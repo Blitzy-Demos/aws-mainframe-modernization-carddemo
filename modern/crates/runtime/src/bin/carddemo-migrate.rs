@@ -1,0 +1,59 @@
+//! Applies the embedded `CardDemo` migrations to the `PostgreSQL` database named by
+//! `DATABASE_URL`, through the embedded migrator in `runtime::migrate`.
+//!
+//! This binary is the only operator entrypoint for schema changes: the API, worker and batch
+//! binaries never migrate, and the `sqlx` command-line tool only prepares the query cache. A run
+//! against an already migrated database applies nothing and still succeeds. The exit status is
+//! non-zero when the configuration, the connection or a migration fails. Errors are logged by
+//! their `Display` form only, so the connection URL and its password never reach the output.
+
+use std::process::ExitCode;
+
+use runtime::config::{Config, OtelExport};
+use tracing::Instrument;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let config = Config::from_env();
+    let otel_export = config.as_ref().map_or(OtelExport::Off, |c| c.otel_export);
+    // Bound until `main` returns: dropping the guard flushes the exported spans.
+    let _telemetry = match runtime::telemetry::init(otel_export) {
+        Ok(guard) => guard,
+        Err(err) => {
+            // No subscriber exists yet, so standard error is the only channel left.
+            eprintln!("carddemo-migrate: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let config = match config {
+        Ok(config) => config,
+        Err(err) => {
+            tracing::error!(error = %err, "invalid configuration");
+            return ExitCode::FAILURE;
+        }
+    };
+    async {
+        let pool = match runtime::db::connect(&config).await {
+            Ok(pool) => pool,
+            Err(err) => {
+                tracing::error!(error = %err, "database connection failed");
+                return ExitCode::FAILURE;
+            }
+        };
+        let applied = runtime::migrate::apply(&pool).await;
+        // Closing also ends the session that holds the migration lock after a failure.
+        pool.close().await;
+        match applied {
+            Ok(()) => {
+                tracing::info!("migrations applied");
+                ExitCode::SUCCESS
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "migration failed");
+                ExitCode::FAILURE
+            }
+        }
+    }
+    .instrument(runtime::telemetry::job_span("carddemo-migrate"))
+    .await
+}
