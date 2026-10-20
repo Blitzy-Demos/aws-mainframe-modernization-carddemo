@@ -1,0 +1,43 @@
+{
+  "rabbit_version": "3.13.7",
+  "rabbitmq_version": "3.13.7",
+  "users": [
+    {
+      "name": "carddemo",
+      "password_hash": "kI06HLh9+HNzsE3iEOpqoupi6MRg0F345NtvdIeBoYQV7Qd1",
+      "hashing_algorithm": "rabbit_password_hashing_sha256",
+      "tags": ["administrator"],
+      "limits": {}
+    }
+  ],
+  "vhosts": [
+    { "name": "/" }
+  ],
+  "permissions": [
+    { "user": "carddemo", "vhost": "/", "configure": ".*", "write": ".*", "read": ".*" }
+  ],
+  "topic_permissions": [],
+  "parameters": [],
+  "global_parameters": [],
+  "policies": [],
+  "queues": [
+    { "name": "CARD.DEMO.REQUEST.DATE", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+    { "name": "CARD.DEMO.REQUEST.ACCT", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+    {
+      "name": "CARD.DEMO.REQUEST.PAUTH",
+      "vhost": "/",
+      "durable": true,
+      "auto_delete": false,
+      "arguments": {
+        "x-dead-letter-exchange": "",
+        "x-dead-letter-routing-key": "CARD.DEMO.DEADLETTER.PAUTH"
+      }
+    },
+    { "name": "CARD.DEMO.REPLY.DATE", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+    { "name": "CARD.DEMO.REPLY.ACCT", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+    { "name": "CARD.DEMO.ERROR", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} },
+    { "name": "CARD.DEMO.DEADLETTER.PAUTH", "vhost": "/", "durable": true, "auto_delete": false, "arguments": {} }
+  ],
+  "exchanges": [],
+  "bindings": []
+}
