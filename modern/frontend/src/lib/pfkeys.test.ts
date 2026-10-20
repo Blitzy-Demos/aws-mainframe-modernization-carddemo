@@ -18,6 +18,14 @@ import {
   parseKeyRow,
   resolvePfKey,
 } from "./pfkeys";
+import {
+  INVALID_KEY,
+  THANK_YOU,
+  TITLE01,
+  TITLE02,
+  formatHeaderDate,
+  formatHeaderTime,
+} from "./header";
 
 /**
  * Unit tests of the PF-key labels and bindings. Every expected key, label and `DRK` flag is written
@@ -26,6 +34,10 @@ import {
  *
  * `usePfKeys` needs React and a DOM, which this Node project does not provide; the decisions it
  * delegates to (`resolvePfKey`, `keyFromEvent`, `enterHandledNatively`) are proved here.
+ *
+ * The header values of `./header` (titles, common messages, date and time formats) are proved at
+ * the end of the file; their expected texts are written by hand from `COTTL01Y`, `CSMSG01Y` and
+ * `CSDAT01Y`.
  */
 
 /** The 21 maps of the screen inventory in `modern/audit/screens.md`. */
@@ -780,5 +792,57 @@ describe("resolvePfKey", () => {
       resolution.handler();
     }
     expect(save.runs()).toBe(1);
+  });
+});
+
+describe("header values", () => {
+  it("keeps both titles at the 40 columns of their fields, padding included", () => {
+    // audit: COSGN00-039
+    expect(TITLE01).toBe(`${" ".repeat(6)}AWS Mainframe Modernization${" ".repeat(7)}`);
+    // audit: COSGN00-042
+    expect(TITLE02).toBe(`${" ".repeat(14)}CardDemo${" ".repeat(18)}`);
+    expect([TITLE01.length, TITLE02.length]).toEqual([40, 40]);
+  });
+
+  it.each([
+    ["THANK_YOU", THANK_YOU, "Thank you for using CardDemo application...", 7],
+    ["INVALID_KEY", INVALID_KEY, "Invalid key pressed. Please see below...", 10],
+  ])("holds %s as its PIC X(50) field value", (_name, value, text, padding) => {
+    expect(value).toBe(`${text}${" ".repeat(padding)}`);
+    expect(value).toHaveLength(50);
+  });
+
+  // audit: COSGN00-040
+  it.each([
+    [new Date(2022, 6, 18), "07/18/22"],
+    [new Date(2000, 0, 1), "01/01/00"],
+    [new Date(1999, 11, 31, 23, 59, 59), "12/31/99"],
+    [new Date(2009, 8, 5), "09/05/09"],
+  ])("formats %s as the header date %s", (date, expected) => {
+    expect(formatHeaderDate(date)).toBe(expected);
+  });
+
+  it("takes the header year without its sign, as the unsigned PIC 9(04) year stores it", () => {
+    const date = new Date(2022, 6, 18);
+    date.setFullYear(-2022);
+    expect(formatHeaderDate(date)).toBe("07/18/22");
+  });
+
+  // audit: COSGN00-043
+  it.each([
+    [new Date(2022, 6, 18, 9, 5, 7), "09:05:07"],
+    [new Date(2022, 6, 18, 0, 0, 0), "00:00:00"],
+    [new Date(2022, 6, 18, 12, 0, 0), "12:00:00"],
+    [new Date(2022, 6, 18, 23, 59, 59), "23:59:59"],
+  ])("formats %s as the 8-character header time %s", (date, expected) => {
+    expect(formatHeaderTime(date)).toBe(expected);
+    expect(formatHeaderTime(date)).toHaveLength(8);
+  });
+
+  it.each([
+    ["formatHeaderDate", formatHeaderDate],
+    ["formatHeaderTime", formatHeaderTime],
+  ])("%s rejects an invalid Date instead of rendering NaN", (_name, format) => {
+    expect(() => format(new Date(Number.NaN))).toThrow(RangeError);
   });
 });
