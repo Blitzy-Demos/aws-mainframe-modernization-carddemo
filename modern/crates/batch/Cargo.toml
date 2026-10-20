@@ -1,0 +1,36 @@
+[package]
+name = "batch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CardDemo batch CLI carddemo-batch: the 15 in-scope JCL jobs as subcommands"
+# carddemo-batch is the only target under src/; no binary is inferred from the layout.
+autobins = false
+
+[[bin]]
+name = "carddemo-batch"
+path = "src/main.rs"
+
+# No sqlx: only persistence issues queries, and the pool returned by runtime::db::connect is
+# passed to persistence::PgStore::new without naming its type. No rust_decimal: batch does no
+# money arithmetic, and tests name decimals through the domain::money::Decimal re-export.
+[dependencies]
+domain = { workspace = true }
+persistence = { workspace = true }
+runtime = { workspace = true }
+copybook = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+printpdf = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+test-support = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+insta = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,33 @@
+[package]
+name = "messaging"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CardDemo RabbitMQ workers CDRD, CDRA and CP00 (binary carddemo-mq)"
+
+# Targets are auto-discovered: src/lib.rs, the binary src/bin/carddemo-mq.rs (the i10 test starts
+# it through CARGO_BIN_EXE_carddemo-mq) and every tests/*.rs. Declaring them would add nothing.
+
+[dependencies]
+# No sqlx: the pool from runtime::db::connect goes straight into persistence::PgStore, so this
+# crate never names a sqlx type and every query stays in persistence. No futures crate: workers
+# poll with basic_get instead of consuming lapin's Stream API.
+domain = { workspace = true }
+persistence = { workspace = true }
+runtime = { workspace = true }
+copybook = { workspace = true }
+lapin = { workspace = true }
+# time: the basic_get poll interval (CARDDEMO_MQ_POLL_MS) and the reconnect backoff.
+tokio = { workspace = true, features = ["time"] }
+tracing = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+test-support = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+insta = { workspace = true }
+rust_decimal = { workspace = true }
+
+[lints]
+workspace = true

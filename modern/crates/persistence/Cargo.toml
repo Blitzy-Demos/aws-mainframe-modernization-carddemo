@@ -1,0 +1,28 @@
+[package]
+name = "persistence"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CardDemo PostgreSQL schema source, codec B row mappings and repository traits"
+
+[dependencies]
+domain = { workspace = true }
+copybook = { workspace = true }
+# The features the query macros and codec B need. No `migrate`: this crate never applies
+# ./migrations; runtime embeds them and is the only schema executor. No TLS feature.
+sqlx = { workspace = true, features = ["postgres", "macros", "chrono", "rust_decimal", "runtime-tokio"] }
+chrono = { workspace = true }
+rust_decimal = { workspace = true }
+
+[dev-dependencies]
+# test-support depends on this crate, so Cargo compiles it twice for these tests: only sqlx,
+# path and byte-buffer types may cross the test_support boundary, never a crate type.
+test-support = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+proptest = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

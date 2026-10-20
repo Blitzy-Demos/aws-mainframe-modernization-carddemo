@@ -1,0 +1,96 @@
+# CardDemo Rust workspace: virtual manifest. Every member under crates/ inherits the package
+# fields, dependency versions and lints declared here; member manifests never carry a version.
+#
+# Version policy: a pin written MAJOR.MINOR is a tilde requirement, so the lockfile stays on that
+# minor line; a pinned range is a caret requirement. The trailing comment on each dependency is
+# the version Cargo.lock holds. The lockfile keeps simple_asn1 at 0.6.3 and time at 0.3.41, which
+# jsonwebtoken would otherwise pull to a time release that needs Rust 1.88, and tokio at 1.53.3.
+# Change it only with `cargo update -p <crate> --precise <version>`, never a bare `cargo update`.
+
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+# Never published. With deny.toml's private-crate settings, this lets cargo-deny's licence and
+# wildcard-path checks pass without an ignore list.
+publish = false
+
+[workspace.dependencies]
+# Runtime and web
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] } # 1.53.3
+axum = "~0.8" # 0.8.9
+tower = "~0.5" # 0.5.3
+tower-http = { version = "~0.6", features = ["trace", "cors"] } # 0.6.11
+serde = { version = "~1.0", features = ["derive"] } # 1.0.229
+serde_json = "~1.0" # 1.0.154
+utoipa = { version = "5", features = ["axum_extras", "chrono", "decimal"] } # 5.5.0
+utoipa-axum = "~0.2" # 0.2.0
+validator = { version = "~0.19", features = ["derive"] } # 0.19.0
+jsonwebtoken = "~9.3" # 9.3.1
+argon2 = "~0.5" # 0.5.3
+
+# Data. sqlx needs a runtime feature for any connection; no TLS feature, the database is local.
+sqlx = { version = "~0.8", default-features = false, features = [
+    "postgres",
+    "macros",
+    "chrono",
+    "rust_decimal",
+    "migrate",
+    "runtime-tokio",
+] } # 0.8.6
+rust_decimal = "~1.36" # 1.36.0
+chrono = { version = "~0.4", features = ["serde"] } # 0.4.45
+
+# Messaging
+lapin = "2" # 2.5.5
+
+# Batch. printpdf re-exports lopdf, which reads statement text back; never depend on lopdf directly.
+clap = { version = "~4.5", features = ["derive"] } # 4.5.61
+printpdf = "~0.7" # 0.7.0
+
+# Telemetry
+tracing = "~0.1" # 0.1.44
+tracing-subscriber = { version = "~0.3", features = ["json", "env-filter"] } # 0.3.23
+opentelemetry = "~0.27" # 0.27.1
+# Beyond the pinned stack: the opentelemetry API crate alone emits nothing, so a tracer provider is
+# required for any span output.
+opentelemetry_sdk = "~0.27" # 0.27.1
+# Beyond the pinned stack: exports spans to standard output, so no collector or cloud service.
+opentelemetry-stdout = "~0.27" # 0.27.0
+# Beyond the pinned stack: bridges tracing spans into OpenTelemetry; the 0.28 line is built
+# against opentelemetry 0.27.
+tracing-opentelemetry = "~0.28" # 0.28.0
+
+# Dev-only: declare these under a member's [dev-dependencies] alone.
+testcontainers = "~0.23" # 0.23.3
+reqwest = { version = "~0.12", default-features = false, features = ["json"] } # 0.12.28
+insta = "~1.41" # 1.41.1
+criterion = "~0.5" # 0.5.1
+trybuild = "~1.0" # 1.0.119 (1.0.122 needs Rust 1.88)
+proptest = "~1.5" # 1.5.0
+
+# Internal crates, declared here so members depend on them as `{ workspace = true }` and every
+# path lives in this file. api, messaging and batch are leaf binaries with no dependents.
+copybook = { path = "crates/copybook" }
+domain = { path = "crates/domain" }
+persistence = { path = "crates/persistence" }
+runtime = { path = "crates/runtime" }
+test-support = { path = "crates/test-support" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+
+# Members inheriting `[lints] workspace = true` cannot add entries of their own, so the parser
+# lints (unwrap_used, expect_used, indexing_slicing) are crate-root #![deny(..)] attributes in
+# the parsing modules instead of entries here.
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+float_arithmetic = "deny"
+# Already in pedantic; named so integer narrowing stays denied whatever pedantic's level becomes.
+cast_possible_truncation = "deny"
+cast_sign_loss = "deny"

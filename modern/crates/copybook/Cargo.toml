@@ -1,0 +1,22 @@
+[package]
+name = "copybook"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "COBOL PIC clause codecs (codec A primitives) for the CardDemo replacement"
+
+[dependencies]
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "codec"
+harness = false
+
+[lints]
+workspace = true
