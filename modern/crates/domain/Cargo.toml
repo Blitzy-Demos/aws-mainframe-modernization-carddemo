@@ -1,0 +1,24 @@
+[package]
+name = "domain"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Pure rules crate: no database, broker or async runtime dependency in any section.
+[dependencies]
+copybook = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+# std: enables the operating-system RNG (password-hash/std -> rand_core/getrandom) that
+# src/password.rs needs to generate argon2id salts; argon2's default features expose none.
+argon2 = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+trybuild = { workspace = true }
+proptest = { workspace = true }
+insta = { workspace = true }
+
+[lints]
+workspace = true
