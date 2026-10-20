@@ -1,0 +1,20 @@
+# Ignore rules for modern/ only; the repository-root .gitignore stays unchanged.
+# Patterns are relative to this directory. Lockfiles, .sqlx/, openapi/openapi.json,
+# frontend/src/api/schema.d.ts, insta snapshots, trybuild .stderr files and
+# .env.example are committed and must never be listed here.
+
+# Rust build output (Cargo, cargo-llvm-cov, check.sh scratch files)
+target/
+
+# Runtime output under CARDDEMO_VAR_DIR (statements, dalyrejs, systran, reports, jobs)
+var/
+
+# Local configuration with local-only secrets; .env.example stays tracked
+.env
+
+# Frontend dependencies, build and test output
+frontend/node_modules/
+frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+frontend/coverage/
