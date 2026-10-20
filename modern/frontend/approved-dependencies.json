@@ -1,0 +1,31 @@
+{
+  "packages": [
+    "@hookform/resolvers",
+    "@playwright/test",
+    "@tailwindcss/vite",
+    "@tanstack/react-query",
+    "@testing-library/dom",
+    "@testing-library/react",
+    "@types/node",
+    "@types/react",
+    "@types/react-dom",
+    "@vitejs/plugin-react",
+    "@vitest/coverage-v8",
+    "class-variance-authority",
+    "cn",
+    "jsdom",
+    "openapi-fetch",
+    "openapi-typescript",
+    "radix-ui",
+    "react",
+    "react-dom",
+    "react-hook-form",
+    "react-router",
+    "shadcn",
+    "tailwindcss",
+    "typescript",
+    "vite",
+    "vitest",
+    "zod"
+  ]
+}
