@@ -1,0 +1,6 @@
+# Rust 1.85.0 matches `rust-version = "1.85"` in modern/Cargo.toml [workspace.package], the release
+# every pinned crate was resolved against; llvm-tools-preview is required by cargo-llvm-cov.
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+profile = "minimal"
