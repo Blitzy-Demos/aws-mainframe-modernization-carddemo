@@ -43,9 +43,14 @@ services:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
     healthcheck:
+      # The probe runs as the rabbitmq user through the image's gosu. Healthchecks run as root, and
+      # a root probe that runs before the server creates /var/lib/rabbitmq/.erlang.cookie writes it
+      # root-only, so the server cannot read it (eacces) and exits.
       test:
         - CMD-SHELL
-        - rabbitmq-diagnostics -q check_running && rabbitmq-diagnostics -q check_port_connectivity
+        - >-
+          gosu rabbitmq rabbitmq-diagnostics -q check_running &&
+          gosu rabbitmq rabbitmq-diagnostics -q check_port_connectivity
       interval: 5s
       timeout: 10s
       retries: 30
