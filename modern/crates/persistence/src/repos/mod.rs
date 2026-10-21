@@ -112,7 +112,7 @@
 //! |---|---|---|
 //! | [`AccountRepository`] | `accounts` | `find_with_customer(PicU<11>)` → [`AccountCustomerChain`]; `find_by_id(PicU<11>)`, `lock_by_id(PicU<11>)`; `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |
 //! | [`AuthFraudRepository`] | `auth_fraud` | `insert(&FraudRecord, NaiveDate)`; `update_flag(&CardNumber, NaiveDateTime, &PicX<1>, NaiveDate)` → `bool`; `find_by_id(&CardNumber, NaiveDateTime)` → record and report date |
-//! | [`CardXrefRepository`] | `card_xref` | `find_by_id(&CardNumber)`; `find_by_acct_id(PicU<11>)`, `find_all_by_acct_id(PicU<11>)`; `find_all`; `insert`; `replace_all` → `u64` |
+//! | [`CardXrefRepository`] | `card_xref` | `find_by_id(&CardNumber)`; `find_by_acct_id(PicU<11>)`, `find_first_two_by_acct_id(PicU<11>)` → at most two rows; `find_all`; `insert`; `replace_all` → `u64` |
 //! | [`CardRepository`] | `cards` | `find_by_id(&CardNumber)`, `lock_by_id(&CardNumber)`, `find_by_ref(CardRef)` → [`CardEntry`]; `page_after`, `page_before` (`Option<&CardNumber>` start, `Option<PicU<11>>` and `Option<&CardNumber>` filters, `limit`); `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |
 //! | [`CsslErrorLogRepository`] | `cssl_error_log` | `insert` → `i64` row ID; `find_all` → `(i64, ErrorLogRecord)` in write order |
 //! | [`CustomerRepository`] | `customers` | `find_by_id(PicU<9>)`, `lock_by_id(PicU<9>)`; `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |

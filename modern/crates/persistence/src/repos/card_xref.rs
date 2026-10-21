@@ -11,7 +11,7 @@
 //! |---|---|
 //! | Keyed read by card number: CBTRN02C `1500-A-LOOKUP-XREF` (`CBTRN02C.cbl:380-391`), CBTRN03C `1500-A-LOOKUP-XREF` (`CBTRN03C.cbl:484-492`), COTRN02C `READ-CCXREF-FILE` (`COTRN02C.cbl:609-637`), COPAUA0C `5100-READ-XREF-RECORD` (`COPAUA0C.cbl:472-514`) | [`CardXrefRepository::find_by_id`] |
 //! | Keyed read through the account path `CXACAIX`: COACTVWC and COACTUPC `9200-GETCARDXREF-BYACCT` (`COACTVWC.cbl:723-770`, `COACTUPC.cbl:3650-3698`), COBIL00C `READ-CXACAIX-FILE` (`COBIL00C.cbl:408-436`), COTRN02C `READ-CXACAIX-FILE` (`COTRN02C.cbl:576-604`), COPAUS0C `GETCARDXREF-BYACCT` (`COPAUS0C.cbl:812-862`), CBACT04C `1110-GET-XREF-DATA`, `READ … KEY IS FD-XREF-ACCT-ID` (`CBACT04C.cbl:393-398`) | [`CardXrefRepository::find_by_acct_id`] |
-//! | Every record sharing one alternate key, which tells a `DUPKEY` read apart (COACTVWC-039) | [`CardXrefRepository::find_all_by_acct_id`] |
+//! | The first two records sharing one alternate key, which tell a `NORMAL` read through `CXACAIX` from a `DUPKEY` one for the programs that branch on that response (COACTVWC-039, COACTUPC-089, COPAUS0C-015, COTRN02C-014) | [`CardXrefRepository::find_first_two_by_acct_id`] |
 //! | Sequential read in key order: CBSTM03B `2000-XREFFILE-PROC` (`CBSTM03B.CBL:157-175`), driven by CREASTMT | [`CardXrefRepository::find_all`] |
 //! | IDCAMS `DELETE`, `DEFINE CLUSTER` and `REPRO` of XREFFILE (`XREFFILE.jcl:25-29,39-52,64`), batch `xreffile` | [`CardXrefRepository::replace_all`] |
 //!
@@ -22,9 +22,12 @@
 //! keys of a shared alternate key in ascending order, and no in-scope program adds a
 //! cross-reference afterwards, so the first record is the one with the lowest card number.
 //! [`find_by_acct_id`](CardXrefRepository::find_by_acct_id) therefore orders by `card_num` and
-//! keeps the first row. The account chain of `accounts.rs` reads every row of the account
-//! through `select_all_by_acct_id` instead, because its programs branch on how many records share
-//! the key: one is `NORMAL`, more are `DUPKEY` (COACTVWC-039, COACTUPC-089). `card_num` is
+//! keeps the first row. The account chain of `accounts.rs` and
+//! [`find_first_two_by_acct_id`](CardXrefRepository::find_first_two_by_acct_id) read the first
+//! two rows of the account through `select_first_two_by_acct_id` instead, because their programs
+//! branch on whether other records share the key: one row is `NORMAL`, two are `DUPKEY`
+//! (COACTVWC-039, COACTUPC-089). A second row already decides that response, so no read through
+//! the account path loads every row of an account, however many cards it holds. `card_num` is
 //! declared `COLLATE "C"` in the migration, so that order is bytewise,
 //! and no statement here names a collation, which would keep the planner off
 //! `card_xref_pkey` and `card_xref_acct_id_idx`.
@@ -85,7 +88,7 @@ pub trait CardXrefRepository: Send {
     /// `1110-GET-XREF-DATA`, served by `card_xref_acct_id_idx`. When other rows share the
     /// account, CICS still returns this record but with the `DUPKEY` response, which this method
     /// does not report: a caller whose program branches on that response, as COACTVWC-039
-    /// records, reads [`find_all_by_acct_id`](Self::find_all_by_acct_id) instead.
+    /// records, reads [`find_first_two_by_acct_id`](Self::find_first_two_by_acct_id) instead.
     ///
     /// # Errors
     ///
@@ -97,12 +100,17 @@ pub trait CardXrefRepository: Send {
         acct_id: PicU<11>,
     ) -> impl Future<Output = Result<Option<CardXrefRecord>, PersistenceError>> + Send;
 
-    /// Every cross-reference of account `acct_id`, in card-number order; empty when no row has
-    /// the account.
+    /// The first two cross-references of account `acct_id` in card-number order, never more:
+    /// none when no row has the account (CICS `NOTFND`), one when the record is the only one
+    /// with the alternate key (`NORMAL`), and two when other records share it (`DUPKEY`). The
+    /// first row is the record [`find_by_acct_id`](Self::find_by_acct_id) returns.
     ///
-    /// Unbounded: an account holds a handful of cards, and no caller passes a size of its own
-    /// (Bounded Pagination binds the API collections, which page `cards`, not this table). Each
-    /// fixture account has exactly one row (COACTVWC-039).
+    /// The `CXACAIX` read of the programs that branch on its response (COACTVWC-039,
+    /// COACTUPC-089, COPAUS0C-015, COTRN02C-014), served by `card_xref_acct_id_idx`. The
+    /// statement's `LIMIT 2` bounds the read whatever the account holds: a second row already
+    /// decides `DUPKEY`, so the rows after it would change no outcome, and an account with many
+    /// cards returns, allocates and decodes no more rows than one with two. Each fixture account
+    /// has exactly one row (COACTVWC-039).
     ///
     /// # Errors
     ///
@@ -110,7 +118,7 @@ pub trait CardXrefRepository: Send {
     /// order, whose stored value does not fit its picture; [`PersistenceError::Unavailable`]
     /// when the database cannot be reached; [`PersistenceError::Database`] for any other failure
     /// of the statement.
-    fn find_all_by_acct_id(
+    fn find_first_two_by_acct_id(
         &mut self,
         acct_id: PicU<11>,
     ) -> impl Future<Output = Result<Vec<CardXrefRecord>, PersistenceError>> + Send;
@@ -160,11 +168,13 @@ pub trait CardXrefRepository: Send {
     ///
     /// # Errors
     ///
-    /// [`PersistenceError::Duplicate`] when two records share a card number,
-    /// [`PersistenceError::Decode`] when a record holds a byte no row can store, and
-    /// [`PersistenceError::Unavailable`] or [`PersistenceError::Database`] when a statement or
-    /// the commit fails. On [`PgStore`] the transaction is then rolled back and the previous
-    /// contents remain (LOADS-018); on [`PgTx`] the caller's transaction is aborted.
+    /// [`PersistenceError::Decode`] when a record holds a byte no row can store: every record is
+    /// converted before the delete, so the call fails with nothing written, leaving the table
+    /// and a [`PgTx`] caller's transaction as they were. [`PersistenceError::Duplicate`] when two
+    /// records share a card number, and [`PersistenceError::Unavailable`] or
+    /// [`PersistenceError::Database`] when a statement or the commit fails. On [`PgStore`] the
+    /// transaction is then rolled back and the previous contents remain (LOADS-018); on [`PgTx`]
+    /// the failed statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[CardXrefRecord],
@@ -186,11 +196,11 @@ impl CardXrefRepository for PgStore {
         select_first_by_acct_id(self.pool(), acct_id)
     }
 
-    fn find_all_by_acct_id(
+    fn find_first_two_by_acct_id(
         &mut self,
         acct_id: PicU<11>,
     ) -> impl Future<Output = Result<Vec<CardXrefRecord>, PersistenceError>> + Send {
-        select_all_by_acct_id(self.pool(), acct_id)
+        select_first_two_by_acct_id(self.pool(), acct_id)
     }
 
     fn find_all(
@@ -236,11 +246,11 @@ impl CardXrefRepository for PgTx<'_> {
         select_first_by_acct_id(self.conn(), acct_id)
     }
 
-    fn find_all_by_acct_id(
+    fn find_first_two_by_acct_id(
         &mut self,
         acct_id: PicU<11>,
     ) -> impl Future<Output = Result<Vec<CardXrefRecord>, PersistenceError>> + Send {
-        select_all_by_acct_id(self.conn(), acct_id)
+        select_first_two_by_acct_id(self.conn(), acct_id)
     }
 
     fn find_all(
@@ -308,16 +318,19 @@ pub(super) async fn select_first_by_acct_id<'e, E: PgExecutor<'e>>(
     row.map(CardXrefRow::into_record).transpose()
 }
 
-/// Every cross-reference of account `acct_id`, in card-number order. Shared with the account
-/// chain of `accounts.rs`, which tells a `CXACAIX` read that finds one record (`NORMAL`) from one
-/// whose key other records share (`DUPKEY`) by the number of rows (COACTVWC-039, COACTUPC-089).
+/// The first two cross-references of account `acct_id`, in card-number order, never more: the
+/// one statement of [`CardXrefRepository::find_first_two_by_acct_id`], shared with the account
+/// chain of `accounts.rs`. Both tell a `CXACAIX` read that finds one record (`NORMAL`) from one
+/// whose key other records share (`DUPKEY`) by the number of rows (COACTVWC-039, COACTUPC-089),
+/// which a second row already decides; the literal `LIMIT 2` keeps the read at two rows however
+/// many cards the account holds.
 ///
 /// # Errors
 ///
 /// [`PersistenceError::Decode`] for the first column, in row order and then migration order,
 /// whose stored value does not fit its picture; [`PersistenceError::Unavailable`] or
 /// [`PersistenceError::Database`] when the statement fails.
-pub(super) async fn select_all_by_acct_id<'e, E: PgExecutor<'e>>(
+pub(super) async fn select_first_two_by_acct_id<'e, E: PgExecutor<'e>>(
     executor: E,
     acct_id: PicU<11>,
 ) -> Result<Vec<CardXrefRecord>, PersistenceError> {
@@ -325,7 +338,7 @@ pub(super) async fn select_all_by_acct_id<'e, E: PgExecutor<'e>>(
     let rows = sqlx::query_as!(
         CardXrefRow,
         "SELECT card_num, cust_id, acct_id, filler FROM card_xref WHERE acct_id = $1 \
-         ORDER BY card_num",
+         ORDER BY card_num LIMIT 2",
         acct_id
     )
     .fetch_all(executor)
@@ -346,12 +359,22 @@ async fn select_all<'e, E: PgExecutor<'e>>(
     rows.into_iter().map(CardXrefRow::into_record).collect()
 }
 
-/// Inserts the row of `record`, every column bound from codec B.
+/// Inserts the row of `record`, converted by [`CardXrefRow::from_record`] and bound by
+/// [`insert_row`].
 async fn insert_one<'e, E: PgExecutor<'e>>(
     executor: E,
     record: &CardXrefRecord,
 ) -> Result<(), PersistenceError> {
     let row = CardXrefRow::from_record(record)?;
+    insert_row(executor, &row).await
+}
+
+/// The one `INSERT` statement, which [`insert_one`] and [`replace_all_in`] share: every column
+/// bound from `row`, already converted through codec B.
+async fn insert_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &CardXrefRow,
+) -> Result<(), PersistenceError> {
     sqlx::query!(
         "INSERT INTO card_xref (card_num, cust_id, acct_id, filler) VALUES ($1, $2, $3, $4)",
         row.card_num,
@@ -366,16 +389,24 @@ async fn insert_one<'e, E: PgExecutor<'e>>(
 
 /// Deletes every row, then inserts `records` in slice order on `conn`, whose transaction the
 /// caller owns; returns the number of records inserted.
+///
+/// Every record is converted through codec B before the delete, so a record that
+/// [`CardXrefRow::from_record`] cannot store fails the call before any statement is sent: the
+/// table, and a caller's transaction, are left as they were (LOADS-018).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[CardXrefRecord],
 ) -> Result<u64, PersistenceError> {
+    let rows = records
+        .iter()
+        .map(CardXrefRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
     sqlx::query!("DELETE FROM card_xref")
         .execute(&mut *conn)
         .await?;
     let mut inserted: u64 = 0;
-    for record in records {
-        insert_one(&mut *conn, record).await?;
+    for row in &rows {
+        insert_row(&mut *conn, row).await?;
         inserted = inserted.saturating_add(1);
     }
     Ok(inserted)
@@ -392,8 +423,8 @@ mod tests {
     use domain::sensitive::CardNumber;
     use test_support::postgres::start_postgres;
 
-    use super::{CardXrefRepository, select_all_by_acct_id, select_first_by_acct_id};
-    use crate::error::PersistenceError;
+    use super::{CardXrefRepository, select_first_by_acct_id, select_first_two_by_acct_id};
+    use crate::error::{DecodeKind, PersistenceError};
     use crate::{PgStore, PgTx};
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -490,7 +521,7 @@ mod tests {
                 "find_by_acct_id returns the one record of its account"
             );
             assert!(
-                store.find_all_by_acct_id(record.acct_id).await? == [record.clone()],
+                store.find_first_two_by_acct_id(record.acct_id).await? == [record.clone()],
                 "each fixture account has exactly one cross-reference"
             );
         }
@@ -499,7 +530,12 @@ mod tests {
         assert!(store.find_by_id(&absent_card).await?.is_none());
         let absent_account = PicU::new(ABSENT_ACCOUNT)?;
         assert!(store.find_by_acct_id(absent_account).await?.is_none());
-        assert!(store.find_all_by_acct_id(absent_account).await?.is_empty());
+        assert!(
+            store
+                .find_first_two_by_acct_id(absent_account)
+                .await?
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -527,9 +563,12 @@ mod tests {
             "the alternate-key read returns the lowest card number"
         );
         assert!(
-            store.find_all_by_acct_id(shared).await?
-                == [lowest.clone(), middle.clone(), highest.clone()],
-            "every record of the account, in card-number order"
+            store.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()],
+            "the probe returns the two lowest card numbers of the account, in order, never more"
+        );
+        assert!(
+            store.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()],
+            "an account with one record returns that record alone"
         );
         assert!(
             store.find_all().await?
@@ -553,12 +592,19 @@ mod tests {
             "the keyed statement keeps the lowest card number"
         );
         assert!(
-            select_all_by_acct_id(tx.conn(), shared).await?
-                == [lowest.clone(), middle.clone(), highest.clone()],
-            "the statement the account chain shares returns every record of the account"
+            select_first_two_by_acct_id(tx.conn(), shared).await?
+                == [lowest.clone(), middle.clone()],
+            "the statement the account chain shares returns the two lowest card numbers"
         );
         assert!(tx.find_by_acct_id(shared).await? == Some(lowest.clone()));
-        assert!(tx.find_all_by_acct_id(shared).await?.len() == 3);
+        assert!(tx.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()]);
+        assert!(tx.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()]);
+        let absent_account = PicU::new(ABSENT_ACCOUNT)?;
+        assert!(
+            tx.find_first_two_by_acct_id(absent_account)
+                .await?
+                .is_empty()
+        );
         assert!(tx.find_by_id(&other.card_num).await? == Some(other.clone()));
         assert!(tx.find_all().await?.len() == 4);
         tx.rollback().await?;
@@ -641,6 +687,46 @@ mod tests {
 
         assert_eq!(store.replace_all(&[]).await?, 0);
         assert!(store.find_all().await?.is_empty());
+        Ok(())
+    }
+
+    /// A record codec B cannot store, after one it can, fails the replacement before the delete:
+    /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
+    /// so committing it after the error keeps the previous contents.
+    // audit: LOADS-018
+    #[tokio::test]
+    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        let guard = start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let original = [
+            xref(*b"6100000000000001", 1, 1)?,
+            xref(*b"6100000000000002", 2, 2)?,
+        ];
+        assert_eq!(store.replace_all(&original).await?, 2);
+        let unstorable = CardXrefRecord {
+            filler: PicX::from_array(*b"             \0"),
+            ..xref(*b"6100000000000004", 4, 4)?
+        };
+        let input = [xref(*b"6100000000000003", 3, 3)?, unstorable];
+        let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
+
+        assert_eq!(store.replace_all(&input).await, invalid);
+        assert!(
+            store.find_all().await? == original,
+            "a failed load through the pool leaves the previous contents"
+        );
+
+        let mut tx = store.begin().await?;
+        assert_eq!(tx.replace_all(&input).await, invalid);
+        assert!(
+            tx.find_all().await? == original,
+            "the transaction deleted nothing and is not aborted"
+        );
+        tx.commit().await?;
+        assert!(
+            store.find_all().await? == original,
+            "committing after the error keeps the previous contents"
+        );
         Ok(())
     }
 }

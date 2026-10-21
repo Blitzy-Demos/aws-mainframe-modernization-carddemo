@@ -50,9 +50,12 @@
 //! # Redaction
 //!
 //! A CP00 request body holds a full card number. Every request span is the `mq.message` span
-//! of `runtime::telemetry::message_span`, which records the queue, `message_id` and
-//! `correlation_id`. Events here name the queue, the outcome
-//! and the [`AmqpError`] or [`PublishFailure`] text, never a body byte or a record.
+//! of `runtime::telemetry::message_span`, which records the queue and the `message_id` and
+//! `correlation_id` as `runtime::telemetry::ScreenedText` shows them, one `*` per byte: the
+//! requester chooses both and either can be a card number, an SSN or a password, so the span
+//! records only whether each is present and its length, never its text. Events here name the
+//! queue, the outcome and the [`AmqpError`] or [`PublishFailure`] text, never a body byte or a
+//! record.
 
 use std::error::Error;
 use std::fmt;
@@ -284,14 +287,16 @@ async fn recover<W: Step>(
 }
 
 /// The span of one request taken from `queue`: `runtime::telemetry::message_span` with the
-/// request's `message_id` and `correlation_id`. A worker runs its handling of the request
-/// inside it through `tracing::Instrument::instrument`; no field ever holds the body.
+/// request's `message_id` and `correlation_id` as [`Request::screened_message_id`] and
+/// [`Request::screened_correlation_id`] give them, one `*` per byte, so no field holds the text
+/// of either ID. A worker runs its handling of the request inside it through
+/// `tracing::Instrument::instrument`; no field ever holds the body.
 #[must_use]
 pub(crate) fn message_span(queue: &str, request: &Request) -> Span {
     telemetry::message_span(
         queue,
-        request.message_id.as_deref(),
-        request.correlation_id.as_deref(),
+        request.screened_message_id(),
+        request.screened_correlation_id(),
     )
 }
 

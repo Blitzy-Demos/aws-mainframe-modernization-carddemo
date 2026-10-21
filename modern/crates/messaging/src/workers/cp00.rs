@@ -64,8 +64,10 @@
 //! The reply's card field and every card-bearing log key come redacted from the domain (E32).
 //! No event, span or error here holds a body byte, a card number or a record: events name the
 //! outcome, a log location, a [`PersistenceError`](persistence::PersistenceError) (SQLSTATE and
-//! constraint only) or a broker condition. The alert carries the request's `message_id`,
-//! `correlation_id` and body length.
+//! constraint only) or a broker condition. The alert carries the body length and the request's
+//! `message_id` and `correlation_id` as `runtime::telemetry::ScreenedText` shows them, one `*`
+//! per byte: the requester chooses both and either can be a card number, an SSN or a password,
+//! so the alert shows only whether each is present and its length, never its text.
 //!
 //! The module's links are written as full paths, because the `pub mod cp00;` declaration carries
 //! an outer doc comment and rustdoc resolves this merged documentation from the parent module.
@@ -494,19 +496,10 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         }
     }
 
-    /// A card number that cannot be read: one alert event with the request's IDs and the body's
-    /// length, then the rejection that dead-letters the request. No reply, lock, write or log
-    /// row (COPAUA0C-006; i11, E31).
+    /// A card number that cannot be read: the `unparseable_alert` event, then the rejection that
+    /// dead-letters the request. No reply, lock, write or log row (COPAUA0C-006; i11, E31).
     async fn unparseable(&self, error: &CardNumberError) -> Processed {
-        tracing::error!(
-            target: telemetry::ALERT_TARGET,
-            alert = copaua0c::ALERT_CARD_UNPARSEABLE,
-            message_id = self.request.message_id.as_deref(),
-            correlation_id = self.request.correlation_id.as_deref(),
-            body_len = error.body_len,
-            cause = ?error.cause,
-            "the CP00 request has no readable card number; it is dead-lettered without a reply"
-        );
+        unparseable_alert(self.request, error);
         self.dead_letter().await
     }
 
@@ -909,6 +902,23 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     }
 }
 
+/// The alert of a request whose card number cannot be read (COPAUA0C-006; i11, E31): one
+/// `ERROR` event with target `runtime::telemetry::ALERT_TARGET`, `alert` set to
+/// `CP00_CARD_UNPARSEABLE`, the request's `message_id` and `correlation_id` as
+/// `Request::screened_message_id` and `Request::screened_correlation_id` give them, one `*` per
+/// byte, the body's length and the cause. It never carries a body byte or a byte of either ID.
+fn unparseable_alert(request: &Request, error: &CardNumberError) {
+    tracing::error!(
+        target: telemetry::ALERT_TARGET,
+        alert = copaua0c::ALERT_CARD_UNPARSEABLE,
+        message_id = request.screened_message_id().map(tracing::field::display),
+        correlation_id = request.screened_correlation_id().map(tracing::field::display),
+        body_len = error.body_len,
+        cause = ?error.cause,
+        "the CP00 request has no readable card number; it is dead-lettered without a reply"
+    );
+}
+
 /// Rolls `tx` back, when there is one; a failed rollback is traced, and `PostgreSQL` discards
 /// the transaction with its connection.
 async fn rollback<T: AuthTx>(tx: Option<T>) {
@@ -932,4 +942,77 @@ fn location(site: LogSite<'_>) -> Cow<'static, str> {
 /// HALTED(H4) (COPAUA0C-112).
 fn sqlstate(error: &PersistenceError) -> Option<SqlState> {
     error.sqlstate().and_then(SqlState::parse)
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::messaging::copaua0c::{CardNumberCause, CardNumberError};
+    use runtime::telemetry::ALERT_TARGET;
+    use test_support::trace_capture;
+
+    use super::unparseable_alert;
+    use crate::broker::Request;
+
+    // audit: COPAUA0C-006
+    #[test]
+    fn the_unparseable_card_alert_shows_the_ids_as_stars_and_no_body_byte() {
+        let body = b"220718,102030,ABC".to_vec();
+        let body_len = body.len();
+        let request = Request {
+            delivery_tag: 9,
+            body,
+            message_id: Some("PASS WOR".to_owned()),
+            correlation_id: Some("SECRET".to_owned()),
+            reply_to: Some("123-45-6789".to_owned()),
+            redelivered: false,
+        };
+        let error = CardNumberError {
+            body_len,
+            cause: CardNumberCause::NotSixteenDigits,
+        };
+
+        let capture = trace_capture::capture();
+        unparseable_alert(&request, &error);
+
+        let alerts = capture.lines_with_target(ALERT_TARGET);
+        let [alert] = alerts.as_slice() else {
+            panic!("expected exactly one alert line, got {alerts:?}");
+        };
+        let expected = [
+            r#""level":"ERROR""#.to_owned(),
+            r#""target":"carddemo::alert""#.to_owned(),
+            r#""alert":"CP00_CARD_UNPARSEABLE""#.to_owned(),
+            format!(r#""body_len":{body_len}"#),
+            r#""message_id":"********""#.to_owned(),
+            r#""correlation_id":"******""#.to_owned(),
+            r#""cause":"NotSixteenDigits""#.to_owned(),
+            concat!(
+                r#""message":"the CP00 request has no readable card number; "#,
+                r#"it is dead-lettered without a reply""#
+            )
+            .to_owned(),
+        ];
+        for member in &expected {
+            assert!(
+                alert.contains(member.as_str()),
+                "{member} missing from {alert}"
+            );
+        }
+        assert_eq!(capture.lines().len(), 1, "{}", capture.text());
+
+        // The three properties, and the body's fields in the comma-delimited context they have
+        // in the body, so that a timestamp's digits cannot match them.
+        let text = capture.text();
+        for value in [
+            "PASS WOR",
+            "SECRET",
+            "123-45-6789",
+            "220718,102030,ABC",
+            "220718,",
+            ",102030,",
+            ",ABC",
+        ] {
+            assert!(!text.contains(value), "{value:?} in {text}");
+        }
+    }
 }

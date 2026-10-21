@@ -144,10 +144,13 @@ pub trait CustomerRepository: Send {
     ///
     /// # Errors
     ///
-    /// The first failure of the delete or of an insert, as [`insert`](Self::insert) reports it,
-    /// a duplicate key in `records` included. On a [`PgStore`] the transaction is then rolled
-    /// back and the previous contents remain (LOADS-018); on a [`PgTx`] the caller's transaction
-    /// is aborted.
+    /// [`PersistenceError::Decode`] when a record holds a byte codec B cannot store, as for
+    /// [`insert`](Self::insert): every record is converted before the delete, so the call fails
+    /// with nothing written, leaving the table and a [`PgTx`] caller's transaction as they were.
+    /// Otherwise the first failure of the delete or of an insert, as [`insert`](Self::insert)
+    /// reports it, a duplicate key in `records` included. On a [`PgStore`] the transaction is
+    /// then rolled back and the previous contents remain (LOADS-018); on a [`PgTx`] the failed
+    /// statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[CustomerRecord],
@@ -220,13 +223,22 @@ async fn select_all<'e, E: PgExecutor<'e>>(
     rows.into_iter().map(CustomerRow::into_record).collect()
 }
 
-/// `INSERT` of `record` as one row, every column bound from its [`CustomerRow`]; returns the
-/// number of rows inserted.
+/// `INSERT` of `record` as one row, converted by [`CustomerRow::from_record`] and bound by
+/// [`insert_row`]; returns the number of rows inserted.
 async fn insert_one<'e, E: PgExecutor<'e>>(
     executor: E,
     record: &CustomerRecord,
 ) -> Result<u64, PersistenceError> {
     let row = CustomerRow::from_record(record)?;
+    insert_row(executor, &row).await
+}
+
+/// The one `INSERT` statement, which [`insert_one`] and [`replace_all_in`] share: every column
+/// bound from `row`, already converted through codec B; returns the number of rows inserted.
+async fn insert_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &CustomerRow,
+) -> Result<u64, PersistenceError> {
     let done = sqlx::query!(
         "INSERT INTO customers (cust_id, cust_first_name, cust_middle_name, cust_last_name, \
          cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, cust_addr_state_cd, \
@@ -300,18 +312,26 @@ async fn update_one<'e, E: PgExecutor<'e>>(
     Ok(done.rows_affected() == 1)
 }
 
-/// `DELETE` of every row, then [`insert_one`] of each record in slice order, on one connection
+/// `DELETE` of every row, then [`insert_row`] of each record in slice order, on one connection
 /// that the caller holds inside a transaction; returns the number of rows inserted.
+///
+/// Every record is converted through codec B before the delete, so a record that
+/// [`CustomerRow::from_record`] cannot store fails the call before any statement is sent: the
+/// table, and a caller's transaction, are left as they were (LOADS-018).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[CustomerRecord],
 ) -> Result<u64, PersistenceError> {
+    let rows = records
+        .iter()
+        .map(CustomerRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
     sqlx::query!("DELETE FROM customers")
         .execute(&mut *conn)
         .await?;
     let mut inserted = 0;
-    for record in records {
-        inserted += insert_one(&mut *conn, record).await?;
+    for row in &rows {
+        inserted += insert_row(&mut *conn, row).await?;
     }
     Ok(inserted)
 }
@@ -423,13 +443,13 @@ mod tests {
     use std::error::Error as StdError;
     use std::str::FromStr;
 
-    use copybook::{FixedRecord, PicU};
+    use copybook::{FixedRecord, PicU, PicX};
     use domain::records::CustomerRecord;
     use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use test_support::postgres::{PostgresGuard, start_postgres};
 
     use super::CustomerRepository;
-    use crate::{PersistenceError, PgStore};
+    use crate::{DecodeKind, PersistenceError, PgStore};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -626,6 +646,45 @@ mod tests {
         assert!(tx.find_all().await? == vec![sample(60, "Inside")?]);
         tx.rollback().await?;
         assert!(store.find_all().await? == expected);
+        Ok(())
+    }
+
+    /// A record codec B cannot store, after one it can, fails the replacement before the delete
+    /// (LOADS-018): through the pool nothing changes, and a caller's transaction is left usable
+    /// and unchanged, so committing it after the error keeps the previous contents.
+    #[tokio::test]
+    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        let guard = start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let original = [sample(42, "First")?, sample(43, "Second")?];
+        assert_eq!(store.replace_all(&original).await?, 2);
+        let unstorable = CustomerRecord {
+            first_name: PicX::moved_from("Zoë".as_bytes()),
+            ..sample(45, "Unstorable")?
+        };
+        let input = [sample(44, "Replacement")?, unstorable];
+        let invalid = Err(PersistenceError::decode(
+            "cust_first_name",
+            DecodeKind::InvalidByte,
+        ));
+
+        assert_eq!(store.replace_all(&input).await, invalid);
+        assert!(
+            store.find_all().await? == original,
+            "a failed load through the pool leaves the previous contents"
+        );
+
+        let mut tx = store.begin().await?;
+        assert_eq!(tx.replace_all(&input).await, invalid);
+        assert!(
+            tx.find_all().await? == original,
+            "the transaction deleted nothing and is not aborted"
+        );
+        tx.commit().await?;
+        assert!(
+            store.find_all().await? == original,
+            "committing after the error keeps the previous contents"
+        );
         Ok(())
     }
 }

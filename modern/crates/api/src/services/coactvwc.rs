@@ -19,8 +19,9 @@
 //! every link into the domain's [`Lookup`]. A failed read becomes [`Lookup::Error`], the
 //! `WHEN OTHER` branch whose `File Error:` text the domain renders, with its CICS codes
 //! `HALTED(H4)` (COACTVWC-037, COACTVWC-038, COACTVWC-042, COACTVWC-043, COACTVWC-046,
-//! COACTVWC-047). The [`PersistenceError`](persistence::PersistenceError) it carries is dropped
-//! there and never reaches a message, so no outcome of this endpoint is a
+//! COACTVWC-047). The [`PersistenceError`] it carries is logged
+//! once by [`traced`], with the read's paragraph and statement, in place of the codes the COBOL
+//! puts in that text, and never reaches a message, so no outcome of this endpoint is a
 //! [`ServiceError::Store`].
 //!
 //! # Identity, writes and cardholder data
@@ -31,15 +32,20 @@
 //!   nothing is written (COACTVWC-005).
 //! - The SSN stays a `domain::sensitive::Ssn` inside the [`AccountView`], and the card number
 //!   the cross-reference read returns is dropped with the chain (COACTVWC-017, COACTVWC-034,
-//!   E32). Nothing here formats, logs or traces a record, a key or a store error.
+//!   E32). Nothing here formats, logs or traces a record or a key; the event of a failed read
+//!   carries only the store error, whose `Display` names an SQLSTATE and a constraint or column
+//!   at most (Cardholder Data Redaction).
 
 use domain::copybook::PicU;
 use domain::online::coactvwc::{self, AccountView, Lookup, ViewFailure};
-use persistence::{AccountCustomerChain, AccountRepository, ChainLink};
+use persistence::{AccountCustomerChain, AccountRepository, ChainLink, PersistenceError};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
 use crate::error::ServiceError;
+
+/// The program the tracing event of a failed read names.
+const PROGRAM: &str = "COACTVWC";
 
 /// ENTER on the account view: the edit of the typed account number, the reads of
 /// `9000-READ-ACCT` and the view `1200-SETUP-SCREEN-VARS` shows (COACTVWC-005, COACTVWC-008,
@@ -67,8 +73,11 @@ pub(crate) async fn view(
 }
 
 /// The domain's decision over the three reads of `chain` for account `acct_id`, each link
-/// mapped by [`lookup`] (COACTVWC-033).
+/// mapped by [`lookup`] (COACTVWC-033), after each failed read is logged once.
 fn decide(acct_id: PicU<11>, chain: &AccountCustomerChain) -> Result<AccountView, ViewFailure> {
+    report_failed(&chain.xref, "9200-GETCARDXREF-BYACCT", "READ CXACAIX");
+    report_failed(&chain.account, "9300-GETACCTDATA-BYACCT", "READ ACCTDAT");
+    report_failed(&chain.customer, "9400-GETCUSTDATA-BYCUST", "READ CUSTDAT");
     coactvwc::view(
         acct_id,
         lookup(&chain.xref),
@@ -77,10 +86,33 @@ fn decide(acct_id: PicU<11>, chain: &AccountCustomerChain) -> Result<AccountView
     )
 }
 
+/// Logs `link` through [`traced`] when its read failed; any other link logs nothing.
+fn report_failed<T>(link: &ChainLink<T>, paragraph: &'static str, statement: &'static str) {
+    if let ChainLink::Failed(error) = link {
+        traced(paragraph, statement, error);
+    }
+}
+
+/// The tracing event of a failed read, in place of the `RESP` and `RESP2` codes the `File
+/// Error:` text holds in the COBOL (`HALTED(H4)`; COACTVWC-037, COACTVWC-042, COACTVWC-046).
+///
+/// `paragraph` and `statement` are constants of this module; the error's `Display` holds only
+/// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
+/// Redaction).
+fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
+    tracing::warn!(
+        program = PROGRAM,
+        paragraph,
+        statement,
+        error = %error,
+        "file read failed; answering the program's file error"
+    );
+}
+
 /// One read of the chain as the lookup [`coactvwc::view`] takes: CICS `NORMAL` is
 /// [`Lookup::Found`], `NOTFND` is [`Lookup::NotFound`] (COACTVWC-035, COACTVWC-040,
-/// COACTVWC-044), and any other response is [`Lookup::Error`] with its error dropped
-/// (COACTVWC-037, COACTVWC-039, COACTVWC-042, COACTVWC-046).
+/// COACTVWC-044), and any other response is [`Lookup::Error`], whose error [`decide`] has
+/// logged (COACTVWC-037, COACTVWC-039, COACTVWC-042, COACTVWC-046).
 fn lookup<T>(link: &ChainLink<T>) -> Lookup<&T> {
     match link {
         ChainLink::Found(record) => Lookup::Found(record),
@@ -103,6 +135,7 @@ mod tests {
     use domain::records::card_xref::CardXrefRecord;
     use domain::records::customer::CustomerRecord;
     use persistence::{AccountCustomerChain, ChainLink, PersistenceError};
+    use test_support::trace_capture;
 
     use super::{decide, lookup};
 
@@ -264,6 +297,84 @@ mod tests {
             );
             assert!(message.contains(names), "{message}");
             assert!(!message.contains(SQLSTATE) && !message.contains("accounts_pkey"));
+        }
+        Ok(())
+    }
+
+    /// COACTVWC-037, COACTVWC-042, COACTVWC-046: each failed read is logged once, with its
+    /// paragraph and the store error, before the domain answers as before; a read that found
+    /// its record or none logs nothing, and no event holds a key or a stored value.
+    #[test]
+    fn each_failed_read_is_logged_once_without_any_value() -> TestResult {
+        let (xref, account, customer) = records()?;
+        let key = PicU::<11>::new(42)?;
+        let traces = trace_capture::capture();
+        let cases = [
+            (
+                ChainLink::Failed(store_error()),
+                ChainLink::NotReached,
+                ChainLink::NotReached,
+                FailureClass::Store,
+                &[("9200-GETCARDXREF-BYACCT", "READ CXACAIX", "SQLSTATE XX000")][..],
+            ),
+            (
+                ChainLink::Found(xref.clone()),
+                ChainLink::Failed(store_error()),
+                ChainLink::Failed(PersistenceError::Unavailable),
+                FailureClass::Store,
+                &[
+                    ("9300-GETACCTDATA-BYACCT", "READ ACCTDAT", "SQLSTATE XX000"),
+                    (
+                        "9400-GETCUSTDATA-BYCUST",
+                        "READ CUSTDAT",
+                        "database unavailable",
+                    ),
+                ][..],
+            ),
+            (
+                ChainLink::Found(xref.clone()),
+                ChainLink::Failed(store_error()),
+                ChainLink::Found(customer),
+                FailureClass::Store,
+                &[("9300-GETACCTDATA-BYACCT", "READ ACCTDAT", "SQLSTATE XX000")][..],
+            ),
+            (
+                ChainLink::Found(xref),
+                ChainLink::Found(account),
+                ChainLink::NotFound,
+                FailureClass::NotFound,
+                &[][..],
+            ),
+        ];
+        for (xref, account, customer, class, logged) in cases {
+            traces.clear();
+            let chain = AccountCustomerChain {
+                xref,
+                account,
+                customer,
+            };
+            let failure = decide(key, &chain)
+                .err()
+                .ok_or("an incomplete chain gave a view")?;
+            assert_eq!(failure.class(), class, "{}", failure.message());
+            let lines = traces.lines();
+            assert_eq!(lines.len(), logged.len(), "{}", traces.text());
+            for (line, &(paragraph, statement, cause)) in lines.iter().zip(logged) {
+                let paragraph = format!(r#""paragraph":"{paragraph}""#);
+                let statement = format!(r#""statement":"{statement}""#);
+                for expected in [
+                    r#""level":"WARN""#,
+                    r#""program":"COACTVWC""#,
+                    paragraph.as_str(),
+                    statement.as_str(),
+                    cause,
+                ] {
+                    assert!(line.contains(expected), "{expected} missing from {line}");
+                }
+            }
+        }
+        for value in ["4111111111111111", "00000000042", "123456789", "000000007"] {
+            assert!(!traces.contains(value), "the trace holds {value}");
         }
         Ok(())
     }

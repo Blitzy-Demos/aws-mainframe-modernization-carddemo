@@ -46,8 +46,8 @@
 //! - Typed Dates and Timestamps: the original and processing dates reach the domain edit as the
 //!   raw text of their map fields, the raw-edit-input exception of AAP 0.3.4.1; the edit returns
 //!   them typed, and the record stores them as layout-`S` timestamps (COTRN02C-046, `E33`).
-//! - Repository Method Naming: `find_all_by_acct_id`, `find_by_id`, `find_last`, `next_id`,
-//!   `insert`.
+//! - Repository Method Naming: `find_first_two_by_acct_id`, `find_by_id`, `find_last`,
+//!   `next_id`, `insert`.
 
 use core::fmt;
 
@@ -185,17 +185,18 @@ async fn process_enter(
 /// `VALIDATE-INPUT-KEY-FIELDS`: the key edit, then the cross-reference read it names, then the
 /// fill-in of the other key (COTRN02C-009 to COTRN02C-019).
 ///
-/// The account path reads every cross-reference of the account, because the `CXACAIX` path is
-/// `NONUNIQUEKEY`: one row is `NORMAL`, none is `NOTFND`, and two or more are the `DUPKEY` that
-/// the program answers as a failed read (COTRN02C-012 to COTRN02C-014). It therefore uses
-/// `find_all_by_acct_id`, not `find_by_acct_id`, which returns the first row and hides that
-/// `DUPKEY`. The card path reads by the primary key (COTRN02C-017 to COTRN02C-019).
+/// The account path reads the first two cross-references of the account, because the `CXACAIX`
+/// path is `NONUNIQUEKEY`: one row is `NORMAL`, none is `NOTFND`, and a second row, however many
+/// more share the account, is the `DUPKEY` that the program answers as a failed read
+/// (COTRN02C-012 to COTRN02C-014). It therefore uses `find_first_two_by_acct_id`, not
+/// `find_by_acct_id`, which returns the first row and hides that `DUPKEY`. The card path reads by
+/// the primary key (COTRN02C-017 to COTRN02C-019).
 async fn fill(store: &mut PgStore, keys: Keys<'_>) -> Result<FilledKey, ServiceError<AddFailure>> {
     let request = cotrn02c::edit_keys(keys.acct_id, keys.card_num).map_err(ServiceError::Rule)?;
     let (paragraph, read): (_, Result<Vec<CardXrefRecord>, PersistenceError>) = match &request {
         KeyRequest::Account(acct_id) => (
             READ_CXACAIX,
-            CardXrefRepository::find_all_by_acct_id(store, *acct_id).await,
+            CardXrefRepository::find_first_two_by_acct_id(store, *acct_id).await,
         ),
         KeyRequest::Card(card_num) => (
             READ_CCXREF,

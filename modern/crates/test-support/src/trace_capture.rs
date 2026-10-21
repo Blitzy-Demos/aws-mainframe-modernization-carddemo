@@ -6,7 +6,11 @@
 //! shape of the standard output that `runtime::telemetry::init` writes. Two settings widen it so
 //! that nothing escapes the scan:
 //!
-//! - Every level down to `TRACE` is recorded, whatever `RUST_LOG` says.
+//! - Every level down to `TRACE` is recorded, whatever `RUST_LOG` says, for every target but the
+//!   [`runtime::telemetry::SILENCED_TARGETS`] (the AMQP client `lapin`, its `amq_protocol`
+//!   crates and `pinky_swear`). [`runtime::telemetry::dependency_filter`] keeps those off here
+//!   exactly as it does on standard output, so the capture records only what standard output can
+//!   carry.
 //! - Every span writes one line when it opens and one when it closes, each with the span's
 //!   recorded fields. A span therefore shows its fields even when no event fires inside it,
 //!   which is what the `OpenTelemetry` span exporter would print for it.
@@ -14,14 +18,24 @@
 //! The buffer is kept in memory only, and is never filtered, redacted or truncated. Alerts are
 //! the lines whose target is [`runtime::telemetry::ALERT_TARGET`], selected with
 //! [`TraceCapture::lines_with_target`].
+//!
+//! No event escapes a capture because another thread reached its callsite first. `tracing`
+//! caches each callsite's interest when a thread first reaches it, and while it knows of a
+//! single live dispatcher it asks only the reaching thread's default subscriber. A test thread
+//! without a capture would then cache "never" for a callsite that a capture on another thread
+//! records, and that capture would miss the callsite's events from then on. The first capture
+//! therefore registers a dispatcher that records nothing and lives as long as the process (see
+//! [`capture`]), so every capture is one of at least two live dispatchers and each callsite's
+//! interest is taken from all of them.
 
 use std::fmt;
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use runtime::telemetry::json_layer;
+use runtime::telemetry::{dependency_filter, json_layer};
 use tracing::Dispatch;
 use tracing::dispatcher::{self, DefaultGuard};
+use tracing::subscriber::NoSubscriber;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt::MakeWriter;
@@ -30,6 +44,17 @@ use tracing_subscriber::layer::SubscriberExt as _;
 
 /// The captured bytes, shared by the capture and every writer its layer makes.
 type Buffer = Arc<Mutex<Vec<u8>>>;
+
+/// The dispatcher that keeps every capture one of at least two live dispatchers, registered by
+/// the first [`capture`] of the process before its own and never dropped.
+///
+/// `tracing` takes a newly reached callsite's interest from the reaching thread's default
+/// subscriber alone whenever the last dispatcher it registered was the only live one. With this
+/// dispatcher alive, every capture's registration counts two or more, so a callsite's interest
+/// combines every live dispatcher's: "sometimes" while any capture that records it is live,
+/// never "never". Its subscriber records nothing and sets no level ceiling, so it neither adds
+/// lines to a capture nor lowers the maximum level below the `TRACE` a capture enables.
+static INTEREST_SENTINEL: OnceLock<Dispatch> = OnceLock::new();
 
 /// Locks `buffer`. A poisoned lock is taken over rather than reported: the lock is held only to
 /// append, copy or clear whole slices, so its bytes stay consistent, and no accessor panics.
@@ -102,13 +127,22 @@ impl fmt::Debug for TraceCapture {
 /// - Child processes, such as `carddemo-mq` or `carddemo-batch` run as binaries, write their own
 ///   standard output, which this capture does not see. Tests read the child's standard output
 ///   instead, which has the same JSON shape.
+///
+/// Before its own dispatcher, the capture makes sure a process-lifetime dispatcher that records
+/// nothing is registered, so that a callsite first reached by a thread without a capture still
+/// reaches this one (see the module documentation).
 #[must_use = "the capture ends when it is dropped; bind it for as long as the code under test runs"]
 pub fn capture() -> TraceCapture {
+    INTEREST_SENTINEL.get_or_init(|| Dispatch::new(NoSubscriber::new()));
     let buffer = Buffer::default();
     let layer = json_layer(BufferMakeWriter(Arc::clone(&buffer)))
         .with_span_events(FmtSpan::NEW | FmtSpan::CLOSE)
         .with_filter(LevelFilter::TRACE);
-    let dispatch = Dispatch::new(tracing_subscriber::registry().with(layer));
+    let dispatch = Dispatch::new(
+        tracing_subscriber::registry()
+            .with(dependency_filter())
+            .with(layer),
+    );
     let guard = dispatcher::set_default(&dispatch);
     TraceCapture {
         buffer,
@@ -176,8 +210,11 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use runtime::telemetry::{ALERT_TARGET, message_span, record_response, request_span};
+    use runtime::telemetry::{
+        ALERT_TARGET, ScreenedText, message_span, record_response, request_span,
+    };
     use tracing::instrument::WithSubscriber as _;
+    use tracing::level_filters::LevelFilter;
 
     use super::capture;
 
@@ -222,8 +259,8 @@ mod tests {
         let capture = capture();
         drop(message_span(
             "CARD.DEMO.REQUEST.PAUTH",
-            Some("m-7"),
-            Some("c-7"),
+            Some(ScreenedText::new("m-7")),
+            Some(ScreenedText::new("c-7")),
         ));
 
         let lines = capture.lines();
@@ -232,8 +269,8 @@ mod tests {
         };
         for expected in [
             r#""queue":"CARD.DEMO.REQUEST.PAUTH""#,
-            r#""message_id":"m-7""#,
-            r#""correlation_id":"c-7""#,
+            r#""message_id":"***""#,
+            r#""correlation_id":"***""#,
         ] {
             assert!(
                 closed.contains(expected),
@@ -255,6 +292,20 @@ mod tests {
         assert!(trace.contains(r#""level":"TRACE""#), "{trace}");
         assert!(trace.contains(r#""depth":"deepest""#), "{trace}");
         assert!(debug.contains(r#""level":"DEBUG""#), "{debug}");
+    }
+
+    #[test]
+    fn silenced_dependency_targets_are_not_recorded() {
+        let capture = capture();
+        tracing::error!(target: "lapin::channels", "dependency probe");
+        tracing::trace!(target: "messaging::workers", "application probe");
+
+        let lines = capture.lines();
+        let [line] = lines.as_slice() else {
+            panic!("expected the application event only, got {lines:?}");
+        };
+        assert!(line.contains("application probe"), "{line}");
+        assert!(!capture.contains("dependency probe"), "{}", capture.text());
     }
 
     #[test]
@@ -310,6 +361,29 @@ mod tests {
 
         assert!(!capture.contains("outside probe"), "{}", capture.text());
         assert!(capture.contains("carried probe"), "{}", capture.text());
+    }
+
+    // The one callsite of the test below: no other code reaches it, so its interest is first
+    // cached by whichever thread of that test reaches it first.
+    fn first_reached_without_a_capture() {
+        tracing::warn!("first reached without a capture");
+    }
+
+    #[test]
+    fn a_callsite_first_reached_by_a_thread_without_a_capture_is_still_captured() {
+        let capture = capture();
+        assert_eq!(LevelFilter::current(), LevelFilter::TRACE);
+
+        let uncaptured = thread::spawn(first_reached_without_a_capture);
+        assert!(uncaptured.join().is_ok());
+        first_reached_without_a_capture();
+
+        let lines = capture.lines();
+        let [line] = lines.as_slice() else {
+            panic!("expected this thread's event only, got {lines:?}");
+        };
+        assert!(line.contains(r#""level":"WARN""#), "{line}");
+        assert!(line.contains("first reached without a capture"), "{line}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

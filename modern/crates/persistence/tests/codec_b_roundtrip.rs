@@ -769,12 +769,12 @@ async fn card_xrefs(store: &mut PgStore) -> usize {
     let file = CardXrefRecord::FILE;
     let records = round_trip::<CardXrefRecord>(store).await;
     let first = first_record(file, &records);
-    let by_account = CardXrefRepository::find_all_by_acct_id(store, first.acct_id)
+    let by_account = CardXrefRepository::find_first_two_by_acct_id(store, first.acct_id)
         .await
-        .expect("card_xref: find_all_by_acct_id");
+        .expect("card_xref: find_first_two_by_acct_id");
     assert!(
-        by_account.contains(first),
-        "{file}:1 is missing from its account's cross-references"
+        by_account == [first.clone()],
+        "{file}:1 is not the one cross-reference of its account"
     );
     assert!(
         by_account.iter().all(|xref| xref.acct_id == first.acct_id),

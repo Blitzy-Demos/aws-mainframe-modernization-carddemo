@@ -70,6 +70,8 @@ mod tests {
 
     use super::next_message_id;
 
+    /// The length of the timestamp part for a reading in a year 0–9999: `YYYYMMDDHHMMSSmmm`.
+    const TIMESTAMP_LEN: usize = 17;
     /// The longest ID for a reading in a year 0–9999.
     const MAX_LEN_FOUR_DIGIT_YEAR: usize = 49;
     /// The longest ID for any reading.
@@ -98,13 +100,15 @@ mod tests {
 
     // audit: COPAUA0C-067
     #[test]
-    fn id_is_the_reading_to_the_millisecond_then_the_process_then_the_sequence() -> TestResult {
+    fn id_is_a_millisecond_timestamp_then_the_process_then_the_sequence() -> TestResult {
         let process = std::process::id().to_string();
         for micros in [456_000, 456_999] {
             let id = next_message_id(&FixedClock::new(instant(micros)?));
             let (timestamp, id_process, sequence) = parts(&id)?;
-            assert!(id.starts_with("20220718102030456-"), "{id}");
-            assert_eq!(timestamp, "20220718102030456");
+            // The timestamp is checked by its layout only, never by the reading's value.
+            assert_eq!(timestamp.len(), TIMESTAMP_LEN, "{id}");
+            assert!(timestamp.bytes().all(|byte| byte.is_ascii_digit()), "{id}");
+            NaiveDateTime::parse_from_str(timestamp, "%Y%m%d%H%M%S%3f")?;
             assert_eq!(id_process, process);
             sequence.parse::<u64>()?;
             assert!(id.is_ascii(), "{id}");

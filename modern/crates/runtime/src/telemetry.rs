@@ -1,8 +1,9 @@
 //! Process telemetry of the `CardDemo` binaries: JSON tracing output on standard output, optional
 //! `OpenTelemetry` span export to standard output, and the span shapes every service uses.
 //!
-//! [`init`] installs the global subscriber once per process: an `EnvFilter` read from `RUST_LOG`
-//! (unset means `info`), the JSON layer of [`json_layer`] over standard output and, when
+//! [`init`] installs the global subscriber once per process: the [`dependency_filter`] that
+//! silences the AMQP client's own diagnostics, an `EnvFilter` read from `RUST_LOG` (unset means
+//! `info`), the JSON layer of [`json_layer`] over standard output and, when
 //! `CARDDEMO_OTEL_EXPORT=stdout`, a `tracing-opentelemetry` layer whose finished spans the
 //! `opentelemetry-stdout` exporter prints. Output goes to standard output only: there is no
 //! collector, no network exporter and no cloud service.
@@ -14,7 +15,8 @@
 //! span as a multi-line, human-readable text block, interleaved with the JSON event lines; the
 //! exporter has no JSON format. A consumer that parses standard output line by line as JSON
 //! therefore runs with export off. Exported spans and their events carry no source-location
-//! attributes, so no source or host path reaches standard output.
+//! attributes, so no source or host path reaches standard output. No event or span of the
+//! [`SILENCED_TARGETS`] reaches it, at any `RUST_LOG`.
 //!
 //! # Redaction boundary
 //!
@@ -23,6 +25,25 @@
 //! Everything a span or event records reaches standard output, so a caller never adds a field
 //! holding a request or message body, a URI, a query string, a header or a protected value (card
 //! number, CVV, SSN, password), and never interpolates one into an event message.
+//!
+//! Text a requester chooses, such as the AMQP `message_id`, `correlation_id` and `reply_to`
+//! properties, can itself be a card number, an SSN or a password, and a `CardDemo` password is
+//! any one to eight printable bytes, spaces included, so nothing in the text tells a protected
+//! value from a harmless one. Such text reaches a span or an event only as a [`ScreenedText`],
+//! which shows that the text is present and how many bytes it has, never a byte of it;
+//! [`message_span`] takes its two message IDs in that form.
+//!
+//! # Dependency boundary
+//!
+//! The redaction boundary binds the code of this workspace, and a dependency's own events bypass
+//! it. The AMQP client `lapin` logs, at `TRACE`, every frame it reads or writes in `Debug` form,
+//! the bytes of each message body and the `PLAIN` authentication response that carries the
+//! broker password included, and at `ERROR` the close text the broker composes. [`init`]
+//! therefore installs [`dependency_filter`] as a global filter of its own, ahead of the
+//! `RUST_LOG` filter. An event or span is recorded only when both filters enable it, so no
+//! `RUST_LOG` directive (`trace`, `lapin=trace`, `lapin::channels=trace`, …) re-enables one of
+//! the [`SILENCED_TARGETS`], while `RUST_LOG` alone, `info` by default, governs every other target
+//! in every binary.
 //!
 //! # Alerts
 //!
@@ -46,7 +67,7 @@ use opentelemetry_sdk::trace::{Tracer, TracerProvider};
 use tracing::field::Empty;
 use tracing::{Span, Subscriber, info_span};
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::filter::{Builder, EnvFilter, FromEnvError, LevelFilter};
+use tracing_subscriber::filter::{Builder, EnvFilter, FromEnvError, LevelFilter, Targets};
 use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
 use tracing_subscriber::fmt::{Layer as FmtLayer, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
@@ -59,7 +80,8 @@ use crate::config::OtelExport;
 ///
 /// An alert is emitted as
 /// `tracing::error!(target: runtime::telemetry::ALERT_TARGET, alert = "…", …)`. Its field values
-/// name the condition and the message identifiers only; they never hold a message body or a
+/// name the condition and give each message identifier only as its [`ScreenedText`] shows it,
+/// one `*` per byte; they never hold a message body, the text of a requester's property or a
 /// protected value.
 pub const ALERT_TARGET: &str = "carddemo::alert";
 
@@ -69,6 +91,22 @@ pub const UNMATCHED_ROUTE: &str = "<unmatched>";
 
 /// Instrumentation scope name of the `OpenTelemetry` tracer.
 const TRACER_NAME: &str = "carddemo";
+
+/// The targets whose events and spans are never recorded, whatever `RUST_LOG` says: the AMQP
+/// client `lapin`, its protocol crates and `pinky_swear`, the promise crate behind every `lapin`
+/// operation.
+///
+/// Their diagnostics pass through no redaction of this workspace. At `TRACE`, `lapin` logs every
+/// frame in `Debug` form, which spells out the bytes of each message body (a CP00 request body
+/// holds a full card number) and of the `PLAIN` authentication response (the broker user and
+/// password); at `ERROR` and `INFO` it logs the channel and connection close text the broker
+/// composes. `amq_protocol_tcp` logs the broker address, and `pinky_swear` traces the promises of
+/// every broker operation.
+///
+/// A target matches by string prefix, as `tracing_subscriber::filter::Targets` compares them:
+/// `lapin` covers `lapin::channels` and every other module of the crate, and `amq_protocol`
+/// covers `amq_protocol_tcp`, `amq_protocol_uri` and `amq_protocol_types` as well.
+pub const SILENCED_TARGETS: [&str; 3] = ["lapin", "amq_protocol", "pinky_swear"];
 
 /// The JSON format layer of the `CardDemo` tracing output, writing through `make_writer`.
 ///
@@ -91,12 +129,50 @@ where
         .with_writer(make_writer)
 }
 
+/// The filter that turns every target of [`SILENCED_TARGETS`] off and passes every other target
+/// at every level.
+///
+/// [`init`] installs it as a global layer ahead of the `RUST_LOG` filter. Every global filter of
+/// a subscriber must enable an event or span for any layer to record it, so the two filters
+/// combine as an AND: no `RUST_LOG` directive re-enables a silenced target, and `RUST_LOG` alone
+/// decides every other one. `test-support`'s trace capture installs it too, so that a capture
+/// records exactly what standard output can carry.
+#[must_use]
+pub fn dependency_filter() -> Targets {
+    Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_targets(SILENCED_TARGETS.map(|target| (target, LevelFilter::OFF)))
+}
+
+/// The subscriber [`init`] installs, short of its optional `OpenTelemetry` layer: the registry
+/// with [`dependency_filter`] and then `env_filter` as global filters, and the [`json_layer`]
+/// over `make_writer`.
+///
+/// Both filters sit below every layer, so they decide for the `OpenTelemetry` layer that [`init`]
+/// adds on top as well. The unit tests build this same subscriber over an in-memory writer, so
+/// they check the filtering that [`init`] installs.
+fn json_subscriber<W>(
+    env_filter: EnvFilter,
+    make_writer: W,
+) -> impl Subscriber + for<'span> LookupSpan<'span> + Send + Sync
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    tracing_subscriber::registry()
+        .with(dependency_filter())
+        .with(env_filter)
+        .with(json_layer(make_writer))
+}
+
 /// Installs the process-wide tracing subscriber.
 ///
-/// The subscriber filters with `RUST_LOG` (unset or empty means `info`), writes JSON lines to
-/// standard output through [`json_layer`] and, for [`OtelExport::Stdout`], also bridges spans
-/// into an `OpenTelemetry` tracer provider whose simple span processor prints each finished span
-/// to standard output. [`OtelExport::Off`] adds no `OpenTelemetry` layer.
+/// The subscriber drops every event and span of the [`SILENCED_TARGETS`] through
+/// [`dependency_filter`], whatever `RUST_LOG` says, filters every other target with `RUST_LOG`
+/// (unset or empty means `info`), writes JSON lines to standard output through [`json_layer`]
+/// and, for [`OtelExport::Stdout`], also bridges spans into an `OpenTelemetry` tracer provider
+/// whose simple span processor prints each finished span to standard output. [`OtelExport::Off`]
+/// adds no `OpenTelemetry` layer. A binary calls it before it connects to a broker or a
+/// database, so the silenced targets are off from the first frame.
 ///
 /// With [`OtelExport::Stdout`], the `opentelemetry-stdout` exporter writes each finished span as a
 /// multi-line, human-readable text block between the JSON event lines, so standard output is no
@@ -127,9 +203,7 @@ pub fn init(otel_export: OtelExport) -> Result<FlushGuard, InitError> {
     };
     let otel = provider.as_ref().map(otel_layer);
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(json_layer(std::io::stdout))
+    json_subscriber(filter, std::io::stdout)
         .with(otel)
         .try_init()
         .map_err(InitError::Install)?;
@@ -266,14 +340,67 @@ pub fn record_response(span: &Span, status: u16, latency: Duration) {
     span.record("latency_ms", latency_ms);
 }
 
+/// Text a requester chose, such as an AMQP property, in the only form a span, an event or a
+/// `Debug` output may show it: one `*` for each of its bytes.
+///
+/// The requester chooses the text, so it can be a card number, an SSN or a password, and a
+/// `CardDemo` password is any one to eight printable bytes, spaces included. Nothing in the text
+/// tells such a value from a harmless one, so every non-empty text is withheld whole: a
+/// diagnostic learns that the text is present and how many bytes it has, and never a byte of it.
+/// An empty text, which has no byte to hide, shows as empty.
+///
+/// `Display` writes the stars and `Debug` writes them quoted, as `str`'s `Debug` writes a string;
+/// neither ever formats the text. The value only borrows the text, so the caller keeps the
+/// original for the wire.
+#[derive(Clone, Copy)]
+pub struct ScreenedText<'a>(&'a str);
+
+impl<'a> ScreenedText<'a> {
+    /// Wraps `text`, which no formatting of the value ever shows.
+    #[must_use]
+    pub const fn new(text: &'a str) -> Self {
+        Self(text)
+    }
+
+    /// Whether the text is withheld, which every non-empty text is.
+    #[must_use]
+    pub fn is_withheld(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    /// One `*` for each byte of the text, and nothing for an empty text.
+    fn shown(&self) -> String {
+        "*".repeat(self.0.len())
+    }
+}
+
+impl fmt::Display for ScreenedText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(&self.shown())
+    }
+}
+
+impl fmt::Debug for ScreenedText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.shown().as_str(), f)
+    }
+}
+
 /// The span of one broker message, named `mq.message`.
 ///
 /// It records the `queue` the message was taken from and, when the message carries them, its
-/// `message_id` and `correlation_id` properties. Never the body: request and reply bodies hold
-/// card numbers and account data. A worker runs its processing future inside the span through
-/// `tracing::Instrument::instrument`; never hold `Span::enter` across an `.await`.
+/// `message_id` and `correlation_id` properties, each as its [`ScreenedText`] displays it, one
+/// `*` per byte: the requester chooses both and either can be a card number, an SSN or a
+/// password, so the span records only that an ID is present and its length in bytes, never its
+/// text. Never the body: request and reply bodies hold card numbers and account data. A worker
+/// runs its processing future inside the span through `tracing::Instrument::instrument`; never
+/// hold `Span::enter` across an `.await`.
 #[must_use]
-pub fn message_span(queue: &str, message_id: Option<&str>, correlation_id: Option<&str>) -> Span {
+pub fn message_span(
+    queue: &str,
+    message_id: Option<ScreenedText<'_>>,
+    correlation_id: Option<ScreenedText<'_>>,
+) -> Span {
     let span = info_span!(
         "mq.message",
         queue,
@@ -281,10 +408,10 @@ pub fn message_span(queue: &str, message_id: Option<&str>, correlation_id: Optio
         correlation_id = Empty
     );
     if let Some(message_id) = message_id {
-        span.record("message_id", message_id);
+        span.record("message_id", tracing::field::display(message_id));
     }
     if let Some(correlation_id) = correlation_id {
-        span.record("correlation_id", correlation_id);
+        span.record("correlation_id", tracing::field::display(correlation_id));
     }
     span
 }
@@ -317,9 +444,27 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, InitError, OtelExport, UNMATCHED_ROUTE, env_filter, init, job_span,
-        json_layer, message_span, otel_layer, record_response, request_span,
+        ALERT_TARGET, InitError, OtelExport, SILENCED_TARGETS, ScreenedText, UNMATCHED_ROUTE,
+        env_filter, init, job_span, json_layer, json_subscriber, message_span, otel_layer,
+        record_response, request_span,
     };
+
+    /// The first card number of `app/data/ASCII/cardxref.txt`.
+    const CARD_NUMBER: &str = "0500024453765740";
+
+    /// Property values a requester may choose, none of which a diagnostic may show: a card
+    /// number, whole and spaced out, an SSN with and without dashes, an 8-byte password, a
+    /// password holding a space, a short password and a short ID.
+    const PROBES: [&str; 8] = [
+        CARD_NUMBER,
+        "123-45-6789",
+        "123456789",
+        "PASSWORD",
+        "PASS WOR",
+        "SECRET",
+        "M-1",
+        "0500 0244 5376 5740",
+    ];
 
     /// In-memory writer standing in for standard output.
     #[derive(Clone, Default)]
@@ -442,20 +587,47 @@ mod tests {
     }
 
     #[test]
+    fn screened_text_withholds_every_byte_of_a_non_empty_text() {
+        for text in PROBES {
+            let screened = ScreenedText::new(text);
+            let stars = "*".repeat(text.len());
+            assert!(screened.is_withheld(), "{text:?}");
+            assert_eq!(screened.to_string(), stars, "{text:?}");
+            assert_eq!(format!("{screened:?}"), format!("\"{stars}\""), "{text:?}");
+        }
+        let empty = ScreenedText::new("");
+        assert!(!empty.is_withheld());
+        assert_eq!(empty.to_string(), "");
+        assert_eq!(format!("{empty:?}"), r#""""#);
+    }
+
+    #[test]
     fn message_span_records_queue_and_present_ids_only() {
-        let with_ids = capture(|| {
-            message_span("CARD.DEMO.REQUEST.PAUTH", Some("m-1"), Some("c-1"))
+        for (message_id, correlation_id) in PROBES.into_iter().zip(PROBES.into_iter().rev()) {
+            let with_ids = capture(|| {
+                message_span(
+                    "CARD.DEMO.REQUEST.PAUTH",
+                    Some(ScreenedText::new(message_id)),
+                    Some(ScreenedText::new(correlation_id)),
+                )
                 .in_scope(|| tracing::info!("probe"));
-        });
-        assert_contains_all(
-            &with_ids,
-            &[
-                r#""name":"mq.message""#,
-                r#""queue":"CARD.DEMO.REQUEST.PAUTH""#,
-                r#""message_id":"m-1""#,
-                r#""correlation_id":"c-1""#,
-            ],
-        );
+            });
+            let message_stars = format!(r#""message_id":"{}""#, "*".repeat(message_id.len()));
+            let correlation_stars =
+                format!(r#""correlation_id":"{}""#, "*".repeat(correlation_id.len()));
+            assert_contains_all(
+                &with_ids,
+                &[
+                    r#""name":"mq.message""#,
+                    r#""queue":"CARD.DEMO.REQUEST.PAUTH""#,
+                    &message_stars,
+                    &correlation_stars,
+                ],
+            );
+            for probe in PROBES {
+                assert!(!with_ids.contains(probe), "{probe:?} in {with_ids}");
+            }
+        }
 
         let without_ids = capture(|| {
             message_span("CARD.DEMO.REQUEST.DATE", None, None).in_scope(|| tracing::info!("probe"));
@@ -484,6 +656,60 @@ mod tests {
                 r#""alert":"CP00_CARD_UNPARSEABLE""#,
             ],
         );
+    }
+
+    #[test]
+    fn no_rust_log_directive_enables_a_silenced_dependency_target() {
+        // `RUST_LOG` value, and whether it enables application `DEBUG` and `TRACE` events.
+        let cases = [
+            ("trace", true),
+            (
+                "lapin=trace,amq_protocol=trace,pinky_swear=trace,info",
+                false,
+            ),
+            ("info", false),
+        ];
+        for (directives, below_info) in cases {
+            let captured = Captured::default();
+            let subscriber = json_subscriber(EnvFilter::new(directives), captured.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::error!(target: "lapin::channels", "dependency probe");
+                tracing::trace!(target: "lapin::channels", "dependency probe");
+                tracing::error!(target: "amq_protocol_tcp", "dependency probe");
+                tracing::trace!(target: "amq_protocol_tcp", "dependency probe");
+                tracing::error!(target: "pinky_swear", "dependency probe");
+                tracing::trace!(target: "pinky_swear", "dependency probe");
+                tracing::info!(target: "messaging::workers", "application info probe");
+                tracing::debug!(target: "messaging::workers", "application debug probe");
+                tracing::trace!(target: "messaging::workers", "application trace probe");
+                tracing::error!(target: ALERT_TARGET, alert = "CP00_CARD_UNPARSEABLE", "alert");
+            });
+            let output = captured.text();
+
+            assert!(
+                !output.contains("dependency probe"),
+                "{directives}: {output}"
+            );
+            for target in SILENCED_TARGETS {
+                let member = format!(r#""target":"{target}"#);
+                assert!(!output.contains(&member), "{directives}: {output}");
+            }
+            assert_contains_all(
+                &output,
+                &[
+                    "application info probe",
+                    r#""target":"carddemo::alert""#,
+                    r#""alert":"CP00_CARD_UNPARSEABLE""#,
+                ],
+            );
+            for probe in ["application debug probe", "application trace probe"] {
+                assert_eq!(
+                    output.contains(probe),
+                    below_info,
+                    "{directives}: {probe} in {output}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -528,6 +754,65 @@ mod tests {
             .filter(|key| key.starts_with("code."))
             .collect();
         assert!(location_keys.is_empty(), "{location_keys:?} in {span:?}");
+    }
+
+    #[test]
+    fn exported_message_spans_carry_the_ids_as_stars_only() {
+        let exported = Exported::default();
+        let provider = TracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        let cases: Vec<(&str, &str)> = PROBES.into_iter().zip(PROBES.into_iter().rev()).collect();
+        tracing::subscriber::with_default(subscriber, || {
+            for &(message_id, correlation_id) in &cases {
+                message_span(
+                    "CARD.DEMO.REQUEST.PAUTH",
+                    Some(ScreenedText::new(message_id)),
+                    Some(ScreenedText::new(correlation_id)),
+                )
+                .in_scope(|| tracing::info!("probe"));
+            }
+        });
+
+        let spans = exported.spans();
+        assert_eq!(spans.len(), cases.len(), "{spans:?}");
+        for (span, &(message_id, correlation_id)) in spans.iter().zip(&cases) {
+            assert_eq!(span.name, "mq.message");
+            let attribute = |key: &str| {
+                span.attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == key)
+                    .map(|kv| kv.value.as_str().into_owned())
+            };
+            assert_eq!(
+                attribute("queue").as_deref(),
+                Some("CARD.DEMO.REQUEST.PAUTH"),
+                "{span:?}"
+            );
+            assert_eq!(
+                attribute("message_id"),
+                Some("*".repeat(message_id.len())),
+                "{span:?}"
+            );
+            assert_eq!(
+                attribute("correlation_id"),
+                Some("*".repeat(correlation_id.len())),
+                "{span:?}"
+            );
+            let values: Vec<String> = span
+                .attributes
+                .iter()
+                .chain(span.events.iter().flat_map(|event| &event.attributes))
+                .map(|kv| kv.value.as_str().into_owned())
+                .collect();
+            for probe in PROBES {
+                assert!(
+                    values.iter().all(|value| !value.contains(probe)),
+                    "{probe:?} in {span:?}"
+                );
+            }
+        }
     }
 
     #[test]

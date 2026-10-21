@@ -50,16 +50,30 @@
 //! [`UserEntry`], whose `Debug` prints `<redacted>` in its place. Neither is logged, traced,
 //! formatted or returned, the success message names only the user ID, and no failure carries a
 //! request value, an argon2 error or a store detail (Cardholder Data Redaction, COUSR01C-018).
+//! A `WHEN OTHER` failure is logged once before it is answered: a store error by its `Display`,
+//! an SQLSTATE and a constraint or column at most; a hash failure by the fixed class text of
+//! [`PasswordError`]; a hashing task that did not complete by whether it panicked, never its
+//! payload. No event names the user, the password or the hash.
 
 use domain::online::cousr01c::{self, UserAddFailure, UserAddInput};
-use domain::password;
+use domain::password::{self, PasswordError};
 use persistence::rows::UserEntry;
 use persistence::{PersistenceError, UserRepository};
+use tokio::task::JoinError;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
 use crate::dto::cousr01c::UserAddRequest;
 use crate::error::ServiceError;
+
+/// The program the tracing events of a failed add name.
+const PROGRAM: &str = "COUSR01C";
+
+/// The paragraph that builds the record, whose password the replacement hashes (COUSR01C-018).
+const ENTER_PARAGRAPH: &str = "PROCESS-ENTER-KEY";
+
+/// The paragraph of the insert (COUSR01C-024).
+const WRITE_PARAGRAPH: &str = "WRITE-USER-SEC-FILE";
 
 /// ENTER on `COUSR1A`: edits the five fields and adds the user, answering with the message of
 /// the stored row (COUSR01C-016, COUSR01C-021).
@@ -115,14 +129,14 @@ async fn insert_user<R: UserRepository>(
     // argon2id is deliberately CPU- and memory-hard, so it runs on the blocking pool rather than
     // stalling a runtime worker. A hash that fails, or a hashing task that cannot finish, is the
     // `WHEN OTHER` answer `Unable to Add User...` that COUSR01C-024 assigns to it, not the
-    // unaudited `ServiceError::Internal`; its cause is dropped, never echoed.
-    let (record, hashed) = tokio::task::spawn_blocking(move || {
+    // unaudited `ServiceError::Internal`; `hashed` logs its class here, after the await, and the
+    // answer never echoes it.
+    let joined = tokio::task::spawn_blocking(move || {
         let hashed = password::hash(record.pwd.expose());
         (record, hashed)
     })
-    .await
-    .map_err(|_| ServiceError::Rule(cousr01c::write_failure()))?;
-    let password_hash = hashed.map_err(|_| ServiceError::Rule(cousr01c::write_failure()))?;
+    .await;
+    let (record, password_hash) = hashed(joined)?;
 
     // `record.pwd` stops here: the row holds the hash in its place (E25).
     let entry = UserEntry {
@@ -139,13 +153,55 @@ async fn insert_user<R: UserRepository>(
         .map_err(|error| ServiceError::Rule(write_answer(&error)))
 }
 
+/// The record and its password hash from the hashing task (COUSR01C-018), or `Unable to Add
+/// User...` when the task did not complete or argon2id could not hash (COUSR01C-024).
+///
+/// Either failure is logged first: the task's as whether it panicked, never its payload, which
+/// the `JoinError`'s `Display` could carry; the hash's as the fixed class text of
+/// [`PasswordError`]. Neither event names the user, the password or the hash.
+fn hashed<T>(
+    joined: Result<(T, Result<String, PasswordError>), JoinError>,
+) -> Result<(T, String), ServiceError<UserAddFailure>> {
+    match joined {
+        Ok((record, Ok(password_hash))) => Ok((record, password_hash)),
+        Ok((_, Err(error))) => {
+            tracing::warn!(
+                program = PROGRAM,
+                paragraph = ENTER_PARAGRAPH,
+                error = %error,
+                "password not hashed; answering Unable to Add User"
+            );
+            Err(ServiceError::Rule(cousr01c::write_failure()))
+        }
+        Err(error) => {
+            tracing::warn!(
+                program = PROGRAM,
+                paragraph = ENTER_PARAGRAPH,
+                panicked = error.is_panic(),
+                "password hashing task did not complete; answering Unable to Add User"
+            );
+            Err(ServiceError::Rule(cousr01c::write_failure()))
+        }
+    }
+}
+
 /// The program's answer to a failed insert: `DUPKEY`/`DUPREC` for the `users_pkey` violation,
 /// the only unique constraint of `users` (COUSR01C-023), and `WHEN OTHER` for anything else
 /// (COUSR01C-024).
+///
+/// A `WHEN OTHER` failure is logged first with its store error, whose `Display` names an SQLSTATE
+/// and a constraint or column at most. A duplicate is the user's own input, a taken ID, and is
+/// answered without an event.
 fn write_answer(error: &PersistenceError) -> UserAddFailure {
     if error.is_duplicate() {
         cousr01c::duplicate_user_id()
     } else {
+        tracing::warn!(
+            program = PROGRAM,
+            paragraph = WRITE_PARAGRAPH,
+            error = %error,
+            "USRSEC write failed; answering Unable to Add User"
+        );
         cousr01c::write_failure()
     }
 }
@@ -158,11 +214,12 @@ mod tests {
     use domain::batch::loads::HashedUser;
     use domain::copybook::PicX;
     use domain::online::cousr01c::{self, UserAddFailure};
-    use domain::password;
+    use domain::password::{self, PasswordError};
     use persistence::rows::{UserEntry, UserListEntry};
     use persistence::{DecodeKind, PersistenceError, PgStore, UserRepository};
+    use test_support::trace_capture;
 
-    use super::insert_user;
+    use super::{hashed, insert_user};
     use crate::dto::cousr01c::UserAddRequest;
     use crate::error::ServiceError;
 
@@ -373,6 +430,7 @@ mod tests {
     // audit: COUSR01C-023
     #[tokio::test]
     async fn a_taken_user_id_is_the_duplicate_answer() -> TestResult {
+        let traces = trace_capture::capture();
         for constraint in [Some("users_pkey".to_owned()), None] {
             let mut store = InsertOnly::answering(Err(PersistenceError::Duplicate { constraint }));
             let failure = rule(insert_user(&mut store, request()).await)?;
@@ -383,6 +441,8 @@ mod tests {
             );
             assert_eq!(store.inserted.len(), 1);
         }
+        // A taken ID is the user's input, not an operational failure: nothing is logged.
+        assert!(traces.text().is_empty(), "{}", traces.text());
         Ok(())
     }
 
@@ -402,8 +462,11 @@ mod tests {
             PersistenceError::Restrict { constraint: None },
             PersistenceError::decode("usr_id", DecodeKind::InvalidByte),
         ];
+        let traces = trace_capture::capture();
         for error in errors {
+            traces.clear();
             let shown = format!("{error:?}");
+            let cause = error.to_string();
             let mut store = InsertOnly::answering(Err(error));
             let failure = rule(insert_user(&mut store, request()).await)?;
             assert_eq!(failure, cousr01c::write_failure(), "{shown}");
@@ -413,7 +476,73 @@ mod tests {
                 "{shown}"
             );
             assert_eq!(failure.class().http_status(), 500, "{shown}");
+
+            // The cause is logged once, before the answer, and the event names no request value.
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{shown}: {} lines", lines.len()).into());
+            };
+            for expected in [
+                r#""level":"WARN""#,
+                r#""program":"COUSR01C""#,
+                r#""paragraph":"WRITE-USER-SEC-FILE""#,
+                cause.as_str(),
+            ] {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+            for value in [PASSWORD, "NEWUSR01", "$argon2id$"] {
+                assert!(!line.contains(value), "{shown}: the event holds {value}");
+            }
         }
+        Ok(())
+    }
+
+    // audit: COUSR01C-024
+    #[tokio::test]
+    async fn a_hash_or_task_failure_is_logged_and_answers_unable_to_add_user() -> TestResult {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let cancelled = task.await.err().ok_or("an aborted task completed")?;
+        let traces = trace_capture::capture();
+        let cases = [
+            (
+                Err(cancelled),
+                [
+                    "password hashing task did not complete",
+                    r#""panicked":false"#,
+                ],
+            ),
+            (
+                Ok(((), Err(PasswordError::Hash))),
+                ["password not hashed", "password hashing failed"],
+            ),
+        ];
+        for (joined, texts) in cases {
+            traces.clear();
+            assert_eq!(
+                hashed(joined),
+                Err(ServiceError::Rule(cousr01c::write_failure()))
+            );
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{texts:?}: {} lines", lines.len()).into());
+            };
+            for expected in [
+                r#""level":"WARN""#,
+                r#""program":"COUSR01C""#,
+                r#""paragraph":"PROCESS-ENTER-KEY""#,
+            ]
+            .into_iter()
+            .chain(texts)
+            {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+        }
+
+        traces.clear();
+        let computed = hashed(Ok(((), Ok("$argon2id$v=19$stand-in".to_owned()))));
+        assert_eq!(computed, Ok(((), "$argon2id$v=19$stand-in".to_owned())));
+        assert!(traces.text().is_empty(), "{}", traces.text());
         Ok(())
     }
 

@@ -341,20 +341,21 @@ where
 /// account path `CXACAIX`, where exactly one row is `NORMAL` and gives its customer
 /// (COPAUS0C-013), none is `NOTFND` and more than one is the `DUPKEY` COPAUS0C answers as a
 /// failure (COPAUS0C-014, COPAUS0C-015).
-// Every row of the account is read, not only the first, because a `DUPKEY` read sets no
-// customer in COPAUS0C, and `Lookup::Failed` is the domain's value for it.
+// The first two rows of the account are read, not only the first, because a `DUPKEY` read sets
+// no customer in COPAUS0C, and `Lookup::Failed` is the domain's value for it; a second row
+// already shows the `DUPKEY`, so the read never takes more than two.
 async fn read_customer<E>(store: &mut E, acct_id: PicU<11>) -> Lookup<PicU<9>>
 where
     E: CardXrefRepository,
 {
-    match CardXrefRepository::find_all_by_acct_id(store, acct_id).await {
+    match CardXrefRepository::find_first_two_by_acct_id(store, acct_id).await {
         Ok(rows) => match rows.as_slice() {
             [] => Lookup::NotFound,
             [xref] => Lookup::Found(xref.cust_id),
             [_, _, ..] => Lookup::Failed,
         },
         Err(error) => {
-            note_store_error("card_xref find_all_by_acct_id", &error);
+            note_store_error("card_xref find_first_two_by_acct_id", &error);
             Lookup::Failed
         }
     }

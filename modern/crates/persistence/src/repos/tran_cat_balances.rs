@@ -133,10 +133,13 @@ pub trait TranCatBalanceRepository: Send {
     ///
     /// # Errors
     ///
+    /// [`PersistenceError::Decode`] when a record's type code or `FILLER` holds a NUL or
+    /// non-ASCII byte: every record is converted before the delete, so the call fails with
+    /// nothing written, leaving the table and a [`PgTx`] caller's transaction as they were.
     /// [`PersistenceError::Duplicate`] when two records share a key, or any other error of the
     /// delete or an insert, as for [`insert`](Self::insert). On [`PgStore`] the transaction then
-    /// rolls back and the previous contents remain (LOADS-018); on [`PgTx`] the caller's
-    /// transaction is aborted.
+    /// rolls back and the previous contents remain (LOADS-018); on [`PgTx`] the failed statement
+    /// aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[TranCatBalanceRecord],
@@ -280,7 +283,8 @@ where
     Ok(records)
 }
 
-/// The `WRITE` of `2700-A-CREATE-TCATBAL-REC` (CBTRN02C-017), and each insert of a load.
+/// The `WRITE` of `2700-A-CREATE-TCATBAL-REC` (CBTRN02C-017): `record` converted by
+/// [`TranCatBalanceRow::from_record`] and bound by [`insert_row`].
 async fn insert_one<'e, E>(
     executor: E,
     record: &TranCatBalanceRecord,
@@ -289,6 +293,15 @@ where
     E: PgExecutor<'e>,
 {
     let row = TranCatBalanceRow::from_record(record)?;
+    insert_row(executor, &row).await
+}
+
+/// The one `INSERT` statement, which [`insert_one`] and [`replace_all_in`] share: every column
+/// bound from `row`, already converted through codec B.
+async fn insert_row<'e, E>(executor: E, row: &TranCatBalanceRow) -> Result<(), PersistenceError>
+where
+    E: PgExecutor<'e>,
+{
     sqlx::query!(
         "INSERT INTO tran_cat_balances (acct_id, tran_type_cd, tran_cat_cd, tran_cat_bal, filler)
          VALUES ($1, $2, $3, $4, $5)",
@@ -333,16 +346,24 @@ where
 
 /// The TCATBALF load on `conn`, which is inside a transaction: every row deleted, then every
 /// record inserted in slice order (LOADS-006, LOADS-014).
+///
+/// Every record is converted through codec B before the delete, so a record that
+/// [`TranCatBalanceRow::from_record`] cannot store fails the call before any statement is sent:
+/// the table, and a caller's transaction, are left as they were (LOADS-018).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[TranCatBalanceRecord],
 ) -> Result<u64, PersistenceError> {
+    let rows = records
+        .iter()
+        .map(TranCatBalanceRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
     sqlx::query!("DELETE FROM tran_cat_balances")
         .execute(&mut *conn)
         .await?;
     let mut inserted: u64 = 0;
-    for record in records {
-        insert_one(&mut *conn, record).await?;
+    for row in &rows {
+        insert_row(&mut *conn, row).await?;
         inserted += 1;
     }
     Ok(inserted)
@@ -421,7 +442,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::{TranCatBalanceRepository, ebcdic_weight, ksds_key};
-    use crate::{PersistenceError, PgStore};
+    use crate::{DecodeKind, PersistenceError, PgStore};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -628,6 +649,51 @@ mod tests {
         assert_eq!(tx.replace_all(&[]).await?, 0);
         tx.commit().await?;
         assert_eq!(store.find_all().await?, Vec::new());
+        Ok(())
+    }
+
+    /// A record codec B cannot store, after one it can, fails the replacement before the delete:
+    /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
+    /// so committing it after the error keeps the previous contents.
+    // audit: LOADS-018
+    #[tokio::test]
+    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        let guard = test_support::postgres::start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let original = vec![
+            record(7, *b"02", 3, "0.01")?,
+            record(8, *b"01", 1, "-0.01")?,
+        ];
+        assert_eq!(store.replace_all(&original).await?, 2);
+        let input = [
+            record(9, *b"01", 1, "1.00")?,
+            record(9, [b'0', 0xFF], 2, "2.00")?,
+        ];
+        let invalid = Err(PersistenceError::decode(
+            "tran_type_cd",
+            DecodeKind::InvalidByte,
+        ));
+
+        assert_eq!(store.replace_all(&input).await, invalid);
+        assert_eq!(
+            store.find_all().await?,
+            original,
+            "a failed load through the pool leaves the previous contents"
+        );
+
+        let mut tx = store.begin().await?;
+        assert_eq!(tx.replace_all(&input).await, invalid);
+        assert_eq!(
+            tx.find_all().await?,
+            original,
+            "the transaction deleted nothing and is not aborted"
+        );
+        tx.commit().await?;
+        assert_eq!(
+            store.find_all().await?,
+            original,
+            "committing after the error keeps the previous contents"
+        );
         Ok(())
     }
 }

@@ -7,8 +7,8 @@
 //!
 //! | COBOL access | Method |
 //! |---|---|
-//! | COACTVWC and COACTUPC `9000-READ-ACCT`: the cross-reference through `CXACAIX`, then the account, then the customer (`COACTVWC.cbl:687-870`, `COACTUPC.cbl:3608-3797`; COACTVWC-033 to COACTVWC-047, COACTUPC-084 to COACTUPC-099) | [`find_with_customer`](AccountRepository::find_with_customer) |
-//! | Keyed `READ` of the account: CBTRN02C `1500-B-LOOKUP-ACCT` (`CBTRN02C.cbl:393-421`), CBACT04C `1100-GET-ACCT-DATA` (`CBACT04C.cbl:372-391`), COPAUA0C `5200-READ-ACCT-RECORD` (`COPAUA0C.cbl:520-564`), COACCT01 `4000-PROCESS-REQUEST-REPLY` (`COACCT01.cbl:390-460`), CBSTM03B `4000-ACCTFILE-PROC` (`CBSTM03B.CBL:206-226`), and COPAUS0C `GETACCTDATA-BYACCT` within `GATHER-ACCOUNT-DETAILS` | [`find_by_id`](AccountRepository::find_by_id) |
+//! | COACTVWC and COACTUPC `9000-READ-ACCT`: the cross-reference through `CXACAIX`, then the account, then the customer (`COACTVWC.cbl:687-870`, `COACTUPC.cbl:3608-3797`; COACTVWC-033 to COACTVWC-047, COACTUPC-084 to COACTUPC-099); COPAUS0C `GATHER-ACCOUNT-DETAILS`, the same three reads (`COPAUS0C.cbl:750-812,865-964`; COPAUS0C-013 to COPAUS0C-019) | [`find_with_customer`](AccountRepository::find_with_customer) |
+//! | Keyed `READ` of the account: CBTRN02C `1500-B-LOOKUP-ACCT` (`CBTRN02C.cbl:393-421`), CBACT04C `1100-GET-ACCT-DATA` (`CBACT04C.cbl:372-391`), COPAUA0C `5200-READ-ACCT-RECORD` (`COPAUA0C.cbl:520-564`), COACCT01 `4000-PROCESS-REQUEST-REPLY` (`COACCT01.cbl:390-460`) and CBSTM03B `4000-ACCTFILE-PROC` (`CBSTM03B.CBL:206-226`) | [`find_by_id`](AccountRepository::find_by_id) |
 //! | `READ … UPDATE` of the account: COACTUPC `9600-WRITE-PROCESSING` (`COACTUPC.cbl:3894-3920`; COACTUPC-101), COBIL00C `READ-ACCTDAT-FILE` (`COBIL00C.cbl:343-376`) | [`lock_by_id`](AccountRepository::lock_by_id) |
 //! | `REWRITE` of the account: COACTUPC `9600-WRITE-PROCESSING` (`COACTUPC.cbl:4066`; COACTUPC-103, COACTUPC-106), COBIL00C `UPDATE-ACCTDAT-FILE` (`COBIL00C.cbl:377-406`), CBTRN02C `2800-UPDATE-ACCOUNT-REC` (`CBTRN02C.cbl:545-559`), CBACT04C `1050-UPDATE-ACCOUNT` (`CBACT04C.cbl:350-370`) | [`update`](AccountRepository::update) |
 //! | ACCTFILE `DELETE`, `DEFINE CLUSTER` and `REPRO` of `acctdata.txt`, batch `acctfile` (LOADS-001, LOADS-014, LOADS-015, LOADS-018, LOADS-025) | [`replace_all`](AccountRepository::replace_all) |
@@ -31,11 +31,13 @@
 //! `COACTUPC.cbl:3627,3636,3719,3769`), so the customer is read whatever the account read
 //! returned (COACTVWC-033, COACTUPC-084).
 //!
-//! COPAUS0C's `GATHER-ACCOUNT-DETAILS` is not this chain: it performs all three reads whatever
-//! each returns, the account keyed by the cross-reference's `XREF-ACCT-ID` and the customer by
-//! its `XREF-CUST-ID` (`COPAUS0C.cbl:750-812,865-964`). Its service composes
-//! `CardXrefRepository::find_by_acct_id`, [`find_by_id`](AccountRepository::find_by_id) here and
-//! `CustomerRepository::find_by_id` as its own audit states.
+//! COPAUS0C's `GATHER-ACCOUNT-DETAILS` runs differently in the COBOL: it performs all three
+//! reads whatever each returns, the account keyed by the cross-reference's `XREF-ACCT-ID` and the
+//! customer by its `XREF-CUST-ID` (`COPAUS0C.cbl:750-812,865-964`). The service of endpoint 21,
+//! `api::services::copaus0c`, still reads all three through this chain (COPAUS0C-013 to
+//! COPAUS0C-019). Endpoint 21 stops at the first failed read (X-COPAUS0C-1), so it never answers
+//! with a read the chain skips after a failed cross-reference read, and the account key it passes
+//! equals `XREF-ACCT-ID`, because the cross-reference was found by that account.
 //!
 //! # Statements
 //!
@@ -59,7 +61,7 @@ use copybook::PicU;
 use domain::records::{AccountRecord, CardXrefRecord, CustomerRecord};
 use sqlx::{PgConnection, PgExecutor};
 
-use super::card_xref::select_all_by_acct_id;
+use super::card_xref::select_first_two_by_acct_id;
 use super::customers;
 use crate::error::PersistenceError;
 use crate::rows::{AccountRow, pic_u_to_i64};
@@ -137,8 +139,9 @@ pub trait AccountRepository: Send {
     /// The reads of `9000-READ-ACCT` for account `acct_id`, each reported as its own
     /// [`ChainLink`] (COACTVWC-033, COACTUPC-084):
     ///
-    /// 1. The cross-reference through `CXACAIX`, every `card_xref` row of the account: none is
-    ///    [`ChainLink::NotFound`], exactly one is [`ChainLink::Found`], and two or more are the
+    /// 1. The cross-reference through `CXACAIX`, at most the first two `card_xref` rows of the
+    ///    account in card-number order: none is [`ChainLink::NotFound`], exactly one is
+    ///    [`ChainLink::Found`], and a second row, however many more share the account, is the
     ///    `DUPKEY` failure of [`ChainLink::Failed`] (COACTVWC-039, COACTUPC-089). Unless it is
     ///    `Found`, the program leaves the paragraph, so `account` and `customer` are
     ///    [`ChainLink::NotReached`].
@@ -156,8 +159,8 @@ pub trait AccountRepository: Send {
     ) -> impl Future<Output = AccountCustomerChain> + Send;
 
     /// The account stored under `id`, or `None` when no row has that key (CICS `NOTFND`,
-    /// `INVALID KEY`): the keyed `READ` of CBTRN02C, CBACT04C, COPAUA0C, COACCT01, CBSTM03B and
-    /// COPAUS0C, served by `accounts_pkey`.
+    /// `INVALID KEY`): the keyed `READ` of CBTRN02C, CBACT04C, COPAUA0C, COACCT01 and CBSTM03B,
+    /// served by `accounts_pkey`.
     ///
     /// # Errors
     ///
@@ -253,10 +256,13 @@ pub trait AccountRepository: Send {
     ///
     /// # Errors
     ///
-    /// The first failure of the delete or of an insert, as [`insert`](Self::insert) reports it,
-    /// a duplicate key in `records` included. On a [`PgStore`] the transaction is then rolled
-    /// back and the previous contents remain (LOADS-018); on a [`PgTx`] the caller's transaction
-    /// is aborted.
+    /// [`PersistenceError::Decode`] when a record holds a byte codec B cannot store, as for
+    /// [`insert`](Self::insert): every record is converted before the delete, so the call fails
+    /// with nothing written, leaving the table and a [`PgTx`] caller's transaction as they were.
+    /// Otherwise the first failure of the delete or of an insert, as [`insert`](Self::insert)
+    /// reports it, a duplicate key in `records` included. On a [`PgStore`] the transaction is
+    /// then rolled back and the previous contents remain (LOADS-018); on a [`PgTx`] the failed
+    /// statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[AccountRecord],
@@ -273,9 +279,10 @@ fn link<T>(read: Result<Option<T>, PersistenceError>) -> ChainLink<T> {
     }
 }
 
-/// The cross-reference link from every `card_xref` row of the account, in card-number order:
-/// a `READ` through `CXACAIX` answers `NORMAL` only when one record has the alternate key, and
-/// `DUPKEY` when others share it (COACTVWC-039, COACTUPC-089).
+/// The cross-reference link from the account's first `card_xref` rows in card-number order, at
+/// most the two `select_first_two_by_acct_id` reads: a `READ` through `CXACAIX` answers `NORMAL`
+/// only when one record has the alternate key, and `DUPKEY` when others share it, which a second
+/// row already shows (COACTVWC-039, COACTUPC-089).
 fn xref_link(rows: Vec<CardXrefRecord>) -> ChainLink<CardXrefRecord> {
     let mut rows = rows.into_iter();
     match (rows.next(), rows.next()) {
@@ -288,11 +295,12 @@ fn xref_link(rows: Vec<CardXrefRecord>) -> ChainLink<CardXrefRecord> {
 }
 
 /// The three reads of `9000-READ-ACCT` in sequence on `conn`: the cross-reference by
-/// `acct_id`, then, only when exactly one was found, the account by `acct_id` and the customer
-/// by the cross-reference's customer ID, whatever the account read returned.
+/// `acct_id`, at most its first two rows, then, only when exactly one was found, the account by
+/// `acct_id` and the customer by the cross-reference's customer ID, whatever the account read
+/// returned.
 async fn chain_in(conn: &mut PgConnection, acct_id: PicU<11>) -> AccountCustomerChain {
     // 9200-GETCARDXREF-BYACCT, then IF FLG-ACCTFILTER-NOT-OK GO TO 9000-READ-ACCT-EXIT.
-    let xref = match select_all_by_acct_id(&mut *conn, acct_id).await {
+    let xref = match select_first_two_by_acct_id(&mut *conn, acct_id).await {
         Ok(rows) => match xref_link(rows) {
             ChainLink::Found(record) => record,
             unfound => return AccountCustomerChain::ended_at_xref(unfound),
@@ -367,13 +375,22 @@ async fn select_all<'e, E: PgExecutor<'e>>(
     rows.into_iter().map(AccountRow::into_record).collect()
 }
 
-/// `INSERT` of `record` as one row, every column bound from its [`AccountRow`]; returns the
-/// number of rows inserted.
+/// `INSERT` of `record` as one row, converted by [`AccountRow::from_record`] and bound by
+/// [`insert_row`]; returns the number of rows inserted.
 async fn insert_one<'e, E: PgExecutor<'e>>(
     executor: E,
     record: &AccountRecord,
 ) -> Result<u64, PersistenceError> {
     let row = AccountRow::from_record(record)?;
+    insert_row(executor, &row).await
+}
+
+/// The one `INSERT` statement, which [`insert_one`] and [`replace_all_in`] share: every column
+/// bound from `row`, already converted through codec B; returns the number of rows inserted.
+async fn insert_row<'e, E: PgExecutor<'e>>(
+    executor: E,
+    row: &AccountRow,
+) -> Result<u64, PersistenceError> {
     let done = sqlx::query!(
         "INSERT INTO accounts (acct_id, acct_active_status, acct_curr_bal, acct_credit_limit, \
          acct_cash_credit_limit, acct_open_date, acct_expiraion_date, acct_reissue_date, \
@@ -430,18 +447,26 @@ async fn update_one<'e, E: PgExecutor<'e>>(
     Ok(done.rows_affected() == 1)
 }
 
-/// `DELETE` of every row, then [`insert_one`] of each record in slice order, on one connection
+/// `DELETE` of every row, then [`insert_row`] of each record in slice order, on one connection
 /// that the caller holds inside a transaction; returns the number of rows inserted.
+///
+/// Every record is converted through codec B before the delete, so a record that
+/// [`AccountRow::from_record`] cannot store fails the call before any statement is sent: the
+/// table, and a caller's transaction, are left as they were (LOADS-018).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[AccountRecord],
 ) -> Result<u64, PersistenceError> {
+    let rows = records
+        .iter()
+        .map(AccountRow::from_record)
+        .collect::<Result<Vec<_>, _>>()?;
     sqlx::query!("DELETE FROM accounts")
         .execute(&mut *conn)
         .await?;
     let mut inserted: u64 = 0;
-    for record in records {
-        inserted = inserted.saturating_add(insert_one(&mut *conn, record).await?);
+    for row in &rows {
+        inserted = inserted.saturating_add(insert_row(&mut *conn, row).await?);
     }
     Ok(inserted)
 }
@@ -583,7 +608,7 @@ mod tests {
     use test_support::postgres::{PostgresGuard, start_postgres};
 
     use super::{AccountCustomerChain, AccountRepository, ChainLink, link, xref_link};
-    use crate::{PersistenceError, PgStore};
+    use crate::{DecodeKind, PersistenceError, PgStore};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -720,8 +745,9 @@ mod tests {
 
     /// The chain over the loaded fixtures: all three found; no cross-reference, so nothing else
     /// read; a cross-reference without its account, whose customer is still read; an account
-    /// whose customer is missing; and two cross-references sharing the account (`DUPKEY`). A
-    /// transaction runs the same chain, and the chain's `Debug` redacts the card number and SSN.
+    /// whose customer is missing; and two, then three cross-references sharing the account
+    /// (`DUPKEY`). A transaction runs the same chain, and the chain's `Debug` redacts the card
+    /// number and SSN.
     // audit: COACTVWC-033
     // audit: COACTVWC-034
     // audit: COACTVWC-035
@@ -788,18 +814,20 @@ mod tests {
         assert!(chain.account == ChainLink::Found(lonely.clone()));
         assert!(chain.customer == ChainLink::NotFound);
 
-        // Two cross-references share account 50: DUPKEY, nothing else read.
-        crate::CardXrefRepository::insert(&mut store, &xref(*b"9200000000000050", LINKED, LINKED)?)
-            .await?;
+        // Two, then three cross-references share account 50: DUPKEY each time, nothing else
+        // read, though the chain's read takes only the first two rows.
         let dupkey = ChainLink::Failed(PersistenceError::Duplicate {
             constraint: Some("card_xref_acct_id_idx".to_owned()),
         });
-        assert!(ended_at_xref(
-            &store.find_with_customer(linked).await,
-            &dupkey
-        ));
+        for card in [*b"9200000000000050", *b"9200000000000051"] {
+            crate::CardXrefRepository::insert(&mut store, &xref(card, LINKED, LINKED)?).await?;
+            assert!(ended_at_xref(
+                &store.find_with_customer(linked).await,
+                &dupkey
+            ));
+        }
 
-        // Inside a transaction the chain gives the same links.
+        // Inside a transaction the chain gives the same links, three rows sharing account 50.
         let mut tx = store.begin().await?;
         assert!(ended_at_xref(&tx.find_with_customer(linked).await, &dupkey));
         assert!(
@@ -967,6 +995,43 @@ mod tests {
         assert_eq!(tx.replace_all(std::slice::from_ref(&inside)).await?, 1);
         tx.commit().await?;
         assert!(store.find_all().await? == vec![inside]);
+        Ok(())
+    }
+
+    /// A record codec B cannot store, after one it can, fails the replacement before the delete:
+    /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
+    /// so committing it after the error keeps the previous contents.
+    // audit: LOADS-018
+    #[tokio::test]
+    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        let guard = start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let original = [account(42, "00000001940{")?, account(43, "00000000500{")?];
+        assert_eq!(store.replace_all(&original).await?, 2);
+        let unstorable = AccountRecord {
+            filler: PicX::moved_from(b"\0"),
+            ..account(45, "00000000000{")?
+        };
+        let input = [account(44, "00000000000{")?, unstorable];
+        let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
+
+        assert_eq!(store.replace_all(&input).await, invalid);
+        assert!(
+            store.find_all().await? == original,
+            "a failed load through the pool leaves the previous contents"
+        );
+
+        let mut tx = store.begin().await?;
+        assert_eq!(tx.replace_all(&input).await, invalid);
+        assert!(
+            tx.find_all().await? == original,
+            "the transaction deleted nothing and is not aborted"
+        );
+        tx.commit().await?;
+        assert!(
+            store.find_all().await? == original,
+            "committing after the error keeps the previous contents"
+        );
         Ok(())
     }
 }

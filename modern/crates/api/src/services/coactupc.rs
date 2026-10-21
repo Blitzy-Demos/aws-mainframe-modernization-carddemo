@@ -46,7 +46,10 @@
 //! domain's edits read, the change check compares the last four digits (E32), and this module
 //! formats, logs and traces no field, record or key (Cardholder Data Redaction). A store error's
 //! SQLSTATE and constraint never reach a message: a failed read reaches the domain only as
-//! [`Lookup::Failed`], whose text the domain words.
+//! [`Lookup::Failed`], whose text the domain words, and a failed lock or rewrite only as the
+//! save's failure. Each such error is logged once by [`traced`], with the paragraph and the
+//! statement that failed, before it is reduced; its `Display` names an SQLSTATE and a constraint
+//! or column at most, never a key or a stored value.
 
 use domain::copybook::PicU;
 use domain::online::coactupc::{
@@ -55,13 +58,20 @@ use domain::online::coactupc::{
 };
 use domain::records::CustomerRecord;
 use persistence::{
-    AccountCustomerChain, AccountRepository, ChainLink, CustomerRepository, PgStore, PgTx,
+    AccountCustomerChain, AccountRepository, ChainLink, CustomerRepository, PersistenceError,
+    PgStore, PgTx,
 };
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
 use crate::dto::coactupc::AccountUpdateRequest;
 use crate::error::ServiceError;
+
+/// The program the tracing event of a failed file statement names.
+const PROGRAM: &str = "COACTUPC";
+
+/// The paragraph of the save's locks and rewrites (`COACTUPC.cbl:3888-4103`).
+const WRITE_PARAGRAPH: &str = "9600-WRITE-PROCESSING";
 
 /// Endpoint 5, ENTER with an account number (COACTUPC-068): the account and customer as
 /// `3202-SHOW-ORIGINAL-VALUES` shows them, with the snapshot of `9500-STORE-FETCHED-DATA`
@@ -192,18 +202,36 @@ async fn save_context(
 /// The three reads of `9000-READ-ACCT` for `acct_id`, each as its own link (COACTUPC-084).
 ///
 /// They run on the pool, each statement on its own, as the plain `READ`s of the fetch hold no
-/// lock.
+/// lock. Each read that failed is logged here, once, for the fetch and the save's re-read alike.
 async fn read_chain(store: &PgStore, acct_id: PicU<11>) -> AccountCustomerChain {
     let mut store = store.clone();
-    AccountRepository::find_with_customer(&mut store, acct_id).await
+    let chain = AccountRepository::find_with_customer(&mut store, acct_id).await;
+    report_failed_reads(&chain);
+    chain
+}
+
+/// Logs each read of `chain` that failed through [`traced`], with its paragraph and dataset;
+/// a read that found its record or none, or was never issued, logs nothing (COACTUPC-087,
+/// COACTUPC-089, COACTUPC-093, COACTUPC-097).
+fn report_failed_reads(chain: &AccountCustomerChain) {
+    report_failed(&chain.xref, "9200-GETCARDXREF-BYACCT", "READ CXACAIX");
+    report_failed(&chain.account, "9300-GETACCTDATA-BYACCT", "READ ACCTDAT");
+    report_failed(&chain.customer, "9400-GETCUSTDATA-BYCUST", "READ CUSTDAT");
+}
+
+/// Logs `link` through [`traced`] when its read failed.
+fn report_failed<T>(link: &ChainLink<T>, paragraph: &'static str, statement: &'static str) {
+    if let ChainLink::Failed(error) = link {
+        traced(paragraph, statement, error);
+    }
 }
 
 /// A link of the read chain as the domain's lookup (COACTUPC-084).
 ///
-/// A failed read keeps only the fact that it failed: the domain words the `File Error:` text of
-/// COACTUPC-087, COACTUPC-093 and COACTUPC-097, and the store error's SQLSTATE and constraint
-/// stay out of it. The `DUPKEY` of two cross-reference rows for one account is such a failure
-/// (COACTUPC-089).
+/// A failed read keeps only the fact that it failed, its error already logged by
+/// [`read_chain`]: the domain words the `File Error:` text of COACTUPC-087, COACTUPC-093 and
+/// COACTUPC-097, and the store error's SQLSTATE and constraint stay out of it. The `DUPKEY` of
+/// two cross-reference rows for one account is such a failure (COACTUPC-089).
 fn lookup<T>(link: &ChainLink<T>) -> Lookup<&T> {
     match link {
         ChainLink::Found(record) => Lookup::Found(record),
@@ -238,11 +266,12 @@ async fn write_changes(
     customer_key: PicU<9>,
 ) -> Result<UpdateOutcome, ServiceError<UpdateFailure>> {
     let mut tx = store.begin().await?;
-    let Ok(Some(account)) = AccountRepository::lock_by_id(&mut tx, pending.account_key()).await
-    else {
+    let account_read = AccountRepository::lock_by_id(&mut tx, pending.account_key()).await;
+    let Some(account) = held(account_read, "READ ACCTDAT UPDATE") else {
         return abandon(tx, pending.account_lock_failed()).await;
     };
-    let Ok(Some(customer)) = CustomerRepository::lock_by_id(&mut tx, customer_key).await else {
+    let customer_read = CustomerRepository::lock_by_id(&mut tx, customer_key).await;
+    let Some(customer) = held(customer_read, "READ CUSTDAT UPDATE") else {
         return abandon(tx, pending.customer_lock_failed()).await;
     };
     if let Err(changed) = rules::check_change_in_rec(old, (&account, &customer)) {
@@ -253,7 +282,8 @@ async fn write_changes(
         Err(unwritable) => return abandon(tx, unwritable).await,
     };
     let (account, customer) = effects.into_parts();
-    if !matches!(AccountRepository::update(&mut tx, &account).await, Ok(true)) {
+    let account_rewrite = AccountRepository::update(&mut tx, &account).await;
+    if !rewritten(account_rewrite, "REWRITE ACCTDAT") {
         return abandon(tx, pending.rewrite_failed()).await;
     }
     match customer {
@@ -280,10 +310,8 @@ async fn rewrite_customer(
     record: &CustomerRecord,
 ) -> Result<UpdateOutcome, ServiceError<UpdateFailure>> {
     let mut savepoint = tx.savepoint().await?;
-    if matches!(
-        CustomerRepository::update(&mut savepoint, record).await,
-        Ok(true)
-    ) {
+    let customer_rewrite = CustomerRepository::update(&mut savepoint, record).await;
+    if rewritten(customer_rewrite, "REWRITE CUSTDAT") {
         savepoint.commit().await?;
         tx.commit().await?;
         return Ok(pending.committed());
@@ -327,4 +355,204 @@ async fn abandon(
 ) -> Result<UpdateOutcome, ServiceError<UpdateFailure>> {
     tx.rollback().await?;
     Err(ServiceError::Rule(failure))
+}
+
+/// The row a `READ … UPDATE` of `9600-WRITE-PROCESSING` holds, or `None` when the read found no
+/// row or failed, which the save answers alike (COACTUPC-101, COACTUPC-102). A failure is logged
+/// first through [`traced`], naming `statement`.
+fn held<T>(read: Result<Option<T>, PersistenceError>, statement: &'static str) -> Option<T> {
+    read.unwrap_or_else(|error| {
+        traced(WRITE_PARAGRAPH, statement, &error);
+        None
+    })
+}
+
+/// Whether a `REWRITE` of `9600-WRITE-PROCESSING` found its row and stored it; a rewrite that
+/// finds no row and one that fails are both `false`, which the save answers alike
+/// (COACTUPC-106, COACTUPC-107, COACTUPC-111). A failure is logged first through [`traced`],
+/// naming `statement`.
+fn rewritten(result: Result<bool, PersistenceError>, statement: &'static str) -> bool {
+    result.unwrap_or_else(|error| {
+        traced(WRITE_PARAGRAPH, statement, &error);
+        false
+    })
+}
+
+/// The tracing event of a failed file statement, in place of the `RESP` and `RESP2` codes the
+/// COBOL puts in its `File Error:` text or drops (`HALTED(H4)`).
+///
+/// `paragraph` and `statement` are constants of this module; the error's `Display` holds only
+/// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
+/// Redaction).
+fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
+    tracing::warn!(
+        program = PROGRAM,
+        paragraph,
+        statement,
+        error = %error,
+        "file statement failed; answering the program's message"
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+
+    use domain::CardNumber;
+    use domain::copybook::{PicU, PicX};
+    use domain::records::card_xref::CardXrefRecord;
+    use persistence::{AccountCustomerChain, ChainLink, PersistenceError};
+    use test_support::trace_capture;
+
+    use super::{held, report_failed_reads, rewritten};
+
+    type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// The parts every event of a failed statement carries.
+    fn event_parts(paragraph: &str, statement: &str) -> [String; 4] {
+        [
+            r#""level":"WARN""#.to_owned(),
+            r#""program":"COACTUPC""#.to_owned(),
+            format!(r#""paragraph":"{paragraph}""#),
+            format!(r#""statement":"{statement}""#),
+        ]
+    }
+
+    /// A store error carrying an SQLSTATE and a constraint name.
+    fn store_error() -> PersistenceError {
+        PersistenceError::Database {
+            sqlstate: Some("40P01".to_owned()),
+            constraint: Some("customers_pkey".to_owned()),
+        }
+    }
+
+    /// COACTUPC-087, COACTUPC-089, COACTUPC-093, COACTUPC-097: each failed read of the chain is
+    /// logged once with its paragraph and the store error; a found, missing or unissued read
+    /// logs nothing, and no event holds a key or a stored value.
+    #[test]
+    fn each_failed_chain_read_is_logged_once_without_any_value() -> TestResult {
+        let xref = CardXrefRecord {
+            card_num: CardNumber::parse("4111111111111111")?,
+            cust_id: PicU::new(7)?,
+            acct_id: PicU::new(42)?,
+            filler: PicX::spaces(),
+        };
+        let duplicate = PersistenceError::Duplicate {
+            constraint: Some("card_xref_acct_id_idx".to_owned()),
+        };
+        let traces = trace_capture::capture();
+        let cases = [
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Failed(duplicate),
+                    account: ChainLink::NotReached,
+                    customer: ChainLink::NotReached,
+                },
+                &[(
+                    "9200-GETCARDXREF-BYACCT",
+                    "READ CXACAIX",
+                    "duplicate key (constraint card_xref_acct_id_idx)",
+                )][..],
+            ),
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Found(xref.clone()),
+                    account: ChainLink::Failed(store_error()),
+                    customer: ChainLink::Failed(PersistenceError::Unavailable),
+                },
+                &[
+                    ("9300-GETACCTDATA-BYACCT", "READ ACCTDAT", "SQLSTATE 40P01"),
+                    (
+                        "9400-GETCUSTDATA-BYCUST",
+                        "READ CUSTDAT",
+                        "database unavailable",
+                    ),
+                ][..],
+            ),
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Found(xref),
+                    account: ChainLink::NotFound,
+                    customer: ChainLink::NotFound,
+                },
+                &[][..],
+            ),
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::NotFound,
+                    account: ChainLink::NotReached,
+                    customer: ChainLink::NotReached,
+                },
+                &[][..],
+            ),
+        ];
+        for (chain, logged) in cases {
+            traces.clear();
+            report_failed_reads(&chain);
+            let lines = traces.lines();
+            assert_eq!(lines.len(), logged.len(), "{}", traces.text());
+            for (line, &(paragraph, statement, cause)) in lines.iter().zip(logged) {
+                assert!(line.contains(cause), "{cause} missing from {line}");
+                for expected in event_parts(paragraph, statement) {
+                    assert!(line.contains(&expected), "{expected} missing from {line}");
+                }
+            }
+        }
+        for value in ["4111111111111111", "00000000042", "000000007"] {
+            assert!(!traces.contains(value), "the trace holds {value}");
+        }
+        Ok(())
+    }
+
+    /// COACTUPC-101, COACTUPC-102: a lock that finds no row and one that fails both end the
+    /// save, and only the failure is logged.
+    #[test]
+    fn a_lock_that_fails_is_logged_and_answers_as_a_missing_row() {
+        let traces = trace_capture::capture();
+        for statement in ["READ ACCTDAT UPDATE", "READ CUSTDAT UPDATE"] {
+            let cases = [
+                (Ok(Some(7_u8)), Some(7_u8), false),
+                (Ok(None), None, false),
+                (Err(store_error()), None, true),
+            ];
+            for (read, expected, logs) in cases {
+                traces.clear();
+                assert_eq!(held(read, statement), expected, "{statement}");
+                let lines = traces.lines();
+                assert_eq!(lines.len(), usize::from(logs), "{}", traces.text());
+                for line in &lines {
+                    assert!(line.contains("SQLSTATE 40P01"), "{line}");
+                    for part in event_parts("9600-WRITE-PROCESSING", statement) {
+                        assert!(line.contains(&part), "{part} missing from {line}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// COACTUPC-106, COACTUPC-107, COACTUPC-111: a rewrite that finds no row and one that fails
+    /// are both not rewritten, and only the failure is logged.
+    #[test]
+    fn a_rewrite_that_fails_is_logged_and_answers_as_not_rewritten() {
+        let traces = trace_capture::capture();
+        for statement in ["REWRITE ACCTDAT", "REWRITE CUSTDAT"] {
+            let cases = [
+                (Ok(true), true, false),
+                (Ok(false), false, false),
+                (Err(PersistenceError::Unavailable), false, true),
+            ];
+            for (result, expected, logs) in cases {
+                traces.clear();
+                assert_eq!(rewritten(result, statement), expected, "{statement}");
+                let lines = traces.lines();
+                assert_eq!(lines.len(), usize::from(logs), "{}", traces.text());
+                for line in &lines {
+                    assert!(line.contains("database unavailable"), "{line}");
+                    for part in event_parts("9600-WRITE-PROCESSING", statement) {
+                        assert!(line.contains(&part), "{part} missing from {line}");
+                    }
+                }
+            }
+        }
+    }
 }

@@ -326,7 +326,11 @@ mod tests {
     impl Drop for ScratchDir {
         fn drop(&mut self) {
             if let Err(error) = remove_tree(&self.0) {
-                eprintln!("scratch directory not removed: {error}");
+                tracing::error!(
+                    operation = "remove scratch directory",
+                    io_error = %error.kind(),
+                    "scratch directory not removed"
+                );
             }
         }
     }

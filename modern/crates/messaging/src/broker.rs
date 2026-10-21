@@ -42,9 +42,18 @@
 //! # Redaction
 //!
 //! CP00 request bodies hold full card numbers. No `Debug`, `Display`, error text or tracing
-//! event of this module shows a body byte: [`Request`]'s `Debug` gives only the body length, and
+//! event of this module shows a body byte: [`Request`]'s `Debug` gives the body length and the
+//! three properties as their [`ScreenedText`] shows them, one `*` per byte, and
 //! [`AmqpError`] and [`PublishFailure`] name queues and broker conditions only. The AMQP URL
 //! carries the local password, so it is never logged and no error repeats it.
+//!
+//! A request's `message_id`, `correlation_id` and `reply_to` are the requester's choice, and any
+//! of them can be a card number, an SSN or a password; a `CardDemo` password is any one to eight
+//! printable bytes, spaces included, so nothing in a property tells it safe. [`Request`] keeps
+//! them as received, for the reply properties and the reply destination, and every diagnostic
+//! takes them through [`Request::screened_message_id`], [`Request::screened_correlation_id`] and
+//! [`Request::screened_reply_to`], which show only whether each is present and its length in
+//! bytes, never its text.
 
 use std::error::Error;
 use std::fmt;
@@ -60,6 +69,7 @@ use lapin::publisher_confirm::Confirmation;
 use lapin::types::{FieldTable, ShortString};
 use lapin::uri::AMQPUri;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ConnectionState};
+use runtime::telemetry::ScreenedText;
 
 /// The queue to which the broker moves a `CARD.DEMO.REQUEST.PAUTH` request that a worker
 /// rejects with `requeue: false`, through the request queue's `x-dead-letter-exchange` `""` and
@@ -465,6 +475,12 @@ impl Publisher {
 ///
 /// The body is untrusted and copied as received. `Debug` shows its length, never its bytes,
 /// because a CP00 body holds a full card number; no `Display` or `Serialize` exists.
+///
+/// The three properties are untrusted too. Their fields keep them as received, because the reply
+/// properties copy them and a CP00 reply goes to `reply_to`. Diagnostics, `Debug` included, show
+/// them only through [`Request::screened_message_id`], [`Request::screened_correlation_id`] and
+/// [`Request::screened_reply_to`], one `*` per byte, since a requester can put a card number, an
+/// SSN or a password in any of them.
 pub struct Request {
     /// The tag that acknowledges or rejects this delivery on the consumer channel.
     pub delivery_tag: u64,
@@ -511,6 +527,30 @@ impl Request {
             redelivered,
         }
     }
+
+    /// The `message_id` property in the only form a span, an event or `Debug` may show it: a
+    /// [`ScreenedText`], one `*` per byte, so a diagnostic learns whether it is present and its
+    /// length, never its text.
+    #[must_use]
+    pub fn screened_message_id(&self) -> Option<ScreenedText<'_>> {
+        self.message_id.as_deref().map(ScreenedText::new)
+    }
+
+    /// The `correlation_id` property in the only form a span, an event or `Debug` may show it: a
+    /// [`ScreenedText`], one `*` per byte, so a diagnostic learns whether it is present and its
+    /// length, never its text.
+    #[must_use]
+    pub fn screened_correlation_id(&self) -> Option<ScreenedText<'_>> {
+        self.correlation_id.as_deref().map(ScreenedText::new)
+    }
+
+    /// The `reply_to` property in the only form a span, an event or `Debug` may show it: a
+    /// [`ScreenedText`], one `*` per byte, so a diagnostic learns whether it is present and its
+    /// length, never its text.
+    #[must_use]
+    pub fn screened_reply_to(&self) -> Option<ScreenedText<'_>> {
+        self.reply_to.as_deref().map(ScreenedText::new)
+    }
 }
 
 /// An owned copy of an optional short-string property.
@@ -519,14 +559,15 @@ fn owned(value: Option<&ShortString>) -> Option<String> {
 }
 
 impl fmt::Debug for Request {
-    /// The delivery tag, the three properties, the redelivery flag and the body's length; never
-    /// a body byte.
+    /// The delivery tag, the three properties as their [`ScreenedText`] shows them (one `*` per
+    /// byte, or `None` when absent), the redelivery flag and the body's length; never a body byte
+    /// or a byte of a property.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Request")
             .field("delivery_tag", &self.delivery_tag)
-            .field("message_id", &self.message_id)
-            .field("correlation_id", &self.correlation_id)
-            .field("reply_to", &self.reply_to)
+            .field("message_id", &self.screened_message_id())
+            .field("correlation_id", &self.screened_correlation_id())
+            .field("reply_to", &self.screened_reply_to())
             .field("redelivered", &self.redelivered)
             .field("body_len", &self.body.len())
             .finish()
@@ -822,18 +863,50 @@ mod tests {
 
     #[test]
     fn request_debug_shows_the_body_length_and_never_a_body_byte() {
-        let request = request(Some("MSG-0001"), Some("CORR-0001"));
-        let shown = format!("{request:?}");
-        assert!(
-            shown.contains(&format!("body_len: {}", request.body.len())),
-            "{shown}"
-        );
-        assert!(
-            shown.contains("MSG-0001") && shown.contains("CORR-0001"),
-            "{shown}"
-        );
-        assert!(!shown.contains(CARD_NUMBER), "{shown}");
-        assert!(!shown.contains("100.00"), "{shown}");
+        // Property values a requester may choose: a card number, whole and spaced out, an SSN
+        // with and without dashes, an 8-byte password, a password holding a space, a short
+        // password and a short ID.
+        let probes = [
+            CARD_NUMBER,
+            "123-45-6789",
+            "123456789",
+            "PASSWORD",
+            "PASS WOR",
+            "SECRET",
+            "M-1",
+            "0500 0244 5376 5740",
+        ];
+        // The body's fields, none of which `Debug` may show.
+        let body_fields = ["000001", "120000", CARD_NUMBER, "100.00"];
+        for probe in probes {
+            let mut protected = request(Some(probe), Some(probe));
+            protected.reply_to = Some(probe.to_owned());
+            let shown = format!("{protected:?}");
+            let stars = "*".repeat(probe.len());
+            for field in ["message_id", "correlation_id", "reply_to"] {
+                let expected = format!(r#"{field}: Some("{stars}")"#);
+                assert!(shown.contains(&expected), "{expected} missing from {shown}");
+            }
+            assert!(
+                shown.contains(&format!("body_len: {}", protected.body.len())),
+                "{shown}"
+            );
+            for value in probes.into_iter().chain(body_fields) {
+                assert!(!shown.contains(value), "{value:?} in {shown}");
+            }
+        }
+
+        let mut absent = request(Some("M-1"), None);
+        absent.reply_to = None;
+        let shown = format!("{absent:?}");
+        for expected in [
+            r#"message_id: Some("***")"#,
+            "correlation_id: None",
+            "reply_to: None",
+        ] {
+            assert!(shown.contains(expected), "{expected} missing from {shown}");
+        }
+        assert!(!shown.contains("M-1"), "{shown}");
     }
 
     #[test]

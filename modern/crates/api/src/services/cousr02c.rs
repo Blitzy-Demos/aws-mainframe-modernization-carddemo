@@ -41,7 +41,11 @@
 //! and `Held`, neither of which this module formats, and no value of either is logged.
 //!
 //! argon2id costs milliseconds of CPU per call, so the change test and the hashing run on
-//! Tokio's blocking pool rather than on the thread that drives other requests.
+//! Tokio's blocking pool rather than on the thread that drives other requests. Their failures
+//! are logged once the task is awaited, on the request's own thread and span: a stored hash that
+//! cannot be verified, a new password that cannot be hashed, by the fixed class text of
+//! `PasswordError`, and a task that did not complete, by whether it panicked, never its payload.
+//! No event names the password, the hash or the user.
 //!
 //! # Store failures
 //!
@@ -59,12 +63,13 @@
 
 use domain::copybook::PicX;
 use domain::online::cousr02c::{
-    self as rules, RewriteResult, StoredUserView, UserMaintFailure, UserRead, UserUpdateInput,
-    UserView, ValidatedUpdate,
+    self as rules, FailureClass, RewriteResult, StoredUserView, UserMaintFailure, UserRead,
+    UserUpdateInput, UserView, ValidatedUpdate,
 };
-use domain::password;
+use domain::password::{self, PasswordError};
 use persistence::rows::UserEntry;
 use persistence::{PersistenceError, PgTx, UserRepository};
+use tokio::task::JoinError;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
@@ -79,6 +84,10 @@ const READ_PARAGRAPH: &str = "READ-USER-SEC-FILE";
 
 /// The paragraph of the rewrite (COUSR02C-032).
 const REWRITE_PARAGRAPH: &str = "UPDATE-USER-SEC-FILE";
+
+/// The paragraph of the change test, whose password compare the replacement runs as argon2id
+/// verification and hashing (COUSR02C-026 to COUSR02C-029, `E27`).
+const CHANGE_PARAGRAPH: &str = "UPDATE-USER-INFO";
 
 /// What both endpoints answer with when they do not succeed.
 type Refusal = ServiceError<UserMaintFailure>;
@@ -220,22 +229,78 @@ async fn rewrite(
 }
 
 /// The row to rewrite, from the change test on Tokio's blocking pool, where argon2id verifies
-/// a supplied password and hashes a changed one.
+/// a supplied password and hashes a changed one; [`answered`] logs its failures once it is
+/// awaited.
 async fn changed_entry(update: ValidatedUpdate, held: Held) -> Result<UserEntry, Refusal> {
-    tokio::task::spawn_blocking(move || changed(&update, held))
-        .await
-        .unwrap_or(Err(ServiceError::Internal))
+    let joined = tokio::task::spawn_blocking(move || changed(&update, held)).await;
+    answered(joined)
+}
+
+/// Why the change test yields no row to rewrite.
+enum Unchanged {
+    /// The domain's answer: `Please modify to update ...` (COUSR02C-028), or `Unable to lookup
+    /// User...` for a stored hash that cannot be verified (`X-COUSR02C-4`).
+    Refused(UserMaintFailure),
+    /// argon2id could not hash the changed password.
+    NotHashed(PasswordError),
+}
+
+/// The change test's answer, on the thread that awaited its task: the row, the domain's
+/// refusal, or `ServiceError::Internal` when the new password cannot be hashed or the task did
+/// not complete.
+///
+/// Each operational failure is logged here, once, rather than on the blocking pool, so that the
+/// event falls in the request's span: the unverifiable stored hash as `WARN`, since the
+/// program's own message answers it; the hash failure, by the fixed class text of
+/// [`PasswordError`], and the task failure, by whether it panicked and never its payload, as
+/// `ERROR`, since both answer the unaudited 500. A refusal for nothing modified is the user's
+/// input and logs nothing.
+fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<UserEntry, Refusal> {
+    match joined {
+        Ok(Ok(entry)) => Ok(entry),
+        Ok(Err(Unchanged::Refused(failure))) => {
+            // `rules::modified` refuses with a store-class failure only when the stored hash
+            // cannot be verified; its other refusal is the input class's no-change message.
+            if failure.class() == FailureClass::Store {
+                tracing::warn!(
+                    program = PROGRAM,
+                    paragraph = CHANGE_PARAGRAPH,
+                    "stored password hash could not be verified; answering Unable to lookup User"
+                );
+            }
+            Err(ServiceError::Rule(failure))
+        }
+        Ok(Err(Unchanged::NotHashed(error))) => {
+            tracing::error!(
+                program = PROGRAM,
+                paragraph = CHANGE_PARAGRAPH,
+                error = %error,
+                "new password not hashed; answering 500"
+            );
+            Err(ServiceError::Internal)
+        }
+        Err(error) => {
+            tracing::error!(
+                program = PROGRAM,
+                paragraph = CHANGE_PARAGRAPH,
+                panicked = error.is_panic(),
+                "password task did not complete; answering 500"
+            );
+            Err(ServiceError::Internal)
+        }
+    }
 }
 
 /// The change test against the held row and the row it yields: the request's names and type,
 /// the held ID's key and `FILLER`, and a new hash only for a changed password (COUSR02C-026 to
 /// COUSR02C-029, `E27`).
-fn changed(update: &ValidatedUpdate, held: Held) -> Result<UserEntry, Refusal> {
+///
+/// It runs on the blocking pool and logs nothing: [`answered`] logs what it returns.
+fn changed(update: &ValidatedUpdate, held: Held) -> Result<UserEntry, Unchanged> {
     let changes =
-        rules::modified(update, &held.stored, &held.password_hash).map_err(ServiceError::Rule)?;
+        rules::modified(update, &held.stored, &held.password_hash).map_err(Unchanged::Refused)?;
     let password_hash = match changes.new_password() {
-        // The cause is dropped: `PasswordError` names a class only, and the answer is a 500.
-        Some(new) => password::hash(new.expose()).map_err(|_| ServiceError::Internal)?,
+        Some(new) => password::hash(new.expose()).map_err(Unchanged::NotHashed)?,
         None => held.password_hash,
     };
     Ok(UserEntry {
@@ -293,14 +358,14 @@ mod tests {
     use domain::SystemClock;
     use domain::copybook::PicX;
     use domain::online::cosgn00c::UserType;
-    use domain::online::cousr02c::{RewriteResult, UserMaintFailure, UserRead};
-    use domain::password;
+    use domain::online::cousr02c::{self as rules, RewriteResult, UserMaintFailure, UserRead};
+    use domain::password::{self, PasswordError};
     use persistence::rows::UserEntry;
     use persistence::{PersistenceError, PgStore, UserRepository};
     use test_support::postgres::start_postgres;
     use test_support::trace_capture;
 
-    use super::{fetch, reread_refusal, rewrite_result, update};
+    use super::{Unchanged, answered, fetch, reread_refusal, rewrite_result, update};
     use crate::app::AppState;
     use crate::auth::extract::{AdminUser, SignedOnUser};
     use crate::auth::jwt::JwtKeys;
@@ -623,6 +688,7 @@ mod tests {
             stored(&store, "BADHASH1").await?.fname,
             PicX::from_text("LAWRENCE")?
         );
+        assert!(traces.contains("stored password hash could not be verified"));
 
         store.pool().close().await;
         // audit: COUSR02C-016
@@ -644,6 +710,74 @@ mod tests {
             "$argon2id$",
             "not-a-phc-string",
         ] {
+            assert!(!traces.contains(value), "the trace holds {value}");
+        }
+        Ok(())
+    }
+
+    /// The change test's failures are logged once, after the task is awaited, with their class
+    /// and never a value, and keep their answers: the unverifiable stored hash its `Unable to
+    /// lookup User...` (`X-COUSR02C-4`), the hash and task failures their 500.
+    #[tokio::test]
+    async fn change_test_failures_are_logged_once_and_keep_their_answers() -> TestResult {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let cancelled = task.await.err().ok_or("an aborted task completed")?;
+        let unverified = rules::read(UserRead::Error)
+            .err()
+            .ok_or("a failed read gave a view")?;
+        let unmodified = rules::edit_user_id("")
+            .err()
+            .ok_or("a blank ID passed the edit")?;
+        let row = entry("USER0001", "$argon2id$v=19$stand-in".to_owned())?;
+        let traces = trace_capture::capture();
+        let cases = [
+            (
+                Err(cancelled),
+                Err(ServiceError::Internal),
+                Some(("ERROR", r#""panicked":false"#)),
+            ),
+            (
+                Ok(Err(Unchanged::NotHashed(PasswordError::Hash))),
+                Err(ServiceError::Internal),
+                Some(("ERROR", "password hashing failed")),
+            ),
+            (
+                Ok(Err(Unchanged::Refused(unverified))),
+                Err(ServiceError::Rule(unverified)),
+                Some(("WARN", "stored password hash could not be verified")),
+            ),
+            (
+                Ok(Err(Unchanged::Refused(unmodified))),
+                Err(ServiceError::Rule(unmodified)),
+                None,
+            ),
+            (Ok(Ok(row.clone())), Ok(row), None),
+        ];
+        for (joined, expected, logged) in cases {
+            traces.clear();
+            let answer = answered(joined);
+            assert!(answer == expected, "{logged:?}");
+            let lines = traces.lines();
+            match logged {
+                None => assert!(lines.is_empty(), "{}", traces.text()),
+                Some((level, text)) => {
+                    let [line] = lines.as_slice() else {
+                        return Err(format!("{text}: {} lines", lines.len()).into());
+                    };
+                    let level = format!(r#""level":"{level}""#);
+                    for part in [
+                        level.as_str(),
+                        r#""program":"COUSR02C""#,
+                        r#""paragraph":"UPDATE-USER-INFO""#,
+                        text,
+                    ] {
+                        assert!(line.contains(part), "{part} missing from {line}");
+                    }
+                }
+            }
+        }
+        for value in ["USER0001", "$argon2id$", STORED_PASSWORD, NEW_PASSWORD] {
             assert!(!traces.contains(value), "the trace holds {value}");
         }
         Ok(())

@@ -25,8 +25,10 @@
 //!
 //! COTRN01C answers every failed read with a text of its own, so a store error on the read is a
 //! domain lookup value and never a `ServiceError::Store`: the read's result is matched, never
-//! propagated with `?`. The error itself is dropped. The COBOL `DISPLAY`s its CICS `RESP` and
-//! `RESP2` to the region log, codes that have no counterpart here (COTRN01C-013).
+//! propagated with `?`. The COBOL `DISPLAY`s its CICS `RESP` and `RESP2` to the region log,
+//! codes that have no counterpart here (COTRN01C-013); in their place [`lookup`] logs the store
+//! error once, as a tracing event naming `READ-TRANSACT-FILE`, before it becomes the lookup
+//! value.
 //!
 //! # No lock, no write
 //!
@@ -45,7 +47,8 @@
 //!
 //! The card number stays a `CardNumber` inside the returned view, so the response carries only
 //! its redacted form (COTRN01C-017, E32, Cardholder Data Redaction). Nothing here logs, traces or
-//! formats the key, the record or the store error.
+//! formats the key or the record; the event of a failed read carries only the store error, whose
+//! `Display` names an SQLSTATE and a constraint or column at most.
 
 use domain::online::cotrn01c::{self, TranLookup, TranView, TranViewFailure};
 use domain::records::TransactionRecord;
@@ -90,13 +93,24 @@ pub(crate) async fn view(
 /// The `EXEC CICS READ` response the result of `find_by_id` stands for: `DFHRESP(NORMAL)` with
 /// the row, `DFHRESP(NOTFND)`, or any other response (COTRN01C-012, COTRN01C-013, COTRN01C-015).
 ///
-/// The store error is not inspected: every failure, whatever its SQLSTATE, gets the program's
-/// one `WHEN OTHER` answer (COTRN01C-013).
+/// The store error does not choose the answer: every failure, whatever its SQLSTATE, gets the
+/// program's one `WHEN OTHER` answer (COTRN01C-013). It is logged first, once, as a `WARN` event
+/// naming the program and the paragraph, in place of the COBOL's `DISPLAY` of the CICS codes.
 fn lookup(read: &Result<Option<TransactionRecord>, PersistenceError>) -> TranLookup<'_> {
     match read {
         Ok(Some(record)) => TranLookup::Found(record),
         Ok(None) => TranLookup::NotFound,
-        Err(_) => TranLookup::Error,
+        Err(error) => {
+            // The error's `Display` holds only an SQLSTATE and a constraint or column name,
+            // never the key or a stored value (Cardholder Data Redaction).
+            tracing::warn!(
+                program = "COTRN01C",
+                paragraph = "READ-TRANSACT-FILE",
+                error = %error,
+                "TRANSACT read failed; answering Unable to lookup Transaction"
+            );
+            TranLookup::Error
+        }
     }
 }
 
@@ -110,6 +124,7 @@ mod tests {
     use domain::online::cotrn01c::{self, TranLookup, TranViewFailure};
     use domain::records::TransactionRecord;
     use persistence::{DecodeKind, PersistenceError};
+    use test_support::trace_capture;
 
     use super::lookup;
     use crate::error::{ScreenError, ServiceError, UNABLE_TO_PROCESS};
@@ -199,5 +214,41 @@ mod tests {
         assert_eq!(response.message(), "Unable to lookup Transaction...");
         assert_ne!(response.message(), UNABLE_TO_PROCESS);
         assert_eq!(response.field(), Some("tran_id"));
+    }
+
+    // audit: COTRN01C-013
+    #[test]
+    fn a_failed_read_is_logged_once_with_its_cause_and_a_found_row_is_not() -> TestResult {
+        let traces = trace_capture::capture();
+        for error in store_errors() {
+            traces.clear();
+            let cause = error.to_string();
+            let read = Err(error);
+            assert_eq!(
+                cotrn01c::view(lookup(&read)),
+                Err(TranViewFailure::LookupFailed),
+                "{cause}"
+            );
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{cause}: {} lines", lines.len()).into());
+            };
+            for expected in [
+                r#""level":"WARN""#,
+                r#""program":"COTRN01C""#,
+                r#""paragraph":"READ-TRANSACT-FILE""#,
+                cause.as_str(),
+            ] {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+        }
+
+        traces.clear();
+        let record = first_fixture_record()?;
+        let found = Ok(Some(record.clone()));
+        assert_eq!(lookup(&found), TranLookup::Found(&record));
+        assert_eq!(lookup(&Ok(None)), TranLookup::NotFound);
+        assert!(traces.text().is_empty(), "{}", traces.text());
+        Ok(())
     }
 }

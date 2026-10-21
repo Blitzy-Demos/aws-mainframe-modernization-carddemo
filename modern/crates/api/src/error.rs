@@ -11,10 +11,10 @@
 //!   `HALTED(H3)` or `HALTED(H4)` path, whose Db2, CICS or IMS codes have no counterpart, is
 //!   passed through exactly as the domain renders it.
 //! - **Store errors without an audited message.** A [`PersistenceError`] that reaches this
-//!   module, through [`ServiceError::Store`], answers 500 with [`UNABLE_TO_PROCESS`]. A store
-//!   error the COBOL does answer with a text of its own (`Unable to lookup User...`, for
-//!   instance) is mapped by the service into the domain's lookup enum and arrives as a domain
-//!   failure.
+//!   module, through [`ServiceError::Store`], answers 500 with [`UNABLE_TO_PROCESS`], and its
+//!   conversion logs it, once, as the only record of its cause. A store error the COBOL does
+//!   answer with a text of its own (`Unable to lookup User...`, for instance) is logged by the
+//!   service and mapped into the domain's lookup enum, and arrives as a domain failure.
 //! - **The request layer.** `api::dto`'s extractors reject a body or query with
 //!   [`ScreenError::input`] and an out-of-range `page_size` with [`ScreenError::page_size`];
 //!   `api::auth::extract` rejects a missing or invalid token with [`ScreenError::unauthorized`]
@@ -253,12 +253,14 @@ impl<F: fmt::Display> fmt::Display for ServiceError<F> {
     }
 }
 
-/// Transparent: the source is the wrapped error's own source.
-impl<F: std::error::Error> std::error::Error for ServiceError<F> {
+/// The source is the wrapped domain failure or [`PersistenceError`], so a walk of the error
+/// chain reaches it and can downcast to it; [`ServiceError::Internal`] wraps nothing and has
+/// none.
+impl<F: std::error::Error + 'static> std::error::Error for ServiceError<F> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Rule(failure) => failure.source(),
-            Self::Store(error) => error.source(),
+            Self::Rule(failure) => Some(failure),
+            Self::Store(error) => Some(error),
             Self::Internal => None,
         }
     }
@@ -280,8 +282,19 @@ where
 
 /// 500 with [`UNABLE_TO_PROCESS`] and no field, whatever the variant: the error's SQLSTATE and
 /// constraint name stay out of the body.
+///
+/// A store error with no audited message, such as a failed `begin`, `commit`, `rollback` or
+/// savepoint, ends here and nowhere else, so this conversion logs it once, as an `ERROR` event,
+/// before answering. The event carries the error's `Display`, an SQLSTATE and a constraint or
+/// column name at most, never a stored or request value (Cardholder Data Redaction); the
+/// request span it falls in names the route. A service that answers a store error with the
+/// program's own message logs it itself and never returns it as [`ServiceError::Store`].
 impl From<PersistenceError> for ScreenError {
-    fn from(_: PersistenceError) -> Self {
+    fn from(error: PersistenceError) -> Self {
+        tracing::error!(
+            error = %error,
+            "store failure without an audited message; answering 500"
+        );
         Self::store(UNABLE_TO_PROCESS, None)
     }
 }
@@ -760,6 +773,41 @@ mod tests {
     }
 
     #[test]
+    fn a_store_error_without_an_audited_message_is_logged_once_with_its_cause() -> TestResult {
+        let traces = test_support::trace_capture::capture();
+        for store in persistence_errors() {
+            traces.clear();
+            let cause = store.to_string();
+            let service = ServiceError::<cotrn01c::TranViewFailure>::Store(store);
+            let error = ScreenError::from(service);
+            assert_eq!(parts(&error), (500, UNABLE_TO_PROCESS, None));
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{cause}: {} lines", lines.len()).into());
+            };
+            for expected in [
+                r#""level":"ERROR""#,
+                "store failure without an audited message",
+                cause.as_str(),
+            ] {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+        }
+
+        // A domain answer or an internal failure is not a store error, and logs nothing here.
+        traces.clear();
+        let rule = ServiceError::Rule(cotrn01c::TranViewFailure::LookupFailed);
+        assert_eq!(ScreenError::from(rule).status().as_u16(), 500);
+        let internal = ServiceError::<cotrn01c::TranViewFailure>::Internal;
+        assert_eq!(
+            parts(&ScreenError::from(internal)),
+            (500, UNABLE_TO_PROCESS, None)
+        );
+        assert!(traces.lines().is_empty(), "{}", traces.text());
+        Ok(())
+    }
+
+    #[test]
     fn service_errors_convert_by_variant() {
         let rule: ServiceError<cotrn01c::TranViewFailure> =
             ServiceError::Rule(cotrn01c::TranViewFailure::NotFound);
@@ -783,20 +831,28 @@ mod tests {
     }
 
     #[test]
-    fn service_errors_display_no_value_and_are_transparent() {
+    fn service_errors_display_no_value_and_chain_to_the_wrapped_error() {
         let failure = cousr00c::UserListFailure::LookupFailed;
-        let cases: [(ServiceError<cousr00c::UserListFailure>, String); 3] = [
-            (ServiceError::Rule(failure), failure.message().to_owned()),
-            (
-                ServiceError::Store(PersistenceError::Unavailable),
-                PersistenceError::Unavailable.to_string(),
-            ),
-            (ServiceError::Internal, UNABLE_TO_PROCESS.to_owned()),
-        ];
-        for (error, text) in cases {
-            assert_eq!(error.to_string(), text);
-            assert!(error.source().is_none());
+        let rule = ServiceError::<cousr00c::UserListFailure>::Rule(failure);
+        assert_eq!(rule.to_string(), failure.message());
+        assert_eq!(
+            rule.source()
+                .and_then(|source| source.downcast_ref::<cousr00c::UserListFailure>()),
+            Some(&failure)
+        );
+        for store in persistence_errors() {
+            let error = ServiceError::<cousr00c::UserListFailure>::Store(store.clone());
+            assert_eq!(error.to_string(), store.to_string());
+            assert_eq!(
+                error
+                    .source()
+                    .and_then(|source| source.downcast_ref::<PersistenceError>()),
+                Some(&store)
+            );
         }
+        let internal = ServiceError::<cousr00c::UserListFailure>::Internal;
+        assert_eq!(internal.to_string(), UNABLE_TO_PROCESS);
+        assert!(internal.source().is_none());
     }
 
     #[tokio::test]

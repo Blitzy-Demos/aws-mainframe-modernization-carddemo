@@ -43,17 +43,19 @@
 //! # Redaction
 //!
 //! The outcome holds no card number, full or redacted: the cross-reference's and the details'
-//! card numbers stay inside the records, which never leave this module (COPAUS0C-055). Nothing
-//! here logs or traces, and every store error is dropped once it has been mapped, so neither a
-//! key, a stored value nor a database text reaches the response (Cardholder Data Redaction).
+//! card numbers stay inside the records, which never leave this module (COPAUS0C-055). Each
+//! failed read is logged once by [`traced`], with its paragraph, its statement and the store
+//! error, before it is mapped; the error's `Display` names an SQLSTATE and a constraint or column
+//! at most. No event names a key, a record or a database text, and none of them reaches the
+//! response (Cardholder Data Redaction).
 
 use domain::copybook::PicU;
 use domain::online::copaus0c::{
     self, AuthKey, AuthPage, AuthSummaryFailure, Lookup, PageRequest, SummaryBlock, SummaryState,
 };
 use persistence::{
-    AccountRepository, ChainLink, PendingAuthDetailRepository, PendingAuthSummaryRepository,
-    PersistenceError,
+    AccountCustomerChain, AccountRepository, ChainLink, PendingAuthDetailRepository,
+    PendingAuthSummaryRepository, PersistenceError,
 };
 
 use crate::app::AppState;
@@ -61,6 +63,9 @@ use crate::auth::extract::SignedOnUser;
 use crate::dto::copaus0c::AuthSummaryQuery;
 use crate::dto::resolve_page_size;
 use crate::error::ServiceError;
+
+/// The program the tracing event of a failed read names.
+const PROGRAM: &str = "COPAUS0C";
 
 /// Endpoint 21: the edited account, its customer and summary block and one page of its pending
 /// authorizations, which `AuthSummaryResponse::from` turns into the response (COPAUS0C-008,
@@ -109,6 +114,7 @@ pub(crate) async fn summary(
 
     let mut store = state.store.clone();
     let chain = AccountRepository::find_with_customer(&mut store, acct).await;
+    report_failed_reads(&chain);
     let keys = copaus0c::xref_keys(acct, chain_lookup(&chain.xref)).map_err(ServiceError::Rule)?;
     let summary_key = copaus0c::summary_key(acct);
     let summary = PendingAuthSummaryRepository::find_by_id(&mut store, summary_key).await;
@@ -138,11 +144,53 @@ pub(crate) async fn summary(
             )
             .await
             .map(|details| copaus0c::page(request, &details, rows))
-            .map_err(|_| ServiceError::Rule(copaus0c::detail_failure(request)))?
+            .map_err(|error| detail_read_failed(request, &error))?
         }
         SummaryState::NotFound => AuthPage::without_details(),
     };
     Ok((acct, block, page))
+}
+
+/// Logs each read of `chain` that failed through [`traced`], with its paragraph and dataset;
+/// a read that found its record or none, or was never issued, logs nothing (COPAUS0C-015,
+/// COPAUS0C-017, COPAUS0C-019).
+fn report_failed_reads(chain: &AccountCustomerChain) {
+    report_failed(&chain.xref, "GETCARDXREF-BYACCT", "READ CXACAIX");
+    report_failed(&chain.account, "GETACCTDATA-BYACCT", "READ ACCTDAT");
+    report_failed(&chain.customer, "GETCUSTDATA-BYCUST", "READ CUSTDAT");
+}
+
+/// Logs `link` through [`traced`] when its read failed.
+fn report_failed<T>(link: &ChainLink<T>, paragraph: &'static str, statement: &'static str) {
+    if let ChainLink::Failed(error) = link {
+        traced(paragraph, statement, error);
+    }
+}
+
+/// The answer to a failed detail page query, `copaus0c::detail_failure` for `request`, once the
+/// error is logged (COPAUS0C-037, COPAUS0C-038).
+fn detail_read_failed(
+    request: PageRequest,
+    error: &PersistenceError,
+) -> ServiceError<AuthSummaryFailure> {
+    traced("PROCESS-PAGE-FORWARD", "GNP PAUTDTL1", error);
+    ServiceError::Rule(copaus0c::detail_failure(request))
+}
+
+/// The tracing event of a failed read, in place of the response and reason codes the COBOL puts
+/// in its system-error text (`HALTED(H4)`, COPAUS0C-056).
+///
+/// `paragraph` and `statement` are constants of this module; the error's `Display` holds only
+/// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
+/// Redaction).
+fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
+    tracing::warn!(
+        program = PROGRAM,
+        paragraph,
+        statement,
+        error = %error,
+        "read failed; answering the program's system error"
+    );
 }
 
 /// One link of the `find_with_customer` chain as the read outcome the domain judges: a record
@@ -164,12 +212,15 @@ fn chain_lookup<T>(link: &ChainLink<T>) -> Lookup<&T> {
 
 /// A keyed read as the read outcome the domain judges: the DL/I `GU` of the summary, whose IMS
 /// status `'  '` or `'FW'` is a found row, `'GE'` no row, and any other status a failed read
-/// (COPAUS0C-027, COPAUS0C-029, COPAUS0C-030).
+/// (COPAUS0C-027, COPAUS0C-029, COPAUS0C-030), whose error is logged first through [`traced`].
 fn read_lookup<T>(read: &Result<Option<T>, PersistenceError>) -> Lookup<&T> {
     match read {
         Ok(Some(record)) => Lookup::Found(record),
         Ok(None) => Lookup::NotFound,
-        Err(_) => Lookup::Failed,
+        Err(error) => {
+            traced("GET-AUTH-SUMMARY", "GU PAUTSUM0", error);
+            Lookup::Failed
+        }
     }
 }
 
@@ -187,13 +238,137 @@ fn page_rows(requested: Option<i64>) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use domain::online::copaus0c::{DEFAULT_PAGE_SIZE, Lookup};
-    use persistence::{ChainLink, PersistenceError};
+    use std::error::Error as StdError;
 
-    use super::{chain_lookup, page_rows, read_lookup};
+    use domain::CardNumber;
+    use domain::copybook::{PicU, PicX};
+    use domain::online::copaus0c::{self, DEFAULT_PAGE_SIZE, Lookup, PageRequest};
+    use domain::records::card_xref::CardXrefRecord;
+    use persistence::{AccountCustomerChain, ChainLink, PersistenceError};
+    use test_support::trace_capture::{self, TraceCapture};
+
+    use super::{chain_lookup, detail_read_failed, page_rows, read_lookup, report_failed_reads};
+    use crate::error::ServiceError;
 
     /// A keyed read of a stand-in record.
     type Read = Result<Option<u8>, PersistenceError>;
+
+    type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// A store error carrying an SQLSTATE and a constraint name.
+    fn store_error() -> PersistenceError {
+        PersistenceError::Database {
+            sqlstate: Some("57014".to_owned()),
+            constraint: Some("pending_auth_summaries_pkey".to_owned()),
+        }
+    }
+
+    /// Asserts that `traces` holds exactly the events `logged` names, one line each, in order:
+    /// a `WARN` of COPAUS0C with the paragraph, the statement and the error's text.
+    fn assert_logged(traces: &TraceCapture, logged: &[(&str, &str, &str)]) {
+        let lines = traces.lines();
+        assert_eq!(lines.len(), logged.len(), "{}", traces.text());
+        for (line, &(paragraph, statement, cause)) in lines.iter().zip(logged) {
+            let paragraph = format!(r#""paragraph":"{paragraph}""#);
+            let statement = format!(r#""statement":"{statement}""#);
+            for expected in [
+                r#""level":"WARN""#,
+                r#""program":"COPAUS0C""#,
+                paragraph.as_str(),
+                statement.as_str(),
+                cause,
+            ] {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+        }
+    }
+
+    /// COPAUS0C-015, COPAUS0C-017, COPAUS0C-019: each failed read of the chain is logged once
+    /// with its paragraph and the store error; a found, missing or unissued read logs nothing,
+    /// and no event holds a key or a stored value.
+    #[test]
+    fn each_failed_chain_read_is_logged_once_without_any_value() -> TestResult {
+        let xref = CardXrefRecord {
+            card_num: CardNumber::parse("4111111111111111")?,
+            cust_id: PicU::new(7)?,
+            acct_id: PicU::new(42)?,
+            filler: PicX::spaces(),
+        };
+        let traces = trace_capture::capture();
+        let cases = [
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Failed(PersistenceError::Unavailable),
+                    account: ChainLink::NotReached,
+                    customer: ChainLink::NotReached,
+                },
+                &[("GETCARDXREF-BYACCT", "READ CXACAIX", "database unavailable")][..],
+            ),
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Found(xref.clone()),
+                    account: ChainLink::Failed(store_error()),
+                    customer: ChainLink::Failed(PersistenceError::Unavailable),
+                },
+                &[
+                    ("GETACCTDATA-BYACCT", "READ ACCTDAT", "SQLSTATE 57014"),
+                    ("GETCUSTDATA-BYCUST", "READ CUSTDAT", "database unavailable"),
+                ][..],
+            ),
+            (
+                AccountCustomerChain {
+                    xref: ChainLink::Found(xref),
+                    account: ChainLink::NotFound,
+                    customer: ChainLink::NotFound,
+                },
+                &[][..],
+            ),
+        ];
+        for (chain, logged) in cases {
+            traces.clear();
+            report_failed_reads(&chain);
+            assert_logged(&traces, logged);
+        }
+        for value in ["4111111111111111", "00000000042", "000000007"] {
+            assert!(!traces.contains(value), "the trace holds {value}");
+        }
+        Ok(())
+    }
+
+    /// COPAUS0C-030, COPAUS0C-037: a failed summary `GU` and a failed detail page are logged
+    /// once each and keep their Rule answers; a found or missing summary logs nothing.
+    #[test]
+    fn a_failed_summary_or_detail_read_is_logged_once_and_keeps_its_answer() {
+        let traces = trace_capture::capture();
+        let failed: Read = Err(store_error());
+        assert_eq!(read_lookup(&failed), Lookup::Failed);
+        assert_logged(
+            &traces,
+            &[("GET-AUTH-SUMMARY", "GU PAUTSUM0", "SQLSTATE 57014")],
+        );
+
+        traces.clear();
+        let answer = detail_read_failed(PageRequest::First, &PersistenceError::Unavailable);
+        assert_eq!(
+            answer,
+            ServiceError::Rule(copaus0c::detail_failure(PageRequest::First))
+        );
+        assert_logged(
+            &traces,
+            &[(
+                "PROCESS-PAGE-FORWARD",
+                "GNP PAUTDTL1",
+                "database unavailable",
+            )],
+        );
+
+        traces.clear();
+        let found: Read = Ok(Some(7));
+        let missing: Read = Ok(None);
+        assert_eq!(read_lookup(&found), Lookup::Found(&7));
+        assert_eq!(read_lookup(&missing), Lookup::NotFound);
+        assert_logged(&traces, &[]);
+    }
 
     #[test]
     fn every_chain_link_maps_to_the_lookup_the_domain_judges() {
