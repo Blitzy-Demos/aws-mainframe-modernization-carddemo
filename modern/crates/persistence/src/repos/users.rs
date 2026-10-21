@@ -32,6 +32,10 @@
 //!   `CHAR(n)` comparison ignores trailing spaces, so a key of eight spaces, the domain's
 //!   stand-in for `LOW-VALUES`, compares as the empty key, below every stored user ID
 //!   (COUSR00C-012).
+//! - Every statement casts its key parameter to `bpchar`, as the page queries do. `sqlx` binds
+//!   a `String` as `text`, and `usr_id = $1` against `text` compares `usr_id::text`, whose
+//!   trailing spaces are dropped, with the padded key: a user ID shorter than 8 bytes, such as
+//!   `AB CD` (COUSR02C-030), would find no row, and `users_pkey` could not serve the lookup.
 //! - Codec B stores no NUL or non-ASCII byte (PIC-002), so no row holds a key that has one. The
 //!   point accesses answer such a key as the `NOTFND` of a key nothing was written under:
 //!   `find_by_id` and `lock_by_id` return `None`, `update` and `delete` return `false`, and no
@@ -456,7 +460,7 @@ async fn select_by_id<'e, E: PgExecutor<'e>>(
         UserRow,
         "SELECT usr_id, usr_fname, usr_lname, password_hash, usr_type, filler
          FROM users
-         WHERE usr_id = $1",
+         WHERE usr_id = $1::bpchar",
         key
     )
     .fetch_optional(executor)
@@ -472,7 +476,7 @@ async fn select_for_update<'e, E: PgExecutor<'e>>(
         UserRow,
         "SELECT usr_id, usr_fname, usr_lname, password_hash, usr_type, filler
          FROM users
-         WHERE usr_id = $1
+         WHERE usr_id = $1::bpchar
          FOR UPDATE",
         key
     )
@@ -525,7 +529,7 @@ async fn update_row<'e, E: PgExecutor<'e>>(executor: E, row: &UserRow) -> Result
     let done = sqlx::query!(
         "UPDATE users
          SET usr_fname = $2, usr_lname = $3, password_hash = $4, usr_type = $5, filler = $6
-         WHERE usr_id = $1",
+         WHERE usr_id = $1::bpchar",
         row.usr_id,
         row.usr_fname,
         row.usr_lname,
@@ -540,7 +544,7 @@ async fn update_row<'e, E: PgExecutor<'e>>(executor: E, row: &UserRow) -> Result
 
 /// Deletes the row whose `usr_id` is `key`; returns the rows deleted.
 async fn delete_row<'e, E: PgExecutor<'e>>(executor: E, key: &str) -> Result<u64, sqlx::Error> {
-    let done = sqlx::query!("DELETE FROM users WHERE usr_id = $1", key)
+    let done = sqlx::query!("DELETE FROM users WHERE usr_id = $1::bpchar", key)
         .execute(executor)
         .await?;
     Ok(done.rows_affected())
@@ -859,6 +863,32 @@ mod tests {
         ));
         assert_eq!(store.insert(&nul_hash).await, invalid_hash);
         assert_eq!(store.find_by_id(&nul_hash.id).await?, None);
+        Ok(())
+    }
+
+    // audit: COUSR02C-011
+    // audit: COUSR02C-030
+    #[tokio::test]
+    async fn a_key_shorter_than_its_field_is_found_by_every_point_access() -> TestResult {
+        let (_guard, mut store) = store().await?;
+        // COUSR01C stores a user ID as typed, so `AB CD` is kept padded to `AB CD   `.
+        let short = entry("AB CD", RUN_ONE)?;
+        store.insert(&short).await?;
+        assert_eq!(store.find_by_id(&short.id).await?, Some(short.clone()));
+        // The padding is the key's: the unpadded prefix and a leading space are other keys.
+        assert_eq!(store.find_by_id(&key("AB")?).await?, None);
+        assert_eq!(store.find_by_id(&key(" AB CD")?).await?, None);
+
+        let mut tx = store.begin().await?;
+        assert_eq!(tx.lock_by_id(&short.id).await?, Some(short.clone()));
+        let mut changed = short.clone();
+        changed.fname = PicX::from_text("RENAMED")?;
+        assert!(tx.update(&changed).await?);
+        tx.commit().await?;
+        assert_eq!(store.find_by_id(&short.id).await?, Some(changed));
+
+        assert!(store.delete(&short.id).await?);
+        assert_eq!(store.find_by_id(&short.id).await?, None);
         Ok(())
     }
 

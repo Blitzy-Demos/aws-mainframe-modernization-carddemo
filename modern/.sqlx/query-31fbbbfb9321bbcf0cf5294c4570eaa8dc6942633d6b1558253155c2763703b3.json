@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT usr_id, usr_fname, usr_lname, password_hash, usr_type, filler\n         FROM users\n         WHERE usr_id = $1",
+  "query": "SELECT usr_id, usr_fname, usr_lname, password_hash, usr_type, filler\n         FROM users\n         WHERE usr_id = $1::bpchar\n         FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "a585aff76dff178f9cfe96def3951533537a801804b4f232ee601b7064a4b51c"
+  "hash": "31fbbbfb9321bbcf0cf5294c4570eaa8dc6942633d6b1558253155c2763703b3"
 }

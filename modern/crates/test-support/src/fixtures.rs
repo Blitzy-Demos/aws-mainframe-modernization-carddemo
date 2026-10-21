@@ -1,0 +1,642 @@
+//! The fixtures read in place, the fixture-loaded database the integration tests run against,
+//! and the protected fixture values the redaction tests search for.
+//!
+//! # Fixtures read in place
+//!
+//! The fixtures are the eight ASCII master and reference files of `app/data/ASCII/` and the
+//! in-stream `USRSEC` records of `app/jcl/DUSRSECJ.jcl`. They are read where they lie and never
+//! copied (AAP 0.2.2). This module is where the integration tests of `persistence`, `api`,
+//! `messaging` and `batch` find them; `copybook` and `domain`, below this crate in the crate
+//! graph, resolve the same files from their own manifest directories (AAP 0.6.2).
+//!
+//! # The fixture-loaded database
+//!
+//! [`load_fixtures`] runs the nine loads of `carddemo-batch` with the semantics
+//! `modern/audit/batch/LOADS.md` states for them, in the `scripts/dev-up.sh` order: `acctfile`,
+//! `cardfile`, `xreffile`, `custfile`, `discgrp`, `tcatbalf`, `trancatg`, `trantype`,
+//! `dusrsecj`, the refresh order of `scripts/remote_refresh.sh:16-44` less TRANFILE.
+//!
+//! - Codec A decodes every line of a load's input, and the record keys must rise strictly,
+//!   before anything is written. A refused line fails the load; nothing is skipped or
+//!   normalised.
+//! - One transaction per table deletes every row and inserts every record through codec B, as
+//!   IDCAMS `DELETE`, `DEFINE CLUSTER` and `REPRO` replace a cluster (AAP 0.3.3.4).
+//! - `users` receives the argon2id hash of each `SEC-USR-PWD`, never the password (E25).
+//! - The fixtures hold 50, 50, 50, 50, 51, 50, 18 and 7 records and the deck 10, the row counts
+//!   each load must report (`modern/audit/fixtures.md`).
+//!
+//! No foreign key joins the loaded tables, so the loads succeed on an empty or a loaded
+//! database, and a rerun leaves the same copybook-derived contents. Only `cards.card_ref`,
+//! which the database assigns anew to every inserted card, and the salted
+//! `users.password_hash` differ between two runs.
+//!
+//! The loads write through the repository traits of `persistence` only: this module holds no
+//! SQL text and applies no migration, which [`start_postgres`] has done before.
+//!
+//! # Redaction needles
+//!
+//! [`fixture_card_numbers`], [`fixture_ssns`], [`fixture_ssn_forms`] and
+//! [`fixture_user_passwords`] return protected values in full: the 50 card numbers, the 50
+//! SSNs and the 10 passwords of the fixtures. They exist only as search needles for the
+//! redaction tests, which assert that no response, trace, error, broker message or log row
+//! holds one (Cardholder Data Redaction). A caller never prints, traces or formats them into a
+//! message, and no [`HarnessError`] of this module carries one: its contexts name the job or the
+//! file, and its messages are the value-free `Display` texts of `LoadError`,
+//! `PersistenceError` and `std::io::Error`.
+//!
+//! The needles are read through codec A rather than by byte offset. For reference, a card
+//! number is bytes 0 to 15 of a `carddata.txt` line (`CARD-NUM`, `CVACT02Y`), an SSN bytes 279
+//! to 287 of a `custdata.txt` line (`CUST-SSN`, `CVCUS01Y`) and a password bytes 48 to 55 of an
+//! in-stream record (`SEC-USR-PWD`, `CSUSR01Y`), all 0-based.
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use copybook::FixedRecord;
+use persistence::domain::batch::loads::{
+    HashedUser, LoadJob, check_key_sequence, decode_fixture, decode_usrsec, hash_user,
+};
+use persistence::domain::records::{
+    AccountRecord, CardRecord, CardXrefRecord, CustomerRecord, DisclosureGroupRecord,
+    TranCatBalanceRecord, TransactionCategoryRecord, TransactionTypeRecord, UserSecurityRecord,
+};
+use persistence::{
+    AccountRepository, CardRepository, CardXrefRepository, CustomerRepository,
+    DisclosureGroupRepository, PersistenceError, PgStore, PgTx, TranCatBalanceRepository,
+    TransactionCategoryRepository, TransactionTypeRepository, UserRepository,
+};
+use sqlx::PgPool;
+
+use crate::HarnessError;
+use crate::postgres::{PostgresGuard, start_postgres};
+
+/// The context of every error of [`load_fixtures`]; the message names the job.
+const LOAD_CONTEXT: &str = "load fixtures";
+
+/// The context of every error of the redaction needles.
+const NEEDLE_CONTEXT: &str = "read redaction needles";
+
+/// The `USRSEC` records with their argon2id hashes, computed once per test binary.
+///
+/// argon2id is slow in unoptimised and coverage builds, and every load of `users` needs the ten
+/// hashes. Each hash is salted and verifies its 8 bytes in any database, so one set serves every
+/// load of the process.
+static HASHED_USERS: OnceLock<Vec<HashedUser>> = OnceLock::new();
+
+/// The directory of the ASCII fixtures, `app/data/ASCII` under the repository root, for
+/// example `/src/carddemo/modern/crates/test-support/../../../app/data/ASCII` for a checkout at
+/// `/src/carddemo`.
+///
+/// The path is not canonicalised, as [`crate::repo_root`] is not.
+#[must_use]
+pub fn fixture_dir() -> PathBuf {
+    crate::repo_root().join("app/data/ASCII")
+}
+
+/// The fixture `name` inside [`fixture_dir`], such as `"acctdata.txt"`. The file is read in
+/// place and never copied.
+#[must_use]
+pub fn fixture_path(name: &str) -> PathBuf {
+    fixture_dir().join(name)
+}
+
+/// The `DUSRSECJ` job deck, `app/jcl/DUSRSECJ.jcl` under the repository root, whose in-stream
+/// records are the only ASCII source of the `USRSEC` users (AAP 0.2.1).
+#[must_use]
+pub fn dusrsecj_path() -> PathBuf {
+    crate::repo_root().join("app/jcl/DUSRSECJ.jcl")
+}
+
+/// Replaces the nine tables the load subcommands of `carddemo-batch` write with the fixtures,
+/// one table per transaction, in the `scripts/dev-up.sh` order, and returns each subcommand
+/// with the number of rows its load wrote, in that order.
+///
+/// The database must already hold the schema, as [`start_postgres`] leaves it. Each load reads
+/// its input in place, decodes every record with codec A and checks that the keys rise before
+/// it opens its transaction, then deletes every row of its table and inserts every record
+/// through codec B, so the result is the same as running `acctfile`, `cardfile`, `xreffile`,
+/// `custfile`, `discgrp`, `tcatbalf`, `trancatg`, `trantype` and `dusrsecj` in turn. The call
+/// can be repeated on the same database and reports the same counts.
+///
+/// # Errors
+///
+/// Returns a [`HarnessError`] when a fixture cannot be read, when codec A refuses a line or a
+/// key does not rise above the previous one, when a password cannot be hashed, when a
+/// transaction cannot be opened, a delete or an insert fails or the commit is refused, or when
+/// a load inserts a number of rows other than its fixture's 50, 50, 50, 50, 51, 50, 18, 7 or
+/// 10, which rolls that load back. Each failure leaves its table as it was and stops the run,
+/// so the tables loaded before it keep their new contents.
+pub async fn load_fixtures(pool: &PgPool) -> Result<Vec<(String, u64)>, HarnessError> {
+    let store = PgStore::new(pool.clone());
+    let mut loaded = Vec::with_capacity(LoadJob::ALL.len());
+    for job in LoadJob::ALL {
+        let rows = load(&store, job).await?;
+        loaded.push((job.subcommand().to_owned(), rows));
+    }
+    Ok(loaded)
+}
+
+/// Starts a `postgres:16` container holding the schema through [`start_postgres`] and loads
+/// the fixtures into it with [`load_fixtures`]: the schema-ready, fixture-loaded database the
+/// `api` and `messaging` integration tests run against. Dropping the guard removes the
+/// container.
+///
+/// # Errors
+///
+/// Returns the [`HarnessError`] of [`start_postgres`] or of [`load_fixtures`]. On a load error
+/// the guard drops before the error returns, which removes the container.
+pub async fn start_loaded_postgres() -> Result<PostgresGuard, HarnessError> {
+    let guard = start_postgres().await?;
+    load_fixtures(guard.pool()).await?;
+    Ok(guard)
+}
+
+/// The 50 card numbers of `carddata.txt`, in file order, each as its 16 digits.
+///
+/// Protected values (Cardholder Data Redaction): use them only as search needles in redaction
+/// assertions, and never print, trace or format one into a message. `cardxref.txt` holds the
+/// same 50 numbers.
+///
+/// # Errors
+///
+/// Returns a [`HarnessError`] when `carddata.txt` cannot be read, when codec A refuses a line
+/// or a key does not rise, or when a card number is not UTF-8.
+pub fn fixture_card_numbers() -> Result<Vec<String>, HarnessError> {
+    decode_job::<CardRecord>(LoadJob::Cardfile)?
+        .into_iter()
+        .map(|card| {
+            String::from_utf8(card.num.expose().as_bytes().to_vec()).map_err(|err| {
+                HarnessError::new(NEEDLE_CONTEXT, &format_args!("carddata.txt: {err}"))
+            })
+        })
+        .collect()
+}
+
+/// The 50 SSNs of `custdata.txt`, in file order, each as its 9 digits, leading zeros included.
+///
+/// Protected values (Cardholder Data Redaction): use them only as search needles in redaction
+/// assertions, and never print, trace or format one into a message.
+///
+/// # Errors
+///
+/// Returns a [`HarnessError`] when `custdata.txt` cannot be read, or when codec A refuses a
+/// line or a key does not rise.
+pub fn fixture_ssns() -> Result<Vec<String>, HarnessError> {
+    Ok(decode_job::<CustomerRecord>(LoadJob::Custfile)?
+        .into_iter()
+        .map(|customer| format!("{:09}", customer.ssn.expose().get()))
+        .collect())
+}
+
+/// Every SSN of [`fixture_ssns`] in both forms a leak could take, the 9 digits and the
+/// `NNN-NN-NNNN` form: 100 strings, each SSN's plain form followed by its dashed form.
+///
+/// Protected values (Cardholder Data Redaction): use them only as search needles in redaction
+/// assertions, and never print, trace or format one into a message.
+///
+/// # Errors
+///
+/// Returns the [`HarnessError`] of [`fixture_ssns`], or one when an SSN is not 9 ASCII digits.
+pub fn fixture_ssn_forms() -> Result<Vec<String>, HarnessError> {
+    let mut forms = Vec::new();
+    for ssn in fixture_ssns()? {
+        let dashed = dashed_ssn(&ssn).ok_or_else(|| {
+            HarnessError::new(
+                NEEDLE_CONTEXT,
+                &"custdata.txt: an SSN is not 9 ASCII digits",
+            )
+        })?;
+        forms.push(ssn);
+        forms.push(dashed);
+    }
+    Ok(forms)
+}
+
+/// The `SEC-USR-PWD` bytes of the 10 in-stream records of `DUSRSECJ.jcl`, in deck order, each
+/// 8 bytes (`PASSWORD` for every fixture user).
+///
+/// Protected values (Cardholder Data Redaction): use them only as search needles in redaction
+/// assertions, and never print, trace or format one into a message.
+///
+/// # Errors
+///
+/// Returns a [`HarnessError`] when `DUSRSECJ.jcl` cannot be read, holds no in-stream records,
+/// or holds a record codec A refuses or a user ID that does not rise.
+pub fn fixture_user_passwords() -> Result<Vec<Vec<u8>>, HarnessError> {
+    Ok(decode_users()?
+        .into_iter()
+        .map(|user| user.pwd.expose().to_vec())
+        .collect())
+}
+
+/// A table one load replaces, with the repository whose `replace_all` replaces it.
+///
+/// Every repository trait names the method `replace_all`, so each implementation names its
+/// trait to choose one.
+trait Table: Sized + Sync {
+    /// Deletes every row of the table and inserts `rows` in slice order inside `tx`,
+    /// returning how many rows were inserted.
+    fn replace(
+        tx: &mut PgTx<'_>,
+        rows: &[Self],
+    ) -> impl Future<Output = Result<u64, PersistenceError>> + Send;
+}
+
+/// Implements [`Table`] for each row type by delegating to its repository's `replace_all`.
+macro_rules! tables {
+    ($($row:ty => $repository:ident;)+) => {$(
+        impl Table for $row {
+            fn replace(
+                tx: &mut PgTx<'_>,
+                rows: &[Self],
+            ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+                $repository::replace_all(tx, rows)
+            }
+        }
+    )+};
+}
+
+tables! {
+    AccountRecord => AccountRepository;
+    CardRecord => CardRepository;
+    CardXrefRecord => CardXrefRepository;
+    CustomerRecord => CustomerRepository;
+    DisclosureGroupRecord => DisclosureGroupRepository;
+    TranCatBalanceRecord => TranCatBalanceRepository;
+    TransactionCategoryRecord => TransactionCategoryRepository;
+    TransactionTypeRecord => TransactionTypeRepository;
+    HashedUser => UserRepository;
+}
+
+/// Runs the load `job`: decodes its input, then replaces its table.
+async fn load(store: &PgStore, job: LoadJob) -> Result<u64, HarnessError> {
+    match job {
+        LoadJob::Acctfile => replace(store, job, &decode_job::<AccountRecord>(job)?).await,
+        LoadJob::Cardfile => replace(store, job, &decode_job::<CardRecord>(job)?).await,
+        LoadJob::Xreffile => replace(store, job, &decode_job::<CardXrefRecord>(job)?).await,
+        LoadJob::Custfile => replace(store, job, &decode_job::<CustomerRecord>(job)?).await,
+        LoadJob::Discgrp => replace(store, job, &decode_job::<DisclosureGroupRecord>(job)?).await,
+        LoadJob::Tcatbalf => replace(store, job, &decode_job::<TranCatBalanceRecord>(job)?).await,
+        LoadJob::Trancatg => {
+            replace(store, job, &decode_job::<TransactionCategoryRecord>(job)?).await
+        }
+        LoadJob::Trantype => replace(store, job, &decode_job::<TransactionTypeRecord>(job)?).await,
+        LoadJob::Dusrsecj => replace(store, job, hashed_users()?).await,
+    }
+}
+
+/// Replaces the table of `T` with `rows` in one transaction of its own, which commits only when
+/// the load inserted the row count of its fixture. Dropping the transaction on an early return
+/// rolls the replacement back, so a failure leaves the table as it was.
+async fn replace<T: Table>(store: &PgStore, job: LoadJob, rows: &[T]) -> Result<u64, HarnessError> {
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|err| store_error(job, "begin", &err))?;
+    let written = T::replace(&mut tx, rows)
+        .await
+        .map_err(|err| store_error(job, "replace", &err))?;
+    let expected = expected_rows(job);
+    if written != expected {
+        return Err(HarnessError::new(
+            LOAD_CONTEXT,
+            &format_args!(
+                "{} inserted {written} rows, expected {expected}",
+                job.subcommand()
+            ),
+        ));
+    }
+    tx.commit()
+        .await
+        .map_err(|err| store_error(job, "commit", &err))?;
+    Ok(written)
+}
+
+/// The records of the fixture file of `job`, in file order: codec A over every line, then the
+/// key-sequence check of the job, then the framing dropped, since no column stores it.
+fn decode_job<R: FixedRecord>(job: LoadJob) -> Result<Vec<R>, HarnessError> {
+    let Some(file) = job.fixture_file() else {
+        return Err(HarnessError::new(
+            LOAD_CONTEXT,
+            &format_args!("{} loads no fixture file", job.subcommand()),
+        ));
+    };
+    let bytes = read(&fixture_path(file))?;
+    let framed = decode_fixture::<R>(&bytes).map_err(|err| decode_error(job, file, &err))?;
+    check_key_sequence(job, &framed).map_err(|err| decode_error(job, file, &err))?;
+    Ok(framed.into_iter().map(|line| line.record).collect())
+}
+
+/// The in-stream `USRSEC` records of `DUSRSECJ.jcl`, in deck order, their user IDs checked to
+/// rise, their framing dropped.
+fn decode_users() -> Result<Vec<UserSecurityRecord>, HarnessError> {
+    let deck = read(&dusrsecj_path())?;
+    let framed = decode_usrsec(&deck)
+        .map_err(|err| decode_error(LoadJob::Dusrsecj, "DUSRSECJ.jcl", &err))?;
+    Ok(framed.into_iter().map(|line| line.record).collect())
+}
+
+/// The `USRSEC` records with their argon2id hashes, computed on the first call of the process
+/// and kept in [`HASHED_USERS`] for every later one.
+fn hashed_users() -> Result<&'static [HashedUser], HarnessError> {
+    if let Some(users) = HASHED_USERS.get() {
+        return Ok(users);
+    }
+    let computed = decode_users()?
+        .into_iter()
+        .map(hash_user)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| decode_error(LoadJob::Dusrsecj, "DUSRSECJ.jcl", &err))?;
+    // A concurrent first call may have stored its own set meanwhile; either set is valid.
+    Ok(HASHED_USERS.get_or_init(|| computed))
+}
+
+/// The row count the fixture of `job` holds (`modern/audit/fixtures.md`).
+const fn expected_rows(job: LoadJob) -> u64 {
+    match job {
+        LoadJob::Acctfile
+        | LoadJob::Cardfile
+        | LoadJob::Xreffile
+        | LoadJob::Custfile
+        | LoadJob::Tcatbalf => 50,
+        LoadJob::Discgrp => 51,
+        LoadJob::Trancatg => 18,
+        LoadJob::Trantype => 7,
+        LoadJob::Dusrsecj => 10,
+    }
+}
+
+/// The whole file at `path`. The error names the file, never its contents.
+fn read(path: &Path) -> Result<Vec<u8>, HarnessError> {
+    fs::read(path).map_err(|err| {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        HarnessError::new("read fixture", &format_args!("{name}: {err}"))
+    })
+}
+
+/// `ssn`, 9 ASCII digits, as `NNN-NN-NNNN`, or `None` for any other text.
+fn dashed_ssn(ssn: &str) -> Option<String> {
+    if ssn.len() != 9 || !ssn.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{}",
+        ssn.get(0..3)?,
+        ssn.get(3..5)?,
+        ssn.get(5..9)?
+    ))
+}
+
+/// A decode, key or hash failure of `job` over `file`; `err` is a value-free `LoadError`.
+fn decode_error(job: LoadJob, file: &str, err: &dyn fmt::Display) -> HarnessError {
+    HarnessError::new(
+        LOAD_CONTEXT,
+        &format_args!("{} over {file}: {err}", job.subcommand()),
+    )
+}
+
+/// A store failure of `job` at `step`; `err` is a value-free `PersistenceError`.
+fn store_error(job: LoadJob, step: &str, err: &dyn fmt::Display) -> HarnessError {
+    HarnessError::new(
+        LOAD_CONTEXT,
+        &format_args!("{} {step}: {err}", job.subcommand()),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+    use std::error::Error;
+    use std::path::Path;
+    use std::ptr;
+
+    use copybook::lines;
+    use persistence::domain::batch::loads::{LoadJob, usrsec_instream_lines};
+    use persistence::domain::password;
+    use persistence::domain::records::{
+        AccountRecord, CardRecord, CardXrefRecord, CustomerRecord, DisclosureGroupRecord,
+        TranCatBalanceRecord, TransactionCategoryRecord, TransactionTypeRecord,
+    };
+
+    use super::{
+        dashed_ssn, decode_job, decode_users, dusrsecj_path, expected_rows, fixture_card_numbers,
+        fixture_dir, fixture_path, fixture_ssn_forms, fixture_ssns, fixture_user_passwords,
+        hashed_users, load_fixtures, read, start_loaded_postgres,
+    };
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    /// The subcommands and row counts every run of the nine loads reports, in load order.
+    const LOADED: [(&str, u64); 9] = [
+        ("acctfile", 50),
+        ("cardfile", 50),
+        ("xreffile", 50),
+        ("custfile", 50),
+        ("discgrp", 51),
+        ("tcatbalf", 50),
+        ("trancatg", 18),
+        ("trantype", 7),
+        ("dusrsecj", 10),
+    ];
+
+    /// The bytes `start..end` of every line of the fixture `file`, read by offset as the
+    /// verification reference of the module documentation.
+    fn columns(file: &str, start: usize, end: usize) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let bytes = read(&fixture_path(file))?;
+        lines(&bytes)
+            .map(|line| {
+                line.body
+                    .get(start..end)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| format!("{file}: a line is shorter than {end} bytes").into())
+            })
+            .collect()
+    }
+
+    /// The paths name the fixtures where they lie, under the repository root.
+    #[test]
+    fn paths_name_the_fixtures_in_place() {
+        assert!(fixture_dir().ends_with("app/data/ASCII"));
+        assert_eq!(
+            fixture_path("acctdata.txt"),
+            fixture_dir().join("acctdata.txt")
+        );
+        for job in LoadJob::ALL {
+            let path = job.fixture_file().map_or_else(dusrsecj_path, fixture_path);
+            assert!(path.is_file(), "{}", path.display());
+        }
+    }
+
+    /// Every fixture decodes to the row count its load must report, in the order of
+    /// [`LoadJob::ALL`].
+    #[test]
+    fn every_fixture_holds_the_rows_its_load_reports() -> TestResult {
+        let decoded = [
+            decode_job::<AccountRecord>(LoadJob::Acctfile)?.len(),
+            decode_job::<CardRecord>(LoadJob::Cardfile)?.len(),
+            decode_job::<CardXrefRecord>(LoadJob::Xreffile)?.len(),
+            decode_job::<CustomerRecord>(LoadJob::Custfile)?.len(),
+            decode_job::<DisclosureGroupRecord>(LoadJob::Discgrp)?.len(),
+            decode_job::<TranCatBalanceRecord>(LoadJob::Tcatbalf)?.len(),
+            decode_job::<TransactionCategoryRecord>(LoadJob::Trancatg)?.len(),
+            decode_job::<TransactionTypeRecord>(LoadJob::Trantype)?.len(),
+            decode_users()?.len(),
+        ];
+        for ((job, count), (subcommand, rows)) in LoadJob::ALL.into_iter().zip(decoded).zip(LOADED)
+        {
+            assert_eq!(job.subcommand(), subcommand);
+            assert_eq!(expected_rows(job), rows, "{subcommand}");
+            assert_eq!(u64::try_from(count)?, rows, "{subcommand}");
+        }
+        Ok(())
+    }
+
+    /// A job without a fixture file and an unreadable file fail with the job or the file name
+    /// and the reason, nothing more.
+    #[test]
+    fn failures_name_the_job_or_the_file_only() {
+        let no_file = decode_job::<AccountRecord>(LoadJob::Dusrsecj).map(|rows| rows.len());
+        assert_eq!(
+            no_file.map_err(|err| err.to_string()),
+            Err("load fixtures: dusrsecj loads no fixture file".to_owned())
+        );
+
+        let missing = read(Path::new("/nonexistent/carddemo-fixture.txt")).map(|bytes| bytes.len());
+        let Err(err) = missing else {
+            panic!("a missing file was read");
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("read fixture: carddemo-fixture.txt: "),
+            "{text}"
+        );
+        assert!(!text.contains("/nonexistent"), "{text}");
+    }
+
+    /// The card numbers are the 16-digit `CARD-NUM` of every `carddata.txt` line, the same 50
+    /// values as the `XREF-CARD-NUM` of `cardxref.txt`.
+    #[test]
+    fn card_numbers_are_the_card_num_field_of_every_card() -> TestResult {
+        let numbers = fixture_card_numbers()?;
+        assert_eq!(numbers.len(), 50);
+        assert_eq!(
+            numbers.first().map(String::as_str),
+            Some("0500024453765740")
+        );
+        assert!(
+            numbers
+                .iter()
+                .all(|number| number.len() == 16 && number.bytes().all(|b| b.is_ascii_digit()))
+        );
+
+        let by_offset = columns("carddata.txt", 0, 16)?;
+        let as_bytes: Vec<Vec<u8>> = numbers
+            .iter()
+            .map(|number| number.clone().into_bytes())
+            .collect();
+        assert_eq!(as_bytes, by_offset);
+
+        let cards: BTreeSet<Vec<u8>> = by_offset.into_iter().collect();
+        let xrefs: BTreeSet<Vec<u8>> = columns("cardxref.txt", 0, 16)?.into_iter().collect();
+        assert_eq!(cards.len(), 50);
+        assert_eq!(cards, xrefs);
+        Ok(())
+    }
+
+    /// The SSNs are the 9-digit `CUST-SSN` of every `custdata.txt` line, and each appears plain
+    /// and dashed among the forms.
+    #[test]
+    fn ssns_are_the_cust_ssn_field_in_both_forms() -> TestResult {
+        let ssns = fixture_ssns()?;
+        assert_eq!(ssns.len(), 50);
+        assert_eq!(ssns.first().map(String::as_str), Some("020973888"));
+        let as_bytes: Vec<Vec<u8>> = ssns.iter().map(|ssn| ssn.clone().into_bytes()).collect();
+        assert_eq!(as_bytes, columns("custdata.txt", 279, 288)?);
+
+        let forms = fixture_ssn_forms()?;
+        assert_eq!(forms.len(), 100);
+        assert_eq!(
+            forms.get(..2),
+            Some(["020973888".to_owned(), "020-97-3888".to_owned()].as_slice())
+        );
+        for (pair, ssn) in forms.chunks(2).zip(&ssns) {
+            assert_eq!(pair.first(), Some(ssn));
+            assert_eq!(pair.get(1).cloned(), dashed_ssn(ssn));
+        }
+        Ok(())
+    }
+
+    /// Only 9 ASCII digits take the dashed form.
+    #[test]
+    fn dashed_ssn_accepts_nine_digits_only() {
+        assert_eq!(dashed_ssn("123456789").as_deref(), Some("123-45-6789"));
+        for text in [
+            "",
+            "12345678",
+            "1234567890",
+            "12345678a",
+            "123-45-678",
+            "１２３456789",
+        ] {
+            assert_eq!(dashed_ssn(text), None, "{text}");
+        }
+    }
+
+    /// The passwords are the 8-byte `SEC-USR-PWD` of the ten in-stream records.
+    #[test]
+    fn passwords_are_the_sec_usr_pwd_field_of_every_user() -> TestResult {
+        let passwords = fixture_user_passwords()?;
+        assert_eq!(passwords.len(), 10);
+        assert!(passwords.iter().all(|pwd| pwd.as_slice() == b"PASSWORD"));
+
+        let deck = read(&dusrsecj_path())?;
+        let by_offset = usrsec_instream_lines(&deck)?
+            .into_iter()
+            .map(|line| {
+                line.body
+                    .get(48..56)
+                    .map(<[u8]>::to_vec)
+                    .ok_or("a short card")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert_eq!(passwords, by_offset);
+        Ok(())
+    }
+
+    /// The users are hashed once per process, and every stored hash verifies its record's
+    /// password.
+    #[test]
+    fn hashed_users_are_computed_once_and_verify() -> TestResult {
+        let first = hashed_users()?;
+        let again = hashed_users()?;
+        assert!(ptr::eq(first, again));
+        assert_eq!(first.len(), 10);
+        for user in first {
+            assert!(user.password_hash.starts_with("$argon2id$"));
+            assert!(password::verify(
+                user.record.pwd.expose(),
+                &user.password_hash
+            )?);
+        }
+        Ok(())
+    }
+
+    /// The loaded database reports the nine counts, and a second run over the same database
+    /// reports them again.
+    #[tokio::test]
+    async fn the_loads_fill_the_nine_tables_and_rerun() -> Result<(), Box<dyn Error>> {
+        let guard = start_loaded_postgres().await?;
+        let expected: Vec<(String, u64)> = LOADED
+            .iter()
+            .map(|&(subcommand, rows)| (subcommand.to_owned(), rows))
+            .collect();
+        assert_eq!(load_fixtures(guard.pool()).await?, expected);
+        assert_eq!(load_fixtures(guard.pool()).await?, expected);
+        Ok(())
+    }
+}
