@@ -47,10 +47,10 @@ CREATE TABLE transactions (
     card_num           CHAR(16)      COLLATE "C" NOT NULL,
     -- Layout codes: I = 'YYYY-MM-DD HH:MM:SS.ffffff' (all 300 DALYTRAN-ORIG-TS values);
     -- D = the Db2 form 'YYYY-MM-DD-HH.MM.SS.ffffff'; S = a 10-character screen date followed by
-    -- 16 spaces, stored at midnight. A NULL timestamp with a NULL form is 26 spaces (all 300
-    -- DALYTRAN-PROC-TS values). The code list is deliberately not constrained here: a further
-    -- layout an audited writer produces is added to modern/audit/copybooks.md and validated by
-    -- codec B (copybook::TsForm), so the schema stays expand-only.
+    -- 16 spaces, stored at midnight (PIC-020). A NULL timestamp with a NULL form is 26 spaces
+    -- (all 300 DALYTRAN-PROC-TS values). The checks below admit only these audited codes, which
+    -- copybook::TsForm decodes (PIC-018 to PIC-021). A further layout an audited writer produces
+    -- gets its code in modern/audit/copybooks.md first, then a later numbered migration admits it.
     orig_ts            TIMESTAMP(6),
     orig_ts_form       CHAR(1)       COLLATE "C",
     proc_ts            TIMESTAMP(6),
@@ -60,7 +60,15 @@ CREATE TABLE transactions (
     CONSTRAINT transactions_pkey PRIMARY KEY (tran_id),
     -- A timestamp and its layout code are present together or absent together.
     CONSTRAINT transactions_orig_ts_form_ck CHECK ((orig_ts IS NULL) = (orig_ts_form IS NULL)),
-    CONSTRAINT transactions_proc_ts_form_ck CHECK ((proc_ts IS NULL) = (proc_ts_form IS NULL))
+    CONSTRAINT transactions_proc_ts_form_ck CHECK ((proc_ts IS NULL) = (proc_ts_form IS NULL)),
+    -- A layout code is one of the audited I, D and S; a NULL code is left to the checks above.
+    CONSTRAINT transactions_orig_ts_form_code_ck CHECK (orig_ts_form IN ('I', 'D', 'S')),
+    CONSTRAINT transactions_proc_ts_form_code_ck CHECK (proc_ts_form IN ('I', 'D', 'S')),
+    -- A form-S value is its screen date at 00:00:00.000000, the only time it encodes (PIC-020).
+    CONSTRAINT transactions_orig_ts_screen_date_ck
+        CHECK (orig_ts_form <> 'S' OR CAST(orig_ts AS TIME) = TIME '00:00:00'),
+    CONSTRAINT transactions_proc_ts_screen_date_ck
+        CHECK (proc_ts_form <> 'S' OR CAST(proc_ts AS TIME) = TIME '00:00:00')
 );
 
 -- Replaces the AIX KEYS(26 304), NONUNIQUEKEY [app/jcl/TRANIDX.jcl:25-28]: it serves tranrept's
