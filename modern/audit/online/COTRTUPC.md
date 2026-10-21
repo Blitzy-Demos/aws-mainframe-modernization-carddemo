@@ -162,8 +162,8 @@ Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `
 - `X-COTRTUPC-8`
   - Found in: `cbl/COTRTUPC.cbl:352-353,524-533,988-1008`; `modern/audit/screens.md` (COTRTUP-037, X-SCREENS-15).
   - Anomaly class: declaration-not-followed.
-  - Finding: the F12 path performs no `1000-PROCESS-INPUTS`, so `WS-EDIT-TTYP-FLAG` keeps the spaces of `INITIALIZE WS-MISC-STORAGE`, `FLG-TRANFILTER-ISVALID` (low-values) is false, the `9000-READ-TRANTYPE` of line 991 never runs, and the `SET FOUND-TRANTYPE-IN-TABLE` of line 528 has no effect. F12 never re-reads the record, contrary to X-SCREENS-15's finding for CTTU, and F12 in state 9 goes to the blank fresh screen rather than back to the details, as COTRTUP-037's "returns to the state before it" would have it.
-  - Proposed resolution: F12 stays client-side with the outcomes of COTRTUPC-039 to COTRTUPC-041; the reviewer reads X-SCREENS-15 and COTRTUP-037 with this correction.
+  - Finding: the F12 path performs no `1000-PROCESS-INPUTS`, so `WS-EDIT-TTYP-FLAG` keeps the spaces of `INITIALIZE WS-MISC-STORAGE`, `FLG-TRANFILTER-ISVALID` (low-values) is false, the `9000-READ-TRANTYPE` of line 991 never runs, and the `SET FOUND-TRANTYPE-IN-TABLE` of line 528 has no effect. F12 therefore never re-reads the record, and in state 9 it shows the blank fresh screen rather than the details. `screens.md` states the same: X-SCREENS-15 and COTRTUP-037 both say that CTTU reads nothing on F12, and both give the outcomes of COTRTUPC-039 to COTRTUPC-041 for each state.
+  - Proposed resolution: F12 stays client-side with the outcomes of COTRTUPC-039 to COTRTUPC-041, which X-SCREENS-15 and COTRTUP-037 also give.
 - `X-COTRTUPC-9`
   - Found in: `cbl/COTRTUPC.cbl:1074-1077,1677-1682`; `app/cpy/CSMSG02Y.cpy:28-29`.
   - Anomaly class: declaration-not-followed.

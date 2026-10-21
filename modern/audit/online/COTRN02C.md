@@ -124,8 +124,8 @@ Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `
 - `X-COTRN02C-3`
   - Found in: `app/cbl/COTRN02C.cbl:471-495`; `modern/audit/screens.md` row `COTRN02-071`.
   - Anomaly class: declaration-not-followed.
-  - Finding: PF5 validates and resolves the key, then copies the data of the highest-ID transaction in the whole file, whichever card it belongs to; the browse ignores the key it has just resolved, so the "last transaction" is another card's whenever another card holds the highest ID. Row `COTRN02-071` of `screens.md` describes the copy as "the account's last transaction".
-  - Proposed resolution: preserved (Behaviour constraint): the copy reads the highest `tran_id` with no card or account filter (COTRN02C-053). The reviewer corrects the wording of `COTRN02-071`, a `client` row whose server effect this file governs.
+  - Finding: PF5 validates and resolves the key, then copies the data of the highest-ID transaction in the whole file, whichever card it belongs to; the browse ignores the key it has just resolved, so the "last transaction" is another card's whenever another card holds the highest ID. Row `COTRN02-071` of `screens.md`, the `F5=Copy Last Tran.` key, states PF5 as COTRN02C-053 does: the key edits first, then a copy of the highest-`TRAN-ID` transaction in the whole file, read backward from `HIGH-VALUES` with no account or card filter, with the resolved key left on the screen.
+  - Proposed resolution: preserved (Behaviour constraint): the copy reads the highest `tran_id` with no card or account filter (COTRN02C-053). `COTRN02-071`, a `client` row whose server effect this file governs, keeps that wording and cites this candidate.
 - `X-COTRN02C-4`
   - Found in: `app/cbl/COTRN02C.cbl:59,481,485`; `app/cpy/CVTRA05Y.cpy:10`.
   - Anomaly class: declaration-not-followed.
