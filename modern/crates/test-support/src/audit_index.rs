@@ -20,9 +20,9 @@
 //! - The `Layer` column (`server`, `client`, `both`) exists in `online/*.md` and `screens.md`
 //!   and nowhere else.
 //! - A row whose expected value a halt blocks says `HALTED(Hn)` in its `Expected result` cell.
-//!   The halt is a row of `HALTS.md`, whose `Status` decides [`AuditIndex::is_blocked`]; the
-//!   coverage test exempts a blocked rule from its tag requirement and reports it `BLOCKED`,
-//!   never passed (AAP 0.8.5).
+//!   The halt is a row of `HALTS.md`, whose `Status` decides [`AuditIndex::is_blocked`]. A
+//!   blocked rule still requires its layer's tags: the coverage test reports it `BLOCKED`, never
+//!   passed (AAP 0.8.5), and fails it when a required tag group is missing.
 //! - A test proves a rule with the comment `// audit: <MEMBER>-nnn`, one rule ID per comment.
 //!   Only the files [`scan_test_tags`] lists carry tags; such a comment in a unit test inside
 //!   `crates/*/src/` is a citation, not a tag.
@@ -799,8 +799,9 @@ impl Requirement {
 /// `frontend/e2e/nav.spec.ts` or a Vitest file; `both` one of each; a rule from a file without a
 /// `Layer` column one in any Rust test under `crates/*/tests/`.
 ///
-/// A rule for which [`AuditIndex::is_blocked`] holds still carries its tags, but the coverage
-/// test exempts it from this requirement and reports it `BLOCKED` (AAP 0.8.5).
+/// A rule for which [`AuditIndex::is_blocked`] holds requires the same tags (the README's
+/// `HALTED(Hn)` rows still carry theirs): the coverage test reports it `BLOCKED`, never passed
+/// (AAP 0.8.5), and fails it when a required tag group is missing.
 #[must_use]
 pub fn required_tags(rule: &AuditRule) -> Requirement {
     let frontend = || vec![TagKind::Nav, TagKind::Vitest];

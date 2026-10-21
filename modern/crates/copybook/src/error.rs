@@ -82,8 +82,9 @@ pub enum ErrorKind {
     /// Input remains after the last field of a record.
     TrailingBytes,
     /// A byte outside printable ASCII (0x20–0x7E) in a `PIC X(n)` field: a control byte, a CR
-    /// inside a line body, or a byte above 0x7E. `CHAR(n)` counts characters, not bytes, so such a
-    /// byte could not round-trip (PIC-002).
+    /// inside a line body, or a byte above 0x7E. The corpus holds none, so codec A raises one as an
+    /// anomaly (R7), a restriction of the codec rather than of `CHAR(n)`, which stores a non-NUL
+    /// control unchanged (PIC-002).
     NonPrintable,
     /// Encoding a short-bodied line would drop record bytes that are not spaces: the bytes
     /// beyond the line's `body_len` must be the blank trailing `FILLER` its decode supplied

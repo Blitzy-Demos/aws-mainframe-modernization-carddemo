@@ -114,11 +114,14 @@ fn ascii_digit(value: u128) -> u8 {
 
 /// COBOL `PIC X(n)`: exactly `N` bytes, padding kept and nothing trimmed (PIC-001).
 ///
-/// [`PicX::decode`] accepts printable ASCII only (`0x20`–`0x7E`): a control byte, a CR inside a
-/// line body or a byte above `0x7E` could not round-trip through a `CHAR(n)` column, which counts
-/// characters rather than bytes, so it is [`ErrorKind::NonPrintable`] (PIC-002). Every other byte
-/// is kept verbatim, `FILLER` contents included (PIC-012, E05). Values compare bytewise, which is
-/// the ASCII collating sequence.
+/// [`PicX::decode`] accepts printable ASCII only (`0x20`–`0x7E`): every fixture byte is printable
+/// ASCII, so a control byte, a CR inside a line body or a byte above `0x7E` is an anomaly raised as
+/// [`ErrorKind::NonPrintable`] (R7, PIC-002). The restriction is this codec's, not a `PostgreSQL`
+/// one: a non-NUL control such as TAB, CR or `0x7F` would round-trip through `CHAR(n)` and is
+/// still rejected, while NUL and a byte above `0x7F` could not be stored byte for byte either, as
+/// no text value holds NUL and a lone byte above `0x7F` is not valid UTF-8. Every other byte is
+/// kept verbatim, `FILLER` contents included (PIC-012, E05). Values compare bytewise, which is the
+/// ASCII collating sequence.
 ///
 /// `Debug` shows the text, so a protected field (card number, SSN, CVV, password) is never held
 /// as a bare `PicX` outside the `domain::sensitive` wrappers, whose `Debug` redacts it (PIC-024,

@@ -23,10 +23,10 @@
 //! repository source and is not claimed as parity (`X-ARITH-7` in `modern/audit/arithmetic.md`).
 //!
 //! Formatting only: de-editing input (`FUNCTION NUMVAL`) belongs to `domain`, so this module
-//! parses nothing and adds no untrusted-input surface. `PIC-022` describes the `+9(10).99`
-//! fields as rendered and parsed here, but `CCPAURQY-009` records that the request token never
-//! passes through that picture, so only the rendering exists. Values are amounts, counts and
-//! SQL codes; no sensitive field is ever edited (Cardholder Data Redaction).
+//! parses nothing and adds no untrusted-input surface. `PIC-022` and `CCPAURQY-009` record that
+//! the `+9(10).99` fields are only rendered here: the request token never passes through that
+//! picture. Values are amounts, counts and SQL codes; no sensitive field is ever edited
+//! (Cardholder Data Redaction).
 
 use rust_decimal::Decimal;
 
