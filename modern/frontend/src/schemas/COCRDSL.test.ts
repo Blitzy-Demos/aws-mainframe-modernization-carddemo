@@ -5,12 +5,16 @@ import { COCRDSL_LENGTHS, type CocrdslValues, cocrdslSchema } from "./COCRDSL";
  * Unit tests of the `CCRDSLA` form schema. They prove the client half of the two `both` rows of
  * `modern/audit/screens.md`, the map `LENGTH` of `ACCTSID` and `CARDSID`, with zod's default
  * message, as the audit records none. Every COCRDSLC edit is a `server` row the endpoint owns, so
- * blank inputs pass here and no program message is asserted. All values are synthetic.
+ * blank inputs and the redacted number a re-entry shows pass here, and no program message is
+ * asserted. All values are synthetic.
  */
 
 /** An account ID and a card number at their full map lengths. */
 const ACCT_ID = "00000000001";
 const CARD_NUM = ["4444", "3333", "2222", "1111"].join("");
+
+/** The card input after a response for a non-admin token: twelve `*` and the last four digits. */
+const REDACTED_CARD_NUM = `${"*".repeat(12)}${CARD_NUM.slice(-4)}`;
 
 type ParseCase = { name: string; values: CocrdslValues };
 type LengthCase = { field: keyof CocrdslValues; length: number; message: string };
@@ -23,6 +27,10 @@ describe("cocrdslSchema", () => {
   it.each<ParseCase>([
     { name: "a typed account and card number", values: { acctId: ACCT_ID, cardNum: CARD_NUM } },
     { name: "a blank card number (card_ref path)", values: { acctId: ACCT_ID, cardNum: "" } },
+    {
+      name: "a redacted card number (unchanged re-entry, card_ref path)",
+      values: { acctId: ACCT_ID, cardNum: REDACTED_CARD_NUM },
+    },
     { name: "a blank account and card number", values: { acctId: "", cardNum: "" } },
   ])("parses $name unchanged", ({ values }) => {
     expect(cocrdslSchema.safeParse(values)).toEqual({ success: true, data: values });
@@ -39,6 +47,18 @@ describe("cocrdslSchema", () => {
     expect(boundary.success).toBe(true);
     const over = cocrdslSchema.safeParse({ ...valid, [field]: "9".repeat(length + 1) });
     expect(over.success).toBe(false);
+    expect(over.error?.issues).toHaveLength(1);
     expect(over.error?.issues[0]).toMatchObject({ path: [field], message });
+  });
+
+  // Each map LENGTH is a field attribute the terminal enforced on its own field, not a program
+  // edit whose first error stands, so both issues are reported, in map order: account first.
+  it("reports the account length first when both inputs exceed their map LENGTH", () => {
+    const result = cocrdslSchema.safeParse({ acctId: "9".repeat(12), cardNum: "9".repeat(17) });
+    expect(result.success).toBe(false);
+    expect(result.error?.issues.map(({ path, message }) => ({ path, message }))).toEqual([
+      { path: ["acctId"], message: "String must contain at most 11 character(s)" },
+      { path: ["cardNum"], message: "String must contain at most 16 character(s)" },
+    ]);
   });
 });
