@@ -7,8 +7,9 @@
 //! the add inserts and the messages of its browse and write (COTRN02C-043 to COTRN02C-051), the
 //! PF5 copy (COTRN02C-052 to COTRN02C-056) and what a 200 response carries (COTRN02C-057). The
 //! `client` rows, F3, F4 and every other key among them (COTRN02C-004 to COTRN02C-006), send no
-//! request and belong to the screen; an `aid` other than ENTER and PF5 never reaches this module,
-//! because the request DTO answers it (COTRN02C-007).
+//! request and belong to the screen. A request whose `aid` is neither ENTER nor PF5 gets
+//! [`AddFailure::invalid_key`], the `WHEN OTHER` branch of the key `EVALUATE`, before anything
+//! is read (COTRN02C-007).
 //!
 //! # Flow
 //!
@@ -74,6 +75,7 @@ use copybook::edited::EditedPicture;
 use copybook::{CobolTimestamp, PicTimestamp, PicU, PicX, TsForm};
 
 use super::csutldtc::{DateMask, LeResult, caller_accepts, validate};
+use crate::messages::CCDA_MSG_INVALID_KEY;
 use crate::money::{Decimal, Money, MoneyExpr};
 use crate::records::card_xref::CardXrefRecord;
 use crate::records::transaction::TransactionRecord;
@@ -256,12 +258,13 @@ impl FailureClass {
 /// status class (COTRN02C-008).
 ///
 /// The message is the literal moved to `WS-MESSAGE PIC X(80)` without its trailing spaces, as
-/// the response carries it. None holds a request value, so a failure can be logged or returned
-/// as it stands (Cardholder Data Redaction).
+/// the response carries it, except for [`AddFailure::invalid_key`], whose audited message is the
+/// whole 50-byte `CCDA-MSG-INVALID-KEY` (COTRN02C-007). None holds a request value, so a failure
+/// can be logged or returned as it stands (Cardholder Data Redaction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AddFailure {
     message: &'static str,
-    field: AddField,
+    field: Option<AddField>,
     class: FailureClass,
 }
 
@@ -270,7 +273,7 @@ impl AddFailure {
     const fn input(message: &'static str, field: AddField) -> Self {
         Self {
             message,
-            field,
+            field: Some(field),
             class: FailureClass::Input,
         }
     }
@@ -279,7 +282,7 @@ impl AddFailure {
     const fn not_found(message: &'static str, field: AddField) -> Self {
         Self {
             message,
-            field,
+            field: Some(field),
             class: FailureClass::NotFound,
         }
     }
@@ -288,8 +291,24 @@ impl AddFailure {
     const fn store(message: &'static str, field: AddField) -> Self {
         Self {
             message,
-            field,
+            field: Some(field),
             class: FailureClass::Store,
+        }
+    }
+
+    /// A request whose `aid` is neither ENTER nor PF5, a key the screen never sends
+    /// (COTRN02C-006, COTRN02C-007): `Invalid key pressed. Please see below...`, the 50-byte
+    /// `CCDA-MSG-INVALID-KEY` with its trailing spaces, on no field, status 400.
+    ///
+    /// It is the `WHEN OTHER` branch of `MAIN-PARA`'s key `EVALUATE` (`COTRN02C.cbl:148-151`),
+    /// which sends the screen without a read or a write, so the service answers it before it
+    /// touches the store.
+    #[must_use]
+    pub const fn invalid_key() -> Self {
+        Self {
+            message: CCDA_MSG_INVALID_KEY,
+            field: None,
+            class: FailureClass::Input,
         }
     }
 
@@ -337,9 +356,10 @@ impl AddFailure {
         self.message
     }
 
-    /// The field the cursor goes to.
+    /// The field the cursor goes to; `None` only for [`AddFailure::invalid_key`], which names
+    /// no field (COTRN02C-007).
     #[must_use]
-    pub const fn field(&self) -> AddField {
+    pub const fn field(&self) -> Option<AddField> {
         self.field
     }
 
@@ -358,8 +378,9 @@ impl fmt::Display for AddFailure {
 
 impl std::error::Error for AddFailure {}
 
-/// The two attention keys endpoint 13 serves (COTRN02C-007). Any other key the screen handles
-/// itself or the request DTO refuses, so it never reaches this module.
+/// The two attention keys endpoint 13 serves (COTRN02C-007). F3 and F4 are the screen's own
+/// (COTRN02C-004, COTRN02C-005); any other key a request names is answered with
+/// [`AddFailure::invalid_key`] before anything is read (COTRN02C-006, COTRN02C-007).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Aid {
     /// ENTER, `PROCESS-ENTER-KEY`: the key edits, the data edits on the request's fields, then
@@ -1389,7 +1410,7 @@ mod tests {
     type TestResult = Result<(), String>;
 
     /// A failure as the response shows it: message, field and HTTP status.
-    type Shown = (&'static str, AddField, u16);
+    type Shown = (&'static str, Option<AddField>, u16);
 
     // The audited literals, written out apart from the module's own constants.
     const KEY_MISSING: &str = "Account or Card Number must be entered...";
@@ -1576,44 +1597,56 @@ mod tests {
     fn key_edits_reject_in_program_order() {
         let eleven_nuls = "\0".repeat(11);
         let cases: [(Option<&str>, Option<&str>, Shown); 11] = [
-            (None, None, (KEY_MISSING, AddField::AcctId, 400)),
-            (Some(""), Some("   "), (KEY_MISSING, AddField::AcctId, 400)),
+            (None, None, (KEY_MISSING, Some(AddField::AcctId), 400)),
+            (
+                Some(""),
+                Some("   "),
+                (KEY_MISSING, Some(AddField::AcctId), 400),
+            ),
             (
                 Some(&eleven_nuls),
                 None,
-                (KEY_MISSING, AddField::AcctId, 400),
+                (KEY_MISSING, Some(AddField::AcctId), 400),
             ),
-            (Some("123"), None, (ACCT_NOT_NUMERIC, AddField::AcctId, 400)),
+            (
+                Some("123"),
+                None,
+                (ACCT_NOT_NUMERIC, Some(AddField::AcctId), 400),
+            ),
             (
                 Some(" 0000000005"),
                 None,
-                (ACCT_NOT_NUMERIC, AddField::AcctId, 400),
+                (ACCT_NOT_NUMERIC, Some(AddField::AcctId), 400),
             ),
             (
                 Some("-0000000005"),
                 None,
-                (ACCT_NOT_NUMERIC, AddField::AcctId, 400),
+                (ACCT_NOT_NUMERIC, Some(AddField::AcctId), 400),
             ),
             (
                 Some("0000000005X"),
                 Some(CARD),
-                (ACCT_NOT_NUMERIC, AddField::AcctId, 400),
+                (ACCT_NOT_NUMERIC, Some(AddField::AcctId), 400),
             ),
-            (Some("\0"), None, (ACCT_NOT_NUMERIC, AddField::AcctId, 400)),
+            (
+                Some("\0"),
+                None,
+                (ACCT_NOT_NUMERIC, Some(AddField::AcctId), 400),
+            ),
             (
                 None,
                 Some("123456789012345"),
-                (CARD_NOT_NUMERIC, AddField::CardNum, 400),
+                (CARD_NOT_NUMERIC, Some(AddField::CardNum), 400),
             ),
             (
                 Some(" "),
                 Some("************3456"),
-                (CARD_NOT_NUMERIC, AddField::CardNum, 400),
+                (CARD_NOT_NUMERIC, Some(AddField::CardNum), 400),
             ),
             (
                 None,
                 Some("1234567890１23456"),
-                (CARD_NOT_NUMERIC, AddField::CardNum, 400),
+                (CARD_NOT_NUMERIC, Some(AddField::CardNum), 400),
             ),
         ];
         for (acct, card_num, expected) in cases {
@@ -1664,28 +1697,28 @@ mod tests {
             (
                 account()?,
                 XrefLookup::NotFound,
-                ("Account ID NOT found...", AddField::AcctId, 404),
+                ("Account ID NOT found...", Some(AddField::AcctId), 404),
             ),
             (
                 account()?,
                 XrefLookup::Error,
                 (
                     "Unable to lookup Acct in XREF AIX file...",
-                    AddField::AcctId,
+                    Some(AddField::AcctId),
                     500,
                 ),
             ),
             (
                 KeyRequest::Card(card()?),
                 XrefLookup::NotFound,
-                ("Card Number NOT found...", AddField::CardNum, 404),
+                ("Card Number NOT found...", Some(AddField::CardNum), 404),
             ),
             (
                 KeyRequest::Card(card()?),
                 XrefLookup::Error,
                 (
                     "Unable to lookup Card # in XREF file...",
-                    AddField::CardNum,
+                    Some(AddField::CardNum),
                     500,
                 ),
             ),
@@ -1708,14 +1741,14 @@ mod tests {
             }
             assert_eq!(
                 failed(&edit_data_with(&input, accept_all)),
-                Some((*message, *field, 400))
+                Some((*message, Some(*field), 400))
             );
             // A field of low-values is blank too; a single space is padded to blank.
             let low_values = "\0".repeat(60);
             for blank in [low_values.as_str(), " "] {
                 assert_eq!(
                     failed(&edit_data_with(&with(*field, blank), accept_all)),
-                    Some((*message, *field, 400))
+                    Some((*message, Some(*field), 400))
                 );
             }
         }
@@ -1728,32 +1761,32 @@ mod tests {
             (
                 AddField::TypeCd,
                 "1",
-                ("Type CD must be Numeric...", AddField::TypeCd, 400),
+                ("Type CD must be Numeric...", Some(AddField::TypeCd), 400),
             ),
             (
                 AddField::TypeCd,
                 "A1",
-                ("Type CD must be Numeric...", AddField::TypeCd, 400),
+                ("Type CD must be Numeric...", Some(AddField::TypeCd), 400),
             ),
             (
                 AddField::TypeCd,
                 "+1",
-                ("Type CD must be Numeric...", AddField::TypeCd, 400),
+                ("Type CD must be Numeric...", Some(AddField::TypeCd), 400),
             ),
             (
                 AddField::CatCd,
                 "5",
-                ("Category CD must be Numeric...", AddField::CatCd, 400),
+                ("Category CD must be Numeric...", Some(AddField::CatCd), 400),
             ),
             (
                 AddField::CatCd,
                 " 005",
-                ("Category CD must be Numeric...", AddField::CatCd, 400),
+                ("Category CD must be Numeric...", Some(AddField::CatCd), 400),
             ),
             (
                 AddField::CatCd,
                 "00.5",
-                ("Category CD must be Numeric...", AddField::CatCd, 400),
+                ("Category CD must be Numeric...", Some(AddField::CatCd), 400),
             ),
         ];
         for (field, value, expected) in cases {
@@ -1770,7 +1803,7 @@ mod tests {
         };
         assert_eq!(
             failed(&edit_data_with(&both, accept_all)),
-            Some(("Type CD must be Numeric...", AddField::TypeCd, 400))
+            Some(("Type CD must be Numeric...", Some(AddField::TypeCd), 400))
         );
     }
 
@@ -1790,7 +1823,7 @@ mod tests {
         for amount in refused {
             assert_eq!(
                 failed(&edit_data_with(&with(AddField::Amount, amount), accept_all)),
-                Some((AMOUNT_FORMAT, AddField::Amount, 400)),
+                Some((AMOUNT_FORMAT, Some(AddField::Amount), 400)),
                 "{amount:?}"
             );
         }
@@ -1802,7 +1835,7 @@ mod tests {
         };
         assert_eq!(
             failed(&edit_data_with(&both, accept_all)),
-            Some((AMOUNT_FORMAT, AddField::Amount, 400))
+            Some((AMOUNT_FORMAT, Some(AddField::Amount), 400))
         );
         // The last is cut to its 12-character map field by the MOVE.
         for accepted in [
@@ -1830,12 +1863,12 @@ mod tests {
         for date in refused {
             assert_eq!(
                 failed(&edit_data_with(&with(AddField::OrigDate, date), accept_all)),
-                Some((ORIG_FORMAT, AddField::OrigDate, 400)),
+                Some((ORIG_FORMAT, Some(AddField::OrigDate), 400)),
                 "{date:?}"
             );
             assert_eq!(
                 failed(&edit_data_with(&with(AddField::ProcDate, date), accept_all)),
-                Some((PROC_FORMAT, AddField::ProcDate, 400)),
+                Some((PROC_FORMAT, Some(AddField::ProcDate), 400)),
                 "{date:?}"
             );
         }
@@ -1847,7 +1880,7 @@ mod tests {
                 &with(AddField::OrigDate, "2022-13-45"),
                 reject_all
             )),
-            Some((ORIG_INVALID, AddField::OrigDate, 400))
+            Some((ORIG_INVALID, Some(AddField::OrigDate), 400))
         );
         Ok(())
     }
@@ -1886,7 +1919,7 @@ mod tests {
     fn the_verdict_decides_each_date_original_first() -> TestResult {
         assert_eq!(
             failed(&edit_data_with(&valid(), reject_all)),
-            Some((ORIG_INVALID, AddField::OrigDate, 400))
+            Some((ORIG_INVALID, Some(AddField::OrigDate), 400))
         );
         let only_proc = |text: &str, mask: DateMask| {
             if text == "2022-07-19" {
@@ -1897,7 +1930,7 @@ mod tests {
         };
         assert_eq!(
             failed(&edit_data_with(&valid(), only_proc)),
-            Some((PROC_INVALID, AddField::ProcDate, 400))
+            Some((PROC_INVALID, Some(AddField::ProcDate), 400))
         );
         // Message 2513 accepts despite its severity (CSUTLDTC-029).
         let accepted = edit_data_with(&valid(), unsupported_range).map_err(|f| f.to_string())?;
@@ -1908,7 +1941,7 @@ mod tests {
         let impossible = with(AddField::ProcDate, "2022-02-30");
         assert_eq!(
             failed(&edit_data_with(&impossible, unsupported_range)),
-            Some((PROC_INVALID, AddField::ProcDate, 400))
+            Some((PROC_INVALID, Some(AddField::ProcDate), 400))
         );
         Ok(())
     }
@@ -1920,11 +1953,11 @@ mod tests {
         // own rule and no parity result.
         assert_eq!(
             failed(&edit_data(&with(AddField::OrigDate, "2022-02-30"))),
-            Some((ORIG_INVALID, AddField::OrigDate, 400))
+            Some((ORIG_INVALID, Some(AddField::OrigDate), 400))
         );
         assert_eq!(
             failed(&edit_data(&with(AddField::ProcDate, "2022-13-01"))),
-            Some((PROC_INVALID, AddField::ProcDate, 400))
+            Some((PROC_INVALID, Some(AddField::ProcDate), 400))
         );
         let accepted = edit_data(&valid()).map_err(|failure| failure.to_string())?;
         assert_eq!(accepted.orig_date(), day(2022, 7, 18)?);
@@ -1940,7 +1973,7 @@ mod tests {
                     &with(AddField::MerchantId, merchant_id),
                     accept_all
                 )),
-                Some((MID_NOT_NUMERIC, AddField::MerchantId, 400)),
+                Some((MID_NOT_NUMERIC, Some(AddField::MerchantId), 400)),
                 "{merchant_id:?}"
             );
             // A rejected date comes first, because its call precedes the merchant edit.
@@ -1949,7 +1982,7 @@ mod tests {
                     &with(AddField::MerchantId, merchant_id),
                     reject_all
                 )),
-                Some((ORIG_INVALID, AddField::OrigDate, 400))
+                Some((ORIG_INVALID, Some(AddField::OrigDate), 400))
             );
         }
     }
@@ -1967,7 +2000,7 @@ mod tests {
         for (field, value) in cases {
             assert_eq!(
                 failed(&edit_data_with(&with(field, value), accept_all)),
-                Some((NOT_STORABLE, field, 400)),
+                Some((NOT_STORABLE, Some(field), 400)),
                 "{value:?}"
             );
         }
@@ -1979,7 +2012,7 @@ mod tests {
         };
         assert_eq!(
             failed(&edit_data_with(&both, accept_all)),
-            Some((MID_NOT_NUMERIC, AddField::MerchantId, 400))
+            Some((MID_NOT_NUMERIC, Some(AddField::MerchantId), 400))
         );
     }
 
@@ -2006,7 +2039,7 @@ mod tests {
             shown(&AddFailure::invalid_confirmation()),
             (
                 "Invalid value. Valid values are (Y/N)...",
-                AddField::Confirm,
+                Some(AddField::Confirm),
                 400
             )
         );
@@ -2018,19 +2051,23 @@ mod tests {
         let cases = [
             (
                 AddFailure::transaction_lookup(),
-                ("Unable to lookup Transaction...", AddField::AcctId, 500),
+                (
+                    "Unable to lookup Transaction...",
+                    Some(AddField::AcctId),
+                    500,
+                ),
             ),
             (
                 AddFailure::last_not_found(),
-                ("Transaction ID NOT found...", AddField::AcctId, 404),
+                ("Transaction ID NOT found...", Some(AddField::AcctId), 404),
             ),
             (
                 AddFailure::duplicate_id(),
-                ("Tran ID already exist...", AddField::AcctId, 500),
+                ("Tran ID already exist...", Some(AddField::AcctId), 500),
             ),
             (
                 AddFailure::write_failed(),
-                ("Unable to Add Transaction...", AddField::AcctId, 500),
+                ("Unable to Add Transaction...", Some(AddField::AcctId), 500),
             ),
         ];
         for (failure, expected) in cases {
@@ -2148,7 +2185,11 @@ mod tests {
         let blank_proc = copy_last(&last);
         assert_eq!(
             failed(&edit_data_with(&blank_proc.as_input("Y"), accept_all)),
-            Some(("Proc Date can NOT be empty...", AddField::ProcDate, 400))
+            Some((
+                "Proc Date can NOT be empty...",
+                Some(AddField::ProcDate),
+                400
+            ))
         );
         let at = day(2022, 7, 18)?
             .and_hms_micro_opt(10, 15, 42, 370_000)

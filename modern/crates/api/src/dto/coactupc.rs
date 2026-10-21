@@ -45,7 +45,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use super::{digits, text};
+use super::{digits, full_text};
 
 /// What `Debug` prints for an SSN part that is present.
 const SSN_PART_MASK: &str = "***";
@@ -601,11 +601,13 @@ impl From<rules::ShownAmounts> for AccountUpdateAmounts {
 /// with the snapshot the client echoes (COACTUPC-068, COACTUPC-074 to COACTUPC-077).
 ///
 /// Every member but the dates, the SSN and the snapshot carries the name of the
-/// [`AccountUpdateFields`] member the screen sends it back in. Text is the stored field without
-/// its trailing spaces; amounts are the 15-character `+ZZZ,ZZZ,ZZZ.99` strings; dates are typed,
-/// `null` for a blank one, and the screen splits them into the map's parts; the ZIP is the first
-/// five stored characters and each phone number its three parts. The SSN is `***-**-` and its
-/// last four digits (COACTUPC-076); no card number is held.
+/// [`AccountUpdateFields`] member the screen sends it back in. Text is every byte of its map
+/// field as stored, trailing spaces included; amounts are the 15-character `+ZZZ,ZZZ,ZZZ.99`
+/// strings; dates are typed, `null` for a blank one, and the screen splits them into the map's
+/// parts; the ZIP is the first five stored characters and each phone number its three parts,
+/// characters 2-4, 6-8 and 10-13 of the stored number (COACTUPC-074, COACTUPC-075,
+/// COACTUPC-077). The SSN is `***-**-` and its last four digits (COACTUPC-076); no card number
+/// is held.
 // No error-message member: a shown view has none (COACTUPC-068), so only the info line travels.
 // No `Deserialize`: `Ssn` serialises redacted only and cannot be read back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
@@ -685,6 +687,9 @@ pub struct AccountUpdateView {
     pub snapshot: AccountUpdateSnapshot,
 }
 
+/// The domain's view as `3202-SHOW-ORIGINAL-VALUES` fills the map: each text member all the
+/// bytes of its map field, identifiers with their leading zeros, the shown amounts, the typed
+/// dates and the [`Ssn`] unchanged (COACTUPC-074 to COACTUPC-077).
 impl From<rules::AccountUpdateView> for AccountUpdateView {
     fn from(view: rules::AccountUpdateView) -> Self {
         let info_message = view.info_message().to_owned();
@@ -719,7 +724,7 @@ impl From<rules::AccountUpdateView> for AccountUpdateView {
         let amounts = AccountUpdateAmounts::from(amounts);
         Self {
             account_id: digits(account_id),
-            active_status: text(&active_status),
+            active_status: full_text(&active_status),
             open_date,
             credit_limit: amounts.credit_limit,
             expiry_date,
@@ -727,30 +732,30 @@ impl From<rules::AccountUpdateView> for AccountUpdateView {
             reissue_date,
             current_balance: amounts.current_balance,
             current_cycle_credit: amounts.current_cycle_credit,
-            group_id: text(&group_id),
+            group_id: full_text(&group_id),
             current_cycle_debit: amounts.current_cycle_debit,
             customer_id: digits(customer_id),
             ssn,
             dob,
             fico_score: digits(fico_score),
-            first_name: text(&first_name),
-            middle_name: text(&middle_name),
-            last_name: text(&last_name),
-            address_line_1: text(&address_line_1),
-            state: text(&state),
-            address_line_2: text(&address_line_2),
-            zip: text(&zip),
-            city: text(&city),
-            country: text(&country),
-            phone_1_area: text(&phone_1.area),
-            phone_1_prefix: text(&phone_1.prefix),
-            phone_1_line: text(&phone_1.line),
-            government_id: text(&government_id),
-            phone_2_area: text(&phone_2.area),
-            phone_2_prefix: text(&phone_2.prefix),
-            phone_2_line: text(&phone_2.line),
-            eft_account_id: text(&eft_account_id),
-            primary_card_holder: text(&primary_card_holder),
+            first_name: full_text(&first_name),
+            middle_name: full_text(&middle_name),
+            last_name: full_text(&last_name),
+            address_line_1: full_text(&address_line_1),
+            state: full_text(&state),
+            address_line_2: full_text(&address_line_2),
+            zip: full_text(&zip),
+            city: full_text(&city),
+            country: full_text(&country),
+            phone_1_area: full_text(&phone_1.area),
+            phone_1_prefix: full_text(&phone_1.prefix),
+            phone_1_line: full_text(&phone_1.line),
+            government_id: full_text(&government_id),
+            phone_2_area: full_text(&phone_2.area),
+            phone_2_prefix: full_text(&phone_2.prefix),
+            phone_2_line: full_text(&phone_2.line),
+            eft_account_id: full_text(&eft_account_id),
+            primary_card_holder: full_text(&primary_card_holder),
             info_message,
             snapshot: AccountUpdateSnapshot::from(snapshot),
         }
@@ -843,8 +848,8 @@ mod tests {
     use axum::http::StatusCode;
     use chrono::{Datelike, NaiveDate};
     use domain::FixedClock;
-    use domain::copybook::FixedRecord;
     use domain::copybook::framing::decode_all;
+    use domain::copybook::{FixedRecord, PicX};
     use domain::online::coactupc as rules;
     use domain::records::account::AccountRecord;
     use domain::records::card_xref::CardXrefRecord;
@@ -1014,6 +1019,71 @@ mod tests {
             json!(open.format("%Y-%m-%d").to_string())
         );
         assert_eq!(body["snapshot"]["open_date"], body["open_date"]);
+        Ok(())
+    }
+
+    // audit: COACTUPC-074
+    // audit: COACTUPC-075
+    // audit: COACTUPC-077
+    #[test]
+    fn the_view_carries_every_byte_of_each_map_field() -> TestResult {
+        let (xref, mut account, mut customer) = records()?;
+        account.active_status = PicX::spaces();
+        account.group_id = PicX::from_text("GRP01")?;
+        customer.first_name = PicX::from_text("JOHN")?;
+        customer.middle_name = PicX::spaces();
+        customer.addr_zip = PicX::from_text("123")?;
+        customer.phone_num_1 = PicX::from_text("(201)   -0100")?;
+        let view = AccountUpdateView::from(rules::fetch(
+            &digits(account.id),
+            rules::Lookup::Found(&xref),
+            rules::Lookup::Found(&account),
+            rules::Lookup::Found(&customer),
+        )?);
+        // A space-only field stays its spaces; a padded one keeps its trailing spaces.
+        assert_eq!(view.active_status, " ");
+        assert_eq!(view.group_id, "GRP01     ");
+        assert_eq!(view.first_name, format!("{:<25}", "JOHN"));
+        assert_eq!(view.middle_name, " ".repeat(25));
+        // COACTUPC-077: the first five ZIP characters and the phone digits at positions 2-4,
+        // 6-8 and 10-13, whatever sits there.
+        assert_eq!(view.zip, "123  ");
+        assert_eq!(
+            [
+                view.phone_1_area.as_str(),
+                &view.phone_1_prefix,
+                &view.phone_1_line
+            ],
+            ["201", "   ", "0100"]
+        );
+        // Every text member is exactly as wide as its map field.
+        for (member, width) in [
+            (&view.active_status, 1),
+            (&view.group_id, 10),
+            (&view.first_name, 25),
+            (&view.middle_name, 25),
+            (&view.last_name, 25),
+            (&view.address_line_1, 50),
+            (&view.state, 2),
+            (&view.address_line_2, 50),
+            (&view.zip, 5),
+            (&view.city, 50),
+            (&view.country, 3),
+            (&view.phone_1_area, 3),
+            (&view.phone_1_prefix, 3),
+            (&view.phone_1_line, 4),
+            (&view.government_id, 20),
+            (&view.phone_2_area, 3),
+            (&view.phone_2_prefix, 3),
+            (&view.phone_2_line, 4),
+            (&view.eft_account_id, 10),
+            (&view.primary_card_holder, 1),
+        ] {
+            assert_eq!(member.len(), width, "{member:?}");
+        }
+        let body = serde_json::to_value(&view)?;
+        assert_eq!(body["first_name"], json!(view.first_name));
+        assert_eq!(body["phone_1_prefix"], json!("   "));
         Ok(())
     }
 

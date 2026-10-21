@@ -2847,7 +2847,7 @@ mod cotrn02c {
             .ok_or("no fixture")?)
     }
 
-    fn failure_of(failure: Option<AddFailure>) -> Option<(&'static str, AddField, u16)> {
+    fn failure_of(failure: Option<AddFailure>) -> Option<(&'static str, Option<AddField>, u16)> {
         failure.map(|f| (f.message(), f.field(), f.class().http_status()))
     }
 
@@ -2874,6 +2874,21 @@ mod cotrn02c {
             *value = "";
         }
         input
+    }
+
+    // audit: COTRN02C-007
+    #[test]
+    fn an_unserved_key_gets_the_whole_invalid_key_message_on_no_field() {
+        let refused = AddFailure::invalid_key();
+        let expected = format!("{:<50}", "Invalid key pressed. Please see below...");
+        assert_eq!(refused.message(), expected);
+        assert_eq!(refused.message().len(), 50);
+        assert_eq!(refused.to_string(), expected);
+        assert_eq!(refused.class(), FailureClass::Input);
+        assert_eq!(
+            failure_of(Some(refused)),
+            Some((expected.as_str(), None, 400))
+        );
     }
 
     // audit: COTRN02C-009
@@ -2912,7 +2927,7 @@ mod cotrn02c {
         for (acct, card, message, field) in cases {
             assert_eq!(
                 failure_of(edit_keys(acct, card).err()),
-                Some((message, field, 400))
+                Some((message, Some(field), 400))
             );
         }
         let by_account = edit_keys(Some("00000000050"), Some("not a card"))?;
@@ -2979,7 +2994,7 @@ mod cotrn02c {
         ] {
             assert_eq!(
                 failure_of(fill_key(request, lookup).err()),
-                Some((message, field, status))
+                Some((message, Some(field), status))
             );
         }
         Ok(())
@@ -3016,7 +3031,7 @@ mod cotrn02c {
             let failure = failure_of(edit_data_with(&blanked(&[field]), accept_all).err());
             assert_eq!(
                 failure.map(|(text, at, status)| (text.to_owned(), at, status)),
-                Some((message, field, 400))
+                Some((message, Some(field), 400))
             );
         }
         let both = failure_of(
@@ -3028,7 +3043,7 @@ mod cotrn02c {
         );
         assert_eq!(
             both,
-            Some(("Type CD can NOT be empty...", AddField::TypeCd, 400))
+            Some(("Type CD can NOT be empty...", Some(AddField::TypeCd), 400))
         );
     }
 
@@ -3103,7 +3118,7 @@ mod cotrn02c {
         for (input, message, field) in cases {
             assert_eq!(
                 failure_of(edit_data_with(&input, accept_all).err()),
-                Some((message, field, 400))
+                Some((message, Some(field), 400))
             );
         }
         let fields = edit_data_with(&VALID, accept_all)?;
@@ -3144,7 +3159,7 @@ mod cotrn02c {
             failure_of(Some(refused)),
             Some((
                 "Invalid value. Valid values are (Y/N)...",
-                AddField::Confirm,
+                Some(AddField::Confirm),
                 400
             ))
         );
@@ -3203,7 +3218,7 @@ mod cotrn02c {
         ] {
             assert_eq!(
                 (failure.message(), failure.field(), failure.class()),
-                (text, AddField::AcctId, FailureClass::Store)
+                (text, Some(AddField::AcctId), FailureClass::Store)
             );
         }
         Ok(())

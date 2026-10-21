@@ -37,15 +37,16 @@ use domain::sensitive::Ssn;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use super::{digits, text};
+use super::{digits, full_text};
 
 /// The account view of endpoint 4 (CAVW, COACTVWC): the account and customer blocks of map
 /// `CACTVWA` after all three reads found their record (COACTVWC-008).
 ///
-/// Text fields hold the stored value without its trailing spaces, numeric identifiers their
-/// digits with the leading zeros, and amounts the 15-character text of the map's
-/// `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number. Dates are typed, `null` for a blank
-/// field. The SSN is only ever its redacted form.
+/// Text fields hold every byte of their map field, trailing spaces included: the stored value
+/// unchanged, or its first characters where the map field is narrower (ZIP code and phone
+/// numbers). Numeric identifiers hold their digits with the leading zeros, and amounts the
+/// 15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number.
+/// Dates are typed, `null` for a blank field. The SSN is only ever its redacted form.
 // The schema name `AccountViewResponse` is the frontend's
 // `components["schemas"]["AccountViewResponse"]` (Generated API Types Only). There is no
 // `Deserialize`: the SSN travels redacted and cannot be read back.
@@ -132,8 +133,8 @@ pub struct AccountViewResponse {
     pub primary_card_holder: String,
 }
 
-/// The view field for field, as `1200-SETUP-SCREEN-VARS` fills the map: text without its
-/// trailing spaces, identifiers with their leading zeros, the domain's edited amounts and typed
+/// The view field for field, as `1200-SETUP-SCREEN-VARS` fills the map: text as all the bytes
+/// of its map field, identifiers with their leading zeros, the domain's edited amounts and typed
 /// dates unchanged, and the [`Ssn`] moved as it is (COACTVWC-010 to COACTVWC-026).
 impl From<rules::AccountView> for AccountViewResponse {
     fn from(view: rules::AccountView) -> Self {
@@ -144,7 +145,7 @@ impl From<rules::AccountView> for AccountViewResponse {
         } = view;
         Self {
             acct_id: digits(acct_id),
-            active_status: text(&account.active_status),
+            active_status: full_text(&account.active_status),
             open_date: account.open_date,
             expiration_date: account.expiration_date,
             reissue_date: account.reissue_date,
@@ -153,25 +154,25 @@ impl From<rules::AccountView> for AccountViewResponse {
             current_balance: account.current_balance,
             current_cycle_credit: account.current_cycle_credit,
             current_cycle_debit: account.current_cycle_debit,
-            group_id: text(&account.group_id),
+            group_id: full_text(&account.group_id),
             customer_id: digits(customer.customer_id),
             ssn: customer.ssn,
             date_of_birth: customer.date_of_birth,
             fico_score: digits(customer.fico_score),
-            first_name: text(&customer.first_name),
-            middle_name: text(&customer.middle_name),
-            last_name: text(&customer.last_name),
-            address_line_1: text(&customer.address_line_1),
-            address_line_2: text(&customer.address_line_2),
-            city: text(&customer.city),
-            state: text(&customer.state),
-            zip: text(&customer.zip),
-            country: text(&customer.country),
-            phone_1: text(&customer.phone_1),
-            phone_2: text(&customer.phone_2),
-            government_id: text(&customer.government_id),
-            eft_account_id: text(&customer.eft_account_id),
-            primary_card_holder: text(&customer.primary_card_holder),
+            first_name: full_text(&customer.first_name),
+            middle_name: full_text(&customer.middle_name),
+            last_name: full_text(&customer.last_name),
+            address_line_1: full_text(&customer.address_line_1),
+            address_line_2: full_text(&customer.address_line_2),
+            city: full_text(&customer.city),
+            state: full_text(&customer.state),
+            zip: full_text(&customer.zip),
+            country: full_text(&customer.country),
+            phone_1: full_text(&customer.phone_1),
+            phone_2: full_text(&customer.phone_2),
+            government_id: full_text(&customer.government_id),
+            eft_account_id: full_text(&customer.eft_account_id),
+            primary_card_holder: full_text(&customer.primary_card_holder),
         }
     }
 }
@@ -285,7 +286,8 @@ mod tests {
         assert_eq!(response.open_date, Some(date(2014, 11, 20)?));
         assert_eq!(response.expiration_date, Some(date(2025, 5, 20)?));
         assert_eq!(response.reissue_date, None);
-        assert_eq!(response.group_id, "GRP01");
+        // COACTVWC-015: the stored 10 characters, trailing spaces included.
+        assert_eq!(response.group_id, field("GRP01", 10));
         // The domain's edited amounts pass through unchanged, each to its own member.
         let amounts = [
             (&response.current_balance, &edited.current_balance),
@@ -310,6 +312,8 @@ mod tests {
         assert_eq!(response.customer_id, "000000007");
         assert_eq!(response.fico_score, "075");
         assert_eq!(response.date_of_birth, Some(date(1980, 1, 15)?));
+        // Each the stored value unchanged, every byte of its map field, trailing spaces
+        // included (COACTVWC-020 to COACTVWC-022, COACTVWC-025, COACTVWC-026).
         assert_eq!(
             [
                 response.first_name.as_str(),
@@ -325,20 +329,20 @@ mod tests {
                 &response.primary_card_holder,
             ],
             [
-                "JOHN",
-                "Q",
-                "PUBLIC",
-                "1 MAIN ST",
-                "APT 2",
-                "SPRINGFIELD",
-                "IL",
-                "USA",
-                "GOVT-ID-0001",
-                "0000000042",
-                "Y",
+                field("JOHN", 25),
+                field("Q", 25),
+                field("PUBLIC", 25),
+                field("1 MAIN ST", 50),
+                field("APT 2", 50),
+                field("SPRINGFIELD", 50),
+                field("IL", 2),
+                field("USA", 3),
+                field("GOVT-ID-0001", 20),
+                field("0000000042", 10),
+                field("Y", 1),
             ]
         );
-        // The narrower map fields keep the leftmost characters.
+        // The narrower map fields keep the leftmost characters (COACTVWC-023, COACTVWC-024).
         assert_eq!(response.zip, "62701");
         assert_eq!(response.phone_1, "(555)555-0100");
         assert_eq!(response.phone_2, "(555)555-0199");

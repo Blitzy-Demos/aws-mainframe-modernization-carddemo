@@ -32,7 +32,9 @@
 //! - A body or query string that does not deserialise into `T`: 400 with [`INVALID_BODY`] or
 //!   [`INVALID_QUERY`] and no field. That covers malformed JSON, a missing JSON content type, a
 //!   value of the wrong type (text where an integer belongs, for instance) and an unknown enum
-//!   value.
+//!   value. An attention key whose program answers unserved keys itself (`cotrtupc`,
+//!   `cotrn02c`) reads every other key name as a hidden variant instead, so that the program's
+//!   invalid-key message, not this rejection, answers it.
 //! - A rule a DTO declares: 400 naming the first failing field in key order, as a path such as
 //!   `user_id`, `fields.zip` or `rows[3].description`, with the text of the rule's code
 //!   ([`FIELD_LENGTH_MESSAGE`], [`FIELD_NUMERIC_MESSAGE`] or [`FIELD_RANGE_MESSAGE`]).
@@ -103,8 +105,7 @@ pub mod cotrtupc; // endpoints 26 and 27
 use axum::Json;
 use axum::extract::{FromRequest, FromRequestParts, Query, Request};
 use axum::http::request::Parts;
-use chrono::{NaiveDate, NaiveDateTime};
-use domain::copybook::{PicDate, PicTimestamp, PicU, PicX};
+use domain::copybook::{PicU, PicX};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -375,9 +376,17 @@ pub(crate) fn text<const N: usize>(field: &PicX<N>) -> String {
     field.to_text()
 }
 
-// The `Copy` PIC types below are taken by value and `PicX`, which is not `Copy`, by reference:
-// the workspace denies clippy's `trivially_copy_pass_by_ref`, which a reference to the
-// eight-byte `PicU` or the four-byte `PicDate` trips, and lint suppressions are not allowed.
+/// A `PIC X(n)` field as its map field holds it: all `N` bytes, trailing spaces included,
+/// converted lossily (the stored bytes are printable ASCII). For the response fields whose
+/// audit row carries the stored or moved value unchanged.
+#[must_use]
+pub(crate) fn full_text<const N: usize>(field: &PicX<N>) -> String {
+    String::from_utf8_lossy(field.as_bytes()).into_owned()
+}
+
+// `digits` below takes the `Copy` `PicU` by value, and the helpers above take `PicX`, which is
+// not `Copy`, by reference: the workspace denies clippy's `trivially_copy_pass_by_ref`, which a
+// reference to the eight-byte `PicU` trips, and lint suppressions are not allowed.
 
 /// A `PIC 9(n)` field as shown: its `N` digits with the leading zeros, the text a COBOL `MOVE`
 /// of the field to `X(n)` gives, from the field's own encoder.
@@ -388,20 +397,6 @@ pub(crate) fn digits<const N: u32>(field: PicU<N>) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A `PIC X(10)` date field as its typed date, `None` for a blank field (Typed Dates and
-/// Timestamps).
-#[must_use]
-pub(crate) const fn date(field: PicDate) -> Option<NaiveDate> {
-    field.value()
-}
-
-/// A `PIC X(26)` timestamp field as its typed value, `None` for a blank field (Typed Dates and
-/// Timestamps). The layout the COBOL wrote it in is a storage concern and is not sent.
-#[must_use]
-pub(crate) fn timestamp(field: PicTimestamp) -> Option<NaiveDateTime> {
-    field.value().map(|stamp| stamp.value())
-}
-
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
@@ -410,8 +405,7 @@ mod tests {
     use axum::extract::{FromRequest, FromRequestParts, Request};
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
-    use chrono::{NaiveDate, NaiveDateTime};
-    use domain::copybook::{CobolTimestamp, PicDate, PicTimestamp, PicU, PicX, TsForm};
+    use domain::copybook::{PicU, PicX};
     use domain::online::{cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
     use serde::Deserialize;
     use utoipa::ToSchema;
@@ -420,8 +414,8 @@ mod tests {
     use super::{
         FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE, INVALID_BODY,
         INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD, PAGE_SIZE_MESSAGE,
-        PageDirection, ScreenResult, ValidJson, ValidQuery, date, digits, numeric,
-        resolve_page_size, text, timestamp, validation_error,
+        PageDirection, ScreenResult, ValidJson, ValidQuery, digits, full_text, numeric,
+        resolve_page_size, text, validation_error,
     };
     use crate::error::ScreenError;
 
@@ -837,21 +831,11 @@ mod tests {
     fn pic_fields_render_as_the_screen_shows_them() -> TestResult {
         assert_eq!(text(&PicX::<8>::from_text(" AB C")?), " AB C");
         assert_eq!(text(&PicX::<4>::spaces()), "");
+        assert_eq!(full_text(&PicX::<8>::from_text(" AB C")?), " AB C   ");
+        assert_eq!(full_text(&PicX::<4>::spaces()), "    ");
+        assert_eq!(full_text(&PicX::<3>::from_text("XYZ")?), "XYZ");
         assert_eq!(digits(PicU::<11>::new(50)?), "00000000050");
         assert_eq!(digits(PicU::<9>::ZERO), "000000000");
-
-        let day = NaiveDate::from_ymd_opt(2022, 7, 18).ok_or("invalid date")?;
-        assert_eq!(date(PicDate::new(Some(day))?), Some(day));
-        assert_eq!(date(PicDate::BLANK), None);
-
-        let at: NaiveDateTime = day
-            .and_hms_micro_opt(13, 5, 9, 120_000)
-            .ok_or("invalid time")?;
-        for form in [TsForm::Iso, TsForm::Db2] {
-            let stamp = PicTimestamp::new(Some(CobolTimestamp::new(at, form)?));
-            assert_eq!(timestamp(stamp), Some(at));
-        }
-        assert_eq!(timestamp(PicTimestamp::BLANK), None);
         Ok(())
     }
 }

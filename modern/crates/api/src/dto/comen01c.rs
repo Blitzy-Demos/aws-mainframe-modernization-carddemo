@@ -21,7 +21,7 @@ use domain::online::comen01c as rules;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::{digits, text};
+use super::{digits, full_text, text};
 
 /// One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide
 /// ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021).
@@ -30,7 +30,7 @@ use super::{digits, text};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
     "number": "01",
-    "text": "01. Account View",
+    "text": "01. Account View                        ",
     "program": "COACTVWC",
     "admin_only": false,
     "installed": true
@@ -40,9 +40,10 @@ pub struct MenuOptionDto {
     /// `11` on the main menu and `01` to `06` on the admin menu, the value the screen's
     /// right-justified, zero-filled option input is matched against (COMEN01C-020).
     pub number: String,
-    /// The row text as `BUILD-MENU-OPTIONS` strings it into the 40-byte `OPTNnnn` field: the
-    /// two digits, `. ` and the name, without the trailing spaces, so at most 40 characters;
-    /// for example `01. Account View` (COMEN01C-021, COADM01C-006).
+    /// The row text as `BUILD-MENU-OPTIONS` strings it into the 40-byte `OPTNnnn` field
+    /// cleared to spaces: the two digits, `. `, the 35-byte name and one space, all 40 bytes,
+    /// trailing spaces included; for example `01. Account View` followed by 24 spaces
+    /// (COMEN01C-021, COADM01C-006 to COADM01C-011).
     pub text: String,
     /// `CDEMO-MENU-OPT-PGMNAME PIC X(08)` without trailing spaces, such as `COACTVWC`: the
     /// program the option transfers to, whose route the client's program table gives
@@ -73,7 +74,7 @@ pub struct MenuOptionDto {
 #[schema(example = json!({
     "options": [{
         "number": "01",
-        "text": "01. Account View",
+        "text": "01. Account View                        ",
         "program": "COACTVWC",
         "admin_only": false,
         "installed": true
@@ -110,7 +111,7 @@ impl From<&rules::MenuEntry> for MenuOptionDto {
         let option = entry.option();
         Self {
             number: digits(option.number()),
-            text: text(&option.display_text()),
+            text: full_text(&option.display_text()),
             program: text(option.program()),
             admin_only: option.access().is_admin_only(),
             installed: option.installation().is_installed(),
@@ -153,7 +154,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    /// The main menu's row texts in table order (COMEN01C-021).
+    /// The main menu's row texts in table order, before the padding of the 40-byte field
+    /// (COMEN01C-021).
     const MAIN_TEXTS: [&str; 11] = [
         "01. Account View",
         "02. Account Update",
@@ -174,7 +176,8 @@ mod tests {
         "COTRN02C", "CORPT00C", "COBIL00C", "COPAUS0C",
     ];
 
-    /// The admin menu's row texts in table order (COADM01C-006 to COADM01C-011).
+    /// The admin menu's row texts in table order, before the padding of the 40-byte field
+    /// (COADM01C-006 to COADM01C-011).
     const ADMIN_TEXTS: [&str; 6] = [
         "01. User List (Security)",
         "02. User Add (Security)",
@@ -192,6 +195,12 @@ mod tests {
     /// The option numbers `01` to `count`, two digits each.
     fn numbers(count: u8) -> Vec<String> {
         (1..=count).map(|number| format!("{number:02}")).collect()
+    }
+
+    /// `text` as the 40-byte option field holds it, space-padded on the right (COMEN01C-021,
+    /// COADM01C-006 to COADM01C-011).
+    fn padded(text: &str) -> String {
+        format!("{text:<40}")
     }
 
     /// One text member of every option, in table order.
@@ -217,7 +226,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             numbers(11)
         );
-        assert_eq!(field(&response.options, |o| o.text.as_str()), MAIN_TEXTS);
+        assert_eq!(
+            field(&response.options, |o| o.text.as_str()),
+            MAIN_TEXTS.map(padded)
+        );
         assert_eq!(
             field(&response.options, |o| o.program.as_str()),
             MAIN_PROGRAMS
@@ -228,7 +240,11 @@ mod tests {
                 .iter()
                 .all(|o| !o.admin_only && o.installed)
         );
-        assert!(response.options.iter().all(|o| o.text.len() <= 40));
+        assert!(response.options.iter().all(|o| o.text.len() == 40));
+        assert_eq!(
+            response.options.last().map(|o| o.text.as_str()),
+            Some("11. Pending Authorization View          ")
+        );
         let (last, rest) = response.options.split_last().unzip();
         assert_eq!(
             last.and_then(|o| o.unavailable_message.as_deref()),
@@ -275,7 +291,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             numbers(6)
         );
-        assert_eq!(field(&response.options, |o| o.text.as_str()), ADMIN_TEXTS);
+        assert_eq!(
+            field(&response.options, |o| o.text.as_str()),
+            ADMIN_TEXTS.map(padded)
+        );
+        assert!(response.options.iter().all(|o| o.text.len() == 40));
         assert_eq!(
             field(&response.options, |o| o.program.as_str()),
             ADMIN_PROGRAMS
@@ -317,7 +337,7 @@ mod tests {
             let response = MenuResponse::from(menu);
             let expected = MenuOptionDto {
                 number: "03".to_owned(),
-                text: "03. Credit Card List".to_owned(),
+                text: padded("03. Credit Card List"),
                 program: "DUMMY001".to_owned(),
                 admin_only,
                 installed,
@@ -338,7 +358,7 @@ mod tests {
             value.get("options").and_then(|options| options.get(0)),
             Some(&json!({
                 "number": "01",
-                "text": "01. Account View",
+                "text": "01. Account View                        ",
                 "program": "COACTVWC",
                 "admin_only": false,
                 "installed": true

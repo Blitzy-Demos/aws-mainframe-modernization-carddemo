@@ -25,10 +25,13 @@
 //!
 //! # Attention keys
 //!
-//! [`Aid`] admits `ENTER` and `PF5` only. Any other value fails deserialisation and is answered
-//! by `ValidJson` with 400 and no field, before any read. COTRN02C-007 words that answer with
-//! the 50-byte invalid-key text; the message differs here, because neither the rejection of
-//! `ValidJson` nor COTRN02C's `AddFailure` can carry that text.
+//! [`Aid`] serves `ENTER` and `PF5`, the only keys its schema names. Any other key name a body
+//! carries is read as the hidden [`Aid::Unserved`], so that it gets the program's own answer
+//! rather than the rejection of an unreadable body: its conversion into the program's key is
+//! COTRN02C's `AddFailure::invalid_key`, which the service returns before anything is read or
+//! written, 400 with the 50-byte `Invalid key pressed. Please see below...` and no field
+//! (COTRN02C-007). An `aid` that is missing or is not text at all still leaves the body
+//! unreadable, and `ValidJson` answers it with its own 400.
 
 use core::fmt;
 
@@ -47,6 +50,11 @@ use super::{digits, text};
 const CARD_INPUT_REDACTED: &str = "****************";
 
 /// The attention key of an endpoint 13 request, `TranAddRequest.aid` (COTRN02C-007).
+///
+/// `ENTER` and `PF5` are served. Any other key name is accepted, so that it gets the program's
+/// own answer, 400 `Invalid key pressed. Please see below...` with nothing read or written, never
+/// the rejection of an unreadable body (COTRN02C-006, COTRN02C-007). F3 and F4 are the screen's,
+/// which serves them without a request (COTRN02C-004, COTRN02C-005).
 // The schema name `Cotrn02cAid` is fixed (Generated API Types Only): each program declares its
 // own `Aid`, so the bare name would collide in `components.schemas`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -60,14 +68,23 @@ pub enum Aid {
     /// transaction with the highest ID, then ENTER on the copied fields (COTRN02C-052 to
     /// COTRN02C-056).
     Pf5,
+    /// Any other key name. Absent from the schema and never serialised: the screen never sends
+    /// it, and serialising it is an error rather than a value the server would read differently.
+    #[serde(other, skip_serializing)]
+    Unserved,
 }
 
-/// The key as `domain::online::cotrn02c` names it.
-impl From<Aid> for rules::Aid {
-    fn from(aid: Aid) -> Self {
+/// The key as `domain::online::cotrn02c` names it. An unserved key has none: it is the
+/// program's `WHEN OTHER` branch, answered with [`rules::AddFailure::invalid_key`]
+/// (COTRN02C-007).
+impl TryFrom<Aid> for rules::Aid {
+    type Error = rules::AddFailure;
+
+    fn try_from(aid: Aid) -> Result<Self, Self::Error> {
         match aid {
-            Aid::Enter => Self::Enter,
-            Aid::Pf5 => Self::Pf5,
+            Aid::Enter => Ok(Self::Enter),
+            Aid::Pf5 => Ok(Self::Pf5),
+            Aid::Unserved => Err(rules::AddFailure::invalid_key()),
         }
     }
 }
@@ -178,7 +195,8 @@ pub struct TranAddFields {
     "confirm": "Y"
 }))]
 pub struct TranAddRequest {
-    /// The attention key: `ENTER` or `PF5` (COTRN02C-007).
+    /// The attention key: `ENTER` or `PF5`. Any other key name is answered with 400 `Invalid key
+    /// pressed. Please see below...` and no field, before anything is read (COTRN02C-007).
     pub aid: Aid,
     /// `ACTIDIN`, the account key as typed, `LENGTH=11` (`COTRN02-013`). A non-blank account
     /// decides the key, whatever `card_num` holds (COTRN02C-010, COTRN02C-011).
@@ -434,6 +452,7 @@ mod tests {
     use axum::http::header::CONTENT_TYPE;
     use chrono::NaiveDate;
     use domain::copybook::{CobolTimestamp, PicTimestamp, PicU, PicX, TsForm};
+    use domain::messages::CCDA_MSG_INVALID_KEY;
     use domain::money::{Decimal, Money};
     use domain::online::cotrn02c as rules;
     use domain::online::csutldtc::{LeFeedback, LeResult};
@@ -446,6 +465,7 @@ mod tests {
         Aid, TranAddCopiedFields, TranAddFields, TranAddRequest, TranAddResult, request_member,
     };
     use crate::dto::{FIELD_LENGTH_MESSAGE, INVALID_BODY, ValidJson};
+    use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -483,11 +503,18 @@ mod tests {
 
     /// `body` through `ValidJson`, the extractor of endpoint 13.
     async fn extract(body: &Value) -> Result<Result<TranAddRequest, Rejection>, Box<dyn StdError>> {
+        extract_text(body.to_string()).await
+    }
+
+    /// The JSON text `body`, well formed or not, through `ValidJson`.
+    async fn extract_text(
+        body: String,
+    ) -> Result<Result<TranAddRequest, Rejection>, Box<dyn StdError>> {
         let request = Request::builder()
             .method("POST")
             .uri("/api/v1/transactions")
             .header(CONTENT_TYPE, "application/json")
-            .body(Body::from(body.to_string()))?;
+            .body(Body::from(body))?;
         Ok(ValidJson::<TranAddRequest>::from_request(request, &())
             .await
             .map(|ValidJson(request)| request)
@@ -551,11 +578,14 @@ mod tests {
         ] {
             assert_eq!(serde_json::to_string(&aid)?, wire);
             assert_eq!(serde_json::from_str::<Aid>(wire)?, aid);
-            assert_eq!(rules::Aid::from(aid), program);
+            assert_eq!(rules::Aid::try_from(aid), Ok(program));
         }
-        for wire in ["\"Enter\"", "\"pf5\"", "\"PF4\"", "\"PF3\"", "\"\"", "5"] {
-            assert!(serde_json::from_str::<Aid>(wire).is_err(), "{wire}");
+        // Every other key name is read, as the one key the schema leaves out.
+        for wire in ["\"Enter\"", "\"pf5\"", "\"PF4\"", "\"PF3\"", "\"\""] {
+            assert_eq!(serde_json::from_str::<Aid>(wire)?, Aid::Unserved, "{wire}");
         }
+        assert!(serde_json::from_str::<Aid>("5").is_err());
+        assert!(serde_json::to_string(&Aid::Unserved).is_err());
         assert_eq!(Aid::name(), "Cotrn02cAid");
         assert_eq!(
             schema_json::<Aid>()?.get("enum"),
@@ -637,18 +667,51 @@ mod tests {
         Ok(())
     }
 
+    // audit: COTRN02C-007
     #[tokio::test]
-    async fn an_unserved_key_is_refused_before_any_edit() -> TestResult {
+    async fn an_unserved_key_gets_the_invalid_key_answer_with_no_field() -> TestResult {
         for aid in ["PF4", "PF7", "enter", ""] {
             let mut body = full_body();
             *body.pointer_mut("/aid").ok_or("aid")? = json!(aid);
-            let error = extract(&body).await?.err().ok_or(aid)?;
+            let request = extract(&body)
+                .await?
+                .map_err(|error| format!("{aid:?} refused by the extractor: {error:?}"))?;
+            assert_eq!(request.aid, Aid::Unserved, "{aid}");
+            let refused = rules::Aid::try_from(request.aid).err().ok_or(aid)?;
+            assert_eq!(refused, rules::AddFailure::invalid_key(), "{aid}");
+            let error = ScreenError::from(refused);
             assert_eq!(
-                error,
-                (StatusCode::BAD_REQUEST, INVALID_BODY.to_owned(), None),
+                (error.status(), error.message(), error.field()),
+                (StatusCode::BAD_REQUEST, CCDA_MSG_INVALID_KEY, None),
                 "{aid}"
             );
+            assert_eq!(error.message().len(), 50);
+            assert_eq!(
+                error.message(),
+                format!("{:<50}", "Invalid key pressed. Please see below...")
+            );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_aid_that_names_no_key_leaves_the_body_unreadable() -> TestResult {
+        let generic = (StatusCode::BAD_REQUEST, INVALID_BODY.to_owned(), None);
+        let mut missing = full_body();
+        missing.as_object_mut().ok_or("body")?.remove("aid");
+        let mut bodies = vec![missing];
+        for aid in [json!(5), Value::Null, json!(["PF4"]), json!({"key": "PF4"})] {
+            let mut body = full_body();
+            *body.pointer_mut("/aid").ok_or("aid")? = aid;
+            bodies.push(body);
+        }
+        for body in bodies {
+            let error = extract(&body).await?.err().ok_or("accepted")?;
+            assert_eq!(error, generic, "{body}");
+        }
+        let truncated = r#"{"aid": "PF4", "fields": {}"#.to_owned();
+        let error = extract_text(truncated).await?.err().ok_or("accepted")?;
+        assert_eq!(error, generic);
         Ok(())
     }
 

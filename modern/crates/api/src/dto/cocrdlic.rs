@@ -43,7 +43,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
-use super::{PageDirection, digits, text};
+use super::{PageDirection, digits, full_text};
 
 /// What the query's `Debug` shows for a card filter, whatever was typed: never its digits, nor
 /// its length.
@@ -223,7 +223,8 @@ pub struct CardListRow {
     #[schema(example = "00000000050")]
     pub acct_id: String,
 
-    /// `CRDSTSn`: `CARD-ACTIVE-STATUS`, one character, empty when the stored byte is a space.
+    /// `CRDSTSn`: `CARD-ACTIVE-STATUS`, the stored byte as one character, a space included
+    /// (COCRDLIC-032).
     #[schema(example = "Y")]
     pub status: String,
 }
@@ -234,7 +235,7 @@ impl From<rules::CardListRow> for CardListRow {
             card_ref: row.card_ref.get(),
             card_num: row.card_num,
             acct_id: digits(row.acct_id),
-            status: text(&row.status),
+            status: full_text(&row.status),
         }
     }
 }
@@ -628,11 +629,13 @@ mod tests {
         let text = body.to_string();
         assert!(!text.contains("4000000000000001") && !text.contains("40000000"));
         assert!(!format!("{response:?}").contains("40000000"));
+        // COCRDLIC-032: a stored space travels as the space it is.
         let blank = CardListRow::from(rules::CardListRow {
             status: PicX::spaces(),
             ..cards(1)?.remove(0)
         });
-        assert_eq!(blank.status, "");
+        assert_eq!(blank.status, " ");
+        assert_eq!(serde_json::to_value(&blank)?["status"], json!(" "));
         Ok(())
     }
 

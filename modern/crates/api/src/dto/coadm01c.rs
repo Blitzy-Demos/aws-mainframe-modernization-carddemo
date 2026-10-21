@@ -36,12 +36,13 @@ mod tests {
     const NOT_INSTALLED: &str = "This option is not installed ...";
 
     /// One option row of endpoint 3's body as the client receives it: the two digits, the row
-    /// text without its trailing spaces, the program, and the flags every admin option has
-    /// (COADM01C-006 to COADM01C-013).
+    /// text as the 40 bytes of its `OPTNnnn` field, trailing spaces included, the program, and
+    /// the flags every admin option has (COADM01C-006 to COADM01C-013).
     fn option(number: &str, name: &str, program: &str) -> Value {
+        let text = [number, ". ", name].concat();
         json!({
             "number": number,
-            "text": format!("{number}. {name}"),
+            "text": format!("{text:<40}"),
             "program": program,
             "admin_only": true,
             "installed": true,

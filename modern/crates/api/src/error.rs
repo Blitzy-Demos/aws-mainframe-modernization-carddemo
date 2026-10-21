@@ -373,12 +373,13 @@ impl From<cotrn01c::TranViewFailure> for ScreenError {
     }
 }
 
+/// Also the field-less 400 of an unserved key, `AddFailure::invalid_key` (COTRN02C-007).
 impl From<cotrn02c::AddFailure> for ScreenError {
     fn from(failure: cotrn02c::AddFailure) -> Self {
         Self::audited(
             failure.class().http_status(),
             failure.message(),
-            Some(tran_add_field(failure.field())),
+            failure.field().map(tran_add_field),
         )
     }
 }
@@ -966,6 +967,17 @@ mod tests {
                 (status, failure.message(), Some(field))
             );
         }
+        // COTRN02C-007: the whole 50-byte text, trailing spaces kept, and no `field` member.
+        let invalid_key = ScreenError::from(cotrn02c::AddFailure::invalid_key());
+        assert_eq!(
+            parts(&invalid_key),
+            (400, domain::messages::CCDA_MSG_INVALID_KEY, None)
+        );
+        assert_eq!(invalid_key.message().len(), 50);
+        assert_eq!(
+            serde_json::to_value(&invalid_key)?,
+            json!({"message": domain::messages::CCDA_MSG_INVALID_KEY})
+        );
         Ok(())
     }
 

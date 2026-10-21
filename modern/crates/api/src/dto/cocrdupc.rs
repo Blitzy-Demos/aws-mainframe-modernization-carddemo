@@ -68,7 +68,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use super::{digits, text};
+use super::{digits, full_text};
 
 /// The key of an endpoint 10 request.
 ///
@@ -200,10 +200,11 @@ impl CardUpdateFields {
 /// last response left, which the client echoes in every endpoint 10 request (COCRDUPC-044).
 ///
 /// It holds the account as entered, the name upper-cased, the typed expiry date with its day and
-/// the status, without their trailing spaces. It holds no card number, because the card is the
-/// path's `card_ref`, and no CVV, which cannot leave the service (module docs). A value the
-/// client alters equals no stored value, so it reads as a change and, at a save, as a card
-/// changed by another user: the snapshot grants nothing (`X-COCRDUPC-1`).
+/// the status; the name and status keep every byte of their fields, trailing spaces included
+/// (COCRDUPC-017). It holds no card number, because the card is the path's `card_ref`, and no
+/// CVV, which cannot leave the service (module docs). A value the client alters equals no stored
+/// value, so it reads as a change and, at a save, as a card changed by another user: the
+/// snapshot grants nothing (`X-COCRDUPC-1`).
 // `state` travels with the fetched values because the domain decides what a key does from the
 // echoed state (`rules::CardSnapshotFields::state`), and a typed member refuses a code the
 // program never sets before the domain is reached.
@@ -216,9 +217,13 @@ pub struct CardUpdateSnapshot {
     #[validate(length(max = 11))]
     #[schema(max_length = 11, example = "00000000050")]
     pub acct_id: String,
-    /// `CCUP-OLD-CRDNAME PIC X(50)`: the stored name, upper-cased at the fetch (COCRDUPC-017).
+    /// `CCUP-OLD-CRDNAME PIC X(50)`: the stored name, upper-cased at the fetch, all 50 bytes
+    /// (COCRDUPC-017).
     #[validate(length(max = 50))]
-    #[schema(max_length = 50, example = "TEST HOLDER")]
+    #[schema(
+        max_length = 50,
+        example = "TEST HOLDER                                       "
+    )]
     pub embossed_name: String,
     /// `CCUP-OLD-EXPYEAR`, `CCUP-OLD-EXPMON` and `CCUP-OLD-EXPDAY`: the stored expiry date,
     /// `null` when it is blank.
@@ -229,16 +234,17 @@ pub struct CardUpdateSnapshot {
     pub status: String,
 }
 
-/// The snapshot as the text the client echoes. An account the domain holds as unknown, from an
-/// echo that was not 11 digits, is the empty text, which reads back as unknown.
+/// The snapshot as the text the client echoes, the name and status every byte of their fields
+/// (COCRDUPC-017, COCRDUPC-044). An account the domain holds as unknown, from an echo that was
+/// not 11 digits, is the empty text, which reads back as unknown.
 impl From<rules::CardSnapshot> for CardUpdateSnapshot {
     fn from(snapshot: rules::CardSnapshot) -> Self {
         Self {
             state: snapshot.state().into(),
             acct_id: snapshot.acct_id().map_or_else(String::new, digits),
-            embossed_name: text(snapshot.embossed_name()),
+            embossed_name: full_text(snapshot.embossed_name()),
             expiration_date: snapshot.expiration_date(),
-            status: text(snapshot.status()),
+            status: full_text(snapshot.status()),
         }
     }
 }
@@ -276,14 +282,15 @@ pub struct CardUpdateView {
     /// `CARDSIDO`: the card number, twelve `*` followed by its last four digits (COCRDUPC-042).
     #[schema(value_type = String, example = "************5740")]
     pub card_num: CardNumber,
-    /// `CRDNAMEO`: the stored name with `a` to `z` upper-cased, without trailing spaces
-    /// (COCRDUPC-017).
-    #[schema(example = "TEST HOLDER")]
+    /// `CRDNAMEO`: the stored name with `a` to `z` upper-cased and every other byte unchanged,
+    /// all 50 bytes, trailing spaces included (COCRDUPC-017).
+    #[schema(example = "TEST HOLDER                                       ")]
     pub embossed_name: String,
     /// `CARD-EXPIRAION-DATE PIC X(10)` as a date, `null` when the stored date is blank
     /// (COCRDUPC-017, CVACT02Y-005).
     pub expiration_date: Option<NaiveDate>,
-    /// `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`; empty when it is a space.
+    /// `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`: the stored byte, a space included
+    /// (COCRDUPC-017).
     #[schema(example = "Y")]
     pub status: String,
     /// The fetched values in state `show_details`, echoed in every endpoint 10 request
@@ -314,9 +321,9 @@ impl From<rules::CardUpdateView> for CardUpdateView {
             card_ref: card_ref.get(),
             acct_id: digits(acct_id),
             card_num,
-            embossed_name: text(&embossed_name),
+            embossed_name: full_text(&embossed_name),
             expiration_date,
-            status: text(&status),
+            status: full_text(&status),
             snapshot: snapshot.into(),
             message: None,
             info_message: Some(info_message.to_owned()),
@@ -342,7 +349,7 @@ impl From<rules::CardUpdateView> for CardUpdateView {
     "snapshot": {
         "state": "show_details",
         "acct_id": "00000000050",
-        "embossed_name": "TEST HOLDER",
+        "embossed_name": "TEST HOLDER                                       ",
         "expiration_date": "2025-04-30",
         "status": "Y"
     }
@@ -376,7 +383,7 @@ pub struct CardUpdateRequest {
     "snapshot": {
         "state": "changes_ok_not_confirmed",
         "acct_id": "00000000050",
-        "embossed_name": "TEST HOLDER",
+        "embossed_name": "TEST HOLDER                                       ",
         "expiration_date": "2025-04-30",
         "status": "Y"
     }
@@ -582,7 +589,7 @@ mod tests {
         let snapshot = json!({
             "state": "show_details",
             "acct_id": "00000000050",
-            "embossed_name": "TEST HOLDER",
+            "embossed_name": "TEST HOLDER                                       ",
             "expiration_date": "2025-04-30",
             "status": "Y",
         });
@@ -592,7 +599,7 @@ mod tests {
                 "card_ref": 7,
                 "acct_id": "00000000050",
                 "card_num": REDACTED,
-                "embossed_name": "TEST HOLDER",
+                "embossed_name": "TEST HOLDER                                       ",
                 "expiration_date": "2025-04-30",
                 "status": "Y",
                 "snapshot": snapshot,
@@ -603,6 +610,35 @@ mod tests {
         let debug = format!("{view:?}");
         assert!(!debug.contains(CARD), "the card number leaked into Debug");
         assert!(debug.contains(REDACTED));
+        Ok(())
+    }
+
+    // audit: COCRDUPC-017
+    // audit: COCRDUPC-044
+    #[test]
+    fn the_name_and_status_travel_as_every_byte_of_their_fields() -> TestResult {
+        let held = rules::CardSnapshot::from_fields(&rules::CardSnapshotFields {
+            state: rules::CardUpdateState::ShowDetails,
+            acct_id: "00000000050",
+            embossed_name: "TEST HOLDER",
+            expiration_date: None,
+            status: " ",
+        });
+        let view = CardUpdateView::from(rules::CardUpdateView {
+            status: PicX::spaces(),
+            snapshot: held.clone(),
+            ..fetched(None)?
+        });
+        let name = format!("{:<50}", "TEST HOLDER");
+        for (shown_name, shown_status) in [
+            (&view.embossed_name, &view.status),
+            (&view.snapshot.embossed_name, &view.snapshot.status),
+        ] {
+            assert_eq!((shown_name, shown_status.as_str()), (&name, " "));
+        }
+        // The 50 and 1 bytes pass the snapshot's widths and rebuild the snapshot held.
+        assert!(view.snapshot.validate().is_ok());
+        assert_eq!(rules::CardSnapshot::from(&view.snapshot), held);
         Ok(())
     }
 

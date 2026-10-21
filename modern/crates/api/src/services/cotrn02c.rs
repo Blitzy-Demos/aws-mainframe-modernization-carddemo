@@ -85,12 +85,14 @@ const DUPKEY: &str = "DUPKEY";
 ///
 /// `aid` ENTER runs `PROCESS-ENTER-KEY` on the request's fields; PF5 runs
 /// `COPY-LAST-TRAN-DATA`, which replaces them with the highest-ID transaction's before it does
-/// the same. The request's typed card number is read only by the key edit.
+/// the same. Any other key is the `WHEN OTHER` branch, decided before the store is touched. The
+/// request's typed card number is read only by the key edit.
 ///
 /// # Errors
 ///
 /// - [`ServiceError::Rule`]: the first COTRN02C edit, read or write that fails, with its audited
-///   message, field and status class: the key edits and cross-reference reads (COTRN02C-009 to
+///   message, field and status class: an unserved key, `AddFailure::invalid_key` with nothing
+///   read or written (COTRN02C-007), the key edits and cross-reference reads (COTRN02C-009 to
 ///   COTRN02C-019), the data edits (COTRN02C-020 to COTRN02C-039), an unknown confirmation
 ///   (COTRN02C-042), the highest-ID browse (COTRN02C-044, COTRN02C-053) and the insert
 ///   (COTRN02C-050, COTRN02C-051).
@@ -108,12 +110,15 @@ pub(crate) async fn add(
         fields,
         confirm,
     } = request;
+    // `MAIN-PARA`'s `EVALUATE EIBAID` comes first: its `WHEN OTHER` sends the invalid-key
+    // message with nothing read or written (COTRN02C-007).
+    let aid = cotrn02c::Aid::try_from(aid).map_err(ServiceError::Rule)?;
     let keys = Keys {
         acct_id: acct_id.as_deref(),
         card_num: card_num.as_deref(),
     };
     let mut store = state.store.clone();
-    match cotrn02c::Aid::from(aid) {
+    match aid {
         cotrn02c::Aid::Enter => {
             process_enter(&mut store, keys, entered(&fields, &confirm), None).await
         }
@@ -295,4 +300,75 @@ async fn browse_highest(tx: &mut PgTx<'_>) -> Result<(PicX<16>, PicX<20>), Persi
 /// CICS condition the replacement detects itself; no key or field is recorded.
 fn region_log(paragraph: &'static str, condition: &dyn fmt::Display) {
     tracing::warn!(paragraph, condition = %condition, "COTRN02C file statement failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use domain::SystemClock;
+    use domain::copybook::PicX;
+    use domain::online::cosgn00c::UserType;
+    use domain::online::cotrn02c::AddFailure;
+    use persistence::PgStore;
+    use test_support::postgres::start_postgres;
+
+    use super::add;
+    use crate::app::AppState;
+    use crate::auth::extract::SignedOnUser;
+    use crate::auth::jwt::JwtKeys;
+    use crate::dto::cotrn02c::{Aid, TranAddFields, TranAddRequest};
+    use crate::error::ServiceError;
+
+    type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// A local-only signing secret for these tests.
+    const SECRET: &str = "services-cotrn02c-test-secret";
+
+    /// A request on the account path with a `Y` confirmation, under `aid`.
+    fn request(aid: Aid) -> TranAddRequest {
+        TranAddRequest {
+            aid,
+            acct_id: Some("00000000050".to_owned()),
+            card_num: None,
+            fields: TranAddFields::default(),
+            confirm: "Y".to_owned(),
+        }
+    }
+
+    // audit: COTRN02C-007
+    #[tokio::test]
+    async fn an_unserved_key_is_answered_before_the_store_is_touched() -> TestResult {
+        let guard = start_postgres().await?;
+        // A closed pool fails every statement, so a request that read or wrote anything shows it.
+        guard.pool().close().await;
+        let state = AppState::new(
+            PgStore::new(guard.pool().clone()),
+            JwtKeys::new(SECRET, 3600),
+            Arc::new(SystemClock),
+            PathBuf::from("var/jobs"),
+        );
+        let user = SignedOnUser {
+            user_id: PicX::from_text("USER0001")?,
+            user_type: UserType::USER,
+        };
+
+        // A served key reaches the store: ENTER's account read fails on the closed pool.
+        match add(&state, &user, request(Aid::Enter)).await {
+            Err(ServiceError::Rule(failure)) => assert_eq!(
+                (failure.message(), failure.class().http_status()),
+                ("Unable to lookup Acct in XREF AIX file...", 500)
+            ),
+            other => return Err(format!("ENTER on a closed pool gave {other:?}").into()),
+        }
+
+        let refused = add(&state, &user, request(Aid::Unserved)).await;
+        assert_eq!(
+            refused.err(),
+            Some(ServiceError::Rule(AddFailure::invalid_key()))
+        );
+        Ok(())
+    }
 }

@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
-use super::{PageDirection, text};
+use super::{PageDirection, full_text, text};
 
 /// The key of the transfer that brought the screen up, sent with the first request only
 /// (COTRN00C-003, COTRN00C-004, X-COTRN00C-2).
@@ -187,12 +187,12 @@ fn key_field(key: &str) -> PicX<16> {
     "tran_id": "0000000000000001",
     "orig_ts": "2022-07-18T13:05:09.120",
     "display_date": "07/18/22",
-    "description": "Purchase at Example Store",
+    "description": "Purchase at Example Store ",
     "amount": "+00000050.47"
 }))]
 pub struct TranListRow {
-    /// `TRNIDnn`: the stored `TRAN-ID`, 16 characters, which the `S` selection carries to
-    /// COTRN01 (COTRN00C-028).
+    /// `TRNIDnn`: the stored `TRAN-ID`, all 16 bytes as stored, which the `S` selection carries
+    /// to COTRN01 (COTRN00C-028).
     pub tran_id: String,
     /// `TRAN-ORIG-TS` as its typed timestamp, `null` when the field is blank (COTRN00C-029;
     /// Typed Dates and Timestamps).
@@ -202,8 +202,8 @@ pub struct TranListRow {
     /// display no source fixes (COTRN00C-029, COTRN00C-030).
     #[schema(min_length = 8, max_length = 8)]
     pub display_date: Option<String>,
-    /// `TDESCnn`: the first 26 bytes of `TRAN-DESC`, without trailing spaces (COTRN00C-031).
-    #[schema(max_length = 26)]
+    /// `TDESCnn`: the first 26 bytes of `TRAN-DESC`, trailing spaces included (COTRN00C-031).
+    #[schema(min_length = 26, max_length = 26)]
     pub description: String,
     /// `TAMTnnn`: `TRAN-AMT` edited by `PIC +99999999.99`, 12 characters such as
     /// `+00000050.47` (COTRN00C-032).
@@ -214,10 +214,10 @@ pub struct TranListRow {
 impl From<rules::TranListRow> for TranListRow {
     fn from(row: rules::TranListRow) -> Self {
         Self {
-            tran_id: text(row.tran_id()),
+            tran_id: full_text(row.tran_id()),
             orig_ts: row.orig_ts(),
             display_date: row.display_date().map(text),
-            description: text(row.description()),
+            description: full_text(row.description()),
             amount: row.amount().to_owned(),
         }
     }
@@ -233,7 +233,7 @@ impl From<rules::TranListRow> for TranListRow {
             "tran_id": "0000000000000001",
             "orig_ts": "2022-07-18T13:05:09.120",
             "display_date": "07/18/22",
-            "description": "Purchase at Example Store",
+            "description": "Purchase at Example Store ",
             "amount": "+00000050.47"
         },
         null
@@ -591,6 +591,7 @@ mod tests {
 
     #[test]
     fn a_row_carries_the_screen_fields_and_no_card_number() -> TestResult {
+        // COTRN00C-031: the first 26 bytes of the description, its 26th a space.
         let long = "Purchase at a store whose name runs past the screen";
         let row = TranListRow::from(rules::row_from(&record(7, -123_456, long)?));
         assert_eq!(
@@ -599,7 +600,7 @@ mod tests {
                 tran_id: "0000000000000007".to_owned(),
                 orig_ts: Some(origin()?),
                 display_date: Some("07/18/22".to_owned()),
-                description: "Purchase at a store whose".to_owned(),
+                description: "Purchase at a store whose ".to_owned(),
                 amount: "-00001234.56".to_owned(),
             }
         );
@@ -610,10 +611,18 @@ mod tests {
                 "tran_id": "0000000000000007",
                 "orig_ts": "2022-07-18T13:05:09.120",
                 "display_date": "07/18/22",
-                "description": "Purchase at a store whose",
+                "description": "Purchase at a store whose ",
                 "amount": "-00001234.56"
             })
         );
+
+        // COTRN00C-028 and COTRN00C-031: a short ID and description keep their trailing spaces.
+        let mut short = record(8, 5047, "Purchase")?;
+        short.id = PicX::from_text("ABC").map_err(shown)?;
+        let row = TranListRow::from(rules::row_from(&short));
+        assert_eq!(row.tran_id, format!("{:<16}", "ABC"));
+        assert_eq!(row.description, format!("{:<26}", "Purchase"));
+        assert_eq!((row.tran_id.len(), row.description.len()), (16, 26));
 
         let response = respond(&TranListQuery::default(), rows([1])?)?;
         let body = serde_json::to_string(&response)?;
