@@ -45,9 +45,10 @@
 //! text has the fixed width of its COBOL field. A reading inside a leap second, which `chrono`
 //! gives as second 59 with a fraction of one second or more, is read as the last instant of
 //! second 59: no COBOL clock shows a second 60. A year outside 0–9999, which neither
-//! [`SystemClock`] nor a COBOL clock produces, keeps its low-order four digits, or two in the
-//! two-digit forms, as a `PIC 9(04)` or `PIC 9(02)` receiver keeps the low-order digits a `MOVE`
-//! gives it.
+//! [`SystemClock`] nor a COBOL clock produces, keeps the low-order four digits of its magnitude,
+//! or two in the two-digit forms, as an unsigned `PIC 9(04)` or `PIC 9(02)` receiver keeps the
+//! low-order digits of the absolute value a `MOVE` gives it: year −1 reads as `0001` and `01`, and
+//! year 12 024 as `2024` and `24`.
 
 use chrono::{Datelike, Local, NaiveDateTime, Timelike};
 use copybook::{CobolTimestamp, PicS, TsForm};
@@ -62,10 +63,10 @@ const NANOS_PER_HUNDREDTH: u32 = 10_000_000;
 const LAST_NANO_OF_SECOND: u32 = 999_999_999;
 
 /// The modulus that keeps the low-order four digits of a year.
-const FOUR_DIGIT_YEARS: i32 = 10_000;
+const FOUR_DIGIT_YEARS: u32 = 10_000;
 
 /// The modulus that keeps the low-order two digits of a year.
-const TWO_DIGIT_YEARS: i32 = 100;
+const TWO_DIGIT_YEARS: u32 = 100;
 
 /// The source of the current local date and time.
 ///
@@ -133,11 +134,13 @@ fn hundredths(at: NaiveDateTime) -> u32 {
     nanos_in_second(at) / NANOS_PER_HUNDREDTH
 }
 
-/// The low-order digits of the year of `at` that `modulus` keeps, never negative.
-fn year_digits(at: NaiveDateTime, modulus: i32) -> i32 {
-    // TRUNCATION: a COBOL year field of four or two digits keeps the low-order digits of the
-    // year it receives; `rem_euclid` drops the rest and maps a negative year into the field too.
-    at.year().rem_euclid(modulus)
+/// The low-order digits of the year of `at` that `modulus` keeps, taken from the year's
+/// magnitude, so a negative year keeps the digits of its absolute value.
+fn year_digits(at: NaiveDateTime, modulus: u32) -> u32 {
+    // TRUNCATION: a COBOL year field of four or two digits is unsigned and keeps the low-order
+    // digits of the year it receives; `unsigned_abs` drops the sign as the `MOVE` does, and the
+    // remainder drops the high-order digits.
+    at.year().unsigned_abs() % modulus
 }
 
 /// `at` as the timestamp a COBOL writer stores in layout `form`, its year cut to four digits and
@@ -145,11 +148,17 @@ fn year_digits(at: NaiveDateTime, modulus: i32) -> i32 {
 fn cobol_timestamp(at: NaiveDateTime, nanos: u32, form: TsForm) -> CobolTimestamp {
     // `CobolTimestamp::new` refuses a year outside 0–9999, a fraction finer than a microsecond, a
     // leap second and a layout-`S` time other than midnight. Callers pass a fraction of whole
-    // hundredths or zero and the year is cut to four digits; a year cut by 10 000 keeps its
-    // leap-year status, since 10 000 is a multiple of 400, so `with_year` keeps every date. The
-    // fallback is therefore never taken; it rebuilds from `NaiveDateTime::default()`, midnight of
-    // 1 January 1970, which passes every check in every layout, so it ends after one call.
-    at.with_year(year_digits(at, FOUR_DIGIT_YEARS))
+    // hundredths or zero, and the year is cut to four digits. Whether a year is a leap year
+    // depends only on whether 4, 100 and 400 divide it, which neither dropping the sign nor
+    // removing a multiple of 10 000 changes, so `with_year` keeps every date: 29 February of year
+    // −4 becomes 29 February of 0004. The fallback is therefore never taken; it rebuilds from
+    // `NaiveDateTime::default()`, midnight of 1 January 1970, which passes every check in every
+    // layout, so it ends after one call.
+    // TRUNCATION: the four-digit year is at most 9 999, far inside `i32`, so the checked
+    // conversion is exact; its error arm only joins the fallback.
+    i32::try_from(year_digits(at, FOUR_DIGIT_YEARS))
+        .ok()
+        .and_then(|year| at.with_year(year))
         .and_then(|value| value.with_nanosecond(nanos))
         .and_then(|value| CobolTimestamp::new(value, form).ok())
         .unwrap_or_else(|| cobol_timestamp(NaiveDateTime::default(), 0, form))
@@ -268,9 +277,7 @@ pub fn hhmmss(at: NaiveDateTime) -> String {
 /// (`CBPAUP0C.cbl:187`) (COPAUA0C-098, CBPAUP0C-001).
 #[must_use]
 pub fn yyddd(at: NaiveDateTime) -> u32 {
-    // The remainder of a positive modulus is never negative, so `unsigned_abs` returns it
-    // unchanged.
-    year_digits(at, TWO_DIGIT_YEARS).unsigned_abs() * 1_000 + at.ordinal()
+    year_digits(at, TWO_DIGIT_YEARS) * 1_000 + at.ordinal()
 }
 
 /// `WS-TIME-WITH-MS = (WS-CUR-TIME-N6 * 1000) + WS-CUR-TIME-MS`: the 24-hour `HHMMSS` time times
@@ -488,20 +495,56 @@ mod tests {
 
     #[test]
     fn a_year_beyond_four_digits_keeps_its_low_order_digits() -> TestResult {
-        // 12024 and -1 keep 2024 and 9999, and 29 February survives the cut.
+        // 12024 keeps 2024. A negative year keeps the low-order digits of its magnitude, as an
+        // unsigned receiver does, so -1 and -10001 keep 0001 and -4 keeps 0004. 29 February
+        // survives every cut.
         let late = instant((12_024, 2, 29), (8, 9, 10, 0))?;
         assert_eq!(encoded(db2_timestamp(late)), b"2024-02-29-08.09.10.000000");
         assert_eq!(mm_dd_yyyy_dash(late), "02-29-2024");
         assert_eq!(header_date(late), "02/29/24");
         assert_eq!(yyddd(late), 24_060);
-        let early = instant((-1, 12, 31), (0, 0, 0, 0))?;
-        assert_eq!(
-            encoded(iso_timestamp_zero_micros(early)),
-            b"9999-12-31 00:00:00.000000"
-        );
-        assert_eq!(yyyy_mm_dd_dash(early), "9999-12-31");
-        assert_eq!(yymmdd(early), "991231");
-        assert_eq!(yyddd(early), 99_365);
+        // (date, Db2 timestamp, layout-I timestamp, then the header, CDRD, COBIL00C and CSSL
+        // dates, YYDDD)
+        let cases = [
+            (
+                (-1, 12, 31),
+                "0001-12-31-00.00.00.000000",
+                "0001-12-31 00:00:00.000000",
+                "12/31/01 12-31-0001 0001-12-31 011231",
+                1_365,
+            ),
+            (
+                (-10_001, 12, 31),
+                "0001-12-31-00.00.00.000000",
+                "0001-12-31 00:00:00.000000",
+                "12/31/01 12-31-0001 0001-12-31 011231",
+                1_365,
+            ),
+            (
+                (-4, 2, 29),
+                "0004-02-29-00.00.00.000000",
+                "0004-02-29 00:00:00.000000",
+                "02/29/04 02-29-0004 0004-02-29 040229",
+                4_060,
+            ),
+        ];
+        for (date, db2, iso, dates, date_number) in cases {
+            let early = instant(date, (0, 0, 0, 0))?;
+            assert_eq!(encoded(db2_timestamp(early)), db2.as_bytes(), "{early}");
+            assert_eq!(
+                encoded(iso_timestamp_zero_micros(early)),
+                iso.as_bytes(),
+                "{early}"
+            );
+            let rendered = [
+                header_date(early),
+                mm_dd_yyyy_dash(early),
+                yyyy_mm_dd_dash(early),
+                yymmdd(early),
+            ];
+            assert_eq!(rendered.join(" "), dates, "{early}");
+            assert_eq!(yyddd(early), date_number, "{early}");
+        }
         Ok(())
     }
 }
