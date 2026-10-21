@@ -1893,6 +1893,9 @@ mod tests {
     fn next_frame(received: &[u8]) -> Option<(Option<(u16, u16)>, usize)> {
         let header = received.get(..7)?;
         let size = u32::from_be_bytes(header.get(3..7)?.try_into().ok()?);
+        // TRUNCATION: checked, never lossy. Every target this workspace builds for has a `usize`
+        // of at least 32 bits, so `size` converts exactly; a refused conversion or an overflowing
+        // add yields `None`, no whole frame, and never a wrapped length.
         let length = usize::try_from(size).ok()?.checked_add(8)?;
         let frame = received.get(..length)?;
         let method = if header.first() == Some(&1) {
@@ -1908,6 +1911,9 @@ mod tests {
     /// A method frame on channel 0: type 1, the payload size, the class and method ids, the
     /// arguments and the frame end.
     fn method_frame(class: u16, method: u16, arguments: &[u8]) -> Vec<u8> {
+        // TRUNCATION: checked, never lossy. Callers pass fixed handshake arguments of at most 24
+        // bytes, so the size is at most 28 and `u32` holds it exactly; the unreachable fallback
+        // saturates, never wraps, announcing a frame far past any frame size the client accepts.
         let size = u32::try_from(arguments.len().saturating_add(4)).unwrap_or(u32::MAX);
         let mut frame = vec![1, 0, 0];
         frame.extend_from_slice(&size.to_be_bytes());
@@ -1920,6 +1926,9 @@ mod tests {
 
     /// An AMQP long string: the length as a big-endian `u32`, then the bytes.
     fn long_string(text: &str) -> Vec<u8> {
+        // TRUNCATION: checked, never lossy. The only texts are the fixed mechanism `PLAIN` and
+        // locale `en_US`, five bytes each, so `u32` holds the length exactly; the unreachable
+        // fallback saturates and never wraps, so a mis-sized string fails the handshake visibly.
         let length = u32::try_from(text.len()).unwrap_or(u32::MAX);
         let mut encoded = length.to_be_bytes().to_vec();
         encoded.extend_from_slice(text.as_bytes());
