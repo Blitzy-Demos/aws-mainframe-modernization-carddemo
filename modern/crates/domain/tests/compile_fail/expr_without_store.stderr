@@ -1,0 +1,10 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/expr_without_store.rs:13:26
+   |
+13 |     let left: Money<9> = bal - amt;
+   |               --------   ^^^^^^^^^ expected `Money<9>`, found `MoneyExpr`
+   |               |
+   |               expected due to this
+   |
+   = note: expected struct `Money<9>`
+              found struct `MoneyExpr`
