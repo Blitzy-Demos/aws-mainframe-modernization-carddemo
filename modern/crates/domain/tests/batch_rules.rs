@@ -2410,6 +2410,8 @@ mod creastmt {
 
 /// TRANREPT, `domain::batch::cbtrn03c` (`modern/audit/batch/TRANREPT.md`, FIXRPT rows).
 mod tranrept {
+    use std::collections::BTreeMap;
+
     use chrono::NaiveDateTime;
     use copybook::{CobolTimestamp, PicTimestamp, PicU, PicX, TsForm};
     use domain::CardNumber;
@@ -2421,7 +2423,7 @@ mod tranrept {
         CardXrefRecord, TransactionCategoryRecord, TransactionRecord, TransactionTypeRecord,
     };
 
-    use super::{Outcome, Posted, TestResult, fixture, instant, money, padded};
+    use super::{Outcome, Posted, TestResult, audit, fixture, instant, money, padded};
 
     /// The first record of every header group (FIXRPT-902).
     const HEADER_GROUPS: [usize; 15] = [
@@ -2433,15 +2435,8 @@ mod tranrept {
         21, 81, 101, 121, 161, 181, 201, 261, 281, 321, 341, 381, 401, 441, 449,
     ];
 
-    /// The details of card block 1, FIXRPT-001, quoted as the audit gives them.
-    const FIRST_BLOCK: [&str; 6] = [
-        "{T:21} 00000000050 01-Purchase        0001-Regular Sales Draft           POS TERM               183.88",
-        "{T:102} 00000000050 01-Purchase        0001-Regular Sales Draft           POS TERM                14.00",
-        "{T:142} 00000000050 01-Purchase        0001-Regular Sales Draft           POS TERM               967.44",
-        "{T:184} 00000000050 03-Credit          0001-Credit to Account             OPERATOR      -         47.88",
-        "{T:214} 00000000050 01-Purchase        0001-Regular Sales Draft           POS TERM                94.77",
-        "{T:257} 00000000050 01-Purchase        0001-Regular Sales Draft           POS TERM               241.66",
-    ];
+    /// The entry of FIXRPT-050 that stands for the account total the last card never gets.
+    const NO_ACCOUNT_TOTAL: &str = "no account total is written for this card (FIXRPT-905)";
 
     /// `TRANSACTION-HEADER-1`, its trailing spaces omitted (FIXRPT-902).
     const HEADER_1: &str = "Transaction ID   Account ID  Transaction Type   Tran Category                      Tran Source            Amount";
@@ -2586,6 +2581,247 @@ mod tranrept {
     /// 2022-07-01 12:00:00 in layout `D`, as `posttran` stamps it.
     fn in_window() -> Outcome<Option<(NaiveDateTime, TsForm)>> {
         Ok(Some((instant((2022, 7, 1), (12, 0, 0))?, TsForm::Db2)))
+    }
+
+    /// One entry of the `Expected result` cell of a `FIXRPT-nnn` row, at its report record.
+    enum Entry {
+        /// A detail, quoted with its `{T:n}` references.
+        Detail(usize, String),
+        /// The account total and its edited amount.
+        AccountTotal(usize, String),
+        /// A dash line.
+        Dashes(usize),
+        /// A page total, its edited amount, and whether X-FIXTURES-H3 blocks that amount.
+        PageTotal {
+            position: usize,
+            amount: String,
+            halted: bool,
+        },
+        /// A header group, by its first record.
+        Headers(usize),
+        /// The grand total, whose amount X-FIXTURES-H3 blocks.
+        GrandTotal(usize),
+        /// FIXRPT-905: the block writes no account total.
+        NoAccountTotal,
+    }
+
+    impl Entry {
+        /// The report records the entry stands for.
+        fn positions(&self) -> Vec<usize> {
+            match self {
+                Self::Detail(position, _)
+                | Self::AccountTotal(position, _)
+                | Self::Dashes(position)
+                | Self::PageTotal { position, .. }
+                | Self::GrandTotal(position) => vec![*position],
+                Self::Headers(first) => (*first..*first + 4).collect(),
+                Self::NoAccountTotal => Vec::new(),
+            }
+        }
+    }
+
+    /// A card block of `FIXRPT-001` to `FIXRPT-050`: its first and last report records and the
+    /// entries that cover them.
+    struct Block {
+        first: usize,
+        last: usize,
+        entries: Vec<Entry>,
+    }
+
+    /// Whether the note after a total's quoted amount names X-FIXTURES-H3, which blocks the
+    /// amount. Any other note is refused.
+    fn halted(note: &str) -> Outcome<bool> {
+        if note.is_empty() {
+            return Ok(false);
+        }
+        note.strip_prefix(" (")
+            .and_then(|inner| inner.strip_suffix(')'))
+            .filter(|inner| inner.ends_with("X-FIXTURES-H3"))
+            .map(|_| true)
+            .ok_or_else(|| format!("an unrecognised note {note:?}").into())
+    }
+
+    /// One `; `-separated entry of a `FIXRPT-nnn` cell. An entry of no known shape is refused.
+    fn parse_entry(entry: &str) -> Outcome<Entry> {
+        if entry == NO_ACCOUNT_TOTAL {
+            return Ok(Entry::NoAccountTotal);
+        }
+        let unknown = || format!("an unrecognised entry {entry:?}");
+        let (head, rest) = entry.split_once(' ').ok_or_else(unknown)?;
+        if rest == "headers" {
+            let (first, last) = head.split_once('-').ok_or_else(unknown)?;
+            let first: usize = first.parse()?;
+            if last.parse::<usize>()? != first + 3 {
+                return Err(format!("{entry:?} is not a group of four records").into());
+            }
+            return Ok(Entry::Headers(first));
+        }
+        let position: usize = head.parse()?;
+        if rest == "dashes" {
+            return Ok(Entry::Dashes(position));
+        }
+        let quote = rest
+            .strip_prefix('`')
+            .and_then(|tail| tail.strip_suffix('`'))
+            .filter(|quote| !quote.contains('`'));
+        if let Some(quote) = quote {
+            return Ok(Entry::Detail(position, quote.to_owned()));
+        }
+        let (label, tail) = rest.split_once(" `").ok_or_else(unknown)?;
+        let (amount, note) = tail.split_once('`').ok_or_else(unknown)?;
+        let amount = amount.to_owned();
+        match (label, halted(note)?) {
+            ("account total", false) => Ok(Entry::AccountTotal(position, amount)),
+            ("page total", halted) => Ok(Entry::PageTotal {
+                position,
+                amount,
+                halted,
+            }),
+            ("grand total", true) => Ok(Entry::GrandTotal(position)),
+            _ => Err(unknown().into()),
+        }
+    }
+
+    /// The `Expected result` cell of `FIXRPT-<row>`: `report records A-B: ` and its entries,
+    /// which must cover records A to B once each.
+    fn parse_block(row: usize, cell: &str) -> Outcome<Block> {
+        let (range, cell_entries) = cell
+            .strip_prefix("report records ")
+            .and_then(|rest| rest.split_once(": "))
+            .ok_or_else(|| format!("FIXRPT-{row:03}: no record range"))?;
+        let (first, last) = range
+            .split_once('-')
+            .ok_or_else(|| format!("FIXRPT-{row:03}: a range of two records"))?;
+        let (first, last): (usize, usize) = (first.parse()?, last.parse()?);
+        let mut entries = Vec::new();
+        for entry in cell_entries.split("; ") {
+            entries.push(parse_entry(entry).map_err(|error| format!("FIXRPT-{row:03}: {error}"))?);
+        }
+        let mut covered: Vec<usize> = entries.iter().flat_map(Entry::positions).collect();
+        covered.sort_unstable();
+        if !covered.into_iter().eq(first..=last) {
+            return Err(format!(
+                "FIXRPT-{row:03}: the entries do not cover records {first} to {last} once each"
+            )
+            .into());
+        }
+        Ok(Block {
+            first,
+            last,
+            entries,
+        })
+    }
+
+    /// The rows `FIXRPT-001` to `FIXRPT-050` of `fixtures.md`, by `cardxref.txt` line.
+    fn fixrpt_blocks() -> Outcome<BTreeMap<usize, Block>> {
+        let text = audit("fixtures.md")?;
+        let mut blocks = BTreeMap::new();
+        for row in text.lines() {
+            let Some(rest) = row.strip_prefix("| FIXRPT-") else {
+                continue;
+            };
+            let number: usize = rest.get(..3).ok_or("a three-digit row number")?.parse()?;
+            if number > 50 {
+                continue;
+            }
+            // Header: Rule ID | Program | Paragraph | Copybook field or PIC | Input condition |
+            // Expected result | Source lines | Fixture record.
+            let cell = row.split(" | ").nth(5).ok_or("an Expected result cell")?;
+            if blocks.insert(number, parse_block(number, cell)?).is_some() {
+                return Err(format!("FIXRPT-{number:03} appears twice").into());
+            }
+        }
+        Ok(blocks)
+    }
+
+    /// Report record `position`, counted from 1 as the audit counts them.
+    fn at(records: &[ReportRecord], position: usize) -> Outcome<&ReportRecord> {
+        position
+            .checked_sub(1)
+            .and_then(|index| records.get(index))
+            .ok_or_else(|| format!("the report has no record {position}").into())
+    }
+
+    /// The records of one card block against the entries of `FIXRPT-<row>`. X-FIXTURES-H3 leaves
+    /// the order inside the block open, so the details are compared as a set; it also blocks the
+    /// grand total's amount and that of every page total the row marks with it, so of those only
+    /// the kind is asserted.
+    fn assert_block(
+        posted: &Posted,
+        records: &[ReportRecord],
+        row: usize,
+        block: &Block,
+    ) -> TestResult {
+        let group = header_group();
+        let mut positions = Vec::new();
+        let mut expected = Vec::new();
+        for entry in &block.entries {
+            match entry {
+                Entry::Detail(position, quote) => {
+                    positions.push(*position);
+                    expected.push(padded::<REPORT_RECORD_LEN>(&posted.expand(quote)?));
+                }
+                Entry::AccountTotal(position, amount) => assert!(
+                    *at(records, *position)? == total("Account Total", amount),
+                    "FIXRPT-{row:03}: the account total at record {position}"
+                ),
+                Entry::Dashes(position) => assert!(
+                    *at(records, *position)? == [b'-'; REPORT_RECORD_LEN],
+                    "FIXRPT-{row:03}: dashes at record {position}"
+                ),
+                Entry::PageTotal {
+                    position,
+                    amount,
+                    halted,
+                } => {
+                    let record = at(records, *position)?;
+                    assert_eq!(
+                        kind(record),
+                        Kind::PageTotal,
+                        "FIXRPT-{row:03}: a page total at record {position}"
+                    );
+                    // A page that splits a card block or ends the file has no amount to assert.
+                    assert!(
+                        *halted || *record == total("Page Total ", amount),
+                        "FIXRPT-{row:03}: the page total at record {position}"
+                    );
+                }
+                Entry::Headers(first) => {
+                    for (position, wanted) in (*first..).zip(&group) {
+                        assert!(
+                            at(records, position)? == wanted,
+                            "FIXRPT-{row:03}: the header group at record {position}"
+                        );
+                    }
+                }
+                Entry::GrandTotal(position) => assert_eq!(
+                    kind(at(records, *position)?),
+                    Kind::GrandTotal,
+                    "FIXRPT-{row:03}: the grand total at record {position}"
+                ),
+                Entry::NoAccountTotal => {
+                    let (first, last) = (block.first, block.last);
+                    let span = records
+                        .get(first.saturating_sub(1)..last)
+                        .ok_or_else(|| format!("the report has no records {first} to {last}"))?;
+                    assert!(
+                        span.iter().all(|record| kind(record) != Kind::AccountTotal),
+                        "FIXRPT-{row:03}: no account total in records {first} to {last}"
+                    );
+                }
+            }
+        }
+        let mut details = positions
+            .iter()
+            .map(|&position| at(records, position).copied())
+            .collect::<Outcome<Vec<ReportRecord>>>()?;
+        details.sort_unstable();
+        expected.sort_unstable();
+        assert!(
+            details == expected,
+            "FIXRPT-{row:03}: the details at records {positions:?}, as a set"
+        );
+        Ok(())
     }
 
     // audit: CBTRN03C-001
@@ -2771,6 +3007,55 @@ mod tranrept {
     }
 
     // audit: FIXRPT-001
+    // audit: FIXRPT-002
+    // audit: FIXRPT-003
+    // audit: FIXRPT-004
+    // audit: FIXRPT-005
+    // audit: FIXRPT-006
+    // audit: FIXRPT-007
+    // audit: FIXRPT-008
+    // audit: FIXRPT-009
+    // audit: FIXRPT-010
+    // audit: FIXRPT-011
+    // audit: FIXRPT-012
+    // audit: FIXRPT-013
+    // audit: FIXRPT-014
+    // audit: FIXRPT-015
+    // audit: FIXRPT-016
+    // audit: FIXRPT-017
+    // audit: FIXRPT-018
+    // audit: FIXRPT-019
+    // audit: FIXRPT-020
+    // audit: FIXRPT-021
+    // audit: FIXRPT-022
+    // audit: FIXRPT-023
+    // audit: FIXRPT-024
+    // audit: FIXRPT-025
+    // audit: FIXRPT-026
+    // audit: FIXRPT-027
+    // audit: FIXRPT-028
+    // audit: FIXRPT-029
+    // audit: FIXRPT-030
+    // audit: FIXRPT-031
+    // audit: FIXRPT-032
+    // audit: FIXRPT-033
+    // audit: FIXRPT-034
+    // audit: FIXRPT-035
+    // audit: FIXRPT-036
+    // audit: FIXRPT-037
+    // audit: FIXRPT-038
+    // audit: FIXRPT-039
+    // audit: FIXRPT-040
+    // audit: FIXRPT-041
+    // audit: FIXRPT-042
+    // audit: FIXRPT-043
+    // audit: FIXRPT-044
+    // audit: FIXRPT-045
+    // audit: FIXRPT-046
+    // audit: FIXRPT-047
+    // audit: FIXRPT-048
+    // audit: FIXRPT-049
+    // audit: FIXRPT-050
     // audit: FIXRPT-903
     // audit: CBTRN03C-013
     // audit: CBTRN03C-015
@@ -2779,27 +3064,52 @@ mod tranrept {
     // audit: CBTRN03C-024
     // audit: CBTRN03C-026
     #[test]
-    fn the_first_card_block_and_every_description_come_from_the_vsam_version() -> TestResult {
+    fn every_card_block_holds_its_audited_records_and_its_vsam_descriptions() -> TestResult {
         let posted = Posted::run()?;
         let (records, _) = posted_report(&posted)?;
-        // The order inside a card block is X-FIXTURES-H3, so block 1 is compared as a set.
-        let mut block = records.get(4..10).ok_or("records 5 to 10")?.to_vec();
-        let mut expected = FIRST_BLOCK
-            .iter()
-            .map(|quote| Ok(padded::<REPORT_RECORD_LEN>(&posted.expand(quote)?)))
-            .collect::<Outcome<Vec<ReportRecord>>>()?;
-        block.sort_unstable();
-        expected.sort_unstable();
-        assert!(block == expected, "FIXRPT-001: the six details of block 1");
-        let account_total = records.get(10).ok_or("record 11")?;
+        let blocks = fixrpt_blocks()?;
         assert!(
-            *account_total == total("Account Total", "+      1,453.87"),
-            "FIXRPT-001: record 11"
+            blocks.keys().copied().eq(1..=50),
+            "FIXRPT-001 to FIXRPT-050, one row each"
         );
+        // Block 1 starts after the first header group, and every later block after the one
+        // before it, up to the last record of the report.
+        let mut next = 5;
+        for (&row, block) in &blocks {
+            assert_eq!(
+                block.first, next,
+                "FIXRPT-{row:03}: the first record follows the block before"
+            );
+            assert_block(&posted, &records, row, block)?;
+            next = block.last + 1;
+        }
+        assert_eq!(next, records.len() + 1, "FIXRPT-050 ends the report");
+        let entries = || blocks.values().flat_map(|block| &block.entries);
+        let details = entries()
+            .filter(|entry| matches!(entry, Entry::Detail(..)))
+            .count();
+        assert_eq!(details, 262, "FIXRPT-001 to FIXRPT-050: details");
+        let account_totals = entries()
+            .filter(|entry| matches!(entry, Entry::AccountTotal(..)))
+            .count();
         assert_eq!(
-            records.get(11).map(kind),
-            Some(Kind::Dashes),
-            "FIXRPT-001: record 12"
+            account_totals, 49,
+            "FIXRPT-001 to FIXRPT-050: account totals"
+        );
+        let page_amounts: Vec<usize> = entries()
+            .filter_map(|entry| match entry {
+                Entry::PageTotal {
+                    position,
+                    halted: false,
+                    ..
+                } => Some(*position),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            page_amounts,
+            [21, 201, 341],
+            "X-FIXTURES-H3: the page totals whose amount is asserted"
         );
         // E23: the descriptions are those of trantype.txt and trancatg.txt, never the Db2 seed.
         let sales = padded::<34>(b"0001-Regular Sales Draft");
@@ -2925,6 +3235,72 @@ mod tranrept {
                 Kind::Detail,
             ],
             "the header group and the one detail, no total"
+        );
+        Ok(())
+    }
+
+    // audit: CBTRN03C-028
+    #[test]
+    fn the_account_page_and_grand_totals_store_each_sum_into_s9_09_v99() -> TestResult {
+        let xrefs = [1, 2]
+            .into_iter()
+            .map(|card| -> Outcome<CardXrefRecord> {
+                Ok(CardXrefRecord {
+                    card_num: card_number(card),
+                    cust_id: PicU::new(card)?,
+                    acct_id: PicU::new(card)?,
+                    filler: PicX::spaces(),
+                })
+            })
+            .collect::<Outcome<Vec<_>>>()?;
+        let mut run = Tranrept::new(
+            DateParm::DEFAULT,
+            xrefs,
+            fixture::<TransactionTypeRecord>("trantype.txt")?,
+            fixture::<TransactionCategoryRecord>("trancatg.txt")?,
+        );
+        // Card 1: 999999999.99 + 0.01 is stored 0.00 in its account and page totals, so the
+        // next amount, -999999999.99, leaves both at -999999999.99; without the store they would
+        // hold 0.01.
+        let card_1 = [(1, 99_999_999_999), (1, 1), (1, -99_999_999_999)];
+        // Eleven details of 0.00 bring the line counter to 20 at the card change, so the account
+        // total of card 1 (record 19) comes before a page break (record 21).
+        let filler = [(1, 0); 11];
+        // Card 2: -0.50 on the new page, counted twice at end of file, so the page total is
+        // -1.00 and the grand total -999999999.99 + (-1.00), stored -0.99.
+        let card_2 = [(2, -50)];
+        let stamp = in_window()?;
+        for (id, (card, cents)) in (1..).zip(card_1.into_iter().chain(filler).chain(card_2)) {
+            assert_eq!(
+                run.process(&reported(card, id, cents, stamp)?)?,
+                Flow::Continue
+            );
+        }
+        let records = run.finish()?;
+        assert_eq!(
+            records.len(),
+            30,
+            "two header groups, 15 details, 4 totals and 3 dash records"
+        );
+        let totals: Vec<(usize, ReportRecord)> = (1..)
+            .zip(&records)
+            .filter(|(_, record)| {
+                matches!(
+                    kind(record),
+                    Kind::AccountTotal | Kind::PageTotal | Kind::GrandTotal
+                )
+            })
+            .map(|(number, record)| (number, *record))
+            .collect();
+        let expected = [
+            (19, total("Account Total", "-999,999,999.99")),
+            (21, total("Page Total ", "-999,999,999.99")),
+            (28, total("Page Total ", "-          1.00")),
+            (30, total("Grand Total", "-           .99")),
+        ];
+        assert!(
+            totals == expected,
+            "the total records and their record numbers"
         );
         Ok(())
     }

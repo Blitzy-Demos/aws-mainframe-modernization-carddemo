@@ -2,7 +2,9 @@
 //! the COBOL exactly, to the cent.
 //!
 //! - Expected values are transcribed from the derive-lane audits: the worked cases of
-//!   `modern/audit/arithmetic.md` (`ARITH-001` to `ARITH-033`) and the per-record rows of
+//!   `modern/audit/arithmetic.md` (`ARITH-001` to `ARITH-033`), the INTCALC rows that cite them
+//!   (`CBACT04C-013`, `CBACT04C-014`, `CBACT04C-020` and `CBACT04C-026` of
+//!   `modern/audit/batch/INTCALC.md`) and the per-record rows of
 //!   `modern/audit/fixtures.md` (`FIXPOST-001` to `FIXPOST-300` and `FIXINT-001` to `FIXINT-050`,
 //!   with their summaries 901 to 903). Each row carries its `// audit:` tag where it is asserted.
 //! - Actual values come only from `domain::money` and the rule modules `domain::batch::cbact04c`
@@ -1194,11 +1196,21 @@ fn run_posttran(masters: &Masters) -> Result<PostedRun, Box<dyn Error>> {
     })
 }
 
+/// One effect `Intcalc::process` returns, as plain values: the account ID a rewrite updates, or
+/// the amount of a SYSTRAN record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordEffect {
+    Rewrite(u64),
+    Systran(Money<9>),
+}
+
 /// An INTCALC run: each SYSTRAN record with the key of the category balance that wrote it, every
-/// account update by account ID, and the summary.
+/// account update by account ID, the effects of each record read in the order its `process` call
+/// returned them, and the summary.
 struct InterestRun {
     systran: Vec<(CategoryKey, TransactionRecord)>,
     updates: BTreeMap<u64, AccountRecord>,
+    effects: Vec<Vec<RecordEffect>>,
     summary: IntcalcSummary,
 }
 
@@ -1219,24 +1231,30 @@ fn run_intcalc(
     );
     let mut systran = Vec::new();
     let mut updates = BTreeMap::new();
+    let mut effects = Vec::with_capacity(tcatbals.len());
     for tcatbal in tcatbals {
+        let mut record_effects = Vec::new();
         for effect in run.process(tcatbal, &clock)? {
             match effect {
                 IntcalcEffect::AccountUpdate(account) => {
                     let acct_id = account.id.get();
+                    record_effects.push(RecordEffect::Rewrite(acct_id));
                     if updates.insert(acct_id, account).is_some() {
                         return Err(format!("account {acct_id} is rewritten twice").into());
                     }
                 }
                 IntcalcEffect::SystemTransaction(record) => {
+                    record_effects.push(RecordEffect::Systran(record.amt));
                     systran.push((category_key(tcatbal), record));
                 }
             }
         }
+        effects.push(record_effects);
     }
     Ok(InterestRun {
         systran,
         updates,
+        effects,
         summary: run.finish(),
     })
 }
@@ -1275,8 +1293,10 @@ fn check_rewrite(
 
 /// `1300-COMPUTE-INTEREST` worked cases: (`TRAN-CAT-BAL`, `DIS-INT-RATE`, the
 /// `WS-MONTHLY-INT` stored), in hundredths. ARITH-006 and ARITH-007 are the cases where rounding
-/// would give one cent more.
-const MONTHLY_INTEREST_CASES: [(i64, i64, i64); 9] = [
+/// would give one cent more. The CBACT04C-013 cases take the sign of the product and store 0.00
+/// for a non-zero product whose kept digits are all zero; a zero stored from a negative product
+/// has no case, as its sign has no single result (X-ARITH-7, X-INTCALC-H6).
+const MONTHLY_INTEREST_CASES: [(i64, i64, i64); 13] = [
     // audit: ARITH-002
     (123_456, 1_500, 1_543),
     // audit: ARITH-003
@@ -1295,9 +1315,18 @@ const MONTHLY_INTEREST_CASES: [(i64, i64, i64); 9] = [
     (99_999_999_999, 999_999, 33_332_499_991),
     // audit: ARITH-008
     (-99_999_999_999, 999_999, -33_332_499_991),
+    // audit: CBACT04C-013
+    (120_000, -1_200, -1_200),
+    // audit: CBACT04C-013
+    (-120_000, -1_200, 1_200),
+    // audit: CBACT04C-013
+    (79, 1_500, 0),
+    // audit: CBACT04C-013
+    (15_000_000_000, 800_000, 0),
 ];
 
 // audit: ARITH-001
+// audit: CBACT04C-013
 #[test]
 fn monthly_interest_truncates_toward_zero_and_drops_high_order_digits() -> TestResult {
     for (balance, rate_hundredths, expected) in MONTHLY_INTEREST_CASES {
@@ -1381,6 +1410,7 @@ fn the_interest_rewrite_adds_the_total_and_zeroes_both_cycle_fields() -> TestRes
 // audit: ARITH-012
 // audit: ARITH-013
 // audit: ARITH-015
+// audit: ARITH-016
 // audit: ARITH-017
 // audit: CBACT04C-012
 // audit: CBACT04C-027
@@ -1417,7 +1447,40 @@ fn intcalc_skips_a_zero_rate_and_applies_each_total_at_the_next_break() -> TestR
             account.curr_cyc_debit = money(-25_000)?;
         }
     }
+    let before = accounts
+        .iter()
+        .find(|account| account.id == first.acct_id)
+        .cloned()
+        .ok_or("the first account is not in acctdata.txt")?;
     let run = run_intcalc(accounts, &records, &masters)?;
+    // ARITH-016: `1400-COMPUTE-FEES` computes no fee. A record at a non-zero rate returns its
+    // SYSTRAN record of the monthly interest alone, the zero-rate record returns nothing, and the
+    // break adds only the rewrite of the previous account.
+    assert_eq!(
+        run.effects,
+        [
+            vec![RecordEffect::Systran(money(1_543)?)],
+            vec![],
+            vec![
+                RecordEffect::Rewrite(first.acct_id.get()),
+                RecordEffect::Systran(money(3_000)?),
+            ],
+        ],
+        "ARITH-016: no fee effect"
+    );
+    // ARITH-016: the rewrite moves the balance by the interest total alone and zeroes the cycle
+    // fields; no other field changes.
+    let rewritten = AccountRecord {
+        curr_bal: money(85_843)?,
+        curr_cyc_credit: Money::ZERO,
+        curr_cyc_debit: Money::ZERO,
+        ..before
+    };
+    assert_eq!(
+        run.updates.get(&first.acct_id.get()),
+        Some(&rewritten),
+        "ARITH-016: no fee field changes"
+    );
     let amounts: Vec<(CategoryKey, Money<9>)> = run
         .systran
         .iter()
@@ -1447,6 +1510,187 @@ fn intcalc_skips_a_zero_rate_and_applies_each_total_at_the_next_break() -> TestR
     Ok(())
 }
 
+// audit: ARITH-010
+// audit: CBACT04C-014
+#[test]
+fn intcalc_sums_each_accounts_interest_and_restarts_the_total_at_its_break() -> TestResult {
+    let masters = Masters::load()?;
+    let [first, second, third, ..] = masters.tcatbals.as_slice() else {
+        return Err("tcatbal.txt holds fewer than three records".into());
+    };
+    for type_cd in [*b"01", *b"04", *b"05"] {
+        let type_text = String::from_utf8_lossy(&type_cd);
+        assert_eq!(
+            masters.default_rate(type_cd)?,
+            rate(DEFAULT_PURCHASE_RATE)?,
+            "DEFAULT {type_text}/0001"
+        );
+    }
+    // At 15.00 the monthly interest of 1234.56 is 15.43 (ARITH-002), of -1234.56 is -15.43
+    // (ARITH-003) and of 2400.00 is 30.00 (ARITH-004).
+    let balance = |account: &TranCatBalanceRecord, type_cd: [u8; 2], cents: i64| {
+        Ok::<_, MoneyError>(TranCatBalanceRecord {
+            type_cd: PicX::from_array(type_cd),
+            bal: money(cents)?,
+            ..account.clone()
+        })
+    };
+    let records = [
+        balance(first, *b"01", 123_456)?,
+        balance(first, *b"04", 240_000)?,
+        balance(second, *b"01", 240_000)?,
+        balance(second, *b"05", -123_456)?,
+        balance(third, *b"01", 123_456)?,
+    ];
+    // ARITH-013's worked balance for the two accounts the run rewrites.
+    let mut accounts = masters.accounts.clone();
+    for account in &mut accounts {
+        if account.id == first.acct_id || account.id == second.acct_id {
+            account.curr_bal = money(84_300)?;
+        }
+    }
+    let run = run_intcalc(accounts, &records, &masters)?;
+    let amounts: Vec<Money<9>> = run.systran.iter().map(|(_, record)| record.amt).collect();
+    assert_eq!(
+        amounts,
+        [
+            money::<9>(1_543)?,
+            money(3_000)?,
+            money(3_000)?,
+            money(-1_543)?,
+            money(1_543)?,
+        ],
+        "one SYSTRAN record per non-zero rate"
+    );
+    // The first account's total is 15.43 + 30.00 = 45.43. The break restarts it at 0.00, so the
+    // second account's is 30.00 + (-15.43) = 14.57, not 59.86, and the third's is 15.43, not
+    // 75.43.
+    let updated: Vec<(u64, Money<10>)> = run
+        .updates
+        .values()
+        .map(|account| (account.id.get(), account.curr_bal))
+        .collect();
+    assert_eq!(
+        updated,
+        [
+            (first.acct_id.get(), money::<10>(88_843)?),
+            (second.acct_id.get(), money(85_757)?),
+        ],
+        "843.00 plus each account's own total"
+    );
+    assert_eq!(run.summary.unapplied_last_account(), Some(third.acct_id));
+    assert_eq!(run.summary.unapplied_total(), Some(money(1_543)?));
+    Ok(())
+}
+
+// audit: ARITH-011
+// audit: CBACT04C-014
+#[test]
+fn intcalc_stores_each_accounts_total_into_s9_09_v99_and_keeps_its_sign() -> TestResult {
+    let masters = Masters::load()?;
+    let [first, second, third, ..] = masters.tcatbals.as_slice() else {
+        return Err("tcatbal.txt holds fewer than three records".into());
+    };
+    // `DEFAULT` `01`/`0001` to `01`/`0004` at 9999.99, the widest `DIS-INT-RATE`. Every fixture
+    // account's group is blank, so each record takes its category's `DEFAULT` rate (E07).
+    let groups = (1..=4)
+        .map(|cat| -> Result<DisclosureGroupRecord, Box<dyn Error>> {
+            Ok(DisclosureGroupRecord {
+                acct_group_id: PicX::from_array(*b"DEFAULT   "),
+                tran_type_cd: PicX::from_array(*b"01"),
+                tran_cat_cd: PicU::new(cat)?,
+                int_rate: rate(999_999)?,
+                filler: PicX::spaces(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let balance = |account: &TranCatBalanceRecord, cat: u64, cents: i64| {
+        Ok::<_, Box<dyn Error>>(TranCatBalanceRecord {
+            type_cd: PicX::from_array(*b"01"),
+            cd: PicU::new(cat)?,
+            bal: money(cents)?,
+            ..account.clone()
+        })
+    };
+    // Four categories of 999999999.99 for the first account and of -999999999.99 for the
+    // second, then a 0.00 balance of the third, whose record is the second account's break.
+    let records = [
+        balance(first, 1, 99_999_999_999)?,
+        balance(first, 2, 99_999_999_999)?,
+        balance(first, 3, 99_999_999_999)?,
+        balance(first, 4, 99_999_999_999)?,
+        balance(second, 1, -99_999_999_999)?,
+        balance(second, 2, -99_999_999_999)?,
+        balance(second, 3, -99_999_999_999)?,
+        balance(second, 4, -99_999_999_999)?,
+        balance(third, 1, 0)?,
+    ];
+    // ARITH-013's worked balance for the two accounts the run rewrites.
+    let mut accounts = masters.accounts.clone();
+    for account in &mut accounts {
+        if account.id == first.acct_id || account.id == second.acct_id {
+            account.curr_bal = money(84_300)?;
+        }
+    }
+    let clock = FixedClock::new(instant(2022, 7, 18, 0)?);
+    let mut run = Intcalc::new(ParmDate::DEFAULT, accounts, masters.xrefs.clone(), groups);
+    let mut effects = Vec::with_capacity(records.len());
+    let mut rewritten = Vec::new();
+    for record in &records {
+        let mut record_effects = Vec::new();
+        for effect in run.process(record, &clock)? {
+            match effect {
+                IntcalcEffect::AccountUpdate(account) => {
+                    record_effects.push(RecordEffect::Rewrite(account.id.get()));
+                    rewritten.push((account.id.get(), account.curr_bal));
+                }
+                IntcalcEffect::SystemTransaction(transaction) => {
+                    record_effects.push(RecordEffect::Systran(transaction.amt));
+                }
+            }
+        }
+        effects.push(record_effects);
+    }
+    let summary = run.finish();
+    // Each monthly interest, and the SYSTRAN amount it writes, is 333324999.91 or -333324999.91
+    // (ARITH-008); the 0.00 balance gives 0.00.
+    let gain = RecordEffect::Systran(money(33_332_499_991)?);
+    let loss = RecordEffect::Systran(money(-33_332_499_991)?);
+    assert_eq!(
+        effects,
+        [
+            vec![gain],
+            vec![gain],
+            vec![gain],
+            vec![gain],
+            vec![RecordEffect::Rewrite(first.acct_id.get()), loss],
+            vec![loss],
+            vec![loss],
+            vec![loss],
+            vec![
+                RecordEffect::Rewrite(second.acct_id.get()),
+                RecordEffect::Systran(Money::ZERO),
+            ],
+        ],
+        "one SYSTRAN record per category balance, each break rewriting the account before it"
+    );
+    // The first total runs 333324999.91, 666649999.82, 999974999.73, then 1333299999.64, stored
+    // 333299999.64: the high-order digit dropped. The second account's mirror is stored
+    // -333299999.64, the sign kept. The unstored totals would give 1333300842.64 and
+    // -1333299156.64, which fit `S9(10)V99` too, so the balances show the total's store.
+    assert_eq!(
+        rewritten,
+        [
+            (first.acct_id.get(), money::<10>(33_330_084_264)?),
+            (second.acct_id.get(), money(-33_329_915_664)?),
+        ],
+        "843.00 plus each account's total stored into S9(09)V99"
+    );
+    assert_eq!(summary.unapplied_last_account(), Some(third.acct_id));
+    assert_eq!(summary.unapplied_total(), Some(Money::ZERO));
+    Ok(())
+}
+
 // audit: ARITH-009
 // audit: ARITH-012
 // audit: ARITH-014
@@ -1455,6 +1699,7 @@ fn intcalc_skips_a_zero_rate_and_applies_each_total_at_the_next_break() -> TestR
 // audit: FIXINT-902
 // audit: FIXINT-903
 // audit: CBACT04C-010
+// audit: CBACT04C-020
 // audit: CBACT04C-022
 #[test]
 fn intcalc_over_the_loaded_balances_matches_interest_raw() -> TestResult {
@@ -1552,6 +1797,7 @@ fn check_posted_inputs(id: &str, row: &PostedInterestRow, posted: &PostedRun) ->
 // audit: ARITH-017
 // audit: FIXINT-903
 // audit: CBACT04C-012
+// audit: CBACT04C-020
 #[test]
 fn intcalc_over_the_posted_tables_matches_interest_posted() -> TestResult {
     let masters = Masters::load()?;
