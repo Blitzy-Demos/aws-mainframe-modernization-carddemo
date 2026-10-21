@@ -132,7 +132,13 @@ enum Failure {
 /// A failed `A`, `U` or `D` statement is no error: it is reported to the domain, which sets
 /// return code 4, and the run goes on (COBTUPDT-022).
 pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
-    let records = decode_input(&super::read_input(input)?)?;
+    // The read and the decoding block, so they run as one step on the blocking pool, awaited
+    // before the database is reached, with the errors of an inline run (W011-F05).
+    let input = input.to_path_buf();
+    let records = super::blocking(super::READING_INPUT, move || {
+        decode_input(&super::read_input(&input)?).map_err(JobError::from)
+    })
+    .await??;
     let mut maintenance = Maintenance::new();
     let mut failed = 0_usize;
     let mut tx = ctx.store.begin().await?;

@@ -169,10 +169,19 @@ pub(crate) async fn run(
 }
 
 /// The one body of every fixture load: read `input`, decode and check it, then replace the
-/// table of `R` in one transaction (LOADS-014 to LOADS-019).
-async fn load<R: Table>(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
-    let bytes = super::read_input(input)?;
-    let records = decode::<R>(&bytes)?;
+/// table of `R` in one transaction (LOADS-014 to LOADS-019). The read and the decoding block,
+/// so they run as one step on the blocking pool, awaited before the transaction opens
+/// (W011-F05); their errors are those of an inline run, in the same order.
+async fn load<R: Table + Send + 'static>(
+    ctx: &JobContext<'_>,
+    input: &Path,
+) -> Result<JobOutcome, JobError> {
+    let input = input.to_path_buf();
+    let records = super::blocking(super::READING_INPUT, move || {
+        let bytes = super::read_input(&input)?;
+        decode::<R>(&bytes).map_err(JobError::from)
+    })
+    .await??;
 
     // Dropping `tx` on an early return rolls the replacement back (LOADS-018).
     let mut tx = ctx.store.begin().await?;

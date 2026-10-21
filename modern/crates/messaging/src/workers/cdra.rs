@@ -70,15 +70,19 @@ use runtime::config::Config;
 use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
-use crate::broker::{Acknowledger, AmqpError, Consumer};
+use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
 use crate::error_body::Flow;
 
-/// The environment variable of the request queue, which the start-up refusal names
-/// (X-COACCT01-8).
+/// The environment variable of the request queue, which the start-up refusal (X-COACCT01-8) and
+/// a failed passive declare of the request queue name in place of the configured value.
 const REQUEST_QUEUE_VARIABLE: &str = "CARDDEMO_QUEUE_REQUEST_ACCT";
 
 /// Bytes of `MQ-APPL-QUEUE-NAME PIC X(48)`, which receives `INPUT-QUEUE-NAME` when the account
-/// read fails (`COACCT01.cbl:441`; COACCT01-029).
+/// read fails (`COACCT01.cbl:441`; COACCT01-029). `Worker::open` refuses a request queue name
+/// longer than this, or holding a byte outside printable ASCII (`' '` to `'~'`), which the
+/// alphanumeric `MOVE` of the error body would cut or carry as no MQ queue name can
+/// (X-COACCT01-8). The limit is below the 255-byte AMQP short string, so the same check keeps
+/// the name within what the broker takes.
 const QUEUE_NAME_LEN: usize = PicX::<48>::WIDTH;
 
 /// The CDRA worker: one consumer and one publisher channel, the configured request queue and
@@ -111,10 +115,14 @@ impl Worker<Consumer> {
         store: PgStore,
     ) -> Result<Self, AmqpError> {
         let request_queue = config.queue_request_acct.as_str();
-        check_request_queue(request_queue)?;
+        super::check_request_queue(REQUEST_QUEUE_VARIABLE, request_queue, QUEUE_NAME_LEN)?;
         let channels = Channels::open(
             connection,
-            &[request_queue, coacct01::REPLY_QUEUE, coacct01::ERROR_QUEUE],
+            &[
+                QueueCheck::configured(REQUEST_QUEUE_VARIABLE, request_queue),
+                QueueCheck::literal(coacct01::REPLY_QUEUE),
+                QueueCheck::literal(coacct01::ERROR_QUEUE),
+            ],
         )
         .await?;
         Ok(Self {
@@ -188,26 +196,6 @@ impl<A: Acknowledger> Step for Worker<A> {
     }
 }
 
-/// Refuses a request queue name that `MQ-APPL-QUEUE-NAME PIC X(48)` cannot carry whole: one
-/// longer than 48 bytes, or holding a byte outside printable ASCII (`' '` to `'~'`), which the
-/// alphanumeric `MOVE` of the error body would cut or carry as no MQ queue name can
-/// (COACCT01-029, X-COACCT01-8).
-///
-/// # Errors
-///
-/// [`AmqpError::QueueName`] naming `CARDDEMO_QUEUE_REQUEST_ACCT`, never the rejected name.
-fn check_request_queue(name: &str) -> Result<(), AmqpError> {
-    let printable = name.bytes().all(|byte| matches!(byte, b' '..=b'~'));
-    if printable && name.len() <= QUEUE_NAME_LEN {
-        Ok(())
-    } else {
-        Err(AmqpError::QueueName {
-            variable: REQUEST_QUEUE_VARIABLE,
-            max_len: QUEUE_NAME_LEN,
-        })
-    }
-}
-
 /// The body `4000-PROCESS-REQUEST-REPLY` publishes for the request `body` taken from
 /// `request_queue`, reading the account through `store` only when `decide` asks for it
 /// (`COACCT01.cbl:390-460`):
@@ -263,8 +251,9 @@ mod tests {
     use domain::records::AccountRecord;
     use persistence::{AccountCustomerChain, AccountRepository, ChainLink, PersistenceError};
 
-    use super::{QUEUE_NAME_LEN, REQUEST_QUEUE_VARIABLE, answer, check_request_queue};
+    use super::{QUEUE_NAME_LEN, REQUEST_QUEUE_VARIABLE, answer};
     use crate::broker::AmqpError;
+    use crate::workers::check_request_queue;
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -487,7 +476,10 @@ mod tests {
     fn the_request_queue_must_fit_mq_appl_queue_name_whole() {
         let longest = "Q".repeat(QUEUE_NAME_LEN);
         for name in [REQUEST_QUEUE, "CARD DEMO REQUEST ACCT", longest.as_str()] {
-            assert!(check_request_queue(name).is_ok(), "{name}");
+            assert!(
+                check_request_queue(REQUEST_QUEUE_VARIABLE, name, QUEUE_NAME_LEN).is_ok(),
+                "{name}"
+            );
         }
         let too_long = "Q".repeat(QUEUE_NAME_LEN + 1);
         for name in [
@@ -496,7 +488,7 @@ mod tests {
             "CARD.DEMO.REQUÊTE.ACCT",
             "CARD.DEMO.REQUEST.\u{7f}",
         ] {
-            let error = check_request_queue(name).err();
+            let error = check_request_queue(REQUEST_QUEUE_VARIABLE, name, QUEUE_NAME_LEN).err();
             assert!(
                 matches!(
                     error,

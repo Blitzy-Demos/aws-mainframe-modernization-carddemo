@@ -54,8 +54,10 @@ use super::{JobContext, JobError, JobOutcome};
 ///
 /// The deck is read in place and never copied (LOADS-011). Every record is decoded and hashed
 /// before the transaction opens, so the transaction holds only the delete and the inserts.
-/// The outcome reports the number of rows written as `records`, writes no file and returns 0
-/// (LOADS-038).
+/// The read, the decoding and the argon2id hashes block, so they run as one step on the
+/// blocking pool, awaited before the transaction opens; their errors are those of an inline
+/// run, in the same order (W011-F05). The outcome reports the number of rows written as
+/// `records`, writes no file and returns 0 (LOADS-038).
 ///
 /// # Errors
 ///
@@ -69,12 +71,16 @@ use super::{JobContext, JobError, JobOutcome};
 ///
 /// Every failure leaves the previous contents of `users`.
 pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
-    let deck = super::read_input(input)?;
-    // LineFraming describes the deck line and is never stored: only the record goes on.
-    let users = decode_usrsec(&deck)?
-        .into_iter()
-        .map(|framed| hash_user(framed.record).map_err(|_| JobError::Password))
-        .collect::<Result<Vec<HashedUser>, JobError>>()?;
+    let input = input.to_path_buf();
+    let users = super::blocking(super::READING_INPUT, move || {
+        let deck = super::read_input(&input)?;
+        // LineFraming describes the deck line and is never stored: only the record goes on.
+        decode_usrsec(&deck)?
+            .into_iter()
+            .map(|framed| hash_user(framed.record).map_err(|_| JobError::Password))
+            .collect::<Result<Vec<HashedUser>, JobError>>()
+    })
+    .await??;
 
     // Dropping `tx` on an early return rolls the replacement back (LOADS-018).
     let mut tx = ctx.store.begin().await?;

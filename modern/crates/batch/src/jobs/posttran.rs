@@ -122,7 +122,7 @@ use persistence::{
     TransactionRepository,
 };
 
-use super::{JobContext, JobError, JobOutcome, OutputFile, read_input};
+use super::{JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking, read_input};
 
 /// The generation base of the reject file, `AWS.M2.CARDDEMO.DALYREJS(+1)` (`POSTTRAN.jcl:38`;
 /// CBTRN02C-028).
@@ -313,7 +313,7 @@ const CLUSTER_NOT_EMPTY: Failure = Failure {
 /// - [`JobError::Posttran`] when a run counter outgrows 64 bits (CBTRN02C-036).
 pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutcome, JobError> {
     tracing::info!("{START_LINE}");
-    let records = open_dalytran(dalytran)?;
+    let records = open_dalytran(dalytran).await?;
     // The store is a handle on the shared pool, cloned for the `&mut self` repository calls.
     // Every statement on it commits on its own, as VSAM keeps each completed write
     // (CBTRN02C-015, X-POSTTRAN-1).
@@ -323,6 +323,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
         .await
         .map_err(|error| unshown_failure(READ_XREFFILE_OP, XREF_READ_FAILED, &error))?;
     let mut rejects = OutputFile::next_generation(&ctx.config.dalyrejs_dir(), REJECTS_BASE)
+        .await
         .map_err(|error| file_failure(OPEN_DALYREJS_OP, OPEN_DALYREJS, &error))?;
     let accounts = AccountRepository::find_all(&mut store)
         .await
@@ -334,11 +335,11 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     for daily in &records {
         match posttran.process(daily, ctx.clock)? {
             RecordOutcome::Posted(posting) => apply_posting(&mut store, &posting).await?,
-            RecordOutcome::Rejected(reject) => write_reject(&mut rejects, &reject)?,
+            RecordOutcome::Rejected(reject) => write_reject(&mut rejects, &reject).await?,
         }
     }
     let summary = posttran.finish();
-    let path = close_dalyrejs(rejects)?;
+    let path = close_dalyrejs(rejects).await?;
     // Unlike jobs that discard their program's job log, this one emits it: the POSTTRAN audit
     // maps every `DISPLAY` to one event, and these lines carry counts only (CBTRN02C-034).
     for line in summary.sysout_lines() {
@@ -363,11 +364,24 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
 /// [`JobError::Abend`] when the file cannot be read (`ERROR OPENING DALYTRAN`, CBTRN02C-031), when
 /// codec A refuses a line (CBTRN02C-032), or when a line's body is not the 350-byte record, which
 /// is never padded into one (CBTRN02C-045). Nothing else has happened then.
-fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobError> {
-    let bytes =
-        read_input(path).map_err(|error| file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error))?;
-    let lines =
-        decode_fixture::<DailyTransactionRecord>(&bytes).map_err(|error| refused(&error))?;
+///
+/// The read and the decoding block, so they run as one step on the blocking pool, awaited at
+/// once; the step only returns what failed, and the events of the failure are emitted here,
+/// in the job's span, as when the step ran inline (W011-F05).
+async fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobError> {
+    let path = path.to_path_buf();
+    let decoded = blocking(READING_INPUT, move || {
+        let bytes = read_input(&path).map_err(DalytranFailure::Unreadable)?;
+        decode_fixture::<DailyTransactionRecord>(&bytes).map_err(DalytranFailure::Refused)
+    })
+    .await;
+    let lines = match decoded {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(DalytranFailure::Unreadable(error))) | Err(error) => {
+            return Err(file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error));
+        }
+        Ok(Err(DalytranFailure::Refused(error))) => return Err(refused(&error)),
+    };
     let mut records = Vec::with_capacity(lines.len());
     for (index, line) in lines.into_iter().enumerate() {
         if line.framing.body_len != DailyTransactionRecord::WIDTH {
@@ -376,6 +390,15 @@ fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobError> {
         records.push(line.record);
     }
     Ok(records)
+}
+
+/// Why the blocking step of [`open_dalytran`] produced no lines, returned unreported so that
+/// its events are emitted on the job's task.
+enum DalytranFailure {
+    /// The file could not be read: the failed open (CBTRN02C-031).
+    Unreadable(JobError),
+    /// Codec A refused a line (CBTRN02C-032).
+    Refused(LoadError),
 }
 
 /// `0100-TRANFILE-OPEN`: the `OPEN OUTPUT` of the transaction cluster, which succeeds only when
@@ -486,9 +509,10 @@ async fn write_transaction(
 ///
 /// [`JobError::Abend`] with `ERROR WRITING TO REJECTS FILE` when the bytes cannot be written
 /// (CBTRN02C-038).
-fn write_reject(rejects: &mut OutputFile, reject: &RejectRecord) -> Result<(), JobError> {
+async fn write_reject(rejects: &mut OutputFile, reject: &RejectRecord) -> Result<(), JobError> {
     rejects
         .write_record(&reject.encode())
+        .await
         .map_err(|error| file_failure(WRITE_DALYREJS_OP, WRITE_DALYREJS, &error))
 }
 
@@ -499,8 +523,8 @@ fn write_reject(rejects: &mut OutputFile, reject: &RejectRecord) -> Result<(), J
 /// [`JobError::Abend`] with `ERROR CLOSING DAILY REJECTS FILE` and `FILE STATUS IS: NNNN0000`
 /// when the file cannot be flushed or synced; the file is removed then (CBTRN02C-040,
 /// CBTRN02C-044).
-fn close_dalyrejs(rejects: OutputFile) -> Result<PathBuf, JobError> {
-    rejects.finish().map_err(|error| {
+async fn close_dalyrejs(rejects: OutputFile) -> Result<PathBuf, JobError> {
+    rejects.finish().await.map_err(|error| {
         report_file(CLOSE_DALYREJS_OP, &error);
         abend(Failure::shown(CLOSE_DALYREJS, Status::CrossReferenceClosed))
     })
@@ -759,10 +783,10 @@ mod tests {
 
     // audit: CBTRN02C-001
     // audit: CBTRN02C-033
-    #[test]
-    fn the_daily_fixture_decodes_whole_in_input_order() -> TestResult {
+    #[tokio::test]
+    async fn the_daily_fixture_decodes_whole_in_input_order() -> TestResult {
         let before = fs::read(dailytran())?;
-        let records = open_dalytran(&dailytran())?;
+        let records = open_dalytran(&dailytran()).await?;
         assert_eq!(records.len(), 300);
         for (n, record) in [(1, records.first()), (300, records.last())] {
             let record = record.ok_or("a record is missing")?;
@@ -773,11 +797,11 @@ mod tests {
     }
 
     // audit: CBTRN02C-029
-    #[test]
-    fn an_empty_input_holds_no_record() -> TestResult {
+    #[tokio::test]
+    async fn an_empty_input_holds_no_record() -> TestResult {
         let scratch = Scratch::new()?;
         let empty = scratch.file("empty.txt", b"")?;
-        assert!(open_dalytran(&empty)?.is_empty());
+        assert!(open_dalytran(&empty).await?.is_empty());
         Ok(())
     }
 
@@ -785,8 +809,8 @@ mod tests {
     /// byte of the input, with no reject generation created (CBTRN02C-032, CBTRN02C-037).
     // audit: CBTRN02C-032
     // audit: CBTRN02C-037
-    #[test]
-    fn a_refused_line_ends_the_job_naming_its_number_only() -> TestResult {
+    #[tokio::test]
+    async fn a_refused_line_ends_the_job_naming_its_number_only() -> TestResult {
         let scratch = Scratch::new()?;
         let first = fixture_line(1)?;
         let card = card_number(&first)?;
@@ -803,6 +827,7 @@ mod tests {
             let path = scratch.file(name, &input)?;
             let capture = trace_capture::capture();
             let error = open_dalytran(&path)
+                .await
                 .err()
                 .ok_or("a refused line was decoded")?;
             assert_eq!(abend_of(&error), Some((Some(12), LINE_REFUSED)), "{name}");
@@ -821,12 +846,13 @@ mod tests {
     }
 
     // audit: CBTRN02C-031
-    #[test]
-    fn an_unreadable_input_is_the_failed_dalytran_open() -> TestResult {
+    #[tokio::test]
+    async fn an_unreadable_input_is_the_failed_dalytran_open() -> TestResult {
         let scratch = Scratch::new()?;
         let missing = scratch.path().join("missing-dailytran.txt");
         let capture = trace_capture::capture();
         let error = open_dalytran(&missing)
+            .await
             .err()
             .ok_or("a missing input was read")?;
         assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYTRAN)));
@@ -848,30 +874,31 @@ mod tests {
     /// CBTRN02C-028).
     // audit: CBTRN02C-027
     // audit: CBTRN02C-028
-    #[test]
-    fn reject_records_are_430_bytes_and_lf_in_the_next_generation() -> TestResult {
+    #[tokio::test]
+    async fn reject_records_are_430_bytes_and_lf_in_the_next_generation() -> TestResult {
         let scratch = Scratch::new()?;
         let dir = scratch.path().join("dalyrejs");
         let lines = [fixture_line(16)?, fixture_line(32)?];
-        let mut rejects = OutputFile::next_generation(&dir, REJECTS_BASE)?;
+        let mut rejects = OutputFile::next_generation(&dir, REJECTS_BASE).await?;
         let mut expected = Vec::new();
         for line in &lines {
             let daily = DailyTransactionRecord::decode(line)?;
             write_reject(
                 &mut rejects,
                 &reject_record(&daily, RejectReason::Overlimit),
-            )?;
+            )
+            .await?;
             expected.extend_from_slice(line);
             expected.extend_from_slice(b"0102");
             expected.extend_from_slice(format!("{:<76}", "OVERLIMIT TRANSACTION").as_bytes());
             expected.push(b'\n');
         }
-        let path = close_dalyrejs(rejects)?;
+        let path = close_dalyrejs(rejects).await?;
         assert_eq!(path, dir.join("DALYREJS.G0001"));
         let written = fs::read(&path)?;
         assert_eq!(written.len(), 2 * 431);
         assert!(written == expected, "the reject records differ");
-        let empty = close_dalyrejs(OutputFile::next_generation(&dir, REJECTS_BASE)?)?;
+        let empty = close_dalyrejs(OutputFile::next_generation(&dir, REJECTS_BASE).await?).await?;
         assert_eq!(empty, dir.join("DALYREJS.G0002"));
         assert!(fs::read(&empty)?.is_empty());
         Ok(())

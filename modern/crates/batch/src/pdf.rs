@@ -1,7 +1,7 @@
 //! The statement PDF: the replacement of the `TXT2PDF` step of `TXT2PDF1.JCL`, which runs the
-//! `%TXT2PDF` exec over `STATEMNT.PS` (CBSTM03A-051). `creastmt` passes the text records of
-//! `STATEMNT.PS` (CBSTM03A-031) to `render` and writes the returned bytes as `STATEMNT.PDF`; this
-//! module does no I/O (Local-Only Runtime).
+//! `%TXT2PDF` exec over `STATEMNT.PS` (CBSTM03A-051). `creastmt` streams the text records it
+//! reads back from `STATEMNT.PS` (CBSTM03A-031) into `render`, one at a time, and writes the
+//! returned bytes as `STATEMNT.PDF`; this module does no I/O (Local-Only Runtime).
 //!
 //! - Input: only the 80-byte text records, never a monetary value (R1). Page positions are whole
 //!   millimetres computed with checked integer arithmetic; `mm` is the one conversion to the
@@ -26,6 +26,7 @@
 //! - Errors carry a record number at most, never record text, because statement records hold
 //!   customer names, addresses and balances (Cardholder Data Redaction).
 
+use std::borrow::Borrow;
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -93,21 +94,29 @@ impl std::error::Error for RenderError {}
 /// extracted text equals the records line for line (CBSTM03A-052). No records give one empty
 /// page.
 ///
+/// `lines` is any sequence of records, borrowed or owned, taken one at a time: `creastmt`
+/// streams the records it reads back from `STATEMNT.PS` without holding them all, and the
+/// bytes rendered are the same whatever the sequence's type.
+///
 /// # Errors
 ///
 /// - [`RenderError::NonText`] when a record holds a byte outside printable ASCII.
 /// - [`RenderError::Layout`] when a checked layout step overflows.
 /// - [`RenderError::Pdf`] when `printpdf` cannot register the font or serialise the document, or
 ///   the saved document cannot be re-read and written again with its font resources inlined.
-pub(crate) fn render(lines: &[[u8; 80]]) -> Result<Vec<u8>, RenderError> {
+pub(crate) fn render<I>(lines: I) -> Result<Vec<u8>, RenderError>
+where
+    I: IntoIterator,
+    I::Item: Borrow<[u8; 80]>,
+{
     let (doc, first_page, first_layer) =
         PdfDocument::new(TITLE, mm(PAGE_WIDTH_MM), mm(PAGE_HEIGHT_MM), LAYER);
     let font = doc
         .add_builtin_font(BuiltinFont::Courier)
         .map_err(|_| RenderError::Pdf)?;
     let mut layer = doc.get_page(first_page).get_layer(first_layer);
-    for (index, record) in lines.iter().enumerate() {
-        let text = record_text(index, record)?;
+    for (index, record) in lines.into_iter().enumerate() {
+        let text = record_text(index, record.borrow())?;
         let (new_page, baseline) = place(index)?;
         if new_page {
             let (page, page_layer) = doc.add_page(mm(PAGE_WIDTH_MM), mm(PAGE_HEIGHT_MM), LAYER);
@@ -208,7 +217,7 @@ mod tests {
 
     /// CBSTM03A-052: 130 distinct records over three pages, which together hold every printable
     /// ASCII byte, `'` and `` ` `` included, and each end in 16 spaces, extract as the same lines
-    /// in the same order.
+    /// in the same order, whether they are passed as a slice or streamed as owned records.
     #[test]
     fn records_extract_as_their_lines_in_order() -> TestResult {
         let printable: Vec<u8> = (b' '..=b'~').collect();
@@ -223,16 +232,18 @@ mod tests {
             .iter()
             .map(|line| std::str::from_utf8(line))
             .collect::<Result<Vec<&str>, _>>()?;
-        let (lines, pages) = extracted(&render(&records)?)?;
-        assert_eq!(lines, expected);
-        assert_eq!(pages, 3);
+        for bytes in [render(&records)?, render(records.iter().copied())?] {
+            let (lines, pages) = extracted(&bytes)?;
+            assert_eq!(lines, expected);
+            assert_eq!(pages, 3);
+        }
         Ok(())
     }
 
     /// CBSTM03A-052: trailing spaces are kept, so a blank record extracts as 80 spaces.
     #[test]
     fn blank_record_extracts_as_80_spaces() -> TestResult {
-        let (lines, pages) = extracted(&render(&[[b' '; 80]])?)?;
+        let (lines, pages) = extracted(&render([[b' '; 80]])?)?;
         assert_eq!(lines, [" ".repeat(80)]);
         assert_eq!(pages, 1);
         Ok(())
@@ -241,7 +252,7 @@ mod tests {
     /// CBSTM03A-051: an empty `STATEMNT.PS` gives a PDF of one empty page.
     #[test]
     fn no_records_give_one_empty_page() -> TestResult {
-        let (lines, pages) = extracted(&render(&[])?)?;
+        let (lines, pages) = extracted(&render(std::iter::empty::<[u8; 80]>())?)?;
         assert!(lines.is_empty());
         assert_eq!(pages, 1);
         Ok(())

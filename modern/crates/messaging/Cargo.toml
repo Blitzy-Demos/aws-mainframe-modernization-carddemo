@@ -18,8 +18,10 @@ persistence = { workspace = true }
 runtime = { workspace = true }
 copybook = { workspace = true }
 lapin = { workspace = true }
-# time: the basic_get poll interval (CARDDEMO_MQ_POLL_MS) and the reconnect backoff.
-tokio = { workspace = true, features = ["time"] }
+# time: the basic_get poll interval (CARDDEMO_MQ_POLL_MS), the reconnect backoff and the broker
+# deadlines. signal: the SIGTERM and SIGINT stop of carddemo-mq. sync: the watch channel that
+# carries that stop to every worker loop.
+tokio = { workspace = true, features = ["time", "signal", "sync"] }
 tracing = { workspace = true }
 chrono = { workspace = true }
 

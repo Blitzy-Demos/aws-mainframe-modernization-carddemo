@@ -2,9 +2,10 @@
 //! [`cdrd`] for `CODATE01`, [`cdra`] for `COACCT01` and [`cp00`] for `COPAUA0C`.
 //!
 //! This module owns what the three would otherwise repeat: the [`Step`] trait each worker
-//! implements, the poll loop [`drive`] that runs one worker until its connection is lost, and
-//! the crate-internal plumbing every flow uses, the worker's channel pair, its span and the put
-//! path of the two fixed-queue flows. Each child module owns only its own flow.
+//! implements, the poll loop [`drive`] that runs one worker until a stop or a lost connection, and
+//! the crate-internal plumbing every flow uses, the check of the configured request queue name,
+//! the worker's channel pair, its span and the put path of the two fixed-queue flows. Each child
+//! module owns only its own flow.
 //!
 //! # Layering
 //!
@@ -22,7 +23,8 @@
 //! Each request is processed as the first message of a CICS task, the only case the source
 //! determines, and no worker keeps state from one request to the next (E14, E15). Output that
 //! depends on several messages of one task is HALTED(H1). The 501-message task limit of
-//! `COPAUA0C` has no counterpart (E14): a worker takes requests until its connection is lost.
+//! `COPAUA0C` has no counterpart (E14): a worker takes requests until it is stopped, and between
+//! requests only (see [`drive`]), or until its connection is lost.
 //!
 //! # Settlement
 //!
@@ -65,8 +67,10 @@ use lapin::{BasicProperties, Connection};
 use runtime::telemetry;
 use tracing::Span;
 
+use crate::Stop;
 use crate::broker::{
-    self, Acknowledger, AmqpError, Backoff, Consumer, PublishFailure, Publisher, Request,
+    self, Acknowledger, AmqpError, Backoff, Consumer, PublishFailure, Publisher, QueueCheck,
+    Request,
 };
 use crate::error_body::{self, Flow, Site};
 
@@ -185,28 +189,45 @@ pub trait Step: Send {
     ) -> impl Future<Output = Result<(), AmqpError>> + Send;
 }
 
-/// Runs `worker` until its connection is lost, and returns the error that ends it.
+/// Runs `worker` until `stop` is requested or its connection is lost.
 ///
+/// - `stop` is checked before every [`Step::process_next`] and ends every idle poll and backoff
+///   wait early; `drive` then returns `Ok`. It never interrupts [`Step::process_next`]: a request
+///   the worker has taken is always finished through its own path, so a CP00 authorization is
+///   never cut between its acknowledgement and its commit.
 /// - [`Processed::Idle`]: waits `poll_interval` (`CARDDEMO_MQ_POLL_MS`), then polls again.
 /// - Any other processed request resets `backoff`.
 /// - [`Processed::Requeued`] or [`StepError::Channel`]: waits the next `backoff` delay and
 ///   reopens the worker's channels, repeating while the connection stays up, then polls again.
-/// - [`StepError::ConnectionLost`], a channel error while the connection is down, or a reopen
-///   failure that shows the connection is gone: returned as [`StepError::ConnectionLost`], so
-///   that the caller reconnects.
 ///
-/// It never returns while the connection is healthy. Events name the queue and the outcome,
-/// never a body.
+/// It never returns while the connection is healthy and no stop is requested. Events name the
+/// queue and the outcome, never a body.
+///
+/// # Errors
+///
+/// [`StepError::ConnectionLost`] for a lost connection, a channel error while the connection is
+/// down, or a reopen failure that shows the connection is gone, so that the caller reconnects. A
+/// missed broker deadline counts as a lost connection ([`AmqpError::is_connection_lost`]).
 pub async fn drive<W: Step>(
     worker: &mut W,
     connection: &Connection,
     poll_interval: Duration,
     backoff: &mut Backoff,
-) -> StepError {
+    stop: &mut Stop,
+) -> Result<(), StepError> {
     loop {
+        if stop.is_requested() {
+            return Ok(());
+        }
         match worker.process_next(connection).await {
             Ok(Processed::Idle) => {
-                broker::idle(poll_interval).await;
+                if stop
+                    .unless_requested(broker::idle(poll_interval))
+                    .await
+                    .is_none()
+                {
+                    return Ok(());
+                }
                 continue;
             }
             Ok(
@@ -227,7 +248,7 @@ pub async fn drive<W: Step>(
             Err(StepError::Channel(error))
                 if error.is_connection_lost() || !connection.status().connected() =>
             {
-                return stopped(worker.queue(), StepError::ConnectionLost(error));
+                return Err(stopped(worker.queue(), StepError::ConnectionLost(error)));
             }
             Err(StepError::Channel(error)) => tracing::warn!(
                 queue = worker.queue(),
@@ -235,10 +256,12 @@ pub async fn drive<W: Step>(
                 error = %error,
                 "a worker channel failed; reopening the channels"
             ),
-            Err(lost @ StepError::ConnectionLost(_)) => return stopped(worker.queue(), lost),
+            Err(lost @ StepError::ConnectionLost(_)) => {
+                return Err(stopped(worker.queue(), lost));
+            }
         }
-        if let Err(lost) = recover(worker, connection, backoff).await {
-            return stopped(worker.queue(), lost);
+        if let Err(lost) = recover(worker, connection, backoff, stop).await {
+            return Err(stopped(worker.queue(), lost));
         }
     }
 }
@@ -255,8 +278,9 @@ fn stopped(queue: &str, lost: StepError) -> StepError {
     lost
 }
 
-/// Reopens `worker`'s channels after the next `backoff` delay, until a reopen succeeds or the
-/// connection is gone.
+/// Reopens `worker`'s channels after the next `backoff` delay, until a reopen succeeds, the
+/// connection is gone or `stop` is requested during a delay. After a stop it returns `Ok` with
+/// the channels as they are, and [`drive`] returns before it takes another request.
 ///
 /// # Errors
 ///
@@ -265,9 +289,12 @@ async fn recover<W: Step>(
     worker: &mut W,
     connection: &Connection,
     backoff: &mut Backoff,
+    stop: &mut Stop,
 ) -> Result<(), StepError> {
     loop {
-        backoff.wait().await;
+        if stop.unless_requested(backoff.wait()).await.is_none() {
+            return Ok(());
+        }
         match worker.reopen(connection).await {
             Ok(()) => {
                 backoff.reset();
@@ -283,6 +310,36 @@ async fn recover<W: Step>(
                 "reopening the worker channels failed; retrying"
             ),
         }
+    }
+}
+
+/// The longest queue name AMQP 0-9-1 can carry: `queue.declare` and `basic.get` send it as a
+/// short string, whose one-byte length prefix counts at most 255 bytes. A longer name goes out
+/// with a wrapped length, and the broker closes the whole connection with `FRAME_ERROR` over a
+/// frame it cannot decode.
+pub(crate) const AMQP_QUEUE_NAME_LEN: usize = 255;
+
+/// Refuses the request queue `name` configured in `variable` unless it is at most `max_len`
+/// bytes of printable ASCII (`' '` to `'~'`). Every worker calls it before it opens a channel:
+/// the broker answers a name longer than the frame carries with `FRAME_ERROR`, and a non-ASCII
+/// one with `INTERNAL_ERROR`, by closing the whole connection, which
+/// [`AmqpError::is_connection_lost`] counts as lost, so the session would reconnect forever.
+/// Control bytes are refused too, as no MQ queue name holds them. The refusal is a
+/// configuration error no reconnect cures, and `run` returns it as `StartupError::Declare`.
+///
+/// # Errors
+///
+/// [`AmqpError::QueueName`] with `variable` and `max_len`, never the rejected name.
+pub(crate) fn check_request_queue(
+    variable: &'static str,
+    name: &str,
+    max_len: usize,
+) -> Result<(), AmqpError> {
+    let printable = name.bytes().all(|byte| matches!(byte, b' '..=b'~'));
+    if printable && name.len() <= max_len {
+        Ok(())
+    } else {
+        Err(AmqpError::QueueName { variable, max_len })
     }
 }
 
@@ -325,8 +382,12 @@ impl Channels<Consumer> {
     /// # Errors
     ///
     /// The [`AmqpError`] of the channel that could not be opened, or [`AmqpError::Declare`]
-    /// naming the first missing queue. A consumer channel opened before the failure is closed.
-    pub(crate) async fn open(connection: &Connection, queues: &[&str]) -> Result<Self, AmqpError> {
+    /// naming the first missing queue by its value-free label. A consumer channel opened before
+    /// the failure is closed.
+    pub(crate) async fn open(
+        connection: &Connection,
+        queues: &[QueueCheck<'_>],
+    ) -> Result<Self, AmqpError> {
         let consumer = Consumer::open(connection).await?;
         let publisher = match broker::declare_passive(consumer.channel(), queues).await {
             Ok(()) => Publisher::open(connection).await,
@@ -592,6 +653,54 @@ async fn acknowledged<A: Acknowledger>(
                 "the acknowledgement after a confirmed publication failed; the broker requeues it"
             );
             channels.abandon().await
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AMQP_QUEUE_NAME_LEN, cdrd, check_request_queue, cp00};
+    use crate::broker::AmqpError;
+
+    #[test]
+    fn a_cdrd_or_cp00_request_queue_the_amqp_frame_cannot_carry_is_a_startup_refusal() {
+        let longest = "Q".repeat(AMQP_QUEUE_NAME_LEN);
+        let too_long = "Q".repeat(AMQP_QUEUE_NAME_LEN + 1);
+        for variable in [cdrd::REQUEST_QUEUE_VARIABLE, cp00::REQUEST_QUEUE_VARIABLE] {
+            for name in ["CARD.DEMO.REQUEST.PAUTH", "QA REQUEST ~", longest.as_str()] {
+                assert!(
+                    check_request_queue(variable, name, AMQP_QUEUE_NAME_LEN).is_ok(),
+                    "{variable}: {name}"
+                );
+            }
+            for name in [
+                too_long.as_str(),
+                "QA.PAUTH.é✓",
+                "QA.PAUTH.\u{1}",
+                "QA.PAUTH\t",
+                "QA.PAUTH.\u{7f}",
+            ] {
+                let error = check_request_queue(variable, name, AMQP_QUEUE_NAME_LEN).err();
+                assert!(
+                    matches!(
+                        error,
+                        Some(AmqpError::QueueName { variable: refused, max_len: 255 })
+                            if refused == variable
+                    ),
+                    "{variable}: {name:?}: {error:?}"
+                );
+                assert!(
+                    error
+                        .as_ref()
+                        .is_some_and(|error| !error.is_connection_lost()),
+                    "{variable}: {name:?}"
+                );
+                let text = error
+                    .map(|error| format!("{error} {error:?}"))
+                    .unwrap_or_default();
+                assert!(text.contains(variable), "{text}");
+                assert!(!text.contains(name), "{text}");
+            }
         }
     }
 }

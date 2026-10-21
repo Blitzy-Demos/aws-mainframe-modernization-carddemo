@@ -6,7 +6,7 @@
 //!
 //! | Item | MQ counterpart | Rules |
 //! |---|---|---|
-//! | [`connect`] | the queue-manager connection of the CICS region | — |
+//! | [`connect`], [`Session`] | the queue-manager connection of the CICS region | — |
 //! | [`declare_passive`] | `MQOPEN` of each queue | the queues of `rabbitmq/definitions.json` |
 //! | [`Consumer::get`] | `MQGET` with the descriptor IDs reset before every get | CODATE01-001, COACCT01-001, COPAUA0C-001 |
 //! | [`Publisher::publish`] | `MQPUT` / `MQPUT1` | CODATE01-002, CODATE01-012, CODATE01-014, COACCT01-023, COACCT01-026, COACCT01-033, COPAUA0C-066, COPAUA0C-117 |
@@ -39,13 +39,40 @@
 //! - **No task boundary.** Each request is processed as the first message of a CICS task, and
 //!   nothing here carries state from one request to the next (E14, E15).
 //!
+//! # Deadlines
+//!
+//! Every broker wait of this module ends by a deadline, cleanup included: the connection and its
+//! handshake within [`CONNECT_DEADLINE`], a publication and its confirmation within
+//! [`PUBLISH_DEADLINE`], and every other operation, channel and connection closes included,
+//! within [`OPERATION_DEADLINE`]. Heartbeats prove only that the socket is alive: a broker that
+//! keeps heartbeating while it withholds a reply would otherwise hold a worker, and a CP00
+//! worker's authorization transaction and summary lock, for good. A missed deadline is
+//! [`Fault::TimedOut`], which leaves the channel and the connection in an unknown state and
+//! therefore counts as a lost connection ([`Fault::is_connection_lost`]): the worker stops, the
+//! [`Session`] is closed with [`Session::close`] and dropped, and a new connection replaces it,
+//! so a late result of the abandoned operation can settle nothing. A timed-out publication is a
+//! [`PublishFailure`], never a confirmation.
+//!
+//! A deadline that passes must also end the TCP connection, because only then does the broker
+//! drop the session and requeue every delivery it left unsettled. The client offers no abort: a
+//! connection dropped while its handshake or its `connection.close` is unanswered keeps its
+//! socket open for as long as the broker sends heartbeats. [`connect`] therefore opens the
+//! socket itself and keeps a second handle to it, with which the socket is shut down when the
+//! connection attempt fails, misses its deadline or is abandoned, when a close
+//! [`Session::close`] makes fails or goes unanswered, and when the [`Session`] is dropped
+//! without a close the broker answered.
+//!
 //! # Redaction
 //!
 //! CP00 request bodies hold full card numbers. No `Debug`, `Display`, error text or tracing
 //! event of this module shows a body byte: [`Request`]'s `Debug` gives the body length and the
-//! three properties as their [`ScreenedText`] shows them, one `*` per byte, and
-//! [`AmqpError`] and [`PublishFailure`] name queues and broker conditions only. The AMQP URL
-//! carries the local password, so it is never logged and no error repeats it.
+//! three properties as their [`ScreenedText`] shows them, one `*` per byte. [`AmqpError`] and
+//! [`PublishFailure`] name an operation and a value-free [`Fault`], and a queue only by its
+//! [`QueueLabel`]: a configured request queue by the environment variable that holds its name,
+//! any other queue by the source constant that names it, never a name read at run time, which
+//! may hold any value an operator typed. They keep no client error, because its text repeats the
+//! broker's close `reply_text`. The AMQP URL carries the local password, so it is never logged
+//! and no error repeats it.
 //!
 //! A request's `message_id`, `correlation_id` and `reply_to` are the requester's choice, and any
 //! of them can be a card number, an SSN or a password; a `CardDemo` password is any one to eight
@@ -57,7 +84,11 @@
 
 use std::error::Error;
 use std::fmt;
-use std::time::Duration;
+use std::io;
+use std::net::{Shutdown, TcpStream as Socket, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use lapin::message::{BasicGetMessage, Delivery};
 use lapin::options::{
@@ -66,10 +97,38 @@ use lapin::options::{
 };
 use lapin::protocol::AMQPErrorKind;
 use lapin::publisher_confirm::Confirmation;
+use lapin::tcp::{HandshakeResult, TLSConfig, TcpStream};
 use lapin::types::{FieldTable, ShortString};
-use lapin::uri::AMQPUri;
-use lapin::{BasicProperties, Channel, Connection, ConnectionProperties, ConnectionState};
+use lapin::uri::{AMQPScheme, AMQPUri};
+use lapin::{
+    BasicProperties, Channel, ChannelState, Connection, ConnectionProperties, ConnectionState,
+};
 use runtime::telemetry::ScreenedText;
+
+/// How long [`connect`] may take from the TCP connect to the broker's `connection.open-ok`: the
+/// socket, the protocol header and the `start`, `tune` and `open` exchanges together. The
+/// default connection properties set no deadline, so a broker that accepts the socket and never
+/// finishes the handshake would hold the first connection, or a reconnect, for good. Ten seconds
+/// is `RabbitMQ`'s own default `handshake_timeout`, which a merely slow broker still meets.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+
+/// How long [`Publisher::publish`] may take from handing the message to the publisher channel
+/// to the broker's confirmation, both waits together. A persistent message on a durable queue is
+/// normally confirmed within milliseconds, after the broker's next disk sync. A CP00 worker holds
+/// its authorization transaction and the account's summary lock across this wait and the
+/// acknowledgement after it, so the two deadlines bound how long every other decision for that
+/// account can be kept waiting by a broker that withholds a confirmation: at most this plus
+/// [`OPERATION_DEADLINE`], beyond the worker's own database work. Five seconds is the life the
+/// COBOL gives the CP00 reply itself (`MQMD-EXPIRY` 50 tenths, [`CP00_REPLY_EXPIRATION`]).
+pub const PUBLISH_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long every other broker operation may take: a method the broker answers
+/// (`channel.open`, `confirm.select`, the passive `queue.declare`, `basic.get`, `channel.close`
+/// and `connection.close`), or a frame the client must hand to the socket (`basic.ack`,
+/// `basic.reject`). A healthy broker answers each in milliseconds, so five seconds is ample
+/// margin for a loaded one. It bounds the acknowledgement half of a CP00 worker's lock hold (see
+/// [`PUBLISH_DEADLINE`]), each idle poll of a worker and every step of a reconnect.
+pub const OPERATION_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The queue to which the broker moves a `CARD.DEMO.REQUEST.PAUTH` request that a worker
 /// rejects with `requeue: false`, through the request queue's `x-dead-letter-exchange` `""` and
@@ -101,58 +160,65 @@ const CLOSE_NORMAL: u16 = 200;
 const CONSUMER_CLOSE_TEXT: &str = "carddemo-mq consumer reset";
 const PUBLISHER_CLOSE_TEXT: &str = "carddemo-mq publisher reset";
 
-/// A broker operation that failed. The text names the operation, the queue where one applies
-/// and the broker's or client's condition, never a message body or the AMQP URL.
+/// A broker operation that failed. Each variant names the operation; the [`Fault`] it carries
+/// names the client's or the broker's condition by its class and AMQP reply code only.
+///
+/// No variant keeps a `lapin::Error`: [`Fault::from`] keeps only its class, because the client
+/// error's text repeats what the broker sent, the `reply_text` of a channel or connection close
+/// included, and the broker writes queue names and other caller-controlled text there. The
+/// `Display`, `Debug` and [`Error::source`] of this type therefore never show broker, parser or
+/// operating-system text, a message body, the AMQP URL or a configured queue name. `Debug` is
+/// derived because every field is value-free by its type: a [`Fault`], a [`QueueLabel`], which
+/// names a queue only by its environment variable or its source constant, a variable name and a
+/// length.
 #[derive(Debug, Clone)]
 pub enum AmqpError {
     /// `CARDDEMO_AMQP_URL` is not a valid AMQP URL. The parser's own message is dropped,
     /// because it can repeat the URL, password included.
     InvalidUrl,
-    /// The queue name configured in `variable` cannot be carried whole by the COBOL field that
-    /// reports it: it is longer than `max_len` bytes or holds a byte outside printable ASCII.
-    /// The CDRA worker refuses such a `CARDDEMO_QUEUE_REQUEST_ACCT` at start, because its
-    /// account-read error body names the request queue in `MQ-APPL-QUEUE-NAME PIC X(48)`
-    /// (COACCT01-029, X-COACCT01-8). The text names the variable, never the rejected value.
+    /// The request queue name configured in `variable` is refused before its worker opens a
+    /// channel: it is longer than `max_len` bytes or holds a byte outside printable ASCII. CDRD
+    /// and CP00 refuse a `CARDDEMO_QUEUE_REQUEST_DATE` or `CARDDEMO_QUEUE_REQUEST_PAUTH` longer
+    /// than the 255 bytes an AMQP short string carries, over which the broker would close the
+    /// whole connection. CDRA refuses a `CARDDEMO_QUEUE_REQUEST_ACCT` longer than 48 bytes,
+    /// because its account-read error body names the request queue in
+    /// `MQ-APPL-QUEUE-NAME PIC X(48)` (COACCT01-029, X-COACCT01-8). The text names the variable,
+    /// never the rejected value.
     QueueName {
         /// The environment variable that holds the rejected name.
         variable: &'static str,
-        /// The width of the field the name must fit.
+        /// The longest name, in bytes, the worker accepts.
         max_len: usize,
     },
-    /// The connection to the broker could not be established.
-    Connect(lapin::Error),
+    /// The connection to the broker could not be established within [`CONNECT_DEADLINE`].
+    Connect(Fault),
     /// A channel could not be opened or put in confirm mode.
-    Channel(lapin::Error),
-    /// The passive declare of `queue` failed: the queue does not exist, or the channel or the
-    /// connection failed first.
+    Channel(Fault),
+    /// The passive declare of `queue` failed: the queue does not exist (AMQP 404), or the channel
+    /// or the connection failed first.
     Declare {
-        /// The queue that was checked.
-        queue: String,
-        /// The broker's or the client's error.
-        source: lapin::Error,
+        /// The queue that was checked, by its value-free label: the environment variable that
+        /// configures a request queue, or the source constant that names any other queue.
+        queue: QueueLabel,
+        /// The class of the broker's or the client's error.
+        source: Fault,
     },
     /// `basic_get` failed on the consumer channel.
-    Get(lapin::Error),
+    Get(Fault),
     /// `basic_ack` failed on the consumer channel.
-    Ack(lapin::Error),
+    Ack(Fault),
     /// `basic_reject` failed on the consumer channel.
-    Reject(lapin::Error),
+    Reject(Fault),
 }
 
 impl AmqpError {
-    /// Whether the AMQP connection behind the failed operation is gone, so that reopening
-    /// channels on it cannot help and only a new [`connect`] can.
+    /// Whether the AMQP connection behind the failed operation is gone, or in a state no longer
+    /// known, so that reopening channels on it cannot help and only a new [`connect`] can.
     ///
-    /// The heuristic, over the client error the variant carries:
-    ///
-    /// - lost: [`AmqpError::Connect`]; an IO error; a missed heartbeat; a frame the client could
-    ///   not parse or serialise, or a protocol version it rejected, each of which closes the
-    ///   connection; a connection state other than connected; a hard AMQP error such as
-    ///   `CONNECTION_FORCED`, with which the broker closes the connection.
-    /// - not lost: a soft AMQP error such as `NOT_FOUND` or `PRECONDITION_FAILED`, which closes
-    ///   only the channel, an invalid channel or channel state, the channel limit, and
-    ///   [`AmqpError::InvalidUrl`] and [`AmqpError::QueueName`], configuration errors no
-    ///   reconnect cures.
+    /// - lost: [`AmqpError::Connect`], and every variant whose [`Fault`] is lost by
+    ///   [`Fault::is_connection_lost`], a missed deadline included.
+    /// - not lost: [`AmqpError::InvalidUrl`] and [`AmqpError::QueueName`], configuration errors
+    ///   no reconnect cures, and every variant whose fault concerns the channel only.
     ///
     /// After a connection loss the client marks its channels failed, so the next operation on a
     /// channel reports a channel state and counts as not lost. The worker then reopens its
@@ -162,30 +228,221 @@ impl AmqpError {
         match self {
             Self::InvalidUrl | Self::QueueName { .. } => false,
             Self::Connect(_) => true,
-            Self::Channel(error)
-            | Self::Declare { source: error, .. }
-            | Self::Get(error)
-            | Self::Ack(error)
-            | Self::Reject(error) => connection_lost(error),
+            Self::Channel(fault)
+            | Self::Declare { source: fault, .. }
+            | Self::Get(fault)
+            | Self::Ack(fault)
+            | Self::Reject(fault) => fault.is_connection_lost(),
         }
     }
 }
 
-/// [`AmqpError::is_connection_lost`] for one client error.
-fn connection_lost(error: &lapin::Error) -> bool {
-    match error {
-        lapin::Error::IOError(_)
-        | lapin::Error::MissingHeartbeatError
-        | lapin::Error::ParsingError(_)
-        | lapin::Error::SerialisationError(_)
-        | lapin::Error::InvalidProtocolVersion(_) => true,
-        lapin::Error::InvalidConnectionState(state) => !matches!(state, ConnectionState::Connected),
-        lapin::Error::ProtocolError(protocol) => {
-            matches!(protocol.kind(), AMQPErrorKind::Hard(_))
+/// The value-free class of a client or broker failure: which condition occurred, never the text
+/// that came with it.
+///
+/// [`Fault::from`] keeps the AMQP reply code of a protocol error and drops its `reply_text`,
+/// keeps the [`io::ErrorKind`] of an I/O error and drops the operating system's message, keeps
+/// the state name of a channel or connection state error, and keeps only the class of a parse or
+/// serialisation error, whose text can quote frame bytes. No variant holds a string.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Fault {
+    /// The operation did not finish within its deadline, `after`: [`CONNECT_DEADLINE`],
+    /// [`PUBLISH_DEADLINE`] or [`OPERATION_DEADLINE`]. The operation was abandoned, and the
+    /// broker may still act on it, so the channel and the connection are in an unknown state.
+    TimedOut {
+        /// The deadline that passed.
+        after: Duration,
+    },
+    /// An AMQP error with reply `code`, for example 404 `NOT_FOUND` when a passive declare finds
+    /// no queue (a soft error, which closes the channel) or 320 `CONNECTION_FORCED` (a hard
+    /// error, which closes the connection).
+    Protocol {
+        /// The AMQP reply code.
+        code: u16,
+    },
+    /// An I/O error of the socket, by its kind.
+    Io(io::ErrorKind),
+    /// No heartbeat came from the broker for too long.
+    MissingHeartbeat,
+    /// A frame from the broker could not be parsed.
+    Parsing,
+    /// A frame could not be serialised.
+    Serialisation,
+    /// The broker does not speak AMQP 0-9-1.
+    ProtocolVersion,
+    /// The channel is not open: it is closing, closed or failed.
+    ChannelState(ChannelState),
+    /// The connection is not in the state the operation needs.
+    ConnectionState(ConnectionState),
+    /// The channel the operation named does not exist.
+    InvalidChannel,
+    /// The connection has as many channels as the broker allows.
+    ChannelsLimit,
+    /// A client error of a kind this crate does not classify, from a later client release.
+    Unclassified,
+}
+
+impl Fault {
+    /// Whether the fault ends the connection or leaves its state unknown:
+    ///
+    /// - lost: a missed deadline ([`Fault::TimedOut`]), after which neither the channel nor the
+    ///   connection can be trusted to settle the right delivery; an I/O error; a missed
+    ///   heartbeat; a frame the client could not parse or serialise, or a protocol version it
+    ///   rejected, each of which closes the connection; a connection state other than
+    ///   connected; a hard AMQP error such as `CONNECTION_FORCED`, with which the broker closes
+    ///   the connection.
+    /// - not lost: a soft AMQP error such as `NOT_FOUND` or `PRECONDITION_FAILED`, which closes
+    ///   only the channel; an invalid channel or channel state; the channel limit; an
+    ///   unclassified client error.
+    #[must_use]
+    pub fn is_connection_lost(&self) -> bool {
+        match self {
+            Self::TimedOut { .. }
+            | Self::Io(_)
+            | Self::MissingHeartbeat
+            | Self::Parsing
+            | Self::Serialisation
+            | Self::ProtocolVersion => true,
+            Self::ConnectionState(state) => !matches!(state, ConnectionState::Connected),
+            Self::Protocol { code } => {
+                matches!(AMQPErrorKind::from_id(*code), Some(AMQPErrorKind::Hard(_)))
+            }
+            Self::ChannelState(_)
+            | Self::InvalidChannel
+            | Self::ChannelsLimit
+            | Self::Unclassified => false,
         }
-        // Channel-level conditions (an invalid channel or channel state, the channel limit) and
-        // any variant a later client release adds.
-        _ => false,
+    }
+}
+
+impl From<&lapin::Error> for Fault {
+    /// The class of `error`, without any of its text.
+    fn from(error: &lapin::Error) -> Self {
+        match error {
+            lapin::Error::ProtocolError(protocol) => Self::Protocol {
+                code: protocol.get_id(),
+            },
+            lapin::Error::IOError(io) => Self::Io(io.kind()),
+            lapin::Error::MissingHeartbeatError => Self::MissingHeartbeat,
+            lapin::Error::ParsingError(_) => Self::Parsing,
+            lapin::Error::SerialisationError(_) => Self::Serialisation,
+            lapin::Error::InvalidProtocolVersion(_) => Self::ProtocolVersion,
+            lapin::Error::InvalidChannelState(state) => Self::ChannelState(state.clone()),
+            lapin::Error::InvalidConnectionState(state) => Self::ConnectionState(state.clone()),
+            lapin::Error::InvalidChannel(_) => Self::InvalidChannel,
+            lapin::Error::ChannelsLimitReached => Self::ChannelsLimit,
+            // The client's error enumeration is non-exhaustive.
+            _ => Self::Unclassified,
+        }
+    }
+}
+
+impl From<lapin::Error> for Fault {
+    /// The class of `error`, without any of its text; `error` is dropped.
+    fn from(error: lapin::Error) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TimedOut { after } => write!(f, "no response within the {after:?} deadline"),
+            Self::Protocol { code } => match AMQPErrorKind::from_id(*code) {
+                Some(AMQPErrorKind::Soft(kind)) => {
+                    write!(f, "AMQP soft error {kind} (reply code {code})")
+                }
+                Some(AMQPErrorKind::Hard(kind)) => {
+                    write!(f, "AMQP hard error {kind} (reply code {code})")
+                }
+                None => write!(f, "AMQP error with reply code {code}"),
+            },
+            Self::Io(kind) => write!(f, "I/O error: {kind}"),
+            Self::MissingHeartbeat => f.write_str("no heartbeat from the broker for too long"),
+            Self::Parsing => f.write_str("a frame from the broker could not be parsed"),
+            Self::Serialisation => f.write_str("a frame could not be serialised"),
+            Self::ProtocolVersion => f.write_str("the broker does not speak AMQP 0-9-1"),
+            Self::ChannelState(state) => write!(f, "invalid channel state {state:?}"),
+            Self::ConnectionState(state) => write!(f, "invalid connection state {state:?}"),
+            Self::InvalidChannel => f.write_str("invalid channel"),
+            Self::ChannelsLimit => f.write_str("the connection's channel limit is reached"),
+            Self::Unclassified => f.write_str("an unclassified client error"),
+        }
+    }
+}
+
+impl Error for Fault {}
+
+/// A queue as diagnostics name it, value-free by construction: a configured request queue by the
+/// environment variable that holds its name, and a queue whose name is a constant of the source
+/// by that constant. Neither variant holds a name read at run time, so no `Display`, `Debug` or
+/// error text built from a label can repeat what an operator configured, which may be anything,
+/// a card number or a password included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueLabel {
+    /// A request queue whose name comes from `runtime::config::Config`, shown as the environment
+    /// variable that holds it, for example `CARDDEMO_QUEUE_REQUEST_PAUTH`.
+    Configured {
+        /// The environment variable that holds the queue name.
+        variable: &'static str,
+    },
+    /// A queue whose name is a constant of the source and of `rabbitmq/definitions.json`, shown
+    /// as that name: a COBOL reply or error queue literal (`CARD.DEMO.REPLY.DATE`,
+    /// `CARD.DEMO.REPLY.ACCT`, `CARD.DEMO.ERROR`) or [`DEAD_LETTER_QUEUE`].
+    Literal(&'static str),
+}
+
+impl fmt::Display for QueueLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configured { variable } => write!(f, "the queue named by {variable}"),
+            Self::Literal(name) => write!(f, "queue {name}"),
+        }
+    }
+}
+
+/// A queue [`declare_passive`] checks: the name sent to the broker, and the [`QueueLabel`] that
+/// a failure shows in its place. Its `Debug` shows only the label, because a configured name is
+/// not value-free.
+#[derive(Clone, Copy)]
+pub struct QueueCheck<'a> {
+    name: &'a str,
+    label: QueueLabel,
+}
+
+impl<'a> QueueCheck<'a> {
+    /// The request queue `name` configured in the environment variable `variable`; a failure
+    /// shows the variable, never `name`.
+    #[must_use]
+    pub fn configured(variable: &'static str, name: &'a str) -> Self {
+        Self {
+            name,
+            label: QueueLabel::Configured { variable },
+        }
+    }
+
+    /// The queue named by the source constant `name`; a failure shows `name` itself.
+    #[must_use]
+    pub fn literal(name: &'static str) -> Self {
+        Self {
+            name,
+            label: QueueLabel::Literal(name),
+        }
+    }
+
+    /// The label a failure of this check shows.
+    #[must_use]
+    pub fn label(&self) -> QueueLabel {
+        self.label
+    }
+}
+
+impl fmt::Debug for QueueCheck<'_> {
+    /// The label only; never the name sent to the broker.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueueCheck")
+            .field("label", &self.label)
+            .finish_non_exhaustive()
     }
 }
 
@@ -197,34 +454,36 @@ impl fmt::Display for AmqpError {
                 f,
                 "{variable} must name a queue of at most {max_len} bytes of printable ASCII"
             ),
-            Self::Connect(error) => write!(f, "cannot connect to the AMQP broker: {error}"),
-            Self::Channel(error) => write!(f, "cannot open an AMQP channel: {error}"),
+            Self::Connect(fault) => write!(f, "cannot connect to the AMQP broker: {fault}"),
+            Self::Channel(fault) => write!(f, "cannot open an AMQP channel: {fault}"),
             Self::Declare { queue, source } => {
-                write!(f, "passive declare of queue {queue} failed: {source}")
+                write!(f, "passive declare of {queue} failed: {source}")
             }
-            Self::Get(error) => write!(f, "basic.get failed: {error}"),
-            Self::Ack(error) => write!(f, "basic.ack failed: {error}"),
-            Self::Reject(error) => write!(f, "basic.reject failed: {error}"),
+            Self::Get(fault) => write!(f, "basic.get failed: {fault}"),
+            Self::Ack(fault) => write!(f, "basic.ack failed: {fault}"),
+            Self::Reject(fault) => write!(f, "basic.reject failed: {fault}"),
         }
     }
 }
 
 impl Error for AmqpError {
+    /// The value-free [`Fault`], never the client error it was classified from.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::InvalidUrl | Self::QueueName { .. } => None,
-            Self::Connect(error)
-            | Self::Channel(error)
-            | Self::Declare { source: error, .. }
-            | Self::Get(error)
-            | Self::Ack(error)
-            | Self::Reject(error) => Some(error),
+            Self::Connect(fault)
+            | Self::Channel(fault)
+            | Self::Declare { source: fault, .. }
+            | Self::Get(fault)
+            | Self::Ack(fault)
+            | Self::Reject(fault) => Some(fault),
         }
     }
 }
 
 /// Why a publication was not confirmed, so the request it answers must not be acknowledged
-/// (CODATE01-014, COACCT01-033, COPAUA0C-117).
+/// (CODATE01-014, COACCT01-033, COPAUA0C-117). Like [`AmqpError`], it keeps only a value-free
+/// [`Fault`], so its derived `Debug` and its `Display` never show broker text.
 #[derive(Debug, Clone)]
 pub enum PublishFailure {
     /// The broker confirmed the message but first returned it under `mandatory: true`: no queue
@@ -236,8 +495,11 @@ pub enum PublishFailure {
     /// The publisher channel is not in confirm mode, so no confirmation exists
     /// (`Confirmation::NotRequested`).
     NotConfirmed,
-    /// `basic_publish` or the wait for its confirmation failed on the publisher channel.
-    Channel(lapin::Error),
+    /// `basic_publish` or the wait for its confirmation failed on the publisher channel, or the
+    /// two together did not finish within [`PUBLISH_DEADLINE`] ([`Fault::TimedOut`]). A
+    /// publication that timed out may still reach its queue later, but it is never counted as
+    /// confirmed: the request it answers takes its failure path.
+    Channel(Fault),
 }
 
 impl fmt::Display for PublishFailure {
@@ -246,35 +508,281 @@ impl fmt::Display for PublishFailure {
             Self::Returned => f.write_str("the broker returned the message: no queue matched"),
             Self::Nacked => f.write_str("the broker did not accept the message (nack)"),
             Self::NotConfirmed => f.write_str("the publisher channel is not in confirm mode"),
-            Self::Channel(error) => {
-                write!(f, "publication failed on the publisher channel: {error}")
+            Self::Channel(fault) => {
+                write!(f, "publication failed on the publisher channel: {fault}")
             }
         }
     }
 }
 
 impl Error for PublishFailure {
+    /// The value-free [`Fault`] of [`PublishFailure::Channel`], never a client error.
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Channel(error) => Some(error),
+            Self::Channel(fault) => Some(fault),
             Self::Returned | Self::Nacked | Self::NotConfirmed => None,
         }
     }
 }
 
-/// Opens the AMQP connection the workers share. `amqp_url` is `Config::amqp_url`
-/// (`CARDDEMO_AMQP_URL`), the only source of the broker address and credentials; it is never
-/// logged.
+/// Awaits `operation` for at most `deadline`. A client or broker error becomes its [`Fault`]; a
+/// missed deadline becomes [`Fault::TimedOut`], and the unfinished operation is dropped, so a
+/// late result, if one ever comes, reaches no caller.
+async fn within<T>(
+    deadline: Duration,
+    operation: impl Future<Output = lapin::Result<T>>,
+) -> Result<T, Fault> {
+    match tokio::time::timeout(deadline, operation).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(Fault::from(&error)),
+        Err(_elapsed) => Err(Fault::TimedOut { after: deadline }),
+    }
+}
+
+/// Opens the AMQP connection the workers share, as a [`Session`]. `amqp_url` is
+/// `Config::amqp_url` (`CARDDEMO_AMQP_URL`), the only source of the broker address and
+/// credentials; it is never logged.
+///
+/// The TCP connect and the whole AMQP handshake must finish within [`CONNECT_DEADLINE`]. The
+/// socket is opened here, as the client's own connector would open it, `amqps` included, so
+/// that the session keeps a second handle to it. When the attempt fails or misses its
+/// deadline, or the returned future is dropped unfinished, as a stop drops it, the socket is
+/// shut down through that handle. The client alone would keep it open, its handshake
+/// unfinished, for as long as the broker sends heartbeats.
 ///
 /// # Errors
 ///
 /// [`AmqpError::InvalidUrl`] when `amqp_url` does not parse as an AMQP URL, and
-/// [`AmqpError::Connect`] when the broker cannot be reached or refuses the login.
-pub async fn connect(amqp_url: &str) -> Result<Connection, AmqpError> {
+/// [`AmqpError::Connect`] when the broker cannot be reached, refuses the login or does not
+/// finish the handshake in time ([`Fault::TimedOut`]).
+pub async fn connect(amqp_url: &str) -> Result<Session, AmqpError> {
+    connect_within(amqp_url, CONNECT_DEADLINE).await
+}
+
+/// [`connect`] with `deadline` in place of [`CONNECT_DEADLINE`].
+async fn connect_within(amqp_url: &str, deadline: Duration) -> Result<Session, AmqpError> {
     let uri = parse_url(amqp_url)?;
-    Connection::connect_uri(uri, ConnectionProperties::default())
-        .await
-        .map_err(AmqpError::Connect)
+    // Dropped on every failure and when this future is dropped unfinished, which shuts the
+    // socket down; kept by the session on success.
+    let transport = Transport::new();
+    let connector = transport.connector(Instant::now(), deadline);
+    let connection = within(
+        deadline,
+        Connection::connector(uri, connector, ConnectionProperties::default()),
+    )
+    .await
+    .map_err(AmqpError::Connect)?;
+    Ok(Session {
+        connection,
+        transport,
+    })
+}
+
+/// The AMQP connection the workers share, opened by [`connect`], with a second handle to the
+/// socket under it.
+///
+/// The workers open their channels on [`Session::connection`]. The second handle lets the
+/// session end the TCP connection where the client cannot: when a close [`Session::close`]
+/// makes fails or goes unanswered, and when the session is dropped without a close the broker
+/// answered. The broker then ends its side of the connection and requeues every delivery the
+/// connection left unsettled, even while it keeps sending heartbeats and withholds every answer.
+pub struct Session {
+    connection: Connection,
+    /// Declared after `connection`, so that it is dropped after it, and shuts the socket down
+    /// when it is, unless a close the broker answered released it.
+    transport: Transport,
+}
+
+impl Session {
+    /// The AMQP connection, on which the workers open their channels.
+    #[must_use]
+    pub fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    /// Closes the connection with a normal reply code and `reason`, waiting at most
+    /// [`OPERATION_DEADLINE`] for the broker's `connection.close-ok`. When the close fails or
+    /// the deadline passes, the socket is shut down; the failure is only traced, with its
+    /// [`Fault`], because the caller drops the session afterwards.
+    ///
+    /// - connected: the close above. The client marks every channel of the connection closing
+    ///   before it sends the close, so no request is taken or settled on the connection
+    ///   afterwards. Once the broker answers, the client closes the socket itself, and neither
+    ///   this method nor the session's drop shuts it down: that would only race the client's
+    ///   last read and make it report a failed connection.
+    /// - closing: a close is already in progress, the broker's or one this method makes for
+    ///   another worker, which ends by its own deadline, so this call returns at once. The
+    ///   session's drop shuts the socket down unless that close was answered.
+    /// - closed or failed: the client is done with the socket, which the second handle still
+    ///   holds open, so it is shut down at once.
+    ///
+    /// Once the socket is shut down, or the close answered, the broker has ended the connection
+    /// and requeued every delivery it left unsettled.
+    pub async fn close(&self, reason: &str) {
+        self.close_within(reason, OPERATION_DEADLINE).await;
+    }
+
+    /// [`Session::close`] with `deadline` in place of [`OPERATION_DEADLINE`].
+    async fn close_within(&self, reason: &str, deadline: Duration) {
+        let status = self.connection.status();
+        if status.closing() {
+            return;
+        }
+        if status.connected() {
+            match within(deadline, self.connection.close(CLOSE_NORMAL, reason)).await {
+                Ok(()) => {
+                    self.transport.release();
+                    return;
+                }
+                Err(fault) => tracing::warn!(
+                    reason,
+                    error = %fault,
+                    "closing the AMQP connection failed; its socket is shut down"
+                ),
+            }
+        }
+        self.transport.shut_down();
+    }
+}
+
+impl fmt::Debug for Session {
+    /// The connection state only: the client's own `Debug` of a connection shows the user name.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("state", &self.connection.status().state())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The second handle to the socket of one connection, shared with the connector that opens the
+/// socket. Shutting it down, or dropping it, ends the TCP connection, unless it was released
+/// after a close the broker answered.
+struct Transport {
+    /// Set once: `Some` by the connector with its socket's second handle, or `None` by
+    /// [`Transport::shut_down`] when the connection was given up before the connector got that
+    /// far, which makes the connector shut its socket down and hand the client none.
+    socket: Arc<OnceLock<Option<Socket>>>,
+    /// Set by [`Transport::release`] once the broker has answered the connection's close: the
+    /// client then closes its own handle, and the second handle only goes with the drop.
+    released: AtomicBool,
+}
+
+impl Transport {
+    fn new() -> Self {
+        Self {
+            socket: Arc::new(OnceLock::new()),
+            released: AtomicBool::new(false),
+        }
+    }
+
+    /// Leaves the socket to the client, which closes it after the close the broker answered:
+    /// [`Transport::shut_down`] and the drop no longer shut it down.
+    fn release(&self) {
+        self.released.store(true, Ordering::Release);
+    }
+
+    /// The connector for `Connection::connector`: [`open_socket`] within what is left of
+    /// `deadline` since `started`, recording the second handle here.
+    fn connector(
+        &self,
+        started: Instant,
+        deadline: Duration,
+    ) -> Box<dyn FnOnce(&AMQPUri) -> HandshakeResult + Send + Sync> {
+        let slot = Arc::clone(&self.socket);
+        Box::new(move |uri: &AMQPUri| open_socket(uri, started, deadline, &slot))
+    }
+
+    /// Shuts the socket down, or, when the connector has not recorded one yet, makes it refuse
+    /// the socket it opens; nothing once [`Transport::release`] was called. Calling it again
+    /// shuts the same socket down again, which is harmless.
+    fn shut_down(&self) {
+        if self.released.load(Ordering::Acquire) || self.socket.set(None).is_ok() {
+            return;
+        }
+        if let Some(Some(socket)) = self.socket.get() {
+            shut_down_socket(socket);
+        }
+    }
+}
+
+impl Drop for Transport {
+    fn drop(&mut self) {
+        self.shut_down();
+    }
+}
+
+/// Opens the TCP connection to the broker as the client's default connector,
+/// `lapin::tcp::AMQPUriTcpExt::connect`, does: the URL's `host:port` resolved and connected,
+/// `TCP_NODELAY`, TLS with the default configuration for `amqps`, then non-blocking mode. A
+/// second handle to the socket is recorded in `slot` before TLS starts, so that a deadline that
+/// passes during the TLS or AMQP handshake can still end the connection; when `slot` already
+/// holds `None`, the connection was given up, and the socket is shut down instead of handed to
+/// the client.
+///
+/// The connect itself is bounded more tightly than by the default connector, which bounds only
+/// the first resolved address, and only by the URL's `connection_timeout`: see
+/// [`connect_socket`]. The client runs this on a blocking thread of its own.
+fn open_socket(
+    uri: &AMQPUri,
+    started: Instant,
+    deadline: Duration,
+    slot: &OnceLock<Option<Socket>>,
+) -> HandshakeResult {
+    let socket = connect_socket(uri, started, deadline)?;
+    socket.set_nodelay(true)?;
+    if slot.set(Some(socket.try_clone()?)).is_err() {
+        shut_down_socket(&socket);
+        return Err(io::Error::from(io::ErrorKind::ConnectionAborted).into());
+    }
+    let stream = TcpStream::from_std(socket)?;
+    let stream = match uri.scheme {
+        AMQPScheme::AMQP => stream,
+        AMQPScheme::AMQPS => stream.into_tls(&uri.authority.host, TLSConfig::default())?,
+    };
+    stream.set_nonblocking(true)?;
+    Ok(stream)
+}
+
+/// Connects to the first address of the URL's `host:port` that accepts within what is left of
+/// `deadline` since `started`, each attempt also bounded by the URL's `connection_timeout` in
+/// milliseconds when it sets one above 0.
+///
+/// # Errors
+///
+/// The error of the last address tried; [`io::ErrorKind::TimedOut`] when no time is left for
+/// the next address; [`io::ErrorKind::AddrNotAvailable`] when the name resolves to no address.
+fn connect_socket(uri: &AMQPUri, started: Instant, deadline: Duration) -> io::Result<Socket> {
+    let address = format!("{}:{}", uri.authority.host, uri.authority.port);
+    let mut failure = io::Error::from(io::ErrorKind::AddrNotAvailable);
+    for address in address.to_socket_addrs()? {
+        let left = deadline.saturating_sub(started.elapsed());
+        if left.is_zero() {
+            return Err(io::Error::from(io::ErrorKind::TimedOut));
+        }
+        let wait = uri
+            .query
+            .connection_timeout
+            .filter(|timeout| *timeout > 0)
+            .map_or(left, |timeout| left.min(Duration::from_millis(timeout)));
+        match Socket::connect_timeout(&address, wait) {
+            Ok(socket) => return Ok(socket),
+            Err(error) => failure = error,
+        }
+    }
+    Err(failure)
+}
+
+/// Shuts `socket` down in both directions, which sends the peer the end of the stream at once,
+/// whatever other handle still holds the socket. A socket no longer connected
+/// ([`io::ErrorKind::NotConnected`]) needs nothing more; any other failure is traced by its
+/// [`io::ErrorKind`] only.
+fn shut_down_socket(socket: &Socket) {
+    if let Err(error) = socket.shutdown(Shutdown::Both) {
+        let kind = error.kind();
+        if kind != io::ErrorKind::NotConnected {
+            tracing::warn!(?kind, "shutting down the AMQP socket failed");
+        }
+    }
 }
 
 /// Parses the AMQP URL, dropping the parser's message, which can repeat the URL.
@@ -284,44 +792,51 @@ fn parse_url(amqp_url: &str) -> Result<AMQPUri, AmqpError> {
         .map_err(|_| AmqpError::InvalidUrl)
 }
 
-/// Checks that each of `queues` exists, with a passive declare that creates nothing.
+/// Checks, in order, that each of `queues` exists, with a passive declare of its name that
+/// creates nothing.
 ///
 /// A missing queue makes the broker close `channel` (AMQP `NOT_FOUND`, 404), so the first
 /// failure ends the check. At startup it is fatal: the queue set of
 /// `rabbitmq/definitions.json` is missing or a request queue name in the configuration is wrong.
+/// Each declare must be answered within [`OPERATION_DEADLINE`].
 ///
 /// # Errors
 ///
-/// [`AmqpError::Declare`] naming the first queue whose check failed.
-pub async fn declare_passive(channel: &Channel, queues: &[&str]) -> Result<(), AmqpError> {
+/// [`AmqpError::Declare`] naming the first queue whose check failed, by its [`QueueLabel`].
+pub async fn declare_passive(
+    channel: &Channel,
+    queues: &[QueueCheck<'_>],
+) -> Result<(), AmqpError> {
     for queue in queues {
-        channel
-            .queue_declare(
-                queue,
-                QueueDeclareOptions {
-                    passive: true,
-                    durable: true,
-                    ..QueueDeclareOptions::default()
-                },
-                FieldTable::default(),
-            )
+        let declare = channel.queue_declare(
+            queue.name,
+            QueueDeclareOptions {
+                passive: true,
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        );
+        within(OPERATION_DEADLINE, declare)
             .await
             .map_err(|source| AmqpError::Declare {
-                queue: (*queue).to_owned(),
+                queue: queue.label(),
                 source,
             })?;
     }
     Ok(())
 }
 
-/// Closes `channel` with a normal reply code if it is still open. A failure is only traced:
-/// the channel is being discarded either way.
+/// Closes `channel` with a normal reply code if it is still open, waiting at most
+/// [`OPERATION_DEADLINE`] for the broker's `channel.close-ok`. A failure or a missed deadline is
+/// only traced, with its [`Fault`]: the channel is being discarded either way, and the client
+/// already counts it as closing, so no request is taken or settled on it afterwards.
 async fn close_quietly(channel: &Channel, reason: &str) {
     if !channel.status().connected() {
         return;
     }
-    if let Err(error) = channel.close(CLOSE_NORMAL, reason).await {
-        tracing::warn!(reason, error = %error, "closing an AMQP channel failed");
+    if let Err(fault) = within(OPERATION_DEADLINE, channel.close(CLOSE_NORMAL, reason)).await {
+        tracing::warn!(reason, error = %fault, "closing an AMQP channel failed");
     }
 }
 
@@ -333,15 +848,14 @@ pub struct Consumer {
 }
 
 impl Consumer {
-    /// Opens a consumer channel on `connection`.
+    /// Opens a consumer channel on `connection`, within [`OPERATION_DEADLINE`].
     ///
     /// # Errors
     ///
     /// [`AmqpError::Channel`] when the channel cannot be opened, for example because the
-    /// connection is gone.
+    /// connection is gone or the broker does not answer in time.
     pub async fn open(connection: &Connection) -> Result<Self, AmqpError> {
-        let channel = connection
-            .create_channel()
+        let channel = within(OPERATION_DEADLINE, connection.create_channel())
             .await
             .map_err(AmqpError::Channel)?;
         Ok(Self { channel })
@@ -360,20 +874,26 @@ impl Consumer {
     /// acknowledged after a confirmed publish or rejected through [`Acknowledger`]. If the
     /// channel closes first, the broker returns it to its queue.
     ///
+    /// The broker must answer within [`OPERATION_DEADLINE`]. A get that times out may still be
+    /// answered with a delivery the worker never sees; [`Fault::TimedOut`] counts as a lost
+    /// connection, so the session's connection is closed and the broker requeues that delivery.
+    ///
     /// # Errors
     ///
     /// [`AmqpError::Get`] when the get fails, for example because the channel or the connection
-    /// is gone.
+    /// is gone or the broker does not answer in time.
     pub async fn get(&self, queue: &str) -> Result<Option<Request>, AmqpError> {
-        let message = self
+        let get = self
             .channel
-            .basic_get(queue, BasicGetOptions { no_ack: false })
+            .basic_get(queue, BasicGetOptions { no_ack: false });
+        let message = within(OPERATION_DEADLINE, get)
             .await
             .map_err(AmqpError::Get)?;
         Ok(message.map(|BasicGetMessage { delivery, .. }| Request::from_delivery(delivery)))
     }
 
-    /// Closes the channel if it is still open; a failure is only traced.
+    /// Closes the channel if it is still open, within [`OPERATION_DEADLINE`]; a failure or a
+    /// missed deadline is only traced.
     ///
     /// Closing returns every delivery the channel has not acknowledged or rejected to its queue.
     /// That is how a worker leaves a request to be redelivered when it can neither acknowledge
@@ -396,23 +916,21 @@ pub struct Publisher {
 }
 
 impl Publisher {
-    /// Opens a publisher channel on `connection` and puts it in confirm mode, once.
+    /// Opens a publisher channel on `connection` and puts it in confirm mode, once; each step
+    /// within [`OPERATION_DEADLINE`].
     ///
     /// # Errors
     ///
-    /// [`AmqpError::Channel`] when the channel cannot be opened or confirm mode is refused; a
-    /// channel opened before the refusal is closed again.
+    /// [`AmqpError::Channel`] when the channel cannot be opened or confirm mode is refused or not
+    /// answered in time; a channel opened before the refusal is closed again.
     pub async fn open(connection: &Connection) -> Result<Self, AmqpError> {
-        let channel = connection
-            .create_channel()
+        let channel = within(OPERATION_DEADLINE, connection.create_channel())
             .await
             .map_err(AmqpError::Channel)?;
-        if let Err(error) = channel
-            .confirm_select(ConfirmSelectOptions::default())
-            .await
-        {
+        let confirm_select = channel.confirm_select(ConfirmSelectOptions::default());
+        if let Err(fault) = within(OPERATION_DEADLINE, confirm_select).await {
             close_quietly(&channel, PUBLISHER_CLOSE_TEXT).await;
-            return Err(AmqpError::Channel(error));
+            return Err(AmqpError::Channel(fault));
         }
         Ok(Self { channel })
     }
@@ -435,33 +953,40 @@ impl Publisher {
     /// COACCT01-026, COPAUA0C-066).
     ///
     /// Only `Confirmation::Ack` with no returned message is success, and only then may the
-    /// worker acknowledge the request it answers.
+    /// worker acknowledge the request it answers. The publication and its confirmation must
+    /// both finish within [`PUBLISH_DEADLINE`]; past it the wait is abandoned and the
+    /// publication counts as failed, never as confirmed.
     ///
     /// # Errors
     ///
     /// The [`PublishFailure`] that kept the message from being confirmed (CODATE01-014,
-    /// COACCT01-033, COPAUA0C-117).
+    /// COACCT01-033, COPAUA0C-117), [`PublishFailure::Channel`] with [`Fault::TimedOut`] when
+    /// the deadline passed.
     pub async fn publish(
         &self,
         queue: &str,
         body: &[u8],
         properties: BasicProperties,
     ) -> Result<(), PublishFailure> {
-        let confirm = self
-            .channel
-            .basic_publish(
-                DEFAULT_EXCHANGE,
-                queue,
-                BasicPublishOptions {
-                    mandatory: true,
-                    ..BasicPublishOptions::default()
-                },
-                body,
-                properties,
-            )
+        let publication = async {
+            self.channel
+                .basic_publish(
+                    DEFAULT_EXCHANGE,
+                    queue,
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..BasicPublishOptions::default()
+                    },
+                    body,
+                    properties,
+                )
+                .await?
+                .await
+        };
+        match within(PUBLISH_DEADLINE, publication)
             .await
-            .map_err(PublishFailure::Channel)?;
-        match confirm.await.map_err(PublishFailure::Channel)? {
+            .map_err(PublishFailure::Channel)?
+        {
             Confirmation::Ack(None) => Ok(()),
             Confirmation::Ack(Some(_)) => Err(PublishFailure::Returned),
             Confirmation::Nack(_) => Err(PublishFailure::Nacked),
@@ -640,18 +1165,27 @@ pub trait Acknowledger: Send + Sync {
 }
 
 impl Acknowledger for Consumer {
-    /// `basic_ack` on the consumer channel.
+    /// `basic_ack` on the consumer channel, handed to the socket within [`OPERATION_DEADLINE`].
+    /// A missed deadline is [`AmqpError::Ack`] with [`Fault::TimedOut`], and the worker closes
+    /// the channel so that the broker requeues the request.
     async fn ack(&self, delivery_tag: u64) -> Result<(), AmqpError> {
-        self.channel
-            .basic_ack(delivery_tag, BasicAckOptions::default())
+        let ack = self
+            .channel
+            .basic_ack(delivery_tag, BasicAckOptions::default());
+        within(OPERATION_DEADLINE, ack)
             .await
             .map_err(AmqpError::Ack)
     }
 
-    /// `basic_reject` with `requeue: false` on the consumer channel.
+    /// `basic_reject` with `requeue: false` on the consumer channel, handed to the socket within
+    /// [`OPERATION_DEADLINE`]. A missed deadline is [`AmqpError::Reject`] with
+    /// [`Fault::TimedOut`], and the worker closes the channel so that the broker requeues the
+    /// request.
     async fn reject_without_requeue(&self, delivery_tag: u64) -> Result<(), AmqpError> {
-        self.channel
-            .basic_reject(delivery_tag, BasicRejectOptions { requeue: false })
+        let reject = self
+            .channel
+            .basic_reject(delivery_tag, BasicRejectOptions { requeue: false });
+        within(OPERATION_DEADLINE, reject)
             .await
             .map_err(AmqpError::Reject)
     }
@@ -715,8 +1249,9 @@ mod tests {
     use lapin::{BasicProperties, ChannelState, ConnectionState};
 
     use super::{
-        AmqpError, BACKOFF_CAP, Backoff, CP00_REPLY_EXPIRATION, DEAD_LETTER_QUEUE, PublishFailure,
-        Request, copied_properties, cp00_properties, parse_url,
+        AmqpError, BACKOFF_CAP, Backoff, CONNECT_DEADLINE, CP00_REPLY_EXPIRATION,
+        DEAD_LETTER_QUEUE, Fault, OPERATION_DEADLINE, PUBLISH_DEADLINE, PublishFailure, QueueCheck,
+        QueueLabel, Request, copied_properties, cp00_properties, parse_url, within,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
@@ -937,14 +1472,28 @@ mod tests {
             AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND),
             ShortString::from("no queue"),
         ));
+        let timed_out = Fault::TimedOut {
+            after: OPERATION_DEADLINE,
+        };
         let lost = [
-            AmqpError::Connect(io.clone()),
-            AmqpError::Get(io),
-            AmqpError::Ack(lapin::Error::MissingHeartbeatError),
-            AmqpError::Channel(lapin::Error::InvalidConnectionState(
+            AmqpError::Connect(Fault::from(&io)),
+            AmqpError::Connect(Fault::TimedOut {
+                after: CONNECT_DEADLINE,
+            }),
+            AmqpError::Get(Fault::from(io)),
+            AmqpError::Get(timed_out.clone()),
+            AmqpError::Ack(timed_out.clone()),
+            AmqpError::Reject(timed_out.clone()),
+            AmqpError::Channel(timed_out.clone()),
+            AmqpError::Declare {
+                queue: QueueLabel::Literal("CARD.DEMO.ERROR"),
+                source: timed_out,
+            },
+            AmqpError::Ack(Fault::from(lapin::Error::MissingHeartbeatError)),
+            AmqpError::Channel(Fault::from(lapin::Error::InvalidConnectionState(
                 ConnectionState::Closed,
-            )),
-            AmqpError::Reject(forced),
+            ))),
+            AmqpError::Reject(Fault::from(forced)),
         ];
         for error in &lost {
             assert!(error.is_connection_lost(), "{error}");
@@ -956,15 +1505,21 @@ mod tests {
                 max_len: 48,
             },
             AmqpError::Declare {
-                queue: "CARD.DEMO.ERROR".to_owned(),
-                source: not_found,
+                queue: QueueLabel::Configured {
+                    variable: "CARDDEMO_QUEUE_REQUEST_DATE",
+                },
+                source: Fault::from(not_found),
             },
-            AmqpError::Get(lapin::Error::InvalidChannelState(ChannelState::Closed)),
-            AmqpError::Ack(lapin::Error::InvalidChannelState(ChannelState::Error)),
-            AmqpError::Channel(lapin::Error::InvalidConnectionState(
+            AmqpError::Get(Fault::from(lapin::Error::InvalidChannelState(
+                ChannelState::Closed,
+            ))),
+            AmqpError::Ack(Fault::from(lapin::Error::InvalidChannelState(
+                ChannelState::Error,
+            ))),
+            AmqpError::Channel(Fault::from(lapin::Error::InvalidConnectionState(
                 ConnectionState::Connected,
-            )),
-            AmqpError::Channel(lapin::Error::ChannelsLimitReached),
+            ))),
+            AmqpError::Channel(Fault::from(lapin::Error::ChannelsLimitReached)),
         ];
         for error in &channel_only {
             assert!(!error.is_connection_lost(), "{error}");
@@ -972,16 +1527,47 @@ mod tests {
     }
 
     #[test]
-    fn error_texts_name_the_queue_and_keep_the_client_error_as_source() {
-        let declare = AmqpError::Declare {
-            queue: "CARD.DEMO.REQUEST.PAUTH".to_owned(),
-            source: lapin::Error::InvalidChannelState(ChannelState::Closed),
-        };
-        assert!(
-            declare.to_string().contains("CARD.DEMO.REQUEST.PAUTH"),
-            "{declare}"
-        );
-        assert!(declare.source().is_some());
+    fn error_texts_name_the_queue_and_keep_only_the_fault_as_source() {
+        let closed = Fault::from(lapin::Error::InvalidChannelState(ChannelState::Closed));
+        let not_found = Fault::Protocol { code: 404 };
+        let cases = [
+            (
+                QueueCheck::configured("CARDDEMO_QUEUE_REQUEST_PAUTH", "CARD.DEMO.REQUEST.PAUTH"),
+                closed.clone(),
+                "passive declare of the queue named by CARDDEMO_QUEUE_REQUEST_PAUTH failed: \
+                 invalid channel state Closed",
+            ),
+            (
+                QueueCheck::configured("CARDDEMO_QUEUE_REQUEST_PAUTH", "CARD.DEMO.REQUEST.PAUTH"),
+                not_found.clone(),
+                "passive declare of the queue named by CARDDEMO_QUEUE_REQUEST_PAUTH failed: \
+                 AMQP soft error NOT-FOUND (reply code 404)",
+            ),
+            (
+                QueueCheck::literal(DEAD_LETTER_QUEUE),
+                not_found,
+                "passive declare of queue CARD.DEMO.DEADLETTER.PAUTH failed: \
+                 AMQP soft error NOT-FOUND (reply code 404)",
+            ),
+            (
+                QueueCheck::literal("CARD.DEMO.ERROR"),
+                closed,
+                "passive declare of queue CARD.DEMO.ERROR failed: invalid channel state Closed",
+            ),
+        ];
+        for (check, source, shown) in cases {
+            let declare = AmqpError::Declare {
+                queue: check.label(),
+                source: source.clone(),
+            };
+            assert_eq!(declare.to_string(), shown);
+            assert!(
+                declare
+                    .source()
+                    .and_then(|fault| fault.downcast_ref::<Fault>())
+                    .is_some_and(|fault| *fault == source)
+            );
+        }
         assert!(AmqpError::InvalidUrl.source().is_none());
 
         let failures = [
@@ -993,9 +1579,152 @@ mod tests {
             assert!(failure.source().is_none(), "{failure}");
             assert!(!failure.to_string().is_empty());
         }
-        let channel =
-            PublishFailure::Channel(lapin::Error::InvalidChannelState(ChannelState::Closed));
-        assert!(channel.source().is_some(), "{channel}");
+        let timed_out = PublishFailure::Channel(Fault::TimedOut {
+            after: PUBLISH_DEADLINE,
+        });
+        assert_eq!(
+            timed_out.to_string(),
+            "publication failed on the publisher channel: no response within the 5s deadline"
+        );
+        assert!(
+            timed_out
+                .source()
+                .and_then(|source| source.downcast_ref::<Fault>())
+                .is_some_and(Fault::is_connection_lost)
+        );
+    }
+
+    #[test]
+    fn a_protocol_fault_keeps_the_reply_code_and_its_class_only() {
+        let cases = [
+            (AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND), 404, false),
+            (
+                AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED),
+                403,
+                false,
+            ),
+            (
+                AMQPErrorKind::Hard(AMQPHardError::CONNECTIONFORCED),
+                320,
+                true,
+            ),
+            (AMQPErrorKind::Hard(AMQPHardError::FRAMEERROR), 501, true),
+        ];
+        for (kind, code, lost) in cases {
+            let fault = Fault::from(lapin::Error::ProtocolError(AMQPError::new(
+                kind,
+                ShortString::from("reply text"),
+            )));
+            assert_eq!(fault, Fault::Protocol { code });
+            assert_eq!(fault.is_connection_lost(), lost, "{fault}");
+            let shown = format!("{fault} {fault:?}");
+            assert!(shown.contains(&code.to_string()), "{shown}");
+            assert!(!shown.contains("reply text"), "{shown}");
+        }
+        let unknown = Fault::Protocol { code: 999 };
+        assert_eq!(unknown.to_string(), "AMQP error with reply code 999");
+        assert!(!unknown.is_connection_lost());
+    }
+
+    #[test]
+    fn a_configured_queue_shows_as_its_variable_and_never_as_its_name() {
+        // Configured names holding protected values, assembled at run time: a password-like
+        // word of letters only, a test card number and a test SSN.
+        let word = ["ONLY", "LETR"].concat();
+        let card = format!("4111{}", "1".repeat(12));
+        let ssn = ["123", "45", "6789"].join("-");
+        let names = [
+            format!("QA.{word}"),
+            word.clone(),
+            format!("QA.{card}"),
+            CARD_NUMBER.to_owned(),
+            format!("SSN {ssn} Q"),
+            format!("QA.{}", "Q".repeat(300)),
+        ];
+        for name in &names {
+            let check = QueueCheck::configured("CARDDEMO_QUEUE_REQUEST_PAUTH", name);
+            assert_eq!(
+                check.name,
+                name.as_str(),
+                "the broker is sent the name itself"
+            );
+            let label = check.label();
+            assert_eq!(
+                label,
+                QueueLabel::Configured {
+                    variable: "CARDDEMO_QUEUE_REQUEST_PAUTH"
+                }
+            );
+            let declare = AmqpError::Declare {
+                queue: label,
+                source: Fault::Protocol { code: 404 },
+            };
+            let mut shown = vec![
+                format!("{label} | {label:?} | {label:#?}"),
+                format!("{check:?} | {check:#?}"),
+                format!("{declare} | {declare:?} | {declare:#?}"),
+            ];
+            for text in &shown {
+                assert!(text.contains("CARDDEMO_QUEUE_REQUEST_PAUTH"), "{text}");
+            }
+            let mut current = declare.source();
+            while let Some(error) = current {
+                shown.push(format!("{error} | {error:?} | {error:#?}"));
+                current = error.source();
+            }
+            for text in &shown {
+                let protected: [&str; 5] = [name, &word, &card, CARD_NUMBER, &ssn];
+                for value in protected {
+                    assert!(!text.contains(value), "{value} shown in: {text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_literal_queue_shows_as_its_name() {
+        for name in [
+            DEAD_LETTER_QUEUE,
+            "CARD.DEMO.REPLY.DATE",
+            "CARD.DEMO.REPLY.ACCT",
+            "CARD.DEMO.ERROR",
+        ] {
+            let check = QueueCheck::literal(name);
+            assert_eq!(check.name, name);
+            assert_eq!(check.label(), QueueLabel::Literal(name));
+            assert_eq!(check.label().to_string(), format!("queue {name}"));
+            assert_eq!(
+                format!("{check:?}"),
+                format!("QueueCheck {{ label: Literal({name:?}), .. }}")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wait_ends_by_its_deadline_and_keeps_only_the_fault() {
+        let deadline = Duration::from_millis(20);
+        let pending = within(deadline, std::future::pending::<lapin::Result<()>>()).await;
+        assert_eq!(pending, Err(Fault::TimedOut { after: deadline }));
+
+        let ready = within(deadline, async { lapin::Result::Ok(7) }).await;
+        assert_eq!(ready, Ok(7));
+
+        let failed = within(deadline, async {
+            lapin::Result::<()>::Err(lapin::Error::IOError(Arc::new(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                format!("os text naming {CARD_NUMBER}"),
+            ))))
+        })
+        .await;
+        assert_eq!(failed, Err(Fault::Io(io::ErrorKind::ConnectionRefused)));
+    }
+
+    #[test]
+    fn the_publish_deadline_is_the_cp00_reply_expiry() {
+        assert_eq!(
+            PUBLISH_DEADLINE.as_millis().to_string(),
+            CP00_REPLY_EXPIRATION
+        );
     }
 
     #[test]
@@ -1004,5 +1733,315 @@ mod tests {
         let routing = format!("\"x-dead-letter-routing-key\": \"{DEAD_LETTER_QUEUE}\"");
         assert!(definitions.contains(&routing));
         assert!(definitions.contains(&format!("\"name\": \"{DEAD_LETTER_QUEUE}\"")));
+    }
+
+    /// The deadline the session tests give the client in place of the production ones.
+    const TEST_DEADLINE: Duration = Duration::from_millis(300);
+
+    /// How soon after the client gives a connection up its scripted broker must see the TCP
+    /// connection end.
+    const END_WITHIN: Duration = Duration::from_secs(2);
+
+    /// How long a scripted broker waits for the client's side to end before it gives up, so that
+    /// a socket left open fails the test instead of hanging it.
+    const PEER_PATIENCE: Duration = Duration::from_secs(10);
+
+    /// How long a scripted broker waits for client bytes before it looks again, sending a
+    /// heartbeat first once the handshake is complete.
+    const PEER_TICK: Duration = Duration::from_millis(100);
+
+    /// The AMQP 0-9-1 protocol header, the first bytes a client sends.
+    const PROTOCOL_HEADER: [u8; 8] = *b"AMQP\x00\x00\x09\x01";
+
+    /// A heartbeat frame: type 8, channel 0, an empty payload and the frame end.
+    const HEARTBEAT: [u8; 8] = [8, 0, 0, 0, 0, 0, 0, 0xCE];
+
+    /// What a scripted broker does once it accepts the client's socket.
+    #[derive(Clone, Copy, Debug)]
+    enum Script {
+        /// Reads and never answers, not even the protocol header, so the handshake never
+        /// finishes.
+        Silent,
+        /// Completes the handshake (`connection.start`, `connection.tune`,
+        /// `connection.open-ok`), then sends heartbeats and never answers `connection.close`.
+        WithholdCloseOk,
+        /// Completes the handshake as [`Script::WithholdCloseOk`] does, then answers
+        /// `connection.close` with `connection.close-ok`.
+        AnswerCloseOk,
+    }
+
+    /// What a scripted broker saw before the client's side of the TCP connection ended.
+    #[derive(Debug)]
+    struct PeerReport {
+        /// Whether the client sent `connection.close` first.
+        close_requested: bool,
+        /// When the broker saw the end: the end of the stream, a reset or a broken pipe.
+        ended_at: std::time::Instant,
+    }
+
+    /// Starts a scripted broker for one connection on a free local port: the AMQP URL that
+    /// reaches it, which names no credentials, and the receiver of its [`PeerReport`]. The
+    /// receiver disconnects without a report when the client's side stays open for
+    /// [`PEER_PATIENCE`].
+    fn scripted_broker(
+        script: Script,
+    ) -> io::Result<(String, std::sync::mpsc::Receiver<PeerReport>)> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let url = format!("amqp://{}/%2f", listener.local_addr()?);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(report) = play(&listener, script) {
+                // The test may have given up already; nothing waits for the report then.
+                let _delivered = sender.send(report);
+            }
+        });
+        Ok((url, receiver))
+    }
+
+    /// Accepts one connection on `listener` and plays `script` until the client's side ends.
+    fn play(listener: &std::net::TcpListener, script: Script) -> io::Result<PeerReport> {
+        use std::io::{Read, Write};
+
+        let (mut socket, _) = listener.accept()?;
+        socket.set_read_timeout(Some(PEER_TICK))?;
+        let accepted = std::time::Instant::now();
+        let ended = |close_requested| PeerReport {
+            close_requested,
+            ended_at: std::time::Instant::now(),
+        };
+        let mut received = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        let mut header_read = false;
+        let mut open = false;
+        let mut close_requested = false;
+        while accepted.elapsed() < PEER_PATIENCE {
+            match socket.read(&mut chunk) {
+                Ok(0) => return Ok(ended(close_requested)),
+                Ok(count) => received.extend_from_slice(chunk.get(..count).unwrap_or_default()),
+                Err(error) if is_connection_end(&error) => return Ok(ended(close_requested)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if open {
+                        match socket.write_all(&HEARTBEAT) {
+                            Ok(()) => {}
+                            Err(error) if is_connection_end(&error) => {
+                                return Ok(ended(close_requested));
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+            if matches!(script, Script::Silent) {
+                continue;
+            }
+            if !header_read {
+                let Some(header) = received.get(..PROTOCOL_HEADER.len()) else {
+                    continue;
+                };
+                if header != PROTOCOL_HEADER {
+                    return Err(io::Error::from(io::ErrorKind::InvalidData));
+                }
+                received.drain(..PROTOCOL_HEADER.len());
+                header_read = true;
+                socket.write_all(&connection_start())?;
+            }
+            while let Some((method, length)) = next_frame(&received) {
+                received.drain(..length);
+                match method {
+                    // connection.start-ok
+                    Some((10, 11)) => socket.write_all(&connection_tune())?,
+                    // connection.open: answered with connection.open-ok
+                    Some((10, 40)) => {
+                        socket.write_all(&method_frame(10, 41, &[0]))?;
+                        open = true;
+                    }
+                    // connection.close: answered with connection.close-ok by one script only
+                    Some((10, 50)) => {
+                        close_requested = true;
+                        if matches!(script, Script::AnswerCloseOk) {
+                            socket.write_all(&method_frame(10, 51, &[]))?;
+                            // Nothing follows a close-ok; the broker waits for the client's end.
+                            open = false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Err(io::Error::from(io::ErrorKind::TimedOut))
+    }
+
+    /// Whether `error` shows the peer's side of the TCP connection gone.
+    fn is_connection_end(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionReset
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::BrokenPipe
+        )
+    }
+
+    /// The first whole frame of `received`: the class and method ids of a method frame, `None`
+    /// for any other frame, and the frame's length; `None` until a whole frame has arrived.
+    fn next_frame(received: &[u8]) -> Option<(Option<(u16, u16)>, usize)> {
+        let header = received.get(..7)?;
+        let size = u32::from_be_bytes(header.get(3..7)?.try_into().ok()?);
+        let length = usize::try_from(size).ok()?.checked_add(8)?;
+        let frame = received.get(..length)?;
+        let method = if header.first() == Some(&1) {
+            let class = u16::from_be_bytes(frame.get(7..9)?.try_into().ok()?);
+            let method = u16::from_be_bytes(frame.get(9..11)?.try_into().ok()?);
+            Some((class, method))
+        } else {
+            None
+        };
+        Some((method, length))
+    }
+
+    /// A method frame on channel 0: type 1, the payload size, the class and method ids, the
+    /// arguments and the frame end.
+    fn method_frame(class: u16, method: u16, arguments: &[u8]) -> Vec<u8> {
+        let size = u32::try_from(arguments.len().saturating_add(4)).unwrap_or(u32::MAX);
+        let mut frame = vec![1, 0, 0];
+        frame.extend_from_slice(&size.to_be_bytes());
+        frame.extend_from_slice(&class.to_be_bytes());
+        frame.extend_from_slice(&method.to_be_bytes());
+        frame.extend_from_slice(arguments);
+        frame.push(0xCE);
+        frame
+    }
+
+    /// An AMQP long string: the length as a big-endian `u32`, then the bytes.
+    fn long_string(text: &str) -> Vec<u8> {
+        let length = u32::try_from(text.len()).unwrap_or(u32::MAX);
+        let mut encoded = length.to_be_bytes().to_vec();
+        encoded.extend_from_slice(text.as_bytes());
+        encoded
+    }
+
+    /// `connection.start`: version 0-9, no server properties, mechanism `PLAIN`, locale `en_US`.
+    fn connection_start() -> Vec<u8> {
+        let mut arguments = vec![0, 9];
+        arguments.extend_from_slice(&0_u32.to_be_bytes());
+        arguments.extend(long_string("PLAIN"));
+        arguments.extend(long_string("en_US"));
+        method_frame(10, 10, &arguments)
+    }
+
+    /// `connection.tune`: 2047 channels, 128 KiB frames and a one-second heartbeat, which the
+    /// broker's heartbeats every [`PEER_TICK`] of client silence keep satisfied.
+    fn connection_tune() -> Vec<u8> {
+        let mut arguments = 2047_u16.to_be_bytes().to_vec();
+        arguments.extend_from_slice(&131_072_u32.to_be_bytes());
+        arguments.extend_from_slice(&1_u16.to_be_bytes());
+        method_frame(10, 30, &arguments)
+    }
+
+    /// Asserts that the scripted broker behind `report` saw the TCP connection end within
+    /// [`END_WITHIN`] of `given_up`, and returns what it saw.
+    fn assert_connection_ended(
+        report: &std::sync::mpsc::Receiver<PeerReport>,
+        given_up: std::time::Instant,
+    ) -> Option<PeerReport> {
+        let report = report
+            .recv_timeout(END_WITHIN.saturating_add(PEER_TICK))
+            .ok();
+        assert!(
+            report.as_ref().is_some_and(|report| {
+                report.ended_at.saturating_duration_since(given_up) <= END_WITHIN
+            }),
+            "the broker saw the TCP connection end late or never: {report:?}"
+        );
+        report
+    }
+
+    #[tokio::test]
+    async fn a_handshake_given_up_ends_its_tcp_connection() -> io::Result<()> {
+        use super::connect_within;
+
+        // Given up once by the connect deadline, and once by the caller, which drops the
+        // unfinished attempt as a stop does.
+        for dropped_by_caller in [false, true] {
+            let (url, report) = scripted_broker(Script::Silent)?;
+            let started = std::time::Instant::now();
+            let outcome = if dropped_by_caller {
+                tokio::time::timeout(TEST_DEADLINE, connect_within(&url, CONNECT_DEADLINE))
+                    .await
+                    .ok()
+            } else {
+                Some(connect_within(&url, TEST_DEADLINE).await)
+            };
+            let given_up = std::time::Instant::now();
+            assert!(
+                match &outcome {
+                    None => dropped_by_caller,
+                    Some(Err(AmqpError::Connect(Fault::TimedOut { after }))) => {
+                        !dropped_by_caller && *after == TEST_DEADLINE
+                    }
+                    Some(_) => false,
+                },
+                "dropped by the caller: {dropped_by_caller}, outcome: {outcome:?}"
+            );
+            assert!(given_up.duration_since(started) < TEST_DEADLINE.saturating_add(END_WITHIN));
+            assert_connection_ended(&report, given_up);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_ends_its_tcp_connection_whether_its_close_is_answered_or_not()
+    -> io::Result<()> {
+        use super::connect_within;
+
+        // (script, closed): a close the broker never answers; a session dropped without a
+        // close; and a close the broker answers, after which the session is dropped.
+        let cases = [
+            (Script::WithholdCloseOk, true),
+            (Script::WithholdCloseOk, false),
+            (Script::AnswerCloseOk, true),
+        ];
+        for (script, closed) in cases {
+            let (url, report) = scripted_broker(script)?;
+            let session = match connect_within(&url, CONNECT_DEADLINE).await {
+                Ok(session) => session,
+                Err(error) => panic!("{script:?}: the scripted handshake failed: {error}"),
+            };
+            assert!(session.connection().status().connected(), "{script:?}");
+            let started = std::time::Instant::now();
+            if closed {
+                session
+                    .close_within("carddemo-mq session test", TEST_DEADLINE)
+                    .await;
+                assert!(
+                    started.elapsed() < TEST_DEADLINE.saturating_add(END_WITHIN),
+                    "{script:?}: the close outlived its deadline"
+                );
+            }
+            // A close never answered must end the connection by itself, so that session is held
+            // until the broker has reported; every other one is dropped first.
+            let kept = if closed && matches!(script, Script::WithholdCloseOk) {
+                Some(session)
+            } else {
+                drop(session);
+                None
+            };
+            let given_up = std::time::Instant::now();
+            let seen = assert_connection_ended(&report, given_up);
+            if closed {
+                assert!(
+                    seen.is_some_and(|seen| seen.close_requested),
+                    "{script:?}: the client sent no connection.close before the socket ended"
+                );
+            }
+            drop(kept);
+        }
+        Ok(())
     }
 }

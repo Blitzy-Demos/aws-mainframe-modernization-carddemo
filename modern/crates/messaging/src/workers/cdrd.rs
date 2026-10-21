@@ -26,7 +26,9 @@
 //! The request queue comes only from `runtime::config::Config::queue_request_date`, because the
 //! COBOL takes it from the trigger message and holds no literal for it. The reply and error
 //! queues are the COBOL literals `CARD.DEMO.REPLY.DATE` and `CARD.DEMO.ERROR`, owned by
-//! `domain::messaging::codate01`; the README's queue names are not used (E01).
+//! `domain::messaging::codate01`; the README's queue names are not used (E01). `Worker::open`
+//! refuses a configured name longer than the 255-byte AMQP short string or holding a byte
+//! outside printable ASCII, which the broker would answer by closing the connection.
 //!
 //! # One request, one task
 //!
@@ -56,8 +58,12 @@ use runtime::config::Config;
 use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
-use crate::broker::{Acknowledger, AmqpError, Consumer};
+use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
 use crate::error_body::Flow;
+
+/// The environment variable of the request queue, which the start-up refusal and a failed
+/// passive declare of the request queue name in place of the configured value.
+pub(super) const REQUEST_QUEUE_VARIABLE: &str = "CARDDEMO_QUEUE_REQUEST_DATE";
 
 /// The CDRD worker: one consumer and one publisher channel, the configured request queue and the
 /// injected clock (CODATE01-008, CODATE01-013).
@@ -71,26 +77,35 @@ pub struct Worker<A: Acknowledger = Consumer> {
 }
 
 impl Worker<Consumer> {
-    /// Opens the worker's channels on `connection`: the consumer channel, a passive declare of
-    /// the request queue `config.queue_request_date`, `CARD.DEMO.REPLY.DATE` and
-    /// `CARD.DEMO.ERROR`, then the publisher channel in confirm mode. `clock` supplies the date
-    /// and time of every reply (CODATE01-008).
+    /// Opens the worker's channels on `connection`: checks that `config.queue_request_date` is
+    /// a queue name AMQP can carry, then opens the consumer channel, checks the request queue,
+    /// `CARD.DEMO.REPLY.DATE` and `CARD.DEMO.ERROR` with a passive declare, and opens the
+    /// publisher channel in confirm mode. `clock` supplies the date and time of every reply
+    /// (CODATE01-008).
     ///
     /// # Errors
     ///
-    /// The [`AmqpError`] of a channel that could not be opened or put in confirm mode, or
-    /// [`AmqpError::Declare`] naming the first of the three queues that does not exist.
+    /// [`AmqpError::QueueName`] naming `CARDDEMO_QUEUE_REQUEST_DATE` when the configured request
+    /// queue is longer than the 255-byte AMQP short string or holds a byte outside printable
+    /// ASCII, before any channel is opened; the [`AmqpError`] of a channel that could not be
+    /// opened or put in confirm mode; or [`AmqpError::Declare`] naming the first of the three
+    /// queues that does not exist.
     pub async fn open(
         connection: &Connection,
         config: &Config,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, AmqpError> {
+        super::check_request_queue(
+            REQUEST_QUEUE_VARIABLE,
+            &config.queue_request_date,
+            super::AMQP_QUEUE_NAME_LEN,
+        )?;
         let channels = Channels::open(
             connection,
             &[
-                config.queue_request_date.as_str(),
-                codate01::REPLY_QUEUE,
-                codate01::ERROR_QUEUE,
+                QueueCheck::configured(REQUEST_QUEUE_VARIABLE, &config.queue_request_date),
+                QueueCheck::literal(codate01::REPLY_QUEUE),
+                QueueCheck::literal(codate01::ERROR_QUEUE),
             ],
         )
         .await?;

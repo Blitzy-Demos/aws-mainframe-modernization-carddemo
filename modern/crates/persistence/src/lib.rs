@@ -77,8 +77,8 @@ pub use repos::{
     CardXrefRepository, ChainLink, CsslErrorLogRepository, CustomerRepository,
     Db2TransactionTypeCategoryRepository, Db2TransactionTypeRepository, DisclosureGroupRepository,
     PendingAuthDetailRepository, PendingAuthSummaryRepository, TranCatBalanceRepository,
-    TransactionCategoryRepository, TransactionRepository, TransactionTypeRepository,
-    UserRepository,
+    TransactionCategoryRepository, TransactionRepository, TransactionRows,
+    TransactionTypeRepository, UserRepository,
 };
 
 /// The connection pool, as the executor of every repository trait: each statement runs on a

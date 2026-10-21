@@ -18,9 +18,10 @@
 //! the `transactions` rows [`selects`] accepts in [`sort_key`] order, and reads `card_xref` and
 //! the VSAM data version `transaction_types` and `transaction_categories`, never schema `db2`
 //! (E23, CBTRN03C-038). It builds a [`Tranrept`] from the reference rows, passes each selected
-//! row to [`Tranrept::process`], shows the two [`Tranrept::end_of_file_display`] lines, and
-//! writes the records [`Tranrept::finish`] returns, each followed by LF. This module does no I/O
-//! and holds no path.
+//! row to [`Tranrept::process`], writing the records each pass gives, which it takes with
+//! [`Tranrept::take_records`], shows the two [`Tranrept::end_of_file_display`] lines, and writes
+//! the records [`Tranrept::finish`] returns, each followed by LF. This module does no I/O and
+//! holds no path.
 //!
 //! # Fidelity
 //!
@@ -604,7 +605,18 @@ impl Tranrept {
         }
     }
 
-    /// Ends the run and returns every report record, in order (CBTRN03C-032).
+    /// The report records written since the last call, or since the run began, in order
+    /// (CBTRN03C-032), so that the job writes them as the run goes rather than holding the
+    /// whole report. Taking them changes nothing else: the records [`Tranrept::finish`] returns
+    /// are then only those not yet taken, and every taken chunk followed by them is the report
+    /// a run that never takes any returns from `finish`.
+    #[must_use]
+    pub fn take_records(&mut self) -> Vec<ReportRecord> {
+        std::mem::take(&mut self.records)
+    }
+
+    /// Ends the run and returns every report record not yet taken by
+    /// [`Tranrept::take_records`], in order (CBTRN03C-032).
     ///
     /// After the last record the end-of-file branch adds the last amount to the page and account
     /// totals a second time, because `TRAN-RECORD` still holds it, then writes the page total,
@@ -1459,6 +1471,40 @@ mod tests {
             Flow::Stop
         );
         assert_eq!(report.finish()?, Vec::<ReportRecord>::new());
+        Ok(())
+    }
+
+    /// Records taken after each pass, then those `finish` returns, are the report of the same
+    /// run finished at once, in the same order: over three card blocks with their totals and
+    /// page break, and over a run the window test leaves.
+    // audit: CBTRN03C-011
+    // audit: CBTRN03C-032
+    #[test]
+    fn records_taken_as_the_run_goes_are_the_report_finished_at_once() -> TestResult {
+        let late = b"2022-07-07-10.15.42.370000";
+        let left = vec![
+            tran(1, CARD_1, Kind::Purchase, 100)?,
+            tran_at(2, CARD_1, Kind::Purchase, 200, late)?,
+            tran(3, CARD_2, Kind::Purchase, 300)?,
+        ];
+        for rows in [three_blocks()?, left] {
+            let mut whole = run()?;
+            let mut streamed = run()?;
+            let mut taken = Vec::new();
+            for row in &rows {
+                let flow = whole.process(row)?;
+                assert_eq!(streamed.process(row)?, flow);
+                taken.extend(streamed.take_records());
+            }
+            assert!(
+                streamed.take_records().is_empty(),
+                "a record was taken twice"
+            );
+            taken.extend(streamed.finish()?);
+            let expected = whole.finish()?;
+            assert!(!expected.is_empty());
+            assert_eq!(taken, expected, "{} rows", rows.len());
+        }
         Ok(())
     }
 

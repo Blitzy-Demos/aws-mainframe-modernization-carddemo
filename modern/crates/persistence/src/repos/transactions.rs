@@ -14,6 +14,7 @@
 //! | `page_before` | COTRN00C `PROCESS-PAGE-BACKWARD`: `STARTBR`, `READPREV` (`COTRN00C.cbl:333-375,591-619,658-687`; COTRN00C-023) | `queries/transactions_page_backward.sql` | `transactions_pkey`, backward |
 //! | `find_all_in_card_order` | CREASTMT `STEP010` `SORT FIELDS=(263,16,CH,A,1,16,CH,A)` (`CREASTMT.JCL:53`; CBSTM03A-001) | `ORDER BY card_num, tran_id` | `transactions_card_num_idx` |
 //! | `find_processed_between` | TRANREPT `INCLUDE COND` on `TRAN-PROC-DT`, then `SORT FIELDS=(TRAN-CARD-NUM,A)` (`TRANREPT.jcl:41-48`, `TRANREPT.prc:39-46`; CBTRN03C-004, CBTRN03C-005) | the `proc_ts` window, `ORDER BY card_num, tran_id` | `transactions_proc_ts_idx` |
+//! | `stream_processed_between` | the same selection, read as CBTRN03C's loop reads the sorted file, one record at a time (`CBTRN03C.cbl:170-206,248-272`; CBTRN03C-003, CBTRN03C-010) | the statement of `find_processed_between` | `transactions_proc_ts_idx` |
 //!
 //! Every method returns domain values: rows pass through codec B
 //! ([`TransactionRow::from_record`] and [`TransactionRow::into_record`]) and no byte is trimmed,
@@ -22,11 +23,18 @@
 //! run it. Every column is `COLLATE "C"`, so key comparisons and orders are byte order, which
 //! is the numeric order of the 16-digit IDs every in-scope writer stores (COTRN02C-043).
 //!
+//! The processing-date window is the one statement two methods share:
+//! `stream_processed_between` yields its rows as [`TransactionRows`], each decoded as it is
+//! read, so the selection is never held whole, and `find_processed_between` collects those
+//! rows into a `Vec`.
+//!
 //! # Redaction (Cardholder Data Redaction)
 //!
 //! The card number reaches its bind parameter only inside the [`TransactionRow`] that
 //! `from_record` built through `CardNumber::expose`. No record or row is formatted into an
 //! error, and a failed allocation names the column alone, never the stored value.
+
+use std::task::{Context, Poll};
 
 use chrono::NaiveDate;
 use copybook::{PicU, PicX};
@@ -44,6 +52,77 @@ const TRAN_ID: &str = "tran_id";
 /// The digits of `WS-TRAN-ID-N PIC 9(16)` (`COTRN02C.cbl:57`) and `WS-TRAN-ID-NUM PIC 9(16)`
 /// (`COBIL00C.cbl:57`), which the allocation moves back into `TRAN-ID`.
 const ID_DIGITS: usize = 16;
+
+/// What one poll of a selection gives: the next record or the failure to read it, `None`
+/// once no row is left.
+type PolledRecord = Poll<Option<Result<TransactionRecord, PersistenceError>>>;
+
+/// How [`TransactionRows`] reads its next record: polled until it answers.
+type PollRecord<'a> = Box<dyn FnMut(&mut Context<'_>) -> PolledRecord + Send + 'a>;
+
+/// The rows of a selection, read one at a time and in the selection's order: what
+/// [`TransactionRepository::stream_processed_between`] returns.
+///
+/// - On [`PgStore`] and [`PgTx`] the statement runs at the first [`next`](Self::next), and each
+///   row is decoded through codec B ([`TransactionRow::into_record`]) as `next` reads it, so no
+///   more than the row being read is held, whatever the selection holds.
+/// - The rows borrow the executor they are read through, and hold its connection (a pooled
+///   one for [`PgStore`]) until they end, fail or are dropped. Dropping them stops the read;
+///   no later row is decoded.
+/// - Implementations that already hold their records, such as test doubles, build the rows
+///   with [`from_records`](Self::from_records) or [`from_results`](Self::from_results).
+pub struct TransactionRows<'a> {
+    /// The read of the next record; `None` once the rows have ended or failed.
+    poll: Option<PollRecord<'a>>,
+}
+
+impl<'a> TransactionRows<'a> {
+    /// Rows that yield `records`, in their order: the rows of an implementation that holds
+    /// them, such as the default
+    /// [`stream_processed_between`](TransactionRepository::stream_processed_between).
+    #[must_use]
+    pub fn from_records(records: Vec<TransactionRecord>) -> Self {
+        let mut records = records.into_iter();
+        Self::polled(move |_| Poll::Ready(records.next().map(Ok)))
+    }
+
+    /// Rows that yield `results`, in their order, up to and including the first error: the rows
+    /// of a test double whose read fails part-way, as the fetch of a later row can
+    /// (CBTRN03C-010).
+    #[must_use]
+    pub fn from_results(results: Vec<Result<TransactionRecord, PersistenceError>>) -> Self {
+        let mut results = results.into_iter();
+        Self::polled(move |_| Poll::Ready(results.next()))
+    }
+
+    /// Rows read by `poll`.
+    fn polled(poll: impl FnMut(&mut Context<'_>) -> PolledRecord + Send + 'a) -> Self {
+        Self {
+            poll: Some(Box::new(poll)),
+        }
+    }
+
+    /// The next record, or `None` once every row has been read.
+    ///
+    /// After the end, and after an error, the rows hold nothing, their connection included,
+    /// and every later call returns `Ok(None)`.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistenceError::Decode`] when the row does not fit its pictures;
+    /// [`PersistenceError::Unavailable`] or [`PersistenceError::Database`] when the statement or
+    /// the fetch of the row fails (CBTRN03C-007, CBTRN03C-010).
+    pub async fn next(&mut self) -> Result<Option<TransactionRecord>, PersistenceError> {
+        let Some(poll) = self.poll.as_mut() else {
+            return Ok(None);
+        };
+        let polled = std::future::poll_fn(|cx| poll(cx)).await;
+        if !matches!(polled, Some(Ok(_))) {
+            self.poll = None;
+        }
+        polled.transpose()
+    }
+}
 
 /// Table `transactions`: the transaction master the online programs, `posttran`, `creastmt`
 /// and `tranrept` read and write (AAP 0.5.4).
@@ -224,6 +303,35 @@ pub trait TransactionRepository: Send {
         start: NaiveDate,
         end: NaiveDate,
     ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send;
+
+    /// The transactions [`find_processed_between`](Self::find_processed_between) returns, over
+    /// the same window and in the same order, read one at a time as [`TransactionRows`]: the
+    /// records `CBTRN03C` reads from the sorted file, one `READ` per pass of its loop
+    /// (`CBTRN03C.cbl:170-206,248-272`; CBTRN03C-003, CBTRN03C-010).
+    ///
+    /// - [`PgStore`] and [`PgTx`] run the one statement of `find_processed_between` at the
+    ///   first [`TransactionRows::next`] and decode each row as it is read, so one decoded row
+    ///   at a time is held, whatever the window holds. The rows hold their connection, a
+    ///   pooled one for [`PgStore`], until they end, fail or are dropped.
+    /// - The default body, for implementations that hold their rows, such as test doubles,
+    ///   awaits `find_processed_between` and yields its records.
+    ///
+    /// # Errors
+    ///
+    /// The returned future fails only in the default body, as `find_processed_between` fails.
+    /// On [`PgStore`] and [`PgTx`] the failures of the statement and of each row, those of
+    /// `find_processed_between`, come from [`TransactionRows::next`] (CBTRN03C-007,
+    /// CBTRN03C-010).
+    fn stream_processed_between(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        async move {
+            let records = self.find_processed_between(start, end).await?;
+            Ok(TransactionRows::from_records(records))
+        }
+    }
 }
 
 impl TransactionRepository for PgStore {
@@ -280,6 +388,14 @@ impl TransactionRepository for PgStore {
     ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
         select_processed_between(self.pool(), start, end)
     }
+
+    fn stream_processed_between(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(processed_between_rows(self.pool(), start, end)))
+    }
 }
 
 impl TransactionRepository for PgTx<'_> {
@@ -335,6 +451,14 @@ impl TransactionRepository for PgTx<'_> {
         end: NaiveDate,
     ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
         select_processed_between(self.conn(), start, end)
+    }
+
+    fn stream_processed_between(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(processed_between_rows(self.conn(), start, end)))
     }
 }
 
@@ -502,14 +626,29 @@ async fn select_in_card_order<'e, E: PgExecutor<'e>>(
     into_records(rows)
 }
 
-/// `find_processed_between`: the rows whose processing date lies in `start..=end`, by card
-/// number, then transaction ID.
-async fn select_processed_between<'e, E: PgExecutor<'e>>(
+/// `find_processed_between`: every record [`processed_between_rows`] reads, in its order.
+async fn select_processed_between<'e, E: PgExecutor<'e> + 'e>(
     executor: E,
     start: NaiveDate,
     end: NaiveDate,
 ) -> Result<Vec<TransactionRecord>, PersistenceError> {
-    let rows = sqlx::query_as!(
+    let mut rows = processed_between_rows(executor, start, end);
+    let mut records = Vec::new();
+    while let Some(record) = rows.next().await? {
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// `stream_processed_between`: the rows whose processing date lies in `start..=end`, by card
+/// number, then transaction ID, each decoded through codec B as it is read. The statement runs
+/// at the first [`TransactionRows::next`].
+fn processed_between_rows<'e, E: PgExecutor<'e> + 'e>(
+    executor: E,
+    start: NaiveDate,
+    end: NaiveDate,
+) -> TransactionRows<'e> {
+    let mut rows = sqlx::query_as!(
         TransactionRow,
         r#"SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
                   tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
@@ -520,9 +659,17 @@ async fn select_processed_between<'e, E: PgExecutor<'e>>(
         start,
         end
     )
-    .fetch_all(executor)
-    .await?;
-    into_records(rows)
+    .fetch(executor);
+    // The boxed stream is polled through its trait object, whose methods need no trait import,
+    // so no stream crate is a dependency.
+    TransactionRows::polled(move |cx| {
+        rows.as_mut().poll_next(cx).map(|row| {
+            row.map(|row| {
+                row.map_err(PersistenceError::from)
+                    .and_then(TransactionRow::into_record)
+            })
+        })
+    })
 }
 
 #[cfg(test)]
@@ -533,7 +680,7 @@ mod tests {
     use copybook::{FixedRecord, PicX};
     use domain::records::TransactionRecord;
 
-    use super::TransactionRepository;
+    use super::{TransactionRepository, TransactionRows};
     use crate::PgStore;
     use crate::error::{DecodeKind, PersistenceError};
 
@@ -593,6 +740,20 @@ mod tests {
     /// The calendar day `(year, month, day)`.
     fn day(year: i32, month: u32, day: u32) -> Result<NaiveDate, &'static str> {
         NaiveDate::from_ymd_opt(year, month, day).ok_or("no such day")
+    }
+
+    /// Every record `rows` yields, in order, after checking that the ended rows stay ended.
+    async fn drain(
+        mut rows: TransactionRows<'_>,
+    ) -> Result<Vec<TransactionRecord>, Box<dyn StdError>> {
+        let mut records = Vec::new();
+        while let Some(record) = rows.next().await? {
+            records.push(record);
+        }
+        if rows.next().await?.is_some() {
+            return Err("a row after the end".into());
+        }
+        Ok(records)
     }
 
     // audit: COTRN02C-043
@@ -714,6 +875,101 @@ mod tests {
         assert_eq!(ids(&window), [two, three, five]);
         assert_eq!(ids(&store.find_processed_between(end, end).await?), [five]);
         assert!(store.find_processed_between(end, start).await?.is_empty());
+        // The streamed selection yields the same records, in the same order, for each window.
+        for (from, to) in [(start, end), (end, end), (end, start)] {
+            let found = store.find_processed_between(from, to).await?;
+            let streamed = drain(store.stream_processed_between(from, to).await?).await?;
+            assert_eq!(streamed, found, "{from} to {to}");
+        }
+        Ok(())
+    }
+
+    /// A double that holds the answer of its window read: the default
+    /// `stream_processed_between` yields exactly the records `find_processed_between` returns,
+    /// or fails as it fails. Its other reads are never called.
+    struct Held(Result<Vec<TransactionRecord>, PersistenceError>);
+
+    impl TransactionRepository for Held {
+        fn find_by_id(
+            &mut self,
+            _: &PicX<16>,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn find_last(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn next_id(&mut self) -> impl Future<Output = Result<PicX<16>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn insert(
+            &mut self,
+            _: &TransactionRecord,
+        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn page_after(
+            &mut self,
+            _: &PicX<16>,
+            _: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn page_before(
+            &mut self,
+            _: &PicX<16>,
+            _: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn find_all_in_card_order(
+            &mut self,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn find_processed_between(
+            &mut self,
+            _: NaiveDate,
+            _: NaiveDate,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(self.0.clone())
+        }
+    }
+
+    /// The default stream of a double, and rows built from results, which end at their first
+    /// error and stay ended.
+    #[tokio::test]
+    async fn held_rows_yield_their_records_and_end_at_the_first_error() -> TestResult {
+        let (start, end) = (day(2022, 1, 1)?, day(2022, 7, 6)?);
+        let first = record(b"0000000000000002", CARD_A, b"2022-01-01 00:00:00.000000")?;
+        let second = record(b"0000000000000001", CARD_B, b"2022-03-15                ")?;
+        let held = vec![first.clone(), second.clone()];
+        let mut answering = Held(Ok(held.clone()));
+        let streamed = drain(answering.stream_processed_between(start, end).await?).await?;
+        assert_eq!(streamed, held);
+        let mut failing = Held(Err(PersistenceError::Unavailable));
+        let refused = failing.stream_processed_between(start, end).await;
+        assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
+
+        let mut rows = TransactionRows::from_results(vec![
+            Ok(first.clone()),
+            Err(PersistenceError::Unavailable),
+            Ok(second),
+        ]);
+        assert_eq!(rows.next().await?, Some(first));
+        assert_eq!(rows.next().await, Err(PersistenceError::Unavailable));
+        assert_eq!(rows.next().await?, None);
         Ok(())
     }
 
@@ -806,6 +1062,14 @@ mod tests {
         let may = day(2022, 5, 1)?;
         let window = tx.find_processed_between(may, may).await?;
         assert_eq!(window, [first.clone()]);
+        // The streamed selection sees the same uncommitted row. Rows dropped before their end
+        // stop the read and leave the transaction's connection usable.
+        let streamed = drain(tx.stream_processed_between(may, may).await?).await?;
+        assert_eq!(streamed, window);
+        let mut rows = tx.stream_processed_between(may, may).await?;
+        assert_eq!(rows.next().await?.as_ref(), Some(&first));
+        drop(rows);
+        assert_eq!(tx.next_id().await?, key(b"0000000000000043"));
         tx.commit().await?;
 
         // Without a savepoint the failed insert aborts the transaction: the next statement is

@@ -124,13 +124,15 @@
 //! | [`TranCatBalanceRepository`] | `tran_cat_balances` | `find_by_id(PicU<11>, &PicX<2>, PicU<4>)`; `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |
 //! | [`TransactionCategoryRepository`] | `transaction_categories` | `find_by_id(&PicX<2>, PicU<4>)`; `find_all`; `insert`; `replace_all` → `u64` |
 //! | [`TransactionTypeRepository`] | `transaction_types` | `find_by_id(&PicX<2>)`; `find_all`; `insert`; `replace_all` → `u64` |
-//! | [`TransactionRepository`] | `transactions` | `find_by_id(&PicX<16>)`; `find_last`; `next_id` → `PicX<16>`; `insert`; `page_after(&PicX<16>, limit)`, `page_before(&PicX<16>, limit)`; `find_all_in_card_order`; `find_processed_between(NaiveDate, NaiveDate)` |
+//! | [`TransactionRepository`] | `transactions` | `find_by_id(&PicX<16>)`; `find_last`; `next_id` → `PicX<16>`; `insert`; `page_after(&PicX<16>, limit)`, `page_before(&PicX<16>, limit)`; `find_all_in_card_order`; `find_processed_between(NaiveDate, NaiveDate)`; `stream_processed_between(NaiveDate, NaiveDate)` → [`TransactionRows`] |
 //! | [`UserRepository`] | `users` | `find_by_id(&PicX<8>)`, `lock_by_id(&PicX<8>)` → `UserEntry`; `page_after(&PicX<8>, limit)`, `page_before(&PicX<8>, limit)` → `UserListEntry`; `insert(&UserEntry)`; `update(&UserEntry)` → `bool`; `delete(&PicX<8>)` → `bool`; `replace_all(&[HashedUser])` → `u64` |
 //!
 //! Point reads return `Option` of the record, of [`CardEntry`] for cards. Multi-row reads return
-//! a `Vec`: `find_all_in_card_order` and `find_processed_between` by card number, then
-//! transaction ID; `page_before` from its start downward, in descending key order; `page_after`
-//! and every other `find_all` read in ascending key order.
+//! a `Vec`, except `stream_processed_between`, whose [`TransactionRows`] yields the rows of
+//! `find_processed_between` one at a time, each decoded as it is read: `find_all_in_card_order`,
+//! `find_processed_between` and `stream_processed_between` by card number, then transaction ID;
+//! `page_before` from its start downward, in descending key order; `page_after` and every other
+//! `find_all` read in ascending key order.
 
 pub mod accounts;
 pub mod auth_fraud;
@@ -163,5 +165,5 @@ pub use pending_auth_summaries::PendingAuthSummaryRepository;
 pub use tran_cat_balances::TranCatBalanceRepository;
 pub use transaction_categories::TransactionCategoryRepository;
 pub use transaction_types::TransactionTypeRepository;
-pub use transactions::TransactionRepository;
+pub use transactions::{TransactionRepository, TransactionRows};
 pub use users::UserRepository;

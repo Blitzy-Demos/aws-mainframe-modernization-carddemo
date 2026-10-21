@@ -133,14 +133,14 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
     let xrefs = CardXrefRepository::find_all(&mut store).await?;
     let groups = DisclosureGroupRepository::find_all(&mut store).await?;
     let mut intcalc = Intcalc::new(args.parm_date.clone(), accounts, xrefs, groups);
-    let mut systran = OutputFile::next_generation(&ctx.config.systran_dir(), SYSTRAN_BASE)?;
+    let mut systran = OutputFile::next_generation(&ctx.config.systran_dir(), SYSTRAN_BASE).await?;
     let balances = TranCatBalanceRepository::find_all(&mut store).await?;
     let rewritten =
         post_interest(&mut intcalc, &balances, ctx.clock, &mut store, &mut systran).await?;
     // E08: the summary's unapplied last account and total are discarded, never rewritten;
     // only its counters are reported (CBACT04C-027).
     let summary = intcalc.finish();
-    let path = systran.finish()?;
+    let path = systran.finish().await?;
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
@@ -186,7 +186,7 @@ async fn post_interest<A: AccountRepository>(
                     rewritten += 1;
                 }
                 IntcalcEffect::SystemTransaction(record) => {
-                    systran.write_record(&record.encode())?;
+                    systran.write_record(&record.encode()).await?;
                 }
             }
         }
@@ -503,12 +503,12 @@ mod tests {
         let before = [account(1, 10_000)?, account(2, 20_000)?];
         let mut ledger = Ledger::holding(&before, false);
         let mut run = intcalc()?;
-        let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN")?;
+        let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
         let balances = [balance(1, 120_000)?, balance(2, 240_000)?];
         let rewritten =
             post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran).await?;
         let summary = run.finish();
-        let path = systran.finish()?;
+        let path = systran.finish().await?;
 
         assert_eq!(rewritten, 1);
         assert_eq!(ledger.rewrites, [PicU::new(1)?]);
@@ -631,7 +631,7 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut ledger = Ledger::holding(&accounts, failing);
             let mut run = intcalc()?;
-            let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN")?;
+            let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
             let balances = keys
                 .into_iter()
                 .map(|id| balance(id, 120_000))

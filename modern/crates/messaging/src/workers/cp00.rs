@@ -96,8 +96,12 @@ use runtime::telemetry;
 use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
-use crate::broker::{self, Acknowledger, AmqpError, Consumer, PublishFailure, Request};
+use crate::broker::{self, Acknowledger, AmqpError, Consumer, PublishFailure, QueueCheck, Request};
 use crate::ids;
+
+/// The environment variable of the request queue, which the start-up refusal and a failed
+/// passive declare of the request queue name in place of the configured value.
+pub(super) const REQUEST_QUEUE_VARIABLE: &str = "CARDDEMO_QUEUE_REQUEST_PAUTH";
 
 /// The store the CP00 worker reads and writes through: the cross-reference read, the
 /// authorization transaction and the error log.
@@ -339,27 +343,36 @@ pub struct Worker<S: AuthStore = PgStore, A: Acknowledger = Consumer> {
 }
 
 impl Worker<PgStore, Consumer> {
-    /// Opens the worker's channels on `connection`: the consumer channel, a passive declare of
-    /// the request queue `config.queue_request_pauth` and of `CARD.DEMO.DEADLETTER.PAUTH`, then
-    /// the publisher channel in confirm mode. Reply queues are the requests' `reply_to` and are
-    /// not declared. `store` serves every read, write and log row; `clock` supplies the detail
-    /// keys, the log dates and times and the reply message IDs.
+    /// Opens the worker's channels on `connection`: checks that `config.queue_request_pauth` is
+    /// a queue name AMQP can carry, then opens the consumer channel, checks the request queue and
+    /// `CARD.DEMO.DEADLETTER.PAUTH` with a passive declare, and opens the publisher channel in
+    /// confirm mode. Reply queues are the requests' `reply_to` and are not declared. `store`
+    /// serves every read, write and log row; `clock` supplies the detail keys, the log dates and
+    /// times and the reply message IDs.
     ///
     /// # Errors
     ///
-    /// The [`AmqpError`] of a channel that could not be opened or put in confirm mode, or
-    /// [`AmqpError::Declare`] naming the first of the two queues that does not exist.
+    /// [`AmqpError::QueueName`] naming `CARDDEMO_QUEUE_REQUEST_PAUTH` when the configured request
+    /// queue is longer than the 255-byte AMQP short string or holds a byte outside printable
+    /// ASCII, before any channel is opened; the [`AmqpError`] of a channel that could not be
+    /// opened or put in confirm mode; or [`AmqpError::Declare`] naming the first of the two
+    /// queues that does not exist.
     pub async fn open(
         connection: &Connection,
         config: &Config,
         store: PgStore,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, AmqpError> {
+        super::check_request_queue(
+            REQUEST_QUEUE_VARIABLE,
+            &config.queue_request_pauth,
+            super::AMQP_QUEUE_NAME_LEN,
+        )?;
         let channels = Channels::open(
             connection,
             &[
-                config.queue_request_pauth.as_str(),
-                broker::DEAD_LETTER_QUEUE,
+                QueueCheck::configured(REQUEST_QUEUE_VARIABLE, &config.queue_request_pauth),
+                QueueCheck::literal(broker::DEAD_LETTER_QUEUE),
             ],
         )
         .await?;
