@@ -52,7 +52,6 @@
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use copybook::FixedRecord;
 use persistence::domain::batch::loads::{
@@ -68,6 +67,8 @@ use persistence::{
     TransactionCategoryRepository, TransactionTypeRepository, UserRepository,
 };
 use sqlx::PgPool;
+use tokio::sync::OnceCell;
+use tokio::task;
 
 use crate::HarnessError;
 use crate::postgres::{PostgresGuard, start_postgres};
@@ -78,12 +79,14 @@ const LOAD_CONTEXT: &str = "load fixtures";
 /// The context of every error of the redaction needles.
 const NEEDLE_CONTEXT: &str = "read redaction needles";
 
-/// The `USRSEC` records with their argon2id hashes, computed once per test binary.
+/// The `USRSEC` records with their argon2id hashes, computed once per process by a single
+/// initialiser on Tokio's blocking pool.
 ///
 /// argon2id is slow in unoptimised and coverage builds, and every load of `users` needs the ten
 /// hashes. Each hash is salted and verifies its 8 bytes in any database, so one set serves every
-/// load of the process.
-static HASHED_USERS: OnceLock<Vec<HashedUser>> = OnceLock::new();
+/// load of the process. Concurrent first loads wait for the one computation in flight rather
+/// than repeat it, and a failed computation stores nothing, so the next load computes again.
+static HASHED_USERS: OnceCell<Vec<HashedUser>> = OnceCell::const_new();
 
 /// The directory of the ASCII fixtures, `app/data/ASCII` under the repository root, for
 /// example `/src/carddemo/modern/crates/test-support/../../../app/data/ASCII` for a checkout at
@@ -123,11 +126,12 @@ pub fn dusrsecj_path() -> PathBuf {
 /// # Errors
 ///
 /// Returns a [`HarnessError`] when a fixture cannot be read, when codec A refuses a line or a
-/// key does not rise above the previous one, when a password cannot be hashed, when a
-/// transaction cannot be opened, a delete or an insert fails or the commit is refused, or when
-/// a load inserts a number of rows other than its fixture's 50, 50, 50, 50, 51, 50, 18, 7 or
-/// 10, which rolls that load back. Each failure leaves its table as it was and stops the run,
-/// so the tables loaded before it keep their new contents.
+/// key does not rise above the previous one, when a password cannot be hashed or the blocking
+/// task hashing them does not complete, when a transaction cannot be opened, a delete or an
+/// insert fails or the commit is refused, or when a load inserts a number of rows other than its
+/// fixture's 50, 50, 50, 50, 51, 50, 18, 7 or 10, which rolls that load back. Each failure
+/// leaves its table as it was and stops the run, so the tables loaded before it keep their new
+/// contents.
 pub async fn load_fixtures(pool: &PgPool) -> Result<Vec<(String, u64)>, HarnessError> {
     let store = PgStore::new(pool.clone());
     let mut loaded = Vec::with_capacity(LoadJob::ALL.len());
@@ -283,7 +287,7 @@ async fn load(store: &PgStore, job: LoadJob) -> Result<u64, HarnessError> {
             replace(store, job, &decode_job::<TransactionCategoryRecord>(job)?).await
         }
         LoadJob::Trantype => replace(store, job, &decode_job::<TransactionTypeRecord>(job)?).await,
-        LoadJob::Dusrsecj => replace(store, job, hashed_users()?).await,
+        LoadJob::Dusrsecj => replace(store, job, hashed_users().await?).await,
     }
 }
 
@@ -338,19 +342,51 @@ fn decode_users() -> Result<Vec<UserSecurityRecord>, HarnessError> {
     Ok(framed.into_iter().map(|line| line.record).collect())
 }
 
-/// The `USRSEC` records with their argon2id hashes, computed on the first call of the process
-/// and kept in [`HASHED_USERS`] for every later one.
-fn hashed_users() -> Result<&'static [HashedUser], HarnessError> {
-    if let Some(users) = HASHED_USERS.get() {
-        return Ok(users);
-    }
-    let computed = decode_users()?
+/// The `USRSEC` records with their argon2id hashes, kept in [`HASHED_USERS`]: the first call of
+/// the process computes them through [`hash_users`] on Tokio's blocking pool, calls made while
+/// that computation runs wait for it, and every later call reuses the stored set.
+async fn hashed_users() -> Result<&'static [HashedUser], HarnessError> {
+    init_once(&HASHED_USERS, LoadJob::Dusrsecj, hash_users)
+        .await
+        .map(Vec::as_slice)
+}
+
+/// The `USRSEC` records of [`decode_users`] with their argon2id hashes. The ten hashes block for
+/// as long as argon2id takes, so [`hashed_users`] runs this off the async workers.
+fn hash_users() -> Result<Vec<HashedUser>, HarnessError> {
+    decode_users()?
         .into_iter()
         .map(hash_user)
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| decode_error(LoadJob::Dusrsecj, "DUSRSECJ.jcl", &err))?;
-    // A concurrent first call may have stored its own set meanwhile; either set is valid.
-    Ok(HASHED_USERS.get_or_init(|| computed))
+        .map_err(|err| decode_error(LoadJob::Dusrsecj, "DUSRSECJ.jcl", &err))
+}
+
+/// The value of `cell`, which the first caller computes with `compute` for the load `job`.
+///
+/// `compute` blocks, so it runs on Tokio's blocking pool: on a current-thread runtime the
+/// caller's worker is the only thread that drives tasks and timers. Callers arriving while one
+/// computation runs wait for it rather than start their own. An error, or a `compute` that
+/// panics or is cancelled, leaves `cell` empty, so the next call computes again. The error of a
+/// task that did not complete names the job and the outcome only, never the panic message.
+async fn init_once<T: Send + Sync + 'static>(
+    cell: &'static OnceCell<T>,
+    job: LoadJob,
+    compute: fn() -> Result<T, HarnessError>,
+) -> Result<&'static T, HarnessError> {
+    cell.get_or_try_init(|| async move {
+        task::spawn_blocking(compute).await.map_err(|err| {
+            let outcome = if err.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            HarnessError::new(
+                LOAD_CONTEXT,
+                &format_args!("{} blocking task {outcome}", job.subcommand()),
+            )
+        })?
+    })
+    .await
 }
 
 /// The row count the fixture of `job` holds (`modern/audit/fixtures.md`).
@@ -414,6 +450,8 @@ mod tests {
     use std::error::Error;
     use std::path::Path;
     use std::ptr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread::{self, ThreadId};
 
     use copybook::lines;
     use persistence::domain::batch::loads::{LoadJob, usrsec_instream_lines};
@@ -422,12 +460,15 @@ mod tests {
         AccountRecord, CardRecord, CardXrefRecord, CustomerRecord, DisclosureGroupRecord,
         TranCatBalanceRecord, TransactionCategoryRecord, TransactionTypeRecord,
     };
+    use tokio::sync::OnceCell;
 
     use super::{
-        dashed_ssn, decode_job, decode_users, dusrsecj_path, expected_rows, fixture_card_numbers,
-        fixture_dir, fixture_path, fixture_ssn_forms, fixture_ssns, fixture_user_passwords,
-        hashed_users, load_fixtures, read, start_loaded_postgres,
+        LOAD_CONTEXT, dashed_ssn, decode_job, decode_users, dusrsecj_path, expected_rows,
+        fixture_card_numbers, fixture_dir, fixture_path, fixture_ssn_forms, fixture_ssns,
+        fixture_user_passwords, hashed_users, init_once, load_fixtures, read,
+        start_loaded_postgres,
     };
+    use crate::HarnessError;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -610,10 +651,10 @@ mod tests {
 
     /// The users are hashed once per process, and every stored hash verifies its record's
     /// password.
-    #[test]
-    fn hashed_users_are_computed_once_and_verify() -> TestResult {
-        let first = hashed_users()?;
-        let again = hashed_users()?;
+    #[tokio::test]
+    async fn hashed_users_are_computed_once_and_verify() -> TestResult {
+        let first = hashed_users().await?;
+        let again = hashed_users().await?;
         assert!(ptr::eq(first, again));
         assert_eq!(first.len(), 10);
         for user in first {
@@ -623,6 +664,57 @@ mod tests {
                 &user.password_hash
             )?);
         }
+        Ok(())
+    }
+
+    /// A failed or panicking computation leaves the cell empty and the next call computes
+    /// again; concurrent first callers then share one computation, which runs on the blocking
+    /// pool rather than on the thread of this current-thread runtime.
+    #[tokio::test]
+    async fn init_once_computes_once_off_the_caller_thread() -> TestResult {
+        /// A computation for [`init_once`], counted in `CALLS`.
+        type Compute = fn() -> Result<ThreadId, HarnessError>;
+        static CELL: OnceCell<ThreadId> = OnceCell::const_new();
+        static CALLS: AtomicUsize = AtomicUsize::new(0);
+
+        let refuses: Compute = || {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(HarnessError::new(LOAD_CONTEXT, &"refused"))
+        };
+        let panics: Compute = || {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            panic!("deliberate panic of the init_once test");
+        };
+        let computes: Compute = || {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(thread::current().id())
+        };
+
+        for (compute, expected) in [
+            (refuses, "load fixtures: refused"),
+            (panics, "load fixtures: dusrsecj blocking task panicked"),
+        ] {
+            let failed = init_once(&CELL, LoadJob::Dusrsecj, compute).await.copied();
+            assert_eq!(
+                failed.map_err(|err| err.to_string()),
+                Err(expected.to_owned())
+            );
+            assert!(CELL.get().is_none(), "{expected}");
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+
+        let (first, second, third, fourth) = tokio::join!(
+            init_once(&CELL, LoadJob::Dusrsecj, computes),
+            init_once(&CELL, LoadJob::Dusrsecj, computes),
+            init_once(&CELL, LoadJob::Dusrsecj, computes),
+            init_once(&CELL, LoadJob::Dusrsecj, computes),
+        );
+        let first = first?;
+        for other in [second?, third?, fourth?] {
+            assert!(ptr::eq(first, other));
+        }
+        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+        assert_ne!(*first, thread::current().id());
         Ok(())
     }
 
