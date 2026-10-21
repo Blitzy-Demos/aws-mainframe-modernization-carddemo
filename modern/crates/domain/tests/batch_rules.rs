@@ -3075,46 +3075,70 @@ mod mnttrdb2 {
         format!("{text:<80}")
     }
 
-    /// The `PROCESSING` line of a record (COBTUPDT-006).
-    fn processing(body: &[u8; INPUT_RECORD_LEN]) -> String {
-        format!("PROCESSING   {}", String::from_utf8_lossy(body))
+    /// The 50 `*` the rows write in place of the description (COBTUPDT-006; X-MNTTRDB2-10).
+    const MASK: &str = "**************************************************";
+
+    /// The `PROCESSING` line of a record as the rows write it: the literal, the action byte and
+    /// the two code bytes of `head`, then [`MASK`] (COBTUPDT-006).
+    fn processing(head: &str) -> String {
+        format!("PROCESSING   {head}{MASK}")
     }
 
     /// The job log of COBTUPDT-111 after `OPEN FILE OK`; `None` marks a line whose columns
     /// 50-54 hold the `HALTED(H3)` SQLCODE.
-    fn expected_log(bodies: &[[u8; INPUT_RECORD_LEN]]) -> Outcome<Vec<Option<String>>> {
+    fn expected_log() -> Outcome<Vec<Option<String>>> {
         let line = |text: &str| Some(text.to_owned());
-        let body = |index: usize| bodies.get(index).ok_or("ten records");
+        let shown = |index: usize| -> Outcome<Option<String>> {
+            let (head, _) = RECORDS.get(index).ok_or("ten records")?;
+            Ok(Some(processing(head)))
+        };
         Ok(vec![
-            Some(processing(body(0)?)),
+            shown(0)?,
             line("IGNORING COMMENTED LINE"),
-            Some(processing(body(1)?)),
+            shown(1)?,
             line("ADDING RECORD"),
             line("RECORD INSERTED SUCCESSFULLY"),
-            Some(processing(body(2)?)),
+            shown(2)?,
             line("UPDATING RECORD"),
             line("RECORD UPDATED SUCCESSFULLY"),
-            Some(processing(body(3)?)),
+            shown(3)?,
             line("UPDATING RECORD"),
             Some(message("No records found.")),
-            Some(processing(body(4)?)),
+            shown(4)?,
             line("DELETING RECORD"),
             line("RECORD DELETED SUCCESSFULLY"),
-            Some(processing(body(5)?)),
+            shown(5)?,
             line("DELETING RECORD"),
             Some(message("No records found.")),
-            Some(processing(body(6)?)),
+            shown(6)?,
             Some(message("ERROR: TYPE NOT VALID")),
-            Some(processing(body(7)?)),
+            shown(7)?,
             line("UPDATING RECORD"),
             Some(message("No records found.ALID")),
-            Some(processing(body(8)?)),
+            shown(8)?,
             line("ADDING RECORD"),
             None,
-            Some(processing(body(9)?)),
+            shown(9)?,
             line("DELETING RECORD"),
             None,
         ])
+    }
+
+    /// Values Cardholder Data Redaction keeps out of every log, assembled at run time so that no
+    /// source line holds one: a 16-digit card-number shape, an SSN with and without dashes, and
+    /// the password the test submits.
+    fn protected_values() -> [String; 4] {
+        [
+            ["4000", "1234", "5678", "9010"].concat(),
+            ["987", "65", "4321"].join("-"),
+            ["987", "65", "4321"].concat(),
+            ["Tr0ub4", "dor&3"].concat(),
+        ]
+    }
+
+    /// Whether `text` shows any of `values`.
+    fn shows_any(text: &str, values: &[String]) -> bool {
+        values.iter().any(|value| text.contains(value.as_str()))
     }
 
     // audit: COBTUPDT-002
@@ -3206,7 +3230,7 @@ mod mnttrdb2 {
         }
         assert_eq!(log.len(), 29, "COBTUPDT-111: 29 lines");
         assert_eq!(log.first().map(String::as_str), Some("OPEN FILE OK"));
-        let expected = expected_log(&bodies)?;
+        let expected = expected_log()?;
         for (n, (line, wanted)) in (2..).zip(log.iter().skip(1).zip(&expected)) {
             if let Some(wanted) = wanted {
                 assert_eq!(line, wanted, "job-log line {n}");
@@ -3238,6 +3262,62 @@ mod mnttrdb2 {
         };
         assert_eq!(row.tr_type().as_bytes(), b"01");
         assert_eq!(row.tr_description().len(), 50, "all 50 description bytes");
+        Ok(())
+    }
+
+    // audit: COBTUPDT-006
+    // audit: COBTUPDT-010
+    // audit: COBTUPDT-012
+    #[test]
+    fn a_protected_value_in_a_description_reaches_the_binds_but_no_log() -> TestResult {
+        let values = protected_values();
+        let description = values.join(" ");
+        assert!(description.len() == 50, "the values fill INPUT-REC-DESC");
+        // Action and code, and whether the record binds the description to the SQL.
+        let records = [
+            ("A08", true),
+            ("U01", true),
+            ("D02", false),
+            ("*  ", false),
+            ("X01", false),
+        ];
+        for (head, binds) in records {
+            let record = parse_input(&body(head, &description))?;
+            assert!(
+                !shows_any(&format!("{record:?}"), &values),
+                "`{head}`: Debug of the record shows the description"
+            );
+            for outcome in [SqlOutcome::Ok, SqlOutcome::NotFound, SqlOutcome::Failed] {
+                let mut run = Maintenance::new();
+                let (mut shown, action) = run.plan(&record);
+                let first = shown.first().ok_or("a PROCESSING line")?;
+                assert!(
+                    *first == processing(head) && first.len() == 66,
+                    "`{head}`: the PROCESSING line is not the masked form of COBTUPDT-006"
+                );
+                shown.extend(run.complete(&action, outcome));
+                assert!(
+                    !shown.iter().any(|line| shows_any(line, &values)),
+                    "`{head}`, {outcome:?}: a job-log line shows the description"
+                );
+                assert!(
+                    !shows_any(&format!("{action:?}"), &values)
+                        && !shows_any(&format!("{run:?}"), &values),
+                    "`{head}`, {outcome:?}: Debug of the action or the run shows the description"
+                );
+                let row = match &action {
+                    MaintenanceAction::Insert(row) | MaintenanceAction::Update(row) => Some(row),
+                    _ => None,
+                };
+                assert_eq!(row.is_some(), binds, "`{head}`: a host row");
+                if let Some(row) = row {
+                    assert!(
+                        row.tr_description() == description,
+                        "`{head}`: the bound row lost description bytes"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 

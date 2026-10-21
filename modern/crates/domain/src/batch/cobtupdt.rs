@@ -27,6 +27,17 @@
 //! - `9999-ABEND` never abends: it displays the message, sets return code 4 and the run goes on
 //!   with the next record (COBTUPDT-022; X-MNTTRDB2-7).
 //!
+//! Behaviour the module changes on purpose (refinement override):
+//!
+//! - The `PROCESSING` line shows `INPUT-REC-DESC` as 50 `*`, whatever it holds, for every record,
+//!   a comment line and an invalid one included. The description is unvalidated free text from
+//!   the input file, so it can carry a card number, an SSN or a password, and Cardholder Data
+//!   Redaction prevails over byte parity for those 50 bytes only: the literal, the action byte,
+//!   the two code bytes and the line's 66 characters are the COBOL's, and the insert and the
+//!   update still bind all 50 bytes (COBTUPDT-006, COBTUPDT-010, COBTUPDT-012; X-MNTTRDB2-10).
+//!   `Debug` of [`MaintenanceRecord`] and [`MaintenanceAction`] masks the description the same
+//!   way.
+//!
 //! Data version: every action names `db2.transaction_type`, the Db2 data version that migration
 //! 0006 seeds. Nothing here produces or reads a VSAM
 //! [`TransactionTypeRecord`](crate::records::TransactionTypeRecord), so a maintenance change never
@@ -83,6 +94,17 @@ const OPEN_FILE_NOT_OK: &str = "OPEN FILE NOT OK";
 /// three spaces (`COBTUPDT.cbl:105`; COBTUPDT-006).
 const PROCESSING: &str = "PROCESSING   ";
 
+/// The byte the `PROCESSING` line and `Debug` show in each position of `INPUT-REC-DESC`, whatever
+/// the description holds (Cardholder Data Redaction; COBTUPDT-006, X-MNTTRDB2-10).
+const DESC_MASK: u8 = b'*';
+
+/// `INPUT-REC-DESC` as the job log and `Debug` show it: one [`DESC_MASK`] per position.
+const MASKED_DESC: [u8; DESC_LEN] = [DESC_MASK; DESC_LEN];
+
+/// Characters in a `PROCESSING` line: the literal and the 53 positions of `WS-INPUT-REC`, the
+/// width of the COBOL line, which the masked description keeps (COBTUPDT-006).
+const PROCESSING_LINE_LEN: usize = 66;
+
 /// The action lines of `1003-TREAT-RECORD` (`COBTUPDT.cbl:112,115,118,121`; COBTUPDT-007,
 /// COBTUPDT-008).
 const ADDING_RECORD: &str = "ADDING RECORD";
@@ -123,6 +145,11 @@ const _: () = assert!(
     "WS-INPUT-REC is PIC X(1), PIC X(2) and PIC X(50)"
 );
 const _: () = assert!(PROCESSING.len() == 13, "the PROCESSING literal is 13 bytes");
+const _: () = assert!(
+    PROCESSING.len() + 1 + 2 + MASKED_DESC.len() == PROCESSING_LINE_LEN
+        && PROCESSING.len() + INPUT_RECORD_LEN == PROCESSING_LINE_LEN,
+    "the masked PROCESSING line keeps the 66 characters of the COBOL line"
+);
 const _: () = assert!(
     TYPE_NOT_VALID.len() == 21 && NO_RECORDS_FOUND.len() == 17,
     "the two fixed messages are 21 and 17 bytes"
@@ -173,8 +200,12 @@ impl std::error::Error for InputError {
 /// also holds the host-variable pair `:INPUT-REC-NUMBER, :INPUT-REC-DESC` that the insert and the
 /// update bind, built once when the record is decoded, so that [`Maintenance::plan`] cannot fail.
 ///
-/// `Debug` shows the 53 bytes as text, as the `PROCESSING` line displays them; the layout holds no
-/// card number or other protected value (Cardholder Data Redaction).
+/// `INPUT-REC-DESC` is unvalidated free text, a comment's included, so it can hold a card number,
+/// an SSN or a password. `Debug` therefore shows what the `PROCESSING` line shows: the action byte
+/// and the two code bytes as read, then 50 `*` in place of the description (Cardholder Data
+/// Redaction; COBTUPDT-006, X-MNTTRDB2-10). [`raw`](Self::raw), [`description`](Self::description)
+/// and [`encode`](FixedRecord::encode) return the description's bytes for the codec and the SQL
+/// binds, never for a log line.
 #[derive(Clone, PartialEq, Eq)]
 pub struct MaintenanceRecord {
     raw: [u8; INPUT_RECORD_LEN],
@@ -199,23 +230,36 @@ impl MaintenanceRecord {
     }
 
     /// The description, `INPUT-REC-DESC PIC X(50)` (columns 4-53), all 50 bytes with their
-    /// trailing spaces (COBTUPDT-010, COBTUPDT-012).
+    /// trailing spaces, as the insert and the update bind it (COBTUPDT-010, COBTUPDT-012). It may
+    /// hold a protected value, so it is for those binds only, never for a log line (COBTUPDT-006).
     #[must_use]
     pub fn description(&self) -> PicX<DESC_LEN> {
         let [_, _, _, description @ ..] = self.raw;
         PicX::from_array(description)
     }
 
-    /// The 53 record bytes, the line body without its terminator (COBTUPDT-006).
+    /// The 53 record bytes as read, the line body without its terminator (COBTUPDT-002), for the
+    /// codec and its checks. They include the description, so they never form a log line: the
+    /// job log shows the masked form of [`Maintenance::plan`] (COBTUPDT-006; X-MNTTRDB2-10).
     #[must_use]
     pub const fn raw(&self) -> &[u8; INPUT_RECORD_LEN] {
         &self.raw
+    }
+
+    /// The 53 positions of `WS-INPUT-REC` as the job log and `Debug` show them: the action byte
+    /// and the two code bytes as read, then [`MASKED_DESC`] (COBTUPDT-006; X-MNTTRDB2-10).
+    fn masked(&self) -> [u8; INPUT_RECORD_LEN] {
+        group(
+            &PicX::from_array([self.kind_byte()]),
+            &self.code(),
+            &PicX::from_array(MASKED_DESC),
+        )
     }
 }
 
 impl fmt::Debug for MaintenanceRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "MaintenanceRecord(\"{}\")", self.raw.escape_ascii())
+        write!(f, "MaintenanceRecord(\"{}\")", self.masked().escape_ascii())
     }
 }
 
@@ -309,7 +353,11 @@ pub fn decode_input(bytes: &[u8]) -> Result<Vec<MaintenanceRecord>, InputError> 
 /// What `1003-TREAT-RECORD` does with one record (COBTUPDT-007 to COBTUPDT-009).
 ///
 /// The job executes the three statements against `db2.transaction_type` only (COBTUPDT-026).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The row of an insert or an update holds all 50 description bytes for the binds. `Debug` shows
+/// the variant and the code, and a row's description as 50 `*`, never its bytes (Cardholder Data
+/// Redaction; COBTUPDT-006, X-MNTTRDB2-10).
+#[derive(Clone, PartialEq, Eq)]
 pub enum MaintenanceAction {
     /// Action `A`: `INSERT INTO … (TR_TYPE, TR_DESCRIPTION) VALUES (:INPUT-REC-NUMBER,
     /// :INPUT-REC-DESC)`, the row holding the code and all 50 description bytes (COBTUPDT-010,
@@ -326,6 +374,30 @@ pub enum MaintenanceAction {
     /// Any other action byte, lower case included: no SQL; [`Maintenance::plan`] has already
     /// displayed the message and set return code 4 (COBTUPDT-009).
     InvalidType,
+}
+
+impl fmt::Debug for MaintenanceAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Insert(row) => masked_row(f, "Insert", row),
+            Self::Update(row) => masked_row(f, "Update", row),
+            Self::Delete(code) => f.debug_tuple("Delete").field(code).finish(),
+            Self::Ignore => f.write_str("Ignore"),
+            Self::InvalidType => f.write_str("InvalidType"),
+        }
+    }
+}
+
+/// `Debug` of the host row of an insert or an update: its code, and [`MASKED_DESC`] in place of
+/// its description (COBTUPDT-006; X-MNTTRDB2-10).
+fn masked_row(f: &mut fmt::Formatter<'_>, variant: &str, row: &Db2TransactionType) -> fmt::Result {
+    f.debug_struct(variant)
+        .field("tr_type", row.tr_type())
+        .field(
+            "tr_description",
+            &format_args!("\"{}\"", MASKED_DESC.escape_ascii()),
+        )
+        .finish()
 }
 
 /// How the statement of an [`Insert`](MaintenanceAction::Insert),
@@ -395,8 +467,10 @@ impl Maintenance {
     /// The lines `1002-READ-RECORDS` and `1003-TREAT-RECORD` display for `record`, and the
     /// statement to execute next (COBTUPDT-006 to COBTUPDT-009).
     ///
-    /// The first line is `PROCESSING   ` followed by the 53 record bytes, 66 characters
-    /// (COBTUPDT-006). The action byte is compared exactly: `A`, `U` and `D` add `ADDING RECORD`,
+    /// The first line is `PROCESSING   `, the action byte, the two code bytes as read and 50 `*`
+    /// in place of the description, 66 characters, the width of the COBOL line, for every record:
+    /// the description never reaches the job log (Cardholder Data Redaction; COBTUPDT-006,
+    /// X-MNTTRDB2-10). The action byte is compared exactly: `A`, `U` and `D` add `ADDING RECORD`,
     /// `UPDATING RECORD` or `DELETING RECORD` and name their statement; `*` adds
     /// `IGNORING COMMENTED LINE` (COBTUPDT-007, COBTUPDT-008). Any other byte writes
     /// `ERROR: TYPE NOT VALID` over the start of `WS-RETURN-MSG`, adds the 80 bytes of that field
@@ -404,7 +478,10 @@ impl Maintenance {
     /// COBTUPDT-022).
     #[must_use]
     pub fn plan(&mut self, record: &MaintenanceRecord) -> (Vec<String>, MaintenanceAction) {
-        let mut lines = vec![format!("{PROCESSING}{}", text(record.raw()))];
+        let mut processing = String::with_capacity(PROCESSING_LINE_LEN);
+        processing.push_str(PROCESSING);
+        processing.push_str(&text(&record.masked()));
+        let mut lines = vec![processing];
         let action = match record.kind_byte() {
             b'A' => {
                 lines.push(ADDING_RECORD.to_owned());
@@ -543,9 +620,14 @@ mod tests {
         format!("{text:<80}")
     }
 
-    /// The `PROCESSING` line of a record body.
+    /// The 50 `*` that `MNTTRDB2.md` writes in place of the description (COBTUPDT-006).
+    const MASK: &str = "**************************************************";
+
+    /// The `PROCESSING` line of a record body as `MNTTRDB2.md` writes it: the literal, the action
+    /// byte and the two code bytes, then the 50 `*` of [`MASK`] (COBTUPDT-006).
     fn processing(body: &[u8]) -> String {
-        format!("PROCESSING   {}", String::from_utf8_lossy(body))
+        let head = String::from_utf8_lossy(body.get(..3).unwrap_or_default());
+        format!("PROCESSING   {head}{MASK}")
     }
 
     /// The Db2 row an `A` or `U` record binds: the code and all 50 description bytes.
@@ -1001,11 +1083,19 @@ mod tests {
         assert_eq!(record.raw().as_slice(), bytes.as_slice());
         assert_eq!(record.encode(), bytes);
         assert_eq!(MaintenanceRecord::decode(&record.encode())?, record);
-        let (lines, _) = Maintenance::new().plan(&record);
+        let (lines, action) = Maintenance::new().plan(&record);
         assert_eq!(lines.first().map(String::len), Some(66));
         assert_eq!(
+            lines.first().map(String::as_str),
+            Some(format!("PROCESSING   U01{MASK}").as_str())
+        );
+        assert_eq!(
             format!("{record:?}"),
-            format!("MaintenanceRecord(\"{}\")", String::from_utf8_lossy(&bytes))
+            format!("MaintenanceRecord(\"U01{MASK}\")")
+        );
+        assert_eq!(
+            format!("{action:?}"),
+            format!("Update {{ tr_type: PicX(\"01\"), tr_description: \"{MASK}\" }}")
         );
         Ok(())
     }
