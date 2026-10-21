@@ -4,8 +4,11 @@
 //! This binary is the only operator entrypoint for schema changes: the API, worker and batch
 //! binaries never migrate, and the `sqlx` command-line tool only prepares the query cache. A run
 //! against an already migrated database applies nothing and still succeeds. The exit status is
-//! non-zero when the configuration, the connection or a migration fails. Errors are logged by
-//! their `Display` form only, so the connection URL and its password never reach the output.
+//! non-zero when the configuration, the connection or a migration fails. A configuration error
+//! names its variable and never its value. A connection or migration error is logged only as
+//! the value-free summary that `runtime::db` or `runtime::migrate` builds: an error class with at
+//! most migration versions and a SQLSTATE, never the driver's or the server's text. Neither the
+//! connection URL nor any value it carries reaches the output.
 
 use std::process::ExitCode;
 
@@ -36,7 +39,8 @@ async fn main() -> ExitCode {
         let pool = match runtime::db::connect(&config).await {
             Ok(pool) => pool,
             Err(err) => {
-                tracing::error!(error = %err, "database connection failed");
+                let error = runtime::db::ErrorSummary::from(&err);
+                tracing::error!(%error, "database connection failed");
                 return ExitCode::FAILURE;
             }
         };
@@ -49,7 +53,8 @@ async fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(err) => {
-                tracing::error!(error = %err, "migration failed");
+                let error = runtime::migrate::ErrorSummary::from(&err);
+                tracing::error!(%error, "migration failed");
                 ExitCode::FAILURE
             }
         }

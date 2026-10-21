@@ -12,13 +12,16 @@
 //! - [`telemetry`]: JSON tracing to standard output, optional `OpenTelemetry` span export to
 //!   standard output, the redaction-safe span constructors of the HTTP, broker and batch paths,
 //!   and the `carddemo::alert` target of alert events.
-//! - [`db`]: the `PostgreSQL` pool constructor, which returns a `PgPool` and never migrates.
+//! - [`db`]: the `PostgreSQL` pool constructor, which refuses a `DATABASE_URL` query parameter
+//!   that `sqlx` would log with its value, returns a `PgPool` and never migrates, and the
+//!   value-free summary under which a `sqlx` error is logged.
 //! - [`gdg`]: generation file names, the local counterpart of the `(+1)` generations of the
 //!   generation data groups whose bases `DEFGDGB.jcl` defines.
 //! - [`migrate`]: the single schema executor. It embeds `crates/persistence/migrations`, and the
 //!   `apply` function of the `migrate` module is the only path by which the schema reaches a
 //!   database; migration `0006` performs the create-and-seed of `CREADB21.jcl` once per
-//!   database. Only the `carddemo-migrate` binary and the `test-support` harness call it.
+//!   database. Only the `carddemo-migrate` binary and the `test-support` harness call it. It
+//!   also holds the value-free summary under which a migration error is logged.
 //!
 //! # Constraints
 //!

@@ -27,9 +27,17 @@
 //! the previous release's queries still run against the migrated schema. Step 6 of
 //! `scripts/check.sh` scans the migrations directory to enforce it. A schema change is a new
 //! numbered file, never an edit of an applied one.
+//!
+//! The text of a [`MigrateError`] embeds the driver's and the server's text, which can quote a
+//! rejected value or a key value, so callers log a migration error only through
+//! [`ErrorSummary`].
+
+use std::fmt;
 
 use sqlx::PgPool;
 use sqlx::migrate::{MigrateError, Migrator};
+
+use crate::db;
 
 /// Every file of `crates/persistence/migrations`, embedded at build time. The macro resolves the
 /// path against this package's root, `crates/runtime`.
@@ -58,4 +66,136 @@ static MIGRATOR: Migrator = sqlx::migrate!("../persistence/migrations");
 /// - an applied migration missing from the embedded set ([`MigrateError::VersionMissing`]).
 pub async fn apply(pool: &PgPool) -> Result<(), MigrateError> {
     MIGRATOR.run(pool).await
+}
+
+/// A value-free account of a [`MigrateError`], the only form in which a caller logs one.
+///
+/// Its `Display` is a fixed error class, such as `execute_migration` or `version_mismatch`, then
+/// the migration versions the error names and, for a failed execution, the
+/// [`db::ErrorSummary`] of the `sqlx` error behind it, as in
+/// `execute_migration (version 4): database (SQLSTATE 42P07)`. It never keeps the text of the
+/// driver, the server or the migration source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorSummary {
+    /// Stable name of the error variant.
+    class: &'static str,
+    /// The migration the error names.
+    version: Option<i64>,
+    /// The latest applied migration, named by an out-of-order version.
+    latest_applied: Option<i64>,
+    /// The summary of the `sqlx` error behind a failed execution.
+    cause: Option<db::ErrorSummary>,
+}
+
+impl From<&MigrateError> for ErrorSummary {
+    fn from(error: &MigrateError) -> Self {
+        let (class, version, latest_applied, cause) = match error {
+            MigrateError::Execute(cause) => ("execute", None, None, Some(cause)),
+            MigrateError::ExecuteMigration(cause, version) => {
+                ("execute_migration", Some(*version), None, Some(cause))
+            }
+            MigrateError::Source(_) => ("source", None, None, None),
+            MigrateError::VersionMissing(version) => {
+                ("version_missing", Some(*version), None, None)
+            }
+            MigrateError::VersionMismatch(version) => {
+                ("version_mismatch", Some(*version), None, None)
+            }
+            MigrateError::VersionNotPresent(version) => {
+                ("version_not_present", Some(*version), None, None)
+            }
+            MigrateError::VersionTooOld(version, latest) => {
+                ("version_too_old", Some(*version), Some(*latest), None)
+            }
+            MigrateError::VersionTooNew(version, latest) => {
+                ("version_too_new", Some(*version), Some(*latest), None)
+            }
+            MigrateError::ForceNotSupported => ("force_not_supported", None, None, None),
+            MigrateError::Dirty(version) => ("dirty", Some(*version), None, None),
+            // `MigrateError` is non-exhaustive and its remaining variant is deprecated; neither
+            // a later variant nor that one keeps its text.
+            _ => ("other", None, None, None),
+        };
+        Self {
+            class,
+            version,
+            latest_applied,
+            cause: cause.map(db::ErrorSummary::from),
+        }
+    }
+}
+
+impl fmt::Display for ErrorSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.class)?;
+        match (self.version, self.latest_applied) {
+            (Some(version), Some(latest)) => {
+                write!(f, " (version {version}, latest applied {latest})")?;
+            }
+            (Some(version), None) => write!(f, " (version {version})")?,
+            (None, _) => {}
+        }
+        if let Some(cause) = &self.cause {
+            write!(f, ": {cause}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use sqlx::migrate::MigrateError;
+
+    use super::ErrorSummary;
+
+    /// Stand-in for a value that the driver's or the server's text quotes.
+    const SECRET: &str = "s3cr3t-migration-value-8K";
+
+    #[test]
+    fn summaries_keep_the_class_and_versions_and_drop_every_value() {
+        let executed = MigrateError::ExecuteMigration(sqlx::Error::Protocol(SECRET.to_owned()), 4);
+        assert!(executed.to_string().contains(SECRET), "{executed}");
+        let cases = [
+            (executed, "execute_migration (version 4): protocol"),
+            (
+                MigrateError::Execute(sqlx::Error::Io(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    SECRET,
+                ))),
+                "execute: io (connection reset)",
+            ),
+            (MigrateError::Source(SECRET.into()), "source"),
+            (
+                MigrateError::VersionMissing(5),
+                "version_missing (version 5)",
+            ),
+            (
+                MigrateError::VersionMismatch(3),
+                "version_mismatch (version 3)",
+            ),
+            (
+                MigrateError::VersionNotPresent(6),
+                "version_not_present (version 6)",
+            ),
+            (
+                MigrateError::VersionTooOld(2, 6),
+                "version_too_old (version 2, latest applied 6)",
+            ),
+            (
+                MigrateError::VersionTooNew(7, 6),
+                "version_too_new (version 7, latest applied 6)",
+            ),
+            (MigrateError::ForceNotSupported, "force_not_supported"),
+            (MigrateError::Dirty(1), "dirty (version 1)"),
+        ];
+        for (error, expected) in &cases {
+            assert_eq!(
+                ErrorSummary::from(error).to_string(),
+                *expected,
+                "{error:?}"
+            );
+        }
+    }
 }
