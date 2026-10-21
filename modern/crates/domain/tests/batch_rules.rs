@@ -1579,44 +1579,31 @@ mod creastmt {
         HTML_RECORD_LEN, STMT_RECORD_LEN, Statement, StatementError, TransactionTable, sort_key,
         statement, xref_sort_key,
     };
+    use domain::money::Decimal;
     use domain::records::{AccountRecord, CardXrefRecord, CustomerRecord, TransactionRecord};
 
-    use super::{Outcome, Posted, TestResult, fixture, money, padded};
+    use super::{Outcome, Posted, TestResult, audit, fixture, money, padded};
 
     const DASHES: &str =
         "--------------------------------------------------------------------------------";
 
-    /// The 25 `STATEMNT.PS` records of FIXSTMT-001, quoted as the audit gives them.
-    const FIRST_TEXT: [&str; 25] = [
-        "*******************************START OF STATEMENT*******************************",
-        "Aniya Alba Von",
-        "1588 Nienow Cape",
-        "Suite 187",
-        "New OR USA 04257",
-        DASHES,
-        "                                 Basic Details",
-        DASHES,
-        "Account ID         :00000000050",
-        "Current Balance    :000001945.87",
-        "FICO Score         :623",
-        DASHES,
-        "                              TRANSACTION SUMMARY",
-        DASHES,
-        "Tran ID         Tran Details                                         Tran Amount",
-        DASHES,
-        "{T:21} Purchase at Blick-Rippin                         $      183.88",
-        "{T:102} Purchase at Reichel Group                        $       14.00",
-        "{T:142} Purchase at Adams-Watsica                        $      967.44",
-        "{T:184} Return item at DuBuque, Wuckert and Mraz         $       47.88-",
-        "{T:214} Purchase at Williamson Group                     $       94.77",
-        "{T:257} Purchase at Abbott-Gerlach                       $      241.66",
-        DASHES,
-        "Total EXP:                                                        $     1453.87",
-        "********************************END OF STATEMENT********************************",
-    ];
+    /// `ST-LINE0` of FIXSTMT-902: 31 `*`, `START OF STATEMENT`, 31 `*`.
+    const ST_LINE0: &str =
+        "*******************************START OF STATEMENT*******************************";
 
-    /// Indexes into [`FIRST_TEXT`] of the six `ST-LINE14` records.
-    const FIRST_TRANSACTIONS: core::ops::Range<usize> = 16..22;
+    /// `ST-LINE6` of FIXSTMT-902: 33 spaces, `Basic Details`, trailing spaces omitted.
+    const ST_LINE6: &str = "                                 Basic Details";
+
+    /// `ST-LINE11` of FIXSTMT-902: 30 spaces, `TRANSACTION SUMMARY`, trailing spaces omitted.
+    const ST_LINE11: &str = "                              TRANSACTION SUMMARY";
+
+    /// `ST-LINE13` of FIXSTMT-902: `Tran ID         Tran Details`, 41 spaces, `Tran Amount`.
+    const ST_LINE13: &str =
+        "Tran ID         Tran Details                                         Tran Amount";
+
+    /// `ST-LINE15` of FIXSTMT-902: 32 `*`, `END OF STATEMENT`, 32 `*`.
+    const ST_LINE15: &str =
+        "********************************END OF STATEMENT********************************";
 
     const LTRS: &str = "<tr>";
     const LTRE: &str = "</tr>";
@@ -1626,8 +1613,8 @@ mod creastmt {
     const L30_42: &str =
         r#"<td colspan="3" style="padding:0px 5px;background-color:#33FFD1; text-align:center;">"#;
 
-    /// The 22 records of 5100-WRITE-HTML-HEADER for statement 1 (FIXSTMT-001, FIXSTMT-903).
-    const FIRST_HTML_HEADER: [&str; 22] = [
+    /// The 10 records of 5100-WRITE-HTML-HEADER before `HTML-L11` (FIXSTMT-903).
+    const HTML_HEADER_OPEN: [&str; 10] = [
         "<!DOCTYPE html>",
         r#"<html lang="en">"#,
         "<head>",
@@ -1638,7 +1625,10 @@ mod creastmt {
         r#"<table  align="center" frame="box" style="width:70%; font:12px Segoe UI,sans-serif;">"#,
         LTRS,
         L10,
-        "<h3>Statement for Account Number: 00000000050         </h3>",
+    ];
+
+    /// The 11 records of 5100-WRITE-HTML-HEADER after `HTML-L11` (FIXSTMT-903).
+    const HTML_HEADER_CLOSE: [&str; 11] = [
         LTDE,
         LTRE,
         LTRS,
@@ -1652,12 +1642,9 @@ mod creastmt {
         L22_35,
     ];
 
-    /// The 34 records of 5200-WRITE-HTML-NMADBS for statement 1 (FIXSTMT-001, FIXSTMT-903).
-    const FIRST_HTML_DETAILS: [&str; 34] = [
-        r#"<p style="font-size:16px">Aniya Alba Von  </p>"#,
-        "<p>1588 Nienow Cape  </p>",
-        "<p>Suite 187  </p>",
-        "<p>New OR USA 04257  </p>",
+    /// The 9 records of 5200-WRITE-HTML-NMADBS between the address records and the three
+    /// basic-detail records (FIXSTMT-903).
+    const HTML_BASIC_OPEN: [&str; 9] = [
         LTDE,
         LTRE,
         LTRS,
@@ -1667,9 +1654,11 @@ mod creastmt {
         LTRE,
         LTRS,
         L22_35,
-        "<p>Account ID         : 00000000050         </p>",
-        "<p>Current Balance    : 000001945.87 </p>",
-        "<p>FICO Score         : 623                 </p>",
+    ];
+
+    /// The 18 records that close 5200-WRITE-HTML-NMADBS after the basic-detail records
+    /// (FIXSTMT-903).
+    const HTML_DETAILS_CLOSE: [&str; 18] = [
         LTDE,
         LTRE,
         LTRS,
@@ -1756,33 +1745,310 @@ mod creastmt {
             .collect()
     }
 
-    /// The `HTML` records of statement 1, from FIXSTMT-001 and FIXSTMT-903: each transaction's
-    /// three cells take the fields of its quoted `ST-LINE14`.
-    fn first_html(posted: &Posted) -> Outcome<Vec<[u8; HTML_RECORD_LEN]>> {
-        let mut records: Vec<Vec<u8>> = FIRST_HTML_HEADER
-            .iter()
-            .chain(&FIRST_HTML_DETAILS)
-            .map(|quote| quote.as_bytes().to_vec())
-            .collect();
-        for quote in FIRST_TEXT.get(FIRST_TRANSACTIONS).ok_or("six ST-LINE14")? {
-            let line = padded::<STMT_RECORD_LEN>(&posted.expand(quote)?);
-            let cell = |range: core::ops::Range<usize>| -> Outcome<Vec<u8>> {
-                let field = line.get(range).ok_or("an ST-LINE14 field")?;
-                Ok([b"<p>".as_slice(), field, b"</p>"].concat())
-            };
-            records.extend([LTRS.into(), L58.into()]);
-            records.push(cell(0..16)?);
-            records.extend([LTDE.into(), L61.into()]);
-            records.push(cell(17..66)?);
-            records.extend([LTDE.into(), L64.into()]);
-            records.push(cell(67..80)?);
-            records.extend([LTDE.into(), LTRE.into()]);
+    /// The positions a row gives one statement in an output file, `records A-B (C)`: the
+    /// 1-based first and last record and their count.
+    struct Span {
+        /// A: the position of the statement's first record.
+        first: usize,
+        /// B: the position of its last record.
+        last: usize,
+        /// C: the number of its records.
+        count: usize,
+    }
+
+    impl Span {
+        /// Moves `rest` past `label` and the `A-B (C): ` that follows it.
+        fn parse(rest: &mut &str, label: &str) -> Outcome<Self> {
+            let (range, count) = between(rest, label, "): ")?
+                .split_once(" (")
+                .ok_or("records A-B (C)")?;
+            let (first, last) = range.split_once('-').ok_or("records A-B")?;
+            Ok(Self {
+                first: first.parse()?,
+                last: last.parse()?,
+                count: count.parse()?,
+            })
         }
-        records.extend(HTML_TRAILER.iter().map(|quote| quote.as_bytes().to_vec()));
-        Ok(records
-            .iter()
-            .map(|record| padded::<HTML_RECORD_LEN>(record))
-            .collect())
+    }
+
+    /// The text after the last quote of every statement row's Expected result.
+    const ROW_END: &str =
+        "; basic-detail and transaction records from the values above by FIXSTMT-903";
+
+    /// One of the rows FIXSTMT-001 to FIXSTMT-050: what its Input condition states, and the
+    /// quotes its Expected result gives, trailing spaces omitted and `{T:n}` unexpanded.
+    struct StatementRow {
+        /// The nnn of the rule ID: the statement's position in the run.
+        number: usize,
+        /// The `cardxref.txt` line of the statement's card.
+        xref_line: usize,
+        /// The `custdata.txt` line of its customer.
+        customer_line: usize,
+        /// Its account ID.
+        account: u64,
+        /// The number of the card's posted transactions the Input condition states.
+        posted_count: usize,
+        /// The card's total the Input condition states.
+        total: Decimal,
+        /// `STATEMNT.PS records A-B (C)`.
+        text: Span,
+        /// `ST-LINE1` to `ST-LINE4`: the name and the three address lines.
+        heading: [String; 4],
+        /// `ST-LINE7` to `ST-LINE9`: account ID, current balance and FICO score.
+        details: [String; 3],
+        /// The k of `ST-LINE14 × k`.
+        listed: usize,
+        /// One `ST-LINE14` per transaction, in `tran_id` order.
+        tran_lines: Vec<String>,
+        /// `ST-LINE14A`, the card's total.
+        total_line: String,
+        /// `STATEMNT.HTML records D-E (F)`.
+        html: Span,
+        /// `HTML-L11`, the account-number heading.
+        html_title: String,
+        /// The name record and the three address records.
+        html_heading: [String; 4],
+    }
+
+    /// Moves `rest` past the first `open` and the text up to the next `close`, and returns
+    /// that text. Each label is matched whole and labels of quotes end in their opening
+    /// backtick, so the label of `ST-LINE1` never matches `ST-LINE14` or `ST-LINE14A`.
+    fn between<'a>(rest: &mut &'a str, open: &str, close: &str) -> Outcome<&'a str> {
+        let (_, tail) = rest
+            .split_once(open)
+            .ok_or_else(|| format!("`{open}` in the row"))?;
+        let (text, after) = tail
+            .split_once(close)
+            .ok_or_else(|| format!("`{close}` after `{open}`"))?;
+        *rest = after;
+        Ok(text)
+    }
+
+    /// Moves `rest` past `label`, which ends in the opening backtick, and its quote, and
+    /// returns the quote as an owned string.
+    fn quote(rest: &mut &str, label: &str) -> Outcome<String> {
+        Ok(between(rest, label, "`")?.to_owned())
+    }
+
+    impl StatementRow {
+        /// Parses row `number` from its Input condition and Expected result cells.
+        fn parse(number: usize, input: &str, expected: &str) -> Outcome<Self> {
+            let mut rest = input;
+            let stated: usize = between(&mut rest, "POSTED; statement ", " of 50: ")?.parse()?;
+            if stated != number {
+                return Err(format!("FIXSTMT-{number:03} states statement {stated}").into());
+            }
+            let xref_line = between(&mut rest, "`cardxref.txt:", "`")?.parse()?;
+            let customer_line = between(&mut rest, "customer `custdata.txt:", "`")?.parse()?;
+            let account = between(&mut rest, ", account ", " with POSTED bal ")?.parse()?;
+            let posted_count = between(&mut rest, "; ", " posted transaction")?.parse()?;
+            let (_, total) = rest.split_once("; total ").ok_or("a stated total")?;
+            let total = Decimal::from_str_exact(total.split(';').next().ok_or("a total")?)?;
+
+            let mut rest = expected;
+            let text = Span::parse(&mut rest, "STATEMNT.PS records ")?;
+            let heading = [
+                quote(&mut rest, "ST-LINE1 `")?,
+                quote(&mut rest, "; ST-LINE2 `")?,
+                quote(&mut rest, "; ST-LINE3 `")?,
+                quote(&mut rest, "; ST-LINE4 `")?,
+            ];
+            let details = [
+                quote(&mut rest, "; ST-LINE7 `")?,
+                quote(&mut rest, "; ST-LINE8 `")?,
+                quote(&mut rest, "; ST-LINE9 `")?,
+            ];
+            let listed = between(&mut rest, "; ST-LINE14 × ", ": ")?.parse()?;
+            let (list, tail) = rest
+                .split_once("; ST-LINE14A `")
+                .ok_or("an ST-LINE14A quote")?;
+            let tran_lines = list
+                .strip_prefix('`')
+                .and_then(|list| list.strip_suffix('`'))
+                .ok_or("backtick-quoted ST-LINE14 records")?
+                .split("`; `")
+                .map(str::to_owned)
+                .collect();
+            let (total_line, tail) = tail.split_once('`').ok_or("a closed ST-LINE14A quote")?;
+            rest = tail;
+            let html = Span::parse(&mut rest, ". STATEMNT.HTML records ")?;
+            let html_title = quote(&mut rest, "HTML-L11 `")?;
+            let html_heading = [
+                quote(&mut rest, "; name `")?,
+                quote(&mut rest, "; addresses `")?,
+                quote(&mut rest, ", `")?,
+                quote(&mut rest, ", `")?,
+            ];
+            if rest != ROW_END {
+                return Err(format!("FIXSTMT-{number:03}: unparsed text after the quotes").into());
+            }
+            Ok(Self {
+                number,
+                xref_line,
+                customer_line,
+                account,
+                posted_count,
+                total,
+                text,
+                heading,
+                details,
+                listed,
+                tran_lines,
+                total_line: total_line.to_owned(),
+                html,
+                html_title,
+                html_heading,
+            })
+        }
+
+        /// Asserts the row's Input condition against the fixtures and the run: statement n is
+        /// the cross-reference of `cardxref.txt:n`, the row's account is that cross-reference's,
+        /// its `custdata.txt` line holds that cross-reference's customer, the card has as many
+        /// posted transactions as the row states and quotes, and the stated total is the amount
+        /// its `ST-LINE14A` quote edits.
+        fn check_inputs(
+            &self,
+            xref: &CardXrefRecord,
+            fixtures: (&[CardXrefRecord], &[CustomerRecord]),
+            transactions: &[&TransactionRecord],
+        ) -> TestResult {
+            let (xrefs, customers) = fixtures;
+            let n = self.number;
+            assert_eq!(self.xref_line, n, "FIXSTMT-{n:03}: cardxref.txt line");
+            let file_xref = n
+                .checked_sub(1)
+                .and_then(|index| xrefs.get(index))
+                .ok_or("the row's cardxref.txt line")?;
+            assert!(
+                file_xref == xref,
+                "FIXSTMT-{n:03}: the statement's cross-reference is cardxref.txt:{n}"
+            );
+            assert_eq!(self.account, xref.acct_id.get(), "FIXSTMT-{n:03}: account");
+            let customer = self
+                .customer_line
+                .checked_sub(1)
+                .and_then(|index| customers.get(index))
+                .ok_or("the row's custdata.txt line")?;
+            assert_eq!(
+                customer.id.get(),
+                xref.cust_id.get(),
+                "FIXSTMT-{n:03}: customer"
+            );
+            let of_card = transactions
+                .iter()
+                .filter(|transaction| transaction.card_num == xref.card_num)
+                .count();
+            let quoted = self.tran_lines.len();
+            assert_eq!(
+                [self.listed, self.posted_count, of_card],
+                [quoted; 3],
+                "FIXSTMT-{n:03}: ST-LINE14 × k, the stated and the posted transactions"
+            );
+            let edited = self
+                .total_line
+                .rsplit_once('$')
+                .map(|(_, amount)| amount.trim())
+                .ok_or("an ST-LINE14A amount")?;
+            let amount = match edited.strip_suffix('-') {
+                Some(magnitude) => -Decimal::from_str_exact(magnitude)?,
+                None => Decimal::from_str_exact(edited)?,
+            };
+            assert_eq!(amount, self.total, "FIXSTMT-{n:03}: ST-LINE14A total");
+            Ok(())
+        }
+
+        /// The row's `STATEMNT.PS` records, in the FIXSTMT-902 order: the fixed lines, the
+        /// row's variable lines, and one `ST-LINE14` per transaction.
+        fn text_records(&self, posted: &Posted) -> Outcome<Vec<[u8; STMT_RECORD_LEN]>> {
+            [ST_LINE0]
+                .into_iter()
+                .chain(self.heading.iter().map(String::as_str))
+                .chain([DASHES, ST_LINE6, DASHES])
+                .chain(self.details.iter().map(String::as_str))
+                .chain([DASHES, ST_LINE11, DASHES, ST_LINE13, DASHES])
+                .chain(self.tran_lines.iter().map(String::as_str))
+                .chain([DASHES, self.total_line.as_str(), ST_LINE15])
+                .map(|quote| fitted::<STMT_RECORD_LEN>(&posted.expand(quote)?))
+                .collect()
+        }
+
+        /// The row's `STATEMNT.HTML` records by FIXSTMT-903. The basic-detail records take
+        /// `ST-ACCT-ID`, `ST-CURR-BAL` and `ST-FICO-SCORE`, bytes 20 to 40, 20 to 33 and 20 to
+        /// 40 of the padded `ST-LINE7` to `ST-LINE9` (`CBSTM03A.CBL:107-118`); each
+        /// transaction's three cells take bytes 0 to 16, 17 to 66 and 67 to 80 of its padded
+        /// `ST-LINE14`.
+        fn html_records(&self, posted: &Posted) -> Outcome<Vec<[u8; HTML_RECORD_LEN]>> {
+            let line = |quote: &str| fitted::<STMT_RECORD_LEN>(&posted.expand(quote)?);
+            let [account, balance, score] = &self.details;
+            let basic = [
+                paragraph(b"<p>Account ID         : ", &line(account)?, 20..40)?,
+                paragraph(b"<p>Current Balance    : ", &line(balance)?, 20..33)?,
+                paragraph(b"<p>FICO Score         : ", &line(score)?, 20..40)?,
+            ];
+            let mut records: Vec<Vec<u8>> = HTML_HEADER_OPEN
+                .into_iter()
+                .chain([self.html_title.as_str()])
+                .chain(HTML_HEADER_CLOSE)
+                .chain(self.html_heading.iter().map(String::as_str))
+                .chain(HTML_BASIC_OPEN)
+                .map(|quote| quote.as_bytes().to_vec())
+                .collect();
+            records.extend(basic);
+            records.extend(HTML_DETAILS_CLOSE.map(|quote| quote.as_bytes().to_vec()));
+            for quote in &self.tran_lines {
+                let tran_line = line(quote)?;
+                records.extend([LTRS.into(), L58.into()]);
+                records.push(paragraph(b"<p>", &tran_line, 0..16)?);
+                records.extend([LTDE.into(), L61.into()]);
+                records.push(paragraph(b"<p>", &tran_line, 17..66)?);
+                records.extend([LTDE.into(), L64.into()]);
+                records.push(paragraph(b"<p>", &tran_line, 67..80)?);
+                records.extend([LTDE.into(), LTRE.into()]);
+            }
+            records.extend(HTML_TRAILER.iter().map(|quote| quote.as_bytes().to_vec()));
+            records
+                .iter()
+                .map(|record| fitted::<HTML_RECORD_LEN>(record))
+                .collect()
+        }
+    }
+
+    /// `bytes` as one `N`-byte record padded with spaces; bytes beyond the record are an
+    /// error, never cut off.
+    fn fitted<const N: usize>(bytes: &[u8]) -> Outcome<[u8; N]> {
+        if bytes.len() > N {
+            return Err(format!("{} bytes for a {N}-byte record", bytes.len()).into());
+        }
+        Ok(padded::<N>(bytes))
+    }
+
+    /// `open`, bytes `range` of the 80-byte `line`, then `</p>`: one HTML field record.
+    fn paragraph(open: &[u8], line: &[u8], range: core::ops::Range<usize>) -> Outcome<Vec<u8>> {
+        let field = line.get(range).ok_or("a field inside its line")?;
+        Ok([open, field, b"</p>"].concat())
+    }
+
+    /// The rows FIXSTMT-001 to FIXSTMT-050 of `fixtures.md`, in file order; the corpus rows
+    /// from FIXSTMT-901 on are skipped.
+    fn statement_rows() -> Outcome<Vec<StatementRow>> {
+        let text = audit("fixtures.md")?;
+        let mut rows = Vec::new();
+        for row in text.lines() {
+            let Some(rest) = row.strip_prefix("| FIXSTMT-") else {
+                continue;
+            };
+            let number: usize = rest.get(..3).ok_or("a three-digit row number")?.parse()?;
+            if number >= 901 {
+                continue;
+            }
+            // Header: Rule ID | Program | Paragraph | Copybook field or PIC | Input condition |
+            // Expected result | Source lines | Fixture record.
+            let mut cells = row.split(" | ");
+            let input = cells.nth(4).ok_or("an Input condition cell")?;
+            let expected = cells.next().ok_or("an Expected result cell")?;
+            rows.push(StatementRow::parse(number, input, expected)?);
+        }
+        Ok(rows)
     }
 
     // audit: CBSTM03A-031
@@ -1910,6 +2176,55 @@ mod creastmt {
     }
 
     // audit: FIXSTMT-001
+    // audit: FIXSTMT-002
+    // audit: FIXSTMT-003
+    // audit: FIXSTMT-004
+    // audit: FIXSTMT-005
+    // audit: FIXSTMT-006
+    // audit: FIXSTMT-007
+    // audit: FIXSTMT-008
+    // audit: FIXSTMT-009
+    // audit: FIXSTMT-010
+    // audit: FIXSTMT-011
+    // audit: FIXSTMT-012
+    // audit: FIXSTMT-013
+    // audit: FIXSTMT-014
+    // audit: FIXSTMT-015
+    // audit: FIXSTMT-016
+    // audit: FIXSTMT-017
+    // audit: FIXSTMT-018
+    // audit: FIXSTMT-019
+    // audit: FIXSTMT-020
+    // audit: FIXSTMT-021
+    // audit: FIXSTMT-022
+    // audit: FIXSTMT-023
+    // audit: FIXSTMT-024
+    // audit: FIXSTMT-025
+    // audit: FIXSTMT-026
+    // audit: FIXSTMT-027
+    // audit: FIXSTMT-028
+    // audit: FIXSTMT-029
+    // audit: FIXSTMT-030
+    // audit: FIXSTMT-031
+    // audit: FIXSTMT-032
+    // audit: FIXSTMT-033
+    // audit: FIXSTMT-034
+    // audit: FIXSTMT-035
+    // audit: FIXSTMT-036
+    // audit: FIXSTMT-037
+    // audit: FIXSTMT-038
+    // audit: FIXSTMT-039
+    // audit: FIXSTMT-040
+    // audit: FIXSTMT-041
+    // audit: FIXSTMT-042
+    // audit: FIXSTMT-043
+    // audit: FIXSTMT-044
+    // audit: FIXSTMT-045
+    // audit: FIXSTMT-046
+    // audit: FIXSTMT-047
+    // audit: FIXSTMT-048
+    // audit: FIXSTMT-049
+    // audit: FIXSTMT-050
     // audit: FIXSTMT-902
     // audit: CBSTM03A-014
     // audit: CBSTM03A-015
@@ -1929,19 +2244,108 @@ mod creastmt {
     // audit: CBSTM03A-029
     // audit: CBSTM03A-030
     #[test]
-    fn the_first_statement_has_its_audited_text_records() -> TestResult {
+    fn every_statement_has_its_audited_text_records() -> TestResult {
         let posted = Posted::run()?;
         let statements = posted_statements(&posted)?;
-        let (_, first) = statements.first().ok_or("a first statement")?;
-        assert_eq!(first.text_lines.len(), FIRST_TEXT.len());
-        for (n, (actual, quote)) in (1..).zip(first.text_lines.iter().zip(FIRST_TEXT)) {
-            let expected = padded::<STMT_RECORD_LEN>(&posted.expand(quote)?);
-            assert!(*actual == expected, "FIXSTMT-001: STATEMNT.PS record {n}");
+        let rows = statement_rows()?;
+        assert!(
+            rows.iter().map(|row| row.number).eq(1..=50),
+            "FIXSTMT-001 to FIXSTMT-050, in order"
+        );
+        assert_eq!(statements.len(), rows.len(), "one statement per row");
+        let xrefs = fixture::<CardXrefRecord>("cardxref.txt")?;
+        let customers = fixture::<CustomerRecord>("custdata.txt")?;
+        let transactions = posted.transactions();
+        let mut written = 0;
+        for ((xref, built), row) in statements.iter().zip(&rows) {
+            let n = row.number;
+            row.check_inputs(xref, (&xrefs, &customers), &transactions)?;
+            let expected = row.text_records(&posted)?;
+            let (first, k) = (written + 1, row.tran_lines.len());
+            assert_eq!(
+                (row.text.first, row.text.last, row.text.count),
+                (first, written + expected.len(), 19 + k),
+                "FIXSTMT-{n:03}: STATEMNT.PS records A-B (C)"
+            );
+            assert_eq!(
+                built.text_lines.len(),
+                expected.len(),
+                "FIXSTMT-{n:03}: STATEMNT.PS record count"
+            );
+            for (record, (actual, wanted)) in (first..).zip(built.text_lines.iter().zip(&expected))
+            {
+                assert!(
+                    actual == wanted,
+                    "FIXSTMT-{n:03}: STATEMNT.PS record {record}"
+                );
+            }
+            written += expected.len();
         }
+        assert_eq!((rows.len(), written), (50, 1_212));
+        let last = rows.last().ok_or("FIXSTMT-050")?;
+        assert_eq!(
+            (last.account, last.customer_line, last.total),
+            (40, 40, Decimal::new(160_910, 2)),
+            "FIXSTMT-050: account, customer and total"
+        );
+        assert_eq!(
+            (last.text.first, last.text.last),
+            (1_188, 1_212),
+            "FIXSTMT-050: STATEMNT.PS records"
+        );
         Ok(())
     }
 
     // audit: FIXSTMT-001
+    // audit: FIXSTMT-002
+    // audit: FIXSTMT-003
+    // audit: FIXSTMT-004
+    // audit: FIXSTMT-005
+    // audit: FIXSTMT-006
+    // audit: FIXSTMT-007
+    // audit: FIXSTMT-008
+    // audit: FIXSTMT-009
+    // audit: FIXSTMT-010
+    // audit: FIXSTMT-011
+    // audit: FIXSTMT-012
+    // audit: FIXSTMT-013
+    // audit: FIXSTMT-014
+    // audit: FIXSTMT-015
+    // audit: FIXSTMT-016
+    // audit: FIXSTMT-017
+    // audit: FIXSTMT-018
+    // audit: FIXSTMT-019
+    // audit: FIXSTMT-020
+    // audit: FIXSTMT-021
+    // audit: FIXSTMT-022
+    // audit: FIXSTMT-023
+    // audit: FIXSTMT-024
+    // audit: FIXSTMT-025
+    // audit: FIXSTMT-026
+    // audit: FIXSTMT-027
+    // audit: FIXSTMT-028
+    // audit: FIXSTMT-029
+    // audit: FIXSTMT-030
+    // audit: FIXSTMT-031
+    // audit: FIXSTMT-032
+    // audit: FIXSTMT-033
+    // audit: FIXSTMT-034
+    // audit: FIXSTMT-035
+    // audit: FIXSTMT-036
+    // audit: FIXSTMT-037
+    // audit: FIXSTMT-038
+    // audit: FIXSTMT-039
+    // audit: FIXSTMT-040
+    // audit: FIXSTMT-041
+    // audit: FIXSTMT-042
+    // audit: FIXSTMT-043
+    // audit: FIXSTMT-044
+    // audit: FIXSTMT-045
+    // audit: FIXSTMT-046
+    // audit: FIXSTMT-047
+    // audit: FIXSTMT-048
+    // audit: FIXSTMT-049
+    // audit: FIXSTMT-050
     // audit: FIXSTMT-903
     // audit: CBSTM03A-032
     // audit: CBSTM03A-033
@@ -1959,16 +2363,47 @@ mod creastmt {
     // audit: CBSTM03A-045
     // audit: CBSTM03A-046
     #[test]
-    fn the_first_statement_has_its_audited_html_records() -> TestResult {
+    fn every_statement_has_its_audited_html_records() -> TestResult {
         let posted = Posted::run()?;
         let statements = posted_statements(&posted)?;
-        let (_, first) = statements.first().ok_or("a first statement")?;
-        let expected = first_html(&posted)?;
-        assert_eq!(first.html_records.len(), 130);
-        assert_eq!(expected.len(), 130);
-        for (n, (actual, wanted)) in (1..).zip(first.html_records.iter().zip(&expected)) {
-            assert!(actual == wanted, "FIXSTMT-001: STATEMNT.HTML record {n}");
+        let rows = statement_rows()?;
+        assert!(
+            rows.iter().map(|row| row.number).eq(1..=50),
+            "FIXSTMT-001 to FIXSTMT-050, in order"
+        );
+        assert_eq!(statements.len(), rows.len(), "one statement per row");
+        let mut written = 0;
+        for ((_, built), row) in statements.iter().zip(&rows) {
+            let n = row.number;
+            let expected = row.html_records(&posted)?;
+            let (first, k) = (written + 1, row.tran_lines.len());
+            assert_eq!(
+                (row.html.first, row.html.last, row.html.count),
+                (first, written + expected.len(), 64 + 11 * k),
+                "FIXSTMT-{n:03}: STATEMNT.HTML records D-E (F)"
+            );
+            assert_eq!(
+                built.html_records.len(),
+                expected.len(),
+                "FIXSTMT-{n:03}: STATEMNT.HTML record count"
+            );
+            for (record, (actual, wanted)) in
+                (first..).zip(built.html_records.iter().zip(&expected))
+            {
+                assert!(
+                    actual == wanted,
+                    "FIXSTMT-{n:03}: STATEMNT.HTML record {record}"
+                );
+            }
+            written += expected.len();
         }
+        assert_eq!((rows.len(), written), (50, 6_082));
+        let last = rows.last().ok_or("FIXSTMT-050")?;
+        assert_eq!(
+            (last.html.first, last.html.last),
+            (5_953, 6_082),
+            "FIXSTMT-050: STATEMNT.HTML records"
+        );
         Ok(())
     }
 }
