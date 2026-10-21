@@ -91,19 +91,16 @@ Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `
   - Anomaly class: request-vs-repository.
   - Finding: AAP 0.2.3 serves both programs' fetch with endpoint 18 because their read paragraphs carry identical not-found and lookup literals, but their success prompts differ: `Press PF5 key to save your updates ...` here and `Press PF5 key to delete this user ...` in COUSR03C, both sent in neutral. One response cannot carry both.
   - Proposed resolution: endpoint 18 returns the user without a prompt, and each screen shows its own program's prompt after a 200 response (COUSR02C-014 and the matching row of `online/COUSR03C.md`), which makes the prompt rows `client`, proved by the screen render tests. Alternatively the reviewer reverses the sharing decision of AAP 0.2.3 and gives each program a read endpoint that returns its prompt. Awaits review.
-  - Status: PROPOSED.
 - `X-COUSR02C-2`
   - Found in: `app/cbl/COUSR02C.cbl:336-339,377-389`.
   - Anomaly class: declaration-not-followed.
   - Finding: the update path's successful read moves `DFHNEUTR` to `ERRMSGC` (line 338), and the write's `NOTFND` and `OTHER` branches set no colour, so `User ID NOT found...` and `Unable to Update User...` from the write show in neutral, while every other error of the program shows in the map's red or in `DFHRED`.
   - Proposed resolution: reproduced (Behaviour constraint): the `COUSR02` screen renders those two endpoint 19 messages in the `default` variant (COUSR02C-033), while their status stays 404 and 500.
-  - Status: PROPOSED.
 - `X-COUSR02C-3`
   - Found in: `app/cbl/COUSR02C.cbl:204-213,231-234`; `app/bms/COUSR02.bms:150-154`.
   - Anomaly class: declaration-not-followed.
   - Finding: the map labels the user type `(A=Admin, U=User)`, but COUSR02C rejects only a blank type and stores any other character.
   - Proposed resolution: reproduced (Behaviour constraint): `user_type` gets no value edit, and the request DTO validates its length only (COUSR02C-023).
-  - Status: PROPOSED.
 
 ## Halt candidates
 
