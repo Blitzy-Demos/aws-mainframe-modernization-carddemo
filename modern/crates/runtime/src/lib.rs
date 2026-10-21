@@ -12,9 +12,12 @@
 //! - [`telemetry`]: JSON tracing to standard output, optional `OpenTelemetry` span export to
 //!   standard output, the redaction-safe span constructors of the HTTP, broker and batch paths,
 //!   and the `carddemo::alert` target of alert events.
-//! - [`db`]: the `PostgreSQL` pool constructor, which refuses a `DATABASE_URL` query parameter
-//!   that `sqlx` would log with its value, returns a `PgPool` and never migrates, and the
-//!   value-free summary under which a `sqlx` error is logged.
+//! - [`db`]: the `PostgreSQL` pool constructor, which takes every connection setting from
+//!   `DATABASE_URL` or an explicit default and none from the libpq environment variables or the
+//!   pgpass file, refuses a URL that names no host, user or password, a `PGOPTIONS` that is not
+//!   blank and a query parameter that `sqlx` would log with its value, reports a refused
+//!   connection, an unresolvable host or a timeout as such, returns a `PgPool` and never
+//!   migrates, and the value-free summary under which a `sqlx` error is logged.
 //! - [`gdg`]: generation file names, the local counterpart of the `(+1)` generations of the
 //!   generation data groups whose bases `DEFGDGB.jcl` defines.
 //! - [`migrate`]: the single schema executor. It embeds `crates/persistence/migrations`, and the

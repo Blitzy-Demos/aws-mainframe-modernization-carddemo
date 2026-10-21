@@ -20,7 +20,7 @@ path = "src/bin/carddemo-migrate.rs"
 # database. No TLS feature and no network telemetry exporter (Local-Only Runtime).
 [dependencies]
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio", "macros", "migrate"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 opentelemetry = { workspace = true, features = ["trace"] }
