@@ -3,9 +3,12 @@
 //! rule basis of i9 (AAP 0.9.1).
 //!
 //! One module per program. Each test carries an `// audit:` tag for every row it proves. Store
-//! writes, generation file names and exit statuses belong to `crates/batch/tests`, and money
-//! results to `financial_parity.rs`; neither is repeated here. A `HALTED(Hn)` path, or a value a
-//! halt candidate blocks, may run for coverage but no value it produces is asserted (AAP 0.8.5).
+//! writes, generation file names and exit statuses belong to `crates/batch/tests`, and the i2
+//! money results of interest, bill payment and posting to `financial_parity.rs`; neither is
+//! repeated here. The purge's working-storage subtractions, ARITH-046 to ARITH-049, which
+//! `modern/audit/arithmetic.md` assigns to this suite, are proved in `mod cbpaup0j`. A
+//! `HALTED(Hn)` path, or a value a halt candidate blocks, may run for coverage but no value it
+//! produces is asserted (AAP 0.8.5).
 //!
 //! The fixtures and `DUSRSECJ.jcl` are read in place and never copied. Reject records, posted
 //! transactions and statements hold full card numbers, so byte comparisons use `assert!` with a
@@ -2706,6 +2709,151 @@ mod cbpaup0j {
             (3, 2)
         );
         assert_eq!((report.details_read(), report.details_deleted()), (2, 2));
+        Ok(())
+    }
+
+    // audit: ARITH-046
+    #[test]
+    fn an_expired_detail_takes_one_from_the_count_its_response_code_names() -> TestResult {
+        // A summary's approved and declined counts.
+        type Counts = (i16, i16);
+        // The response, the stored counts and the working counts after one qualifying detail:
+        // `00` lowers the approved count, any other code the declined one.
+        let cases: [([u8; 2], Counts, Counts); 6] = [
+            (*b"00", (3, 7), (2, 7)),
+            (*b"00", (1, 7), (0, 7)),
+            (*b"00", (0, 7), (-1, 7)),
+            (*b"05", (7, 3), (7, 2)),
+            (*b"05", (7, 1), (7, 0)),
+            (*b"05", (7, 0), (7, -1)),
+        ];
+        for (resp, (approved, declined), (approved_after, declined_after)) in cases {
+            let case = format!(
+                "response {} with counts {approved} and {declined}",
+                String::from_utf8_lossy(&resp)
+            );
+            // With expiry 0, today's own authorization qualifies.
+            let mut run = purge(DEFAULT_SYSIN)?;
+            let mut pass = run.begin_summary(&summary(41, approved, declined)?);
+            assert_eq!(
+                pass.on_detail(&detail(today()?, resp)?)?,
+                DetailAction::Delete,
+                "{case}"
+            );
+            let working = pass.working();
+            assert_eq!(
+                (working.approved_auth_cnt, working.declined_auth_cnt),
+                (Count::new(approved_after), Count::new(declined_after)),
+                "{case}"
+            );
+        }
+        Ok(())
+    }
+
+    // audit: ARITH-047
+    #[test]
+    fn an_expired_approval_takes_its_approved_amount_cut_to_nine_digits() -> TestResult {
+        // The stored approved amount, the detail's approved amount and the working result, in
+        // cents. The detail's transaction amount, 777.00, differs from its approved amount in
+        // every case, so only the approved amount gives these results.
+        let cases: [(&str, i64, i64, i64); 3] = [
+            ("1300.00 - 100.00", 130_000, 10_000, 120_000),
+            ("100.00 - 100.00", 10_000, 10_000, 0),
+            // -1000000050.00 keeps its low nine integer digits and its sign.
+            ("50.00 - 1000000100.00", 5_000, 100_000_010_000, -5_000),
+        ];
+        for (case, stored_cents, approved_cents, result_cents) in cases {
+            let mut stored = summary(43, 2, 1)?;
+            stored.approved_auth_amt = money(stored_cents)?;
+            let approval = PendingAuthDetailRecord {
+                transaction_amt: money(77_700)?,
+                approved_amt: money(approved_cents)?,
+                ..detail(today()?, *b"00")?
+            };
+            let mut run = purge(DEFAULT_SYSIN)?;
+            let mut pass = run.begin_summary(&stored);
+            assert_eq!(pass.on_detail(&approval)?, DetailAction::Delete, "{case}");
+            assert_eq!(
+                pass.working().approved_auth_amt,
+                money::<9>(result_cents)?,
+                "{case}"
+            );
+            assert_eq!(
+                pass.working().declined_auth_amt,
+                money::<9>(25_000)?,
+                "{case}: the declined amount is unchanged"
+            );
+        }
+        Ok(())
+    }
+
+    // audit: ARITH-048
+    #[test]
+    fn an_expired_decline_takes_its_transaction_amount_from_a_seeded_summary() -> TestResult {
+        // CP00's stored declined amount is HALTED(H2), so only a seeded summary is asserted.
+        for resp in [*b"05", *b"51"] {
+            let case = format!("response {}", String::from_utf8_lossy(&resp));
+            let mut stored = summary(45, 2, 1)?;
+            stored.declined_auth_amt = money(25_000)?;
+            // The approved amount, 0.00, differs from the transaction amount, 75.00, so only the
+            // transaction amount gives 175.00.
+            let decline = PendingAuthDetailRecord {
+                transaction_amt: money(7_500)?,
+                approved_amt: money(0)?,
+                ..detail(today()?, resp)?
+            };
+            let mut run = purge(DEFAULT_SYSIN)?;
+            let mut pass = run.begin_summary(&stored);
+            assert_eq!(pass.on_detail(&decline)?, DetailAction::Delete, "{case}");
+            assert_eq!(
+                pass.working().declined_auth_amt,
+                money::<9>(17_500)?,
+                "{case}: 250.00 - 75.00"
+            );
+            assert_eq!(
+                pass.working().approved_auth_amt,
+                money::<9>(30_000)?,
+                "{case}: the approved amount is unchanged"
+            );
+        }
+        Ok(())
+    }
+
+    // audit: ARITH-049
+    #[test]
+    fn a_purge_leaves_the_credit_balance_and_the_stored_summary_unchanged() -> TestResult {
+        let mut stored = summary(46, 2, 0)?;
+        stored.credit_balance = money(130_000)?;
+        stored.approved_auth_amt = money(130_000)?;
+        let before = stored.clone();
+        let approval = PendingAuthDetailRecord {
+            transaction_amt: money(10_000)?,
+            approved_amt: money(10_000)?,
+            ..detail(today()?, *b"00")?
+        };
+        let mut run = purge(DEFAULT_SYSIN)?;
+        let mut pass = run.begin_summary(&stored);
+        assert_eq!(pass.on_detail(&approval)?, DetailAction::Delete);
+        assert_eq!(
+            pass.working().approved_auth_amt,
+            money::<9>(120_000)?,
+            "1300.00 - 100.00"
+        );
+        // The working copy holds no credit balance, and the approved count 1 keeps the summary:
+        // the action names only the delete and checkpoint tests, so nothing is written back.
+        assert_eq!(
+            pass.end_summary(),
+            SummaryAction {
+                delete_summary: SummaryDisposition::Keep,
+                checkpoint: CheckpointAction::NotDue,
+            }
+        );
+        assert_eq!(
+            stored.credit_balance,
+            money::<9>(130_000)?,
+            "the credit balance stays 1300.00"
+        );
+        assert_eq!(stored, before, "the stored summary is unchanged");
         Ok(())
     }
 
