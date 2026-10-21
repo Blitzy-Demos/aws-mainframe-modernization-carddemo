@@ -435,6 +435,8 @@ fn read_calendar(field: &str, mask: DateMask) -> Result<NaiveDate, LeFeedback> {
     if !(1..=12).contains(&month) {
         return Err(LeFeedback::InvalidMonth);
     }
+    // TRUNCATION: `year` accumulates at most the four `Year` slots of the mask, so it is at
+    // most 9999, which `i32` holds; the checked conversion loses no value.
     i32::try_from(year)
         .ok()
         .and_then(|year| NaiveDate::from_ymd_opt(year, month, day))
@@ -694,14 +696,18 @@ pub fn edit_date_ccyymmdd(
 /// `EDIT-DATE-LE` (COACTUPC-117 to COACTUPC-131).
 ///
 /// `year`, `month` and `day` are the raw text of the three map fields, moved into the 4-, 2-
-/// and 2-character parts of `WS-EDIT-DATE-CCYYMMDD`. The year edit (COACTUPC-118 to
-/// COACTUPC-120), the month edit (COACTUPC-121 to COACTUPC-123) and the day edit
-/// (COACTUPC-124, COACTUPC-125) run in that order and the first failure is returned. When all
-/// three pass, the day-month-year checks follow (COACTUPC-126 to COACTUPC-128), and then
-/// `EDIT-DATE-LE`, whose verdict `verdict` gives for the eight characters under `YYYYMMDD`
-/// (CSUTLDTC-019 to CSUTLDTC-025, COACTUPC-129); [`edit_date_ccyymmdd`] passes [`validate`],
-/// whose verdict is `HALTED(H5)`. The accepted date is the typed date of the edited year, month
-/// and day values (COACTUPC-131).
+/// and 2-character parts of `WS-EDIT-DATE-CCYYMMDD`, the edit's own copy (CSUTLDTC-027); the
+/// caller keeps the raw parts themselves for the save (COACTUPC-111). The year edit
+/// (COACTUPC-118 to COACTUPC-120), the month edit (COACTUPC-121 to COACTUPC-123) and the day
+/// edit (COACTUPC-124, COACTUPC-125) run in that order and the first failure is returned. When
+/// all three pass, the day-month-year checks follow (COACTUPC-126 to COACTUPC-128), and then
+/// `EDIT-DATE-LE`, whose verdict `verdict` gives under `YYYYMMDD` (CSUTLDTC-019 to
+/// CSUTLDTC-025, COACTUPC-129); [`edit_date_ccyymmdd`] passes [`validate`], whose verdict is
+/// `HALTED(H5)`. `verdict` receives the eight characters of the edit's own copy, not the raw
+/// text: the month and day edits store their `NUMVAL` values into the `PIC 9(2)` redefinitions
+/// of their bytes, so a day `1.`, `-1`, ` 1` or `1+` reaches it as `01` (COACTUPC-123,
+/// COACTUPC-125, CSUTLDTC-021, CSUTLDTC-027). The accepted date is the typed date of the edited
+/// year, month and day values (COACTUPC-131).
 ///
 /// After a failed part the COBOL still runs the day-month-year checks, which then either only
 /// flag parts after the message is set or read text no edit accepted (halt candidate
@@ -724,12 +730,14 @@ pub fn edit_date_ccyymmdd_with(
     let mm = edit_month(name, &month)?;
     let dd = edit_day(name, &day)?;
     edit_day_month_year(name, ccyy, mm, dd)?;
-    edit_date_le(
-        name,
-        &verdict(&format!("{year}{month}{day}"), DateMask::YyyyMmDd),
-    )?;
-    // Unreachable fallback: the checks above leave a year of 1900-2099, a month of 1-12 and a
-    // day the month has, which `from_ymd_opt` always accepts.
+    // The edit's own copy as CSUTLDTC receives it: the year keeps the four digits its edit
+    // accepted, and the month and day hold the two zero-filled digits their `NUMVAL` stores
+    // wrote over the received bytes (COACTUPC-123, COACTUPC-125, CSUTLDTC-021).
+    let edited = format!("{ccyy:04}{mm:02}{dd:02}");
+    edit_date_le(name, &verdict(&edited, DateMask::YyyyMmDd))?;
+    // TRUNCATION: `edit_year` passes only years 1900-2099, which `i32` holds, so the checked
+    // conversion loses no value. Unreachable fallback: the checks above leave that year, a
+    // month of 1-12 and a day the month has, which `from_ymd_opt` always accepts.
     i32::try_from(ccyy)
         .ok()
         .and_then(|year| NaiveDate::from_ymd_opt(year, mm, dd))
@@ -1373,21 +1381,35 @@ mod tests {
 
     #[test]
     fn le_step_receives_the_eight_characters_blocked_h5() {
-        // CSUTLDTC-021, CSUTLDTC-027; BLOCKED (H5) where the stand-in verdict decides.
-        let mut seen = None;
-        let accepted = edit_date_ccyymmdd_with("Expiry Date", "2020", "01", "1.", |text, mask| {
-            seen = Some((text.to_owned(), mask));
-            LeResult::new(text, mask, LeFeedback::Valid)
-        });
-        assert_eq!(accepted.ok(), date(2020, 1, 1));
-        assert_eq!(seen, Some(("2020011.".to_owned(), DateMask::YyyyMmDd)));
-        let message = " validation error Sev code: 0003 Message code: 2520";
-        assert_eq!(
-            opened(edit_date_ccyymmdd("Expiry Date", "2020", "01", "1.")),
-            expected("Expiry Date", Some((message, Year)))
-        );
-        let valid = edit_date_ccyymmdd("Expiry Date", "2020", "01", "31");
-        assert_eq!(valid.ok(), date(2020, 1, 31));
+        // CSUTLDTC-021, CSUTLDTC-027, COACTUPC-123, COACTUPC-125: the verdict receives the
+        // edit's own copy, whose day bytes the `NUMVAL` store rewrote as two zero-filled digits;
+        // two-digit parts pass unchanged. BLOCKED (H5) where the stand-in verdict decides.
+        let cases = [
+            ("2020", "01", "1.", "20200101"),
+            ("2020", "01", "-1", "20200101"),
+            ("2020", "01", " 1", "20200101"),
+            ("2020", "01", "1+", "20200101"),
+            ("2020", "01", "+1", "20200101"),
+            ("2020", "01", "1 ", "20200101"),
+            ("2020", "01", "1-", "20200101"),
+            ("2020", "01", "31", "20200131"),
+            ("1999", "12", "09", "19991209"),
+        ];
+        for (y, m, d, edited) in cases {
+            let mut seen = None;
+            let accepted = edit_date_ccyymmdd_with("Expiry Date", y, m, d, |text, mask| {
+                seen = Some((text.to_owned(), mask));
+                LeResult::new(text, mask, LeFeedback::Valid)
+            })
+            .ok();
+            let received = Some((edited.to_owned(), DateMask::YyyyMmDd));
+            assert_eq!(seen, received, "{y:?} {m:?} {d:?}");
+            assert!(accepted.is_some(), "{y:?} {m:?} {d:?}");
+            // BLOCKED (H5): `validate` runs the stand-in's own calendar check over the same
+            // edited copy; this is no parity result and proves nothing of what CEEDAYS accepts.
+            let stand_in = edit_date_ccyymmdd("Expiry Date", y, m, d).ok();
+            assert_eq!(stand_in, accepted, "{y:?} {m:?} {d:?}");
+        }
     }
 
     #[test]

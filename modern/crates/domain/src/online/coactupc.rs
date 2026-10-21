@@ -1493,11 +1493,12 @@ impl Amount {
 ///
 /// The accepted form, which the reviewer confirms against IBM's `NUMVAL-C` rules: optional
 /// spaces; an optional leading `+` or `-` with optional spaces; an optional currency sign `$`
-/// with optional spaces; a number, digits with commas among the integer digits and at most one
-/// decimal point, or a point followed by digits; optional spaces; and, only without a leading
-/// sign, an optional trailing `+`, `-`, `CR` or `DB` in either case, with optional spaces.
-/// `1,234.56`, `$1,234.56`, `-50`, `50-`, `50CR` and the `+ZZZ,ZZZ,ZZZ.99` strings endpoint 5
-/// shows pass; `1.2.3`, `12 34` and letters fail.
+/// with optional spaces; a number, digits with commas among the integer digits, each comma
+/// between two integer digits, and at most one decimal point, or a point followed by digits;
+/// optional spaces; and, only without a leading sign, an optional trailing `+`, `-`, `CR` or `DB`
+/// in either case, with optional spaces. `1,234.56`, `1,23,4`, `$1,234.56`, `-50`, `50-`, `50CR`
+/// and the `+ZZZ,ZZZ,ZZZ.99` strings endpoint 5 shows pass; `1.2.3`, `12 34`, `1,`, `1,,2`,
+/// `1,.00` and letters fail.
 fn numval_c(text: &str) -> Option<Decimal> {
     let mut chars = text.chars().peekable();
     skip_spaces(&mut chars);
@@ -1579,29 +1580,35 @@ fn take_trailing_sign(chars: &mut Peekable<Chars<'_>>) -> Trailing {
     }
 }
 
-/// The digits of a number with its commas dropped, and the count of digits after its point.
+/// The number of a `NUMVAL-C` string, `digit[,digit]...[.[digit]]` or `.digit` where each
+/// `digit` is a run of one or more digits: the value of its digits with the commas dropped, and
+/// the count of digits after its point. Groups need not have three digits. `None` when the text
+/// has no digit, a second point, or a comma that does not stand between two integer digits: a
+/// comma first, after the point, before the point, beside another comma, or last.
 fn take_number(chars: &mut Peekable<Chars<'_>>) -> Option<(i128, u32)> {
     let mut mantissa = 0_i128;
     let mut digits = 0_u32;
     let mut scale = 0_u32;
     let mut seen_point = false;
+    let mut comma_pending = false;
     while let Some(c) = chars.next_if(|c| c.is_ascii_digit() || matches!(c, ',' | '.')) {
         match c {
-            '.' if seen_point => return None,
+            '.' if seen_point || comma_pending => return None,
             '.' => seen_point = true,
-            ',' if seen_point || digits == 0 => return None,
-            ',' => {}
+            ',' if seen_point || comma_pending || digits == 0 => return None,
+            ',' => comma_pending = true,
             _ => {
                 let digit = c.to_digit(10)?;
                 mantissa = mantissa.checked_mul(10)?.checked_add(i128::from(digit))?;
                 digits = digits.checked_add(1)?;
+                comma_pending = false;
                 if seen_point {
                     scale = scale.checked_add(1)?;
                 }
             }
         }
     }
-    (digits > 0).then_some((mantissa, scale))
+    (digits > 0 && !comma_pending).then_some((mantissa, scale))
 }
 
 /// A received date: the year, month and day fields as `1100-RECEIVE-MAP` leaves them.
@@ -3743,6 +3750,11 @@ mod tests {
                 "Credit Limit is not valid",
                 CreditLimit,
             ),
+            (
+                |f| f.credit_limit = "1,".to_owned(),
+                "Credit Limit is not valid",
+                CreditLimit,
+            ),
             // audit: COACTUPC-018, COACTUPC-121
             (
                 |f| f.expiry[1] = String::new(),
@@ -4098,6 +4110,16 @@ mod tests {
             ("+7", Some(Decimal::new(7, 0))),
             (".5", Some(Decimal::new(5, 1))),
             ("     -1,940.00", Some(Decimal::new(-194_000, 2))),
+            ("1,23,4", Some(Decimal::new(1234, 0))),
+            ("1,234.", Some(Decimal::new(1234, 0))),
+            ("1,", None),
+            ("1,,2", None),
+            ("1,.00", None),
+            ("1, ", None),
+            ("1,-", None),
+            ("1,CR", None),
+            ("$1,", None),
+            ("-1,", None),
             ("1.2.3", None),
             ("12 34", None),
             ("abc", None),

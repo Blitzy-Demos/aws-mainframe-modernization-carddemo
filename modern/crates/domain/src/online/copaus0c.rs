@@ -469,6 +469,11 @@ const fn sign_digit(value: i64) -> char {
 /// One part of a rendered key: its sign digit and its magnitude's digits.
 fn signed_part<const N: u32>(sign: u8, digits: &[u8]) -> Result<PicS<N>, AuthKeyError> {
     let magnitude = digits_value(digits).ok_or(AuthKeyError)?;
+    // TRUNCATION: `digits_value` builds the magnitude with checked arithmetic, and
+    // `AuthKey::parse` passes only the 5 date digits or the 9 time digits, so it is at most
+    // 999_999_999 and always fits an `i64`; were it ever out of range, the conversion fails and
+    // the key is refused with `AuthKeyError` rather than wrapped. `PicS::<N>::new` then bounds
+    // the signed value to the part's picture, ±99_999 or ±999_999_999.
     let magnitude = i64::try_from(magnitude).map_err(|_| AuthKeyError)?;
     // A `1` sign over a zero magnitude is rejected, so every key has exactly one text.
     let value = match (sign, magnitude) {

@@ -198,12 +198,18 @@ impl PageNumber {
     /// `ADD +1 TO WS-CA-SCREEN-NUM` (`COCRDLIC.cbl:492`): 9 + 1 stores 0, the high-order digit
     /// dropped (COCRDLIC-030). The digit is at most 9, so the sum is at most 10.
     const fn plus_one(self) -> Self {
+        // TRUNCATION: the field is PIC 9(1) (COCRDLIC.cbl:237) and the ADD (COCRDLIC.cbl:492) has
+        // no ON SIZE ERROR, so only the units digit is kept and page 9 plus 1 is 0 (COCRDLIC-030);
+        // the digit is at most 9, so the sum is at most 10 and cannot overflow.
         Self((self.0 + 1) % PAGE_NUMBER_MODULUS)
     }
 
     /// `SUBTRACT 1 FROM WS-CA-SCREEN-NUM` (`COCRDLIC.cbl:508`): 0 − 1 stores 1, the unsigned
     /// receiver dropping the sign (COCRDLIC-030).
     const fn minus_one(self) -> Self {
+        // TRUNCATION: the field is unsigned (COCRDLIC.cbl:237), so the -1 that the SUBTRACT
+        // (COCRDLIC.cbl:508) gives on page 0 is stored without its sign and page 0 minus 1 is 1
+        // (COCRDLIC-030); any other page gives one less, so the result stays one digit.
         Self(self.0.abs_diff(1))
     }
 }
@@ -224,6 +230,10 @@ impl TryFrom<i64> for PageNumber {
     ///
     /// [`ErrorKind::OutOfRange`] outside 0 to 9.
     fn try_from(value: i64) -> Result<Self, Self::Error> {
+        // TRUNCATION: the checked conversion rejects an echoed value outside the u8 range instead
+        // of wrapping it, and `PageNumber::new` then admits only 0 to 9 (`PAGE_NUMBER_MAX`, the
+        // PIC 9(1) range of `WS-CA-SCREEN-NUM`), so every other value is `ErrorKind::OutOfRange`;
+        // nothing is truncated.
         u8::try_from(value)
             .ok()
             .and_then(Self::new)

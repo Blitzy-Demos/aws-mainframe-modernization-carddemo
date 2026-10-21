@@ -16,8 +16,9 @@
 //! # Flow
 //!
 //! `api::services::cobil00c` calls [`edit`] with the two inputs. [`EnterAction::Clear`] answers
-//! [`BillPayOutcome::Cleared`] at once; [`EnterAction::ReadAccount`] reads the account, the read
-//! for update on the payment path, and answers a failed read with [`account_not_found`] or
+//! [`BillPayOutcome::Cleared`] at once; [`EnterAction::ReadAccount`] reads the account for update,
+//! its row locked until the request's transaction ends, on both the payment and the show-balance
+//! paths (COBIL00C-011, COBIL00C-013), and answers a failed read with [`account_not_found`] or
 //! [`account_lookup_failed`]. [`decide`] then judges the balance: it shows it, refuses it, or
 //! orders the payment. For a payment the service reads the cross-reference by account, the
 //! transaction with the highest ID and the next ID, calls [`payment`], inserts
@@ -380,11 +381,17 @@ pub fn edit_account(raw: &str) -> Result<AccountKey, BillPayFailure> {
 
 /// Why the account is read: the confirmation that leads `PROCESS-ENTER-KEY` to
 /// `READ-ACCTDAT-FILE` (`COBIL00C.cbl:174-184`).
+///
+/// Both intents lead to the same read for update, the unconditional `READ` with `UPDATE` of
+/// `READ-ACCTDAT-FILE` (`COBIL00C.cbl:343-354`): the row stays locked until the request's
+/// transaction ends (COBIL00C-013). The intent decides only what [`decide`] does with the
+/// balance, never whether the row is locked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReadIntent {
     /// `Y` or `y`: the read for update that precedes the payment (COBIL00C-009, COBIL00C-013).
     Pay,
-    /// A blank confirmation: the read whose balance is shown (COBIL00C-011).
+    /// A blank confirmation: the read for update whose balance is shown (COBIL00C-011,
+    /// COBIL00C-013).
     ShowBalance,
 }
 
@@ -394,8 +401,8 @@ pub enum EnterAction {
     /// `N` or `n`: answer [`BillPayOutcome::Cleared`]; the account is neither read nor
     /// validated, and nothing is written (COBIL00C-010).
     Clear,
-    /// Read account `id`, for update when `intent` is [`ReadIntent::Pay`], then [`decide`]
-    /// (COBIL00C-009, COBIL00C-011, COBIL00C-013).
+    /// Read account `id` for update whatever the `intent`, its row locked until the request's
+    /// transaction ends, then [`decide`] (COBIL00C-009, COBIL00C-011, COBIL00C-013).
     ReadAccount {
         /// The account key.
         id: PicU<11>,

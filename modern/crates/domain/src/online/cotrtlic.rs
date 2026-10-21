@@ -345,6 +345,11 @@ impl RowIndex {
     /// `None` outside 1 to 7.
     #[must_use]
     pub fn from_number(number: i64) -> Option<Self> {
+        // TRUNCATION: `checked_sub` refuses `i64::MIN`, the checked conversion refuses the
+        // negative index of a row number of 0 or below instead of wrapping it, and
+        // `RowIndex::new` admits only indexes 0 to 6, the `OCCURS 7` positions (COTRTLIC-017);
+        // any other row number is `None`, which decoding an echoed state reports as
+        // `ListFailure::RowOutOfRange`.
         number
             .checked_sub(1)
             .and_then(|index| usize::try_from(index).ok())
@@ -427,6 +432,10 @@ impl PageNumber {
     /// The page `number`; `None` outside 0 to 9.
     #[must_use]
     pub fn new(number: i64) -> Option<Self> {
+        // TRUNCATION: the checked conversion rejects a number a u8 cannot hold (negative or
+        // above 255) instead of wrapping it, and the filter then admits only 0 to 9, the range
+        // of `WS-CA-SCREEN-NUM PIC 9(1)` (COTRTLIC-013); any other number is `None`, which
+        // decoding an echoed state reports as `ListFailure::PageOutOfRange`.
         u8::try_from(number)
             .ok()
             .filter(|digit| *digit < PAGE_MODULUS)
@@ -2758,6 +2767,10 @@ mod tests {
                 .iter()
                 .filter(|row| Self::matches(row, filters))
                 .count();
+            // TRUNCATION: a test table holds a few rows, and no `Vec` holds more than
+            // `isize::MAX`, which is `i64::MAX` on the supported 64-bit target, so the count
+            // always fits; the saturating fallback is never taken and only keeps the test
+            // double free of a panic path.
             Ok(i64::try_from(count).unwrap_or(i64::MAX))
         }
 
@@ -2765,6 +2778,9 @@ mod tests {
             if self.fault == Fault::Read {
                 return Err(StoreFailure);
             }
+            // TRUNCATION: `PageSize::limit` gives 1 to 8 (a page of 1 to 7 rows, plus the forward
+            // lookahead row), so the limit always fits; the fallback of 0, reading nothing, is
+            // never taken.
             let limit = usize::try_from(query.limit()).unwrap_or(0);
             let mut rows: Vec<Db2TransactionType> = self
                 .rows
