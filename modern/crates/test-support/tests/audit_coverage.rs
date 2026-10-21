@@ -15,6 +15,11 @@
 //! tag group fails it like any other row, its violation naming the halt. Checks 2 to 4 apply to
 //! it unchanged.
 //!
+//! A halt's `Status` is `BLOCKED`, `RESOLVED` or `DESCOPED`. The synthetic tests prove that any
+//! other status, an empty one included, fails the index load at the halt's row instead of
+//! unblocking its rules, and that a `RESOLVED` or `DESCOPED` halt blocks nothing, so its fully
+//! tagged rules count as satisfied while a `BLOCKED` halt's never do.
+//!
 //! The test only reads files: no container, database or async runtime. Its first passing run is
 //! checkpoint C7, once every layer's tagged tests exist; before then it fails by design, and it
 //! is not part of the C2 gate (AAP 0.6.3).
@@ -598,5 +603,211 @@ fn blocked_rules_need_their_layer_tags() {
         assert_eq!(violations, expected, "{name}: violations");
         assert_eq!(outcome.blocked, case.blocked, "{name}: blocked rules");
         assert_eq!(outcome.satisfied, case.satisfied, "{name}: satisfied rules");
+    }
+}
+
+/// A halt report in the shape of [`synthetic_halts`] whose rows are `rows`, each a halt ID and
+/// the text of its `Status` cell.
+fn halt_report(rows: &[(&str, &str)]) -> String {
+    let mut text = "# Halt report\n\n\
+                    | ID | Path | Why no single result | Bindings blocked | Status | Resolution |\n\
+                    |---|---|---|---|---|---|\n"
+        .to_owned();
+    for (halt, status) in rows {
+        text.push_str(&format!(
+            "| {halt} | synthetic | synthetic | synthetic | {status} | synthetic |\n"
+        ));
+    }
+    text
+}
+
+/// The 1-based line of the row of halt `halt` in the halt report `text`.
+fn halt_line(text: &str, halt: &str) -> usize {
+    let prefix = format!("| {halt} |");
+    (1..)
+        .zip(text.lines())
+        .find_map(|(line, content)| content.starts_with(&prefix).then_some(line))
+        .unwrap_or_else(|| panic!("the halt report has no row for {halt}"))
+}
+
+/// One tag of every kind each synthetic row's layer requires, so check 1 finds every group met.
+fn every_row_tagged() -> Vec<TagSite> {
+    let mut sites = Vec::new();
+    for (row, spec) in (1..).zip(&SYNTHETIC_ROWS) {
+        let kinds = match spec.layer {
+            Some("server") => vec![TagKind::ApiEndpoints],
+            Some("client") => vec![TagKind::Nav],
+            Some("both") => vec![TagKind::ApiEndpoints, TagKind::Vitest],
+            Some(other) => panic!("synthetic row {row} has the unknown layer `{other}`"),
+            None => vec![TagKind::RustTest("batch".to_owned())],
+        };
+        sites.extend(kinds.into_iter().map(|kind| TagSite {
+            id: synthetic_id(row),
+            path: PathBuf::from("synthetic"),
+            line: row,
+            kind,
+        }));
+    }
+    sites
+}
+
+/// A `Status` cell outside the closed set, and the synthetic halt whose row carries it; the other
+/// halt keeps its valid status.
+struct InvalidStatus {
+    name: &'static str,
+    halt: &'static str,
+    status: &'static str,
+}
+
+/// The cases of [`halt_status_outside_the_closed_set_fails_at_its_row`]. Read as anything but
+/// `BLOCKED`, each would unblock the rules of a halt that has no valid terminal status.
+const INVALID_STATUSES: [InvalidStatus; 5] = [
+    InvalidStatus {
+        name: "a misspelt BLOCKED",
+        halt: BLOCKED_HALT,
+        status: "BLOCKD",
+    },
+    InvalidStatus {
+        name: "an empty cell",
+        halt: RESOLVED_HALT,
+        status: "",
+    },
+    InvalidStatus {
+        name: "a dash for no status",
+        halt: BLOCKED_HALT,
+        status: "—",
+    },
+    InvalidStatus {
+        name: "a status outside the set",
+        halt: RESOLVED_HALT,
+        status: "PENDING",
+    },
+    InvalidStatus {
+        name: "a valid status followed by more text",
+        halt: BLOCKED_HALT,
+        status: "BLOCKED, acknowledged",
+    },
+];
+
+#[test]
+fn halt_status_outside_the_closed_set_fails_at_its_row() {
+    let tree = SyntheticTree::create("halt_status_outside_the_closed_set_fails_at_its_row");
+    let halts_path = tree.root.join("HALTS.md");
+    for case in &INVALID_STATUSES {
+        let name = case.name;
+        let rows = [(BLOCKED_HALT, "BLOCKED"), (RESOLVED_HALT, "RESOLVED")].map(|(halt, valid)| {
+            let status = if halt == case.halt {
+                case.status
+            } else {
+                valid
+            };
+            (halt, status)
+        });
+        let report = halt_report(&rows);
+        tree.write("HALTS.md", &report);
+        let Err(err) = AuditIndex::load(&tree.root) else {
+            panic!(
+                "{name}: the index loaded halt {} with status `{}`",
+                case.halt, case.status
+            );
+        };
+        let message = err.to_string();
+        let location = format!(
+            "{}:{}: ",
+            halts_path.display(),
+            halt_line(&report, case.halt)
+        );
+        assert!(
+            message.starts_with(&location),
+            "{name}: `{message}` starts with `{location}`"
+        );
+        let halt = format!("halt {} ", case.halt);
+        assert!(
+            message.contains(&halt),
+            "{name}: `{message}` names `{halt}`"
+        );
+        let allowed = "`BLOCKED`, `RESOLVED` or `DESCOPED`";
+        assert!(
+            message.contains(allowed),
+            "{name}: `{message}` names the allowed statuses"
+        );
+    }
+}
+
+/// A valid `Status` cell of the synthetic [`BLOCKED_HALT`] row, whether it blocks the rows that
+/// name that halt, and the outcome of check 1 when every synthetic row carries its tags.
+struct ValidStatus {
+    status: &'static str,
+    blocks: bool,
+    satisfied: usize,
+    blocked: usize,
+}
+
+/// The cases of [`only_a_blocked_halt_blocks_its_rules`]: the initial status, both terminal
+/// statuses, and a terminal status written in backticks and lower case.
+const VALID_STATUSES: [ValidStatus; 4] = [
+    ValidStatus {
+        status: "BLOCKED",
+        blocks: true,
+        satisfied: 1,
+        blocked: 4,
+    },
+    ValidStatus {
+        status: "RESOLVED",
+        blocks: false,
+        satisfied: 5,
+        blocked: 0,
+    },
+    ValidStatus {
+        status: "DESCOPED",
+        blocks: false,
+        satisfied: 5,
+        blocked: 0,
+    },
+    ValidStatus {
+        status: "`descoped`",
+        blocks: false,
+        satisfied: 5,
+        blocked: 0,
+    },
+];
+
+#[test]
+fn only_a_blocked_halt_blocks_its_rules() {
+    let tree = SyntheticTree::create("only_a_blocked_halt_blocks_its_rules");
+    let sites = every_row_tagged();
+    let tags = tags_by_rule(&sites);
+    for case in &VALID_STATUSES {
+        let status = case.status;
+        let report = halt_report(&[(BLOCKED_HALT, status), (RESOLVED_HALT, "RESOLVED")]);
+        tree.write("HALTS.md", &report);
+        let index = AuditIndex::load(&tree.root).unwrap_or_else(|err| {
+            panic!("status `{status}`: cannot load the synthetic audit index: {err}")
+        });
+        for (row, spec) in (1..).zip(&SYNTHETIC_ROWS) {
+            let id = synthetic_id(row);
+            let rule = index
+                .get(&id)
+                .unwrap_or_else(|| panic!("status `{status}`: the index has no rule {id}"));
+            assert_eq!(
+                index.is_blocked(rule),
+                case.blocks && spec.halt == BLOCKED_HALT,
+                "status `{status}`: whether rule {id} is blocked"
+            );
+        }
+        let outcome = check_required_tags(&index, &tags);
+        assert_eq!(
+            outcome.violations,
+            Vec::<String>::new(),
+            "status `{status}`: violations"
+        );
+        assert_eq!(
+            outcome.blocked, case.blocked,
+            "status `{status}`: blocked rules"
+        );
+        assert_eq!(
+            outcome.satisfied, case.satisfied,
+            "status `{status}`: satisfied rules"
+        );
     }
 }
