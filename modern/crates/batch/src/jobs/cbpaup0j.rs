@@ -6,9 +6,12 @@
 //!
 //! # Flow
 //!
-//! 1. The `--sysin` record goes through the domain's total parser before anything else: a refused
-//!    record ends the job with no SYSOUT line, no table touched and a non-zero exit
-//!    (CBPAUP0C-002). Today's `YYDDD` is then read once from the injected clock (CBPAUP0C-001).
+//! 1. The `--sysin` record goes through the domain's total parser, [`params`], before anything
+//!    else: `main` calls it right after the command line is parsed, before the configuration is
+//!    read or the pool opened, so a refused record ends the run with no SYSOUT line, no database
+//!    connection, no table touched and a non-zero exit (CBPAUP0C-002). [`run`] receives the
+//!    parameters it accepted and reads today's `YYDDD` once from the injected clock
+//!    (CBPAUP0C-001).
 //! 2. A transaction is opened and every summary is read in ascending `acct_id`, the root-key
 //!    order of the unqualified `GN` (CBPAUP0C-009).
 //! 3. Each summary's details are read in ascending (`auth_date_9c`, `auth_time_9c`) order, the
@@ -79,7 +82,7 @@
 
 use copybook::PicS;
 use domain::batch::cbpaup0c::{
-    CheckpointAction, DetailAction, Purge, PurgeFailure, PurgeHalt, SummaryAction,
+    CheckpointAction, DetailAction, Purge, PurgeFailure, PurgeHalt, PurgeParams, SummaryAction,
     SummaryDisposition, SysinError,
 };
 use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
@@ -117,18 +120,28 @@ const CHKP: &str = "CHKP";
 /// the failure of the interval's first call, a `GN` (CBPAUP0C-023).
 const INTERVAL_START: &str = "start of a checkpoint interval";
 
-/// Runs CBPAUP0C over `pending_auth_summaries` and `pending_auth_details` with the `--sysin`
-/// record of `args`.
+/// The run parameters of the `--sysin` record of `args`, through the domain's total parser
+/// (CBPAUP0C-002). `main` calls it right after the command line is parsed, before it reads the
+/// configuration or opens the pool, and hands the parameters to [`run`].
 ///
 /// # Errors
 ///
-/// - [`JobError::Abend`] with no code when the SYSIN record is refused (CBPAUP0C-002); nothing
-///   is read or shown.
+/// [`JobError::Abend`] with no code when the record is longer than the 80-byte card or holds a
+/// byte outside printable ASCII. Its reason is static text that shows neither the record nor the
+/// length or offset the domain error carries.
+pub(crate) fn params(args: &Cbpaup0jArgs) -> Result<PurgeParams, JobError> {
+    args.purge_params().map_err(sysin_refused)
+}
+
+/// Runs CBPAUP0C over `pending_auth_summaries` and `pending_auth_details` with `params`, the
+/// SYSIN record [`params`] accepted.
+///
+/// # Errors
+///
 /// - [`JobError::Abend`] with code 16 when a read, a delete or a commit fails (CBPAUP0C-023 to
 ///   CBPAUP0C-028), after the deletes that succeeded since the last checkpoint are committed.
 /// - [`JobError::Abend`] with no code when the domain halts a detail (X-CBPAUP0J-H1).
-pub(crate) async fn run(ctx: &JobContext<'_>, args: &Cbpaup0jArgs) -> Result<JobOutcome, JobError> {
-    let params = args.purge_params().map_err(sysin_refused)?;
+pub(crate) async fn run(ctx: &JobContext<'_>, params: PurgeParams) -> Result<JobOutcome, JobError> {
     let mut purge = Purge::new(params, ctx.clock);
     match purge_all(ctx, &mut purge).await {
         Ok(()) => Ok(finished(purge)),

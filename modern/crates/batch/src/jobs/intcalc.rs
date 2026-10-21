@@ -226,8 +226,8 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use chrono::NaiveDate;
-    use copybook::{FixedRecord, PicDate, PicU, PicX};
+    use chrono::{NaiveDate, Timelike};
+    use copybook::{FixedRecord, PicDate, PicU, PicX, TsForm};
     use domain::batch::cbact04c::{
         DEFAULT_GROUP, Intcalc, IntcalcError, ParmDate, REWRITE_ACCOUNT_ERROR,
     };
@@ -248,9 +248,13 @@ mod tests {
     /// Width of a `CVTRA05Y` SYSTRAN record (CBACT04C-024).
     const SYSTRAN_WIDTH: usize = 350;
 
-    /// Both SYSTRAN timestamps under the test clock, layout `D` with the fraction cut to
-    /// hundredths (CBACT04C-022).
-    const STAMP: &[u8; 26] = b"2022-07-18-00.00.00.000000";
+    /// The shape of both SYSTRAN timestamps: layout `D`, `YYYY-MM-DD-HH.MM.SS.ffffff`, with
+    /// the fraction cut to hundredths, `9` standing for any ASCII digit (CBACT04C-022).
+    const DB2_HUNDREDTHS: &[u8; 26] = b"9999-99-99-99.99.99.990000";
+
+    /// Nanoseconds in one hundredth of a second, the finest unit of a SYSTRAN timestamp
+    /// (CBACT04C-022).
+    const NANOS_PER_HUNDREDTH: u32 = 10_000_000;
 
     /// Tells apart the scratch directories of the tests of one process.
     static SCRATCH_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -473,6 +477,19 @@ mod tests {
             .collect()
     }
 
+    /// Whether `text` has the shape of [`DB2_HUNDREDTHS`]. Time fields are compared by format
+    /// only, never by the clock's value (AAP 0.5.6).
+    fn is_db2_hundredths(text: &[u8]) -> bool {
+        text.len() == DB2_HUNDREDTHS.len()
+            && text
+                .iter()
+                .zip(DB2_HUNDREDTHS)
+                .all(|(&byte, &shape)| match shape {
+                    b'9' => byte.is_ascii_digit(),
+                    _ => byte == shape,
+                })
+    }
+
     /// Account 1 is rewritten at the break of account 2 with its interest added and both cycle
     /// fields zeroed; account 2, the last in key order, keeps every field (E08), while the
     /// records of both are written in key order with consecutive suffixes.
@@ -518,8 +535,24 @@ mod tests {
             assert_eq!(record.id, PicX::from_text(id)?, "{id}");
             assert_eq!(record.amt, money::<9>(cents)?, "{id}");
             assert!(record.card_num == card(owner), "{id}: card number");
-            assert_eq!(raw.get(278..304), Some(&STAMP[..]), "{id}: TRAN-ORIG-TS");
-            assert_eq!(raw.get(304..330), Some(&STAMP[..]), "{id}: TRAN-PROC-TS");
+            // Time fields are compared by format only (AAP 0.5.6): one clock reading, in layout
+            // `D` and cut to hundredths, fills both fields (CBACT04C-022).
+            let orig_text = raw.get(278..304).ok_or("TRAN-ORIG-TS is in the record")?;
+            let proc_text = raw.get(304..330).ok_or("TRAN-PROC-TS is in the record")?;
+            assert!(is_db2_hundredths(orig_text), "{id}: TRAN-ORIG-TS");
+            assert!(is_db2_hundredths(proc_text), "{id}: TRAN-PROC-TS");
+            assert_eq!(orig_text, proc_text, "{id}: one reading for both fields");
+            assert_eq!(
+                record.orig_ts, record.proc_ts,
+                "{id}: one reading for both fields"
+            );
+            let stamp = record.orig_ts.value().ok_or("TRAN-ORIG-TS is not blank")?;
+            assert_eq!(stamp.form(), TsForm::Db2, "{id}: layout D");
+            assert_eq!(
+                stamp.value().nanosecond() % NANOS_PER_HUNDREDTH,
+                0,
+                "{id}: hundredths"
+            );
         }
         Ok(())
     }

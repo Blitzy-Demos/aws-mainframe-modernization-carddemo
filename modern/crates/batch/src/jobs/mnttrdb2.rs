@@ -15,7 +15,8 @@
 //!    statement, `NotFound` for an update or delete that changed no row (COBTUPDT-013,
 //!    COBTUPDT-016), and `Failed` for any statement error, the duplicate insert (COBTUPDT-011)
 //!    and the delete refused by the `ON DELETE RESTRICT` of `TRNTYCAT.ddl:6-7` (COBTUPDT-017)
-//!    included. The run goes on with the next record after every failure (COBTUPDT-022).
+//!    included. A failed statement is first reported in one `ERROR` event (see Job log). The run
+//!    goes on with the next record after every failure (COBTUPDT-022).
 //! 4. One commit after the last record; the exit code is then the domain's `RETURN-CODE`, 4 once
 //!    any record reached `9999-ABEND` and 0 otherwise (COBTUPDT-023, COBTUPDT-025).
 //!
@@ -45,6 +46,15 @@
 //! nothing (AAP 0.3.4.3). The lines are proved where the domain builds them; the five `SQLCODE`
 //! positions their error text ends with are halted under H3 (COBTUPDT-020).
 //!
+//! The tracing stream is no job log. Besides `main`'s events, it carries one `ERROR` event,
+//! `COBTUPDT database call failed`, for each `A`, `U` or `D` statement that failed and was
+//! answered with [`SqlOutcome::Failed`]: its fields are `operation`, the COBTUPDT paragraph
+//! (`10031-INSERT-DB`, `10032-UPDATE-DB` or `10033-DELETE-DB`), `error`, the
+//! [`PersistenceError`] text, and `unit_of_work_rolled_back`, true for `SQLCODE` -911. So a run
+//! that ends with return code 4 shows why each statement failed. A record that reached
+//! `9999-ABEND` through an invalid action byte or a `+100` had no statement error and adds no
+//! event.
+//!
 //! # Data version (E23)
 //!
 //! Only `db2.transaction_type` is written, through [`Db2TransactionTypeRepository`];
@@ -60,7 +70,9 @@
 //!
 //! A description is unvalidated free text and may hold a protected value, so no line, record or
 //! description reaches an error, a counter or a tracing event: [`JobError`] carries an SQLSTATE
-//! and a constraint name at most, and the counters are plain counts (Cardholder Data Redaction).
+//! and a constraint name at most, the failed-statement event a static paragraph name, the
+//! [`PersistenceError`] text and a flag, never the type code or the description, and the
+//! counters are plain counts (Cardholder Data Redaction).
 
 use std::path::Path;
 
@@ -72,6 +84,15 @@ use super::{JobContext, JobError, JobOutcome};
 /// The SQLSTATEs standing for Db2 `SQLCODE` -911, after which Db2 has rolled back the unit of
 /// work: `deadlock_detected` and `lock_not_available` (COBTUPDT-024).
 const UNIT_OF_WORK_ROLLED_BACK: [&str; 2] = ["40P01", "55P03"];
+
+// The COBTUPDT paragraph each statement replaces, named in the event that reports its failure.
+
+/// The `INSERT` of an `A` record (COBTUPDT-010).
+const INSERT_DB_OP: &str = "10031-INSERT-DB";
+/// The `UPDATE` of a `U` record (COBTUPDT-012).
+const UPDATE_DB_OP: &str = "10032-UPDATE-DB";
+/// The `DELETE` of a `D` record (COBTUPDT-015).
+const DELETE_DB_OP: &str = "10033-DELETE-DB";
 
 /// How one statement ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,31 +182,31 @@ async fn execute(
     tx: &mut PgTx<'_>,
     action: &MaintenanceAction,
 ) -> Result<Option<Statement>, JobError> {
-    let (savepoint, result) = match action {
+    let (operation, savepoint, result) = match action {
         MaintenanceAction::Insert(row) => {
             let mut savepoint = tx.savepoint().await?;
             let result = Db2TransactionTypeRepository::insert(&mut savepoint, row)
                 .await
                 .map(|()| SqlOutcome::Ok);
-            (savepoint, result)
+            (INSERT_DB_OP, savepoint, result)
         }
         MaintenanceAction::Update(row) => {
             let mut savepoint = tx.savepoint().await?;
             let result = Db2TransactionTypeRepository::update(&mut savepoint, row)
                 .await
                 .map(row_found);
-            (savepoint, result)
+            (UPDATE_DB_OP, savepoint, result)
         }
         MaintenanceAction::Delete(code) => {
             let mut savepoint = tx.savepoint().await?;
             let result = Db2TransactionTypeRepository::delete(&mut savepoint, code)
                 .await
                 .map(row_found);
-            (savepoint, result)
+            (DELETE_DB_OP, savepoint, result)
         }
         MaintenanceAction::Ignore | MaintenanceAction::InvalidType => return Ok(None),
     };
-    settle(savepoint, result).await.map(Some)
+    settle(operation, savepoint, result).await.map(Some)
 }
 
 /// The outcome of an update or a delete: `SQLCODE` 0 when it changed a row, `+100` when no row
@@ -198,18 +219,22 @@ const fn row_found(changed: bool) -> SqlOutcome {
     }
 }
 
-/// Ends the savepoint a statement ran in and names how the statement ended (COBTUPDT-024).
+/// Ends the savepoint the statement of paragraph `operation` ran in and names how the statement
+/// ended (COBTUPDT-024).
 ///
 /// A statement that completed, whether or not it changed a row, keeps its work in the run's
-/// transaction and its savepoint is released. A failed statement is undone by rolling back to
-/// its savepoint, and is reported as [`SqlOutcome::Failed`], flagged when it stands for
-/// `SQLCODE` -911.
+/// transaction and its savepoint is released. A failed statement is first reported in one
+/// `ERROR` event (see [`report`]), then undone by rolling back to its savepoint, and is returned
+/// as [`SqlOutcome::Failed`], flagged when it stands for `SQLCODE` -911. The event comes before
+/// the rollback, so the statement's cause is on record even when the rollback fails too.
 ///
 /// # Errors
 ///
 /// [`JobError::Persistence`] when the savepoint cannot be released or rolled back, or when the
 /// statement failed because the database cannot be reached; the run's transaction is then lost.
+/// A lost connection raises no event here: the error itself ends the job, and `main` reports it.
 async fn settle(
+    operation: &'static str,
     savepoint: PgTx<'_>,
     result: Result<SqlOutcome, PersistenceError>,
 ) -> Result<Statement, JobError> {
@@ -230,6 +255,7 @@ async fn settle(
                 // replacement's answer to the audit's halt candidate rather than a parity result.
                 Failure::Connection => return Err(JobError::Persistence(error)),
             };
+            report(operation, &error, unit_of_work_rolled_back);
             savepoint.rollback().await?;
             Ok(Statement {
                 outcome: SqlOutcome::Failed,
@@ -237,6 +263,19 @@ async fn settle(
             })
         }
     }
+}
+
+/// Reports why the statement of paragraph `operation` failed, for the operator: the paragraph,
+/// the error's text, which names an SQLSTATE, a constraint or a column only, and whether the
+/// failure stands for `SQLCODE` -911, so that the run's unit of work is rolled back. No
+/// description, type code, record or job-log line reaches it (Cardholder Data Redaction).
+fn report(operation: &'static str, error: &PersistenceError, unit_of_work_rolled_back: bool) {
+    tracing::error!(
+        operation,
+        error = %error,
+        unit_of_work_rolled_back,
+        "COBTUPDT database call failed"
+    );
 }
 
 /// What the failure of an `A`, `U` or `D` statement stands for, by the `SQLCODE` mapping of
@@ -264,8 +303,9 @@ fn classify(error: &PersistenceError) -> Failure {
 mod tests {
     use domain::batch::cobtupdt::SqlOutcome;
     use persistence::{DecodeKind, PersistenceError};
+    use test_support::trace_capture;
 
-    use super::{Failure, classify, row_found};
+    use super::{DELETE_DB_OP, Failure, INSERT_DB_OP, UPDATE_DB_OP, classify, report, row_found};
 
     /// A server error with SQLSTATE `code` and no constraint.
     fn database(code: &str) -> PersistenceError {
@@ -329,5 +369,68 @@ mod tests {
         assert_eq!(row_found(true), SqlOutcome::Ok);
         // audit: COBTUPDT-013
         assert_eq!(row_found(false), SqlOutcome::NotFound);
+    }
+
+    /// A statement failure the run goes on after is reported in one `ERROR` event: the paragraph,
+    /// the error's SQLSTATE or constraint text and whether it stands for `SQLCODE` -911, by the
+    /// classification `settle` reports it under.
+    #[test]
+    fn a_failed_statement_is_reported_with_its_paragraph_and_cause() {
+        let cases = [
+            (
+                INSERT_DB_OP,
+                PersistenceError::Duplicate {
+                    constraint: Some("xtran_type".to_owned()),
+                },
+                "duplicate key (constraint xtran_type)",
+                Failure::Statement,
+            ),
+            (
+                DELETE_DB_OP,
+                PersistenceError::Restrict {
+                    constraint: Some("trc_type_code".to_owned()),
+                },
+                "restricted by foreign key (constraint trc_type_code)",
+                Failure::Statement,
+            ),
+            (
+                UPDATE_DB_OP,
+                database("42P01"),
+                "database error (SQLSTATE 42P01)",
+                Failure::Statement,
+            ),
+            (
+                UPDATE_DB_OP,
+                database("40P01"),
+                "database error (SQLSTATE 40P01)",
+                Failure::UnitOfWork,
+            ),
+            (
+                DELETE_DB_OP,
+                database("55P03"),
+                "database error (SQLSTATE 55P03)",
+                Failure::UnitOfWork,
+            ),
+        ];
+        for (operation, error, text, failure) in cases {
+            assert_eq!(classify(&error), failure, "{error}");
+            let rolled_back = failure == Failure::UnitOfWork;
+            let capture = trace_capture::capture();
+            report(operation, &error, rolled_back);
+
+            let lines = capture.lines();
+            let [event] = lines.as_slice() else {
+                panic!("expected one event for {error}, got {lines:?}");
+            };
+            for expected in [
+                r#""level":"ERROR""#.to_owned(),
+                r#""message":"COBTUPDT database call failed""#.to_owned(),
+                format!(r#""operation":"{operation}""#),
+                format!(r#""error":"{text}""#),
+                format!(r#""unit_of_work_rolled_back":{rolled_back}"#),
+            ] {
+                assert!(event.contains(&expected), "{expected} missing from {event}");
+            }
+        }
     }
 }
