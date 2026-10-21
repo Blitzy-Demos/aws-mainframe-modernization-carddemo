@@ -159,11 +159,25 @@ describe("cotrtupSchema", () => {
     });
   });
 
-  // The screen's contract reads "first error wins", the type code first, when both fields fail.
-  // zod instead lists every field issue of the object before the issue its object-level
-  // refinement adds, so a too-long description comes first; this pins the schema's actual order.
-  // The input cannot reach the schema from the screen, whose maxLength of 50 stops the 51st
-  // character, and the program's own edit order is the server's.
+  // `1245-EDIT-NUM-REQD` leaves `1200-EDIT-MAP-INPUTS` after a blank code, so the description
+  // edits never run and the type code's message is the only one, whatever the description holds.
+  // audit: COTRTUPC-005
+  it.each([
+    { name: "empty", description: "" },
+    { name: "`*`", description: "*" },
+    { name: "with punctuation", description: "Synthetic type!" },
+  ])("reports only the type code when the description is $name", ({ description }) => {
+    expect(outcome(cotrtupSchema.safeParse({ typeCode: "*", description }))).toEqual({
+      success: false,
+      issues: [{ path: ["typeCode"], message: TYPE_CODE_NOT_SUPPLIED }],
+    });
+  });
+
+  // "First error wins" binds the program edits, which the one refinement adds at most one of
+  // (above). The map lengths are zod field checks: zod lists every field issue of the object
+  // before the issue its object-level refinement adds, so a too-long description comes first;
+  // this pins the schema's actual order. The input cannot reach the schema from the screen, whose
+  // maxLength of 50 stops the 51st character, and the program's own edit order is the server's.
   it("reports the description length before a type code that is not supplied", () => {
     expect(outcome(cotrtupSchema.safeParse({ typeCode: "", description: "D".repeat(51) }))).toEqual(
       {

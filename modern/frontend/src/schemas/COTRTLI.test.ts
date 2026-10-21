@@ -153,6 +153,9 @@ describe("cotrtliSchema", () => {
     });
   });
 
+  // The map LENGTH edits have no COBOL order, since the 3270 never sends a field longer than its
+  // LENGTH. COTRTLIC's edit order (selections, then description filter, then type filter) binds
+  // only its server edits, so zod reports every length issue, in the schema's key order.
   it("reports the type filter, then the description filter, then the rows", () => {
     expect(
       check({

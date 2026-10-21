@@ -215,12 +215,38 @@ export function keyFromEvent(event: PfKeyEventLike, foldShifted = false): PfKey 
   if (event.repeat || event.isComposing || event.ctrlKey || event.altKey || event.metaKey) {
     return undefined;
   }
-  // An own-property check, so inherited names such as `constructor` are no key.
-  const key = Object.hasOwn(EVENT_KEYS, event.key) ? EVENT_KEYS[event.key] : undefined;
+  const key = namedKey(event.key);
   if (key === undefined || (event.shiftKey && (key === "ENTER" || !foldShifted))) {
     return undefined;
   }
   return key;
+}
+
+/** The key a `KeyboardEvent.key` value names, modifiers aside. */
+function namedKey(name: string): PfKey | undefined {
+  // An own-property check, so inherited names such as `constructor` are no key.
+  return Object.hasOwn(EVENT_KEYS, name) ? EVENT_KEYS[name] : undefined;
+}
+
+/**
+ * The F-key of a Shift+F1…F12 keydown on a screen that does not fold shifted keys, or `undefined`
+ * for every other event. The 3270 sends PF13–PF24 for it, which such a program serves under no
+ * branch but `WHEN OTHER` (`app/cbl/COSGN00C.cbl:91-94`), so it is an unserved key, not no key.
+ */
+function unfoldedShiftedFKey(event: PfKeyEventLike, foldShifted: boolean): PfKey | undefined {
+  if (
+    foldShifted ||
+    !event.shiftKey ||
+    event.repeat ||
+    event.isComposing ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.metaKey
+  ) {
+    return undefined;
+  }
+  const key = namedKey(event.key);
+  return key === "ENTER" ? undefined : key;
 }
 
 /** Where a keydown landed, read from its DOM target. */
@@ -248,7 +274,11 @@ export function enterHandledNatively(target: PfKeyTarget | undefined): boolean {
   );
 }
 
-/** What a keydown means for a screen: a served key with its action, or an unserved F-key. */
+/**
+ * What a keydown means for a screen: a served key with its action, or an unserved F-key. An
+ * unserved Shift+F-key on a screen that does not fold shifted keys reports its unshifted F-key,
+ * because PF13–PF24 have no key of their own.
+ */
 export type PfKeyResolution =
   | { readonly kind: "handled"; readonly key: PfKey; readonly handler: () => void }
   | { readonly kind: "invalid"; readonly key: PfKey };
@@ -264,10 +294,11 @@ export interface PfKeyResolveOptions {
  *
  * Returns `handled` with the action when the screen serves the key, and `invalid` for an F-key it
  * does not serve when the screen shows the invalid-key message for those (the programs'
- * `WHEN OTHER`, `app/cbl/COSGN00C.cbl:91-94`). Returns `undefined`, leaving the event to the
- * browser, for every other event: no key, ENTER the browser already handles at `target`, ENTER
- * the screen does not serve (ENTER is never invalid), or an unserved F-key with no invalid-key
- * handling.
+ * `WHEN OTHER`, `app/cbl/COSGN00C.cbl:91-94`). Without `foldShifted`, Shift+F1…F12 is such an
+ * unserved key (PF13–PF24), never the F-key's action. Returns `undefined`, leaving the event to
+ * the browser, for every other event: no key, ENTER the browser already handles at `target`,
+ * ENTER the screen does not serve (ENTER is never invalid), or an unserved F-key with no
+ * invalid-key handling.
  */
 export function resolvePfKey(
   handlers: PfKeyHandlers,
@@ -275,8 +306,15 @@ export function resolvePfKey(
   options: PfKeyResolveOptions = {},
   target?: PfKeyTarget,
 ): PfKeyResolution | undefined {
-  const key = keyFromEvent(event, options.foldShifted ?? false);
-  if (key === undefined || (key === "ENTER" && enterHandledNatively(target))) {
+  const foldShifted = options.foldShifted ?? false;
+  const key = keyFromEvent(event, foldShifted);
+  if (key === undefined) {
+    const shifted = unfoldedShiftedFKey(event, foldShifted);
+    return shifted !== undefined && options.hasInvalidKeyHandler === true
+      ? { kind: "invalid", key: shifted }
+      : undefined;
+  }
+  if (key === "ENTER" && enterHandledNatively(target)) {
     return undefined;
   }
   const handler = handlers[key];
