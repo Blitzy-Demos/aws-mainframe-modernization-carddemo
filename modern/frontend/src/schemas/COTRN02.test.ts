@@ -19,6 +19,12 @@ import {
 /** Zod's default `max` message, which every length rejection carries. */
 const tooLong = (length: number): string => `String must contain at most ${length} character(s)`;
 
+type Issue = { path: (string | number)[]; message: string };
+
+/** The path and message of each issue of a rejected parse, in zod's order. */
+const issuesOf = (issues: readonly Issue[] | undefined): Issue[] =>
+  (issues ?? []).map(({ path, message }) => ({ path, message }));
+
 /** A synthetic card number, assembled from parts so no literal has the shape of one. */
 const CARD_NUM = ["4444", "3333", "2222", "1111"].join("");
 
@@ -93,6 +99,17 @@ describe("cotrn02KeySchema", () => {
     expect(over.error?.issues).toHaveLength(1);
     expect(over.error?.issues[0]).toMatchObject({ path: [field], message: tooLong(length) });
   });
+
+  // Each map LENGTH is a field attribute the terminal enforced on its own field, not a program
+  // edit whose first error stands, so both issues are reported, in map order: account first.
+  it("reports the account length first when both keys exceed their map LENGTH", () => {
+    const result = cotrn02KeySchema.safeParse({ acctId: "9".repeat(12), cardNum: "9".repeat(17) });
+    expect(result.success).toBe(false);
+    expect(issuesOf(result.error?.issues)).toEqual([
+      { path: ["acctId"], message: tooLong(11) },
+      { path: ["cardNum"], message: tooLong(16) },
+    ]);
+  });
 });
 
 describe("cotrn02Schema", () => {
@@ -160,5 +177,57 @@ describe("cotrn02Schema", () => {
     expect(over.success).toBe(false);
     expect(over.error?.issues).toHaveLength(1);
     expect(over.error?.issues[0]).toMatchObject({ path: [field], message: tooLong(length) });
+  });
+
+  // Every over-length field is reported, in map order, so the key's issues always come before
+  // the data fields' issues.
+  it("reports one issue for each field over its map LENGTH, in map order", () => {
+    const over: Cotrn02Values = {
+      acctId: "9".repeat(12),
+      cardNum: "9".repeat(17),
+      typeCode: "A".repeat(3),
+      categoryCode: "A".repeat(5),
+      source: "A".repeat(11),
+      description: "A".repeat(61),
+      amount: "A".repeat(13),
+      origDate: "A".repeat(11),
+      procDate: "A".repeat(11),
+      merchantId: "A".repeat(10),
+      merchantName: "A".repeat(31),
+      merchantCity: "A".repeat(26),
+      merchantZip: "A".repeat(11),
+      confirm: "A".repeat(2),
+    };
+    const result = cotrn02Schema.safeParse(over);
+    expect(result.success).toBe(false);
+    expect(issuesOf(result.error?.issues)).toEqual([
+      { path: ["acctId"], message: tooLong(11) },
+      { path: ["cardNum"], message: tooLong(16) },
+      { path: ["typeCode"], message: tooLong(2) },
+      { path: ["categoryCode"], message: tooLong(4) },
+      { path: ["source"], message: tooLong(10) },
+      { path: ["description"], message: tooLong(60) },
+      { path: ["amount"], message: tooLong(12) },
+      { path: ["origDate"], message: tooLong(10) },
+      { path: ["procDate"], message: tooLong(10) },
+      { path: ["merchantId"], message: tooLong(9) },
+      { path: ["merchantName"], message: tooLong(30) },
+      { path: ["merchantCity"], message: tooLong(25) },
+      { path: ["merchantZip"], message: tooLong(10) },
+      { path: ["confirm"], message: tooLong(1) },
+    ]);
+  });
+
+  it("reports an over-length card number before an over-length data field", () => {
+    // The input names the amount first, so the order shown is the schema's, not the input's.
+    const result = cotrn02Schema.safeParse({
+      ...FULL_VALUES,
+      amount: "-000000012.34",
+      cardNum: "9".repeat(17),
+    });
+    expect(issuesOf(result.error?.issues)).toEqual([
+      { path: ["cardNum"], message: tooLong(16) },
+      { path: ["amount"], message: tooLong(12) },
+    ]);
   });
 });
