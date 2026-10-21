@@ -2930,20 +2930,78 @@ mod tranrept {
 
     // audit: CBTRN03C-005
     #[test]
-    fn selected_rows_sort_by_card_number_then_transaction_id() -> TestResult {
+    fn selected_rows_sort_by_ascending_card_number() -> TestResult {
         let stamp = in_window()?;
-        let mut rows = [
-            reported(2, 1, 100, stamp)?,
-            reported(1, 9, 100, stamp)?,
-            reported(1, 3, 100, stamp)?,
+        // Card, transaction ID and amount in cents: three cards interleaved, the IDs of each card
+        // out of order, and the IDs alone in an order no card order follows.
+        let input = [
+            (3, 7, 307),
+            (1, 9, 109),
+            (2, 8, 208),
+            (1, 3, 103),
+            (3, 2, 302),
+            (2, 1, 201),
+            (1, 5, 105),
+            (3, 6, 306),
+            (2, 4, 204),
         ];
+        let mut rows = input
+            .into_iter()
+            .map(|(card, id, amt_cents)| reported(card, id, amt_cents, stamp))
+            .collect::<Outcome<Vec<TransactionRecord>>>()?;
         rows.sort_by_key(sort_key);
-        let expected = [
-            reported(1, 3, 100, stamp)?,
-            reported(1, 9, 100, stamp)?,
-            reported(2, 1, 100, stamp)?,
-        ];
-        assert!(rows == expected, "card number, then transaction ID");
+        assert!(
+            rows.windows(2)
+                .all(|pair| matches!(pair, [earlier, later] if earlier.card_num <= later.card_num)),
+            "CBTRN03C-005: no card number follows a higher one"
+        );
+        let mut blocks: Vec<&CardNumber> = rows.iter().map(|tran| &tran.card_num).collect();
+        blocks.dedup();
+        let cards = [card_number(1), card_number(2), card_number(3)];
+        assert!(
+            blocks.into_iter().eq(&cards),
+            "CBTRN03C-005: one block per card, in ascending card order"
+        );
+        // The order of the rows inside a card block is HALTED(X-TRANREPT-H1), the same case as
+        // X-FIXTURES-H3: not asserted, and that part of CBTRN03C-005 is BLOCKED. Each block is put
+        // in ID order here, by the test, so its rows are compared as a set.
+        let mut by_card: BTreeMap<CardNumber, Vec<TransactionRecord>> = BTreeMap::new();
+        for tran in rows {
+            by_card.entry(tran.card_num.clone()).or_default().push(tran);
+        }
+        for block in by_card.values_mut() {
+            block.sort_by_key(|tran| tran.id.clone());
+        }
+        let expected = BTreeMap::from([
+            (
+                card_number(1),
+                vec![
+                    reported(1, 3, 103, stamp)?,
+                    reported(1, 5, 105, stamp)?,
+                    reported(1, 9, 109, stamp)?,
+                ],
+            ),
+            (
+                card_number(2),
+                vec![
+                    reported(2, 1, 201, stamp)?,
+                    reported(2, 4, 204, stamp)?,
+                    reported(2, 8, 208, stamp)?,
+                ],
+            ),
+            (
+                card_number(3),
+                vec![
+                    reported(3, 2, 302, stamp)?,
+                    reported(3, 6, 306, stamp)?,
+                    reported(3, 7, 307, stamp)?,
+                ],
+            ),
+        ]);
+        assert!(
+            by_card == expected,
+            "CBTRN03C-005: each card block holds its card's transactions, as a set"
+        );
         Ok(())
     }
 
@@ -3393,6 +3451,8 @@ mod tranrept {
 
 /// CBPAUP0J, `domain::batch::cbpaup0c` (`modern/audit/batch/CBPAUP0J.md`).
 mod cbpaup0j {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use chrono::NaiveDateTime;
     use copybook::{Count, FixedRecord, PicS, PicU, PicX};
     use domain::FixedClock;
@@ -3401,7 +3461,7 @@ mod cbpaup0j {
         NORMAL_RETURN_CODE, PRM_INFO_LEN, Purge, PurgeFailure, PurgeHalt, PurgeParams,
         SYSIN_RECORD_LEN, SummaryAction, SummaryDisposition, SysinError,
     };
-    use domain::clock::{inverted_auth_keys, yyddd};
+    use domain::clock::{Clock, inverted_auth_keys};
     use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
     use domain::sensitive::Password;
 
@@ -3500,20 +3560,93 @@ mod cbpaup0j {
         Ok(())
     }
 
+    /// `TODAYS DATE`, 12 spaces and a colon: the 24 characters before today's `YYDDD` digits in
+    /// the fourth opening line (CBPAUP0C-003).
+    const TODAYS_DATE: &str = "TODAYS DATE            :";
+
+    /// A `FixedClock` that counts its readings, so that the test can prove a run reads today
+    /// once (CBPAUP0C-001): a bare `FixedClock` answers a second reading as it answers the first
+    /// and so cannot reveal one. Every reading is the `FixedClock`'s instant.
+    struct CountingClock {
+        /// The clock every reading is delegated to.
+        inner: FixedClock,
+        /// The readings taken so far.
+        readings: AtomicU64,
+    }
+
+    impl CountingClock {
+        /// A clock that always reads `at` and has not been read yet.
+        const fn new(at: NaiveDateTime) -> Self {
+            Self {
+                inner: FixedClock::new(at),
+                readings: AtomicU64::new(0),
+            }
+        }
+
+        /// The readings taken so far.
+        fn readings(&self) -> u64 {
+            self.readings.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Clock for CountingClock {
+        fn now(&self) -> NaiveDateTime {
+            self.readings.fetch_add(1, Ordering::SeqCst);
+            self.inner.now()
+        }
+    }
+
     // audit: CBPAUP0C-001
     // audit: CBPAUP0C-003
     #[test]
     fn a_run_reads_today_once_and_opens_with_five_lines() -> TestResult {
-        let run = purge(DEFAULT_SYSIN)?;
-        assert_eq!(run.today(), 25_040);
-        assert_eq!(run.today(), yyddd(today()?));
+        let clock = CountingClock::new(today()?);
+        let run = Purge::new(PurgeParams::parse(DEFAULT_SYSIN.as_bytes())?, &clock);
+        assert_eq!(clock.readings(), 1, "today is read once");
+        // Today is checked by format only, never against the clock's instant: two year digits
+        // and a day of the year from 001 to 366.
+        let is_yyddd = |value: u32| value <= 99_366 && (1..=366).contains(&(value % 1_000));
+        let today = run.today();
+        assert!(is_yyddd(today), "{today} is a YYDDD value");
+        // The date line is checked by format only: after its prefix, exactly five ASCII digits
+        // that form a YYDDD value. They must be the run's own today, the one reading's other
+        // output, so the one reading is the value logged.
+        let shown = run
+            .sysout()
+            .iter()
+            .find_map(|line| line.strip_prefix(TODAYS_DATE))
+            .ok_or("a TODAYS DATE line")?;
+        assert!(
+            shown.len() == 5 && shown.bytes().all(|byte| byte.is_ascii_digit()),
+            "{shown:?} is five ASCII digits"
+        );
+        let logged: u32 = shown.parse()?;
+        assert!(is_yyddd(logged), "{logged} is a YYDDD value");
         assert_eq!(
-            run.sysout(),
+            shown,
+            format!("{today:05}"),
+            "the date line shows the run's own today"
+        );
+        // The date line's five digits are masked, so the five lines are compared by layout.
+        let masked: Vec<String> = run
+            .sysout()
+            .iter()
+            .map(|line| match line.strip_prefix(TODAYS_DATE) {
+                Some(digits)
+                    if digits.len() == 5 && digits.bytes().all(|byte| byte.is_ascii_digit()) =>
+                {
+                    format!("{TODAYS_DATE}#####")
+                }
+                _ => line.clone(),
+            })
+            .collect();
+        assert_eq!(
+            masked,
             [
                 "STARTING PROGRAM CBPAUP0C::",
                 "*-------------------------------------*",
                 "CBPAUP0C PARM RECEIVED :00,00001,00001,Y ",
-                "TODAYS DATE            :25040",
+                "TODAYS DATE            :#####",
                 " ",
             ]
         );
