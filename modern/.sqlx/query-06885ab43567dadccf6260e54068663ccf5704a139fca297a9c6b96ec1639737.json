@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT group_id, tran_type_cd, tran_cat_cd, dis_int_rate, filler FROM disclosure_groups WHERE group_id = $1::bpchar AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "group_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "dis_int_rate",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "06885ab43567dadccf6260e54068663ccf5704a139fca297a9c6b96ec1639737"
+}

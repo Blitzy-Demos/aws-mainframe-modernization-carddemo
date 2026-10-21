@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE customers SET cust_first_name = $2, cust_middle_name = $3, cust_last_name = $4, cust_addr_line_1 = $5, cust_addr_line_2 = $6, cust_addr_line_3 = $7, cust_addr_state_cd = $8, cust_addr_country_cd = $9, cust_addr_zip = $10, cust_phone_num_1 = $11, cust_phone_num_2 = $12, cust_ssn = $13, cust_govt_issued_id = $14, cust_dob_yyyy_mm_dd = $15, cust_eft_account_id = $16, cust_pri_card_holder_ind = $17, cust_fico_credit_score = $18, filler = $19 WHERE cust_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Int8",
+        "Bpchar",
+        "Date",
+        "Bpchar",
+        "Bpchar",
+        "Int8",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "75a47416c9265b30d80ed74cba97159821b49cfd035c408508e2be1435b7223e"
+}

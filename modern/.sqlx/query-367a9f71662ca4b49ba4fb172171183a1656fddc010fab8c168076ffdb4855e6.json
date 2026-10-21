@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transaction_types (tran_type, tran_type_desc, filler) VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "367a9f71662ca4b49ba4fb172171183a1656fddc010fab8c168076ffdb4855e6"
+}

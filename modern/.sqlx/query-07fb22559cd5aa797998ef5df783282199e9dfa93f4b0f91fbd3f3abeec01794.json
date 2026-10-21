@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT trc_type_code, trc_type_category, trc_cat_data\n             FROM db2.transaction_type_category\n            WHERE trc_type_code = $1::bpchar\n            ORDER BY trc_type_category",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "trc_type_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "trc_type_category",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "trc_cat_data",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "07fb22559cd5aa797998ef5df783282199e9dfa93f4b0f91fbd3f3abeec01794"
+}

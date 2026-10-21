@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT card_num, cust_id, acct_id, filler FROM card_xref WHERE card_num = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f8f8c68035e2c3289f5d5677559ec6d894c6ed299e190fc354a73a0aca13222f"
+}

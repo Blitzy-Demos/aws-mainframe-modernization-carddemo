@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM db2.transaction_type WHERE tr_type = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "594a32ed13af9c293f23d511b7aba8b37ea77816c58bc06d5a5c6c92f6f3eef8"
+}

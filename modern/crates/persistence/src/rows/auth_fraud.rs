@@ -282,8 +282,9 @@ fn char_bind<const N: usize>(
 /// The column keeps microseconds, and `sqlx` drops any finer part when it binds the value, so a
 /// sub-microsecond part or a leap second would read back as another instant. Such a value is
 /// refused, never moved (R7). Every `auth_ts` the domain builds is a whole number of
-/// milliseconds (COPAUS2C-004), so none is refused in practice.
-fn storable_timestamp(value: NaiveDateTime) -> Result<NaiveDateTime, PersistenceError> {
+/// milliseconds (COPAUS2C-004), so none is refused in practice. The repository applies the same
+/// check to the key of its update and its read, so no key is moved to another instant either.
+pub(crate) fn storable_timestamp(value: NaiveDateTime) -> Result<NaiveDateTime, PersistenceError> {
     let nanos = value.nanosecond();
     if nanos < NANOS_PER_SECOND && nanos % NANOS_PER_MICRO == 0 {
         Ok(value)

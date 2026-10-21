@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO db2.transaction_type (tr_type, tr_description) VALUES ($1, $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c8998970d4120699f12d2a0934b320c788a390ba5970df52410e6e1c1ed50081"
+}

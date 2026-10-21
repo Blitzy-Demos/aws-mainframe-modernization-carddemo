@@ -1,0 +1,173 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type, message_source,\n                auth_id_code, auth_resp_code, auth_resp_reason, processing_code, transaction_amt,\n                approved_amt, merchant_catagory_code, acqr_country_code, pos_entry_mode,\n                merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip,\n                transaction_id, match_status, auth_fraud, fraud_rpt_date, acct_id, cust_id\n         FROM auth_fraud\n         WHERE card_num = $1 AND auth_ts = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "auth_ts",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 2,
+        "name": "auth_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "card_expiry_date",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "message_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "message_source",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "auth_id_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "auth_resp_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "auth_resp_reason",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "processing_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "transaction_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 11,
+        "name": "approved_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 12,
+        "name": "merchant_catagory_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "acqr_country_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "pos_entry_mode",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 15,
+        "name": "merchant_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 16,
+        "name": "merchant_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 17,
+        "name": "merchant_city",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 18,
+        "name": "merchant_state",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 19,
+        "name": "merchant_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "transaction_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 21,
+        "name": "match_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "auth_fraud",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 23,
+        "name": "fraud_rpt_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 24,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 25,
+        "name": "cust_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "85255802015b390481e67de00dde14456006263c3c30eb04af0085283bdd8063"
+}

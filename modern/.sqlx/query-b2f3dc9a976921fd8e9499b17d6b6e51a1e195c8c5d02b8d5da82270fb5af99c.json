@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE auth_fraud SET auth_fraud = $1, fraud_rpt_date = $2\n         WHERE card_num = $3 AND auth_ts = $4",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Date",
+        "Bpchar",
+        "Timestamp"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b2f3dc9a976921fd8e9499b17d6b6e51a1e195c8c5d02b8d5da82270fb5af99c"
+}

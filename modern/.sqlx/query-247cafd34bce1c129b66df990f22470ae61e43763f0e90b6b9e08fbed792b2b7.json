@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tran_type_cd, tran_cat_cd, tran_cat_type_desc, filler FROM transaction_categories WHERE tran_type_cd = $1 AND tran_cat_cd = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tran_type_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_cat_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_type_desc",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "247cafd34bce1c129b66df990f22470ae61e43763f0e90b6b9e08fbed792b2b7"
+}

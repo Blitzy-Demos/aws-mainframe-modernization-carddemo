@@ -1,0 +1,130 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cust_id, cust_first_name, cust_middle_name, cust_last_name, cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, cust_addr_state_cd, cust_addr_country_cd, cust_addr_zip, cust_phone_num_1, cust_phone_num_2, cust_ssn, cust_govt_issued_id, cust_dob_yyyy_mm_dd, cust_eft_account_id, cust_pri_card_holder_ind, cust_fico_credit_score, filler FROM customers WHERE cust_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cust_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_first_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "cust_middle_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "cust_last_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "cust_addr_line_1",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "cust_addr_line_2",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "cust_addr_line_3",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "cust_addr_state_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "cust_addr_country_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "cust_addr_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "cust_phone_num_1",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "cust_phone_num_2",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "cust_ssn",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "cust_govt_issued_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 14,
+        "name": "cust_dob_yyyy_mm_dd",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 15,
+        "name": "cust_eft_account_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 16,
+        "name": "cust_pri_card_holder_ind",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 17,
+        "name": "cust_fico_credit_score",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ca349911dad0c1c950d70a6445df3e4a0503e4f039264d8b22eb46c8ebfdbd8c"
+}

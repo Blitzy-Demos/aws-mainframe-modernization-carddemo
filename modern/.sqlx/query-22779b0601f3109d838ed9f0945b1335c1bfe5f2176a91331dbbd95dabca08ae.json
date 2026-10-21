@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_auth_summaries WHERE acct_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "22779b0601f3109d838ed9f0945b1335c1bfe5f2176a91331dbbd95dabca08ae"
+}

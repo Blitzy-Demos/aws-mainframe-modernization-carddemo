@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tr_type, tr_description FROM db2.transaction_type WHERE tr_type = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tr_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tr_description",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ab5a9c71d5da69de1eecab37d948e96ae865b8430f4f75ce961c584bd8e66baf"
+}

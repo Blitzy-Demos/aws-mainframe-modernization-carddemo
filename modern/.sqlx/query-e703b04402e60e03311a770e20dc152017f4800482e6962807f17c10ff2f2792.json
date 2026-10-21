@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO cards (card_num, acct_id, card_cvv_cd, card_embossed_name,\n               card_expiraion_date, card_active_status, filler)\n           VALUES ($1, $2, $3, $4, $5, $6, $7)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8",
+        "Int8",
+        "Bpchar",
+        "Date",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e703b04402e60e03311a770e20dc152017f4800482e6962807f17c10ff2f2792"
+}

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COUSR00C PROCESS-PAGE-FORWARD (app/cbl/COUSR00C.cbl:282-331): STARTBR (default GTEQ, 586-614)\n-- + READNEXT (619-648) over USRSEC by SEC-USR-ID (KEYS(8,0), app/jcl/DUSRSECJ.jcl:65), in\n-- ascending key byte order, which is the \"C\" collation migration 0003 gives usr_id. Audit rows\n-- COUSR00C-013 to COUSR00C-018. Only the four columns POPULATE-USER-DATA shows are read, and no\n-- credential column. Endpoint 16 GET /api/v1/users [A]. Rule: Bounded Pagination (users_pkey).\n-- Parameters: 1 start user ID, inclusive (empty for the LOW-VALUES first page), 2 row limit.\nSELECT\n    usr_id,\n    usr_fname,\n    usr_lname,\n    usr_type\nFROM users\nWHERE usr_id >= $1::bpchar\nORDER BY usr_id ASC\nLIMIT $2::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "usr_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "usr_fname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "usr_lname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "usr_type",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "da62881b66fe5bda9321f14de0a45f4dc8891f405b361e455c2b20dcafee1b1e"
+}

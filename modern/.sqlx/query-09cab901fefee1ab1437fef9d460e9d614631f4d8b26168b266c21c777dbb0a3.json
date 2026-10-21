@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_auth_details SET auth_orig_date = $4, auth_orig_time = $5, card_num = $6, auth_type = $7, card_expiry_date = $8, message_type = $9, message_source = $10, auth_id_code = $11, auth_resp_code = $12, auth_resp_reason = $13, processing_code = $14, transaction_amt = $15, approved_amt = $16, merchant_catagory_code = $17, acqr_country_code = $18, pos_entry_mode = $19, merchant_id = $20, merchant_name = $21, merchant_city = $22, merchant_state = $23, merchant_zip = $24, transaction_id = $25, match_status = $26, auth_fraud = $27, fraud_rpt_date = $28, filler = $29 WHERE acct_id = $1 AND auth_date_9c = $2 AND auth_time_9c = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Int8",
+        "Numeric",
+        "Numeric",
+        "Bpchar",
+        "Bpchar",
+        "Int8",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "09cab901fefee1ab1437fef9d460e9d614631f4d8b26168b266c21c777dbb0a3"
+}

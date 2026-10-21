@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM pending_auth_details WHERE acct_id = $1 AND auth_date_9c = $2 AND auth_time_9c = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "593df4bdaef9b7ab06c2d4a7f40630179bb6d16161e51be9684ef68be7e32a5b"
+}

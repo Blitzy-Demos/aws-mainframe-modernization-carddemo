@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM transaction_categories",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "2b50f1799aa39204a165f84d3094d651f8012223267721efa2acfb0a51bf071b"
+}

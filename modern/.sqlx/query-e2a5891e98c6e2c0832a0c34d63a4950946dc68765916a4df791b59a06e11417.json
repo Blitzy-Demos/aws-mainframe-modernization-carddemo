@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COTRN00C PROCESS-PAGE-BACKWARD (app/cbl/COTRN00C.cbl:333-375): STARTBR (default GTEQ, 591-619)\n-- + READPREV (658-687) over TRANSACT by TRAN-ID, descending. A READPREV straight after STARTBR\n-- returns the start record, so the read is inclusive. The caller drops that record where the\n-- program's skip READPREV does (339-341). Audit rows COTRN00C-023 to COTRN00C-026.\n-- Endpoint 11 GET /api/v1/transactions (PF7). Rule: Bounded Pagination (served by transactions_pkey).\n-- Parameters: 1 start transaction ID (inclusive), 2 limit.\n-- Parameter 1 is bpchar, never text: a text operand casts tran_id to text, and the primary key\n-- then only orders the scan instead of positioning it at the start ID.\nSELECT\n    tran_id,\n    tran_type_cd,\n    tran_cat_cd,\n    tran_source,\n    tran_desc,\n    tran_amt,\n    tran_merchant_id,\n    tran_merchant_name,\n    tran_merchant_city,\n    tran_merchant_zip,\n    card_num,\n    orig_ts,\n    orig_ts_form,\n    proc_ts,\n    proc_ts_form,\n    filler\nFROM transactions\nWHERE tran_id <= $1::bpchar\nORDER BY tran_id DESC\nLIMIT $2::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tran_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_source",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "tran_desc",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "tran_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "tran_merchant_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "tran_merchant_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "tran_merchant_city",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "tran_merchant_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "orig_ts",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 12,
+        "name": "orig_ts_form",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "proc_ts",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 14,
+        "name": "proc_ts_form",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "e2a5891e98c6e2c0832a0c34d63a4950946dc68765916a4df791b59a06e11417"
+}
