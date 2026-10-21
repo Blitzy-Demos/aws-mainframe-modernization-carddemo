@@ -1,20 +1,32 @@
 import { describe, expect, it } from "vitest";
 import {
+  type CoactupKeyState,
+  type CocrdupKeyState,
+  type CotrtupKeyState,
   KEY_ROWS,
   type KeyRowMap,
   type KeyRowSpec,
   PF_KEYS,
   type PfKey,
+  type PfKeyAvailability,
   type PfKeyEventLike,
   type PfKeyHandlers,
   type PfKeyItem,
   type PfKeyLabel,
   type PfKeyResolution,
   type PfKeyResolveOptions,
+  type PfKeyRole,
+  type PfKeyRoleActions,
   type PfKeyTarget,
+  type ShownPfKeyItem,
+  bindPfKeys,
+  coactupKeys,
+  cocrdupKeys,
+  cotrtupKeys,
   enterHandledNatively,
   keyFromEvent,
   keyRowItems,
+  keyRowItemsFor,
   parseKeyRow,
   resolvePfKey,
 } from "./pfkeys";
@@ -34,6 +46,14 @@ import {
  * maps and the PF-key rows of `modern/audit/screens.md`, and every set of served keys from the AID
  * `EVALUATE` rows of `modern/audit/online/<PROGRAM>.md`; none is read from `KEY_ROWS`. The header
  * texts are written by hand from `COTTL01Y`, `CSMSG01Y` and `CSDAT01Y`.
+ *
+ * COACTUP, COCRDUP and COTRTUP decide their keys by program state. For every state of each, the
+ * role of all 13 keys, the labels shown and the action each key and Shift+key runs are written by
+ * hand from the audit rows each case's comment names (among them COACTUPC-003, COACTUPC-006,
+ * COACTUPC-082, COCRDUPC-005, COCRDUPC-008 and COTRTUPC-042), never computed from `coactupKeys`,
+ * `cocrdupKeys` or `cotrtupKeys`, and checked against those functions, `keyRowItemsFor` and
+ * `bindPfKeys`. Sessions then walk each screen from state to state: labels hidden, shown and hidden
+ * again, keys refused, and resets that bring back the fresh screen's labels.
  *
  * `usePfKeys` needs React and a DOM, which this Node project does not provide; the decisions it
  * delegates to (`resolvePfKey`, `keyFromEvent`, `enterHandledNatively`) are proved here, and the
@@ -181,6 +201,118 @@ function resolveShifted(
     foldShifted: KEY_ROWS[map].foldShifted,
     hasInvalidKeyHandler: true,
   });
+}
+
+/**
+ * The hand-written keys of one state of a state-keyed screen: the keys that run their own action,
+ * the keys that start the screen over, the role of every other key, and the keys whose labels
+ * show.
+ */
+interface StateKeys<State extends string> {
+  readonly state: State;
+  readonly own: readonly PfKey[];
+  readonly reset?: readonly PfKey[];
+  readonly others: PfKeyRole;
+  readonly shown: readonly PfKey[];
+}
+
+/** The role `expected` gives `key`. */
+function roleIn(expected: StateKeys<string>, key: PfKey): PfKeyRole {
+  if (expected.own.includes(key)) {
+    return "own";
+  }
+  return expected.reset?.includes(key) === true ? "reset" : expected.others;
+}
+
+/** What runs for `key` in `role`, as `boundScreen` records it. */
+function runOf(key: PfKey, role: PfKeyRole): string {
+  switch (role) {
+    case "own":
+      return key;
+    case "enter":
+      return "ENTER";
+    case "reset":
+      return "reset";
+    case "invalid":
+      return `invalid ${key}`;
+  }
+}
+
+/**
+ * Binds every key of `availability` as a state-keyed screen does, to actions that record what
+ * ran: a key's own action records the key, the reset `reset`, the invalid-key message
+ * `invalid <key>`. Asserts that binding runs nothing, and returns a press: it resolves the keydown
+ * of `key`, with Shift when `shiftKey`, as `usePfKeys` does with `map`'s shifted-key folding and
+ * the invalid-key path on, runs the resolved action, and returns what ran.
+ */
+function boundScreen(
+  map: KeyRowMap,
+  availability: PfKeyAvailability,
+): (key: PfKey, shiftKey?: boolean) => string[] {
+  const ran: string[] = [];
+  const own: PfKeyHandlers = {};
+  for (const key of PF_KEYS) {
+    own[key] = () => {
+      ran.push(key);
+    };
+  }
+  const handlers = bindPfKeys(availability, {
+    own,
+    reset: () => {
+      ran.push("reset");
+    },
+    invalid: (key) => {
+      ran.push(`invalid ${key}`);
+    },
+  });
+  expect(ran, `${map}: binding runs no action`).toEqual([]);
+  const options: PfKeyResolveOptions = {
+    foldShifted: KEY_ROWS[map].foldShifted,
+    hasInvalidKeyHandler: true,
+  };
+  return (key, shiftKey = false) => {
+    const resolution = resolvePfKey(handlers, keydown(eventKeyOf(key), { shiftKey }), options);
+    if (resolution?.kind === "handled") {
+      resolution.handler();
+    } else if (resolution !== undefined) {
+      // Every key is bound; one that is not records an entry no expectation holds.
+      ran.push(`unbound ${resolution.key}`);
+    }
+    return ran.splice(0);
+  };
+}
+
+/**
+ * Asserts one state of `map`'s screen against the hand-written `expected`: the role of every key;
+ * the shown keys and the row-24 labels in map order with their DRK flags (`labels`), each shown or
+ * hidden; and that each key and Shift+key runs the action of its role (the three state-keyed maps
+ * fold shifted keys), Shift+Enter being no key.
+ */
+function expectStateKeys(
+  map: KeyRowMap,
+  labels: readonly ExpectedLabel[],
+  availability: PfKeyAvailability,
+  expected: StateKeys<string>,
+): void {
+  const at = `${map} state ${expected.state}`;
+  expect(availability.roles, at).toEqual(
+    Object.fromEntries(PF_KEYS.map((key): [PfKey, PfKeyRole] => [key, roleIn(expected, key)])),
+  );
+  expect(availability.shown, at).toEqual(new Set(expected.shown));
+  const items = labels.map(([key, label, dark]): ShownPfKeyItem => ({
+    key,
+    label,
+    dark,
+    shown: expected.shown.includes(key),
+  }));
+  expect(keyRowItemsFor(map, availability), at).toEqual(items);
+  expect(keyRowItemsFor(KEY_ROWS[map], availability), at).toEqual(items);
+  const press = boundScreen(map, availability);
+  for (const key of PF_KEYS) {
+    const runs = [runOf(key, roleIn(expected, key))];
+    expect(press(key), `${at} ${key}`).toEqual(runs);
+    expect(press(key, true), `${at} Shift+${key}`).toEqual(key === "ENTER" ? [] : runs);
+  }
 }
 
 describe("PF_KEYS", () => {
@@ -416,6 +548,37 @@ describe("row-24 labels and key bindings of the screens whose programs fold no s
   });
 });
 
+/** COACTUP's row 24 (`COACTUP.bms:493-507`): `FKEYS`, then the dark `FKEY05` and `FKEY12`. */
+const COACTUP_LABELS: readonly ExpectedLabel[] = [
+  ["ENTER", "ENTER=Process", false],
+  ["F3", "F3=Exit", false],
+  ["F5", "F5=Save", true],
+  ["F12", "F12=Cancel", true],
+];
+
+/** COCRDUP's row 24 (`COCRDUP.bms:158-167`): `FKEYS`, then the one dark field `FKEYSC`. */
+const COCRDUP_LABELS: readonly ExpectedLabel[] = [
+  ["ENTER", "ENTER=Process", false],
+  ["F3", "F3=Exit", false],
+  ["F5", "F5=Save", true],
+  ["F12", "F12=Cancel", true],
+];
+
+/**
+ * COTRTUP's row 24 (`COTRTUP.bms:111-135`): `FKEYS`, then the dark `FKEY04`, `FKEY05`, `FKEY06`
+ * and `FKEY12`.
+ */
+const COTRTUP_LABELS: readonly ExpectedLabel[] = [
+  ["ENTER", "ENTER=Process", false],
+  ["F3", "F3=Exit", false],
+  ["F4", "F4=Delete", true],
+  ["F5", "F5=Save", true],
+  // The map's dark FKEY06 text; COTRTUPC never shows or accepts it (COTRTUP-036, X-SCREENS-12):
+  // no state below shows F6 or gives it its own action.
+  ["F6", "F6=Add", true],
+  ["F12", "F12=Cancel", true],
+];
+
 describe("row-24 labels and key bindings of the screens whose programs COPY CSSTRPFY", () => {
   // audit: COACTVW-107
   // audit: COACTVWC-003
@@ -430,25 +593,41 @@ describe("row-24 labels and key bindings of the screens whose programs COPY CSST
     });
   });
 
+  // audit: COACTUP-127
+  // audit: COACTUP-128
   // audit: COACTUP-135
   // audit: COACTUP-136
   // audit: COACTUP-137
   // audit: COACTUP-138
   // audit: COACTUPC-003
-  it("COACTUP labels ENTER and F3, then the dark F5=Save and F12=Cancel, by state", () => {
-    expectLabels("COACTUP", [
-      ["ENTER", "ENTER=Process", false],
-      ["F3", "F3=Exit", false],
-      ["F5", "F5=Save", true],
-      ["F12", "F12=Cancel", true],
-    ]);
-    // No details shown: ENTER and F3; F5 and F12 are processed as ENTER.
-    expectServes("COACTUP", ["ENTER", "F3"]);
-    // Details shown: F12 as well.
-    expectServes("COACTUP", ["ENTER", "F3", "F12"]);
-    // Awaiting confirmation (state N): F5 as well.
-    expectServes("COACTUP", ["ENTER", "F3", "F5", "F12"]);
-  });
+  // audit: COACTUPC-006
+  // audit: COACTUPC-069
+  // audit: COACTUPC-083
+  it.each<StateKeys<CoactupKeyState>>([
+    // COACTUPC-001, COACTUPC-003: before a fetch F5 and F12 are ENTER, and neither label shows.
+    { state: "not-fetched", own: ["ENTER", "F3"], others: "enter", shown: ["ENTER", "F3"] },
+    // COACTUPC-069: F12 cancels once details show; its label shows only after a change
+    // (COACTUPC-082).
+    { state: "S", own: ["ENTER", "F3", "F12"], others: "enter", shown: ["ENTER", "F3"] },
+    { state: "E", own: ["ENTER", "F3", "F12"], others: "enter", shown: ["ENTER", "F3", "F12"] },
+    // COACTUPC-003, COACTUPC-082: F5 saves, and shows, only while changes await confirmation.
+    {
+      state: "N",
+      own: ["ENTER", "F3", "F5", "F12"],
+      others: "enter",
+      shown: ["ENTER", "F3", "F5", "F12"],
+    },
+    // COACTUPC-006, COACTUPC-083: every key but F3 starts over; F12=Cancel shows in L and F.
+    { state: "C", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "L", own: ["F3"], others: "reset", shown: ["ENTER", "F3", "F12"] },
+    { state: "F", own: ["F3"], others: "reset", shown: ["ENTER", "F3", "F12"] },
+  ])(
+    "COACTUP in state $state labels ENTER and F3, then the dark F5=Save and F12=Cancel, by state",
+    (expected) => {
+      expectLabels("COACTUP", COACTUP_LABELS);
+      expectStateKeys("COACTUP", COACTUP_LABELS, coactupKeys(expected.state), expected);
+    },
+  );
 
   // audit: COCRDLI-079
   // audit: COCRDLI-080
@@ -493,24 +672,39 @@ describe("row-24 labels and key bindings of the screens whose programs COPY CSST
     expectServes("COCRDSL", ["ENTER", "F3"]);
   });
 
+  // audit: COCRDUP-034
   // audit: COCRDUP-041
   // audit: COCRDUP-042
   // audit: COCRDUP-043
   // audit: COCRDUP-044
+  // audit: COCRDUPC-005
+  // audit: COCRDUPC-006
   // audit: COCRDUPC-008
-  it("COCRDUP labels ENTER and F3, then the dark F5=Save F12=Cancel field, by state", () => {
-    expectLabels("COCRDUP", [
-      ["ENTER", "ENTER=Process", false],
-      ["F3", "F3=Exit", false],
-      ["F5", "F5=Save", true],
-      ["F12", "F12=Cancel", true],
-    ]);
-    // Before a fetch: ENTER and F3; F5 and F12 are submitted as ENTER.
-    expectServes("COCRDUP", ["ENTER", "F3"]);
-    // After a fetch: F12 as well; F5 only while confirmation is asked.
-    expectServes("COCRDUP", ["ENTER", "F3", "F12"]);
-    expectServes("COCRDUP", ["ENTER", "F3", "F5", "F12"]);
-  });
+  it.each<StateKeys<CocrdupKeyState>>([
+    // COCRDUPC-001, COCRDUPC-008: before a fetch F5 and F12 are submitted as ENTER, unlabelled.
+    { state: "not-fetched", own: ["ENTER", "F3"], others: "enter", shown: ["ENTER", "F3"] },
+    // COCRDUPC-006: F12 cancels once details show; the one dark field shows only in N
+    // (COCRDUP-034).
+    { state: "S", own: ["ENTER", "F3", "F12"], others: "enter", shown: ["ENTER", "F3"] },
+    { state: "E", own: ["ENTER", "F3", "F12"], others: "enter", shown: ["ENTER", "F3"] },
+    {
+      state: "N",
+      own: ["ENTER", "F3", "F5", "F12"],
+      others: "enter",
+      shown: ["ENTER", "F3", "F5", "F12"],
+    },
+    // COCRDUPC-005: on the result of C, L or F every key but F3 starts over (COCRDUPC-039: no
+    // F5 or F12 label).
+    { state: "C", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "L", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "F", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+  ])(
+    "COCRDUP in state $state labels ENTER and F3, then the dark F5=Save F12=Cancel field, by state",
+    (expected) => {
+      expectLabels("COCRDUP", COCRDUP_LABELS);
+      expectStateKeys("COCRDUP", COCRDUP_LABELS, cocrdupKeys(expected.state), expected);
+    },
+  );
 
   // audit: COTRTLI-088
   // audit: COTRTLI-089
@@ -529,30 +723,453 @@ describe("row-24 labels and key bindings of the screens whose programs COPY CSST
     expectServes("COTRTLI", ["ENTER", "F2", "F3", "F7", "F8", "F10"]);
   });
 
+  // audit: COTRTUP-021
+  // audit: COTRTUP-022
+  // audit: COTRTUP-023
+  // audit: COTRTUP-025
   // audit: COTRTUP-032
   // audit: COTRTUP-033
   // audit: COTRTUP-034
   // audit: COTRTUP-035
   // audit: COTRTUP-037
+  // audit: COTRTUPC-003
+  // audit: COTRTUPC-013
+  // audit: COTRTUPC-014
+  // audit: COTRTUPC-015
+  // audit: COTRTUPC-022
+  // audit: COTRTUPC-030
+  // audit: COTRTUPC-031
+  // audit: COTRTUPC-035
+  // audit: COTRTUPC-036
+  // audit: COTRTUPC-039
+  // audit: COTRTUPC-040
+  // audit: COTRTUPC-041
   // audit: COTRTUPC-042
-  it("COTRTUP labels ENTER and F3, then dark F4, F5, F6 and F12; COTRTUPC accepts by state", () => {
-    expectLabels("COTRTUP", [
-      ["ENTER", "ENTER=Process", false],
-      ["F3", "F3=Exit", false],
-      ["F4", "F4=Delete", true],
-      ["F5", "F5=Save", true],
-      // The map's dark FKEY06 text; COTRTUPC never shows or serves it (COTRTUP-036, X-SCREENS-12),
-      // which the screen's render test proves.
-      ["F6", "F6=Add", true],
-      ["F12", "F12=Cancel", true],
-    ]);
-    // State S (details shown): F3, ENTER, F4 and F12.
-    expectServes("COTRTUP", ["ENTER", "F3", "F4", "F12"]);
-    // State N (confirm save): F3, ENTER, F5 and F12.
-    expectServes("COTRTUP", ["ENTER", "F3", "F5", "F12"]);
-    // State 9 (confirm delete): F3, F4, F5 and F12; ENTER is not served, so it stays with the
-    // screen's form, never the invalid-key path.
-    expectServes("COTRTUP", ["F3", "F4", "F5", "F12"]);
+  it.each<StateKeys<CotrtupKeyState>>([
+    // COTRTUPC-003: the fresh screen shows ENTER=Process and F3=Exit alone.
+    { state: "fresh", own: ["ENTER", "F3"], others: "invalid", shown: ["ENTER", "F3"] },
+    // COTRTUPC-014, COTRTUPC-015, COTRTUPC-041: not found: F5 adds, F12 starts over.
+    {
+      state: "X",
+      own: ["ENTER", "F3", "F5"],
+      reset: ["F12"],
+      others: "invalid",
+      shown: ["ENTER", "F3", "F5", "F12"],
+    },
+    // COTRTUPC-013, COTRTUPC-031, COTRTUPC-041: details shown: F4 asks to delete, F12 starts over.
+    {
+      state: "S",
+      own: ["ENTER", "F3", "F4"],
+      reset: ["F12"],
+      others: "invalid",
+      shown: ["ENTER", "F3", "F4", "F12"],
+    },
+    // COTRTUPC-015, COTRTUPC-041: a new type: F12 starts over.
+    {
+      state: "R",
+      own: ["ENTER", "F3"],
+      reset: ["F12"],
+      others: "invalid",
+      shown: ["ENTER", "F3", "F12"],
+    },
+    // COTRTUPC-018, COTRTUPC-042: an edit error: ENTER and F3 alone.
+    { state: "E", own: ["ENTER", "F3"], others: "invalid", shown: ["ENTER", "F3"] },
+    // COTRTUPC-022, COTRTUPC-039: changes await confirmation: F5 saves, F12 cancels.
+    {
+      state: "N",
+      own: ["ENTER", "F3", "F5", "F12"],
+      others: "invalid",
+      shown: ["ENTER", "F3", "F5", "F12"],
+    },
+    // COTRTUPC-039: cancelled over fetched values, with no F4, F5 or F12 label.
+    { state: "B", own: ["ENTER", "F3"], others: "invalid", shown: ["ENTER", "F3"] },
+    // COTRTUPC-039, COTRTUPC-042: cancelled over blank old values: every key but F3 starts over.
+    { state: "B-blank", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    // COTRTUPC-031, COTRTUPC-036, COTRTUPC-040, COTRTUPC-042: a delete to confirm: ENTER is
+    // invalid, its label dark with F3's; F5 is accepted although dark.
+    { state: "9", own: ["F3", "F4", "F5", "F12"], others: "invalid", shown: ["F4", "F12"] },
+    // COTRTUPC-035: a delete refused for child records: ENTER and F5 accepted, F4 and F12 invalid.
+    { state: "8", own: ["ENTER", "F3", "F5"], others: "invalid", shown: ["ENTER", "F3"] },
+    // COTRTUPC-030: after a delete done or failed, changes done or a lock error, every key but F3
+    // starts over.
+    { state: "7", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "6", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "C", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+    { state: "L", own: ["F3"], others: "reset", shown: ["ENTER", "F3"] },
+  ])(
+    "COTRTUP in state $state labels ENTER, F3 and dark F4, F5, F6, F12; COTRTUPC accepts by state",
+    (expected) => {
+      expectLabels("COTRTUP", COTRTUP_LABELS);
+      expectStateKeys("COTRTUP", COTRTUP_LABELS, cotrtupKeys(expected.state), expected);
+    },
+  );
+});
+
+/** One step of a screen session: the state, the labels it shows, a key pressed and what ran. */
+interface SessionStep<State extends string> {
+  readonly state: State;
+  readonly shows: readonly string[];
+  readonly press: PfKey;
+  readonly runs: string;
+}
+
+/** A session on one of the three state-keyed screens, its steps in order. */
+type SessionCase =
+  | {
+      readonly title: string;
+      readonly map: "COACTUP";
+      readonly steps: readonly SessionStep<CoactupKeyState>[];
+    }
+  | {
+      readonly title: string;
+      readonly map: "COCRDUP";
+      readonly steps: readonly SessionStep<CocrdupKeyState>[];
+    }
+  | {
+      readonly title: string;
+      readonly map: "COTRTUP";
+      readonly steps: readonly SessionStep<CotrtupKeyState>[];
+    };
+
+/** One step of a session with the availability its state has. */
+type StepKeys = readonly [step: SessionStep<string>, availability: PfKeyAvailability];
+
+/** Each step of `session` with the availability of its state, from the map's state policy. */
+function sessionKeys(session: SessionCase): StepKeys[] {
+  switch (session.map) {
+    case "COACTUP":
+      return session.steps.map((step): StepKeys => [step, coactupKeys(step.state)]);
+    case "COCRDUP":
+      return session.steps.map((step): StepKeys => [step, cocrdupKeys(step.state)]);
+    case "COTRTUP":
+      return session.steps.map((step): StepKeys => [step, cotrtupKeys(step.state)]);
+  }
+}
+
+describe("sessions on the screens whose programs decide keys by state", () => {
+  // audit: COACTUPC-003
+  // audit: COACTUPC-006
+  // audit: COACTUPC-083
+  // audit: COCRDUPC-005
+  // audit: COCRDUPC-006
+  // audit: COCRDUPC-008
+  // audit: COTRTUPC-015
+  // audit: COTRTUPC-030
+  // audit: COTRTUPC-031
+  // audit: COTRTUPC-035
+  // audit: COTRTUPC-039
+  // audit: COTRTUPC-040
+  // audit: COTRTUPC-041
+  // audit: COTRTUPC-042
+  it.each<SessionCase>([
+    {
+      title: "COACTUP: F5 and F12 show, then reset",
+      map: "COACTUP",
+      steps: [
+        // COACTUPC-011: ENTER fetches; the details show in state S.
+        {
+          state: "not-fetched",
+          shows: ["ENTER=Process", "F3=Exit"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        // COACTUPC-003: F5 before confirmation validates as ENTER; an edit fails (state E).
+        { state: "S", shows: ["ENTER=Process", "F3=Exit"], press: "F5", runs: "ENTER" },
+        {
+          state: "E",
+          shows: ["ENTER=Process", "F3=Exit", "F12=Cancel"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        // The changes validate (state N); F5 saves them (state C).
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        // COACTUPC-006: any key but F3 starts over, back to the first labels.
+        { state: "C", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "reset" },
+        { state: "not-fetched", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "ENTER" },
+      ],
+    },
+    {
+      title: "COCRDUP: cancel, save, then reset",
+      map: "COCRDUP",
+      steps: [
+        {
+          state: "not-fetched",
+          shows: ["ENTER=Process", "F3=Exit"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        { state: "S", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        // COCRDUPC-006: F12 discards the validated changes (state S again).
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F12",
+          runs: "F12",
+        },
+        { state: "S", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        // COCRDUPC-005: after the save any key but F3 starts over.
+        { state: "C", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "reset" },
+        { state: "not-fetched", shows: ["ENTER=Process", "F3=Exit"], press: "F5", runs: "ENTER" },
+      ],
+    },
+    {
+      title: "COTRTUP: add a type not found, reset",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-010: the fetch finds nothing (state X).
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        {
+          state: "X",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F4",
+          runs: "invalid F4",
+        },
+        // COTRTUPC-015: F5 starts a new type (state R).
+        {
+          state: "X",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        // COTRTUPC-020, COTRTUPC-021: ENTER validates it (state N); F5 inserts it (state C).
+        {
+          state: "R",
+          shows: ["ENTER=Process", "F3=Exit", "F12=Cancel"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        // COTRTUPC-030: any key but F3 gives the fresh screen.
+        { state: "C", shows: ["ENTER=Process", "F3=Exit"], press: "F5", runs: "reset" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "F5", runs: "invalid F5" },
+      ],
+    },
+    {
+      title: "COTRTUP: F12 on not found starts over",
+      map: "COTRTUP",
+      steps: [
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        // COTRTUPC-041: F12 in state X gives the fresh screen.
+        {
+          state: "X",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F12",
+          runs: "reset",
+        },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "invalid F12" },
+      ],
+    },
+    {
+      title: "COTRTUP: delete asked, ENTER invalid",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-009: the fetch finds the type (state S); COTRTUPC-031: F4 asks to delete it.
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        {
+          state: "S",
+          shows: ["ENTER=Process", "F3=Exit", "F4=Delete", "F12=Cancel"],
+          press: "F4",
+          runs: "F4",
+        },
+        // COTRTUPC-042: ENTER is no key of state 9; COTRTUPC-040: F12 cancels the delete.
+        { state: "9", shows: ["F4=Delete", "F12=Cancel"], press: "ENTER", runs: "invalid ENTER" },
+        { state: "9", shows: ["F4=Delete", "F12=Cancel"], press: "F12", runs: "F12" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+      ],
+    },
+    {
+      title: "COTRTUP: edit error, then cancel to B",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-018: the edited description fails its edit (state E).
+        {
+          state: "S",
+          shows: ["ENTER=Process", "F3=Exit", "F4=Delete", "F12=Cancel"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        { state: "E", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "invalid F12" },
+        // COTRTUPC-020: corrected, it validates (state N); COTRTUPC-039: F12 backs it out (B).
+        { state: "E", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F12",
+          runs: "F12",
+        },
+        { state: "B", shows: ["ENTER=Process", "F3=Exit"], press: "F4", runs: "invalid F4" },
+        { state: "B", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+      ],
+    },
+    {
+      title: "COTRTUP: delete fails (6), then reset",
+      map: "COTRTUP",
+      steps: [
+        {
+          state: "S",
+          shows: ["ENTER=Process", "F3=Exit", "F4=Delete", "F12=Cancel"],
+          press: "F4",
+          runs: "F4",
+        },
+        // COTRTUPC-034: the delete fails (state 6); COTRTUPC-030: any key but F3 starts over.
+        { state: "9", shows: ["F4=Delete", "F12=Cancel"], press: "F4", runs: "F4" },
+        { state: "6", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "reset" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "ENTER", runs: "ENTER" },
+      ],
+    },
+    {
+      title: "COTRTUP: delete refused (8)",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-033: child records refuse the delete (state 8); COTRTUPC-035: F4 and F12 are
+        // invalid there, F5 is accepted.
+        { state: "9", shows: ["F4=Delete", "F12=Cancel"], press: "F4", runs: "F4" },
+        { state: "8", shows: ["ENTER=Process", "F3=Exit"], press: "F4", runs: "invalid F4" },
+        { state: "8", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "invalid F12" },
+        { state: "8", shows: ["ENTER=Process", "F3=Exit"], press: "F5", runs: "F5" },
+      ],
+    },
+    {
+      title: "COTRTUP: delete done (7), then reset",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-032: the delete succeeds (state 7); COTRTUPC-030: any key but F3 starts over.
+        { state: "9", shows: ["F4=Delete", "F12=Cancel"], press: "F4", runs: "F4" },
+        { state: "7", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "reset" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "F12", runs: "invalid F12" },
+      ],
+    },
+    {
+      title: "COTRTUP: lock error (L), then reset",
+      map: "COTRTUP",
+      steps: [
+        // COTRTUPC-029: the save cannot lock the row (state L); COTRTUPC-030: any key but F3
+        // starts over.
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        { state: "L", shows: ["ENTER=Process", "F3=Exit"], press: "F4", runs: "reset" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "F4", runs: "invalid F4" },
+      ],
+    },
+    {
+      title: "COTRTUP: new type cancelled (B-blank)",
+      map: "COTRTUP",
+      steps: [
+        {
+          state: "X",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F5",
+          runs: "F5",
+        },
+        {
+          state: "R",
+          shows: ["ENTER=Process", "F3=Exit", "F12=Cancel"],
+          press: "ENTER",
+          runs: "ENTER",
+        },
+        // COTRTUPC-039: F12 backs out a new type over blank old values; COTRTUPC-042: every key
+        // but F3 then gives the fresh screen.
+        {
+          state: "N",
+          shows: ["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"],
+          press: "F12",
+          runs: "F12",
+        },
+        { state: "B-blank", shows: ["ENTER=Process", "F3=Exit"], press: "F6", runs: "reset" },
+        { state: "fresh", shows: ["ENTER=Process", "F3=Exit"], press: "F6", runs: "invalid F6" },
+      ],
+    },
+  ])("$title", (session) => {
+    for (const [step, availability] of sessionKeys(session)) {
+      const at = `${session.map} state ${step.state}`;
+      const shows = keyRowItemsFor(session.map, availability)
+        .filter((item) => item.shown)
+        .map((item) => item.label);
+      expect(shows, at).toEqual(step.shows);
+      expect(boundScreen(session.map, availability)(step.press), `${at} ${step.press}`).toEqual([
+        step.runs,
+      ]);
+    }
+  });
+});
+
+/** Roles that give every key `role`. */
+function everyKey(role: PfKeyRole): Record<PfKey, PfKeyRole> {
+  return {
+    ENTER: role,
+    F1: role,
+    F2: role,
+    F3: role,
+    F4: role,
+    F5: role,
+    F6: role,
+    F7: role,
+    F8: role,
+    F9: role,
+    F10: role,
+    F11: role,
+    F12: role,
+  };
+}
+
+interface BindErrorCase {
+  readonly title: string;
+  readonly availability: () => PfKeyAvailability;
+  readonly actions: PfKeyRoleActions;
+  readonly message: string;
+}
+
+describe("bindPfKeys", () => {
+  const action = countingAction();
+
+  it.each<BindErrorCase>([
+    {
+      title: "an own key has no action",
+      availability: () => coactupKeys("N"),
+      actions: { own: { ENTER: action.run, F3: action.run, F12: action.run } },
+      message: 'PF key F5 has role "own", but the screen passes no F5 action',
+    },
+    {
+      title: "a key taken as ENTER lacks ENTER",
+      availability: () => ({ roles: { ...everyKey("enter"), F3: "own" }, shown: new Set<PfKey>() }),
+      actions: { own: { F3: action.run } },
+      message: 'PF key ENTER has role "enter", but the screen passes no ENTER action',
+    },
+    {
+      title: "a reset key has no reset action",
+      availability: () => coactupKeys("C"),
+      actions: { own: { ENTER: action.run, F3: action.run } },
+      message: 'PF key ENTER has role "reset", but the screen passes no reset action',
+    },
+    {
+      title: "an invalid key has no invalid action",
+      availability: () => cotrtupKeys("fresh"),
+      actions: { own: { ENTER: action.run, F3: action.run }, reset: action.run },
+      message: 'PF key F1 has role "invalid", but the screen passes no invalid-key action',
+    },
+  ])("throws when $title", ({ availability, actions, message }) => {
+    expect(() => bindPfKeys(availability(), actions)).toThrow(new Error(message));
+    expect(action.runs()).toBe(0);
   });
 });
 

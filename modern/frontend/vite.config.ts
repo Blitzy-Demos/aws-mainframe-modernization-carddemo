@@ -45,6 +45,8 @@ export default defineConfig({
   },
   test: {
     globals: true,
+    // Keeps it.each `$title` names whole (default cut: 40 chars), so every test name is distinct.
+    chaiConfig: { truncateThreshold: 0 },
     projects: [
       {
         extends: true,
