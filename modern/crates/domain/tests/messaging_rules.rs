@@ -830,6 +830,8 @@ mod cp00 {
         ErrorLogRecord, ErrorSubsystem, PendingAuthDetailRecord, PendingAuthSummaryRecord,
     };
     use domain::sensitive::CardNumber;
+    use proptest::prelude::{ProptestConfig, TestCaseError, any};
+    use proptest::test_runner::TestRunner;
 
     use super::{
         TestResult, blocked, contains, fixture_lines, fixture_records, has_format, instant, money,
@@ -1475,6 +1477,113 @@ mod cp00 {
         Ok(())
     }
 
+    // audit: COPAUA0C-002
+    // audit: COPAUA0C-013
+    #[test]
+    fn extra_fields_and_final_commas_within_the_buffer_change_nothing() -> TestResult {
+        let world = World::load()?;
+        let (_, card) = world.first()?;
+        let base = body(card, &[]);
+        let plain = parse_request(&base)?;
+        // 17 fields and a final comma leave field 18 absent (COPAUA0C-007); one comma more makes
+        // it present and empty, as a field after it does (COPAUA0C-003).
+        let seventeen = body(card, &[(18, b"")]);
+        let empty_eighteenth = parse_request(&[seventeen.as_slice(), b",19"].concat())?;
+        let room = GET_BUFFER_LEN - base.len();
+        let cases: [(Vec<u8>, &AuthRequestRecord); 4] = [
+            // n = 19: the empty 19th field is ignored.
+            ([base.as_slice(), b",,"].concat(), &plain),
+            // Empty fields up to the 500-byte buffer, all after the 18th.
+            (
+                [base.as_slice(), vec![b','; room].as_slice()].concat(),
+                &plain,
+            ),
+            // One-byte fields up to the buffer, all after the 18th.
+            (
+                [base.as_slice(), b",X".repeat(room / 2).as_slice()].concat(),
+                &plain,
+            ),
+            ([seventeen.as_slice(), b","].concat(), &empty_eighteenth),
+        ];
+        for (bytes, expected) in &cases {
+            assert!(bytes.len() <= GET_BUFFER_LEN, "COPAUA0C-010");
+            // Compared unprinted: the request holds the fixture card (Cardholder Data Redaction).
+            assert!(parse_request(bytes)? == **expected, "COPAUA0C-002");
+        }
+        Ok(())
+    }
+
+    // audit: COPAUA0C-002
+    // audit: COPAUA0C-010
+    // audit: COPAUA0C-012
+    #[test]
+    fn a_comma_flood_past_the_buffer_is_one_field_error_with_its_reply_fields() -> TestResult {
+        let world = World::load()?;
+        let (xref, card) = world.first()?;
+        let eighteen = body(card, &[]);
+        let three = [b"220618,143012,".as_slice(), card].concat();
+        // Each flood adds one empty field per comma; the parse keeps only the first 18, so the
+        // outcome and its reply fields are those of the head alone (COPAUA0C-002).
+        let cases: [(&[u8], usize, &[u8]); 4] = [
+            (
+                eighteen.as_slice(),
+                GET_BUFFER_LEN + 1 - eighteen.len(),
+                b"ORDER-A        ",
+            ),
+            (eighteen.as_slice(), 1 << 20, b"ORDER-A        "),
+            (eighteen.as_slice(), 16 << 20, b"ORDER-A        "),
+            // Fields 4 to 18 are empty fields of the flood: field 18 is present and moves as
+            // spaces.
+            (three.as_slice(), 1 << 20, &[b' '; 15]),
+        ];
+        for (head, flood, transaction_id) in cases {
+            let bytes = [head, vec![b','; flood].as_slice()].concat();
+            let error = field_error(&bytes)?;
+            assert!(error.card == xref.card_num, "COPAUA0C-005");
+            assert_eq!(
+                error.fault,
+                FieldFault::BodyTooLong { len: bytes.len() },
+                "COPAUA0C-010"
+            );
+            assert_eq!(error.auth_id_code.as_bytes(), b"143012", "COPAUA0C-012");
+            assert_eq!(
+                error.transaction_id.as_bytes(),
+                transaction_id,
+                "COPAUA0C-012"
+            );
+        }
+        Ok(())
+    }
+
+    // audit: COPAUA0C-005
+    // audit: COPAUA0C-017
+    #[test]
+    fn a_comma_flood_never_outranks_the_card_check() -> TestResult {
+        let world = World::load()?;
+        let (_, card) = world.first()?;
+        let flood = vec![b','; 1 << 20];
+        let cases: [Vec<u8>; 3] = [
+            // An unparseable field 3, then a flood of empty fields.
+            [b"220618,143012,ABC".as_slice(), flood.as_slice()].concat(),
+            // A flood that opens the body leaves field 3 empty, whatever follows it.
+            [flood.as_slice(), card].concat(),
+            // A card number in field 2 leaves field 3 to the flood, empty.
+            [b"220618,".as_slice(), card, flood.as_slice()].concat(),
+        ];
+        for bytes in &cases {
+            let Err(ParseError::CardNumber(error)) = parse_request(bytes) else {
+                return Err("COPAUA0C-017: not a card-number error".into());
+            };
+            assert_eq!(
+                error.cause,
+                CardNumberCause::NotSixteenDigits,
+                "COPAUA0C-005"
+            );
+            assert_eq!(error.body_len, bytes.len(), "COPAUA0C-017");
+        }
+        Ok(())
+    }
+
     // audit: COPAUA0C-041
     // audit: ARITH-034
     // audit: ARITH-037
@@ -1842,6 +1951,165 @@ mod cp00 {
             (limited.curr_bal + row.approved_auth_amt).store::<12>() <= limited.credit_limit,
             "COPAUA0C-046"
         );
+        Ok(())
+    }
+
+    /// i10 over committed state: the account's balance plus the summary's stored approved amount
+    /// is within the account's credit limit. Below 10^10 and 10^9 in magnitude, the two sum below
+    /// 10^12, so the store drops nothing.
+    fn within_limit(account: &AccountRecord, summary: &PendingAuthSummaryRecord) -> bool {
+        (account.curr_bal + summary.approved_auth_amt).store::<12>() <= account.credit_limit
+    }
+
+    // audit: COPAUA0C-046
+    // audit: COPAUA0C-094
+    // audit: ARITH-043
+    #[test]
+    fn the_guard_bounds_the_approved_total_as_the_summary_stores_it() -> TestResult {
+        let world = World::load()?;
+        let (xref, card) = world.first()?;
+        // Balance 1900000000.00 and limit 1000000000.00, both within `S9(10)V99`.
+        let account = with_balance(world.account(xref)?, 190_000_000_000, 100_000_000_000)?;
+        let template = summary_template(xref);
+        let created = SummaryState::Created(&template);
+        // The created summary offers 1000000000.00 − 1900000000.00 = −900000000.00, which the
+        // request does not exceed, and the balance plus −900000000.00 equals the limit.
+        let first = decide(
+            &asking(card, b"-900000000.00")?,
+            &found(xref, Some(&account), CustomerLookup::Found, created),
+        );
+        assert_decision(&first, APPROVED, "COPAUA0C-046");
+        let row = summary_update(created, xref, Some(&account), &first)?;
+        assert!(
+            row.approved_auth_amt == money::<9>(-90_000_000_000)?,
+            "COPAUA0C-094"
+        );
+        assert!(
+            row.credit_balance == money::<9>(-90_000_000_000)?,
+            "ARITH-043"
+        );
+        // 1000000000.00 loses its high-order digit in `S9(09)V99`.
+        assert!(row.credit_limit.is_zero(), "COPAUA0C-090");
+        assert!(within_limit(&account, &row), "COPAUA0C-046");
+        // On that summary COPAUA0C's rule offers 0.00 − (−900000000.00) = 900000000.00, and the
+        // exact sum 1900000000.00 − 900000000.00 − 200000000.00 = 800000000.00 is within the
+        // limit; but the stored total (−1100000000.00).store::<9>() is −100000000.00, and the
+        // balance plus it, 1800000000.00, is over the limit.
+        let request = asking(card, b"-200000000.00")?;
+        let amount = request.transaction_amt;
+        assert!(
+            (account.curr_bal + row.approved_auth_amt + amount).store::<12>()
+                <= account.credit_limit,
+            "COPAUA0C-046"
+        );
+        assert!(
+            (row.approved_auth_amt + amount).store::<9>() == money::<9>(-10_000_000_000)?,
+            "ARITH-043"
+        );
+        let existing_row = SummaryState::Existing(&row);
+        let second = decide(
+            &request,
+            &found(xref, Some(&account), CustomerLookup::Found, existing_row),
+        );
+        assert_decision(&second, GUARD_DECLINED, "COPAUA0C-046");
+        let row = summary_update(existing_row, xref, Some(&account), &second)?;
+        assert!(
+            row.approved_auth_amt == money::<9>(-90_000_000_000)?,
+            "COPAUA0C-094"
+        );
+        assert!(within_limit(&account, &row), "COPAUA0C-046");
+        Ok(())
+    }
+
+    /// The largest magnitude of a `S9(10)V99` amount, in hundredths.
+    const S9_10_CENTS: i64 = 999_999_999_999;
+    /// The largest magnitude of a `S9(09)V99` amount, in hundredths.
+    const S9_09_CENTS: i64 = 99_999_999_999;
+
+    /// One generated case of the i10 property, every amount in hundredths within its picture.
+    #[derive(Clone, Copy)]
+    struct GuardCase {
+        /// `acct_curr_bal` and `acct_credit_limit`, `S9(10)V99`.
+        account: (i64, i64),
+        /// The summary's `credit_limit`, `credit_balance` and `approved_auth_amt`, `S9(09)V99`.
+        summary: (i64, i64, i64),
+        /// The request amount, `S9(10)V99`.
+        amount: i64,
+        /// Whether this request created the summary.
+        created: bool,
+        /// The customer read's result.
+        customer: CustomerLookup,
+    }
+
+    /// Decides `case` for the request `base` with its amount replaced and, when it approves,
+    /// fails unless the summary `summary_update` builds keeps i10 (COPAUA0C-046, COPAUA0C-094).
+    fn approval_keeps_i10(
+        xref: &CardXrefRecord,
+        account: &AccountRecord,
+        base: &AuthRequestRecord,
+        case: GuardCase,
+    ) -> TestResult {
+        let (balance, limit) = case.account;
+        let account = with_balance(account, balance, limit)?;
+        let (summary_limit, credit_balance, approved) = case.summary;
+        let row = existing(xref, summary_limit, credit_balance, approved)?;
+        let state = if case.created {
+            SummaryState::Created(&row)
+        } else {
+            SummaryState::Existing(&row)
+        };
+        let request = AuthRequestRecord {
+            transaction_amt: money(case.amount)?,
+            ..base.clone()
+        };
+        let decision = decide(&request, &found(xref, Some(&account), case.customer, state));
+        if decision.status == AuthStatus::Approved {
+            let committed = summary_update(state, xref, Some(&account), &decision)?;
+            if !within_limit(&account, &committed) {
+                return Err("COPAUA0C-046: an approval leaves the account over its limit".into());
+            }
+        }
+        Ok(())
+    }
+
+    // audit: COPAUA0C-046
+    // audit: COPAUA0C-094
+    #[test]
+    fn no_approval_commits_a_summary_over_the_credit_limit() -> TestResult {
+        let world = World::load()?;
+        let (xref, card) = world.first()?;
+        let base_account = world.account(xref)?;
+        let base_request = asking(card, b"100.00")?;
+        let mut runner = TestRunner::new(ProptestConfig {
+            cases: 4_096,
+            failure_persistence: None,
+            ..ProptestConfig::default()
+        });
+        let s9_10 = -S9_10_CENTS..=S9_10_CENTS;
+        let s9_09 = -S9_09_CENTS..=S9_09_CENTS;
+        let cases = (
+            (s9_10.clone(), s9_10.clone()),
+            (s9_09.clone(), s9_09.clone(), s9_09),
+            s9_10,
+            any::<bool>(),
+            any::<bool>(),
+        );
+        runner.run(&cases, |(account, summary, amount, created, known)| {
+            let customer = if known {
+                CustomerLookup::Found
+            } else {
+                CustomerLookup::NotFound
+            };
+            let case = GuardCase {
+                account,
+                summary,
+                amount,
+                created,
+                customer,
+            };
+            approval_keeps_i10(xref, base_account, &base_request, case)
+                .map_err(|error| TestCaseError::fail(error.to_string()))
+        })?;
         Ok(())
     }
 

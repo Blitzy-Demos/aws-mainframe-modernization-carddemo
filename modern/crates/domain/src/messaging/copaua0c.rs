@@ -48,7 +48,9 @@
 //!
 //! [`parse_request`] returns a request, a card-number error or a field error for every byte
 //! sequence of any length and never panics (Total Parsers Over Untrusted Input, COPAUA0C-017).
-//! The module root denies `unwrap`, `expect` and indexing here and in the unit tests.
+//! It holds at most 18 field slices, whatever the body's length and comma count, so untrusted
+//! input cannot grow its memory beyond the body itself. The module root denies `unwrap`,
+//! `expect` and indexing here and in the unit tests.
 
 use core::fmt;
 
@@ -376,7 +378,7 @@ impl std::error::Error for ParseError {
 /// (`COPAUA0C.cbl:354-379`; COPAUA0C-002 to COPAUA0C-017).
 ///
 /// - The body is cut at every `,`; a final comma ends the last field and opens none, and fields
-///   beyond the 18th are ignored (COPAUA0C-002).
+///   beyond the 18th are ignored and never held (COPAUA0C-002).
 /// - Field 3 must be exactly 16 ASCII digits, and is checked before every other rule
 ///   (COPAUA0C-005, COPAUA0C-017).
 /// - Alphanumeric fields are moved left-justified, space-padded and cut on the right; fields 8
@@ -386,7 +388,10 @@ impl std::error::Error for ParseError {
 ///   `PIC +9(10).99` by truncation (COPAUA0C-008, COPAUA0C-014).
 ///
 /// The function is total: any byte sequence of any length gives exactly one outcome, and nothing
-/// indexes, slices or unwraps (Total Parsers Over Untrusted Input).
+/// indexes, slices or unwraps (Total Parsers Over Untrusted Input). Its memory beside the body is
+/// bounded: the split allocates nothing and holds at most 18 field slices, independent of the
+/// body's length and comma count, so a body of any size reaches its card-number error or its
+/// over-length field error (COPAUA0C-010) at that fixed cost.
 ///
 /// # Errors
 ///
@@ -396,9 +401,10 @@ impl std::error::Error for ParseError {
 /// field 8 or 12, or an amount that is not a valid `NUMVAL` argument (COPAUA0C-007 to
 /// COPAUA0C-011).
 pub fn parse_request(body: &[u8]) -> Result<AuthRequestRecord, ParseError> {
-    let fields = split_fields(body);
-    let card = parse_card(&fields, body.len()).map_err(ParseError::CardNumber)?;
-    move_fields(card.clone(), body.len(), &fields).map_err(|fault| {
+    let split = split_fields(body);
+    let fields = split.present();
+    let card = parse_card(fields, body.len()).map_err(ParseError::CardNumber)?;
+    move_fields(card.clone(), body.len(), fields).map_err(|fault| {
         ParseError::Field(FieldError {
             card,
             fault,
@@ -410,16 +416,46 @@ pub fn parse_request(body: &[u8]) -> Result<AuthRequestRecord, ParseError> {
     })
 }
 
-/// The fields the `UNSTRING` delimits: the bytes between commas, the number present being the
-/// commas plus one, less one when the body ends with a comma (COPAUA0C-002).
-fn split_fields(body: &[u8]) -> Vec<&[u8]> {
-    let mut fields: Vec<&[u8]> = body.split(|&byte| byte == DELIMITER).collect();
-    if body.last() == Some(&DELIMITER) {
-        // The transfer stops once every sending character is moved, so the empty piece after a
-        // final comma is no field.
-        fields.pop();
+/// The fields of a request body that reach the 18 `UNSTRING` receivers (COPAUA0C-002).
+struct Fields<'a> {
+    /// Field k + 1 at entry k; the entries from `count` on are empty and never read.
+    received: [&'a [u8]; FIELD_COUNT],
+    /// The number of fields present, n, capped at the 18 receivers.
+    count: usize,
+}
+
+impl<'a> Fields<'a> {
+    /// The fields present, in wire order: at most 18.
+    fn present(&self) -> &[&'a [u8]] {
+        // `count` never exceeds the 18 entries, so `get` always finds them; the empty default
+        // only keeps this free of a panic path.
+        self.received.get(..self.count).unwrap_or_default()
     }
-    fields
+}
+
+/// The fields the `UNSTRING` delimits: the bytes between commas, the number present being the
+/// commas plus one, less one when the body ends with a comma; fields after the 18th are ignored
+/// (COPAUA0C-002).
+///
+/// The split reads at most 19 pieces and allocates nothing: it holds at most 18 field slices,
+/// independent of the body's length and comma count, and reads the 19th piece only to learn
+/// whether the body goes on past the 18th. A body of millions of commas therefore costs the same
+/// fixed memory as an 18-field body before its over-length field error (COPAUA0C-010).
+fn split_fields(body: &[u8]) -> Fields<'_> {
+    let mut pieces = body.split(|&byte| byte == DELIMITER);
+    let mut received: [&[u8]; FIELD_COUNT] = [&[]; FIELD_COUNT];
+    let mut count = 0_usize;
+    for (slot, piece) in received.iter_mut().zip(pieces.by_ref().take(FIELD_COUNT)) {
+        *slot = piece;
+        count += 1;
+    }
+    if pieces.next().is_none() && body.last() == Some(&DELIMITER) {
+        // The transfer stops once every sending character is moved, so the empty piece after a
+        // final comma, the last piece held, is no field. A piece past the 18th means 18 fields
+        // or more whatever the last byte is, and the count stays at the 18 receivers.
+        count = count.saturating_sub(1);
+    }
+    Fields { received, count }
 }
 
 /// Field 3 as a card number: exactly 16 ASCII digits (COPAUA0C-005).
@@ -613,6 +649,9 @@ fn digit_string(mut text: &[u8]) -> Option<(u64, u32, &[u8])> {
 /// a second point, an all-space argument and any other byte do not conform. The value is the
 /// exact decimal of the text, which `NUMVAL`'s floating-point result rounds back to for at most
 /// two decimal places (X-ARITH-1); no floating point is used (R1).
+///
+/// Outside the unit tests `text` is the 13 bytes of `WS-TRANSACTION-AMT-AN PIC X(13)`
+/// (COPAUA0C-008), so the digit string holds at most 13 digits.
 fn numval(text: &[u8]) -> Option<Decimal> {
     let (leading, rest) = leading_sign(skip_spaces(text));
     // Format 1 admits spaces between the sign and the digits; without a sign the leading spaces
@@ -627,6 +666,11 @@ fn numval(text: &[u8]) -> Option<Decimal> {
         (Some(sign), None) | (None, Some(sign)) => sign == Sign::Minus,
         (None, None) => false,
     };
+    // TRUNCATION: the checked u64 → i64 narrowing cannot lose a value here. Outside the unit
+    // tests the only caller, `transaction_amount`, passes the 13 bytes of
+    // `WS-TRANSACTION-AMT-AN PIC X(13)`, so the digit string holds at most 13 digits and the
+    // mantissa is below 10^13, far inside `i64`. Its `None` arm stays the typed failure,
+    // `FieldFault::AmountNotNumeric`, never a panic.
     let magnitude = i64::try_from(mantissa).ok()?;
     let signed = if negative { -magnitude } else { magnitude };
     Decimal::try_new(signed, scale).ok()
@@ -776,11 +820,14 @@ pub enum GuardOutcome {
     /// The guard did not run: the card has no cross-reference row, or COPAUA0C's own rule
     /// declined.
     NotApplied,
-    /// COPAUA0C's rule approved and `acct_curr_bal + approved_auth_amt + amount ≤
-    /// acct_credit_limit`, so the approval stands (COPAUA0C-046).
+    /// COPAUA0C's rule approved, `acct_curr_bal + approved_auth_amt + amount ≤
+    /// acct_credit_limit`, and `acct_curr_bal` plus the approved total as the summary update
+    /// stores it into `S9(09)V99` is within `acct_credit_limit` too, so the approval stands
+    /// (COPAUA0C-046, COPAUA0C-094, ARITH-043).
     Passed,
-    /// COPAUA0C's rule approved but the approval would breach i10, so the request is declined
-    /// `05`/`4100` (COPAUA0C-046, COPAUA0C-047).
+    /// COPAUA0C's rule approved but the approval would breach i10, by the exact sum or by the
+    /// stored total, so the request is declined `05`/`4100` (COPAUA0C-046, COPAUA0C-047,
+    /// COPAUA0C-094, ARITH-043).
     DeclinedByCreditLimit,
     /// COPAUA0C's rule approved on an existing summary while the account was not found, so the
     /// guard has no balance or limit to bound the approval by and the request is declined
@@ -845,8 +892,10 @@ enum Verdict {
 /// The guard runs only where COPAUA0C's rule approves a card found in the cross-reference
 /// (COPAUA0C-046 to COPAUA0C-048, ARITH-045): the approval stands only when
 /// `acct_curr_bal + approved_auth_amt + amount ≤ acct_credit_limit`, over the locked summary
-/// row, and is otherwise declined `05`/`4100`; without an account row it is declined `05`/`3100`.
-/// Every COBOL decline is kept.
+/// row, and `acct_curr_bal` plus the approved total as [`summary_update`] stores it into
+/// `S9(09)V99` is within `acct_credit_limit` too (COPAUA0C-094, ARITH-043); otherwise it is
+/// declined `05`/`4100`. Without an account row it is declined `05`/`3100`. Every COBOL decline
+/// is kept.
 ///
 /// The reply takes the request's card, field 18 as the transaction ID and field 2 as the
 /// auth-ID code; response `00` with the request amount when approved, `05` with 0.00 when
@@ -940,6 +989,13 @@ fn decline_reason(not_found: bool, flag: DeclineFlag) -> ReasonCode {
 
 /// The i10 guard over an approval of COPAUA0C's rule (E30; COPAUA0C-046 to COPAUA0C-048,
 /// ARITH-045).
+///
+/// The approval stands only when the exact `acct_curr_bal + approved_auth_amt + amount` is
+/// within `acct_credit_limit` and, that holding, `acct_curr_bal` plus the approved total as
+/// [`summary_update`] will store it into `S9(09)V99` is within it too (COPAUA0C-094,
+/// ARITH-043). i10 binds the stored total, and a sum below −999999999.99 loses its high-order
+/// digits in that store, which raises the stored total above the exact sum. Otherwise the
+/// request is declined `05`/`4100`.
 fn credit_limit_guard(amount: Money<10>, context: &FoundContext<'_>) -> (Verdict, GuardOutcome) {
     let Some(account) = context.account else {
         // An approval on an existing summary with no account row: the guard has nothing to
@@ -954,15 +1010,28 @@ fn credit_limit_guard(amount: Money<10>, context: &FoundContext<'_>) -> (Verdict
     // integer digits drops nothing at scale 2: the comparison is the exact one ARITH-045 states.
     let committed = (account.curr_bal + pending + amount).store::<12>();
     if committed <= account.credit_limit {
-        (Verdict::Approved, GuardOutcome::Passed)
-    } else {
-        // Every guard decline carries `4100`, a customer not found included (COPAUA0C-047,
-        // X-COPAUA0C-4).
-        (
-            Verdict::Declined(ReasonCode::InsufficientFunds4100),
-            GuardOutcome::DeclinedByCreditLimit,
-        )
+        // The balance below 10^10 and the stored total below 10^9 in magnitude sum below 10^12,
+        // so this store drops nothing either: it is the committed state i10 binds.
+        let stored = (account.curr_bal + approved_total(pending, amount)).store::<12>();
+        if stored <= account.credit_limit {
+            return (Verdict::Approved, GuardOutcome::Passed);
+        }
     }
+    // Every guard decline carries `4100`, a customer not found included (COPAUA0C-047,
+    // X-COPAUA0C-4).
+    (
+        Verdict::Declined(ReasonCode::InsufficientFunds4100),
+        GuardOutcome::DeclinedByCreditLimit,
+    )
+}
+
+/// `PA-APPROVED-AUTH-AMT` after `ADD WS-APPROVED-AMT TO PA-APPROVED-AUTH-AMT` adds `approved`
+/// (`COPAUA0C.cbl:815`; COPAUA0C-094, ARITH-043): the total [`summary_update`] writes and the
+/// i10 guard bounds (COPAUA0C-046), computed in one place so the two cannot differ.
+fn approved_total(approved_auth_amt: Money<9>, approved: Money<10>) -> Money<9> {
+    // TRUNCATION: the ADD stores into `PA-APPROVED-AUTH-AMT PIC S9(09)V99 COMP-3`, dropping the
+    // integer digits of the sum above the ninth and keeping its sign (ARITH-043).
+    (approved_auth_amt + approved).store::<9>()
 }
 
 /// The 15 bytes of `PA-RL-TRANSACTION-ID` the reply carries: field 18 unchanged, unless it
@@ -1107,8 +1176,9 @@ impl std::error::Error for SummaryError {}
 ///   `S9(09)V99`, losing a high-order digit (COPAUA0C-090, ARITH-040).
 /// - An approval adds 1 to `approved_auth_cnt` and the approved amount to `approved_auth_amt` and
 ///   `credit_balance`, each stored into `S9(09)V99`, and sets `cash_balance` to 0.00
-///   (COPAUA0C-094, ARITH-042, ARITH-043). `credit_balance` is never reduced here or by the
-///   purge (E30).
+///   (COPAUA0C-094, ARITH-042, ARITH-043). The stored `approved_auth_amt` is the total the i10
+///   guard bounded before approving (COPAUA0C-046). `credit_balance` is never reduced here or by
+///   the purge (E30).
 /// - A decline adds 1 to `declined_auth_cnt` (COPAUA0C-095).
 ///
 /// Call it only after the request's acknowledgement (E29, COPAUA0C-081); the worker writes the
@@ -1143,9 +1213,9 @@ pub fn summary_update(
             let approved = decision.reply.approved_amt;
             row.approved_auth_cnt =
                 add_one(row.approved_auth_cnt, SummaryError::ApprovedCountAtLimit)?;
-            // TRUNCATION: each ADD stores into `S9(09)V99`, dropping a high-order digit
+            row.approved_auth_amt = approved_total(row.approved_auth_amt, approved);
+            // TRUNCATION: the ADD stores into `S9(09)V99`, dropping a high-order digit
             // (ARITH-043).
-            row.approved_auth_amt = (row.approved_auth_amt + approved).store::<9>();
             row.credit_balance = (row.credit_balance + approved).store::<9>();
             row.cash_balance = Money::ZERO;
         }
