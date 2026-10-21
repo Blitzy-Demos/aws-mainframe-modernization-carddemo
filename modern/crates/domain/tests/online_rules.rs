@@ -51,14 +51,27 @@ fn at(
         .ok_or("not a time of day")?)
 }
 
+/// Whether `text` has the layout `picture`: the same length, a digit wherever the picture has
+/// `9`, and the picture's own byte everywhere else. Clock-generated fields are compared this way.
+fn has_layout(text: &[u8], picture: &[u8]) -> bool {
+    text.len() == picture.len()
+        && text.iter().zip(picture).all(|(&byte, &slot)| {
+            if slot == b'9' {
+                byte.is_ascii_digit()
+            } else {
+                byte == slot
+            }
+        })
+}
+
 /// The clock every time-dependent rule reads here: 2022-07-18 13:45:07, the `INTCALC` PARM date.
 fn clock() -> Result<FixedClock, Box<dyn Error>> {
     Ok(FixedClock::new(at(date(2022, 7, 18)?, 13, 45, 7)?))
 }
 
 /// The argon2id hash of the DUSRSECJ password, computed once: argon2 at its default cost is slow
-/// in an unoptimised build, so the whole file performs four argon2 operations (this hash, two
-/// verifications in `password` and the successful sign-on in `cosgn00c`).
+/// in an unoptimised build, so the whole file performs five argon2 operations (this hash, two
+/// verifications in `password`, and the successful and the wrong-password sign-ons in `cosgn00c`).
 fn demo_hash() -> Result<&'static str, Box<dyn Error>> {
     static HASH: std::sync::OnceLock<Result<String, domain::password::PasswordError>> =
         std::sync::OnceLock::new();
@@ -375,39 +388,59 @@ mod cosgn00c {
     // audit: COSGN00C-020
     #[test]
     fn failed_sign_ons_carry_their_messages_fields_and_statuses() -> TestResult {
-        let key = edit("USER0001", "PASSWORD")?;
-        let not_found = decide(&key, UserLookup::NotFound).into_result().err();
-        assert_eq!(not_found, Some(SignonFailure::UserNotFound));
-        let read_error = decide(&key, UserLookup::ReadError).into_result().err();
-        assert_eq!(read_error, Some(SignonFailure::UnableToVerify));
-        // A stored hash that is no PHC string cannot be verified (X-COSGN00C-2); no argon2 work.
-        let broken = UserLookup::Found(StoredUser::new(UserType::USER, "not-a-phc-string"));
-        let unverifiable = decide(&key, broken).into_result().err();
-        assert_eq!(unverifiable, Some(SignonFailure::UnableToVerify));
-        for (failure, message, field, status) in [
+        let found = |hash: &'static str| UserLookup::Found(StoredUser::new(UserType::USER, hash));
+        for (rule, password, lookup, expected, message, field, status) in [
+            // `PASSWOR` is padded to `PASSWOR `, which differs from the stored `PASSWORD` only in
+            // its eighth byte, so a trimmed or prefix comparison would wrongly sign on.
             (
+                "COSGN00C-018",
+                "PASSWOR",
+                found(demo_hash()?),
                 SignonFailure::WrongPassword,
                 "Wrong Password. Try again ...",
                 SignonField::Password,
                 401,
             ),
             (
+                "COSGN00C-019",
+                "PASSWORD",
+                UserLookup::NotFound,
                 SignonFailure::UserNotFound,
                 "User not found. Try again ...",
                 SignonField::UserId,
                 401,
             ),
             (
+                "COSGN00C-020",
+                "PASSWORD",
+                UserLookup::ReadError,
+                SignonFailure::UnableToVerify,
+                "Unable to verify the User ...",
+                SignonField::UserId,
+                500,
+            ),
+            // A stored hash that is no PHC string cannot be verified (X-COSGN00C-2), so no argon2
+            // work is done.
+            (
+                "COSGN00C-020",
+                "PASSWORD",
+                found("not-a-phc-string"),
                 SignonFailure::UnableToVerify,
                 "Unable to verify the User ...",
                 SignonField::UserId,
                 500,
             ),
         ] {
-            assert_eq!(failure.message(), message);
-            assert_eq!(failure.to_string(), message);
-            assert_eq!(failure.field(), field);
-            assert_eq!(failure.class().http_status(), status);
+            let key = edit("USER0001", password)?;
+            let failure = decide(&key, lookup)
+                .into_result()
+                .err()
+                .ok_or_else(|| format!("{rule}: a failed sign-on signed on"))?;
+            assert_eq!(failure, expected, "{rule}");
+            assert_eq!(failure.message(), message, "{rule}");
+            assert_eq!(failure.to_string(), message, "{rule}");
+            assert_eq!(failure.field(), field, "{rule}");
+            assert_eq!(failure.class().http_status(), status, "{rule}");
         }
         Ok(())
     }
@@ -2775,7 +2808,9 @@ mod cotrn01c {
 }
 
 mod cotrn02c {
-    use domain::copybook::{PicU, PicX, TsForm};
+    use chrono::NaiveDateTime;
+    use domain::copybook::{CobolTimestamp, PicTimestamp, PicU, PicX, TsForm};
+    use domain::money::{Decimal, Money};
     use domain::online::cotrn02c::{
         AddFailure, AddField, AddOutcome, Confirmation, FailureClass, KeyRequest, TranAddInput,
         XrefLookup, build_record, confirm, copy_last, edit_data_with, edit_keys, fill_key,
@@ -3174,34 +3209,144 @@ mod cotrn02c {
         Ok(())
     }
 
+    /// `dailytran.txt:300`, the fixture's last record: type `01`, category 1, source `POS TERM`,
+    /// description `Purchase at Kilback LLC`, amount `0000006032B` (+603.22, FIXPOST-300),
+    /// merchant 800000000 `Kilback LLC` of `Cummeratamouth` `53200-7529`, original timestamp
+    /// `2022-06-10 19:27:53.000000` in layout `I` and a blank processing timestamp.
+    fn last_transaction() -> Result<TransactionRecord, Box<dyn std::error::Error>> {
+        Ok(fixture::<TransactionRecord>("dailytran.txt")?
+            .into_iter()
+            .last()
+            .ok_or("no fixture")?)
+    }
+
+    /// `count` ten-character blocks, each `lead`, the block's index and `abcdefgh`
+    /// (`D0abcdefghD1abcdefgh`...), so a cut at another offset, or a field copied from another
+    /// field, shows.
+    fn blocks(lead: char, count: usize) -> String {
+        "0123456789"
+            .chars()
+            .take(count)
+            .flat_map(|index| [lead, index].into_iter().chain("abcdefgh".chars()))
+            .collect()
+    }
+
+    /// A non-blank `PIC X(26)` timestamp holding `value` in layout `form`.
+    fn stamp(
+        value: NaiveDateTime,
+        form: TsForm,
+    ) -> Result<PicTimestamp, Box<dyn std::error::Error>> {
+        Ok(PicTimestamp::new(Some(CobolTimestamp::new(value, form)?)))
+    }
+
     // audit: COTRN02C-054
     // audit: COTRN02C-055
     #[test]
     fn f5_copies_the_last_transaction_into_the_screen_fields() -> TestResult {
-        let last = fixture::<TransactionRecord>("dailytran.txt")?
-            .into_iter()
-            .last()
-            .ok_or("no fixture")?;
-        let copied = copy_last(&last);
-        assert_eq!(copied.type_cd(), last.type_cd.to_text());
-        assert_eq!(copied.cat_cd().len(), 4);
-        assert_eq!(copied.amount().len(), 12);
-        assert!(
-            copied.amount().starts_with('+') || copied.amount().starts_with('-'),
-            "COTRN02C-055"
-        );
-        assert_eq!(
-            copied.orig_date().map(|day| day.to_string()),
-            Some(copied.orig_date_text().to_owned())
-        );
+        let copied = copy_last(&last_transaction()?);
+        let description = format!("{:<60}", "Purchase at Kilback LLC");
+        let merchant_name = format!("{:<30}", "Kilback LLC");
+        let merchant_city = format!("{:<25}", "Cummeratamouth");
+        let expected = TranAddInput {
+            type_cd: "01",
+            cat_cd: "0001",
+            source: "POS TERM  ",
+            description: &description,
+            amount: "+00000603.22",
+            orig_date: "2022-06-10",
+            proc_date: "          ",
+            merchant_id: "800000000",
+            merchant_name: &merchant_name,
+            merchant_city: &merchant_city,
+            merchant_zip: "53200-7529",
+            confirm: "Y",
+        };
+        assert_eq!(copied.as_input("Y"), expected);
+        assert_eq!(copied.orig_date(), Some(date(2022, 6, 10)?));
         assert_eq!(copied.proc_date(), None);
-        let input = copied.as_input("Y");
-        assert_eq!(input.confirm, "Y");
-        assert_eq!(input.description, copied.description());
-        assert_eq!(
-            copied.merchant_id(),
-            format!("{:09}", last.merchant_id.get())
-        );
+        Ok(())
+    }
+
+    // audit: COTRN02C-054
+    // audit: COTRN02C-055
+    #[test]
+    fn f5_cuts_each_copied_field_and_amount_to_its_map_picture() -> TestResult {
+        let mut last = last_transaction()?;
+        last.type_cd = PicX::from_text("02")?;
+        last.cat_cd = PicU::new(5)?;
+        last.source = PicX::from_text("WEB PORTAL")?;
+        last.desc = PicX::from_text(&blocks('D', 10))?;
+        last.merchant_id = PicU::new(42)?;
+        last.merchant_name = PicX::from_text(&blocks('N', 5))?;
+        last.merchant_city = PicX::from_text(&blocks('C', 5))?;
+        last.merchant_zip = PicX::from_text("K1A 0B1")?;
+        let copied = copy_last(&last);
+        let description = blocks('D', 6);
+        let merchant_name = blocks('N', 3);
+        let merchant_city = format!("{}C2abc", blocks('C', 2));
+        let expected = TranAddInput {
+            type_cd: "02",
+            cat_cd: "0005",
+            source: "WEB PORTAL",
+            description: &description,
+            amount: "+00000603.22",
+            orig_date: "2022-06-10",
+            proc_date: "          ",
+            merchant_id: "000000042",
+            merchant_name: &merchant_name,
+            merchant_city: &merchant_city,
+            merchant_zip: "K1A 0B1   ",
+            confirm: "N",
+        };
+        assert_eq!(copied.as_input("N"), expected);
+        // No negative amount whose eight kept integer digits and two decimals are all zero:
+        // the sign of that edit is the unresolved negative-zero case X-ARITH-7.
+        for (cents, edited) in [
+            (0, "+00000000.00"),
+            (1, "+00000000.01"),
+            (-1, "-00000000.01"),
+            (-1_234, "-00000012.34"),
+            (9_999_999_999, "+99999999.99"),
+            (-9_999_999_999, "-99999999.99"),
+            (10_000_000_000, "+00000000.00"),
+            (12_345_678_901, "+23456789.01"),
+            (-12_345_678_901, "-23456789.01"),
+            (99_999_999_999, "+99999999.99"),
+        ] {
+            last.amt = Money::new(Decimal::new(cents, 2))?;
+            assert_eq!(copy_last(&last).amount(), edited, "{cents} cents");
+        }
+        let stamps = [
+            (
+                stamp(at(date(2023, 1, 2)?, 3, 4, 5)?, TsForm::Db2)?,
+                "2023-01-02",
+                Some(date(2023, 1, 2)?),
+            ),
+            (
+                stamp(at(date(2021, 12, 31)?, 0, 0, 0)?, TsForm::ScreenDate)?,
+                "2021-12-31",
+                Some(date(2021, 12, 31)?),
+            ),
+            (
+                stamp(at(date(2024, 2, 29)?, 23, 59, 59)?, TsForm::Iso)?,
+                "2024-02-29",
+                Some(date(2024, 2, 29)?),
+            ),
+            (PicTimestamp::BLANK, "          ", None),
+        ];
+        // Each layout in `TRAN-ORIG-TS` beside the next one in `TRAN-PROC-TS`.
+        for (orig, proc) in stamps.iter().zip(stamps.iter().cycle().skip(1)) {
+            (last.orig_ts, last.proc_ts) = (orig.0, proc.0);
+            let copied = copy_last(&last);
+            assert_eq!(
+                (copied.orig_date_text(), copied.orig_date()),
+                (orig.1, orig.2)
+            );
+            assert_eq!(
+                (copied.proc_date_text(), copied.proc_date()),
+                (proc.1, proc.2)
+            );
+        }
         Ok(())
     }
 }
@@ -3585,7 +3730,7 @@ mod cobil00c {
     };
     use domain::records::{AccountRecord, CardXrefRecord};
 
-    use super::{TestResult, clock, date, fixture};
+    use super::{TestResult, clock, fixture, has_layout};
 
     type Outcome<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -3745,7 +3890,12 @@ mod cobil00c {
             .value()
             .ok_or("COBIL00C-027: a blank timestamp")?;
         assert_eq!(stamp.form(), TsForm::Iso);
-        assert_eq!(stamp.value().date(), date(2022, 7, 18)?);
+        let mut text = Vec::new();
+        record.orig_ts.encode_into(&mut text);
+        assert!(
+            has_layout(&text, b"9999-99-99 99:99:99.000000"),
+            "COBIL00C-027"
+        );
         assert_eq!(effects.account.id, first.id);
         Ok(())
     }
@@ -5433,13 +5583,13 @@ mod copaus2c {
     };
 
     use super::authorization::{CARD, detail, key_2022_01_15};
-    use super::{TestResult, at, clock, date};
+    use super::{TestResult, at, clock, date, has_layout};
 
     // audit: COPAUS2C-001
     #[test]
     fn the_report_date_is_mm_dd_yy_with_slashes() -> TestResult {
         let today = report_date(&clock()?);
-        assert_eq!(today.to_text(), "07/18/22");
+        assert!(has_layout(today.as_bytes(), b"99/99/99"), "COPAUS2C-001");
         let record = detail(
             key_2022_01_15()?,
             ("220115", "103045"),
@@ -6789,15 +6939,19 @@ mod csutldtc {
     }
 
     // audit: CSUTLDTC-003
-    // audit: CSUTLDTC-007
     // audit: CSUTLDTC-008
     #[test]
-    fn the_result_record_lays_out_codes_text_date_and_mask() {
+    fn the_result_record_lays_out_codes_text_and_mask_around_the_halted_date() {
         let record =
             LeResult::new("2020-01-31", DateMask::YyyyMmDdDash, LeFeedback::Valid).to_record();
-        let expected = b"0000Mesg Code: 0000 Date is valid   TstDate: \x00\x0A2020-01- Mask used:YYYY-MM-DD    ";
         assert_eq!((record.len(), LS_RESULT_LEN), (80, 80));
-        assert_eq!(&record, expected);
+        assert_eq!(
+            record.get(..45),
+            Some(&b"0000Mesg Code: 0000 Date is valid   TstDate: "[..])
+        );
+        // Positions 46-55 are HALTED(H5): the group move after CEEDAYS copies whatever CEEDAYS
+        // leaves in its input string, so they are reported BLOCKED and not asserted.
+        assert_eq!(record.get(55..), Some(&b" Mask used:YYYY-MM-DD    "[..]));
         let rejected = LeResult::new(
             "2020-02-30",
             DateMask::YyyyMmDdDash,
