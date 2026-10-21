@@ -44,6 +44,13 @@
 //! No report record holds a card number (CBTRN03C-023). Card numbers stay [`CardNumber`] values,
 //! keys of a private map, and every text this module builds shows only the redacted form
 //! (CBTRN03C-012, CBTRN03C-014, CBTRN03C-039; Cardholder Data Redaction).
+//!
+//! The `TRAN-RECORD` job-log line of [`record_display`] also shows `TRAN-SOURCE`, `TRAN-DESC`,
+//! `TRAN-MERCHANT-NAME`, `TRAN-MERCHANT-CITY`, `TRAN-MERCHANT-ZIP` and `FILLER` as `*` in every
+//! position, whatever they hold: they are unvalidated text that can carry a card number, an SSN
+//! or a password, and Cardholder Data Redaction prevails over byte parity for those 240 bytes
+//! only. The line keeps its 350 bytes, and the record, its encoding and the report keep every
+//! byte (CBTRN03C-012, CBTRN03C-039; X-TRANREPT-3).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -120,6 +127,11 @@ const LINE_COUNTER_MODULUS: u64 = 1_000_000_000;
 
 /// Offset of `TRAN-CARD-NUM` in the 350-byte `TRAN-RECORD` (CVTRA05Y-011).
 const CARD_NUM_OFFSET: usize = 262;
+
+/// The byte the `TRAN-RECORD` job-log line shows in each position of `TRAN-SOURCE`, `TRAN-DESC`,
+/// `TRAN-MERCHANT-NAME`, `TRAN-MERCHANT-CITY`, `TRAN-MERCHANT-ZIP` and `FILLER`, whatever they
+/// hold (Cardholder Data Redaction; CBTRN03C-012, CBTRN03C-039, X-TRANREPT-3).
+const TEXT_MASK: u8 = b'*';
 
 /// Integer digits of `TRAN-AMT` and `WS-PAGE-TOTAL PIC S9(09)V99`.
 const AMOUNT_INT_DIGITS: u32 = 9;
@@ -339,16 +351,32 @@ pub fn sort_key(t: &TransactionRecord) -> SortKey {
 }
 
 /// The job-log line `DISPLAY TRAN-RECORD` shows for each record read (CBTRN03C-012): the 350
-/// bytes of the record's codec A encoding with the card number in its redacted form, twelve `*`
-/// and the last four digits, so the line keeps its width and holds no card number (X-TRANREPT-3,
-/// Cardholder Data Redaction).
+/// bytes of the record's codec A encoding with its free-text fields masked and its card number
+/// in the redacted form, so the line keeps its width and holds no card number, SSN or password
+/// (CBTRN03C-039, X-TRANREPT-3, Cardholder Data Redaction).
+///
+/// `TRAN-SOURCE`, `TRAN-DESC`, `TRAN-MERCHANT-NAME`, `TRAN-MERCHANT-CITY`, `TRAN-MERCHANT-ZIP`
+/// and `FILLER` are unvalidated text, so any of them can carry a protected value: each shows as
+/// `*` in every position, whatever it holds. `TRAN-CARD-NUM` shows as twelve `*` and its last
+/// four digits. `TRAN-ID`, the type and category codes, `TRAN-AMT`, `TRAN-MERCHANT-ID` and the
+/// two timestamps show as encoded. Only the line is masked: `t`, its encoding and the report
+/// records built from it keep every byte.
 ///
 /// The COBOL shows it after the window test and before the lookups, so the job shows it for a
 /// row [`selects`] accepts, before passing that row to [`Tranrept::process`]; a row outside the
 /// window leaves the loop first and shows nothing (CBTRN03C-011).
 #[must_use]
 pub fn record_display(t: &TransactionRecord) -> Vec<u8> {
-    let mut line = t.encode();
+    let shown = TransactionRecord {
+        source: PicX::from_array([TEXT_MASK; 10]),
+        desc: PicX::from_array([TEXT_MASK; 100]),
+        merchant_name: PicX::from_array([TEXT_MASK; 50]),
+        merchant_city: PicX::from_array([TEXT_MASK; 50]),
+        merchant_zip: PicX::from_array([TEXT_MASK; 10]),
+        filler: PicX::from_array([TEXT_MASK; 20]),
+        ..t.clone()
+    };
+    let mut line = shown.encode();
     let redacted = t.card_num.redacted_bytes();
     for (target, byte) in line.iter_mut().skip(CARD_NUM_OFFSET).zip(redacted) {
         *target = byte;
@@ -726,7 +754,11 @@ impl Tranrept {
     /// `ADD 1 TO WS-LINE-COUNTER`, with no `ON SIZE ERROR`: the sum keeps its low nine digits,
     /// so the counter after 999 999 999 is 0 (the store rule of `modern/audit/arithmetic.md`).
     fn count_line(&mut self) {
-        // The counter is below 10^9, so the addition never saturates.
+        // TRUNCATION: `ADD 1` into `WS-LINE-COUNTER PIC 9(09) COMP-3` has no `ON SIZE ERROR`, so
+        // the COBOL store keeps the low nine digits and 999 999 999 + 1 stores 0
+        // (`CBTRN03C.cbl:129,299,302,311,314,327-339,373`; CBTRN03C-021). The counter is always
+        // below 10^9, far below `u64::MAX`, so `saturating_add` never saturates and the modulo
+        // is exactly that store.
         self.line_counter = self.line_counter.saturating_add(1) % LINE_COUNTER_MODULUS;
     }
 }
@@ -1192,14 +1224,23 @@ mod tests {
 
     // audit: CBTRN03C-012
     #[test]
-    fn the_record_display_redacts_the_card_number_and_keeps_every_other_byte() -> TestResult {
+    fn the_record_display_masks_the_free_text_and_redacts_the_card_number() -> TestResult {
         let row = tran(21, CARD_1, Kind::Purchase, 18_388)?;
         let encoded = row.encode();
         let shown = record_display(&row);
         assert_eq!(shown.len(), TransactionRecord::WIDTH);
-        assert_eq!(shown.get(..262), encoded.get(..262));
+        // TRAN-SOURCE, TRAN-DESC, TRAN-MERCHANT-NAME, TRAN-MERCHANT-CITY, TRAN-MERCHANT-ZIP and
+        // FILLER, every byte `*` whatever the row holds, its spaces included.
+        let masked = [22..32, 32..132, 152..202, 202..252, 252..262, 330..350];
+        for range in masked {
+            let bytes = shown.get(range.clone()).ok_or("a masked field")?;
+            assert!(bytes.iter().all(|&byte| byte == b'*'), "{range:?}");
+        }
+        // TRAN-ID, TRAN-TYPE-CD and TRAN-CAT-CD; TRAN-AMT and TRAN-MERCHANT-ID; the timestamps.
+        for range in [0..22, 132..152, 278..330] {
+            assert_eq!(shown.get(range.clone()), encoded.get(range));
+        }
         assert_eq!(shown.get(262..278), Some(b"************0001".as_slice()));
-        assert_eq!(shown.get(278..), encoded.get(278..));
         Ok(())
     }
 

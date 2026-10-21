@@ -75,8 +75,14 @@
 //! # Rules
 //!
 //! No line shows a card number: the program displays parameters, dates, counts and `PA-ACCT-ID`
-//! only (Cardholder Data Redaction). The parse is total and indexes nothing (Total Parsers Over
-//! Untrusted Input). Amounts move only through `crate::money` and `store::<9>()`, and today
+//! only. The parameters are unvalidated SYSIN text, and a password is any 1 to 8 printable
+//! characters, so any received bytes can be or hold a protected value. `PARM RECEIVED` and
+//! `Debug` therefore show the received bytes only when they are one of two public values, the
+//! default card's 17 bytes, published as the job's in-stream card, or 17 spaces, which no card
+//! number, SSN or accepted password is. Any other value shows 17 `*`, and `Debug` then masks
+//! every value derived from it, while the run still uses the bytes as received (Cardholder Data
+//! Redaction; CBPAUP0C-003, X-CBPAUP0J-7). The parse is total and indexes nothing (Total Parsers
+//! Over Untrusted Input). Amounts move only through `crate::money` and `store::<9>()`, and today
 //! comes only from the injected [`Clock`]. Narrowing is checked or follows a COBOL store rule,
 //! each such place commented (Checked Integer Narrowing). No I/O.
 
@@ -133,6 +139,32 @@ const LOW_VALUES: [u8; FREQ_LEN] = [0; FREQ_LEN];
 
 /// The `P-DEBUG-FLAG` value of `88 DEBUG-ON` (CBPAUP0C-007).
 const DEBUG_ON_FLAG: u8 = b'Y';
+
+/// `PRM-INFO` of the default card, [`DEFAULT_SYSIN`] padded with spaces to 17 bytes:
+/// `00,00001,00001,Y ` (CBPAUP0C-002). It is the published in-stream card of `CBPAUP0J.jcl:37`,
+/// so showing it discloses nothing (CBPAUP0C-003, X-CBPAUP0J-7).
+const DEFAULT_PRM_INFO: [u8; PRM_INFO_LEN] = prm_info_of(DEFAULT_SYSIN.as_bytes());
+
+/// `PRM-INFO` of an empty or blank value: 17 spaces (CBPAUP0C-002). No card number or SSN is
+/// blank, and COUSR01C and sign-on refuse a blank password, so showing it discloses nothing
+/// (CBPAUP0C-003, X-CBPAUP0J-7).
+const BLANK_PRM_INFO: [u8; PRM_INFO_LEN] = [b' '; PRM_INFO_LEN];
+
+/// What `PARM RECEIVED` and `Debug` show in place of a `PRM-INFO` that is neither
+/// [`DEFAULT_PRM_INFO`] nor [`BLANK_PRM_INFO`]: 17 `*`, whatever the received bytes hold, so the
+/// line keeps its 41 characters and shows none of them (Cardholder Data Redaction; CBPAUP0C-003,
+/// X-CBPAUP0J-7).
+const MASKED_PRM_INFO: [u8; PRM_INFO_LEN] = [b'*'; PRM_INFO_LEN];
+
+/// What `Debug` shows in place of `WS-EXPIRY-DAYS` of a masked `PRM-INFO`: 2 `*`, the width of
+/// `P-EXPIRY-DAYS PIC 9(02)`, since the days are the value's first two bytes whenever they are
+/// digits (CBPAUP0C-003, CBPAUP0C-004, X-CBPAUP0J-7).
+const MASKED_EXPIRY_DAYS: [u8; 2] = [b'*'; 2];
+
+/// What `Debug` shows in place of a frequency of a masked `PRM-INFO`, since the frequency is five
+/// of the bytes the mask hides unless the default replaced them: 5 `*` (CBPAUP0C-003,
+/// X-CBPAUP0J-7).
+const MASKED_FREQ: [u8; FREQ_LEN] = [b'*'; FREQ_LEN];
 
 /// Spaces that pad a five-character parameter to the eight digits of a `PIC 9(8)` counter in a
 /// text comparison (CBPAUP0C-018).
@@ -269,9 +301,17 @@ pub enum DebugFlag {
 /// `1000-INITIALIZE` (`CBPAUP0C.cbl:98-108,189-209`; CBPAUP0C-002 to CBPAUP0C-007).
 ///
 /// Built only by [`PurgeParams::parse`], so every value holds the defaults the program applies.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The received bytes are unvalidated SYSIN text, so they can be or hold a card number, an SSN
+/// or a password, which is any 1 to 8 printable characters, digits and punctuation included. The
+/// run uses them as received, while `PARM RECEIVED` and `Debug` show them only when they are one
+/// of the two public values, the default card's 17 bytes or 17 spaces, and otherwise 17 `*`;
+/// `Debug` then masks every value derived from them, the debug flag aside (Cardholder Data
+/// Redaction; CBPAUP0C-003, X-CBPAUP0J-7).
+#[derive(Clone, PartialEq, Eq)]
 pub struct PurgeParams {
-    /// The 17 bytes of `PRM-INFO` before any default, as `PARM RECEIVED` shows them.
+    /// The 17 bytes of `PRM-INFO` before any default. `PARM RECEIVED` shows them only when they
+    /// are the default card's or 17 spaces (CBPAUP0C-003, X-CBPAUP0J-7).
     raw: [u8; PRM_INFO_LEN],
     /// `WS-EXPIRY-DAYS`: 0 to 99, or 5.
     expiry_days: u8,
@@ -326,10 +366,27 @@ impl PurgeParams {
         })
     }
 
-    /// The 17 bytes of `PRM-INFO` as received, before any default (CBPAUP0C-003).
+    /// The 17 bytes of `PRM-INFO` as received, before any default (CBPAUP0C-002), for the run's
+    /// logic and its checks. They can hold any printable text, a password of digits and
+    /// punctuation included, so they never form a log line: `PARM RECEIVED` shows the form of
+    /// CBPAUP0C-003, which is the received bytes only for the default card and 17 spaces
+    /// (X-CBPAUP0J-7).
     #[must_use]
     pub const fn raw(&self) -> &[u8; PRM_INFO_LEN] {
         &self.raw
+    }
+
+    /// The 17 bytes `PARM RECEIVED` and `Debug` show: the received bytes when they are
+    /// [`DEFAULT_PRM_INFO`] or [`BLANK_PRM_INFO`], otherwise [`MASKED_PRM_INFO`]. The decision
+    /// is taken over the whole value, so no fragment of any other value is shown (CBPAUP0C-003;
+    /// X-CBPAUP0J-7). Bytes 18 to 80 of the card are never part of `PRM-INFO`, so the default
+    /// card followed by more text is still shown as the default card.
+    fn shown(&self) -> [u8; PRM_INFO_LEN] {
+        if is_public(&self.raw) {
+            self.raw
+        } else {
+            MASKED_PRM_INFO
+        }
     }
 
     /// `WS-EXPIRY-DAYS`: the two digits of `P-EXPIRY-DAYS` when both are digits, otherwise 5
@@ -358,6 +415,69 @@ impl PurgeParams {
     pub const fn debug(&self) -> DebugFlag {
         self.debug
     }
+}
+
+impl fmt::Debug for PurgeParams {
+    /// For the default card and 17 spaces, the received bytes and the derived parameters. For
+    /// any other value, every value derived from the received bytes is masked: the received
+    /// bytes as 17 `*`, the expiry days as 2 `*` and each frequency as 5 `*`, so the output is
+    /// the same whatever the bytes except for the debug flag (CBPAUP0C-003; X-CBPAUP0J-7).
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = f.debug_struct("PurgeParams");
+        if is_public(&self.raw) {
+            out.field("received", &format_args!("\"{}\"", self.raw.escape_ascii()))
+                .field("expiry_days", &self.expiry_days)
+                .field(
+                    "chkp_freq",
+                    &format_args!("\"{}\"", self.chkp_freq.escape_ascii()),
+                )
+                .field(
+                    "chkp_dis_freq",
+                    &format_args!("\"{}\"", self.chkp_dis_freq.escape_ascii()),
+                );
+        } else {
+            out.field(
+                "received",
+                &format_args!("\"{}\"", MASKED_PRM_INFO.escape_ascii()),
+            )
+            .field(
+                "expiry_days",
+                &format_args!("\"{}\"", MASKED_EXPIRY_DAYS.escape_ascii()),
+            )
+            .field(
+                "chkp_freq",
+                &format_args!("\"{}\"", MASKED_FREQ.escape_ascii()),
+            )
+            .field(
+                "chkp_dis_freq",
+                &format_args!("\"{}\"", MASKED_FREQ.escape_ascii()),
+            );
+        }
+        out.field("debug", &self.debug).finish()
+    }
+}
+
+/// Whether `PARM RECEIVED` and `Debug` may show a received `PRM-INFO` as received: only when it
+/// is [`DEFAULT_PRM_INFO`], the published default card, or [`BLANK_PRM_INFO`], which no card
+/// number, SSN or accepted password is. Any other value, whatever its bytes, can be or hold a
+/// protected value, since a password is any 1 to 8 printable characters (Cardholder Data
+/// Redaction; CBPAUP0C-003, X-CBPAUP0J-7).
+fn is_public(prm_info: &[u8; PRM_INFO_LEN]) -> bool {
+    *prm_info == DEFAULT_PRM_INFO || *prm_info == BLANK_PRM_INFO
+}
+
+/// The first 17 bytes of `text` padded with spaces to 17, as [`PurgeParams::parse`] keeps them:
+/// [`DEFAULT_PRM_INFO`] at compile time (CBPAUP0C-002).
+const fn prm_info_of(text: &[u8]) -> [u8; PRM_INFO_LEN] {
+    let mut prm_info = BLANK_PRM_INFO;
+    let mut source = text;
+    let mut target: &mut [u8] = &mut prm_info;
+    while let ([byte, source_rest @ ..], [slot, target_rest @ ..]) = (source, target) {
+        *slot = *byte;
+        source = source_rest;
+        target = target_rest;
+    }
+    prm_info
 }
 
 /// Whether `byte` is printable ASCII, the bytes a SYSIN card holds (CBPAUP0C-002).
@@ -551,12 +671,16 @@ pub struct Purge {
 
 impl Purge {
     /// Starts a run: reads today's date once from `clock` as `YYDDD` (`ACCEPT CURRENT-YYDDD FROM
-    /// DAY`, CBPAUP0C-001) and shows the five opening lines, `PRM-INFO` as received
-    /// (CBPAUP0C-003).
+    /// DAY`, CBPAUP0C-001) and shows the five opening lines (CBPAUP0C-003). `PARM RECEIVED`
+    /// shows `PRM-INFO` as received only when it is the default card's `00,00001,00001,Y ` or an
+    /// empty value's 17 spaces, the two values that can never be a protected value, and
+    /// otherwise 17 `*`, so the line is 41 characters either way and never shows a card number,
+    /// an SSN or a password, which may be any 1 to 8 printable characters, that SYSIN carried
+    /// (Cardholder Data Redaction; X-CBPAUP0J-7). The run still uses the parameters as received.
     #[must_use]
     pub fn new(params: PurgeParams, clock: &dyn Clock) -> Self {
         let today = yyddd(clock.now());
-        let received: String = params.raw.iter().copied().map(char::from).collect();
+        let received: String = params.shown().into_iter().map(char::from).collect();
         let sysout = vec![
             STARTING.to_owned(),
             DASHES.to_owned(),
@@ -1005,9 +1129,9 @@ mod tests {
 
     use super::{
         ABEND_RETURN_CODE, CheckpointAction, DEFAULT_SYSIN, DebugFlag, DetailAction,
-        NORMAL_RETURN_CODE, Purge, PurgeFailure, PurgeHalt, PurgeParams, SYSIN_RECORD_LEN,
-        SummaryDisposition, SysinError, add_one_pic_9_8, auth_date, compare_as_text,
-        day_difference, display_count, display_curr_app_id, display_pa_acct_id,
+        NORMAL_RETURN_CODE, PRM_INFO_LEN, Purge, PurgeFailure, PurgeHalt, PurgeParams,
+        SYSIN_RECORD_LEN, SummaryDisposition, SysinError, add_one_pic_9_8, auth_date,
+        compare_as_text, day_difference, display_count, display_curr_app_id, display_pa_acct_id,
     };
     use crate::clock::FixedClock;
     use crate::money::{Decimal, Money};
@@ -1204,6 +1328,156 @@ mod tests {
             assert_eq!(Purge::new(params, &clock).today(), yyddd);
         }
         Ok(())
+    }
+
+    // CBPAUP0C-003, X-CBPAUP0J-7: PARM RECEIVED shows PRM-INFO as received only for the default
+    // card and a blank value, decided over the whole value, and otherwise 17 `*`.
+    #[test]
+    fn parm_received_shows_only_the_default_card_or_a_blank_value() -> TestResult {
+        let trailing = format!(
+            "{DEFAULT_SYSIN} {}",
+            "X".repeat(SYSIN_RECORD_LEN - DEFAULT_SYSIN.len() - 1)
+        );
+        let cases: [(&[u8], bool); 14] = [
+            (DEFAULT_SYSIN.as_bytes(), true),
+            (b"", true),
+            (b"                 ", true),
+            (trailing.as_bytes(), true),
+            (b"12;     ;     ;Y", false),
+            (b"99,00010,00002,Y", false),
+            (b"12,34567", false),
+            (b"12!34567", false),
+            (b"00,00001,00001,N", false),
+            (b"00,00001,00001,YX", false),
+            (b"7", false),
+            (b"01,00001,00001,Y", false),
+            (b"00,00001,00001", false),
+            (b"*****************", false),
+        ];
+        for (sysin, public) in cases {
+            let params = PurgeParams::parse(sysin)?;
+            let context = String::from_utf8_lossy(sysin);
+            let shown = if public { *params.raw() } else { [b'*'; 17] };
+            assert_eq!(params.shown(), shown, "shown form of {context:?}");
+            let purge = Purge::new(params, &february_9()?);
+            let line = format!(
+                "CBPAUP0C PARM RECEIVED :{}",
+                String::from_utf8_lossy(&shown)
+            );
+            assert_eq!(purge.sysout().get(2), Some(&line), "line of {context:?}");
+            assert_eq!(line.len(), 41);
+        }
+        Ok(())
+    }
+
+    // CBPAUP0C-003, X-CBPAUP0J-7: Debug shows the parameters of the default card and a blank
+    // value, and masks every value derived from any other, the debug flag aside.
+    #[test]
+    fn debug_shows_the_parameters_in_the_shown_form() -> TestResult {
+        let cases: [(&[u8], &str); 4] = [
+            (
+                DEFAULT_SYSIN.as_bytes(),
+                concat!(
+                    r#"PurgeParams { received: "00,00001,00001,Y ", expiry_days: 0, "#,
+                    r#"chkp_freq: "00001", chkp_dis_freq: "00001", debug: On }"#,
+                ),
+            ),
+            (
+                b"",
+                concat!(
+                    r#"PurgeParams { received: "                 ", expiry_days: 5, "#,
+                    r#"chkp_freq: "5    ", chkp_dis_freq: "10   ", debug: Off }"#,
+                ),
+            ),
+            (
+                b"07\"00000\\0    ,N",
+                concat!(
+                    r#"PurgeParams { received: "*****************", expiry_days: "**", "#,
+                    r#"chkp_freq: "*****", chkp_dis_freq: "*****", debug: Off }"#,
+                ),
+            ),
+            (
+                b"12,ABCDE,00002,Y",
+                concat!(
+                    r#"PurgeParams { received: "*****************", expiry_days: "**", "#,
+                    r#"chkp_freq: "*****", chkp_dis_freq: "*****", debug: On }"#,
+                ),
+            ),
+        ];
+        for (sysin, debug) in cases {
+            let params = PurgeParams::parse(sysin)?;
+            assert_eq!(format!("{params:?}"), debug);
+        }
+        Ok(())
+    }
+
+    /// The bytes a password of digits and punctuation, or a near miss of the default card, is
+    /// made of: digits, punctuation, a space, `*` and the default card's flag.
+    const NEAR_DEFAULT_BYTES: &[u8] = b"0123456789 ,;!.-/\"\\#*Y";
+
+    /// SYSIN values close to the public ones: the default card with up to three of its 17 bytes
+    /// replaced and up to 63 more printable bytes after them, and values of 0 to 17 digits and
+    /// punctuation alone, as a password or a well-formed custom card is.
+    fn near_the_default_card() -> impl Strategy<Value = Vec<u8>> {
+        let byte = || proptest::sample::select(NEAR_DEFAULT_BYTES.to_vec());
+        prop_oneof![
+            (
+                proptest::collection::vec((0..PRM_INFO_LEN, byte()), 0..=3),
+                proptest::collection::vec(0x20_u8..=0x7e, 0..=SYSIN_RECORD_LEN - PRM_INFO_LEN),
+            )
+                .prop_map(|(edits, tail)| {
+                    let mut card = b"00,00001,00001,Y ".to_vec();
+                    for (offset, value) in edits {
+                        if let Some(slot) = card.get_mut(offset) {
+                            *slot = value;
+                        }
+                    }
+                    card.extend(tail);
+                    card
+                }),
+            proptest::collection::vec(byte(), 0..=PRM_INFO_LEN),
+        ]
+    }
+
+    proptest! {
+        // CBPAUP0C-003, X-CBPAUP0J-7: whatever a card holds, the shown form is the received bytes
+        // only when they are the default card's 17 bytes or 17 spaces, and otherwise 17 `*`; a
+        // masked value's Debug is the same constant whatever the bytes except for the debug
+        // flag, and its PARM RECEIVED line is the masked line.
+        #[test]
+        fn the_shown_form_is_a_public_value_or_the_mask(
+            bytes in prop_oneof![
+                proptest::collection::vec(0x20_u8..=0x7e, 0..=SYSIN_RECORD_LEN),
+                near_the_default_card(),
+            ]
+        ) {
+            let Ok(params) = PurgeParams::parse(&bytes) else {
+                return Err(TestCaseError::fail("a printable card was refused"));
+            };
+            let raw = *params.raw();
+            let public = raw == *b"00,00001,00001,Y " || raw == [b' '; 17];
+            let shown = params.shown();
+            prop_assert_eq!(shown, if public { raw } else { [b'*'; 17] });
+            if !public {
+                let flag = match params.debug() {
+                    DebugFlag::On => "On",
+                    DebugFlag::Off => "Off",
+                };
+                let masked = format!(
+                    "PurgeParams {{ received: \"*****************\", expiry_days: \"**\", \
+                     chkp_freq: \"*****\", chkp_dis_freq: \"*****\", debug: {flag} }}"
+                );
+                prop_assert_eq!(format!("{params:?}"), masked);
+                let Ok(clock) = february_9() else {
+                    return Err(TestCaseError::fail("no clock"));
+                };
+                let purge = Purge::new(params, &clock);
+                prop_assert_eq!(
+                    purge.sysout().get(2).map(String::as_str),
+                    Some("CBPAUP0C PARM RECEIVED :*****************")
+                );
+            }
+        }
     }
 
     // CBPAUP0C-018, CBPAUP0C-020: a counter's eight digits against the space-padded parameter,

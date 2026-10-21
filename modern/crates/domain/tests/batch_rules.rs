@@ -2413,11 +2413,11 @@ mod tranrept {
     use std::collections::BTreeMap;
 
     use chrono::NaiveDateTime;
-    use copybook::{CobolTimestamp, PicTimestamp, PicU, PicX, TsForm};
+    use copybook::{CobolTimestamp, FixedRecord, PicTimestamp, PicU, PicX, TsForm};
     use domain::CardNumber;
     use domain::batch::cbtrn03c::{
         DATEPARM_RECORD_LEN, DateParm, DateParmError, Flow, REPORT_RECORD_LEN, ReportError,
-        ReportRecord, Tranrept, selects, sort_key,
+        ReportRecord, Tranrept, record_display, selects, sort_key,
     };
     use domain::records::{
         CardXrefRecord, TransactionCategoryRecord, TransactionRecord, TransactionTypeRecord,
@@ -2581,6 +2581,34 @@ mod tranrept {
     /// 2022-07-01 12:00:00 in layout `D`, as `posttran` stamps it.
     fn in_window() -> Outcome<Option<(NaiveDateTime, TsForm)>> {
         Ok(Some((instant((2022, 7, 1), (12, 0, 0))?, TsForm::Db2)))
+    }
+
+    /// Synthetic protected values, each assembled from parts: a 16-digit card number, an SSN
+    /// with and without dashes, and the sign-on password (Cardholder Data Redaction).
+    fn protected_values() -> [String; 4] {
+        [
+            ["4000", "1234", "5678", "9010"].concat(),
+            ["987", "65", "4321"].join("-"),
+            ["987", "65", "4321"].concat(),
+            ["PASS", "WORD"].concat(),
+        ]
+    }
+
+    /// Stores a value in one free-text field of a record, returning whether it fits there.
+    type Store = fn(&mut TransactionRecord, &str) -> bool;
+
+    /// `value` left-justified in `field` when it fits there, whether it did.
+    fn put<const N: usize>(field: &mut PicX<N>, value: &str) -> bool {
+        let fits = value.len() <= N;
+        if fits {
+            *field = PicX::moved_from(value.as_bytes());
+        }
+        fits
+    }
+
+    /// Whether `bytes` hold `value` anywhere.
+    fn holds(bytes: &[u8], value: &[u8]) -> bool {
+        value.is_empty() || bytes.windows(value.len()).any(|window| window == value)
     }
 
     /// One entry of the `Expected result` cell of a `FIXRPT-nnn` row, at its report record.
@@ -3213,6 +3241,63 @@ mod tranrept {
         Ok(())
     }
 
+    // audit: CBTRN03C-012
+    // audit: CBTRN03C-039
+    #[test]
+    fn a_protected_value_in_a_free_text_field_stays_in_the_record_but_not_in_the_job_log()
+    -> TestResult {
+        let values = protected_values();
+        let base = reported(1, 1, 100, in_window()?)?;
+        let card = *base.card_num.expose().as_bytes();
+        let fields: [(&str, Store); 6] = [
+            ("TRAN-SOURCE", |t, value| put(&mut t.source, value)),
+            ("TRAN-DESC", |t, value| put(&mut t.desc, value)),
+            ("TRAN-MERCHANT-NAME", |t, value| {
+                put(&mut t.merchant_name, value)
+            }),
+            ("TRAN-MERCHANT-CITY", |t, value| {
+                put(&mut t.merchant_city, value)
+            }),
+            ("TRAN-MERCHANT-ZIP", |t, value| {
+                put(&mut t.merchant_zip, value)
+            }),
+            ("FILLER", |t, value| put(&mut t.filler, value)),
+        ];
+        let mut placed = 0_usize;
+        for (field, store) in fields {
+            for (n, value) in (1..).zip(&values) {
+                let mut record = base.clone();
+                if !store(&mut record, value) {
+                    // A value wider than the field cannot occur in it.
+                    continue;
+                }
+                placed += 1;
+                let encoded = record.encode();
+                assert!(
+                    holds(&encoded, value.as_bytes()) && holds(&encoded, &card),
+                    "{field}, value {n}: the record lost bytes"
+                );
+                let line = record_display(&record);
+                assert!(
+                    line.len() == TransactionRecord::WIDTH,
+                    "{field}, value {n}: the job-log line is not 350 bytes"
+                );
+                assert!(
+                    !values.iter().any(|shown| holds(&line, shown.as_bytes())),
+                    "{field}, value {n}: the job-log line shows a protected value"
+                );
+                assert!(
+                    !holds(&line, &card),
+                    "{field}, value {n}: the job-log line shows the record's card number"
+                );
+            }
+        }
+        // The SSN without dashes and the password fit all six fields; the card number and the
+        // SSN with dashes only TRAN-DESC, the merchant name and city, and FILLER.
+        assert!(placed == 20, "every value in every field it fits");
+        Ok(())
+    }
+
     // audit: CBTRN03C-011
     #[test]
     fn a_record_outside_the_window_leaves_the_loop_without_totals() -> TestResult {
@@ -3318,8 +3403,9 @@ mod cbpaup0j {
     };
     use domain::clock::{inverted_auth_keys, yyddd};
     use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
+    use domain::sensitive::Password;
 
-    use super::{Outcome, TestResult, instant, money};
+    use super::{Outcome, TestResult, instant, money, padded};
 
     /// 2025-02-09 at noon, `YYDDD` 25040, the worked example of CBPAUP0C-012.
     fn today() -> Outcome<NaiveDateTime> {
@@ -3432,6 +3518,162 @@ mod cbpaup0j {
             ]
         );
         assert_eq!(run.params().expiry_days(), 0);
+        Ok(())
+    }
+
+    /// The passwords the test submits, assembled at run time so that no source line holds one:
+    /// one of letters and, since a password is any 1 to 8 printable characters, four of digits
+    /// and punctuation: two with a punctuation byte, eight digits and four digits.
+    fn submitted_passwords() -> [String; 5] {
+        [
+            ["PASS", "WORD"].concat(),
+            ["12", "34567"].join(","),
+            ["12", "34567"].join("!"),
+            ["7319", "2846"].concat(),
+            ["71", "93"].concat(),
+        ]
+    }
+
+    /// Values Cardholder Data Redaction keeps out of every log, assembled at run time so that no
+    /// source line holds one: a 16-digit card-number shape, an SSN with dashes, with spaces and
+    /// without either, and the passwords the test submits.
+    fn protected_values() -> Vec<String> {
+        let mut values = vec![
+            ["4000", "1234", "5678", "9010"].concat(),
+            ["987", "65", "4321"].join("-"),
+            ["987", "65", "4321"].join(" "),
+            ["987", "65", "4321"].concat(),
+        ];
+        values.extend(submitted_passwords());
+        values
+    }
+
+    /// Whether `text` shows any of `values`.
+    fn shows_any(text: &str, values: &[String]) -> bool {
+        values.iter().any(|value| text.contains(value.as_str()))
+    }
+
+    /// The parameters CBPAUP0C-004 to CBPAUP0C-007 give for the 17 bytes `prm`, read from the
+    /// rows: the expiry days, the frequency, the display frequency and the debug flag.
+    fn parameters_of(prm: [u8; PRM_INFO_LEN]) -> (u8, [u8; 5], [u8; 5], DebugFlag) {
+        let [e1, e2, _, rest @ ..] = prm;
+        let [c1, c2, c3, c4, c5, _, rest @ ..] = rest;
+        let [d1, d2, d3, d4, d5, _, flag, _] = rest;
+        let expiry = if e1.is_ascii_digit() && e2.is_ascii_digit() {
+            (e1 - b'0') * 10 + (e2 - b'0')
+        } else {
+            5
+        };
+        let kept = |field: [u8; 5], default: [u8; 5]| {
+            if field == [b' '; 5] || field == *b"0    " {
+                default
+            } else {
+                field
+            }
+        };
+        let debug = if flag == b'Y' {
+            DebugFlag::On
+        } else {
+            DebugFlag::Off
+        };
+        (
+            expiry,
+            kept([c1, c2, c3, c4, c5], *b"5    "),
+            kept([d1, d2, d3, d4, d5], *b"10   "),
+            debug,
+        )
+    }
+
+    // audit: CBPAUP0C-003
+    #[test]
+    fn a_protected_value_in_sysin_drives_the_run_but_reaches_no_log() -> TestResult {
+        const MASKED: &str = "CBPAUP0C PARM RECEIVED :*****************";
+        assert!(
+            submitted_passwords()
+                .iter()
+                .all(|password| Password::from_input(password).is_ok()),
+            "every submitted password is one the password type accepts"
+        );
+        let values = protected_values();
+        // Each value alone, followed by the default card's text, and after an expiry field; the
+        // last keeps only a fragment of the value in PRM-INFO, which is masked all the same. Two
+        // well-formed custom cards follow: only the default card and a blank value are public,
+        // so they are masked too.
+        let sysins: Vec<String> = values
+            .iter()
+            .flat_map(|value| {
+                [
+                    value.clone(),
+                    format!("{value},00001,Y"),
+                    format!("00,{value}"),
+                ]
+            })
+            .chain(["12;     ;     ;Y", "99,00010,00002,Y"].map(String::from))
+            .collect();
+        for (case, sysin) in (1..).zip(&sysins) {
+            let params = PurgeParams::parse(sysin.as_bytes())?;
+            let received = padded::<PRM_INFO_LEN>(sysin.as_bytes());
+            assert!(
+                *params.raw() == received,
+                "case {case}: PRM-INFO keeps the received bytes"
+            );
+            let (expiry, chkp, dis, debug) = parameters_of(received);
+            assert!(
+                params.expiry_days() == expiry
+                    && params.chkp_freq() == chkp
+                    && params.chkp_dis_freq() == dis
+                    && params.debug() == debug,
+                "case {case}: the parameters are those of the received bytes"
+            );
+            let run = Purge::new(params.clone(), &FixedClock::new(today()?));
+            assert!(
+                run.sysout().get(2).map(String::as_str) == Some(MASKED),
+                "case {case}: PARM RECEIVED shows 17 `*`"
+            );
+            assert!(run.params() == &params, "case {case}: the run uses them");
+            let report = run.clone().finish();
+            assert!(
+                !run.sysout()
+                    .iter()
+                    .chain(report.sysout())
+                    .any(|line| shows_any(line, &values)),
+                "case {case}: a SYSOUT line shows a protected value"
+            );
+            let debugs = [format!("{params:?}"), format!("{run:?}")];
+            let report_debug = format!("{report:?}");
+            assert!(
+                !debugs
+                    .iter()
+                    .chain([&report_debug])
+                    .any(|text| shows_any(text, &values)),
+                "case {case}: Debug output shows a protected value"
+            );
+            let flag = params.debug();
+            let masked_debug = format!(
+                "PurgeParams {{ received: \"*****************\", expiry_days: \"**\", \
+                 chkp_freq: \"*****\", chkp_dis_freq: \"*****\", debug: {flag:?} }}"
+            );
+            assert!(
+                debugs.first() == Some(&masked_debug)
+                    && debugs.iter().all(|text| text.contains(&masked_debug)),
+                "case {case}: Debug masks every value derived from the received bytes"
+            );
+        }
+        // The default card and an empty value are shown as received, the default card's line
+        // unchanged.
+        for sysin in [DEFAULT_SYSIN, ""] {
+            let run = purge(sysin)?;
+            let received = String::from_utf8_lossy(run.params().raw()).into_owned();
+            assert_eq!(
+                run.sysout().get(2),
+                Some(&format!("CBPAUP0C PARM RECEIVED :{received}")),
+                "{sysin:?}"
+            );
+            assert!(
+                format!("{:?}", run.params()).contains(&format!("received: \"{received}\"")),
+                "{sysin:?}: Debug shows the received bytes"
+            );
+        }
         Ok(())
     }
 
