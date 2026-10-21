@@ -1235,6 +1235,64 @@ mod intcalc {
         Ok(())
     }
 
+    // audit: CBACT04C-016
+    #[test]
+    fn a_run_past_999999_records_wraps_the_suffix_and_repeats_earlier_ids() -> TestResult {
+        // The blank group falls back to DEFAULT's 15.00 and every balance names the same
+        // account, so each read writes one SYSTRAN record, never a rewrite: record n carries
+        // suffix n modulo 10^6.
+        let mut run = Intcalc::new(
+            ParmDate::DEFAULT,
+            [account(1, b"          ")?],
+            [xref(1, card(1))?],
+            [group(DEFAULT_GROUP.as_bytes(), 1_500)?],
+        );
+        let tcatbal = balance(1, 100)?;
+        let clock = interest_clock()?;
+        // Record 1 and records 999999 to 1000002 are kept; every other ID is checked and dropped.
+        let mut kept = Vec::with_capacity(5);
+        for n in 1_u64..=1_000_002 {
+            let effects = run.process(&tcatbal, &clock)?;
+            let [IntcalcEffect::SystemTransaction(record)] = effects.as_slice() else {
+                return Err(format!("CBACT04C-016: record {n} is one SYSTRAN record").into());
+            };
+            let expected = format!("2022071800{:06}", n % 1_000_000);
+            assert!(
+                record.id.as_bytes() == expected.as_bytes(),
+                "CBACT04C-016: TRAN-ID of record {n}"
+            );
+            if n == 1 || n >= 999_999 {
+                kept.push(*record.id.as_bytes());
+            }
+        }
+        let [first, last_unwrapped, wrapped, repeated, after] = kept.as_slice() else {
+            return Err("CBACT04C-016: records 1 and 999999 to 1000002 kept".into());
+        };
+        assert!(
+            last_unwrapped.ends_with(b"999999"),
+            "CBACT04C-016: record 999999 ends 999999"
+        );
+        assert!(
+            wrapped.ends_with(b"000000"),
+            "CBACT04C-016: record 1000000 wraps to 000000"
+        );
+        assert!(
+            repeated.ends_with(b"000001") && repeated == first,
+            "CBACT04C-016: record 1000001 repeats the TRAN-ID of record 1"
+        );
+        assert!(
+            after.ends_with(b"000002"),
+            "CBACT04C-016: record 1000002 ends 000002"
+        );
+        // Only the suffix wraps: the written count goes on past 999999.
+        let summary = run.finish();
+        assert_eq!(
+            (summary.records_read(), summary.transactions_written()),
+            (1_000_002, 1_000_002)
+        );
+        Ok(())
+    }
+
     // audit: FIXINT-901
     // audit: FIXINT-902
     // audit: FIXINT-903
