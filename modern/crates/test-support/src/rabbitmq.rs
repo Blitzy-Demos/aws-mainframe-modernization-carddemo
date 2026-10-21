@@ -15,8 +15,9 @@
 //! channel before it returns the error, and every later request on it fails at once.
 //!
 //! The helpers never log a message body and never put one into a [`HarnessError`]; errors carry
-//! only the `Display` text of the `lapin`, testcontainers or I/O error behind them, a mount path,
-//! or the bound that passed (Cardholder Data Redaction).
+//! only the `Display` text of the `lapin`, testcontainers, Docker or I/O error behind them, a
+//! mount path, the bound that passed, or the label token of the start (Cardholder Data
+//! Redaction).
 
 use std::fmt;
 use std::path::PathBuf;
@@ -28,8 +29,7 @@ use lapin::publisher_confirm::Confirmation;
 use lapin::types::FieldTable;
 use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{ContainerAsync, ContainerRequest, GenericImage, ImageExt};
 use tokio::task;
 use tokio::time::{self, Instant};
 
@@ -134,28 +134,16 @@ impl RabbitMqGuard {
 /// or is not UTF-8, when the container does not start or log its startup message within 180
 /// seconds, when its ports cannot be read, when user `carddemo` cannot connect within 60 seconds
 /// of startup (the attempt under way at that point may take 10 seconds more), or when the broker
-/// does not confirm the close of that probe connection within 10 seconds.
+/// does not confirm the close of that probe connection within 10 seconds. Every such error
+/// removes the container; when Docker created it but the start failed, the error also reports
+/// how many containers of this start that removal found, or why it failed.
 pub async fn start_rabbitmq() -> Result<RabbitMqGuard, HarnessError> {
     let modern = modern_dir();
     let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
     let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;
 
-    let container = GenericImage::new(IMAGE, TAG)
-        .with_exposed_port(AMQP_PORT.tcp())
-        .with_exposed_port(MANAGEMENT_PORT.tcp())
-        .with_wait_for(WaitFor::message_on_stdout(STARTUP_MESSAGE))
-        .with_mount(
-            Mount::bind_mount(conf, "/etc/rabbitmq/rabbitmq.conf")
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_mount(
-            Mount::bind_mount(definitions, "/etc/rabbitmq/definitions.json")
-                .with_access_mode(AccessMode::ReadOnly),
-        )
-        .with_startup_timeout(STARTUP_TIMEOUT)
-        .start()
-        .await
-        .map_err(|err| HarnessError::new("start rabbitmq", &err))?;
+    let container =
+        crate::start_owned(request(image(), conf, definitions), "start rabbitmq").await?;
 
     let host = container
         .get_host()
@@ -179,6 +167,35 @@ pub async fn start_rabbitmq() -> Result<RabbitMqGuard, HarnessError> {
         management_url,
         container,
     })
+}
+
+/// The `rabbitmq:3.13-management` image with its ports and startup message. [`request`] adds
+/// the rest; the two stay apart so that a test can change what only a `GenericImage` can, such
+/// as the entrypoint.
+fn image() -> GenericImage {
+    GenericImage::new(IMAGE, TAG)
+        .with_exposed_port(AMQP_PORT.tcp())
+        .with_exposed_port(MANAGEMENT_PORT.tcp())
+        .with_wait_for(WaitFor::message_on_stdout(STARTUP_MESSAGE))
+}
+
+/// The container request of [`start_rabbitmq`] for `image`: `conf` and `definitions`, the
+/// absolute broker file paths of [`bind_source`], mounted read-only, and the startup bound.
+fn request(
+    image: GenericImage,
+    conf: String,
+    definitions: String,
+) -> ContainerRequest<GenericImage> {
+    image
+        .with_mount(
+            Mount::bind_mount(conf, "/etc/rabbitmq/rabbitmq.conf")
+                .with_access_mode(AccessMode::ReadOnly),
+        )
+        .with_mount(
+            Mount::bind_mount(definitions, "/etc/rabbitmq/definitions.json")
+                .with_access_mode(AccessMode::ReadOnly),
+        )
+        .with_startup_timeout(STARTUP_TIMEOUT)
 }
 
 /// The absolute UTF-8 form of a broker file, as a Docker bind mount requires.
@@ -429,8 +446,32 @@ async fn within<T>(
 mod tests {
     use std::path::Path;
 
-    use super::bind_source;
-    use crate::modern_dir;
+    use super::{IMAGE, bind_source, image, request, start_rabbitmq};
+    use crate::tests::{MISSING_ENTRYPOINT, failed_start_case, guarded_container_case};
+    use crate::{HarnessError, modern_dir};
+
+    #[tokio::test]
+    async fn a_started_broker_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
+        let guard = start_rabbitmq().await?;
+        let id = guard.container.id().to_owned();
+        guarded_container_case(guard, &id, IMAGE).await
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_removes_only_its_own_container() -> Result<(), HarnessError> {
+        let modern = modern_dir();
+        let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
+        let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;
+        failed_start_case(
+            request(
+                image().with_entrypoint(MISSING_ENTRYPOINT),
+                conf,
+                definitions,
+            ),
+            "start rabbitmq",
+        )
+        .await
+    }
 
     // `#[tokio::test]` runs on a current-thread runtime, where blocking the worker would stall
     // every other task and timer.
