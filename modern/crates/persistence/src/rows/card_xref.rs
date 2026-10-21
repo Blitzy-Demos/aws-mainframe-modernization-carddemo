@@ -244,6 +244,9 @@ mod tests {
             };
             let row = CardXrefRow::from_record(&record)?;
             assert!(row.card_num.as_bytes() == card, "card_num keeps every byte");
+            // TRUNCATION: none survives. Both conversions are checked: `cust_id` (`PIC 9(09)`)
+            // and `acct_id` (`PIC 9(11)`) are at most 10^9 − 1 and 10^11 − 1, which `i64` holds
+            // exactly, and `?` refuses any value outside `i64` instead of wrapping.
             assert_eq!(row.cust_id, i64::try_from(cust_id)?);
             assert_eq!(row.acct_id, i64::try_from(acct_id)?);
             assert_eq!(row.filler.as_bytes(), filler);

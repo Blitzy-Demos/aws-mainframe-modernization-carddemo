@@ -144,8 +144,10 @@ pub trait TransactionRepository: Send {
     /// The start is inclusive, as the record `STARTBR` positions on is the first `READNEXT`
     /// returns. Blank `start` ranks below every ID, because `CHAR(16)` ignores trailing
     /// spaces, and is the low-values key of a first page (COTRN00C-011). `limit` is bound
-    /// verbatim: the caller passes the rows it reads, the page and the read-ahead, after the
-    /// API bounded `page_size` to 1..=100 (Bounded Pagination).
+    /// verbatim: the caller passes the domain's `cotrn00c::Browse::limit`, from a `page_size`
+    /// the API bounded to 1..=100 (Bounded Pagination): the page and the read-ahead, plus one
+    /// for the record the skip read drops after PF8 or PF7 and on a PF5 entry (COTRN00C-004,
+    /// COTRN00C-015, COTRN00C-023).
     ///
     /// # Errors
     ///

@@ -143,9 +143,13 @@ pub trait CardRepository: Send {
     /// - `acct`, `card`: the account and card filters, each `None` when off. A card passes only if
     ///   it matches every filter given. The look-ahead read of COCRDLIC-019 ignores the filters, so
     ///   the service issues it with both `None`.
-    /// - `limit`: the row bound, bound verbatim. The service passes `page_size + 1`, the page and
-    ///   its look-ahead row, from a `page_size` the API has validated to 1–100 (Bounded
-    ///   Pagination), and decides from the rows which page, keys and messages result.
+    /// - `limit`: the row bound, bound verbatim. The service passes the bound of the domain's
+    ///   `ListPlan::limit` for a `page_size` the API has validated to 1–100 (Bounded Pagination):
+    ///   `page_size` for a filtered forward page, and `page_size + 1` for
+    ///   [`page_before`](Self::page_before), whose first row may be the start card it drops. The
+    ///   unfiltered look-ahead of COCRDLIC-019 passes 2: the page's last card, which the inclusive
+    ///   start returns first, and the card after it (X-COCRDLIC-3). The service decides from the
+    ///   rows which page, keys and messages result.
     ///
     /// # Errors
     ///

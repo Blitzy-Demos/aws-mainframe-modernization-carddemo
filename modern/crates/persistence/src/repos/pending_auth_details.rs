@@ -93,7 +93,9 @@ pub trait PendingAuthDetailRepository: Send {
     ///
     /// - a first page starts from the smallest keys the pictures allow, −99999 and −999999999;
     /// - `limit` is bound as given, so a page that must tell whether another follows asks for one
-    ///   row more than it shows, and the API validates the page size before it gets here;
+    ///   row more than it shows, and a page repositioned after a key one more again, for the row
+    ///   at that key (`copaus0c::PageRequest::fetch_limit`, COPAUS0C-041); the API validates the
+    ///   page size before it gets here;
     /// - whether a repositioned page keeps its first row, and whether that row must equal the key
     ///   it started from, are decisions of the service after the COPAUS0C and COPAUS1C audits.
     ///

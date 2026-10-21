@@ -475,6 +475,8 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 
 /// The value of one hex digit.
 fn nibble(digit: u8) -> Option<u8> {
+    // TRUNCATION: checked, never lossy. A hex digit's value is 0 to 15, which `u8` holds, so
+    // `.ok()` discards nothing; a byte that is not a hex digit is already `None`, never wrapped.
     char::from(digit)
         .to_digit(16)
         .and_then(|value| u8::try_from(value).ok())
@@ -934,10 +936,15 @@ mod tests {
 
         fn count(&self, filters: &rules::FilterQuery) -> i64 {
             let matching = self.0.iter().filter(|row| Self::matches(row, filters));
+            // TRUNCATION: checked, never lossy. The table holds at most the 7 seed rows, which
+            // `i64` holds; a count beyond `i64` saturates and never wraps.
             i64::try_from(matching.count()).unwrap_or(i64::MAX)
         }
 
         fn read(&self, query: &rules::ReadQuery) -> Vec<Db2TransactionType> {
+            // TRUNCATION: checked, never lossy. `ReadQuery::limit` is 1 to 8 (a page of 1 to 7
+            // rows, plus the forward lookahead row), which `usize` holds; a value it refused,
+            // such as a negative limit, reads no row and is never wrapped.
             let limit = usize::try_from(query.limit()).unwrap_or(0);
             let filtered = self
                 .0
@@ -1018,6 +1025,8 @@ mod tests {
     }
 
     fn page_size(requested: Option<i64>) -> Result<rules::PageSize, Box<dyn StdError>> {
+        // TRUNCATION: checked, never lossy. The default is 7, which `u32` holds; a refusal is a
+        // test failure, never a wrapped size.
         let default = u32::try_from(rules::DEFAULT_PAGE_SIZE)?;
         Ok(rules::PageSize::from_u32(resolve_page_size(requested, default)).ok_or("page size")?)
     }

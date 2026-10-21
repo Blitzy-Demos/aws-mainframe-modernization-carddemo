@@ -674,6 +674,8 @@ mod tests {
             assert_eq!(param["in"], "query", "{param}");
             assert_ne!(param["required"], true, "{param}");
         }
+        // TRUNCATION: checked, never lossy. The rendered key is 16 characters wide and `usize` is
+        // at most 64 bits, so `u64` holds it; `?` refuses any other value, never wrapping it.
         let width = u64::try_from(rules::AuthKey::RENDERED_WIDTH)?;
         let page_key = &params.first().ok_or("no page_key parameter")?["schema"];
         assert_eq!(page_key["minLength"], width);

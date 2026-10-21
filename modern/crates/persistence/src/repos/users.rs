@@ -48,8 +48,11 @@
 //! `queries/users_page_backward.sql`, the files the `explain` test plans on `users_pkey`. Both
 //! select the four columns `POPULATE-USER-DATA` shows and no credential column, so no page reads
 //! a hash (COUSR00C-028). The start key is included, and `limit` is bound verbatim: the service
-//! passes the page size the API validated (1 to 100) plus one, which tells it whether a further
-//! page exists, and discards the start record where F7 and F8 do (COUSR00C-022).
+//! passes `domain::online::cousr00c::PageRead::fetch_limit`, from the page size the API
+//! validated (1 to 100). For ENTER that is the page size plus one, the look-ahead row that tells
+//! whether a further page exists (COUSR00C-014); for F7 and F8 it is the page size plus two,
+//! because their browse first reads and discards the start record (COUSR00C-017, COUSR00C-022)
+//! before the page and its look-ahead (COUSR00C-014, COUSR00C-023).
 //!
 //! # Transactions
 //!

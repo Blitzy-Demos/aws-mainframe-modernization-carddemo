@@ -185,6 +185,9 @@ pub(crate) fn i64_to_pic_u<const N: u32>(
     column: &'static str,
     value: i64,
 ) -> Result<PicU<N>, PersistenceError> {
+    // TRUNCATION: none survives. The conversion is checked: a value from 0 to 10^N − 1 converts
+    // exactly, and a negative one or one above 10^N − 1 is `OutOfRange`, never wrapped or
+    // truncated.
     PicU::try_from(value).map_err(|_| PersistenceError::decode(column, DecodeKind::OutOfRange))
 }
 

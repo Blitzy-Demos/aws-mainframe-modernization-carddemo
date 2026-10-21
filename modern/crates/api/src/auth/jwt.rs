@@ -12,8 +12,11 @@
 //! # What this module does not do
 //!
 //! - It never puts the password (`SEC-USR-PWD X(08)`, CSUSR01Y-004) or any other protected value
-//!   into a token, and its `Debug` and `Display` output never shows key material, token text or
-//!   claim content (Cardholder Data Redaction). It does not log or trace.
+//!   (card number, SSN, CVV) into a token. It does not log or trace. The `Debug` of [`JwtKeys`]
+//!   shows only the lifetime, never key material, and the `Debug` and `Display` of [`JwtError`]
+//!   give only a fixed variant name or text, never the token, its claims or the `jsonwebtoken`
+//!   error (Cardholder Data Redaction). The derived `Debug` of [`Claims`] shows its ordinary
+//!   identity and lifetime fields (`sub`, `usr_type`, `iat`, `exp`), none a protected value.
 //! - It reads no environment variable: the secret and the lifetime arrive as parameters from
 //!   `runtime::config::Config` (`CARDDEMO_JWT_SECRET`, `CARDDEMO_JWT_TTL_SECONDS`), which also
 //!   refuses an empty secret (Local-Only Runtime).

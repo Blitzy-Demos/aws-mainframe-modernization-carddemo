@@ -633,6 +633,9 @@ fn decode<R: FixedRecord>(file: &str, bytes: &[u8], expected: usize) -> Vec<Fram
 
 /// The count `replace_all` reports for `records`.
 fn row_count<R>(records: &[R]) -> u64 {
+    // TRUNCATION: none survives. The conversion is checked: `usize` is at most 64 bits on every
+    // supported target, so every length converts into `u64` exactly, and a length `u64` cannot
+    // hold would panic through `expect` instead of wrapping.
     u64::try_from(records.len()).expect("a record count fits u64")
 }
 

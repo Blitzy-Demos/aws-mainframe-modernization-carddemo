@@ -156,6 +156,9 @@ mod tests {
         for (acct_id, type_cd, cd, bal) in cases {
             let original = record(acct_id, type_cd, cd, bal)?;
             let row = TranCatBalanceRow::from_record(&original)?;
+            // TRUNCATION: none survives. Both conversions are checked: `acct_id` (`PIC 9(11)`)
+            // and `tran_cat_cd` (`PIC 9(04)`) are 0 to 10^11 − 1 and 0 to 9999, which `u64`
+            // holds exactly, and `?` refuses a negative value instead of wrapping.
             assert_eq!(u64::try_from(row.acct_id)?, acct_id);
             assert_eq!(row.tran_type_cd.as_bytes(), &type_cd);
             assert_eq!(u64::try_from(row.tran_cat_cd)?, cd);

@@ -365,6 +365,10 @@ mod tests {
                 (row.acct_id, row.auth_date_9c, row.auth_time_9c),
                 (case.acct, case.date_9c, case.time_9c)
             );
+            // TRUNCATION: none survives. Both conversions are checked: a `PA-PROCESSING-CODE`
+            // value (`PIC 9(06)`) is at most 999999 and a `PA-POS-ENTRY-MODE` one (`PIC 9(02)`)
+            // at most 99, so `i64` holds both exactly, and `?` refuses any value outside `i64`
+            // instead of wrapping.
             assert_eq!(
                 (row.processing_code, row.pos_entry_mode),
                 (

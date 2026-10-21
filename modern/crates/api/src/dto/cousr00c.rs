@@ -375,6 +375,8 @@ mod tests {
             direction,
             first_key: response.first_key.clone(),
             last_key: response.last_key.clone(),
+            // TRUNCATION: checked, never lossy. The page number is PIC 9(08), at most
+            // 99,999,999, which `i64` holds; `?` refuses any other value, never wrapping it.
             page_no: Some(i64::try_from(response.page_no)?),
             has_next_page: Some(response.has_next_page),
             ..UserListQuery::default()

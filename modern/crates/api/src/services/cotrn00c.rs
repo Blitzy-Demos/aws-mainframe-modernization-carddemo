@@ -188,7 +188,9 @@ mod tests {
             if self.fail {
                 return Err(PersistenceError::Unavailable);
             }
-            // A negative `LIMIT` is refused by the server (SQLSTATE 2201W), as here.
+            // TRUNCATION: checked, never lossy. `Browse::limit` is at most `MAX_PAGE_SIZE + 2`,
+            // which `usize` holds; a negative `LIMIT` is refused as the server refuses it
+            // (SQLSTATE 2201W), never wrapped.
             let take = usize::try_from(limit).map_err(|_| PersistenceError::Database {
                 sqlstate: Some("2201W".to_owned()),
                 constraint: None,
@@ -343,6 +345,9 @@ mod tests {
             direction,
             first_key: response.first_key.clone(),
             last_key: response.last_key.clone(),
+            // TRUNCATION: checked, never lossy. The page number is PIC 9(08), at most
+            // 99,999,999, which `i64` holds; `.ok()` would drop only an impossible value to
+            // absent, never wrap it.
             page_no: i64::try_from(response.page_no).ok(),
             has_next_page: Some(response.has_next_page),
             ..TranListQuery::default()

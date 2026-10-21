@@ -180,6 +180,8 @@ impl From<&CardListQuery> for rules::ListState {
     fn from(query: &CardListQuery) -> Self {
         let fresh = Self::fresh();
         Self {
+            // TRUNCATION: checked, never lossy. Validation admits only 0 to 9, which the one-digit
+            // page number holds; a value the conversion refuses counts as absent, never wrapped.
             page_no: query
                 .page_no
                 .and_then(|page_no| rules::PageNumber::try_from(page_no).ok())
@@ -342,6 +344,8 @@ mod tests {
         (1..=count)
             .map(|n| {
                 Ok(rules::CardListRow {
+                    // TRUNCATION: checked, never lossy. `n` counts at most 15 synthetic cards,
+                    // which `i64` holds; `?` refuses a larger count, never wrapping it.
                     card_ref: rules::CardRef::new(i64::try_from(n)?),
                     card_num: CardNumber::parse(&format!("4000{n:012}"))?,
                     acct_id: PicU::new(n)?,

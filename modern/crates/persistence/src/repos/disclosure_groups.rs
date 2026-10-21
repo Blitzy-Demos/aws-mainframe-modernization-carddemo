@@ -387,6 +387,8 @@ mod tests {
         }
 
         // The two `DEFAULT` keys every fixture lookup falls back to: `discgrp.txt:18` and `:25`.
+        // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)` holds
+        // 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
         let category = PicU::<4>::try_from(1_u64)?;
         let purchase = store
             .find_by_id(&default_group(), &PicX::from_array(*b"01"), category)
@@ -407,6 +409,8 @@ mod tests {
             (PicX::moved_from(b"A000000000"), *b"01", 9_999),
         ];
         for (group, type_cd, cat_cd) in misses {
+            // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)`
+            // holds 1 and 9999 exactly, and `?` refuses a value above 9999 instead of wrapping.
             let cat_cd = PicU::<4>::try_from(cat_cd)?;
             let found = store
                 .find_by_id(&group, &PicX::from_array(type_cd), cat_cd)
@@ -453,6 +457,8 @@ mod tests {
         let mut store = PgStore::new(guard.pool().clone());
         let records = fixture()?;
         assert_eq!(store.replace_all(&records).await?, 51);
+        // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)` holds
+        // 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
         let category = PicU::<4>::try_from(1_u64)?;
         let type_cd = PicX::from_array(*b"01");
 

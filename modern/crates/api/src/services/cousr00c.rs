@@ -187,6 +187,9 @@ mod tests {
             if self.fail {
                 return Err(PersistenceError::Unavailable);
             }
+            // TRUNCATION: checked, never lossy. `PageRead::fetch_limit` is a page size of 1 to 100
+            // plus the read-ahead and the discarded start record, at most 102, which `usize`
+            // holds; a negative `LIMIT` is refused as unavailable, never wrapped.
             let limit = usize::try_from(limit).map_err(|_| PersistenceError::Unavailable)?;
             Ok(matching.take(limit).cloned().collect())
         }

@@ -302,6 +302,9 @@ mod tests {
                 limit,
             });
             self.failure()?;
+            // TRUNCATION: checked, never lossy. The service binds at most the page size plus
+            // one, 101, or the look-ahead's 2, which `usize` holds; a negative `LIMIT` is refused
+            // as the server refuses it (SQLSTATE 2201W), never wrapped.
             let rows = usize::try_from(limit).map_err(|_| PersistenceError::Database {
                 sqlstate: Some("2201W".to_owned()),
                 constraint: None,
@@ -431,6 +434,9 @@ mod tests {
                     .map(|(record, handle)| (CardRef::new(handle), record))
                     .collect();
                 self.sort();
+                // TRUNCATION: checked, never lossy. `usize` is at most 64 bits on every supported
+                // target, so `u64` holds the count; a refusal is a check failure, never a wrapped
+                // count.
                 u64::try_from(self.entries.len())
                     .map_err(|_| PersistenceError::Check { constraint: None })
             });

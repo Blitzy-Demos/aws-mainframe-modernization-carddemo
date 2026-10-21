@@ -37,9 +37,11 @@
 //! The pages read `queries/db2_transaction_types_page_forward.sql` and
 //! `queries/db2_transaction_types_page_backward.sql` through `sqlx::query_file_as!`, the same
 //! files the `explain` test plans on the `xtran_type` key (Bounded Pagination). `limit` is bound
-//! as given: the service passes the page size plus one, the look-ahead fetch by which
-//! `8000-READ-FORWARD` learns whether a next page exists (`COTRTLIC.cbl:1657-1676`), after the
-//! API has bounded the page size to 1 to 100.
+//! as given: the service passes the domain's `cotrtlic::ReadQuery::limit`, the page's rows plus,
+//! forward, the look-ahead fetch by which `8000-READ-FORWARD` learns whether a next page exists
+//! (`COTRTLIC.cbl:1657-1676`, COTRTLIC-004); backward, the rows alone. The API has bounded the
+//! page size to 1 to 100, and the domain serves at most the screen's seven rows of it
+//! (COTRTLIC-017).
 //!
 //! # Stored bytes
 //!
@@ -635,6 +637,9 @@ mod tests {
             assert_eq!(backward, forward);
 
             let count = store.count_matching(type_filter, desc_pattern).await?;
+            // TRUNCATION: none survives. The conversion is checked: a SQL `count` is never
+            // negative and here is at most the seven seeded rows, which `usize` holds exactly,
+            // and `?` refuses a value `usize` cannot hold instead of wrapping.
             assert_eq!(usize::try_from(count)?, forward.len());
         }
         Ok(())

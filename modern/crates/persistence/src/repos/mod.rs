@@ -37,9 +37,16 @@
 //! - The nine paginated reads use `sqlx::query_file_as!` over `queries/*.sql`, the same files the
 //!   `explain` test plans: `page_after` and `page_before` of [`CardRepository`],
 //!   [`TransactionRepository`], [`UserRepository`] and [`Db2TransactionTypeRepository`], and
-//!   [`PendingAuthDetailRepository::page_after`]. Each returns at most `limit` rows; the API
-//!   service passes `page_size + 1`, the page and its look-ahead row, from a `page_size` it has
-//!   validated to `1..=100`.
+//!   [`PendingAuthDetailRepository::page_after`]. Each returns at most `limit` rows, bound
+//!   verbatim. A page read's limit is the one its program's domain rules compute
+//!   (`cocrdlic::ListPlan::limit`, `cotrn00c::Browse::limit`, `cousr00c::PageRead::fetch_limit`,
+//!   `copaus0c::PageRequest::fetch_limit`, `cotrtlic::ReadQuery::limit`, in `domain::online`)
+//!   from a page size the API has validated to `1..=100`: the page, plus at most the start or
+//!   anchor record the program discards and the look-ahead row, so never more than the page size
+//!   plus two. Two reads take a fixed limit of 2 instead: COPAUS1C's next detail, and the card
+//!   list's look-ahead (COCRDLIC-019), which is not an extra row of the filtered page but a
+//!   separate, unfiltered [`CardRepository::page_after`] from the page's last card
+//!   (X-COCRDLIC-3).
 //!
 //! # Outcomes
 //!

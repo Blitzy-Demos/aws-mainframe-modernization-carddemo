@@ -173,6 +173,9 @@ mod tests {
             };
             let row = TransactionCategoryRow::from_record(&record)?;
             assert_eq!(row.tran_type_cd.as_bytes(), record.type_cd.as_bytes());
+            // TRUNCATION: none survives. The conversion is checked: `tran_cat_cd` holds a
+            // `PIC 9(04)` value, 0 to 9999, which `u64` holds exactly, and `?` refuses a
+            // negative value instead of wrapping.
             assert_eq!(u64::try_from(row.tran_cat_cd)?, cat_cd);
             assert_eq!(
                 row.tran_cat_type_desc.as_bytes(),
