@@ -1,0 +1,10 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/wide_into_narrow.rs:13:28
+   |
+13 |     let narrow: Money<9> = wide;
+   |                 --------   ^^^^ expected `9`, found `10`
+   |                 |
+   |                 expected due to this
+   |
+   = note: expected struct `Money<9>`
+              found struct `Money<10>`
