@@ -99,7 +99,8 @@ pub(crate) fn truncated_digits(value: Decimal, int_digits: u32, scale: u32) -> D
 
 /// The lowest decimal digit of `value`.
 fn low_digit(value: u128) -> u8 {
-    // A remainder modulo 10 always fits `u8`; the fallback only keeps this free of a panic path.
+    // TRUNCATION: a remainder modulo 10 is at most 9, which `u8` holds exactly; the fallback is
+    // unreachable and only keeps this free of a panic path.
     u8::try_from(value % 10).unwrap_or(0)
 }
 
@@ -116,17 +117,25 @@ fn signed_decimal(magnitude: u128, negative: bool, scale: u32) -> Result<Decimal
     if negative && magnitude == 0 {
         return Err(ErrorKind::NegativeZero);
     }
+    // TRUNCATION: every caller builds `magnitude` from at most `MAX_DIGITS` (28) digits, which
+    // `total_digits` and `packed::byte_width` enforce, so it is below 10^28 and `i128` holds it
+    // exactly; the error arm is unreachable.
     let unsigned = i128::try_from(magnitude).map_err(|_| ErrorKind::OutOfRange)?;
     let mantissa = if negative {
         unsigned.checked_neg().ok_or(ErrorKind::OutOfRange)?
     } else {
         unsigned
     };
+    // TRUNCATION: |mantissa| is below 10^28, which the 96-bit `Decimal` mantissa holds, and every
+    // caller's scale is at most its digit count, so at most 28; the error arm is unreachable.
     Decimal::try_from_i128_with_scale(mantissa, scale).map_err(|_| ErrorKind::OutOfRange)
 }
 
 /// A scale-0 value as a `PIC S9(N)` field.
 fn pic_s_from_decimal<const N: u32>(value: Decimal) -> Result<PicS<N>, ErrorKind> {
+    // TRUNCATION: both callers decode at scale 0, so the mantissa is the integer of at most N
+    // digits, and N ≤ 18 for every `PicS<N>` that compiles: |mantissa| ≤ 10^18 − 1, below
+    // `i64::MAX`, so the error arm is unreachable, and `PicS::new` re-checks the range.
     i64::try_from(value.mantissa())
         .map_err(|_| ErrorKind::OutOfRange)
         .and_then(PicS::new)
@@ -251,6 +260,8 @@ pub mod packed {
     /// [`ErrorKind::OutOfRange`] when `digits` is 0 or above 28 (PIC-023).
     pub fn byte_width(digits: u32) -> Result<usize, ErrorKind> {
         if (1..=MAX_DIGITS).contains(&digits) {
+            // TRUNCATION: `digits` is at most 28 here, so the width is at most 15, which `usize`
+            // holds on every target; the error arm is unreachable.
             usize::try_from(digits / 2 + 1).map_err(|_| ErrorKind::OutOfRange)
         } else {
             Err(ErrorKind::OutOfRange)
@@ -659,6 +670,9 @@ mod tests {
         assert_eq!(min.digits.len(), 33);
         assert_eq!(min.digits.first(), Some(&7));
         assert_eq!(min.digits.iter().rev().take(4).max(), Some(&0));
+        // TRUNCATION: the literal is 2^96 − 1, the largest 96-bit mantissa (that of
+        // `Decimal::MAX`), so the `i128` fits the mantissa exactly, and 28 is the largest scale
+        // `Decimal` supports, so the checked constructor succeeds and the `?` arm is unreachable.
         let fine = Decimal::try_from_i128_with_scale(79_228_162_514_264_337_593_543_950_335, 28)?;
         assert_eq!(signed(fine, 3, 2), b"0079B");
         assert_eq!(truncated_digits(fine, 0, 0).digits, Vec::<u8>::new());

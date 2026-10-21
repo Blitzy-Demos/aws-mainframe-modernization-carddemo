@@ -104,8 +104,9 @@ pub(crate) fn push_digits(out: &mut Vec<u8>, magnitude: u128, count: u32) {
 
 /// The ASCII digit for a value below 10.
 fn ascii_digit(value: u128) -> u8 {
-    // Every caller passes a remainder modulo 10, so the conversion succeeds and the sum stays in
-    // `0`–`9`; the fallback only keeps this function free of a panic path.
+    // TRUNCATION: every caller passes a remainder modulo 10, at most 9, so the conversion into
+    // `u8` is exact and the sum stays in `0`–`9`; the fallback is unreachable and only keeps
+    // this function free of a panic path.
     u8::try_from(value)
         .ok()
         .and_then(|digit| b'0'.checked_add(digit))
@@ -248,8 +249,47 @@ impl<const N: usize> fmt::Debug for PicX<N> {
 /// width from 1 to 18, so every identifier of 10 or more digits is 64-bit (PIC-003, PIC-023,
 /// Checked Integer Narrowing).
 ///
-/// A width outside 1–18 fails to compile wherever a constructor is used.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// A width outside 1–18 fails to compile wherever a constructor is used, [`PicU::ZERO`] and
+/// [`Default`] included. Widths 1 and 18 construct through each of them, as does [`PicS`]'s
+/// [`Default`]:
+///
+/// ```
+/// let zero = copybook::pic::PicU::<1>::ZERO;
+/// assert_eq!(zero.get(), 0);
+/// let zero = copybook::pic::PicU::<18>::ZERO;
+/// assert_eq!(zero.get(), 0);
+/// let zero = copybook::pic::PicU::<1>::default();
+/// assert_eq!(zero.get(), 0);
+/// let zero = copybook::pic::PicU::<18>::default();
+/// assert_eq!(zero.get(), 0);
+/// let zero = copybook::pic::PicS::<1>::default();
+/// assert_eq!(zero.get(), 0);
+/// let zero = copybook::pic::PicS::<18>::default();
+/// assert_eq!(zero.get(), 0);
+/// ```
+///
+/// Widths 0 and 19 do not:
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicU::<0>::ZERO;
+/// assert_eq!(zero.get(), 0);
+/// ```
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicU::<19>::ZERO;
+/// assert_eq!(zero.get(), 0);
+/// ```
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicU::<0>::default();
+/// assert_eq!(zero.get(), 0);
+/// ```
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicU::<19>::default();
+/// assert_eq!(zero.get(), 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PicU<const N: u32>(u64);
 
 impl<const N: u32> PicU<N> {
@@ -260,7 +300,17 @@ impl<const N: u32> PicU<N> {
     };
 
     /// Zero, which encodes as `N` zeros.
-    pub const ZERO: Self = Self(0);
+    pub const ZERO: Self = Self::from_valid(0);
+
+    /// The single constructor every [`PicU`] value passes through, [`PicU::ZERO`] and
+    /// [`Default`] included; `value` is at most [`Self::MAX`]. The inline const block rejects a
+    /// width outside 1–18 at compile time, when the width is instantiated.
+    const fn from_valid(value: u64) -> Self {
+        const {
+            assert!(N != 0 && N < 19, "PicU width must be 1..=18");
+        };
+        Self(value)
+    }
 
     /// The value `value`.
     ///
@@ -271,7 +321,7 @@ impl<const N: u32> PicU<N> {
         if value > Self::MAX {
             Err(ErrorKind::OutOfRange)
         } else {
-            Ok(Self(value))
+            Ok(Self::from_valid(value))
         }
     }
 
@@ -296,6 +346,9 @@ impl<const N: u32> PicU<N> {
                 actual: bytes.len(),
             });
         }
+        // TRUNCATION: the length check leaves exactly N digits, and N ≤ 18 for every width that
+        // compiles, so the value is at most 10^18 − 1, below `u64::MAX`; the error arm is
+        // unreachable, and `Self::new` still checks the value against `Self::MAX`.
         let value = u64::try_from(parse_digits(bytes)?).map_err(|_| ErrorKind::OutOfRange)?;
         Self::new(value)
     }
@@ -318,6 +371,13 @@ impl<const N: u32> PicU<N> {
     }
 }
 
+/// [`PicU::ZERO`], so the default passes the same width check.
+impl<const N: u32> Default for PicU<N> {
+    fn default() -> Self {
+        Self::ZERO
+    }
+}
+
 impl<const N: u32> TryFrom<u64> for PicU<N> {
     type Error = ErrorKind;
 
@@ -330,6 +390,9 @@ impl<const N: u32> TryFrom<i64> for PicU<N> {
     type Error = ErrorKind;
 
     fn try_from(value: i64) -> Result<Self, Self::Error> {
+        // TRUNCATION: a sign conversion only: a negative value has no `PIC 9(n)` value and is
+        // `OutOfRange`, every non-negative `i64` converts into `u64` exactly, and `Self::new`
+        // checks the result against `Self::MAX`.
         u64::try_from(value)
             .map_err(|_| ErrorKind::OutOfRange)
             .and_then(Self::new)
@@ -350,7 +413,20 @@ impl<const N: u32> From<PicU<N>> for u64 {
 /// `From<PicU<N>>` and `TryFrom<PicS<N>> for PicU<N>`, and the inverted authorization keys
 /// `PA-AUTH-DATE-9C PIC S9(05)` and `PA-AUTH-TIME-9C PIC S9(09)` through
 /// [`PicS::complement_from`] (`CIPAUSMY.cpy:19`, `CIPAUDTY.cpy:20-21`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+///
+/// A width outside 1–18 fails to compile wherever a constructor is used, [`Default`] included;
+/// [`PicU`] shows widths 1 and 18 constructing. Widths 0 and 19 do not:
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicS::<0>::default();
+/// assert_eq!(zero.get(), 0);
+/// ```
+///
+/// ```compile_fail,E0080
+/// let zero = copybook::pic::PicS::<19>::default();
+/// assert_eq!(zero.get(), 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct PicS<const N: u32>(i64);
 
 impl<const N: u32> PicS<N> {
@@ -360,6 +436,16 @@ impl<const N: u32> PicS<N> {
         10_i64.pow(N) - 1
     };
 
+    /// The single constructor every [`PicS`] value passes through, [`Default`] included; the
+    /// magnitude of `value` is at most [`Self::MAX`]. The inline const block rejects a width
+    /// outside 1–18 at compile time, when the width is instantiated.
+    const fn from_valid(value: i64) -> Self {
+        const {
+            assert!(N != 0 && N < 19, "PicS width must be 1..=18");
+        };
+        Self(value)
+    }
+
     /// The value `value`.
     ///
     /// # Errors
@@ -367,7 +453,7 @@ impl<const N: u32> PicS<N> {
     /// [`ErrorKind::OutOfRange`] when the magnitude exceeds [`Self::MAX`].
     pub fn new(value: i64) -> Result<Self, ErrorKind> {
         if (-Self::MAX..=Self::MAX).contains(&value) {
-            Ok(Self(value))
+            Ok(Self::from_valid(value))
         } else {
             Err(ErrorKind::OutOfRange)
         }
@@ -391,6 +477,8 @@ impl<const N: u32> PicS<N> {
             .unsigned_abs()
             .checked_sub(value)
             .ok_or(ErrorKind::OutOfRange)?;
+        // TRUNCATION: `inverted` is `MAX − value`, at most `MAX` ≤ 10^18 − 1, below `i64::MAX`,
+        // so the conversion is exact for every width that compiles; the error arm is unreachable.
         i64::try_from(inverted)
             .map_err(|_| ErrorKind::OutOfRange)
             .and_then(Self::new)
@@ -403,6 +491,8 @@ impl<const N: u32> PicS<N> {
     ///
     /// [`ErrorKind::OutOfRange`] for a negative value, which no inverted key holds.
     pub fn uncomplement(self) -> Result<u64, ErrorKind> {
+        // TRUNCATION: a sign conversion only: a negative value, which no inverted key holds, is
+        // `OutOfRange`, and a non-negative `i64` converts into `u64` exactly.
         let value = u64::try_from(self.0).map_err(|_| ErrorKind::OutOfRange)?;
         Self::MAX
             .unsigned_abs()
@@ -415,7 +505,14 @@ impl<const N: u32> From<PicU<N>> for PicS<N> {
     fn from(value: PicU<N>) -> Self {
         // TRUNCATION: a `PicU<N>` value is at most 10^N − 1 ≤ 10^18 − 1, below `i64::MAX`, so the
         // conversion is exact for every width that compiles; the fallback is unreachable.
-        Self(i64::try_from(value.get()).unwrap_or(Self::MAX))
+        Self::from_valid(i64::try_from(value.get()).unwrap_or(Self::MAX))
+    }
+}
+
+/// Zero, built by the same width-checked constructor as every other value.
+impl<const N: u32> Default for PicS<N> {
+    fn default() -> Self {
+        Self::from_valid(0)
     }
 }
 
@@ -423,6 +520,9 @@ impl<const N: u32> TryFrom<PicS<N>> for PicU<N> {
     type Error = ErrorKind;
 
     fn try_from(value: PicS<N>) -> Result<Self, Self::Error> {
+        // TRUNCATION: a sign conversion only: a negative value has no unsigned key and is
+        // `OutOfRange`; a non-negative one is at most 10^N − 1 and converts into `u64` exactly,
+        // and `Self::new` re-checks it against `Self::MAX`.
         u64::try_from(value.get())
             .map_err(|_| ErrorKind::OutOfRange)
             .and_then(Self::new)
@@ -570,6 +670,9 @@ fn year_fits(date: NaiveDate) -> bool {
 
 /// The value of a fixed run of ASCII digits.
 fn digits_u32<const K: usize>(digits: [u8; K]) -> Option<u32> {
+    // TRUNCATION: every caller passes at most 6 digits (a 4-digit year; 2-digit month, day, hour,
+    // minute and second; 6 fraction digits), so the value is at most 999 999, far below
+    // `u32::MAX`; a failed conversion would still be `None`, invalid text, never a truncated value.
     u32::try_from(parse_digits(&digits).ok()?).ok()
 }
 
@@ -579,13 +682,16 @@ fn parse_date_text(text: [u8; DATE_WIDTH]) -> Option<NaiveDate> {
     let [y1, y2, y3, y4, b'-', m1, m2, b'-', d1, d2] = text else {
         return None;
     };
+    // TRUNCATION: four year digits are at most 9999, which `i32` holds exactly; the conversion's
+    // `None` arm is unreachable.
     let year = i32::try_from(digits_u32([y1, y2, y3, y4])?).ok()?;
     NaiveDate::from_ymd_opt(year, digits_u32([m1, m2])?, digits_u32([d1, d2])?)
 }
 
 fn push_date(out: &mut Vec<u8>, date: NaiveDate) {
-    // Every constructor and decoder admits only years 0..=9999, so the conversion succeeds; the
-    // fallback only keeps this function free of a panic path.
+    // TRUNCATION: every constructor and decoder admits only years 0..=9999, never negative, so
+    // the conversion into `u128` is exact; the default fallback is unreachable and only keeps
+    // this function free of a panic path.
     let year = u128::try_from(date.year()).unwrap_or_default();
     push_digits(out, year, 4);
     out.push(b'-');
@@ -998,6 +1104,19 @@ mod tests {
         assert_eq!(PicU::<5>::ZERO, PicU::<5>::default());
         assert_eq!(u64::from(PicU::<5>::new(42)?), 42);
         Ok(())
+    }
+
+    fn assert_zero_encodes_n_zeros<const N: u32>() {
+        assert_eq!(PicU::<N>::ZERO, PicU::<N>::default());
+        let mut out = Vec::new();
+        PicU::<N>::default().encode_into(&mut out);
+        assert_eq!(out, vec![b'0'; digit_count(N)]);
+    }
+
+    #[test]
+    fn pic_u_zero_encodes_n_zeros_at_the_boundary_widths() {
+        assert_zero_encodes_n_zeros::<1>();
+        assert_zero_encodes_n_zeros::<18>();
     }
 
     #[test]
