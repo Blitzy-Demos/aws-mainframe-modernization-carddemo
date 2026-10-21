@@ -19,11 +19,17 @@
 //! member is the empty text, so an empty field reaches the program's own message and never a
 //! deserialisation error (COUSR01C-010 to COUSR01C-014).
 //!
-//! The only rule declared here is each map field's `LENGTH`, the server half of the `both` rows
-//! of `modern/audit/screens.md`: `first_name` 20 (COUSR01-013), `last_name` 20 (COUSR01-016),
-//! `user_id` 8 (COUSR01-019), `password` 8 (COUSR01-022) and `user_type` 1 (COUSR01-025). A
-//! longer value is the 400 the parent module's `ValidJson` gives, naming the member. `user_type`
-//! is not narrowed to `A` and `U`: COUSR01C stores any non-blank character (COUSR01C-015).
+//! The rules declared here are each map field's `LENGTH`, the server half of the `both` rows of
+//! `modern/audit/screens.md`: `first_name` 20 (COUSR01-013), `last_name` 20 (COUSR01-016),
+//! `user_id` 8 (COUSR01-019), `password` 8 (COUSR01-022) and `user_type` 1 (COUSR01-025), and
+//! the `PIC X(n)` field each is moved into, through the parent module's `pic_x`: at most that
+//! many bytes, each printable ASCII (`0x20`–`0x7E`). A longer value, or one that counts few
+//! enough characters but holds a byte outside printable ASCII, such as an accented letter or a
+//! TAB, is the 400 the parent module's `ValidJson` gives, naming the member (X-COUSR01C-3).
+//! `LOW-VALUES`, a value of the field's width in NUL bytes, which `pic_x` admits for the
+//! programs that test it, passes on to `domain::online::cousr01c::edit`, which rejects it
+//! naming the member, because an erased field arrives as an empty value here. `user_type` is
+//! not narrowed to `A` and `U`: COUSR01C stores any non-blank character (COUSR01C-015).
 //!
 //! # Redaction
 //!
@@ -57,39 +63,43 @@ const PASSWORD_REDACTED: &str = "********";
 // (Generated API Types Only). `Debug` is written by hand so the password cannot reach a log.
 #[derive(Clone, Serialize, Deserialize, ToSchema, Validate)]
 pub struct UserAddRequest {
-    /// `FNAME`, `PIC X(20)`: the first name, as typed (COUSR01-013).
+    /// `FNAME`, `PIC X(20)`: the first name, as typed, at most 20 bytes of printable ASCII
+    /// (`0x20`–`0x7E`; COUSR01-013).
     #[serde(default)]
-    #[validate(length(max = 20))]
+    #[validate(length(max = 20), custom(function = "super::pic_x::<20>"))]
     #[schema(max_length = 20, example = "ALEX")]
     pub first_name: String,
 
-    /// `LNAME`, `PIC X(20)`: the last name, as typed (COUSR01-016).
+    /// `LNAME`, `PIC X(20)`: the last name, as typed, at most 20 bytes of printable ASCII
+    /// (`0x20`–`0x7E`; COUSR01-016).
     #[serde(default)]
-    #[validate(length(max = 20))]
+    #[validate(length(max = 20), custom(function = "super::pic_x::<20>"))]
     #[schema(max_length = 20, example = "MORGAN")]
     pub last_name: String,
 
     /// `USERID`, `PIC X(8)`: the ID of the user to add, as typed and compared byte for byte
-    /// with the stored IDs (COUSR01-019, COUSR01C-023).
+    /// with the stored IDs, at most 8 bytes of printable ASCII (`0x20`–`0x7E`; COUSR01-019,
+    /// COUSR01C-023).
     #[serde(default)]
-    #[validate(length(max = 8))]
+    #[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]
     #[schema(max_length = 8, example = "NEWUSR01")]
     pub user_id: String,
 
-    /// `PASSWD`, `PIC X(8)`, a dark field: the new user's password, stored as typed and hashed
-    /// (COUSR01-022, COUSR01C-018). Write-only: never sent back.
+    /// `PASSWD`, `PIC X(8)`, a dark field: the new user's password, stored as typed and hashed,
+    /// at most 8 bytes of printable ASCII (`0x20`–`0x7E`; COUSR01-022, COUSR01C-018).
+    /// Write-only: never sent back.
     // `skip_serializing_if` with a predicate that is always true, not `skip_serializing`:
     // utoipa drops a `skip_serializing` member from the schema, and the request body must
     // declare the password as a write-only property. Serialisation omits it all the same.
     #[serde(default, skip_serializing_if = "never_serialised")]
-    #[validate(length(max = 8))]
+    #[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]
     #[schema(write_only, max_length = 8, example = "********")]
     pub password: String,
 
-    /// `USRTYPE`, `PIC X(1)`: `A` for an administrator, any other non-blank character for a
-    /// regular user (COUSR01-025, COUSR01C-015).
+    /// `USRTYPE`, `PIC X(1)`: `A` for an administrator, any other non-blank character of
+    /// printable ASCII (`0x20`–`0x7E`) for a regular user (COUSR01-025, COUSR01C-015).
     #[serde(default)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     #[schema(max_length = 1, example = "U")]
     pub user_type: String,
 }
@@ -120,6 +130,7 @@ mod tests {
     use axum::extract::{FromRequest, Request};
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
+    use domain::online::cousr01c::{FailureClass, UserAddInput, edit};
     use serde_json::{Map, Value, json};
     use utoipa::{PartialSchema, ToSchema};
     use validator::Validate;
@@ -234,6 +245,51 @@ mod tests {
                 (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
             );
             assert!(!rejection.message().contains(&long));
+        }
+        Ok(())
+    }
+
+    // audit: COUSR01-013
+    // audit: COUSR01-016
+    // audit: COUSR01-019
+    // audit: COUSR01-022
+    // audit: COUSR01-025
+    #[tokio::test]
+    async fn each_member_admits_only_what_its_field_holds_byte_for_byte() -> TestResult {
+        for (member, length) in LENGTHS {
+            // As many characters as the map `LENGTH`, so within the `length` rule, yet bytes no
+            // `PIC X(n)` field holds: a two-byte letter or a control byte in every position.
+            for value in ["é".repeat(length), "\t".repeat(length)] {
+                let rejection = match extract(&json!({ member: value })).await? {
+                    Ok(_) => return Err(format!("{member} {value:?} passed").into()),
+                    Err(rejection) => rejection,
+                };
+                assert_eq!(
+                    (rejection.status(), rejection.message(), rejection.field()),
+                    (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
+                    "{member} {value:?}"
+                );
+                let wire = serde_json::to_string(&rejection)?;
+                assert!(!wire.contains(&value), "{wire}");
+            }
+
+            // `LOW-VALUES` passes the request rules, and `edit` answers it as a value no
+            // `PIC X(n)` field stores, naming the member (X-COUSR01C-3).
+            let request = extract(&json!({ member: "\0".repeat(length) }))
+                .await?
+                .map_err(|e| e.message().to_owned())?;
+            let input = UserAddInput {
+                first_name: &request.first_name,
+                last_name: &request.last_name,
+                user_id: &request.user_id,
+                password: &request.password,
+                user_type: &request.user_type,
+            };
+            let failure = edit(&input).err().ok_or("LOW-VALUES passed the edits")?;
+            assert_eq!(
+                (failure.field().name(), failure.class()),
+                (member, FailureClass::Input)
+            );
         }
         Ok(())
     }

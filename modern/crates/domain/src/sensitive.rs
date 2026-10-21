@@ -29,6 +29,22 @@
 //! [`DisclosedCardNumber`] is the single full-value serialiser in the workspace. Only
 //! [`CardNumber::disclose`] builds one, for the card-detail response of endpoint 8.
 //!
+//! # Free text
+//!
+//! A stored text field that is no protected field can still hold a protected value: the text
+//! fields of a pending authorization are copied from the CP00 request, so the 22 bytes of
+//! `PA-MERCHANT-NAME` can hold a 16-digit card number and the 9 of `PA-MERCHANT-ZIP` an SSN.
+//! [`redact_free_text`] masks such values where that text leaves a service. It reads a written
+//! number as a run of ASCII digits whose groups may be joined by one space or one hyphen, and
+//! masks each written number of nine or more digits, nine being the fewest a protected value
+//! holds (an SSN). Nine digits show as the SSN redacted form `***-**-1234` and sixteen as the
+//! card redacted form `************5740`, whatever separators they are written with. Any other
+//! count of nine or more, for which no redacted form exists, shows `*` for each digit but the
+//! last four, its separators kept. A run of eight or fewer digits, such as a ZIP code or a store
+//! number, shows as it is. The text keeps its width where its trailing spaces allow: a form
+//! longer than the number it replaces takes its room from the trailing spaces, and a shorter
+//! one is padded with spaces at the end.
+//!
 //! # API schemas
 //!
 //! This crate has no `utoipa` dependency. The `api` DTOs describe these fields as `String`
@@ -68,6 +84,10 @@ const MASK: u8 = b'*';
 /// The hidden area and group numbers of a redacted SSN, which its last four digits follow.
 const SSN_MASK: &str = "***-**-";
 
+/// The twelve hidden positions of a redacted card number as text, which its last four digits
+/// follow: [`CARD_WIDTH`] less [`LAST_DIGITS`] [`MASK`] characters, as [`redact_card`] writes.
+const CARD_MASK: &str = "************";
+
 /// Length of a redacted SSN: [`SSN_MASK`] and four digits.
 const SSN_REDACTED_LEN: usize = 11;
 
@@ -76,6 +96,18 @@ const CVV_REDACTED: &str = "***";
 
 /// What `Debug` and `Display` print for any password.
 const PASSWORD_REDACTED: &str = "********";
+
+/// The characters that join the digit groups of one written number in free text, as in
+/// `4000 1234` or `123-45`.
+const NUMBER_SEPARATORS: [char; 2] = [' ', '-'];
+
+/// The digits of an SSN written in text: [`SSN_DIGITS`] as a count of characters. A written
+/// number of this many digits shows as the SSN redacted form in [`redact_free_text`].
+const SSN_TEXT_DIGITS: usize = 9;
+
+/// The fewest digits of a written number that [`redact_free_text`] masks: the nine of an SSN,
+/// the shortest protected value (a card number holds [`CARD_WIDTH`]).
+const PROTECTED_MIN_DIGITS: usize = SSN_TEXT_DIGITS;
 
 /// Why external text is not a protected value.
 ///
@@ -447,6 +479,108 @@ impl fmt::Display for Password {
     }
 }
 
+/// `text` with every protected value it may hold masked, for a stored free-text field that
+/// leaves a service, such as the request text of a pending authorization (`E32`).
+///
+/// A written number is a maximal run of ASCII digits whose digit groups may be joined by one
+/// space or one hyphen. A separator joins only when a digit follows it, so a separator before
+/// any other character, or a second separator, ends the number. A written number of fewer than
+/// nine digits is kept as it is. One of nine or more digits, the fewest a protected value holds
+/// (an SSN; a card number holds 16), is masked by its count of digits:
+///
+/// - nine digits, an SSN however it is written (`123456789`, `123-45-6789`, `123 45 6789`),
+///   become the redacted form of an [`Ssn`], `***-**-` and the last four digits, such as
+///   `***-**-6789`;
+/// - sixteen digits, a card number however it is grouped, become the redacted form of a
+///   [`CardNumber`], twelve `*` and the last four digits, such as `************5740`;
+/// - any other count, ten to fifteen or seventeen and more, for which no redacted form exists,
+///   shows `*` for each digit but its last four and keeps its separators, so `TXN000000000001`
+///   becomes `TXN********0001`.
+///
+/// Every other character is kept, in its order. The result keeps the character count of `text`
+/// where the trailing spaces of `text` allow: when the forms add characters, as the two a plain
+/// SSN gains, as many trailing spaces are dropped, and when they remove characters, as the
+/// three separators of a grouped card number, as many spaces are appended. When `text` has too
+/// few trailing spaces, as for an SSN that fills its field, the result is longer than `text` by
+/// the difference: a redacted form is never cut to keep the width. Each character added or
+/// removed is one byte, so the byte length follows the same rule. Text with no written
+/// number of nine digits, such as `CORNER GROCERY`, `#1234`, `MERCHANT0000001` or the ZIP code
+/// `98101`, is returned unchanged.
+///
+/// Only ASCII digits count: any other character, a non-ASCII digit included, is kept as it is.
+/// The function is total, for any text; it neither indexes nor panics, and its result is its
+/// own redaction, unchanged.
+#[must_use]
+pub fn redact_free_text(text: &str) -> String {
+    let mut redacted = String::with_capacity(text.len());
+    let mut number = String::new();
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        let joins_groups = NUMBER_SEPARATORS.contains(&character)
+            && !number.is_empty()
+            && characters.peek().is_some_and(char::is_ascii_digit);
+        if character.is_ascii_digit() || joins_groups {
+            number.push(character);
+        } else {
+            push_written_number(&mut redacted, &number);
+            number.clear();
+            redacted.push(character);
+        }
+    }
+    push_written_number(&mut redacted, &number);
+    fit_width(&mut redacted, text.chars().count());
+    redacted
+}
+
+/// Appends one written number of [`redact_free_text`] to `redacted`: as it is when it holds
+/// fewer than [`PROTECTED_MIN_DIGITS`] digits; as [`SSN_MASK`] or [`CARD_MASK`] and its last
+/// [`LAST_DIGITS`] digits, its separators dropped, when it holds [`SSN_TEXT_DIGITS`] or
+/// [`CARD_WIDTH`]; otherwise with [`MASK`] for each digit but the last [`LAST_DIGITS`], its
+/// separators kept.
+fn push_written_number(redacted: &mut String, number: &str) {
+    let digits = number.chars().filter(char::is_ascii_digit).count();
+    let hidden = digits.saturating_sub(LAST_DIGITS);
+    match digits {
+        0..PROTECTED_MIN_DIGITS => redacted.push_str(number),
+        SSN_TEXT_DIGITS | CARD_WIDTH => {
+            redacted.push_str(if digits == CARD_WIDTH {
+                CARD_MASK
+            } else {
+                SSN_MASK
+            });
+            redacted.extend(number.chars().filter(char::is_ascii_digit).skip(hidden));
+        }
+        _ => {
+            let mut left = hidden;
+            for character in number.chars() {
+                if character.is_ascii_digit() && left > 0 {
+                    redacted.push(char::from(MASK));
+                    left -= 1;
+                } else {
+                    redacted.push(character);
+                }
+            }
+        }
+    }
+}
+
+/// Brings `redacted` back to `width` characters through its trailing spaces: when it is longer,
+/// drops its trailing spaces, at most as many as it has characters too many; when it is
+/// shorter, appends as many spaces as it lacks.
+fn fit_width(redacted: &mut String, width: usize) {
+    let shown = redacted.chars().count();
+    if let Some(missing) = width.checked_sub(shown) {
+        redacted.extend(core::iter::repeat_n(' ', missing));
+        return;
+    }
+    for _ in width..shown {
+        if !redacted.ends_with(' ') {
+            break;
+        }
+        redacted.pop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::fmt;
@@ -454,9 +588,13 @@ mod tests {
     use std::error::Error;
 
     use copybook::pic::{PicU, PicX};
+    use proptest::prelude::*;
     use serde::Serialize;
 
-    use super::{CardNumber, Cvv, DisclosedCardNumber, Password, SensitiveError, Ssn};
+    use super::{
+        CardNumber, Cvv, DisclosedCardNumber, NUMBER_SEPARATORS, PROTECTED_MIN_DIGITS, Password,
+        SensitiveError, Ssn, redact_free_text,
+    };
 
     /// The first cross-reference record's card number (`cardxref.txt:1`).
     const CARD: &str = "0500024453765740";
@@ -665,6 +803,306 @@ mod tests {
             assert_eq!(error.to_string(), message);
             let source: &dyn Error = &error;
             assert!(source.source().is_none());
+        }
+    }
+
+    /// The protected-shaped values of the free-text cases, assembled at run time so that no
+    /// secret scanner reads a literal, and the forms [`Ssn`] and [`CardNumber`] print for them.
+    struct FreeText {
+        card: String,
+        spaced_card: String,
+        hyphenated_card: String,
+        ssn: String,
+        dashed_ssn: String,
+        spaced_ssn: String,
+        /// Twelve `*` and `9010`.
+        card_redacted: String,
+        /// `***-**-6789`.
+        ssn_redacted: String,
+    }
+
+    impl FreeText {
+        fn new() -> Result<Self, SensitiveError> {
+            let groups = ["4000", "1234", "5678", "9010"];
+            let ssn_parts = ["123", "45", "6789"];
+            let card = groups.concat();
+            let ssn = ssn_parts.concat();
+            Ok(Self {
+                card_redacted: CardNumber::parse(&card)?.redacted(),
+                ssn_redacted: Ssn::parse(&ssn)?.redacted(),
+                spaced_card: groups.join(" "),
+                hyphenated_card: groups.join("-"),
+                dashed_ssn: ssn_parts.join("-"),
+                spaced_ssn: ssn_parts.join(" "),
+                card,
+                ssn,
+            })
+        }
+
+        /// Asserts each case: (what it is, the text, its expected redaction, how many characters
+        /// and bytes longer than the text the redaction is, because the text has too few trailing
+        /// spaces for the forms). No assertion message prints a protected value.
+        fn check(&self, cases: &[(&str, String, String, usize)]) {
+            let protected = [
+                &self.card,
+                &self.spaced_card,
+                &self.hyphenated_card,
+                &self.ssn,
+                &self.dashed_ssn,
+                &self.spaced_ssn,
+            ];
+            for (case, text, expected, longer) in cases {
+                let shown = redact_free_text(text);
+                assert!(shown == *expected, "{case}: not the expected redacted form");
+                assert_eq!(
+                    shown.chars().count(),
+                    text.chars().count() + longer,
+                    "{case}: width"
+                );
+                assert_eq!(shown.len(), text.len() + longer, "{case}: bytes");
+                for value in protected {
+                    assert!(
+                        !shown.contains(value.as_str()),
+                        "{case}: a protected value is shown"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn free_text_masks_each_written_number_of_nine_digits_or_more() -> Result<(), SensitiveError> {
+        let values = FreeText::new()?;
+        let FreeText {
+            card,
+            spaced_card,
+            hyphenated_card,
+            ssn,
+            dashed_ssn,
+            spaced_ssn,
+            card_redacted,
+            ssn_redacted,
+        } = &values;
+        values.check(&[
+            // Nine digits, however written: the SSN redacted form, two characters longer than
+            // the plain SSN, which has no trailing space to give them.
+            ("a plain SSN", ssn.clone(), ssn_redacted.clone(), 2),
+            ("a dashed SSN", dashed_ssn.clone(), ssn_redacted.clone(), 0),
+            ("a spaced SSN", spaced_ssn.clone(), ssn_redacted.clone(), 0),
+            // Sixteen digits, however grouped: the card redacted form, padded at the end of the
+            // text for the separators it drops.
+            ("a plain card", card.clone(), card_redacted.clone(), 0),
+            (
+                "a spaced card number",
+                spaced_card.clone(),
+                format!("{card_redacted}   "),
+                0,
+            ),
+            (
+                "a hyphenated card number",
+                hyphenated_card.clone(),
+                format!("{card_redacted}   "),
+                0,
+            ),
+            (
+                "a card number inside a merchant name",
+                format!("PAY {card} NOW"),
+                format!("PAY {card_redacted} NOW"),
+                0,
+            ),
+            (
+                "a spaced card number inside a merchant name",
+                format!("PAY {spaced_card} NOW"),
+                format!("PAY {card_redacted} NOW   "),
+                0,
+            ),
+            (
+                "a card number between letters",
+                format!("X{card}Y"),
+                format!("X{card_redacted}Y"),
+                0,
+            ),
+            // Any other count of nine or more: `*` for each digit but the last four.
+            (
+                "a 17-digit run that embeds a card number",
+                format!("7{card}"),
+                "*************9010".to_owned(),
+                0,
+            ),
+            (
+                "a 12-digit run inside an identifier",
+                "TXN000000000001".to_owned(),
+                "TXN********0001".to_owned(),
+                0,
+            ),
+            (
+                "a 10-digit number, its separator kept",
+                "12345-67890".to_owned(),
+                "*****-*7890".to_owned(),
+                0,
+            ),
+            (
+                "non-ASCII text before the number",
+                format!("CAF\u{c9} {dashed_ssn}"),
+                format!("CAF\u{c9} {ssn_redacted}"),
+                0,
+            ),
+        ]);
+        Ok(())
+    }
+
+    #[test]
+    fn free_text_keeps_its_width_where_its_trailing_spaces_allow() -> Result<(), SensitiveError> {
+        let values = FreeText::new()?;
+        let FreeText {
+            card,
+            spaced_card,
+            ssn,
+            dashed_ssn,
+            card_redacted,
+            ssn_redacted,
+            ..
+        } = &values;
+        values.check(&[
+            // Text padded to its field keeps its width through its trailing spaces.
+            (
+                "a plain SSN padded to a 25-character field",
+                format!("{ssn:<25}"),
+                format!("{ssn_redacted:<25}"),
+                0,
+            ),
+            (
+                "a dashed SSN padded to its field",
+                format!("{dashed_ssn}  "),
+                format!("{ssn_redacted}  "),
+                0,
+            ),
+            (
+                "a plain SSN inside padded text",
+                format!("SSN {ssn} OK  "),
+                format!("SSN {ssn_redacted} OK"),
+                0,
+            ),
+            (
+                "a plain card number padded to a 25-character field",
+                format!("{card:<25}"),
+                format!("{card_redacted:<25}"),
+                0,
+            ),
+            (
+                "a spaced card number padded to a 25-character field",
+                format!("{spaced_card:<25}"),
+                format!("{card_redacted:<25}"),
+                0,
+            ),
+            // Too few trailing spaces: the redaction is longer than the text.
+            (
+                "a 9-digit value filling its field with one trailing space",
+                format!("{ssn} "),
+                ssn_redacted.clone(),
+                1,
+            ),
+            (
+                "a trailing separator, which ends the number",
+                format!("{ssn}-"),
+                format!("{ssn_redacted}-"),
+                2,
+            ),
+            (
+                "a leading separator, which joins nothing",
+                format!("-{ssn} "),
+                format!("-{ssn_redacted}"),
+                1,
+            ),
+        ]);
+        Ok(())
+    }
+
+    #[test]
+    fn free_text_without_a_nine_digit_number_is_unchanged() {
+        let unchanged = [
+            "",
+            "CORNER GROCERY",
+            "SEATTLE",
+            "#1234",
+            "MERCHANT0000001",
+            "98101",
+            "SEATTLE 98101",
+            "STORE 12345678",
+            "1234 5678",
+            "1234-5678 X",
+            // A second separator, or a separator before any other character, ends the number,
+            // so each part holds fewer than nine digits.
+            "123 45  6789",
+            "1234--56789",
+            "12345 -6789",
+            "1234-X-56789",
+            // Only ASCII digits count.
+            "\u{661}\u{662}\u{663}\u{664}\u{665}\u{666}\u{667}\u{668}\u{669}",
+            "1234\u{ff15}6789",
+        ];
+        for text in unchanged {
+            assert_eq!(redact_free_text(text), text);
+        }
+    }
+
+    /// What every redaction of free text keeps: the width of the text where its trailing spaces
+    /// allow, every character that is neither an ASCII digit nor a number separator in its order
+    /// with only `*` added, the order of the digits it still shows, and no written number of nine
+    /// digits left to mask.
+    fn check_free_text(text: &str) -> Result<(), TestCaseError> {
+        let shown = redact_free_text(text);
+        let (width, shown_width) = (text.chars().count(), shown.chars().count());
+        // The width is kept, or the redaction is longer only once no trailing space is left,
+        // and each character added or removed is one byte.
+        prop_assert!(shown_width >= width);
+        prop_assert!(shown_width == width || !shown.ends_with(' '));
+        prop_assert_eq!(
+            shown.len().checked_sub(text.len()),
+            Some(shown_width - width)
+        );
+        let kept = |character: &char| {
+            !character.is_ascii_digit() && !NUMBER_SEPARATORS.contains(character)
+        };
+        let mut expected = text.chars().filter(kept).peekable();
+        for character in shown.chars().filter(kept) {
+            if expected.peek() == Some(&character) {
+                expected.next();
+            } else {
+                prop_assert_eq!(character, '*');
+            }
+        }
+        prop_assert!(expected.next().is_none());
+        let mut digits = text.chars().filter(char::is_ascii_digit);
+        prop_assert!(
+            shown
+                .chars()
+                .filter(char::is_ascii_digit)
+                .all(|digit| digits.any(|candidate| candidate == digit))
+        );
+        prop_assert!(
+            shown
+                .split(|character: char| !character.is_ascii_digit())
+                .all(|run| run.len() < PROTECTED_MIN_DIGITS)
+        );
+        prop_assert_eq!(redact_free_text(&shown), shown);
+        Ok(())
+    }
+
+    proptest! {
+        // Total Parsers Over Untrusted Input: any text, never a panic.
+        #[test]
+        fn free_text_redaction_is_total_and_keeps_the_width(text in any::<String>()) {
+            check_free_text(&text)?;
+        }
+
+        // Digit-heavy text, where written numbers of every length and separator layout occur,
+        // next to stars, letters, trailing spaces and non-ASCII characters.
+        #[test]
+        fn free_text_redaction_leaves_no_nine_digit_number(
+            text in "[0-9 x*\\-\u{e9}\u{661}]{0,48}",
+        ) {
+            check_free_text(&text)?;
         }
     }
 }

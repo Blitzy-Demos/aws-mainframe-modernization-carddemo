@@ -434,7 +434,13 @@ pub enum NextLookup<'a> {
 /// the field's width (module documentation, Display values). `PA-MESSAGE-TYPE`,
 /// `PA-AUTH-ID-CODE`, `PA-TRANSACTION-AMT`, `PA-ACQR-COUNTRY-CODE` and the `FILLER` are read but
 /// never shown, so the view does not carry them (COPAUS1C-023). The derived `Debug` shows the card
-/// number only redacted; no other field holds a protected value.
+/// number only redacted, but the stored request text as stored: `source`,
+/// `merchant_category_code`, `auth_type`, `transaction_id`, `match_status`, `merchant_name`,
+/// `merchant_id`, `merchant_city`, `merchant_state` and `merchant_zip` hold the text of the CP00
+/// request and may hold a protected value, such as a card number or an SSN.
+/// `api::dto::copaus1c` masks every one of them with [`crate::sensitive::redact_free_text`] as
+/// the response leaves the service, so the view itself is not formatted into a log line, a span
+/// or an error (Cardholder Data Redaction, E32).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthDetailView {
     /// The account, `CDEMO-ACCT-ID`, which the screen keeps unchanged (COPAUS1C-003).

@@ -105,15 +105,25 @@ impl From<rules::UserView> for UserView {
 /// The body of endpoint 19: the four input fields of the update map, each the raw text of its
 /// map field (`FNAME`, `LNAME`, `PASSWD`, `USRTYPE`).
 ///
-/// Only the map `LENGTH` of each field is validated here, the server half of its `both` row of
+/// Each field is validated against its map `LENGTH`, the server half of its `both` row of
 /// `modern/audit/screens.md`: `first_name` and `last_name` 20 (COUSR02-017, COUSR02-020),
-/// `password` 8 (COUSR02-023) and `user_type` 1 (COUSR02-026). A name or type that is absent is
-/// the empty text, so the program's own blank-field edits answer it with their messages, in its
-/// order (COUSR02C-019 to COUSR02C-022); no value edit applies to the type (COUSR02C-023).
+/// `password` 8 (COUSR02-023) and `user_type` 1 (COUSR02-026), and against the `PIC X(n)`
+/// field it is stored in: at most that many bytes, each printable ASCII (`0x20`–`0x7E`), or
+/// `LOW-VALUES`, the field's width in NUL bytes. A value that fails either is a 400 naming the
+/// field, before any program edit, so a password is stored with exactly the bytes sent.
+///
+/// A name or type that is absent is the empty text, and an empty, all-space or `LOW-VALUES`
+/// value passes both rules, so the program's own blank-field edits answer it with their
+/// messages, in its order (COUSR02C-019 to COUSR02C-022); no value edit applies to the type
+/// (COUSR02C-023).
 ///
 /// The password is optional and write-only: omitted or `null`, the stored hash is kept (`E27`).
 /// It never leaves through `Serialize`, so a client that sends one writes the JSON itself, and
 /// `Debug` shows a supplied one as `********`.
+// The byte rule is the parent module's `pic_x` beside each `length`, whose rejection text is
+// `FIELD_LENGTH_MESSAGE`. `length` counts characters, and the domain reads each value as an
+// alphanumeric `MOVE` that cuts on the right, so without `pic_x` a password such as `ééééAAAA`,
+// eight characters in twelve bytes, would be cut to its first eight bytes before hashing.
 // The schema name `UserUpdateRequest` is the frontend's
 // `components["schemas"]["UserUpdateRequest"]` (Generated API Types Only).
 #[derive(Clone, Serialize, Deserialize, ToSchema, Validate)]
@@ -124,26 +134,30 @@ impl From<rules::UserView> for UserView {
     "user_type": "U"
 }))]
 pub struct UserUpdateRequest {
-    /// `FNAME`, `PIC X(20)`.
+    /// `FNAME`, `PIC X(20)`: at most 20 bytes of printable ASCII (`0x20`–`0x7E`).
     #[serde(default)]
-    #[validate(length(max = 20))]
+    #[validate(length(max = 20), custom(function = "super::pic_x::<20>"))]
+    #[schema(max_length = 20)]
     pub first_name: String,
-    /// `LNAME`, `PIC X(20)`.
+    /// `LNAME`, `PIC X(20)`: at most 20 bytes of printable ASCII (`0x20`–`0x7E`).
     #[serde(default)]
-    #[validate(length(max = 20))]
+    #[validate(length(max = 20), custom(function = "super::pic_x::<20>"))]
+    #[schema(max_length = 20)]
     pub last_name: String,
-    /// `PASSWD`, `PIC X(8)`, dark on the map: the new password, or absent to keep the stored
-    /// one. Never returned by any endpoint.
+    /// `PASSWD`, `PIC X(8)`, dark on the map: the new password, at most 8 bytes of printable
+    /// ASCII (`0x20`–`0x7E`), or absent to keep the stored one. Never returned by any endpoint.
     // `skip_serializing_if` with an always-true predicate, not `skip_serializing`: utoipa 5.5
     // reads `skip_serializing` as `skip` and drops the property from the OpenAPI document,
     // which would take the write-only `password` out of the generated client type.
     #[serde(default, skip_serializing_if = "never_serialized")]
-    #[validate(length(max = 8))]
-    #[schema(write_only, example = "********")]
+    #[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]
+    #[schema(write_only, max_length = 8, example = "********")]
     pub password: Option<String>,
-    /// `USRTYPE`, `PIC X(1)`: the type to store for the target user.
+    /// `USRTYPE`, `PIC X(1)`: the type to store for the target user, one byte of printable
+    /// ASCII (`0x20`–`0x7E`).
     #[serde(default)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
+    #[schema(max_length = 1)]
     pub user_type: String,
 }
 
@@ -188,14 +202,20 @@ mod tests {
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
     use domain::copybook::PicX;
+    use domain::online::cosgn00c;
+    use domain::password;
     use serde_json::{Value, json};
     use utoipa::{PartialSchema, ToSchema};
     use validator::Validate;
 
     use super::{UserUpdateRequest, UserView, rules};
     use crate::dto::{FIELD_LENGTH_MESSAGE, ScreenResult, ValidJson};
+    use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// The members a case blanks, each with the width of its `PIC X(n)` field.
+    type Blanks = &'static [(&'static str, usize)];
 
     // The audited literals, written out apart from the domain constants.
     const UPDATE_PROMPT: &str = "Press PF5 key to save your updates ...";
@@ -248,6 +268,34 @@ mod tests {
             .uri("/api/v1/users/USER0001")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_owned()))
+    }
+
+    /// `body` through the extractor endpoint 19's handler takes: the request, or its rejection.
+    async fn extract(
+        body: &Value,
+    ) -> Result<Result<UserUpdateRequest, ScreenError>, Box<dyn StdError>> {
+        Ok(
+            ValidJson::<UserUpdateRequest>::from_request(json_request(&body.to_string())?, &())
+                .await
+                .map(|ValidJson(request)| request),
+        )
+    }
+
+    /// A body every rule and every edit admits.
+    fn valid_body() -> Value {
+        json!({
+            "first_name": "LAWRENCE",
+            "last_name": "THOMAS",
+            "password": SECRET,
+            "user_type": "U",
+        })
+    }
+
+    /// [`valid_body`] with `member` set to `value`.
+    fn body_with(member: &str, value: Value) -> Value {
+        let mut body = valid_body();
+        body[member] = value;
+        body
     }
 
     #[test]
@@ -331,6 +379,18 @@ mod tests {
             keys(&schema["properties"]),
             ["first_name", "last_name", "password", "user_type"]
         );
+        // Each property publishes the map `LENGTH` its rules enforce (COUSR02-017, COUSR02-020,
+        // COUSR02-023, COUSR02-026), and no pattern.
+        for (member, length) in [
+            ("first_name", 20),
+            ("last_name", 20),
+            ("password", 8),
+            ("user_type", 1),
+        ] {
+            let property = &schema["properties"][member];
+            assert_eq!(property["maxLength"], json!(length), "{member}: {schema}");
+            assert!(property.get("pattern").is_none(), "{member}: {schema}");
+        }
         assert_eq!(UserUpdateRequest::name(), "UserUpdateRequest");
         Ok(())
     }
@@ -416,6 +476,158 @@ mod tests {
                 "{name}"
             );
             assert!(!serde_json::to_string(&error)?.contains(SECRET));
+        }
+        Ok(())
+    }
+
+    // audit: COUSR02-017
+    // audit: COUSR02-020
+    // audit: COUSR02-023
+    // audit: COUSR02-026
+    #[tokio::test]
+    async fn a_value_its_pic_x_field_cannot_hold_is_a_400_naming_it() -> TestResult {
+        let wide_name = "é".repeat(20);
+        let short_nul = "\0".repeat(3);
+        let cases = [
+            // Eight characters, within `length`; twelve bytes, beyond `PIC X(8)`.
+            ("password", "ééééAAAA"),
+            ("password", "NEWPW12\u{7f}"),
+            ("password", short_nul.as_str()),
+            ("first_name", wide_name.as_str()),
+            ("first_name", "LAW\tRENCE"),
+            ("last_name", wide_name.as_str()),
+            ("last_name", "THO\0MAS"),
+            ("user_type", "é"),
+            ("user_type", "\n"),
+        ];
+        for (member, value) in cases {
+            let error = extract(&body_with(member, json!(value)))
+                .await?
+                .err()
+                .ok_or("a value its field cannot hold was accepted")?;
+            assert_eq!(
+                (error.status(), error.message(), error.field()),
+                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
+                "{member} {value:?}"
+            );
+            let wire = serde_json::to_string(&error)?;
+            let shown = format!("{error:?}");
+            for output in [&wire, &shown] {
+                assert!(!output.contains(value), "{output}");
+                assert!(!output.contains(SECRET), "{output}");
+            }
+        }
+        Ok(())
+    }
+
+    // audit: COUSR02C-019
+    // audit: COUSR02C-020
+    // audit: COUSR02C-021
+    // audit: COUSR02C-022
+    #[tokio::test]
+    async fn blank_and_low_values_reach_the_programs_blank_edits_in_its_order() -> TestResult {
+        let fills: [fn(usize) -> String; 3] = [
+            |_| String::new(),
+            |width| " ".repeat(width),
+            |width| "\0".repeat(width),
+        ];
+        // Each case blanks the members it lists, at their full widths, in a valid body; the
+        // first blank one in the program's order is the answer.
+        let cases: [(Blanks, &str, &str); 4] = [
+            (
+                &[
+                    ("first_name", 20),
+                    ("last_name", 20),
+                    ("password", 8),
+                    ("user_type", 1),
+                ],
+                "First Name can NOT be empty...",
+                "first_name",
+            ),
+            (
+                &[("last_name", 20), ("password", 8), ("user_type", 1)],
+                "Last Name can NOT be empty...",
+                "last_name",
+            ),
+            (
+                &[("password", 8), ("user_type", 1)],
+                "Password can NOT be empty...",
+                "password",
+            ),
+            (
+                &[("user_type", 1)],
+                "User Type can NOT be empty...",
+                "user_type",
+            ),
+        ];
+        for fill in fills {
+            for (blanks, message, member) in cases {
+                let mut body = valid_body();
+                for &(blank, width) in blanks {
+                    body[blank] = json!(fill(width));
+                }
+                let request = extract(&body)
+                    .await?
+                    .map_err(|error| format!("{member}: {error}"))?;
+                let failure = rules::edit_update("USER0001", &request.as_input())
+                    .err()
+                    .ok_or("a blank field passed the edits")?;
+                assert_eq!(
+                    (failure.message(), failure.field().name()),
+                    (message, member),
+                    "{body}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    // audit: COUSR02C-021
+    #[tokio::test]
+    async fn an_omitted_or_null_password_passes_and_keeps_the_stored_one() -> TestResult {
+        // An omitted or null password means unchanged (E27).
+        let mut omitted = valid_body();
+        omitted
+            .as_object_mut()
+            .ok_or("the body is not an object")?
+            .remove("password");
+        for body in [omitted, body_with("password", Value::Null)] {
+            let request = extract(&body).await?.map_err(|error| error.to_string())?;
+            assert_eq!(request.password, None, "{body}");
+            let update = rules::edit_update("USER0001", &request.as_input())?;
+            assert!(update.password().is_none(), "{body}");
+        }
+        Ok(())
+    }
+
+    // audit: COUSR02-023
+    // audit: COUSR02C-027
+    // audit: COSGN00C-009
+    #[tokio::test]
+    async fn an_accepted_password_reaches_the_update_byte_for_byte_and_signs_on() -> TestResult {
+        // Upper case, because sign-on upper-cases what it is given while the update stores the
+        // password as sent (E26).
+        let cases: [(&str, &[u8; 8]); 3] = [
+            (SECRET, b"NEWPW123"),
+            ("PW 12", b"PW 12   "),
+            (" ~!@Z#9", b" ~!@Z#9 "),
+        ];
+        for (typed, stored) in cases {
+            let request = extract(&body_with("password", json!(typed)))
+                .await?
+                .map_err(|error| error.to_string())?;
+            let update = rules::edit_update("USER0001", &request.as_input())?;
+            let supplied = update
+                .password()
+                .ok_or("the supplied password was dropped")?;
+            assert!(supplied.expose() == stored, "{typed:?}");
+            let signon = cosgn00c::edit("USER0001", typed)?;
+            assert!(signon.password().expose() == stored, "{typed:?}");
+            if typed == SECRET {
+                // The hash the rewrite stores over those bytes verifies what sign-on is given.
+                let hash = password::hash(supplied.expose())?;
+                assert!(password::verify(signon.password().expose(), &hash)?);
+            }
         }
         Ok(())
     }

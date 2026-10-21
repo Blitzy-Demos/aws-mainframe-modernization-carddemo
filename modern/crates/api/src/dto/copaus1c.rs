@@ -15,8 +15,16 @@
 //! Every display field is the string COPAUS1C moves into its map field, already padded to the
 //! field's width by `domain::online::copaus1c`, so neither this module nor the screen formats
 //! anything (COPAUS1C-012 to COPAUS1C-023). The card number is a [`CardNumber`], whose
-//! `Serialize` emits only twelve `*` and the last four digits (COPAUS1C-012, E32); no other
-//! field holds a protected value, and the examples hold none (Cardholder Data Redaction).
+//! `Serialize` emits only twelve `*` and the last four digits (COPAUS1C-012, E32). Every field
+//! that shows stored request text, which CP00 keeps as the request sent it and which can hold a
+//! card number or an SSN, passes through [`redact_free_text`]: the source, the MCC code, the
+//! auth type, the transaction ID, the match status and the merchant's name, ID, city, state and
+//! ZIP. A written number of nine digits in any of them shows as `***-**-` and its last four,
+//! one of sixteen as twelve `*` and its last four, and one of any other count of ten or more
+//! with `*` for each digit but its last four, so the transaction ID `TXN000000000001` shows as
+//! `TXN********0001` (COPAUS1C-020, COPAUS1C-021, COPAUS1C-023, E32). The other fields are
+//! values the program builds, shown as built, and the examples hold no protected value
+//! (Cardholder Data Redaction).
 //!
 //! A failure answers through `ScreenError`, never through these types: the 400, 404 and 500 of
 //! `domain::online::copaus1c::AuthDetailFailure` (COPAUS1C-006, COPAUS1C-009 to COPAUS1C-011,
@@ -25,6 +33,7 @@
 use domain::CardNumber;
 use domain::online::copaus1c as rules;
 use domain::online::copaus1c::FraudToggleResult as ToggleOutcome;
+use domain::sensitive::redact_free_text;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
@@ -67,7 +76,10 @@ pub struct AuthDetailQuery {
 /// keeps for it, and the message row (COPAUS1C-012 to COPAUS1C-025, COPAUS1C-034, COPAUS1C-035).
 ///
 /// Each text member holds exactly its map field's width in characters, trailing spaces
-/// included. It has no `Deserialize`: the card number it carries is redacted.
+/// included, except a masked member whose redacted SSN needs more room than its trailing spaces
+/// give: it is longer by the difference, as an SSN that fills the 9 bytes of the ZIP shows as
+/// its 11-character redacted form, one more than `MERZIP` ([`redact_free_text`]). It has no
+/// `Deserialize`: the card number it carries is redacted.
 // The schema name `AuthDetailResponse` is fixed (Generated API Types Only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AuthDetailResponse {
@@ -111,31 +123,42 @@ pub struct AuthDetailResponse {
     pub amount: String,
     /// POS Entry Mode, `POSEMD` (4): the two digits, then two spaces (COPAUS1C-020).
     pub pos_entry_mode: String,
-    /// Source, `AUTHSRC` (10): `PA-MESSAGE-SOURCE`, then four spaces (COPAUS1C-020).
+    /// Source, `AUTHSRC` (10): `PA-MESSAGE-SOURCE`, then four spaces, masked by
+    /// [`redact_free_text`] as stored request text (COPAUS1C-020, E32).
     pub source: String,
-    /// MCC Code, `MCCCD` (4): `PA-MERCHANT-CATAGORY-CODE` (COPAUS1C-020).
+    /// MCC Code, `MCCCD` (4): `PA-MERCHANT-CATAGORY-CODE`, masked as the source is
+    /// (COPAUS1C-020, E32).
     pub merchant_category_code: String,
     /// Card Exp. Date, `CRDEXP` (5): `MM/YY` text built from the four stored bytes of
     /// `PA-CARD-EXPIRY-DATE PIC X(04)`, not a date (COPAUS1C-020).
     pub card_expiry: String,
-    /// Auth Type, `AUTHTYP` (14): `PA-AUTH-TYPE`, then ten spaces (COPAUS1C-021).
+    /// Auth Type, `AUTHTYP` (14): `PA-AUTH-TYPE`, then ten spaces, masked as the transaction ID
+    /// is (COPAUS1C-021, E32).
     pub auth_type: String,
-    /// Tran Id, `TRNID` (15): `PA-TRANSACTION-ID` (COPAUS1C-021).
+    /// Tran Id, `TRNID` (15): `PA-TRANSACTION-ID`, masked by [`redact_free_text`] as stored
+    /// request text: an SSN in it shows as `***-**-` and its last four digits, and the 12-digit
+    /// run of `TXN000000000001` as `TXN********0001` (COPAUS1C-021, E32).
     pub transaction_id: String,
-    /// Match Status, `AUTHMTC` (1): the stored byte (COPAUS1C-021).
+    /// Match Status, `AUTHMTC` (1): the stored byte, masked as the transaction ID is
+    /// (COPAUS1C-021, E32).
     pub match_status: String,
     /// Fraud Status, `AUTHFRD` (10): `F` or `R`, `-` and the report date, or `-` and nine
     /// spaces when the authorization was never reported (COPAUS1C-022).
     pub fraud_status: String,
-    /// Name, `MERNAME` (25): `PA-MERCHANT-NAME`, then three spaces (COPAUS1C-023).
+    /// Name, `MERNAME` (25): `PA-MERCHANT-NAME`, then three spaces, masked by
+    /// [`redact_free_text`] as stored request text, so a card number or an SSN in the name shows
+    /// only in its redacted form (COPAUS1C-023, E32).
     pub merchant_name: String,
-    /// Merchant ID, `MERID` (15): `PA-MERCHANT-ID` (COPAUS1C-023).
+    /// Merchant ID, `MERID` (15): `PA-MERCHANT-ID`, masked as the name is (COPAUS1C-023, E32).
     pub merchant_id: String,
-    /// City, `MERCITY` (25): `PA-MERCHANT-CITY`, then twelve spaces (COPAUS1C-023).
+    /// City, `MERCITY` (25): `PA-MERCHANT-CITY`, then twelve spaces, masked as the name is
+    /// (COPAUS1C-023, E32).
     pub merchant_city: String,
-    /// State, `MERST` (2): `PA-MERCHANT-STATE` (COPAUS1C-023).
+    /// State, `MERST` (2): `PA-MERCHANT-STATE`, masked as the name is (COPAUS1C-023, E32).
     pub merchant_state: String,
-    /// Zip, `MERZIP` (10): `PA-MERCHANT-ZIP`, then one space (COPAUS1C-023).
+    /// Zip, `MERZIP` (10): `PA-MERCHANT-ZIP`, then one space, masked as the name is. An SSN
+    /// that fills the 9 bytes shows as its 11-character redacted form, one character more than
+    /// the map field (COPAUS1C-023, E32).
     pub merchant_zip: String,
     /// The message row, `ERRMSG` (78): none after ENTER or a found F8 (COPAUS1C-035),
     /// `Already at the last Authorization...` after F8 at the account's last authorization
@@ -185,18 +208,26 @@ impl From<rules::AuthDetailView> for AuthDetailResponse {
             auth_code,
             amount,
             pos_entry_mode,
-            source,
-            merchant_category_code,
+            // Every member that shows stored request text leaves through `redact_free_text`,
+            // whatever its width: CP00 keeps that text as the request sent it, so the 22 bytes of
+            // the name can hold a card number, the 15 of either ID and the 13 of the city an
+            // SSN, and the 9 of the ZIP an SSN that fills them. No stored text reaches the body,
+            // or the derived `Debug` of this type and of `FraudToggleResult`, unmasked; the
+            // shorter members hold no written number of nine digits and pass unchanged. The
+            // values the program builds (the dates and times, the response, reason, auth code,
+            // amount, POS entry mode, expiry and fraud status) stay as built.
+            source: redact_free_text(&source),
+            merchant_category_code: redact_free_text(&merchant_category_code),
             card_expiry,
-            auth_type,
-            transaction_id,
-            match_status,
+            auth_type: redact_free_text(&auth_type),
+            transaction_id: redact_free_text(&transaction_id),
+            match_status: redact_free_text(&match_status),
             fraud_status,
-            merchant_name,
-            merchant_id,
-            merchant_city,
-            merchant_state,
-            merchant_zip,
+            merchant_name: redact_free_text(&merchant_name),
+            merchant_id: redact_free_text(&merchant_id),
+            merchant_city: redact_free_text(&merchant_city),
+            merchant_state: redact_free_text(&merchant_state),
+            merchant_zip: redact_free_text(&merchant_zip),
             message: message.map(str::to_owned),
         }
     }
@@ -256,14 +287,15 @@ mod tests {
 
     use axum::extract::FromRequestParts;
     use axum::http::{Request, StatusCode};
-    use domain::CardNumber;
     use domain::copybook::{PicS, PicU, PicX};
     use domain::money::{Decimal, Money};
     use domain::online::copaus0c::AuthKey;
     use domain::online::copaus1c::{self as rules, DetailLookup, NextLookup, SegmentUpdate};
     use domain::online::copaus2c::FraudOutcome;
     use domain::records::PendingAuthDetailRecord;
+    use domain::{CardNumber, Ssn};
     use serde_json::json;
+    use test_support::fixtures;
     use utoipa::{IntoParams, PartialSchema};
 
     use super::{AuthDetailQuery, AuthDetailResponse, FraudToggleResult};
@@ -421,6 +453,228 @@ mod tests {
         ] {
             assert!(text.contains(CARD_REDACTED), "{text}");
             assert!(!text.contains(CARD_HEAD), "{text}");
+        }
+        Ok(())
+    }
+
+    /// The response a committed F5 gives for `stored`: marked as fraud on [`REPORT_DATE`], the
+    /// detail replaced.
+    fn toggle_response(
+        stored: &PendingAuthDetailRecord,
+    ) -> Result<FraudToggleResult, Box<dyn StdError>> {
+        Ok(FraudToggleResult::from(rules::toggle_outcome(
+            acct()?,
+            &rules::toggle(stored).with_report_date(PicX::from_text(REPORT_DATE)?),
+            FraudOutcome::Added,
+            Some(SegmentUpdate::Replaced),
+        )))
+    }
+
+    /// The members of `response` that show stored request text, each with its name and the
+    /// `LENGTH` of its map field (`modern/audit/screens.md`), in the order of
+    /// `ordinary_request_text`.
+    fn request_text(response: &AuthDetailResponse) -> [(&'static str, &str, usize); 10] {
+        [
+            ("source", response.source.as_str(), 10),
+            (
+                "merchant_category_code",
+                response.merchant_category_code.as_str(),
+                4,
+            ),
+            ("auth_type", response.auth_type.as_str(), 14),
+            ("transaction_id", response.transaction_id.as_str(), 15),
+            ("match_status", response.match_status.as_str(), 1),
+            ("merchant_name", response.merchant_name.as_str(), 25),
+            ("merchant_id", response.merchant_id.as_str(), 15),
+            ("merchant_city", response.merchant_city.as_str(), 25),
+            ("merchant_state", response.merchant_state.as_str(), 2),
+            ("merchant_zip", response.merchant_zip.as_str(), 10),
+        ]
+    }
+
+    /// What `request_text` shows for `record()`: each stored value padded to its map field,
+    /// the 12-digit run of the transaction ID masked and every other value unchanged.
+    fn ordinary_request_text() -> [String; 10] {
+        [
+            format!("{:<10}", "POS"),
+            "5411".to_owned(),
+            format!("{:<14}", "SALE"),
+            "TXN********0001".to_owned(),
+            "P".to_owned(),
+            format!("{:<25}", "CORNER GROCERY"),
+            "MERCHANT0000001".to_owned(),
+            format!("{:<25}", "SEATTLE"),
+            "WA".to_owned(),
+            format!("{:<10}", "98101"),
+        ]
+    }
+
+    /// Asserts that each member of `response` that shows stored request text, and the member of
+    /// the same name in its JSON `body`, holds the text `shown_otherwise` names for it, or else
+    /// its `ordinary_request_text`, and is as many characters longer than its map field as
+    /// `shown_otherwise` says (0 for the ordinary text). No assertion message prints a value.
+    fn check_request_text(
+        (case, owner): (&str, &str),
+        response: &AuthDetailResponse,
+        body: &serde_json::Value,
+        shown_otherwise: &[(&str, String, usize)],
+    ) {
+        for ((field, value, width), ordinary) in request_text(response)
+            .into_iter()
+            .zip(ordinary_request_text())
+        {
+            let (expected, longer) = shown_otherwise
+                .iter()
+                .find(|(name, ..)| *name == field)
+                .map_or((ordinary.as_str(), 0), |(_, text, longer)| {
+                    (text.as_str(), *longer)
+                });
+            assert!(
+                value == expected,
+                "{case}: {owner}.{field} is not the expected text"
+            );
+            assert!(
+                body.get(field).and_then(serde_json::Value::as_str) == Some(expected),
+                "{case}: {owner} JSON member {field} is not the expected text"
+            );
+            assert_eq!(
+                value.chars().count(),
+                width + longer,
+                "{case}: {owner}.{field} width"
+            );
+        }
+    }
+
+    /// Asserts that neither the JSON nor the `Debug` text of `detail` and of `toggled` holds any
+    /// of `needles`. No assertion message prints one.
+    fn check_egress(
+        case: &str,
+        detail: &AuthDetailResponse,
+        toggled: &FraudToggleResult,
+        needles: &[String],
+    ) -> TestResult {
+        let egress = [
+            ("AuthDetailResponse JSON", serde_json::to_string(detail)?),
+            ("AuthDetailResponse Debug", format!("{detail:?}")),
+            ("FraudToggleResult JSON", serde_json::to_string(toggled)?),
+            ("FraudToggleResult Debug", format!("{toggled:?}")),
+        ];
+        for (form, text) in &egress {
+            let leaks = needles
+                .iter()
+                .filter(|needle| text.contains(needle.as_str()))
+                .count();
+            assert_eq!(leaks, 0, "{case}: {form} holds a protected value");
+        }
+        Ok(())
+    }
+
+    // audit: COPAUS1C-012
+    // audit: COPAUS1C-020
+    // audit: COPAUS1C-021
+    // audit: COPAUS1C-023
+    #[test]
+    fn stored_request_text_leaves_with_its_card_numbers_and_ssns_redacted() -> TestResult {
+        // Protected values (Cardholder Data Redaction): search needles only, and no assertion
+        // message below prints one or the text that would hold it.
+        let cards = fixtures::fixture_card_numbers()?;
+        let ssn_forms = fixtures::fixture_ssn_forms()?;
+        // The 50 card numbers of `carddata.txt`; the 50 SSNs of `custdata.txt`, each plain and
+        // dashed.
+        assert_eq!((cards.len(), ssn_forms.len()), (50, 100));
+        let needles: Vec<String> = cards.iter().chain(&ssn_forms).cloned().collect();
+        let card = cards.first().ok_or("carddata.txt holds a card number")?;
+        let ssn = ssn_forms
+            .iter()
+            .find(|form| form.len() == 9)
+            .ok_or("custdata.txt holds a 9-digit SSN")?;
+        let dashed_ssn = ssn_forms
+            .iter()
+            .find(|form| form.len() == 11)
+            .ok_or("custdata.txt holds a dashed SSN")?;
+        // `************` and the last four digits; `***-**-` and the last four digits.
+        let card_redacted = CardNumber::parse(card)?.redacted();
+        let ssn_redacted = Ssn::parse(ssn)?.redacted();
+        let dashed_redacted = Ssn::parse(&dashed_ssn.replace('-', ""))?.redacted();
+        // Each case: the stored detail, and each member it shows otherwise than the ordinary
+        // record does, with how many characters that member is longer than its map field. The
+        // IDs keep 15 characters through the 6 trailing spaces a 9-digit SSN leaves, the name
+        // and the city 25; the SSN filling the 9 bytes of the ZIP leaves 1 trailing space for
+        // the 2 characters its redacted form adds.
+        let cases = [
+            ("the ordinary record", record()?, vec![]),
+            (
+                "a plain SSN in the merchant ID",
+                PendingAuthDetailRecord {
+                    merchant_id: PicX::from_text(ssn)?,
+                    ..record()?
+                },
+                vec![("merchant_id", format!("{ssn_redacted:<15}"), 0)],
+            ),
+            (
+                "a plain SSN in the transaction ID",
+                PendingAuthDetailRecord {
+                    transaction_id: PicX::from_text(ssn)?,
+                    ..record()?
+                },
+                vec![("transaction_id", format!("{ssn_redacted:<15}"), 0)],
+            ),
+            (
+                "a plain SSN filling the ZIP",
+                PendingAuthDetailRecord {
+                    merchant_zip: PicX::from_text(ssn)?,
+                    ..record()?
+                },
+                vec![("merchant_zip", ssn_redacted.clone(), 1)],
+            ),
+            (
+                "a dashed SSN in the city",
+                PendingAuthDetailRecord {
+                    merchant_city: PicX::from_text(dashed_ssn)?,
+                    ..record()?
+                },
+                vec![("merchant_city", format!("{dashed_redacted:<25}"), 0)],
+            ),
+            (
+                "a card number in the name",
+                PendingAuthDetailRecord {
+                    merchant_name: PicX::from_text(card)?,
+                    ..record()?
+                },
+                vec![("merchant_name", format!("{card_redacted:<25}"), 0)],
+            ),
+            (
+                "a plain SSN in the name",
+                PendingAuthDetailRecord {
+                    merchant_name: PicX::from_text(ssn)?,
+                    ..record()?
+                },
+                vec![("merchant_name", format!("{ssn_redacted:<25}"), 0)],
+            ),
+        ];
+        for (case, stored, shown_otherwise) in cases {
+            let detail = shown(&stored)?;
+            let toggled = toggle_response(&stored)?;
+            let replaced = toggled
+                .detail
+                .as_ref()
+                .ok_or("a committed toggle carries its detail")?;
+            let toggled_body = serde_json::to_value(&toggled)?;
+            check_request_text(
+                (case, "AuthDetailResponse"),
+                &detail,
+                &serde_json::to_value(&detail)?,
+                &shown_otherwise,
+            );
+            check_request_text(
+                (case, "FraudToggleResult.detail"),
+                replaced,
+                toggled_body
+                    .get("detail")
+                    .ok_or("a committed toggle serialises its detail")?,
+                &shown_otherwise,
+            );
+            check_egress(case, &detail, &toggled, &needles)?;
         }
         Ok(())
     }

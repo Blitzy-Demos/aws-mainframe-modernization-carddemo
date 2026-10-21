@@ -38,8 +38,10 @@
 //! never trimmed or upper-cased. A field is blank when, so padded, it is all spaces or all NUL
 //! bytes, the `= SPACES OR LOW-VALUES` test; any other byte, a leading space included, makes it
 //! non-blank. The values are compared and stored as they stand: no edit tests their content
-//! beyond blankness (COUSR02C-023), and a byte the store cannot hold fails at the store, not
-//! here.
+//! beyond blankness (COUSR02C-023). The request DTO has already rejected a value that does not
+//! fit its `PIC X(n)` field as printable ASCII bytes, `LOW-VALUES` aside, before this module
+//! sees it, so the `MOVE` never cuts a byte of a request and a supplied password reaches
+//! [`Password`] exactly as sent; this module does not repeat that check.
 //!
 //! # Password (`E27`)
 //!

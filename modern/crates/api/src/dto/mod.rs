@@ -13,10 +13,10 @@
 //!   keys of `modern/openapi/openapi.json` and the only payload types of the frontend's
 //!   generated `schema.d.ts` (Generated API Types Only), so renaming one changes the contract.
 //! - **Conversions only.** A module holds its DTOs, their `validator` rules (the map `LENGTH`
-//!   and `NUM` attributes, the server half of the `both` rows of `modern/audit/screens.md`) and
-//!   `From` conversions from domain outcomes. It holds no business rule, reads no store and
-//!   names neither `persistence` nor `sqlx`: every program edit and message stays in
-//!   `domain::online` (Thin Request Handlers).
+//!   and `NUM` attributes, the server half of the `both` rows of `modern/audit/screens.md`, and
+//!   the [`pic_x`] storage of a text field) and `From` conversions from domain outcomes. It
+//!   holds no business rule, reads no store and names neither `persistence` nor `sqlx`: every
+//!   program edit and message stays in `domain::online` (Thin Request Handlers).
 //! - **A DTO field keeps its Rust name on the wire.** `validator` reports a failing field under
 //!   its Rust name, so no DTO field is renamed through `serde`; the `field` of a rejection is
 //!   then the name the client sent.
@@ -37,7 +37,8 @@
 //!   invalid-key message, not this rejection, answers it.
 //! - A rule a DTO declares: 400 naming the first failing field in key order, as a path such as
 //!   `user_id`, `fields.zip` or `rows[3].description`, with the text of the rule's code
-//!   ([`FIELD_LENGTH_MESSAGE`], [`FIELD_NUMERIC_MESSAGE`] or [`FIELD_RANGE_MESSAGE`]).
+//!   ([`FIELD_LENGTH_MESSAGE`] for `length` and [`PIC_X_CODE`], [`FIELD_NUMERIC_MESSAGE`] or
+//!   [`FIELD_RANGE_MESSAGE`]).
 //! - `page_size` outside [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`]: 422 with [`PAGE_SIZE_MESSAGE`]
 //!   and field `page_size`, whatever else failed. It is the only 422 of the API.
 //!
@@ -204,8 +205,9 @@ pub const INVALID_BODY: &str = "Invalid request body...";
 /// value of the query.
 pub const INVALID_QUERY: &str = "Invalid query parameters...";
 
-/// The message of a field longer than its map `LENGTH`, and of every rule code without a text
-/// of its own: input the 3270 field would not have admitted.
+/// The message of a field longer than its map `LENGTH`, of a text that does not fit its
+/// `PIC X(n)` field byte for byte as printable ASCII ([`pic_x`], code [`PIC_X_CODE`]), and of
+/// every rule code without a text of its own: input the 3270 field would not have admitted.
 ///
 /// The server half of the `LENGTH` `both` rows of `modern/audit/screens.md`, such as
 /// `COSGN00-027` (`USERID`, 8), `COSGN00-031` (`PASSWD`, 8), `COACTUP-013` (`ACCTSID`, 11) and
@@ -232,6 +234,12 @@ pub const PAGE_SIZE_MESSAGE: &str = "page_size must be from 1 to 100...";
 
 /// The code of the [`numeric`] rule.
 pub const NUMERIC_CODE: &str = "numeric";
+
+/// The code of the [`pic_x`] rule.
+pub const PIC_X_CODE: &str = "pic_x";
+
+/// The `LOW-VALUES` byte, NUL.
+const LOW_VALUE: u8 = 0;
 
 /// `validator`'s code of a `range` rule.
 const RANGE_CODE: &str = "range";
@@ -309,8 +317,8 @@ fn validation_error(errors: &ValidationErrors) -> ScreenError {
 }
 
 /// The text of a rule code: [`FIELD_NUMERIC_MESSAGE`] for [`NUMERIC_CODE`],
-/// [`FIELD_RANGE_MESSAGE`] for `range`, and [`FIELD_LENGTH_MESSAGE`] for `length` and every
-/// other code.
+/// [`FIELD_RANGE_MESSAGE`] for `range`, and [`FIELD_LENGTH_MESSAGE`] for `length`,
+/// [`PIC_X_CODE`] and every other code.
 fn code_message(code: &str) -> &'static str {
     match code {
         NUMERIC_CODE => FIELD_NUMERIC_MESSAGE,
@@ -369,6 +377,34 @@ pub fn numeric(value: &str) -> Result<(), ValidationError> {
     }
 }
 
+/// The `PIC X(n)` field a map input is moved into, as a `validator` custom rule beside the
+/// field's `length`: `#[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]`.
+///
+/// `length` counts characters, but the field holds `N` bytes of printable ASCII (`0x20`–`0x7E`,
+/// PIC-001, PIC-002), and a program reads the text into it as an alphanumeric `MOVE`, which cuts
+/// it on the right. This rule admits a value only when it fits the field byte for byte, as
+/// `PicX::<N>::from_text` takes it, so that `MOVE` never drops a byte and a password is hashed
+/// exactly as typed: at most `N` bytes, each printable ASCII. An empty or all-space value is
+/// printable text and reaches the program's blank edit. So does `LOW-VALUES`, exactly `N` NUL
+/// bytes, the field as the terminal sends it unmodified, which the `= SPACES OR LOW-VALUES`
+/// edits answer with their own messages.
+///
+/// # Errors
+///
+/// A [`ValidationError`] with code [`PIC_X_CODE`] for any other value: more than `N` bytes, a
+/// character outside ASCII however few characters the value counts, a control byte such as TAB
+/// or `0x7F`, or NUL bytes that do not fill the field, which are not `LOW-VALUES` and which no
+/// field stores. The error carries no message; its text is [`FIELD_LENGTH_MESSAGE`].
+pub fn pic_x<const N: usize>(value: &str) -> Result<(), ValidationError> {
+    let bytes = value.as_bytes();
+    let low_values = bytes.len() == N && bytes.iter().all(|&byte| byte == LOW_VALUE);
+    if low_values || PicX::<N>::from_text(value).is_ok() {
+        Ok(())
+    } else {
+        Err(ValidationError::new(PIC_X_CODE))
+    }
+}
+
 /// A `PIC X(n)` field as shown: its bytes without the trailing spaces, leading spaces kept,
 /// converted lossily (the stored bytes are printable ASCII).
 #[must_use]
@@ -409,17 +445,20 @@ mod tests {
     use domain::online::{cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
     use serde::Deserialize;
     use utoipa::ToSchema;
-    use validator::Validate;
+    use validator::{Validate, ValidationError};
 
     use super::{
         FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE, INVALID_BODY,
         INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD, PAGE_SIZE_MESSAGE,
-        PageDirection, ScreenResult, ValidJson, ValidQuery, digits, full_text, numeric,
-        resolve_page_size, text, validation_error,
+        PIC_X_CODE, PageDirection, ScreenResult, ValidJson, ValidQuery, digits, full_text, numeric,
+        pic_x, resolve_page_size, text, validation_error,
     };
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// One width of the [`pic_x`] rule, so that one table holds several widths.
+    type PicXRule = fn(&str) -> Result<(), ValidationError>;
 
     /// A card number the rejection texts must never echo.
     const CARD: &str = "4111111111111111";
@@ -446,7 +485,7 @@ mod tests {
         page_size: Option<i64>,
         #[validate(range(min = 1))]
         page_no: Option<i64>,
-        #[validate(length(max = 8))]
+        #[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]
         user_id: String,
         #[validate(length(max = 2), custom(function = "super::numeric"))]
         start_month: String,
@@ -558,6 +597,15 @@ mod tests {
                 FIELD_LENGTH_MESSAGE,
             ),
             (
+                // Eight characters within `length`, twelve bytes beyond the `PIC X(8)` field.
+                Probe {
+                    user_id: "ééééAAAA".to_owned(),
+                    ..Probe::default()
+                },
+                "user_id",
+                FIELD_LENGTH_MESSAGE,
+            ),
+            (
                 Probe {
                     start_month: "1A".to_owned(),
                     ..Probe::default()
@@ -659,6 +707,58 @@ mod tests {
                 "{value:?}"
             );
             assert!(error.is_some_and(|error| error.message.is_none() && error.params.is_empty()));
+        }
+    }
+
+    // audit: PIC-002
+    #[test]
+    fn pic_x_admits_what_its_field_holds_byte_for_byte_and_low_values() {
+        let low_values = "\0".repeat(8);
+        let nul_over_width = "\0".repeat(9);
+        let wide_name = "é".repeat(10);
+        let cases: &[(PicXRule, &str, bool)] = &[
+            // Printable ASCII up to the width, blank values included.
+            (pic_x::<8>, "PASSWORD", true),
+            (pic_x::<8>, "PW", true),
+            (pic_x::<8>, "", true),
+            (pic_x::<8>, "        ", true),
+            (pic_x::<8>, " !~AZaz9", true),
+            (pic_x::<1>, "U", true),
+            (pic_x::<20>, "LAWRENCE", true),
+            // `LOW-VALUES`: NUL in every byte of the field.
+            (pic_x::<8>, &low_values, true),
+            (pic_x::<1>, "\0", true),
+            // One byte more than the field.
+            (pic_x::<8>, "PASSWORD9", false),
+            (pic_x::<1>, "UA", false),
+            // Within the width in characters or bytes, but not ASCII.
+            (pic_x::<8>, "ééééAAAA", false),
+            (pic_x::<8>, "é", false),
+            (pic_x::<1>, "é", false),
+            (pic_x::<20>, &wide_name, false),
+            // Control bytes.
+            (pic_x::<8>, "PASS\tWD", false),
+            (pic_x::<8>, "PASS\u{7f}", false),
+            // NUL bytes that are not `LOW-VALUES`.
+            (pic_x::<8>, &nul_over_width, false),
+            (pic_x::<8>, "\0\0\0", false),
+            (pic_x::<8>, "AB\0\0\0\0\0\0", false),
+        ];
+        for &(rule, value, admitted) in cases {
+            let error = rule(value).err();
+            if admitted {
+                assert!(error.is_none(), "{value:?}");
+            } else {
+                assert_eq!(
+                    error.as_ref().map(|error| error.code.as_ref()),
+                    Some(PIC_X_CODE),
+                    "{value:?}"
+                );
+                assert!(
+                    error.is_some_and(|error| error.message.is_none() && error.params.is_empty()),
+                    "{value:?}"
+                );
+            }
         }
     }
 
