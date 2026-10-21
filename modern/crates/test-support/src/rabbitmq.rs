@@ -7,12 +7,19 @@
 //! no exchanges: MQ point-to-point maps to the default exchange, so a queue name is also the
 //! routing key.
 //!
+//! Every broker round trip the helpers make (a connection with its handshake, a connection or
+//! channel close, a publication, its confirmation, a declaration, a `basic.get`) is bounded by
+//! 10 seconds, or, for a `basic.get` poll, by the deadline of its [`get`] call when that is
+//! later, so a broker that stops answering fails the test instead of stalling it. A channel
+//! request cut off at its bound is left outstanding on the channel, so the helper closes that
+//! channel before it returns the error, and every later request on it fails at once.
+//!
 //! The helpers never log a message body and never put one into a [`HarnessError`]; errors carry
-//! only the `Display` text of the `lapin` or testcontainers error behind them (Cardholder Data
-//! Redaction).
+//! only the `Display` text of the `lapin`, testcontainers or I/O error behind them, a mount path,
+//! or the bound that passed (Cardholder Data Redaction).
 
 use std::fmt;
-use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use lapin::message::BasicGetMessage;
@@ -23,6 +30,7 @@ use lapin::{BasicProperties, Channel, Connection, ConnectionProperties};
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::task;
 use tokio::time::{self, Instant};
 
 use crate::{HarnessError, modern_dir};
@@ -42,8 +50,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bound on one probe attempt, so a handshake the broker never answers cannot stall the probe.
 const PROBE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
 const PROBE_RETRY: Duration = Duration::from_millis(500);
-/// AMQP 0-9-1 `reply-success`, sent when the probe connection closes.
+/// AMQP 0-9-1 `reply-success`, sent when the probe connection or an abandoned channel closes.
 const REPLY_SUCCESS: u16 = 200;
+
+/// Bound on one broker round trip: a connection with its handshake, a connection or channel
+/// close, a publication, its confirmation, a queue declaration or a `basic.get`. A `basic.get`
+/// poll in [`get`] runs instead to the `get` deadline when that is later.
+const OPERATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Interval between `basic.get` polls in [`get`].
 const GET_POLL: Duration = Duration::from_millis(50);
@@ -87,11 +100,24 @@ impl RabbitMqGuard {
     ///
     /// # Errors
     ///
-    /// Returns a [`HarnessError`] when the connection or its AMQP handshake fails.
+    /// Returns a [`HarnessError`] when the connection or its AMQP handshake fails or does not
+    /// complete within 10 seconds.
     pub async fn connect(&self) -> Result<Connection, HarnessError> {
-        Connection::connect(&self.amqp_url, ConnectionProperties::default())
-            .await
-            .map_err(|err| HarnessError::new("connect to rabbitmq", &err))
+        time::timeout(
+            OPERATION_TIMEOUT,
+            Connection::connect(&self.amqp_url, ConnectionProperties::default()),
+        )
+        .await
+        .map_err(|_| {
+            HarnessError::new(
+                "connect to rabbitmq",
+                &format_args!(
+                    "the broker did not complete the connection and its handshake within {} ms",
+                    OPERATION_TIMEOUT.as_millis()
+                ),
+            )
+        })?
+        .map_err(|err| HarnessError::new("connect to rabbitmq", &err))
     }
 }
 
@@ -104,13 +130,15 @@ impl RabbitMqGuard {
 ///
 /// # Errors
 ///
-/// Returns a [`HarnessError`] when either broker file is missing or its path is not UTF-8, when
-/// the container does not start or log its startup message within 180 seconds, when its ports
-/// cannot be read, or when user `carddemo` cannot connect within 60 seconds of startup.
+/// Returns a [`HarnessError`] when either broker file is missing or its path cannot be resolved
+/// or is not UTF-8, when the container does not start or log its startup message within 180
+/// seconds, when its ports cannot be read, when user `carddemo` cannot connect within 60 seconds
+/// of startup (the attempt under way at that point may take 10 seconds more), or when the broker
+/// does not confirm the close of that probe connection within 10 seconds.
 pub async fn start_rabbitmq() -> Result<RabbitMqGuard, HarnessError> {
     let modern = modern_dir();
-    let conf = bind_source(&modern.join("rabbitmq/rabbitmq.conf"))?;
-    let definitions = bind_source(&modern.join("rabbitmq/definitions.json"))?;
+    let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
+    let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;
 
     let container = GenericImage::new(IMAGE, TAG)
         .with_exposed_port(AMQP_PORT.tcp())
@@ -154,13 +182,21 @@ pub async fn start_rabbitmq() -> Result<RabbitMqGuard, HarnessError> {
 }
 
 /// The absolute UTF-8 form of a broker file, as a Docker bind mount requires.
-fn bind_source(path: &Path) -> Result<String, HarnessError> {
-    let absolute = std::fs::canonicalize(path).map_err(|err| {
-        HarnessError::new(
-            "resolve rabbitmq mount",
-            &format_args!("{}: {err}", path.display()),
-        )
-    })?;
+///
+/// Resolving the path reads filesystem metadata, which can block, so it runs on Tokio's blocking
+/// pool: on a current-thread runtime the caller's worker is the only thread that drives tasks and
+/// timers.
+async fn bind_source(path: PathBuf) -> Result<String, HarnessError> {
+    let absolute = task::spawn_blocking(move || {
+        std::fs::canonicalize(&path).map_err(|err| {
+            HarnessError::new(
+                "resolve rabbitmq mount",
+                &format_args!("{}: {err}", path.display()),
+            )
+        })
+    })
+    .await
+    .map_err(|err| HarnessError::new("resolve rabbitmq mount", &err))??;
     absolute.to_str().map(str::to_owned).ok_or_else(|| {
         HarnessError::new(
             "resolve rabbitmq mount",
@@ -170,7 +206,8 @@ fn bind_source(path: &Path) -> Result<String, HarnessError> {
 }
 
 /// Retries an AMQP connection as user `carddemo` until one succeeds or [`READY_TIMEOUT`] passes,
-/// then closes the probe connection.
+/// then closes the probe connection, waiting at most [`OPERATION_TIMEOUT`] for the broker to
+/// confirm the close. A probe whose close goes unconfirmed is dropped, already marked closing.
 async fn wait_until_ready(amqp_url: &str) -> Result<(), HarnessError> {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
@@ -181,9 +218,17 @@ async fn wait_until_ready(amqp_url: &str) -> Result<(), HarnessError> {
         .await;
         let failure = match attempt {
             Ok(Ok(connection)) => {
-                return connection
-                    .close(REPLY_SUCCESS, "probe")
+                return time::timeout(OPERATION_TIMEOUT, connection.close(REPLY_SUCCESS, "probe"))
                     .await
+                    .map_err(|_| {
+                        HarnessError::new(
+                            "close rabbitmq probe",
+                            &format_args!(
+                                "the broker did not confirm the close within {} ms",
+                                OPERATION_TIMEOUT.as_millis()
+                            ),
+                        )
+                    })?
                     .map_err(|err| HarnessError::new("close rabbitmq probe", &err));
             }
             Ok(Err(err)) => err.to_string(),
@@ -199,24 +244,34 @@ async fn wait_until_ready(amqp_url: &str) -> Result<(), HarnessError> {
 /// Publishes `body` to `queue` through the default exchange, with `queue` as the routing key.
 ///
 /// On a channel in confirm mode the call returns once the broker has confirmed the message; on
-/// any other channel it returns once the message has been sent.
+/// any other channel it returns once the message has been sent. Sending and confirmation are
+/// bounded by 10 seconds each.
 ///
 /// # Errors
 ///
-/// Returns a [`HarnessError`] when the publication fails or the broker confirms it negatively.
+/// Returns a [`HarnessError`] when the publication fails or the broker confirms it negatively,
+/// and when sending or confirmation takes longer than 10 seconds, in which case the channel is
+/// closed first, which waits up to 10 seconds more for the broker.
 pub async fn publish(
     channel: &Channel,
     queue: &str,
     body: &[u8],
     properties: BasicProperties,
 ) -> Result<(), HarnessError> {
-    let confirm = channel
-        .basic_publish("", queue, BasicPublishOptions::default(), body, properties)
-        .await
-        .map_err(|err| HarnessError::new("publish", &err))?;
-    let confirmation = confirm
-        .await
-        .map_err(|err| HarnessError::new("publish confirmation", &err))?;
+    let confirm = within(
+        channel,
+        "publish",
+        Instant::now() + OPERATION_TIMEOUT,
+        channel.basic_publish("", queue, BasicPublishOptions::default(), body, properties),
+    )
+    .await?;
+    let confirmation = within(
+        channel,
+        "publish confirmation",
+        Instant::now() + OPERATION_TIMEOUT,
+        confirm,
+    )
+    .await?;
     match confirmation {
         Confirmation::Ack(_) | Confirmation::NotRequested => Ok(()),
         Confirmation::Nack(_) => Err(HarnessError::new(
@@ -227,14 +282,21 @@ pub async fn publish(
 }
 
 /// Takes the next message from `queue`, polling every 50 milliseconds until one arrives or
-/// `timeout` passes. The last poll runs at the deadline, so a zero `timeout` polls once.
+/// `timeout` passes. The last poll starts at the deadline, so a zero `timeout` polls once.
+///
+/// Each poll waits for the broker's reply until the deadline or for 10 seconds, whichever is
+/// later, so the poll that starts at the deadline still gets a full round trip. The call
+/// therefore returns within `timeout` plus 10 seconds; when a poll goes unanswered, closing the
+/// channel adds up to 10 seconds more.
 ///
 /// The message is taken with `no_ack`, so a test never leaves an unacknowledged delivery behind.
 ///
 /// # Errors
 ///
 /// Returns a [`HarnessError`] when a `basic.get` fails, for example because `queue` does not
-/// exist, which also closes the channel.
+/// exist, which also closes the channel. A poll left unanswered past its bound is an error too,
+/// never `None`, because its late reply could still carry a message; the channel is closed so
+/// that the reply cannot take a message unseen.
 pub async fn get(
     channel: &Channel,
     queue: &str,
@@ -242,10 +304,14 @@ pub async fn get(
 ) -> Result<Option<BasicGetMessage>, HarnessError> {
     let deadline = Instant::now() + timeout;
     loop {
-        let message = channel
-            .basic_get(queue, BasicGetOptions { no_ack: true })
-            .await
-            .map_err(|err| HarnessError::new("get", &err))?;
+        let poll_deadline = deadline.max(Instant::now() + OPERATION_TIMEOUT);
+        let message = within(
+            channel,
+            "get",
+            poll_deadline,
+            channel.basic_get(queue, BasicGetOptions { no_ack: true }),
+        )
+        .await?;
         if message.is_some() {
             return Ok(message);
         }
@@ -267,10 +333,15 @@ pub async fn get(
 ///
 /// # Errors
 ///
-/// Returns a [`HarnessError`] when the declaration fails.
+/// Returns a [`HarnessError`] when the declaration fails, and when the broker does not answer it
+/// within 10 seconds, in which case the channel is closed first, which waits up to 10 seconds
+/// more for the broker.
 pub async fn declare_reply_queue(channel: &Channel) -> Result<String, HarnessError> {
-    let queue = channel
-        .queue_declare(
+    let queue = within(
+        channel,
+        "declare reply queue",
+        Instant::now() + OPERATION_TIMEOUT,
+        channel.queue_declare(
             "",
             QueueDeclareOptions {
                 durable: false,
@@ -279,9 +350,9 @@ pub async fn declare_reply_queue(channel: &Channel) -> Result<String, HarnessErr
                 ..QueueDeclareOptions::default()
             },
             FieldTable::default(),
-        )
-        .await
-        .map_err(|err| HarnessError::new("declare reply queue", &err))?;
+        ),
+    )
+    .await?;
     Ok(queue.name().as_str().to_owned())
 }
 
@@ -293,18 +364,98 @@ pub async fn declare_reply_queue(channel: &Channel) -> Result<String, HarnessErr
 /// # Errors
 ///
 /// Returns a [`HarnessError`] when the declaration fails, for example because `queue` does not
-/// exist.
+/// exist, and when the broker does not answer it within 10 seconds, in which case the channel is
+/// closed first, which waits up to 10 seconds more for the broker.
 pub async fn message_count(channel: &Channel, queue: &str) -> Result<u32, HarnessError> {
-    let queue = channel
-        .queue_declare(
+    let queue = within(
+        channel,
+        "count queue messages",
+        Instant::now() + OPERATION_TIMEOUT,
+        channel.queue_declare(
             queue,
             QueueDeclareOptions {
                 passive: true,
                 ..QueueDeclareOptions::default()
             },
             FieldTable::default(),
-        )
-        .await
-        .map_err(|err| HarnessError::new("count queue messages", &err))?;
+        ),
+    )
+    .await?;
     Ok(queue.message_count())
+}
+
+/// Awaits `operation`, one request on `channel`, until `deadline`, and maps a failure to a
+/// [`HarnessError`] under `context`.
+///
+/// A request cancelled at its deadline, whether a reply never came or a publication's frames
+/// were never sent, is left outstanding on the channel: a late `basic.get-ok` would take a
+/// message off its queue unseen, and every later synchronous request would wait behind it. The
+/// channel is therefore closed before the error returns, waiting at most [`OPERATION_TIMEOUT`]
+/// for the broker to confirm. `lapin` marks the channel closing as soon as the close is sent, so
+/// every later request on it fails at once even when that confirmation never comes.
+async fn within<T>(
+    channel: &Channel,
+    context: &'static str,
+    deadline: Instant,
+    operation: impl Future<Output = lapin::Result<T>>,
+) -> Result<T, HarnessError> {
+    let started = Instant::now();
+    let Ok(outcome) = time::timeout_at(deadline, operation).await else {
+        let waited = started.elapsed().as_millis();
+        let close = time::timeout(
+            OPERATION_TIMEOUT,
+            channel.close(REPLY_SUCCESS, "harness deadline passed"),
+        )
+        .await;
+        let note = match close {
+            Ok(Ok(())) => String::new(),
+            Ok(Err(err)) => format!(" (the close itself failed: {err})"),
+            Err(_) => format!(
+                " (the broker did not confirm the close within {} ms)",
+                OPERATION_TIMEOUT.as_millis()
+            ),
+        };
+        return Err(HarnessError::new(
+            context,
+            &format_args!(
+                "the request did not complete within {waited} ms, so the channel was closed{note}"
+            ),
+        ));
+    };
+    outcome.map_err(|err| HarnessError::new(context, &err))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::bind_source;
+    use crate::modern_dir;
+
+    // `#[tokio::test]` runs on a current-thread runtime, where blocking the worker would stall
+    // every other task and timer.
+    #[tokio::test]
+    async fn broker_files_resolve_to_absolute_utf8_paths() {
+        for file in ["rabbitmq/rabbitmq.conf", "rabbitmq/definitions.json"] {
+            let resolved = bind_source(modern_dir().join(file)).await;
+            assert!(
+                resolved
+                    .as_deref()
+                    .is_ok_and(|path| Path::new(path).is_absolute() && path.ends_with(file)),
+                "{file}: {resolved:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_broker_file_is_reported_with_its_path() {
+        let Err(err) = bind_source(modern_dir().join("rabbitmq/missing.conf")).await else {
+            panic!("a missing broker file resolved");
+        };
+        let text = err.to_string();
+        assert!(
+            text.starts_with("resolve rabbitmq mount: ") && text.contains("rabbitmq/missing.conf"),
+            "{text}"
+        );
+    }
 }
