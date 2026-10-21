@@ -21,9 +21,11 @@
 //! alternate-index record lists for the key. `BLDINDEX` (`XREFFILE.jcl:100-102`) lists the prime
 //! keys of a shared alternate key in ascending order, and no in-scope program adds a
 //! cross-reference afterwards, so the first record is the one with the lowest card number.
-//! [`find_by_acct_id`](CardXrefRepository::find_by_acct_id) and `select_first_by_acct_id`,
-//! which the account chain of `accounts.rs` shares, therefore order by `card_num` and keep the
-//! first row. `card_num` is declared `COLLATE "C"` in the migration, so that order is bytewise,
+//! [`find_by_acct_id`](CardXrefRepository::find_by_acct_id) therefore orders by `card_num` and
+//! keeps the first row. The account chain of `accounts.rs` reads every row of the account
+//! through `select_all_by_acct_id` instead, because its programs branch on how many records share
+//! the key: one is `NORMAL`, more are `DUPKEY` (COACTVWC-039, COACTUPC-089). `card_num` is
+//! declared `COLLATE "C"` in the migration, so that order is bytewise,
 //! and no statement here names a collation, which would keep the planner off
 //! `card_xref_pkey` and `card_xref_acct_id_idx`.
 //!
@@ -279,8 +281,8 @@ async fn select_by_card<'e, E: PgExecutor<'e>>(
 }
 
 /// The first cross-reference of account `acct_id` in alternate-index order, the lowest card
-/// number, or `None` when no row has the account. The one statement of the `CXACAIX` read:
-/// [`CardXrefRepository::find_by_acct_id`] and the account chain of `accounts.rs` both run it.
+/// number, or `None` when no row has the account. The one statement of the `CXACAIX` read that
+/// [`CardXrefRepository::find_by_acct_id`] runs.
 ///
 /// # Errors
 ///
@@ -303,8 +305,16 @@ pub(super) async fn select_first_by_acct_id<'e, E: PgExecutor<'e>>(
     row.map(CardXrefRow::into_record).transpose()
 }
 
-/// Every cross-reference of account `acct_id`, in card-number order.
-async fn select_all_by_acct_id<'e, E: PgExecutor<'e>>(
+/// Every cross-reference of account `acct_id`, in card-number order. Shared with the account
+/// chain of `accounts.rs`, which tells a `CXACAIX` read that finds one record (`NORMAL`) from one
+/// whose key other records share (`DUPKEY`) by the number of rows (COACTVWC-039, COACTUPC-089).
+///
+/// # Errors
+///
+/// [`PersistenceError::Decode`] for the first column, in row order and then migration order,
+/// whose stored value does not fit its picture; [`PersistenceError::Unavailable`] or
+/// [`PersistenceError::Database`] when the statement fails.
+pub(super) async fn select_all_by_acct_id<'e, E: PgExecutor<'e>>(
     executor: E,
     acct_id: PicU<11>,
 ) -> Result<Vec<CardXrefRecord>, PersistenceError> {
@@ -379,7 +389,7 @@ mod tests {
     use domain::sensitive::CardNumber;
     use test_support::postgres::start_postgres;
 
-    use super::{CardXrefRepository, select_first_by_acct_id};
+    use super::{CardXrefRepository, select_all_by_acct_id, select_first_by_acct_id};
     use crate::error::PersistenceError;
     use crate::{PgStore, PgTx};
 
@@ -533,11 +543,16 @@ mod tests {
             "the keyed read ignores the shared account"
         );
 
-        // The same statements inside a transaction, and the one the account chain shares.
+        // The same statements inside a transaction, the one the account chain shares included.
         let mut tx: PgTx<'static> = store.begin().await?;
         assert!(
             select_first_by_acct_id(tx.conn(), shared).await? == Some(lowest.clone()),
-            "the shared statement keeps the lowest card number"
+            "the keyed statement keeps the lowest card number"
+        );
+        assert!(
+            select_all_by_acct_id(tx.conn(), shared).await?
+                == [lowest.clone(), middle.clone(), highest.clone()],
+            "the statement the account chain shares returns every record of the account"
         );
         assert!(tx.find_by_acct_id(shared).await? == Some(lowest.clone()));
         assert!(tx.find_all_by_acct_id(shared).await?.len() == 3);

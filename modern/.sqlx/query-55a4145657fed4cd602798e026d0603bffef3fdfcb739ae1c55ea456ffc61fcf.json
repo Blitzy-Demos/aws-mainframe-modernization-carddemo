@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT acct_id, acct_active_status, acct_curr_bal, acct_credit_limit, acct_cash_credit_limit, acct_open_date, acct_expiraion_date, acct_reissue_date, acct_curr_cyc_credit, acct_curr_cyc_debit, acct_addr_zip, acct_group_id, filler FROM accounts WHERE acct_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_active_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "acct_curr_bal",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "acct_credit_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "acct_cash_credit_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "acct_open_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 6,
+        "name": "acct_expiraion_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 7,
+        "name": "acct_reissue_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 8,
+        "name": "acct_curr_cyc_credit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 9,
+        "name": "acct_curr_cyc_debit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 10,
+        "name": "acct_addr_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "acct_group_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "55a4145657fed4cd602798e026d0603bffef3fdfcb739ae1c55ea456ffc61fcf"
+}

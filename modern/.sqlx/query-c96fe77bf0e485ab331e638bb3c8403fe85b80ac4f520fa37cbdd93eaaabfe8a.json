@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET acct_active_status = $2, acct_curr_bal = $3, acct_credit_limit = $4, acct_cash_credit_limit = $5, acct_open_date = $6, acct_expiraion_date = $7, acct_reissue_date = $8, acct_curr_cyc_credit = $9, acct_curr_cyc_debit = $10, acct_addr_zip = $11, acct_group_id = $12, filler = $13 WHERE acct_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bpchar",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Date",
+        "Date",
+        "Date",
+        "Numeric",
+        "Numeric",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c96fe77bf0e485ab331e638bb3c8403fe85b80ac4f520fa37cbdd93eaaabfe8a"
+}
