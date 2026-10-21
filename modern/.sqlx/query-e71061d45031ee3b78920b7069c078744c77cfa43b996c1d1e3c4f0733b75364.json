@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE tran_cat_balances\n            SET tran_cat_bal = $4, filler = $5\n          WHERE acct_id = $1 AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bpchar",
+        "Int8",
+        "Numeric",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e71061d45031ee3b78920b7069c078744c77cfa43b996c1d1e3c4f0733b75364"
+}

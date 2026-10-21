@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT nspname::text AS \"name!\"\n             FROM pg_namespace\n            WHERE NOT starts_with(nspname::text, 'pg_') AND nspname <> 'information_schema'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1d067eac286eab7b6968b3840f02467a075cbeadfcf10caf904c51c088e43b41"
+}

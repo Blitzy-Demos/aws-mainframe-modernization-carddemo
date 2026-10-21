@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE db2.transaction_type SET tr_description = $1 WHERE tr_type = $2",
+  "query": "UPDATE db2.transaction_type SET tr_description = $1 WHERE tr_type = $2::bpchar",
   "describe": {
     "columns": [],
     "parameters": {
@@ -11,5 +11,5 @@
     },
     "nullable": []
   },
-  "hash": "89b68d9e85e1e8ce4abe85d6bdab3e557ab25c656ad8ed924e25e046e52ad60a"
+  "hash": "fd20245924c1e0faf372fef0914053a0495e119b54b51d67824934878e5c24f7"
 }

@@ -1,20 +1,25 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT tran_type, tran_type_desc, filler FROM transaction_types WHERE tran_type = $1",
+  "query": "SELECT card_num, cust_id, acct_id, filler FROM card_xref WHERE card_num = $1::bpchar",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "tran_type",
+        "name": "card_num",
         "type_info": "Bpchar"
       },
       {
         "ordinal": 1,
-        "name": "tran_type_desc",
-        "type_info": "Bpchar"
+        "name": "cust_id",
+        "type_info": "Int8"
       },
       {
         "ordinal": 2,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
         "name": "filler",
         "type_info": "Bpchar"
       }
@@ -27,8 +32,9 @@
     "nullable": [
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "4e936ffa2779f3d27769a6a7b2182872b15d8b73ebc0dca7b8197bfae79accc8"
+  "hash": "4dc17dc9f896c695e9b48109efc15f5d729cc3a6b9e7f980301f22618397cc37"
 }

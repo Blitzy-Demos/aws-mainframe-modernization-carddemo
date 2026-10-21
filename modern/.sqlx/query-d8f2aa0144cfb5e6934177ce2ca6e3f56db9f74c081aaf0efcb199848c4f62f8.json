@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,\n                  tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,\n                  card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler\n           FROM transactions\n           WHERE tran_id = $1",
+  "query": "SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,\n                  tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,\n                  card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler\n           FROM transactions\n           WHERE tran_id = $1::bpchar",
   "describe": {
     "columns": [
       {
@@ -108,5 +108,5 @@
       false
     ]
   },
-  "hash": "656649fcb2d1405919aa99ee05de58a68fa1f03e745d723cb0291966bca6f87a"
+  "hash": "d8f2aa0144cfb5e6934177ce2ca6e3f56db9f74c081aaf0efcb199848c4f62f8"
 }

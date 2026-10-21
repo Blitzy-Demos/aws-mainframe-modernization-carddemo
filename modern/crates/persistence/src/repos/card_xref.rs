@@ -270,9 +270,12 @@ async fn select_by_card<'e, E: PgExecutor<'e>>(
     card: &CardNumber,
 ) -> Result<Option<CardXrefRecord>, PersistenceError> {
     let card_num = pic_x_to_string(CARD_NUM, card.expose())?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         CardXrefRow,
-        "SELECT card_num, cust_id, acct_id, filler FROM card_xref WHERE card_num = $1",
+        "SELECT card_num, cust_id, acct_id, filler FROM card_xref WHERE card_num = $1::bpchar",
         card_num
     )
     .fetch_optional(executor)

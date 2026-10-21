@@ -253,9 +253,12 @@ async fn update_one<'e, E: PgExecutor<'e>>(
     let card_num = pic_x_to_string("card_num", card.expose())?;
     let auth_ts = storable_timestamp(auth_ts)?;
     let auth_fraud = pic_x_to_string("auth_fraud", flag)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let done = sqlx::query!(
         "UPDATE auth_fraud SET auth_fraud = $1, fraud_rpt_date = $2
-         WHERE card_num = $3 AND auth_ts = $4",
+         WHERE card_num = $3::bpchar AND auth_ts = $4",
         auth_fraud,
         report_date,
         card_num,
@@ -274,6 +277,9 @@ async fn select_by_id<'e, E: PgExecutor<'e>>(
 ) -> Result<Option<(FraudRecord, Option<NaiveDate>)>, PersistenceError> {
     let card_num = pic_x_to_string("card_num", card.expose())?;
     let auth_ts = storable_timestamp(auth_ts)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         AuthFraudRow,
         "SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type, message_source,
@@ -282,7 +288,7 @@ async fn select_by_id<'e, E: PgExecutor<'e>>(
                 merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip,
                 transaction_id, match_status, auth_fraud, fraud_rpt_date, acct_id, cust_id
          FROM auth_fraud
-         WHERE card_num = $1 AND auth_ts = $2",
+         WHERE card_num = $1::bpchar AND auth_ts = $2",
         card_num,
         auth_ts,
     )

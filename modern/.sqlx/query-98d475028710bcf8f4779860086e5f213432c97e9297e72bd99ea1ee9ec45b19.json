@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET acct_id = -1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "98d475028710bcf8f4779860086e5f213432c97e9297e72bd99ea1ee9ec45b19"
+}

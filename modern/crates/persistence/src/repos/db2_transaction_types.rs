@@ -345,9 +345,12 @@ where
     E: PgExecutor<'e>,
 {
     let code = code_text(code)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         Db2TransactionTypeRow,
-        "SELECT tr_type, tr_description FROM db2.transaction_type WHERE tr_type = $1",
+        "SELECT tr_type, tr_description FROM db2.transaction_type WHERE tr_type = $1::bpchar",
         code
     )
     .fetch_optional(executor)
@@ -458,8 +461,11 @@ where
     E: PgExecutor<'e>,
 {
     let row = Db2TransactionTypeRow::from_record(record)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let done = sqlx::query!(
-        "UPDATE db2.transaction_type SET tr_description = $1 WHERE tr_type = $2",
+        "UPDATE db2.transaction_type SET tr_description = $1 WHERE tr_type = $2::bpchar",
         row.tr_description,
         row.tr_type
     )
@@ -475,9 +481,15 @@ where
     E: PgExecutor<'e>,
 {
     let code = code_text(code)?;
-    let done = sqlx::query!("DELETE FROM db2.transaction_type WHERE tr_type = $1", code)
-        .execute(executor)
-        .await?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
+    let done = sqlx::query!(
+        "DELETE FROM db2.transaction_type WHERE tr_type = $1::bpchar",
+        code
+    )
+    .execute(executor)
+    .await?;
     Ok(done.rows_affected() == 1)
 }
 

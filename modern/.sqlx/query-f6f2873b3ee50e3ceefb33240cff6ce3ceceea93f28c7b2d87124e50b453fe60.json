@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transactions SET orig_ts_form = 'S'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f6f2873b3ee50e3ceefb33240cff6ce3ceceea93f28c7b2d87124e50b453fe60"
+}

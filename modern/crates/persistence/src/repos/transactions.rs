@@ -6,7 +6,7 @@
 //!
 //! | Method | COBOL access | Statement | Served by |
 //! |---|---|---|---|
-//! | `find_by_id` | COTRN01C `READ-TRANSACT-FILE` by `TRAN-ID` (`COTRN01C.cbl:267-295`; COTRN01C-011, COTRN01C-012) | `WHERE tran_id = $1`, no lock | `transactions_pkey` |
+//! | `find_by_id` | COTRN01C `READ-TRANSACT-FILE` by `TRAN-ID` (`COTRN01C.cbl:267-295`; COTRN01C-011, COTRN01C-012) | `WHERE tran_id = $1::bpchar`, no lock | `transactions_pkey` |
 //! | `find_last` | COTRN02C `COPY-LAST-TRAN-DATA`: `STARTBR` at `HIGH-VALUES`, `READPREV`, `ENDBR` (`COTRN02C.cbl:471-480,642-706`; COTRN02C-053) | `ORDER BY tran_id DESC LIMIT 1` | `transactions_pkey`, backward |
 //! | `next_id` | the same browse, then `MOVE TRAN-ID TO WS-TRAN-ID-N` and `ADD 1` (`COTRN02C.cbl:442-449,689`; `COBIL00C.cbl:212-219,488`; COTRN02C-043, COBIL00C-023) | `max(tran_id)` | `transactions_pkey` |
 //! | `insert` | `WRITE-TRANSACT-FILE` of COTRN02C and COBIL00C (`COTRN02C.cbl:711-741`, `COBIL00C.cbl:510-539`; COTRN02C-050, COBIL00C-029) and CBTRN02C `2900-WRITE-TRANSACTION-FILE` (`CBTRN02C.cbl:562-579`; CBTRN02C-024, CBTRN02C-025) | `INSERT` of every column | — |
@@ -347,13 +347,16 @@ async fn select_by_id<'e, E: PgExecutor<'e>>(
     id: &PicX<16>,
 ) -> Result<Option<TransactionRecord>, PersistenceError> {
     let key = pic_x_to_string(TRAN_ID, id)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         TransactionRow,
         r#"SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
                   tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
                   card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler
            FROM transactions
-           WHERE tran_id = $1"#,
+           WHERE tran_id = $1::bpchar"#,
         key
     )
     .fetch_optional(executor)

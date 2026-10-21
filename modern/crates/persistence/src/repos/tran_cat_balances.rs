@@ -240,11 +240,14 @@ where
     let acct_id = pic_u_to_i64(ACCT_ID, acct_id)?;
     let type_cd = pic_x_to_string(TRAN_TYPE_CD, type_cd)?;
     let cat_cd = pic_u_to_i64(TRAN_CAT_CD, cat_cd)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         TranCatBalanceRow,
         "SELECT acct_id, tran_type_cd, tran_cat_cd, tran_cat_bal, filler
            FROM tran_cat_balances
-          WHERE acct_id = $1 AND tran_type_cd = $2 AND tran_cat_cd = $3",
+          WHERE acct_id = $1 AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
         acct_id,
         type_cd,
         cat_cd
@@ -310,10 +313,13 @@ where
     E: PgExecutor<'e>,
 {
     let row = TranCatBalanceRow::from_record(record)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let result = sqlx::query!(
         "UPDATE tran_cat_balances
             SET tran_cat_bal = $4, filler = $5
-          WHERE acct_id = $1 AND tran_type_cd = $2 AND tran_cat_cd = $3",
+          WHERE acct_id = $1 AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
         row.acct_id,
         row.tran_type_cd,
         row.tran_cat_cd,

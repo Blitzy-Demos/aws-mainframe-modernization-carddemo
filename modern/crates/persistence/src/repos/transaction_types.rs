@@ -204,9 +204,13 @@ where
     E: PgExecutor<'e>,
 {
     let key = pic_x_to_string(TRAN_TYPE, code)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         TransactionTypeRow,
-        "SELECT tran_type, tran_type_desc, filler FROM transaction_types WHERE tran_type = $1",
+        "SELECT tran_type, tran_type_desc, filler FROM transaction_types \
+         WHERE tran_type = $1::bpchar",
         key,
     )
     .fetch_optional(executor)

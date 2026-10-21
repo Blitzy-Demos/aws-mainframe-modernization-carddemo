@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT table_schema::text AS \"schema!\",\n                  table_name::text AS \"table!\",\n                  column_name::text AS \"name!\",\n                  data_type::text AS \"data_type!\",\n                  character_maximum_length::int4 AS \"char_len?\",\n                  numeric_precision::int4 AS \"precision?\",\n                  numeric_scale::int4 AS \"scale?\",\n                  datetime_precision::int4 AS \"dt_precision?\",\n                  (is_nullable = 'YES') AS \"nullable!\",\n                  (is_identity = 'YES') AS \"identity!\",\n                  identity_generation::text AS \"generation?\",\n                  column_default::text AS \"column_default?\"\n             FROM information_schema.columns\n            WHERE table_schema IN ('public', 'db2')\n            ORDER BY table_schema, table_name, ordinal_position",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "schema!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "table!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "data_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "char_len?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "precision?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "scale?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "dt_precision?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 8,
+        "name": "nullable!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "identity!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "generation?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "column_default?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "551fbaef350c1a1fb16bdce04def5ea27b97a3c2da160bff09e827ad4b061c36"
+}

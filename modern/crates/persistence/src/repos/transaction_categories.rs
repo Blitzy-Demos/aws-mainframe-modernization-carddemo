@@ -202,11 +202,14 @@ where
 {
     let tran_type_cd = pic_x_to_string(TRAN_TYPE_CD, type_cd)?;
     let tran_cat_cd = pic_u_to_i64(TRAN_CAT_CD, cat_cd)?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and the primary key could not serve the statement.
     let row = sqlx::query_as!(
         TransactionCategoryRow,
         "SELECT tran_type_cd, tran_cat_cd, tran_cat_type_desc, filler \
          FROM transaction_categories \
-         WHERE tran_type_cd = $1 AND tran_cat_cd = $2",
+         WHERE tran_type_cd = $1::bpchar AND tran_cat_cd = $2",
         tran_type_cd,
         tran_cat_cd,
     )

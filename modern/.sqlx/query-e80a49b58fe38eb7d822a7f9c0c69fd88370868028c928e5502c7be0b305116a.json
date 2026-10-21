@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type, message_source,\n                auth_id_code, auth_resp_code, auth_resp_reason, processing_code, transaction_amt,\n                approved_amt, merchant_catagory_code, acqr_country_code, pos_entry_mode,\n                merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip,\n                transaction_id, match_status, auth_fraud, fraud_rpt_date, acct_id, cust_id\n         FROM auth_fraud\n         WHERE card_num = $1 AND auth_ts = $2",
+  "query": "SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type, message_source,\n                auth_id_code, auth_resp_code, auth_resp_reason, processing_code, transaction_amt,\n                approved_amt, merchant_catagory_code, acqr_country_code, pos_entry_mode,\n                merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip,\n                transaction_id, match_status, auth_fraud, fraud_rpt_date, acct_id, cust_id\n         FROM auth_fraud\n         WHERE card_num = $1::bpchar AND auth_ts = $2",
   "describe": {
     "columns": [
       {
@@ -169,5 +169,5 @@
       true
     ]
   },
-  "hash": "85255802015b390481e67de00dde14456006263c3c30eb04af0085283bdd8063"
+  "hash": "e80a49b58fe38eb7d822a7f9c0c69fd88370868028c928e5502c7be0b305116a"
 }

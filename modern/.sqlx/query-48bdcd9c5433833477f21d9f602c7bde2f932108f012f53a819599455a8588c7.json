@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT acct_id, tran_type_cd, tran_cat_cd, tran_cat_bal, filler\n           FROM tran_cat_balances\n          WHERE acct_id = $1 AND tran_type_cd = $2 AND tran_cat_cd = $3",
+  "query": "SELECT acct_id, tran_type_cd, tran_cat_cd, tran_cat_bal, filler\n           FROM tran_cat_balances\n          WHERE acct_id = $1 AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
   "describe": {
     "columns": [
       {
@@ -44,5 +44,5 @@
       false
     ]
   },
-  "hash": "2fd15670febb7d6070a29b102f058dcc4d94e7af3d498d21f988477230b3384d"
+  "hash": "48bdcd9c5433833477f21d9f602c7bde2f932108f012f53a819599455a8588c7"
 }
