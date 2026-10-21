@@ -98,6 +98,17 @@ pub enum AmqpError {
     /// `CARDDEMO_AMQP_URL` is not a valid AMQP URL. The parser's own message is dropped,
     /// because it can repeat the URL, password included.
     InvalidUrl,
+    /// The queue name configured in `variable` cannot be carried whole by the COBOL field that
+    /// reports it: it is longer than `max_len` bytes or holds a byte outside printable ASCII.
+    /// The CDRA worker refuses such a `CARDDEMO_QUEUE_REQUEST_ACCT` at start, because its
+    /// account-read error body names the request queue in `MQ-APPL-QUEUE-NAME PIC X(48)`
+    /// (COACCT01-029, X-COACCT01-8). The text names the variable, never the rejected value.
+    QueueName {
+        /// The environment variable that holds the rejected name.
+        variable: &'static str,
+        /// The width of the field the name must fit.
+        max_len: usize,
+    },
     /// The connection to the broker could not be established.
     Connect(lapin::Error),
     /// A channel could not be opened or put in confirm mode.
@@ -130,7 +141,8 @@ impl AmqpError {
     ///   `CONNECTION_FORCED`, with which the broker closes the connection.
     /// - not lost: a soft AMQP error such as `NOT_FOUND` or `PRECONDITION_FAILED`, which closes
     ///   only the channel, an invalid channel or channel state, the channel limit, and
-    ///   [`AmqpError::InvalidUrl`], a configuration error no reconnect cures.
+    ///   [`AmqpError::InvalidUrl`] and [`AmqpError::QueueName`], configuration errors no
+    ///   reconnect cures.
     ///
     /// After a connection loss the client marks its channels failed, so the next operation on a
     /// channel reports a channel state and counts as not lost. The worker then reopens its
@@ -138,7 +150,7 @@ impl AmqpError {
     #[must_use]
     pub fn is_connection_lost(&self) -> bool {
         match self {
-            Self::InvalidUrl => false,
+            Self::InvalidUrl | Self::QueueName { .. } => false,
             Self::Connect(_) => true,
             Self::Channel(error)
             | Self::Declare { source: error, .. }
@@ -171,6 +183,10 @@ impl fmt::Display for AmqpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUrl => f.write_str("the AMQP URL (CARDDEMO_AMQP_URL) is not valid"),
+            Self::QueueName { variable, max_len } => write!(
+                f,
+                "{variable} must name a queue of at most {max_len} bytes of printable ASCII"
+            ),
             Self::Connect(error) => write!(f, "cannot connect to the AMQP broker: {error}"),
             Self::Channel(error) => write!(f, "cannot open an AMQP channel: {error}"),
             Self::Declare { queue, source } => {
@@ -186,7 +202,7 @@ impl fmt::Display for AmqpError {
 impl Error for AmqpError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::InvalidUrl => None,
+            Self::InvalidUrl | Self::QueueName { .. } => None,
             Self::Connect(error)
             | Self::Channel(error)
             | Self::Declare { source: error, .. }
@@ -862,6 +878,10 @@ mod tests {
         }
         let channel_only = [
             AmqpError::InvalidUrl,
+            AmqpError::QueueName {
+                variable: "CARDDEMO_QUEUE_REQUEST_ACCT",
+                max_len: 48,
+            },
             AmqpError::Declare {
                 queue: "CARD.DEMO.ERROR".to_owned(),
                 source: not_found,
