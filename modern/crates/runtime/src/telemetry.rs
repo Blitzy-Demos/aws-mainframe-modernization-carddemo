@@ -7,6 +7,15 @@
 //! `opentelemetry-stdout` exporter prints. Output goes to standard output only: there is no
 //! collector, no network exporter and no cloud service.
 //!
+//! # Standard output format
+//!
+//! With span export off, every line of standard output is one JSON event. With
+//! `CARDDEMO_OTEL_EXPORT=stdout`, the `opentelemetry-stdout` exporter also writes each finished
+//! span as a multi-line, human-readable text block, interleaved with the JSON event lines; the
+//! exporter has no JSON format. A consumer that parses standard output line by line as JSON
+//! therefore runs with export off. Exported spans and their events carry no source-location
+//! attributes, so no source or host path reaches standard output.
+//!
 //! # Redaction boundary
 //!
 //! [`request_span`], [`record_response`], [`message_span`] and [`job_span`] are the only span
@@ -27,15 +36,17 @@
 //! `Span::enter` returns across an `.await` (`clippy::await_holding_span_guard`): the span would
 //! stay entered for whatever else the executor runs on that thread.
 
+use std::env::VarError;
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::{Tracer, TracerProvider};
 use tracing::field::Empty;
 use tracing::{Span, Subscriber, info_span};
-use tracing_subscriber::filter::{EnvFilter, FromEnvError, LevelFilter};
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::filter::{Builder, EnvFilter, FromEnvError, LevelFilter};
 use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
 use tracing_subscriber::fmt::{Layer as FmtLayer, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
@@ -87,19 +98,24 @@ where
 /// into an `OpenTelemetry` tracer provider whose simple span processor prints each finished span
 /// to standard output. [`OtelExport::Off`] adds no `OpenTelemetry` layer.
 ///
+/// With [`OtelExport::Stdout`], the `opentelemetry-stdout` exporter writes each finished span as a
+/// multi-line, human-readable text block between the JSON event lines, so standard output is no
+/// longer one JSON object per line. A consumer that parses standard output line by line as JSON
+/// runs with [`OtelExport::Off`], where every line is one JSON event. Exported spans and their
+/// events carry no source-location attributes.
+///
 /// The returned [`FlushGuard`] shuts the span exporter down when dropped; bind it for the life of
 /// `main`.
 ///
 /// # Errors
 ///
+/// - [`InitError::NotUnicode`] when `RUST_LOG` holds bytes that are not valid Unicode.
 /// - [`InitError::Filter`] when `RUST_LOG` holds a directive the filter cannot parse.
 /// - [`InitError::Install`] when a global subscriber is already installed in this process, for
 ///   example by an earlier call of this function.
 pub fn init(otel_export: OtelExport) -> Result<FlushGuard, InitError> {
-    let filter = EnvFilter::builder()
-        .with_default_directive(LevelFilter::INFO.into())
-        .from_env()
-        .map_err(InitError::Filter)?;
+    let builder = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into());
+    let filter = env_filter(&builder, builder.try_from_env())?;
 
     let provider = match otel_export {
         OtelExport::Off => None,
@@ -109,9 +125,7 @@ pub fn init(otel_export: OtelExport) -> Result<FlushGuard, InitError> {
                 .build(),
         ),
     };
-    let otel = provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer(TRACER_NAME)));
+    let otel = provider.as_ref().map(otel_layer);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -121,6 +135,47 @@ pub fn init(otel_export: OtelExport) -> Result<FlushGuard, InitError> {
         .map_err(InitError::Install)?;
 
     Ok(FlushGuard { provider })
+}
+
+/// The filter [`init`] installs, given `builder` and the outcome of its `try_from_env`.
+///
+/// An unset `RUST_LOG` gives the builder's default directive, as an empty one does. A value that
+/// is not valid Unicode is an error, never read as unset. Taking the outcome as an argument keeps
+/// this mapping independent of the process environment.
+///
+/// # Errors
+///
+/// - [`InitError::NotUnicode`] when `RUST_LOG` holds bytes that are not valid Unicode.
+/// - [`InitError::Filter`] when `RUST_LOG` holds a directive the filter cannot parse.
+fn env_filter(
+    builder: &Builder,
+    read: Result<EnvFilter, FromEnvError>,
+) -> Result<EnvFilter, InitError> {
+    read.or_else(|err| {
+        match err
+            .source()
+            .and_then(|source| source.downcast_ref::<VarError>())
+        {
+            Some(VarError::NotPresent) => Ok(builder.parse_lossy("")),
+            Some(VarError::NotUnicode(_)) => Err(InitError::NotUnicode),
+            None => Err(InitError::Filter(err)),
+        }
+    })
+}
+
+/// The `tracing-opentelemetry` layer that bridges spans and their events into `provider`'s
+/// tracer.
+///
+/// Location attributes are off, so no exported span or span event carries `code.filepath`,
+/// `code.namespace` or `code.lineno`: a source path of this workspace or of the cargo registry
+/// never reaches standard output. Every other layer setting keeps its default.
+fn otel_layer<S>(provider: &TracerProvider) -> OpenTelemetryLayer<S, Tracer>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+{
+    tracing_opentelemetry::layer()
+        .with_location(false)
+        .with_tracer(provider.tracer(TRACER_NAME))
 }
 
 /// Keeps the `OpenTelemetry` span exporter alive and shuts it down, flushing it, when dropped.
@@ -147,6 +202,9 @@ impl Drop for FlushGuard {
 /// Why [`init`] could not install the subscriber.
 #[derive(Debug)]
 pub enum InitError {
+    /// `RUST_LOG` holds bytes that are not valid Unicode. The message names the variable, never
+    /// its value.
+    NotUnicode,
     /// `RUST_LOG` holds a directive the filter cannot parse. The message carries only what the
     /// filter's own error reports.
     Filter(FromEnvError),
@@ -157,6 +215,7 @@ pub enum InitError {
 impl fmt::Display for InitError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NotUnicode => f.write_str("environment variable RUST_LOG is not valid Unicode"),
             Self::Filter(err) => write!(f, "invalid RUST_LOG filter: {err}"),
             Self::Install(err) => write!(f, "tracing subscriber already installed: {err}"),
         }
@@ -166,6 +225,7 @@ impl fmt::Display for InitError {
 impl Error for InitError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::NotUnicode => None,
             Self::Filter(err) => Some(err),
             Self::Install(err) => Some(err),
         }
@@ -243,17 +303,22 @@ pub fn job_span(job: &str) -> Span {
 mod tests {
     use std::env::VarError;
     use std::error::Error as _;
+    use std::ffi::OsString;
     use std::io;
+    use std::os::unix::ffi::OsStringExt;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
-    use tracing_subscriber::filter::{EnvFilter, FromEnvError};
+    use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
+    use opentelemetry_sdk::trace::TracerProvider;
+    use tracing_subscriber::filter::{EnvFilter, FromEnvError, LevelFilter};
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, InitError, OtelExport, UNMATCHED_ROUTE, init, job_span, json_layer,
-        message_span, record_response, request_span,
+        ALERT_TARGET, InitError, OtelExport, UNMATCHED_ROUTE, env_filter, init, job_span,
+        json_layer, message_span, otel_layer, record_response, request_span,
     };
 
     /// In-memory writer standing in for standard output.
@@ -301,6 +366,33 @@ mod tests {
     fn assert_contains_all(output: &str, expected: &[&str]) {
         for needle in expected {
             assert!(output.contains(needle), "{needle} missing from {output}");
+        }
+    }
+
+    /// In-memory span exporter standing in for `opentelemetry-stdout`: it keeps every span it is
+    /// handed, as the stdout exporter would print it.
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl Exported {
+        fn spans(&self) -> Vec<SpanData> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl SpanExporter for Exported {
+        fn export(
+            &mut self,
+            batch: Vec<SpanData>,
+        ) -> Pin<Box<dyn Future<Output = ExportResult> + Send + 'static>> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend(batch);
+            Box::pin(std::future::ready(Ok(())))
         }
     }
 
@@ -395,6 +487,50 @@ mod tests {
     }
 
     #[test]
+    fn exported_spans_carry_their_fields_but_no_source_location() {
+        let exported = Exported::default();
+        let provider = TracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        tracing::subscriber::with_default(subscriber, || {
+            job_span("posttran").in_scope(|| tracing::info!(step = "load", "probe"));
+        });
+
+        let spans = exported.spans();
+        let [span] = spans.as_slice() else {
+            panic!("expected exactly one exported span, got {spans:?}");
+        };
+        assert_eq!(span.name, "batch.job");
+        assert!(
+            span.attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "job" && kv.value.as_str() == "posttran"),
+            "{span:?}"
+        );
+        let [event] = &*span.events else {
+            panic!("expected exactly one span event, got {span:?}");
+        };
+        assert_eq!(event.name, "probe");
+        assert!(
+            event
+                .attributes
+                .iter()
+                .any(|kv| kv.key.as_str() == "step" && kv.value.as_str() == "load"),
+            "{event:?}"
+        );
+
+        let location_keys: Vec<&str> = span
+            .attributes
+            .iter()
+            .chain(&event.attributes)
+            .map(|kv| kv.key.as_str())
+            .filter(|key| key.starts_with("code."))
+            .collect();
+        assert!(location_keys.is_empty(), "{location_keys:?} in {span:?}");
+    }
+
+    #[test]
     fn filter_errors_carry_only_the_inner_message() {
         let not_present = InitError::Filter(FromEnvError::from(VarError::NotPresent));
         assert_eq!(
@@ -413,6 +549,67 @@ mod tests {
         );
         assert!(invalid.source().is_some());
         assert!(format!("{invalid:?}").starts_with("Filter("));
+    }
+
+    #[test]
+    fn rust_log_outcomes_give_the_default_filter_or_a_value_free_error() {
+        /// What `env_filter` must make of one failed `try_from_env`.
+        #[derive(Debug)]
+        enum Expected {
+            DefaultInfo,
+            NotUnicode,
+            Filter,
+        }
+
+        let builder = EnvFilter::builder().with_default_directive(LevelFilter::INFO.into());
+        let unparsable = builder
+            .parse("runtime=loud")
+            .expect_err("`loud` is not a level");
+        let not_unicode = OsString::from_vec(b"trace\xffX".to_vec());
+        let cases = [
+            (
+                "unset",
+                FromEnvError::from(VarError::NotPresent),
+                Expected::DefaultInfo,
+            ),
+            (
+                "not valid Unicode",
+                FromEnvError::from(VarError::NotUnicode(not_unicode)),
+                Expected::NotUnicode,
+            ),
+            (
+                "unparsable directive",
+                FromEnvError::from(unparsable),
+                Expected::Filter,
+            ),
+        ];
+        for (case, read, expected) in cases {
+            match (env_filter(&builder, Err(read)), expected) {
+                (Ok(filter), Expected::DefaultInfo) => {
+                    assert_eq!(filter.max_level_hint(), Some(LevelFilter::INFO), "{case}");
+                }
+                (Err(err @ InitError::NotUnicode), Expected::NotUnicode) => {
+                    let display = err.to_string();
+                    assert_eq!(
+                        display, "environment variable RUST_LOG is not valid Unicode",
+                        "{case}"
+                    );
+                    assert!(err.source().is_none(), "{case}");
+                    for text in [display, format!("{err:?}")] {
+                        for value in ["trace", "\\x", "\u{fffd}"] {
+                            assert!(!text.contains(value), "{case}: {text}");
+                        }
+                    }
+                }
+                (Err(err @ InitError::Filter(_)), Expected::Filter) => {
+                    assert!(
+                        err.to_string().starts_with("invalid RUST_LOG filter: "),
+                        "{case}: {err}"
+                    );
+                }
+                (outcome, expected) => panic!("{case}: expected {expected:?}, got {outcome:?}"),
+            }
+        }
     }
 
     // The only test that calls `init`: a global subscriber can be installed once per process.
@@ -436,9 +633,10 @@ mod tests {
                 assert!(format!("{guard:?}").contains("provider: Some"), "{guard:?}");
                 drop(guard);
             }
-            // An invalid `RUST_LOG` in the test environment stops `init` before it installs
-            // anything, which is the documented `Filter` outcome.
+            // An invalid or non-Unicode `RUST_LOG` in the test environment stops `init` before it
+            // installs anything, which are the documented `Filter` and `NotUnicode` outcomes.
             Err(InitError::Filter(err)) => assert!(!err.to_string().is_empty()),
+            Err(err @ InitError::NotUnicode) => assert!(err.source().is_none()),
             Err(other) => panic!("first install must succeed, got {other:?}"),
         }
     }
