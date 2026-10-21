@@ -30,10 +30,12 @@
 use std::error::Error;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use copybook::{FixedRecord, lines};
 use domain::batch::loads::decode_fixture;
+use domain::clock::Clock;
 use domain::messaging::codate01::{BUFFER_LEN, MQ_ERR_DISPLAY_LEN};
 use domain::money::{Decimal, Money};
 
@@ -116,6 +118,23 @@ fn instant(
         .ok_or_else(|| Box::<dyn Error>::from("no such instant"))
 }
 
+/// A clock that reads `first` once and `later` on every reading after it, counting readings.
+struct TwoInstantClock {
+    first: NaiveDateTime,
+    later: NaiveDateTime,
+    reads: AtomicUsize,
+}
+
+impl Clock for TwoInstantClock {
+    fn now(&self) -> NaiveDateTime {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first
+        } else {
+            self.later
+        }
+    }
+}
+
 /// `cents` hundredths as an amount of picture `S9(N)V99`.
 fn money<const N: u32>(cents: i64) -> Result<Money<N>, Box<dyn Error>> {
     Ok(Money::new(Decimal::new(cents, 2))?)
@@ -160,32 +179,17 @@ fn assert_error_body(body: &[u8], message: &[u8], queue: &[u8], rule: &str) -> T
 mod cdrd {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use chrono::NaiveDateTime;
     use copybook::PicU;
-    use domain::clock::{Clock, FixedClock};
+    use domain::clock::FixedClock;
     use domain::messaging::codate01::{
         BUFFER_LEN, ERROR_QUEUE, MQ_ERR_DISPLAY_LEN, MqErrDisplay, REPLY_QUEUE, REPLY_TEXT_LEN,
         ReturnMessage, reply_body, space_padded,
     };
 
-    use super::{TestResult, all_spaces, assert_error_body, blocked, has_format, instant, segment};
-
-    /// A clock that reads `first` once and `later` on every reading after it, counting readings.
-    struct TwoInstantClock {
-        first: NaiveDateTime,
-        later: NaiveDateTime,
-        reads: AtomicUsize,
-    }
-
-    impl Clock for TwoInstantClock {
-        fn now(&self) -> NaiveDateTime {
-            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
-                self.first
-            } else {
-                self.later
-            }
-        }
-    }
+    use super::{
+        TestResult, TwoInstantClock, all_spaces, assert_error_body, blocked, has_format, instant,
+        segment,
+    };
 
     // audit: CODATE01-003
     // audit: CODATE01-004
@@ -811,6 +815,7 @@ mod cdra {
 /// COPAUA0C rows of `modern/audit/arithmetic.md`).
 mod cp00 {
     use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::NaiveDate;
     use copybook::edited::EditedPicture;
@@ -834,8 +839,8 @@ mod cp00 {
     use proptest::test_runner::TestRunner;
 
     use super::{
-        TestResult, blocked, contains, fixture_lines, fixture_records, has_format, instant, money,
-        padded, segment,
+        TestResult, TwoInstantClock, blocked, contains, fixture_lines, fixture_records, has_format,
+        instant, money, padded, segment,
     };
 
     /// A well-formed request in wire order; field 3, the card number, is supplied per test.
@@ -2499,56 +2504,85 @@ mod cp00 {
 
     // audit: COPAUA0C-098
     #[test]
-    fn the_detail_key_inverts_one_clock_reading() -> TestResult {
+    fn the_detail_key_comes_from_one_clock_reading() -> TestResult {
         let world = World::load()?;
-        let (xref, card) = world.first()?;
-        let template = summary_template(xref);
-        let lookup = found(
-            xref,
-            Some(world.account(xref)?),
-            world.customer(xref),
-            SummaryState::Created(&template),
+        let (request, decision) = decided(&world, &[])?;
+        let first = instant((2024, 12, 31), (23, 59, 59, 999))?;
+        let later = instant((2025, 1, 1), (0, 0, 0, 0))?;
+        let clock = TwoInstantClock {
+            first,
+            later,
+            reads: AtomicUsize::new(0),
+        };
+        let detail = detail_record(&request, &decision, &clock);
+        assert_eq!(clock.reads.load(Ordering::SeqCst), 1, "COPAUA0C-098");
+        // A second reading would cross midnight, where both the day and the time of day change,
+        // so a key built from two readings could pair the old day with the new time. The key is
+        // the one built from the first reading alone, and each half differs from the later one's.
+        let once = detail_record(&request, &decision, &FixedClock::new(first));
+        let after = detail_record(&request, &decision, &FixedClock::new(later));
+        assert_eq!(
+            (detail.auth_date_9c, detail.auth_time_9c),
+            (once.auth_date_9c, once.auth_time_9c),
+            "COPAUA0C-098"
         );
-        let request = asking(card, b"100.00")?;
-        let decision = decide(&request, &lookup);
-        // Day 32 of 2025 at 13:45:07.123: YYDDD 25032 and HHMMSSmmm 134507123.
-        let at = NaiveDate::from_yo_opt(2025, 32)
-            .and_then(|day| day.and_hms_milli_opt(13, 45, 7, 123))
-            .ok_or("no such instant")?;
-        let detail = detail_record(&request, &decision, &FixedClock::new(at));
-        assert_eq!(detail.auth_date_9c.get(), 74_967, "COPAUA0C-098");
-        assert_eq!(detail.auth_time_9c.get(), 865_492_876, "COPAUA0C-098");
+        assert_ne!(detail.auth_date_9c, after.auth_date_9c, "COPAUA0C-098");
+        assert_ne!(detail.auth_time_9c, after.auth_time_9c, "COPAUA0C-098");
+        Ok(())
+    }
+
+    // audit: COPAUA0C-098
+    #[test]
+    fn the_detail_key_has_the_inverted_key_format_and_order() -> TestResult {
+        let world = World::load()?;
+        let (request, decision) = decided(&world, &[])?;
         // One instant gives one key, so a second detail under it takes the `I004` path.
+        let at = instant((2022, 6, 18), (14, 30, 12, 345))?;
+        let detail = detail_record(&request, &decision, &FixedClock::new(at));
         let again = detail_record(&request, &decision, &FixedClock::new(at));
         assert_eq!(
             (again.auth_date_9c, again.auth_time_9c),
             (detail.auth_date_9c, detail.auth_time_9c),
             "COPAUA0C-098"
         );
-        // Any reading gives keys inside `S9(05)` and `S9(09)`, newer instants lower ones.
+        // Readings in time order, all in one century: the first instant of year 00, the first and
+        // last milliseconds of days 1 and 366 of a leap year with a reading between, and the last
+        // instant of year 99. The keys are compared by format and order only.
         let readings = [
             instant((2000, 1, 1), (0, 0, 0, 0))?,
+            instant((2024, 1, 1), (0, 0, 0, 0))?,
+            instant((2024, 1, 1), (23, 59, 59, 999))?,
+            instant((2024, 12, 31), (0, 0, 0, 0))?,
             instant((2024, 12, 31), (12, 0, 0, 500))?,
+            instant((2024, 12, 31), (23, 59, 59, 999))?,
             instant((2099, 12, 31), (23, 59, 59, 999))?,
         ];
-        let mut previous: Option<PendingAuthDetailRecord> = None;
+        let mut previous: Option<(NaiveDate, PicS<5>, PicS<9>)> = None;
         for reading in readings {
             let detail = detail_record(&request, &decision, &FixedClock::new(reading));
-            assert!(
-                (0..=99_999).contains(&detail.auth_date_9c.get()),
-                "COPAUA0C-098"
-            );
-            assert!(
-                (0..=999_999_999).contains(&detail.auth_time_9c.get()),
-                "COPAUA0C-098"
-            );
-            if let Some(earlier) = &previous {
-                assert!(
-                    detail.auth_date_9c.get() < earlier.auth_date_9c.get(),
-                    "COPAUA0C-098"
-                );
+            let (date_key, time_key) = (detail.auth_date_9c, detail.auth_time_9c);
+            assert!((0..=99_999).contains(&date_key.get()), "COPAUA0C-098");
+            assert!((0..=999_999_999).contains(&time_key.get()), "COPAUA0C-098");
+            // `YYDDD`: a two-digit year, then a day of the year from 001 to 366.
+            let yyddd = date_key.uncomplement()?;
+            assert!(yyddd / 1_000 <= 99, "COPAUA0C-098");
+            assert!((1..=366).contains(&(yyddd % 1_000)), "COPAUA0C-098");
+            // `HHMMSSmmm`: a 24-hour time of day, then three digits of milliseconds.
+            let hhmmssmmm = time_key.uncomplement()?;
+            assert!(hhmmssmmm / 10_000_000 < 24, "COPAUA0C-098");
+            assert!(hhmmssmmm / 100_000 % 100 < 60, "COPAUA0C-098");
+            assert!(hhmmssmmm / 1_000 % 100 < 60, "COPAUA0C-098");
+            // A later time of the same day keeps the date key and lowers the time key; a later
+            // day lowers the date key.
+            if let Some((day, earlier_date, earlier_time)) = previous {
+                if reading.date() == day {
+                    assert_eq!(date_key, earlier_date, "COPAUA0C-098");
+                    assert!(time_key < earlier_time, "COPAUA0C-098");
+                } else {
+                    assert!(date_key < earlier_date, "COPAUA0C-098");
+                }
             }
-            previous = Some(detail);
+            previous = Some((reading.date(), date_key, time_key));
         }
         Ok(())
     }
