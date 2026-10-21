@@ -1,0 +1,333 @@
+//! MNTTRDB2, the batch maintenance of the Db2 transaction types: `carddemo-batch mnttrdb2
+//! --input <file>` drives the rules of COBTUPDT (`domain::batch::cobtupdt`) against
+//! `db2.transaction_type` (AAP 0.2.3, 0.3.4.3). The audit is `modern/audit/batch/MNTTRDB2.md`.
+//!
+//! # Run
+//!
+//! 1. The `--input` file is read and decoded in full before the database is reached. A line that
+//!    is no 53-byte record fails the job with [`JobError::Input`]: no record is processed and no
+//!    table changes (COBTUPDT-003, COBTUPDT-004).
+//! 2. One transaction holds the run, the single unit of work of a program that issues no `COMMIT`
+//!    (COBTUPDT-024). Records are planned and executed one at a time, in file order
+//!    (COBTUPDT-006, COBTUPDT-007): `A` inserts, `U` updates and `D` deletes; `*` and any other
+//!    action byte run no statement (COBTUPDT-008, COBTUPDT-009).
+//! 3. Each statement's result goes back to the domain as a [`SqlOutcome`]: `Ok` for a completed
+//!    statement, `NotFound` for an update or delete that changed no row (COBTUPDT-013,
+//!    COBTUPDT-016), and `Failed` for any statement error, the duplicate insert (COBTUPDT-011)
+//!    and the delete refused by the `ON DELETE RESTRICT` of `TRNTYCAT.ddl:6-7` (COBTUPDT-017)
+//!    included. The run goes on with the next record after every failure (COBTUPDT-022).
+//! 4. One commit after the last record; the exit code is then the domain's `RETURN-CODE`, 4 once
+//!    any record reached `9999-ABEND` and 0 otherwise (COBTUPDT-023, COBTUPDT-025).
+//!
+//! The message overlay, the return code and the absence of any field validation are the domain's
+//! and are reproduced, never corrected, here (Behaviour constraint).
+//!
+//! # Savepoints
+//!
+//! A failed Db2 statement changes nothing and leaves the unit of work open, whereas a failed
+//! `PostgreSQL` statement aborts the whole transaction. Each statement therefore runs inside a
+//! savepoint of its own, released when the statement completes and rolled back to when it fails,
+//! so the earlier records' changes stand and the later records still run (COBTUPDT-024). Two
+//! failures are not answered that way:
+//!
+//! - A deadlock or a lock timeout, SQLSTATE `40P01` or `55P03`, stands for Db2 `SQLCODE` -911,
+//!   which rolls back the whole unit of work: the run's transaction is rolled back, every earlier
+//!   change of the run with it, and a new transaction holds the later records (COBTUPDT-024).
+//! - A lost connection, a savepoint or rollback the server refuses, and a failed commit end the
+//!   run at once with [`JobError::Persistence`] and nothing committed, because a transaction whose
+//!   connection is gone can be neither continued nor committed. The audit raises this case as a
+//!   halt candidate (`X-MNTTRDB2-H2`) and claims no parity for it.
+//!
+//! # Job log
+//!
+//! Every domain step returns the `DISPLAY` lines COBTUPDT writes. This job discards them: the
+//! batch job contract reports only the files a job wrote, and this job writes none, so it prints
+//! nothing (AAP 0.3.4.3). The lines are proved where the domain builds them; the five `SQLCODE`
+//! positions their error text ends with are halted under H3 (COBTUPDT-020).
+//!
+//! # Data version (E23)
+//!
+//! Only `db2.transaction_type` is written, through [`Db2TransactionTypeRepository`];
+//! `db2.transaction_type_category` is reached only through the delete restriction. The VSAM data
+//! version in `transaction_types`, which `tranrept` reads, is never touched, so a maintenance
+//! change never reaches the report lookups (COBTUPDT-026, COBTUPDT-027).
+//!
+//! The job does no schema work (Single Schema Executor). It runs against the schema and the Db2
+//! seed that migration 0006 gave the database once; against a database without them each `A`,
+//! `U` and `D` record fails its statement and the run exits 4 (COBTUPDT-026).
+//!
+//! # Redaction
+//!
+//! A description is unvalidated free text and may hold a protected value, so no line, record or
+//! description reaches an error, a counter or a tracing event: [`JobError`] carries an SQLSTATE
+//! and a constraint name at most, and the counters are plain counts (Cardholder Data Redaction).
+
+use std::path::Path;
+
+use domain::batch::cobtupdt::{Maintenance, MaintenanceAction, SqlOutcome, decode_input};
+use persistence::{Db2TransactionTypeRepository, PersistenceError, PgTx};
+
+use super::{JobContext, JobError, JobOutcome};
+
+/// The SQLSTATEs standing for Db2 `SQLCODE` -911, after which Db2 has rolled back the unit of
+/// work: `deadlock_detected` and `lock_not_available` (COBTUPDT-024).
+const UNIT_OF_WORK_ROLLED_BACK: [&str; 2] = ["40P01", "55P03"];
+
+/// How one statement ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Statement {
+    /// The `SQLCODE` class the domain's `EVALUATE` tests (COBTUPDT-010 to COBTUPDT-019).
+    outcome: SqlOutcome,
+    /// Whether the failure stands for `SQLCODE` -911, so that the run's transaction must be
+    /// rolled back and replaced (COBTUPDT-024).
+    unit_of_work_rolled_back: bool,
+}
+
+/// What a failed statement means for the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// A negative `SQLCODE`: the statement changed nothing and the run goes on (COBTUPDT-019).
+    Statement,
+    /// `SQLCODE` -911: the statement failed and the whole unit of work is rolled back
+    /// (COBTUPDT-024).
+    UnitOfWork,
+    /// The database cannot be reached: the run cannot go on.
+    Connection,
+}
+
+/// Runs MNTTRDB2 over the records of the file at `input` and reports COBTUPDT's return code
+/// (COBTUPDT-023). It writes no file, so [`JobOutcome::written`] is empty; its counters are
+/// `records`, the records decoded, and `failed`, those that reached `9999-ABEND`
+/// (COBTUPDT-022).
+///
+/// # Errors
+///
+/// - [`JobError::Io`] when the file cannot be read, and [`JobError::Input`] when a line of it is
+///   no COBTUPDT record; the database is not reached (COBTUPDT-004).
+/// - [`JobError::Persistence`] when the run's transaction cannot be opened, a savepoint cannot be
+///   opened, released or rolled back, the connection is lost, or the final commit fails. Nothing
+///   is committed then.
+///
+/// A failed `A`, `U` or `D` statement is no error: it is reported to the domain, which sets
+/// return code 4, and the run goes on (COBTUPDT-022).
+pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
+    let records = decode_input(&super::read_input(input)?)?;
+    let mut maintenance = Maintenance::new();
+    let mut failed = 0_usize;
+    let mut tx = ctx.store.begin().await?;
+    for record in &records {
+        // The job log is discarded here and below: `JobOutcome` carries no job log and a job that
+        // writes no file prints nothing, although `MNTTRDB2.md` sends COBTUPDT's `DISPLAY` lines
+        // to standard output; the domain's tests prove those lines.
+        let (_job_log, action) = maintenance.plan(record);
+        let reached_abend = match execute(&mut tx, &action).await? {
+            Some(statement) => {
+                if statement.unit_of_work_rolled_back {
+                    tx.rollback().await?;
+                    tx = ctx.store.begin().await?;
+                }
+                let _job_log = maintenance.complete(&action, statement.outcome);
+                statement.outcome != SqlOutcome::Ok
+            }
+            // No statement ran: a comment changes nothing, while an invalid action byte has
+            // already reached `9999-ABEND` in the plan (COBTUPDT-008, COBTUPDT-009).
+            None => matches!(action, MaintenanceAction::InvalidType),
+        };
+        if reached_abend {
+            failed += 1;
+        }
+    }
+    tx.commit().await?;
+    Ok(JobOutcome {
+        written: Vec::new(),
+        return_code: maintenance.return_code(),
+        counts: vec![
+            ("records", super::count(records.len())),
+            ("failed", super::count(failed)),
+        ],
+    })
+}
+
+/// Executes the statement `action` names inside a savepoint of `tx`: the insert of
+/// `10031-INSERT-DB`, the update of `10032-UPDATE-DB` or the delete of `10033-DELETE-DB`
+/// (COBTUPDT-010, COBTUPDT-012, COBTUPDT-015). `None` for a comment or an invalid action byte,
+/// which run no statement.
+///
+/// # Errors
+///
+/// [`JobError::Persistence`] when the savepoint cannot be opened, released or rolled back, or the
+/// statement lost the connection (see [`settle`]).
+async fn execute(
+    tx: &mut PgTx<'_>,
+    action: &MaintenanceAction,
+) -> Result<Option<Statement>, JobError> {
+    let (savepoint, result) = match action {
+        MaintenanceAction::Insert(row) => {
+            let mut savepoint = tx.savepoint().await?;
+            let result = Db2TransactionTypeRepository::insert(&mut savepoint, row)
+                .await
+                .map(|()| SqlOutcome::Ok);
+            (savepoint, result)
+        }
+        MaintenanceAction::Update(row) => {
+            let mut savepoint = tx.savepoint().await?;
+            let result = Db2TransactionTypeRepository::update(&mut savepoint, row)
+                .await
+                .map(row_found);
+            (savepoint, result)
+        }
+        MaintenanceAction::Delete(code) => {
+            let mut savepoint = tx.savepoint().await?;
+            let result = Db2TransactionTypeRepository::delete(&mut savepoint, code)
+                .await
+                .map(row_found);
+            (savepoint, result)
+        }
+        MaintenanceAction::Ignore | MaintenanceAction::InvalidType => return Ok(None),
+    };
+    settle(savepoint, result).await.map(Some)
+}
+
+/// The outcome of an update or a delete: `SQLCODE` 0 when it changed a row, `+100` when no row
+/// had the code (COBTUPDT-013, COBTUPDT-016).
+const fn row_found(changed: bool) -> SqlOutcome {
+    if changed {
+        SqlOutcome::Ok
+    } else {
+        SqlOutcome::NotFound
+    }
+}
+
+/// Ends the savepoint a statement ran in and names how the statement ended (COBTUPDT-024).
+///
+/// A statement that completed, whether or not it changed a row, keeps its work in the run's
+/// transaction and its savepoint is released. A failed statement is undone by rolling back to
+/// its savepoint, and is reported as [`SqlOutcome::Failed`], flagged when it stands for
+/// `SQLCODE` -911.
+///
+/// # Errors
+///
+/// [`JobError::Persistence`] when the savepoint cannot be released or rolled back, or when the
+/// statement failed because the database cannot be reached; the run's transaction is then lost.
+async fn settle(
+    savepoint: PgTx<'_>,
+    result: Result<SqlOutcome, PersistenceError>,
+) -> Result<Statement, JobError> {
+    match result {
+        Ok(outcome) => {
+            savepoint.commit().await?;
+            Ok(Statement {
+                outcome,
+                unit_of_work_rolled_back: false,
+            })
+        }
+        Err(error) => {
+            let unit_of_work_rolled_back = match classify(&error) {
+                Failure::Statement => false,
+                Failure::UnitOfWork => true,
+                // Not a failed statement: with the connection gone there is no transaction to go
+                // on with or to commit, so the run ends here with nothing committed, the
+                // replacement's answer to the audit's halt candidate rather than a parity result.
+                Failure::Connection => return Err(JobError::Persistence(error)),
+            };
+            savepoint.rollback().await?;
+            Ok(Statement {
+                outcome: SqlOutcome::Failed,
+                unit_of_work_rolled_back,
+            })
+        }
+    }
+}
+
+/// What the failure of an `A`, `U` or `D` statement stands for, by the `SQLCODE` mapping of
+/// `MNTTRDB2.md`: a duplicate key (`-803`, COBTUPDT-011), a restricted delete (`-532`,
+/// COBTUPDT-017) and every other statement error are a negative `SQLCODE` (COBTUPDT-014,
+/// COBTUPDT-019); a deadlock or lock timeout is `-911` (COBTUPDT-024); a lost connection ends
+/// the run.
+fn classify(error: &PersistenceError) -> Failure {
+    match error {
+        PersistenceError::Unavailable => Failure::Connection,
+        PersistenceError::Database {
+            sqlstate: Some(sqlstate),
+            ..
+        } if UNIT_OF_WORK_ROLLED_BACK.contains(&sqlstate.as_str()) => Failure::UnitOfWork,
+        PersistenceError::NotFound
+        | PersistenceError::Duplicate { .. }
+        | PersistenceError::Restrict { .. }
+        | PersistenceError::Check { .. }
+        | PersistenceError::Database { .. }
+        | PersistenceError::Decode { .. } => Failure::Statement,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use domain::batch::cobtupdt::SqlOutcome;
+    use persistence::{DecodeKind, PersistenceError};
+
+    use super::{Failure, classify, row_found};
+
+    /// A server error with SQLSTATE `code` and no constraint.
+    fn database(code: &str) -> PersistenceError {
+        PersistenceError::Database {
+            sqlstate: Some(code.to_owned()),
+            constraint: None,
+        }
+    }
+
+    /// Every class of repository failure, by the `SQLCODE` it stands for.
+    #[test]
+    fn failures_follow_the_sqlcode_mapping() {
+        let cases = [
+            // audit: COBTUPDT-011
+            (
+                PersistenceError::Duplicate {
+                    constraint: Some("xtran_type".to_owned()),
+                },
+                Failure::Statement,
+            ),
+            // audit: COBTUPDT-017
+            (
+                PersistenceError::Restrict {
+                    constraint: Some("trc_type_code".to_owned()),
+                },
+                Failure::Statement,
+            ),
+            // audit: COBTUPDT-019
+            (database("42P01"), Failure::Statement),
+            (database("40001"), Failure::Statement),
+            (
+                PersistenceError::Database {
+                    sqlstate: None,
+                    constraint: None,
+                },
+                Failure::Statement,
+            ),
+            (
+                PersistenceError::Check { constraint: None },
+                Failure::Statement,
+            ),
+            (PersistenceError::NotFound, Failure::Statement),
+            (
+                PersistenceError::decode("tr_type", DecodeKind::InvalidByte),
+                Failure::Statement,
+            ),
+            // audit: COBTUPDT-024
+            (database("40P01"), Failure::UnitOfWork),
+            (database("55P03"), Failure::UnitOfWork),
+            (PersistenceError::Unavailable, Failure::Connection),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(classify(&error), expected, "{error}");
+        }
+    }
+
+    /// An update or delete that changed a row is `SQLCODE` 0, one that changed none `+100`.
+    #[test]
+    fn changed_rows_decide_the_outcome() {
+        // audit: COBTUPDT-012
+        assert_eq!(row_found(true), SqlOutcome::Ok);
+        // audit: COBTUPDT-013
+        assert_eq!(row_found(false), SqlOutcome::NotFound);
+    }
+}
