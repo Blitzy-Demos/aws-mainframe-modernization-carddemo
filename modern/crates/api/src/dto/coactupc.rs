@@ -99,135 +99,174 @@ const fn withheld<T>(_: &T) -> bool {
 #[serde(default)]
 pub struct AccountUpdateFields {
     /// `ACSTTUS` (1): the active status.
+    #[schema(max_length = 1)]
     #[validate(length(max = 1))]
     pub active_status: String,
     /// `OPNYEAR` (4): the open date's year.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub open_year: String,
     /// `OPNMON` (2): the open date's month.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub open_month: String,
     /// `OPNDAY` (2): the open date's day.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub open_day: String,
     /// `ACRDLIM` (15): the credit limit.
+    #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub credit_limit: String,
     /// `EXPYEAR` (4): the expiry date's year.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub expiry_year: String,
     /// `EXPMON` (2): the expiry date's month.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub expiry_month: String,
     /// `EXPDAY` (2): the expiry date's day.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub expiry_day: String,
     /// `ACSHLIM` (15): the cash credit limit.
+    #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub cash_credit_limit: String,
     /// `RISYEAR` (4): the reissue date's year.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub reissue_year: String,
     /// `RISMON` (2): the reissue date's month.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub reissue_month: String,
     /// `RISDAY` (2): the reissue date's day.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub reissue_day: String,
     /// `ACURBAL` (15): the current balance.
+    #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub current_balance: String,
     /// `ACRCYCR` (15): the current cycle credit.
+    #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub current_cycle_credit: String,
     /// `AADDGRP` (10): the account group.
+    #[schema(max_length = 10)]
     #[validate(length(max = 10))]
     pub group_id: String,
     /// `ACRCYDB` (15): the current cycle debit.
+    #[schema(max_length = 15)]
     #[validate(length(max = 15))]
     pub current_cycle_debit: String,
     /// `ACSTNUM` (9): the customer ID, read-only once details are shown.
+    #[schema(max_length = 9)]
     #[validate(length(max = 9))]
     pub customer_id: String,
     /// `ACTSSN1` (3): the first three SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
-    #[schema(write_only, example = "***")]
+    #[schema(write_only, max_length = 3, example = "***")]
     #[validate(length(max = 3))]
     pub ssn_part1: Option<String>,
     /// `ACTSSN2` (2): the fourth and fifth SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
-    #[schema(write_only, example = "**")]
+    #[schema(write_only, max_length = 2, example = "**")]
     #[validate(length(max = 2))]
     pub ssn_part2: Option<String>,
     /// `ACTSSN3` (4): the last four SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
-    #[schema(write_only, example = "****")]
+    #[schema(write_only, max_length = 4, example = "****")]
     #[validate(length(max = 4))]
     pub ssn_part3: Option<String>,
     /// `DOBYEAR` (4): the date of birth's year.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub dob_year: String,
     /// `DOBMON` (2): the date of birth's month.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub dob_month: String,
     /// `DOBDAY` (2): the date of birth's day.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub dob_day: String,
     /// `ACSTFCO` (3): the FICO score.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub fico_score: String,
     /// `ACSFNAM` (25): the first name.
+    #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub first_name: String,
     /// `ACSMNAM` (25): the middle name.
+    #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub middle_name: String,
     /// `ACSLNAM` (25): the last name.
+    #[schema(max_length = 25)]
     #[validate(length(max = 25))]
     pub last_name: String,
     /// `ACSADL1` (50): address line 1.
+    #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub address_line_1: String,
     /// `ACSSTTE` (2): the state code.
+    #[schema(max_length = 2)]
     #[validate(length(max = 2))]
     pub state: String,
     /// `ACSADL2` (50): address line 2.
+    #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub address_line_2: String,
     /// `ACSZIPC` (5): the ZIP code.
+    #[schema(max_length = 5)]
     #[validate(length(max = 5))]
     pub zip: String,
     /// `ACSCITY` (50): address line 3, the city.
+    #[schema(max_length = 50)]
     #[validate(length(max = 50))]
     pub city: String,
     /// `ACSCTRY` (3): the country code, read-only once details are shown.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub country: String,
     /// `ACSPH1A` (3): phone number 1's area code.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub phone_1_area: String,
     /// `ACSPH1B` (3): phone number 1's prefix.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub phone_1_prefix: String,
     /// `ACSPH1C` (4): phone number 1's line number.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub phone_1_line: String,
     /// `ACSGOVT` (20): the government-issued ID.
+    #[schema(max_length = 20)]
     #[validate(length(max = 20))]
     pub government_id: String,
     /// `ACSPH2A` (3): phone number 2's area code.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub phone_2_area: String,
     /// `ACSPH2B` (3): phone number 2's prefix.
+    #[schema(max_length = 3)]
     #[validate(length(max = 3))]
     pub phone_2_prefix: String,
     /// `ACSPH2C` (4): phone number 2's line number.
+    #[schema(max_length = 4)]
     #[validate(length(max = 4))]
     pub phone_2_line: String,
     /// `ACSEFTC` (10): the EFT account ID.
+    #[schema(max_length = 10)]
     #[validate(length(max = 10))]
     pub eft_account_id: String,
     /// `ACSPFLG` (1): the primary card holder indicator.
+    #[schema(max_length = 1)]
     #[validate(length(max = 1))]
     pub primary_card_holder: String,
 }

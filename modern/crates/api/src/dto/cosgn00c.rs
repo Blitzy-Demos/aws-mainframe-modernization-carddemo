@@ -41,7 +41,7 @@ pub struct SignonRequest {
     /// `USERIDI PIC X(8)`: the user ID as typed, at most 8 characters. Upper-cased by the
     /// program before the read, so `user0001` signs on as `USER0001` (COSGN00C-009).
     #[serde(default)]
-    #[schema(example = "ADMIN001")]
+    #[schema(max_length = 8, example = "ADMIN001")]
     #[validate(length(max = 8))]
     pub user_id: String,
     /// `PASSWDI PIC X(8)`, a dark field: the password as typed, at most 8 characters. Accepted,
@@ -51,7 +51,7 @@ pub struct SignonRequest {
     // generated `SignonRequest` without a password. The predicate keeps the field documented as
     // `writeOnly` while no serialisation ever emits it.
     #[serde(default, skip_serializing_if = "never_serialized")]
-    #[schema(write_only, example = "********")]
+    #[schema(write_only, max_length = 8, example = "********")]
     #[validate(length(max = 8))]
     pub password: String,
 }

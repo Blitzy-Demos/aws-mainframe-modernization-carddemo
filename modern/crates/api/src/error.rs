@@ -72,7 +72,7 @@ const PAGE_SIZE_FIELD: &str = "page_size";
 #[schema(example = json!({"message": "Please enter User ID ...", "field": "user_id"}))]
 pub struct ScreenError {
     /// The message row, exactly as the program words it; it never holds a full card number,
-    /// SSN, CVV or password.
+    /// SSN, card verification code or password.
     message: String,
     /// The request field the message names and the screen puts the cursor on, as its wire
     /// name, such as `user_id` or `rows[3].description`.

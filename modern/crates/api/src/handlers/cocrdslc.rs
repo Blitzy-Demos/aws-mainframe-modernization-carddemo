@@ -37,7 +37,7 @@ use crate::services;
 /// ENTER on the card detail screen: the card is looked up by the account and either the typed
 /// `card_num` or the `card_ref` handle of a card list row, never both. The card number is
 /// returned in full only to an administrator token; any other token receives twelve asterisks
-/// followed by the last four digits. The response carries no CVV.
+/// followed by the last four digits. The response carries no card verification code.
 ///
 /// # Errors
 ///

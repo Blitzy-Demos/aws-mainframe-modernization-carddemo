@@ -43,19 +43,19 @@ pub struct AuthSummaryQuery {
     /// F8: the `last_key` of the page shown; F7: the `first_key` the screen saved for the page
     /// before it. The 16 digits of an authorization key exactly as a response renders them; any
     /// other text is rejected with 400 on field `page_key`.
+    // No example: every valid key is a run of sixteen digits, which a card-number scan of the
+    // emitted contract cannot tell from a card number (Cardholder Data Redaction).
     #[validate(custom(function = "valid_page_key"))]
     #[schema(
         min_length = 16,
         max_length = 16,
         pattern = "^[01][0-9]{5}[01][0-9]{9}$"
     )]
-    #[schema(example = "0759680869490879")]
     #[param(
         min_length = 16,
         max_length = 16,
         pattern = "^[01][0-9]{5}[01][0-9]{9}$"
     )]
-    #[param(example = "0759680869490879")]
     pub page_key: Option<String>,
     /// `forward` (F8) pages after `page_key`, `backward` (F7) from it; absent with a `page_key`
     /// pages forward, and without one the first page is shown whatever the direction.
@@ -191,10 +191,11 @@ impl From<rules::SummaryBlock> for AuthSummaryBlock {
 /// from `PA-AUTH-ORIG-DATE` and `PA-AUTH-ORIG-TIME`, `PIC X(06)` fields outside the `X(10)` dates
 /// and `X(26)` timestamps that Typed Dates and Timestamps covers, copied with no calendar check,
 /// so a stored `241399` shows `13/99/24`, which no date type holds (COPAUS0C-034).
-// The schema name `AuthSummaryRow` is fixed (Generated API Types Only).
+// The schema name `AuthSummaryRow` is fixed (Generated API Types Only). The example leaves out
+// `auth_key`: a key is sixteen digits, which a card-number scan of the emitted contract cannot
+// tell from a card number (Cardholder Data Redaction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
-    "auth_key": "0759680869490879",
     "transaction_id": "TX0000000000001 ",
     "date": "01/31/24",
     "time": "13:05:09",

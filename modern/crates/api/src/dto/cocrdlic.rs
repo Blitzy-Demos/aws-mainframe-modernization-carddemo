@@ -66,16 +66,16 @@ pub struct CardListQuery {
     // Raw text: `2210-EDIT-ACCOUNT` owns the numeric edit and its message, so typing the member
     // as an integer would replace that message with a deserialisation error.
     #[validate(length(max = 11))]
-    #[schema(example = "00000000050")]
-    #[param(example = "00000000050")]
+    #[schema(max_length = 11, example = "00000000050")]
+    #[param(max_length = 11, example = "00000000050")]
     pub acct_id: Option<String>,
 
     /// `CARDSID`, the card filter, as typed (map `LENGTH` 16). Blank, or sixteen `0` digits, is
     /// no filter (COCRDLIC-007); sixteen digits list only that card (COCRDLIC-010); anything else
     /// is 400 with field `card_num` (COCRDLIC-008). Input only: never sent back.
     #[validate(length(max = 16))]
-    #[schema(write_only, example = "************5740")]
-    #[param(example = "************5740")]
+    #[schema(write_only, max_length = 16, example = "************5740")]
+    #[param(write_only, max_length = 16, example = "************5740")]
     pub card_num: Option<String>,
 
     /// The key pressed: `forward` for F8, `backward` for F7, absent for ENTER or any key the
@@ -205,7 +205,7 @@ impl From<&CardListQuery> for rules::ListState {
 /// One listed card (COCRDLIC-032): row `n` of the map, `ACCTNOn`, `CRDNUMn` and `CRDSTSn`
 /// (`COCRDLI-030` to `COCRDLI-032` for row 1), with the card's handle.
 ///
-/// No CVV, embossed name or expiry date is listed.
+/// No card verification code, embossed name or expiry date is listed.
 // No `Deserialize`: `card_num` is a `CardNumber`, which serialises only its redacted form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct CardListRow {

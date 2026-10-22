@@ -73,10 +73,10 @@ impl From<TranListEntryKey> for rules::EntryKey {
     Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoParams, Validate,
 )]
 #[into_params(parameter_in = Query)]
+// The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
+// scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
 #[schema(example = json!({
     "direction": "forward",
-    "first_key": "0000000000000001",
-    "last_key": "0000000000000010",
     "page_no": 1,
     "has_next_page": true
 }))]
@@ -183,8 +183,9 @@ fn key_field(key: &str) -> PicX<16> {
 /// COTRN00C-034).
 // The schema name `TranListRow` is fixed (Generated API Types Only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+// The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
+// scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
 #[schema(example = json!({
-    "tran_id": "0000000000000001",
     "orig_ts": "2022-07-18T13:05:09.120",
     "display_date": "07/18/22",
     "description": "Purchase at Example Store ",
@@ -227,10 +228,11 @@ impl From<rules::TranListRow> for TranListRow {
 /// and the message the program moved last (COTRN00C-035).
 // The schema name `TranListResponse` is fixed (Generated API Types Only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+// The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
+// scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
 #[schema(example = json!({
     "rows": [
         {
-            "tran_id": "0000000000000001",
             "orig_ts": "2022-07-18T13:05:09.120",
             "display_date": "07/18/22",
             "description": "Purchase at Example Store ",
@@ -239,8 +241,6 @@ impl From<rules::TranListRow> for TranListRow {
         null
     ],
     "rows_kept": false,
-    "first_key": "0000000000000001",
-    "last_key": null,
     "page_no": 1,
     "has_next_page": false,
     "message": "You have reached the bottom of the page..."

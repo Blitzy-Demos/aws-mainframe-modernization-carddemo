@@ -28,7 +28,7 @@
 //! # Errors
 //!
 //! An edit or store failure is a [`MaintFailure`](rules::MaintFailure), which the service returns
-//! as its error and `api::error` turns into a [`ScreenError`](crate::error::ScreenError) with the
+//! as its error and `api::error` turns into a [`ScreenError`] with the
 //! audited status: 400 for the edits and an unserved key, 500 for every store failure, the
 //! delete refused while categories exist (COTRTUPC-033) and the lock error (COTRTUPC-029)
 //! included. No outcome is a 404 or a 409: a type no row holds is a 200 offering the add path

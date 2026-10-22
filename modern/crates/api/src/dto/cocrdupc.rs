@@ -202,9 +202,9 @@ impl CardUpdateFields {
 /// It holds the account as entered, the name upper-cased, the typed expiry date with its day and
 /// the status; the name and status keep every byte of their fields, trailing spaces included
 /// (COCRDUPC-017). It holds no card number, because the card is the path's `card_ref`, and no
-/// CVV, which cannot leave the service (module docs). A value the client alters equals no stored
-/// value, so it reads as a change and, at a save, as a card changed by another user: the
-/// snapshot grants nothing (`X-COCRDUPC-1`).
+/// card verification code, which cannot leave the service (module docs). A value the client
+/// alters equals no stored value, so it reads as a change and, at a save, as a card changed by
+/// another user: the snapshot grants nothing (`X-COCRDUPC-1`).
 // `state` travels with the fetched values because the domain decides what a key does from the
 // echoed state (`rules::CardSnapshotFields::state`), and a typed member refuses a code the
 // program never sets before the domain is reached.
@@ -266,8 +266,9 @@ impl From<&CardUpdateSnapshot> for rules::CardSnapshot {
 /// The 200 body of endpoint 9: the card as `3200-SETUP-SCREEN-VARS` shows it in state `S`, with
 /// the snapshot the client echoes (COCRDUPC-002, COCRDUPC-016, COCRDUPC-017, COCRDUPC-044).
 ///
-/// The card number is redacted and the CVV absent (COCRDUPC-042, `E32`). The screen shows the
-/// month and year of `expiration_date` in `EXPMON` and `EXPYEAR` and keeps the day out of sight.
+/// The card number is redacted and the card verification code absent (COCRDUPC-042, `E32`).
+/// The screen shows the month and year of `expiration_date` in `EXPMON` and `EXPYEAR` and keeps
+/// the day out of sight.
 // No `Deserialize`: `CardNumber` serialises redacted only and cannot be read back. The schema
 // name `CardUpdateView` is fixed (Generated API Types Only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]

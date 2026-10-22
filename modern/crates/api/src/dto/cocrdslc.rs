@@ -145,7 +145,8 @@ impl From<rules::CardNumberDisclosure> for CardViewNumber {
 /// The 200 body of endpoint 8: the found card as `1200-SETUP-SCREEN-VARS` shows it
 /// (COCRDSLC-018 to COCRDSLC-023).
 ///
-/// It holds no CVV: the program moves `CARD-CVV-CD` to no screen field (COCRDSLC-021).
+/// It holds no card verification code: the program moves the verification-code field of
+/// `CVACT02Y` to no screen field (COCRDSLC-021).
 // The schema name `CardViewResponse` is fixed (Generated API Types Only); `api::openapi::ApiDoc`
 // registers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]

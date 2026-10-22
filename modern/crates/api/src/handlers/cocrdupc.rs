@@ -100,7 +100,7 @@ pub(crate) async fn fetch(
 /// `changes_ok_not_confirmed` runs the change check and the edits again and rewrites the card
 /// the `card_ref` path segment names; PF5 in any other state is processed as ENTER. After a
 /// save, a lock failure or a rewrite failure, the next request restarts the search. The stored
-/// card number and CVV are never taken from the request.
+/// card number and verification code are never taken from the request.
 ///
 /// # Errors
 ///
@@ -113,8 +113,10 @@ pub(crate) async fn fetch(
     path = "/api/v1/cards/{card_ref}",
     operation_id = "cocrdupc_save",
     tag = "COCRDUPC",
+    // Documented as the integer handle the fetch and list responses carry, so a client passes it
+    // back unchanged; the handler still extracts the raw segment for the service to resolve.
     params(
-        ("card_ref" = String, Path, description = "Card handle from the fetch or list response")
+        ("card_ref" = i64, Path, description = "Card handle from the fetch or list response")
     ),
     request_body = CardUpdateRequest,
     // No 404: a save reads the card only for update, and a `card_ref` that names no card is
