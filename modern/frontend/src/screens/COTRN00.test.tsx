@@ -1,15 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { setSession } from "@/auth/session";
-import { INVALID_KEY, TITLE01, TITLE02 } from "@/lib/header";
 import { PATHS } from "@/routes";
 import { COTRN00 } from "./COTRN00";
-// The shared render-test contract imports only the screen under test; COTRN00C-002's round trip
-// is proved through the real COTRN01, whose hand-back of the paging state is half of the rule.
-import { COTRN01 } from "./COTRN01";
 
 /**
  * Render test of map `COTRN0A` (transaction CT00, program COTRN00C) at `/transactions`, run in
@@ -23,6 +19,18 @@ import { COTRN01 } from "./COTRN01";
 
 const TOKEN = "test-token";
 const LIST_PATH = "/api/v1/transactions";
+
+/*
+ * The header titles and the invalid-key message, restated from their copybooks so the screen is
+ * checked against the oracle rather than against the module that renders them: the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types.
+ */
+/** `CCDA-TITLE01 PIC X(40)` (`app/cpy/COTTL01Y.cpy:18-19`), padding included. */
+const TITLE01 = "      AWS Mainframe Modernization       ";
+/** `CCDA-TITLE02 PIC X(40)` (`app/cpy/COTTL01Y.cpy:20-22`), padding included. */
+const TITLE02 = "              CardDemo                  ";
+/** `CCDA-MSG-INVALID-KEY PIC X(50)` (`app/cpy/CSMSG01Y.cpy:20-21`), padded to its 50 bytes. */
+const INVALID_KEY = "Invalid key pressed. Please see below...".padEnd(50, " ");
 
 /** The program's messages, as `modern/audit/online/COTRN00C.md` words them. */
 const INVALID_SELECTION = "Invalid selection. Valid value is S";
@@ -134,27 +142,6 @@ const NOT_NUMERIC_ERROR: components["schemas"]["ScreenError"] = {
 /** The 500 of a page read that failed (COTRN00C-027). */
 const LOOKUP_ERROR: components["schemas"]["ScreenError"] = { message: LOOKUP_FAILED };
 
-/**
- * Endpoint 12's view of transaction 3, which COTRN01 reads on a selection of row 3 of
- * {@link FIRST_PAGE}; its card number is redacted, as the endpoint returns it.
- */
-const VIEWED: components["schemas"]["TranViewResponse"] = {
-  tran_id: tranId(3),
-  card_num: "************5740",
-  type_cd: "01",
-  cat_cd: "0001",
-  source: "POS TERM  ",
-  description: "Purchase 3".padEnd(60, " "),
-  amount: AMOUNTS[2],
-  orig_ts: "2022-06-10T00:00:00",
-  proc_ts: null,
-  merchant_id: "800000000",
-  merchant_name: "Abshire-Lowe".padEnd(30, " "),
-  merchant_city: "North Enoshaven".padEnd(25, " "),
-  merchant_zip: "72112     ",
-  message: null,
-};
-
 /** A reply with a JSON body, as the API sends every page and every `ScreenError`. */
 function json(status: number, body: unknown): () => Response {
   return () =>
@@ -165,11 +152,9 @@ function json(status: number, body: unknown): () => Response {
 }
 
 /**
- * Replaces the global `fetch`. Each `GET /api/v1/transactions` (endpoint 11), and each
- * `GET /api/v1/transactions/{tran_id}` (endpoint 12, which only COTRN01 sends, in the round trip
- * of COTRN00C-002), takes the next of `replies`; any other request, and any past the last reply,
- * is answered 500. Returns every request's method, path, full URL, query parameters and
- * `Authorization` header, in order.
+ * Replaces the global `fetch`. Each `GET /api/v1/transactions` (endpoint 11) takes the next of
+ * `replies`; any other request, and any past the last reply, is answered 500. Returns every
+ * request's method, path, full URL, query parameters and `Authorization` header, in order.
  */
 function stubFetch(...replies: (() => Response)[]) {
   const sent: {
@@ -193,10 +178,7 @@ function stubFetch(...replies: (() => Response)[]) {
         authorization: req.headers.get("Authorization"),
       });
       const reply =
-        req.method === "GET" &&
-        (url.pathname === LIST_PATH || url.pathname.startsWith(`${LIST_PATH}/`))
-          ? pending.shift()
-          : undefined;
+        req.method === "GET" && url.pathname === LIST_PATH ? pending.shift() : undefined;
       if (reply !== undefined) {
         return reply();
       }
@@ -216,6 +198,34 @@ function TransferStub({ name }: { name: string }) {
     <section aria-label={name}>
       <h1>{name}</h1>
       <output>{JSON.stringify(location.state ?? null)}</output>
+    </section>
+  );
+}
+
+/**
+ * Stands in for COTRN01 at `/transactions/view`: its F3 and F5 return to the list with the route
+ * state COTRN01C's `XCTL` back carries, the list's paging state passed back unchanged
+ * (COTRN00C-002). That COTRN01 returns exactly this state is proved by `COTRN01.test.tsx`; this
+ * file proves the list's half: the state it hands out and the state it reads back.
+ */
+function ViewHandBackStub() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  const state: unknown = location.state;
+  const list =
+    typeof state === "object" && state !== null && "list" in state ? state.list : undefined;
+  const back = (entryKey: components["schemas"]["TranListEntryKey"]) => {
+    navigate(PATHS.COTRN00, { state: { from: PATHS.COTRN01, entry_key: entryKey, list } });
+  };
+  return (
+    <section aria-label="View Transaction">
+      <h1>View Transaction</h1>
+      <button type="button" onClick={() => back("pf3")}>
+        F3=Back
+      </button>
+      <button type="button" onClick={() => back("pf5")}>
+        F5=Browse Tran.
+      </button>
     </section>
   );
 }
@@ -508,6 +518,34 @@ describe("COTRN00 List Transactions", () => {
     expect(valueOf(searchField())).toBe("");
     expect(document.activeElement).toBe(searchField());
     expect(errorRow().textContent).toBe("");
+  });
+
+  it("leaves no element at the zero-length stoppers after the search field and each selector", async () => {
+    // audit: COTRN00-016
+    // audit: COTRN00-028
+    // audit: COTRN00-034
+    // audit: COTRN00-040
+    // audit: COTRN00-046
+    // audit: COTRN00-052
+    // audit: COTRN00-058
+    // audit: COTRN00-064
+    // audit: COTRN00-070
+    // audit: COTRN00-076
+    // audit: COTRN00-082
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await answered(sent, 1);
+
+    // POS=(6,38) ends the search field: the grid has no cell there.
+    expect(document.querySelector(".row-start-6.col-start-38")).toBeNull();
+    // POS=(10..19,5) end the selectors: no grid cell sits there, and each list line holds only
+    // the selector's cell and the four value cells, the selector alone in its cell.
+    listLines().forEach((line, index) => {
+      expect(document.querySelector(`.row-start-${index + 10}.col-start-5`)).toBeNull();
+      const cells = within(line).getAllByRole("cell");
+      expect(cells).toHaveLength(5);
+      expect(within(cells[0]).getByRole("textbox")).toBe(selector(index + 1));
+    });
   });
 
   it.each(Array.from({ length: 10 }, (_, index) => index + 1))(
@@ -929,8 +967,8 @@ describe("COTRN00 List Transactions", () => {
     },
   );
 
-  // How each route state is read on entry. COTRN00C-002 is tagged on the round trip below, which
-  // runs the real COTRN01, so the `list` it reads here is the one COTRN01 handed back.
+  // How each route state is read on entry. COTRN00C-002 is tagged on the round trip below, whose
+  // `list` comes back through the view's hand-back rather than being written by the test.
   it.each([
     {
       entry: "no route state",
@@ -1005,33 +1043,26 @@ describe("COTRN00 List Transactions", () => {
     { key: "F3=Back", entryKey: "pf3" },
     { key: "F5=Browse Tran.", entryKey: "pf5" },
   ])(
-    "keeps its paging state across the round trip to /transactions/view and back by COTRN01's $key",
+    "keeps its paging state across the round trip to /transactions/view and back by the view's $key",
     async ({ key, entryKey }) => {
       // audit: COTRN00C-002
-      const sent = stubFetch(json(200, FIRST_PAGE), json(200, VIEWED), json(200, SECOND_PAGE));
-      renderList(undefined, <COTRN01 />);
+      const sent = stubFetch(json(200, FIRST_PAGE), json(200, SECOND_PAGE));
+      renderList(undefined, <ViewHandBackStub />);
       await answered(sent, 1);
 
       // Page 1 leaves keys 1 and 10, page 1 and the next-page flag Y: each differs from the
       // blank state a menu entry starts from.
       typeInto(selector(3), "S");
       press("ENTER=Continue");
-      // COTRN01 reads the selected transaction on entry.
-      await waitFor(() => {
-        expect(valueOf(screen.getByLabelText("Transaction ID:"))).toBe(tranId(3));
-      });
-      await answered(sent, 2);
+      await screen.findByRole("region", { name: "View Transaction" });
+      expect(sent).toHaveLength(1);
 
       press(key);
 
-      await answered(sent, 3);
-      expect(sent.map(({ path }) => path)).toEqual([
-        LIST_PATH,
-        `${LIST_PATH}/${tranId(3)}`,
-        LIST_PATH,
-      ]);
+      await answered(sent, 2);
+      expect(sent.map(({ path }) => path)).toEqual([LIST_PATH, LIST_PATH]);
       // Back on the list, the entry request echoes the state the list held when it left.
-      expect(sent[2].query).toEqual({
+      expect(sent[1].query).toEqual({
         entry_key: entryKey,
         first_key: tranId(1),
         last_key: tranId(10),

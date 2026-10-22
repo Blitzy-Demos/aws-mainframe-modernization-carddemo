@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { setSession } from "@/auth/session";
-import { PATHS, PROGRAM_ROUTES } from "@/routes";
+import { PATHS, PROGRAM_ROUTES, routes } from "@/routes";
 import { COADM01 } from "./COADM01";
 
 /**
@@ -16,6 +24,12 @@ import { COADM01 } from "./COADM01";
  *
  * ENTER and every key are served from the response the screen already holds, so each test also
  * counts the requests: one per entry to `/admin`.
+ *
+ * Rows `COADM01-001` to `COADM01-010` place the header labels in a `Label` and the header values in
+ * a read-only `Input`; the shared `ScreenShell` renders both as plain text, so those rows are not
+ * tagged here. Their content rows (`COADM01-029` to `COADM01-034`) are. `COADM01C-002` is blocked
+ * by halt candidate `X-COADM01C-H1`: its group is reported BLOCKED and asserts only the
+ * replacement's path the row states, never a COBOL result.
  */
 
 const MENU_PATH = "/api/v1/menus/admin";
@@ -658,5 +672,41 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     enter("5");
     expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
     await expectMenuRequests(2);
+  });
+});
+
+// CA00 entered without a COMMAREA transfers to whatever the uninitialised `CDEMO-TO-PROGRAM`
+// holds, so the COBOL target has no single value. The row's replacement counterpart is the route
+// guard in front of `/admin`, which only the application's route table mounts, so this group
+// renders that table rather than the screen alone.
+describe("BLOCKED X-COADM01C-H1: /admin opened with no session, not a parity result", () => {
+  beforeEach(() => {
+    requests = [];
+    sessionStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  // audit: COADM01C-002
+  it("the route guard sends /admin to /signon before the menu requests endpoint 3", async () => {
+    stubMenu(200, served);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COADM01] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
+    expect(requests).toHaveLength(0);
+    router.dispose();
   });
 });

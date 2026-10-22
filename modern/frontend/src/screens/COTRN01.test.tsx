@@ -84,23 +84,65 @@ const lookupFailed: components["schemas"]["ScreenError"] = {
 };
 
 /**
- * The 13 detail fields of the map, in map order: each label's `INITIAL`, the BMS field it labels
- * and the field's `LENGTH` (`COTRN01-016` to `COTRN01-053`).
+ * The 13 detail fields of the map, in map order: each label's `INITIAL`, the BMS field it labels,
+ * the field's `LENGTH`, and the `POS` of both, which share a map row (`COTRN01-016` to
+ * `COTRN01-053`). Each label's `LENGTH` is the length of its `INITIAL`.
  */
 const OUTPUTS = [
-  { label: "Transaction ID:", field: "TRNID", length: 16 },
-  { label: "Card Number:", field: "CARDNUM", length: 16 },
-  { label: "Type CD:", field: "TTYPCD", length: 2 },
-  { label: "Category CD:", field: "TCATCD", length: 4 },
-  { label: "Source:", field: "TRNSRC", length: 10 },
-  { label: "Description:", field: "TDESC", length: 60 },
-  { label: "Amount:", field: "TRNAMT", length: 12 },
-  { label: "Orig Date:", field: "TORIGDT", length: 10 },
-  { label: "Proc Date:", field: "TPROCDT", length: 10 },
-  { label: "Merchant ID:", field: "MID", length: 9 },
-  { label: "Merchant Name:", field: "MNAME", length: 30 },
-  { label: "Merchant City:", field: "MCITY", length: 25 },
-  { label: "Merchant Zip:", field: "MZIP", length: 10 },
+  { label: "Transaction ID:", field: "TRNID", length: 16, row: 10, labelCol: 6, col: 22 },
+  { label: "Card Number:", field: "CARDNUM", length: 16, row: 10, labelCol: 45, col: 58 },
+  { label: "Type CD:", field: "TTYPCD", length: 2, row: 12, labelCol: 6, col: 15 },
+  { label: "Category CD:", field: "TCATCD", length: 4, row: 12, labelCol: 23, col: 36 },
+  { label: "Source:", field: "TRNSRC", length: 10, row: 12, labelCol: 46, col: 54 },
+  { label: "Description:", field: "TDESC", length: 60, row: 14, labelCol: 6, col: 19 },
+  { label: "Amount:", field: "TRNAMT", length: 12, row: 16, labelCol: 6, col: 14 },
+  { label: "Orig Date:", field: "TORIGDT", length: 10, row: 16, labelCol: 31, col: 42 },
+  { label: "Proc Date:", field: "TPROCDT", length: 10, row: 16, labelCol: 57, col: 68 },
+  { label: "Merchant ID:", field: "MID", length: 9, row: 18, labelCol: 6, col: 19 },
+  { label: "Merchant Name:", field: "MNAME", length: 30, row: 18, labelCol: 33, col: 48 },
+  { label: "Merchant City:", field: "MCITY", length: 25, row: 20, labelCol: 6, col: 21 },
+  { label: "Merchant Zip:", field: "MZIP", length: 10, row: 20, labelCol: 53, col: 67 },
+];
+
+/**
+ * Every cell of the body grid, at its map `POS` and `LENGTH`: the Tran ID label and input
+ * (`COTRN01-012`, `COTRN01-013`), the separator (`COTRN01-015`) and each detail label and field.
+ * Sorted by row, then column, as {@link bodyCells} returns them.
+ */
+const BODY_CELLS = [
+  { row: 6, col: 6, span: 14, content: "text Enter Tran ID:" },
+  { row: 6, col: 21, span: 16, content: "field TRNIDIN" },
+  { row: 8, col: 6, span: 70, content: `text ${"-".repeat(70)}` },
+  ...OUTPUTS.flatMap((output) => [
+    {
+      row: output.row,
+      col: output.labelCol,
+      span: output.label.length,
+      content: `text ${output.label}`,
+    },
+    { row: output.row, col: output.col, span: output.length, content: `field ${output.field}` },
+  ]),
+].sort((a, b) => a.row - b.row || a.col - b.col);
+
+/**
+ * The map's zero-length stoppers (`LENGTH=0`), each ending the field before it on its row, by
+ * their `POS` (`COTRN01-014` to `COTRN01-054`).
+ */
+const STOPPERS = [
+  { id: "COTRN01-014", row: 6, col: 38 },
+  { id: "COTRN01-018", row: 10, col: 39 },
+  { id: "COTRN01-021", row: 10, col: 75 },
+  { id: "COTRN01-024", row: 12, col: 18 },
+  { id: "COTRN01-027", row: 12, col: 41 },
+  { id: "COTRN01-030", row: 12, col: 65 },
+  { id: "COTRN01-033", row: 14, col: 80 },
+  { id: "COTRN01-036", row: 16, col: 27 },
+  { id: "COTRN01-039", row: 16, col: 53 },
+  { id: "COTRN01-042", row: 16, col: 79 },
+  { id: "COTRN01-045", row: 18, col: 29 },
+  { id: "COTRN01-048", row: 18, col: 79 },
+  { id: "COTRN01-051", row: 20, col: 47 },
+  { id: "COTRN01-054", row: 20, col: 78 },
 ];
 
 /** Every detail field blank: before a read, while it runs and after a failure. */
@@ -279,6 +321,35 @@ function headerField(container: HTMLElement, name: string): string | null {
   return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
 }
 
+/**
+ * Every `GridCell` of the body grid (the `FieldGrid` inside the form), as its map row, `POS`
+ * column and the columns it spans, read from its placement classes, and its content: the
+ * `data-field` it shows, or else its text. Sorted by row, then column.
+ */
+function bodyCells(container: HTMLElement) {
+  const grid = container.querySelector("form")?.firstElementChild;
+  if (grid === null || grid === undefined) {
+    throw new Error("no body grid");
+  }
+  return Array.from(grid.querySelectorAll('[class^="row-start-"]'), (cell) => {
+    const place = /^row-start-(\d+) col-start-(\d+) col-span-(\d+)$/.exec(cell.className);
+    if (place === null) {
+      throw new Error(`a cell placed as "${cell.className}"`);
+    }
+    const [, row, col, span] = place;
+    const named = cell.querySelector("[data-field]");
+    return {
+      row: Number.parseInt(row, 10),
+      col: Number.parseInt(col, 10),
+      span: Number.parseInt(span, 10),
+      content:
+        named instanceof HTMLElement
+          ? `field ${named.dataset.field ?? ""}`
+          : `text ${cell.textContent ?? ""}`,
+    };
+  }).sort((a, b) => a.row - b.row || a.col - b.col);
+}
+
 /** The row-24 button labelled `label`, checked to be a plain `outline`, `sm` button. */
 function pfKeyButton(label: string): HTMLElement {
   const button = screen.getByRole("button", { name: label });
@@ -391,6 +462,41 @@ describe("COTRN01 transaction view screen", () => {
     // The map declares no INFOMSG row, only ERRMSG.
     expect(messageRows("info")).toHaveLength(0);
     expect(messageRows("error")).toHaveLength(1);
+  });
+
+  // audit: COTRN01-014
+  // audit: COTRN01-018
+  // audit: COTRN01-021
+  // audit: COTRN01-024
+  // audit: COTRN01-027
+  // audit: COTRN01-030
+  // audit: COTRN01-033
+  // audit: COTRN01-036
+  // audit: COTRN01-039
+  // audit: COTRN01-042
+  // audit: COTRN01-045
+  // audit: COTRN01-048
+  // audit: COTRN01-051
+  // audit: COTRN01-054
+  it("places each literal and field at its map POS and LENGTH, and nothing at the stoppers", () => {
+    stubApi();
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+
+    const cells = bodyCells(container);
+    expect(cells).toEqual(BODY_CELLS);
+
+    // A stopper has no element, and no cell reaches into its attribute column.
+    for (const stopper of STOPPERS) {
+      expect({
+        id: stopper.id,
+        covering: cells.filter(
+          (cell) =>
+            cell.row === stopper.row &&
+            cell.col <= stopper.col &&
+            stopper.col < cell.col + cell.span,
+        ),
+      }).toEqual({ id: stopper.id, covering: [] });
+    }
   });
 
   // audit: COTRN01C-029

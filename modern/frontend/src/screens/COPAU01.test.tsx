@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import type { components } from "@/api/schema";
@@ -15,6 +15,14 @@ import { COPAU01 } from "./COPAU01";
  * results of `modern/audit/screens.md` (`COPAU01-nnn`) and `modern/audit/online/COPAUS1C.md`
  * (`COPAUS1C-nnn`). Every card number below is redacted, and no password appears.
  */
+
+/*
+ * A flow waits on up to five stubbed round-trips in jsdom. Alone a test takes under 2 s, but under
+ * coverage on a host shared with other suites one took 2.8 s, its waits close to Testing
+ * Library's 1 s default. The file raises its wait limit to 10 s (the `dom` project of
+ * `vite.config.ts` allows 30 s per test); a passing test runs no longer for it.
+ */
+configure({ asyncUtilTimeout: 10_000 });
 
 /** The account a COPAU00 `S` selection hands over, `CDEMO-ACCT-ID PIC 9(11)`. */
 const ACCT_ID = "00000000050";
@@ -436,6 +444,51 @@ function headerField(container: HTMLElement, name: string): string | null {
   return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
 }
 
+/**
+ * The label literals of header rows 1 and 2 (`COPAU01-001`, `COPAU01-004`, `COPAU01-006`,
+ * `COPAU01-009`): each `INITIAL` with the grid cell of its `POS` and `LENGTH`, and the value
+ * field it labels with that field's cell.
+ *
+ * The six value rows of those lines (`COPAU01-002`, `-003`, `-005`, `-007`, `-008`, `-010`) are
+ * not tagged: they describe read-only `Input` elements, while `ScreenShell` renders the header
+ * values as plain text. Their content rows, `COPAU01-055` to `COPAU01-060`, are proved instead.
+ */
+const HEADER_LABELS = [
+  {
+    label: "Tran:",
+    labelCell: "row-start-1 col-start-1 col-span-5",
+    name: "TRNNAME",
+    fieldCell: "row-start-1 col-start-7 col-span-4",
+  },
+  {
+    label: "Date:",
+    labelCell: "row-start-1 col-start-65 col-span-5",
+    name: "CURDATE",
+    fieldCell: "row-start-1 col-start-71 col-span-8",
+  },
+  {
+    label: "Prog:",
+    labelCell: "row-start-2 col-start-1 col-span-5",
+    name: "PGMNAME",
+    fieldCell: "row-start-2 col-start-7 col-span-8",
+  },
+  {
+    label: "Time:",
+    labelCell: "row-start-2 col-start-65 col-span-5",
+    name: "CURTIME",
+    fieldCell: "row-start-2 col-start-71 col-span-8",
+  },
+];
+
+/** The screen's `CardHeader`, which holds header rows 1 and 2 and the screen title. */
+function cardHeader(container: HTMLElement): HTMLElement {
+  const header = container.querySelector('[data-slot="card-header"]');
+  if (!(header instanceof HTMLElement)) {
+    throw new Error("the screen renders no CardHeader");
+  }
+  return header;
+}
+
 /** The row-24 button labelled `label`, checked to be a plain `outline`, `sm` button. */
 function pfKeyButton(label: string): HTMLElement {
   const button = screen.getByRole("button", { name: label });
@@ -678,6 +731,10 @@ describe("COPAU01 authorization detail screen", () => {
   });
 
   // audit: COPAUS1C-037
+  // audit: COPAU01-001
+  // audit: COPAU01-004
+  // audit: COPAU01-006
+  // audit: COPAU01-009
   // audit: COPAU01-055
   // audit: COPAU01-056
   // audit: COPAU01-057
@@ -690,6 +747,16 @@ describe("COPAU01 authorization detail screen", () => {
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
     stubApi();
     const { container } = renderScreen(FROM_LIST);
+
+    // Each label stands in the CardHeader at its map POS and LENGTH, on the line of its field.
+    const header = cardHeader(container);
+    for (const { label, labelCell, name, fieldCell } of HEADER_LABELS) {
+      const text = within(header).getByText(label, { normalizer: (shownText) => shownText });
+      expect(text.parentElement?.className).toBe(labelCell);
+      expect(header.querySelector(`[data-field="${name}"]`)?.parentElement?.className).toBe(
+        fieldCell,
+      );
+    }
 
     expect(headerField(container, "TRNNAME")).toBe("CPVD");
     expect(headerField(container, "PGMNAME")).toBe("COPAUS1C");

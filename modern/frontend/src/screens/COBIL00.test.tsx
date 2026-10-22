@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COBIL00 } from "./COBIL00";
 
 /*
@@ -14,6 +21,10 @@ import { COBIL00 } from "./COBIL00";
  * `modern/audit/online/COBIL00C.md` (`COBIL00C-nnn`). The balance is the 14-character text that
  * `PIC +9999999999.99` edits (ARITH-019); it is compared as text, never read as an amount. The
  * endpoint carries no card number, and no SSN or password appears.
+ *
+ * Rows `COBIL00-001` to `COBIL00-010` place the header labels in a `Label` and the header values
+ * in a read-only `Input`, while the shared `ScreenShell` renders both as plain text, so those rows
+ * are not tagged here; their content rows (`COBIL00-025` to `COBIL00-030`) are.
  */
 
 const ENDPOINT = "/api/v1/bill-payments";
@@ -164,11 +175,14 @@ function billPayment(body: unknown): Response {
 }
 
 /**
- * Replaces `fetch` with endpoint 15 as {@link billPayment} answers it; any other request gets a
- * 500. Each reply waits for `hold` when one is given. Returns every request in the order the
- * screen sent it.
+ * Replaces `fetch` with endpoint 15 as `answer` (by default {@link billPayment}) answers it; any
+ * other request gets a 500. Each reply waits for `hold` when one is given. Returns every request
+ * in the order the screen sent it.
  */
-function stubApi(hold?: Promise<void>): Request[] {
+function stubApi(
+  hold?: Promise<void>,
+  answer: (body: unknown) => Response = billPayment,
+): Request[] {
   const requests: Request[] = [];
   vi.stubGlobal(
     "fetch",
@@ -181,7 +195,7 @@ function stubApi(hold?: Promise<void>): Request[] {
       }
       const body: unknown = await req.clone().json();
       await hold;
-      return billPayment(body);
+      return answer(body);
     }),
   );
   return requests;
@@ -208,11 +222,16 @@ function RouteStub() {
   );
 }
 
-/** COBIL00 at `/bill-payment` with `state`, and stubs at the routes F3 can return to. */
-function renderScreen(state?: unknown) {
-  const client = new QueryClient({
+/** A query client that never retries, so a stubbed failure shows at once. */
+function testQueryClient(): QueryClient {
+  return new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
+}
+
+/** COBIL00 at `/bill-payment` with `state`, and stubs at the routes F3 can return to. */
+function renderScreen(state?: unknown) {
+  const client = testQueryClient();
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COBIL00, state }]}>
@@ -440,6 +459,51 @@ describe("COBIL00 bill payment screen", () => {
     expect(messageRows("error")).toHaveLength(1);
   });
 
+  // audit: COBIL00-014
+  // audit: COBIL00-018
+  // audit: COBIL00-021
+  it.each([
+    { field: "ACTIDIN", row: 6, start: 21, stopper: 33 },
+    { field: "CURBAL", row: 11, start: 32, stopper: 47 },
+    { field: "CONFIRM", row: 15, start: 60, stopper: 62 },
+  ])("leaves no element at the zero-length stopper that ends $field", (map) => {
+    stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+
+    // The same query finds the field's own cell, so the empty stopper column is no selector slip.
+    const cellsAt = (col: number) =>
+      document.querySelectorAll(`.row-start-${map.row}.col-start-${col}`);
+    expect(cellsAt(map.start)).toHaveLength(1);
+    expect(cellsAt(map.stopper)).toHaveLength(0);
+  });
+
+  // audit: COBIL00C-001
+  it("sends a browser with no session from /bill-payment to /signon, with no request", async () => {
+    // The guard lives in the application's route tree, not in the screen, so this test renders
+    // that tree rather than the screen with stubs.
+    clearSession();
+    const requests = stubApi();
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COBIL00] });
+    render(
+      <QueryClientProvider client={testQueryClient()}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("heading", { level: 1 }).textContent).not.toBe("Bill Payment");
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByText("Enter Acct ID:")).toBeNull();
+    await settle();
+    expect(requests).toHaveLength(0);
+    router.dispose();
+  });
+
   // audit: COBIL00C-002
   it("opens cleared, with the cursor on the account, and sends nothing until ENTER", async () => {
     const requests = stubApi();
@@ -616,6 +680,29 @@ describe("COBIL00 bill payment screen", () => {
       { acct_id: ACCT, confirm: "" },
       { acct_id: row.acct, confirm: row.confirm },
     ]);
+  });
+
+  // A failure of the replacement alone, which no audit row covers: the dev proxy answers an empty
+  // 502 while the API is down, so the message names the status, and no field takes the cursor.
+  it("shows a failure with no ScreenError body by its status, keeps fields, cursor", async () => {
+    stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    await showBalance();
+    const requests = stubApi(
+      undefined,
+      () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
+    );
+
+    const enter = screen.getByRole("button", { name: "ENTER=Continue" });
+    await moveFocus(enter);
+    fireEvent.click(enter);
+
+    await waitFor(() => {
+      expect(errorText()).toBe("HTTP 502 Bad Gateway");
+    });
+    expect(shown()).toEqual({ acct: ACCT, balance: BALANCE, confirm: "" });
+    expect(document.activeElement).toBe(enter);
+    expect(await bodies(requests)).toStrictEqual([{ acct_id: ACCT, confirm: "" }]);
   });
 
   // audit: COBIL00C-005

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import type { components } from "@/api/schema";
@@ -175,12 +175,22 @@ function inMapOrder(entry: components["schemas"]["UserAddRequest"]): string[] {
   );
 }
 
+/**
+ * Moves the cursor to `input`. The move runs inside `act`, so React renders the blur it causes
+ * (the field state the form labels and controls subscribe to) before the test goes on.
+ */
+function moveFocus(input: HTMLInputElement): void {
+  act(() => {
+    input.focus();
+  });
+}
+
 /** Types `entry` into the five fields, then leaves the cursor in Password, away from First Name. */
 function typeEntry(entry: components["schemas"]["UserAddRequest"]): void {
   inputs().forEach((input, index) => {
     fireEvent.change(input, { target: { value: inMapOrder(entry)[index] } });
   });
-  inputFor(LABELS.password).focus();
+  moveFocus(inputFor(LABELS.password));
 }
 
 /** The message rows of `kind` (COUSR1A declares only `ERRMSG`, so at most one exists). */
@@ -482,9 +492,12 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
     });
     // A second ENTER while the add is in flight sends nothing, as the locked 3270 keyboard did.
     // Its submit validates in microtasks only, so one timer turn lets it finish while the first
-    // answer is still held back.
+    // answer is still held back; the turn runs inside `act`, which renders the form state the
+    // submit updates.
     fireEvent.click(key("ENTER=Add User"));
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
     expect(sent).toHaveLength(1);
     for (const release of releases) {
       release();
@@ -509,7 +522,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       typeEntry(typed);
       fireEvent.click(key("F12=Exit"));
       expect(messageRow("error").textContent).toBe(INVALID_KEY);
-      inputFor(LABELS.password).focus();
+      moveFocus(inputFor(LABELS.password));
 
       press();
 

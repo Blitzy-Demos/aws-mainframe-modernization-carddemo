@@ -4,7 +4,6 @@ import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { setSession } from "@/auth/session";
-import { INVALID_KEY, TITLE01, TITLE02 } from "@/lib/header";
 import { PATHS } from "@/routes";
 import { COUSR00 } from "./COUSR00";
 
@@ -32,6 +31,16 @@ const LOOKUP_FAILED = "Unable to lookup User...";
 const ADMIN_ONLY = "No access - Admin Only function ...";
 /** zod's default message for the 8-character `USRIDIN` length (`src/schemas/COUSR00.ts`). */
 const SEARCH_TOO_LONG = "String must contain at most 8 character(s)";
+/**
+ * `CCDA-MSG-INVALID-KEY PIC X(50)` (`CSMSG01Y.cpy:20-21`): the 50-byte field value COUSR00C-005
+ * shows, the short `VALUE` literal padded with spaces, written out so the length is visible.
+ */
+const INVALID_KEY = "Invalid key pressed. Please see below...          ";
+/** The 40-byte title values of COUSR00-091 and COUSR00-094 (`COTTL01Y.cpy:18-22`). */
+const TITLE01 = "      AWS Mainframe Modernization       ";
+const TITLE02 = "              CardDemo                  ";
+/** `ERRMSGO PIC X(78)`: the width of the error row (COUSR00-088, COUSR00C-033). */
+const ERRMSG_WIDTH = 78;
 
 /** The ten users of the fixture's key order (`DUSRSECJ.jcl:35-44`), with invented names. */
 const FIXTURE_USERS: components["schemas"]["UserListRow"][] = [
@@ -372,6 +381,7 @@ describe("COUSR00 List Users", () => {
     // audit: COUSR00-093
     // audit: COUSR00-094
     // audit: COUSR00-095
+    // audit: COUSR00C-033
     const sent = stubFetch(json(200, FIRST_PAGE));
     renderList();
     await listed(sent, 1, "ADMIN001");
@@ -398,6 +408,8 @@ describe("COUSR00 List Users", () => {
     );
     expect(headerField("TRNNAME")).toBe("CU00");
     expect(headerField("PGMNAME")).toBe("COUSR00C");
+    expect(TITLE01).toHaveLength(40);
+    expect(TITLE02).toHaveLength(40);
     expect(headerField("TITLE01")).toBe(TITLE01);
     expect(headerField("TITLE02")).toBe(TITLE02);
     // Time-dependent fields are compared by format only.
@@ -993,6 +1005,36 @@ describe("COUSR00 List Users", () => {
     expect(valueOf(pageField())).toBe("");
     expect(document.activeElement).toBe(searchField());
   });
+
+  /** An 80-character `WS-MESSAGE`: 78 that fit `ERRMSGO`, then two that the move cuts off. */
+  const FULL_MESSAGE = `${"M".repeat(ERRMSG_WIDTH)}XY`;
+
+  it.each([
+    {
+      answer: "a 500 ScreenError",
+      reply: json(500, { message: FULL_MESSAGE } satisfies components["schemas"]["ScreenError"]),
+    },
+    {
+      answer: "a page",
+      reply: json(200, {
+        ...FIRST_PAGE,
+        message: FULL_MESSAGE,
+      } satisfies components["schemas"]["UserListResponse"]),
+    },
+  ])(
+    "shows the first 78 characters of a longer message from $answer, as ERRMSGO PIC X(78) holds it",
+    async ({ reply }) => {
+      // audit: COUSR00-088
+      // audit: COUSR00C-033
+      const sent = stubFetch(reply);
+      renderList();
+      await shown(sent, 1, "M".repeat(ERRMSG_WIDTH));
+
+      expect(FULL_MESSAGE).toHaveLength(80);
+      expect(errorRow().textContent).toHaveLength(ERRMSG_WIDTH);
+      expect(document.activeElement).toBe(searchField());
+    },
+  );
 
   it("keeps the keyboard locked while a request is outstanding", async () => {
     const releases: ((reply: Response) => void)[] = [];

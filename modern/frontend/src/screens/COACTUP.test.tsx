@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
@@ -15,9 +15,23 @@ import { COACTUP } from "./COACTUP";
  * dark keys, the message rows, the keys that send no request (F3, F12, the restart after a
  * finished save) and the requests ENTER and F5 build. `online/CSUTLDTC.md` has no `client` row.
  *
+ * Not tagged here: COACTUP-001 to COACTUP-010 describe the header literals and values as `Label`
+ * and read-only `Input` elements, while `ScreenShell` renders them as plain text; their content
+ * rows (COACTUP-129 to COACTUP-134) and the absence of the unnamed (1,1) field (COACTUP-124) are
+ * proved instead.
+ *
  * Every value is synthetic. Responses carry only the redacted SSN `***-**-1234`; the SSN the
  * operator re-enters exists only as request input (Cardholder Data Redaction, E32).
  */
+
+/*
+ * Each flow re-renders the 43-field form after every typed value and every answer. Alone a test
+ * takes under a second, but under coverage on a host shared with other suites it took up to 13 s
+ * and its steps several seconds each, past Vitest's 5 s test and Testing Library's 1 s wait
+ * defaults. The wider budgets change no assertion: a condition that never holds still fails.
+ */
+const TEST_TIMEOUT_MS = 30_000;
+configure({ asyncUtilTimeout: 10_000 });
 
 /** The account the tests fetch, and the path of endpoints 5 and 6 for it. */
 const ACCOUNT = "00000000050";
@@ -449,7 +463,7 @@ afterEach(() => {
   sessionStorage.clear();
 });
 
-describe("COACTUP render", () => {
+describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
   it("opens with the header, the empty map, the initial values, the key row and no request", () => {
     // audit: COACTUPC-001
     // audit: COACTUPC-072

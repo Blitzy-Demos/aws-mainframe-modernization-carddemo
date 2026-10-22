@@ -42,6 +42,13 @@ const PAGE_DIGITS = 8;
 /** COUSR00C-010: the message `PROCESS-ENTER-KEY` moves for a selector other than U, u, D or d. */
 const INVALID_SELECTION = "Invalid selection. Valid values are U and D";
 
+/**
+ * `ERRMSG LENGTH=78` (COUSR00-088): `MOVE WS-MESSAGE TO ERRMSGO` stores the 80-byte message into
+ * the 78-byte field, so the row shows its first 78 characters (COUSR00C-033). The audit makes this
+ * cut the screen's, not the server's; no COUSR00C literal reaches it, but any message does.
+ */
+const ERRMSG_LENGTH = 78;
+
 /** COUSR00-087: the `INITIAL` of line 21 (BMS `''` is one quote). */
 const INSTRUCTION = "Type 'U' to Update or 'D' to Delete a User from the list";
 
@@ -313,7 +320,7 @@ export function COUSR00(): ReactNode {
       program={SCREENS.COUSR00.program}
       title="List Users"
       formId={formId}
-      message={{ text: message, kind: "error" }}
+      message={{ text: message.slice(0, ERRMSG_LENGTH), kind: "error" }}
       keys={keys}
       keyOptions={{ onInvalidKey: showInvalidKey }}
     >

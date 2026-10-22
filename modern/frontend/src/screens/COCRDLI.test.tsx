@@ -449,6 +449,69 @@ describe("COCRDLI", () => {
     expect(requests.at(0)?.authorization).toBe("Bearer test-token");
   });
 
+  it("places the fields on their map lines and renders no stopper or dark field", async () => {
+    // audit: COCRDLI-013
+    // audit: COCRDLI-016
+    // audit: COCRDLI-019
+    // audit: COCRDLI-029
+    // audit: COCRDLI-034
+    // audit: COCRDLI-035
+    // audit: COCRDLI-040
+    // audit: COCRDLI-041
+    // audit: COCRDLI-046
+    // audit: COCRDLI-047
+    // audit: COCRDLI-052
+    // audit: COCRDLI-053
+    // audit: COCRDLI-058
+    // audit: COCRDLI-059
+    // audit: COCRDLI-064
+    // audit: COCRDLI-065
+    // audit: COCRDLI-070
+    stubReplies([200, FIRST_PAGE]);
+    renderScreen();
+    await firstPageShown();
+    const form = document.querySelector("form");
+    if (form === null) {
+      throw new Error("the screen rendered no form");
+    }
+
+    // `PAGENO`, `POS=(4,76) LENGTH=3`: read-only, showing the page number endpoint 7 sent.
+    expect(pageNo().parentElement?.className).toBe("row-start-4 col-start-76 col-span-3");
+    expect(pageNo()).toHaveProperty("readOnly", true);
+    expect(pageNo()).toHaveProperty("value", String(FIRST_PAGE.page_no));
+
+    // Every placed element of the body grid as its line, column and width. No cell stands at the
+    // zero-length stoppers (6,56), (7,61) and (20,65): their columns stay empty.
+    const placed = Array.from(form.querySelectorAll('[class*="row-start-"]'), (cell) => [
+      /\brow-start-(\d+)\b/.exec(cell.className)?.[1],
+      /\bcol-start-(\d+)\b/.exec(cell.className)?.[1],
+      /\bcol-span-(\d+)\b/.exec(cell.className)?.[1],
+    ]);
+    expect(placed).toEqual([
+      ["4", "70", "5"],
+      ["4", "76", "3"],
+      ["6", "22", "19"],
+      ["6", "44", "11"],
+      ["7", "22", "19"],
+      ["7", "44", "16"],
+      // The list table, map lines 9 to 17, columns 10 to 72.
+      ["9", "10", "63"],
+    ]);
+
+    // Each list row holds its selector and three output cells and nothing else: neither the
+    // stopper after the selector (column 14) nor the dark `CRDSTP2` to `CRDSTP7` is rendered.
+    for (const row of bodyRows()) {
+      const cells = Array.from(row.children);
+      expect(cells.map((cell) => cell.tagName)).toEqual(["TD", "TD", "TD", "TD"]);
+      expect(cells.at(0)?.querySelectorAll("input")).toHaveLength(1);
+      expect(cells.at(0)?.textContent).toBe("");
+      expect(row.querySelectorAll("input")).toHaveLength(1);
+    }
+    // The form's inputs are the page number, the two filters and the seven selectors.
+    expect(form.querySelectorAll("input")).toHaveLength(10);
+    expect(form.querySelectorAll('input[type="hidden"]')).toHaveLength(0);
+  });
+
   it.each(
     FIRST_PAGE.rows.flatMap((card, index) => [
       { code: "S", target: "COCRDSL", row: index + 1, card },
@@ -919,6 +982,30 @@ describe("COCRDLI", () => {
     expect(selector(4)).toHaveProperty("readOnly", false);
     expect(messageRow("info").textContent).toBe(INFO_RECORD_ACTIONS);
     expect(document.body.textContent).not.toMatch(/\d{16}/);
+  });
+
+  it("shows a failed first read's message, then ENTER starts afresh with no paging", async () => {
+    // audit: COCRDLI-071
+    const failure: components["schemas"]["ScreenError"] = { message: FILE_ERROR };
+    const requests = stubReplies([500, failure], [200, FIRST_PAGE]);
+    renderScreen();
+
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(FILE_ERROR);
+    });
+    await answered(requests, 1);
+    expect(listedRows()).toEqual(Array.from({ length: 7 }, () => EMPTY_ROW));
+    expect(bodyRows().some((row) => row.querySelector("input") !== null)).toBe(false);
+    expect(pageNo()).toHaveProperty("value", "");
+    expect(messageRow("info").textContent).toBe("");
+
+    // No page is displayed, so nothing is echoed and the server reads a fresh start.
+    press("ENTER");
+    await firstPageShown();
+    expect(listQueries(requests)).toEqual([{}, {}]);
+    expect(pageNo()).toHaveProperty("value", "1");
+    expect(messageRow("error").textContent).toBe("");
+    expect(messageRow("info").textContent).toBe(INFO_RECORD_ACTIONS);
   });
 
   it.each([

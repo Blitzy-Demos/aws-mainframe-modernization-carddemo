@@ -4,7 +4,6 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
-import { TITLE01, TITLE02 } from "@/lib/header";
 import { PATHS } from "@/routes";
 import { COCRDSL } from "./COCRDSL";
 
@@ -22,8 +21,18 @@ const ACCT_ID = "00000000050";
 const TYPED_CARD = "12345678".repeat(2);
 const OTHER_TYPED_CARD = "87654321".repeat(2);
 
+/**
+ * Header title rows 1 and 2: the 40-byte `CCDA-TITLE01` and `CCDA-TITLE02` of
+ * `app/cpy/COTTL01Y.cpy:18-22`, padding kept, as COCRDSL-033 and COCRDSL-036 quote them.
+ */
+const TITLE01 = `${" ".repeat(6)}AWS Mainframe Modernization${" ".repeat(7)}`;
+const TITLE02 = `${" ".repeat(14)}CardDemo${" ".repeat(18)}`;
+
 /** The info row before any request and after every error (COCRDSLC-025). */
 const PROMPT = "Please enter Account and Card Number";
+
+/** The information message of a found card, three leading spaces kept (COCRDSLC-020). */
+const FOUND_INFO = "   Displaying requested details";
 
 /** Route state of a COCRDLI `S` selection: the caller and the row's account and card handle. */
 const FROM_LIST = { from: PATHS.COCRDLI, acct_id: ACCT_ID, card_ref: 1 };
@@ -45,7 +54,7 @@ const view: components["schemas"]["CardViewResponse"] = {
   card_ref: 1,
   embossed_name: "TEST CARDHOLDER",
   expiration_date: "2025-03-31",
-  info_message: "   Displaying requested details",
+  info_message: FOUND_INFO,
   message: null,
   status: "Y",
 };
@@ -377,12 +386,14 @@ describe("COCRDSL", () => {
     // audit: COCRDSL-032
     expect(headerValue("TRNNAME")).toBe("CCDL");
     // audit: COCRDSL-033
+    expect(TITLE01).toHaveLength(40);
     expect(headerValue("TITLE01")).toBe(TITLE01);
     // audit: COCRDSL-034
     expect(headerValue("CURDATE")).toMatch(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/);
     // audit: COCRDSL-035
     expect(headerValue("PGMNAME")).toBe("COCRDSLC");
     // audit: COCRDSL-036
+    expect(TITLE02).toHaveLength(40);
     expect(headerValue("TITLE02")).toBe(TITLE02);
     // audit: COCRDSL-037
     expect(headerValue("CURTIME")).toMatch(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/);
@@ -444,10 +455,43 @@ describe("COCRDSL", () => {
         expect(field(label).readOnly).toBe(true);
         expect(field(label).className).not.toContain("text-destructive");
       }
-      expect(messageRow("info").textContent).toBe("   Displaying requested details");
+      expect(messageRow("info").textContent).toBe(FOUND_INFO);
       expect(messageRow("error").textContent).toBe("");
     },
   );
+
+  it("shows no information box during the entry read, then the response's message", async () => {
+    // audit: COCRDSL-029
+    let release = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const seen = stubFetch(async () => {
+      await held;
+      return json(200, view);
+    });
+    renderScreen(FROM_LIST);
+
+    // Entered from the card list, no message is set until endpoint 8 answers.
+    await waitFor(() => {
+      expect(form().getAttribute("aria-busy")).toBe("true");
+    });
+    const pending = messageRow("info");
+    expect(pending.textContent).toBe("");
+    expect(pending.className).toContain("border-transparent");
+
+    release();
+    await requestsSettled(seen, 1);
+
+    const info = messageRow("info");
+    expect(info.dataset.slot).toBe("alert");
+    expect(info.className).toContain("text-card-foreground");
+    expect(info.className).not.toContain("text-destructive");
+    expect(info.className).not.toContain("border-transparent");
+    const description = info.querySelector('[data-slot="alert-description"]');
+    expect(description?.textContent).toBe(FOUND_INFO);
+    expect(FOUND_INFO.length).toBeLessThanOrEqual(40);
+  });
 
   it("looks up a typed card number, then reads the shown card again by its card_ref", async () => {
     // audit: COCRDSL-038
@@ -465,7 +509,7 @@ describe("COCRDSL", () => {
     fireEvent.click(enter);
     await requestsSettled(seen, 1);
     expect(field(CARD).value).toBe("************5678");
-    expect(messageRow("info").textContent).toBe("   Displaying requested details");
+    expect(messageRow("info").textContent).toBe(FOUND_INFO);
 
     // Unchanged, the card input names the card shown: its redacted number is never sent.
     fireEvent.click(enter);

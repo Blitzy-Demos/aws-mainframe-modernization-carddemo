@@ -1,10 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { setSession } from "@/auth/session";
-import { INVALID_KEY, TITLE01, TITLE02 } from "@/lib/header";
 import { PATHS } from "@/routes";
 import { COPAU00 } from "./COPAU00";
 
@@ -25,6 +24,15 @@ import { COPAU00 } from "./COPAU00";
  * COBOL result.
  */
 
+/*
+ * The paging scenarios drive the real screen through up to 22 request round-trips in jsdom. On a
+ * shared host under load one of them can outlast Vitest's 5-second default and a single answer
+ * the 1-second default of `waitFor`, so both limits are raised for this file only. A screen that
+ * never answers still fails, at the raised limit.
+ */
+vi.setConfig({ testTimeout: 30_000 });
+configure({ asyncUtilTimeout: 10_000 });
+
 const TOKEN = "test-token";
 
 /** The account the scenarios read; its customer is 000000050. */
@@ -33,6 +41,20 @@ const ACCOUNT = "00000000050";
 const NO_SUMMARY_ACCOUNT = "00000000051";
 /** An account no cross-reference row holds (COPAUS0C-014). */
 const UNKNOWN_ACCOUNT = "00000000099";
+
+/**
+ * Header rows 1 and 2: `CCDA-TITLE01` and `CCDA-TITLE02`, 40 bytes each with their padding
+ * (`app/cpy/COTTL01Y.cpy:18-22`; COPAU00-106, COPAU00-109). Written out here rather than imported
+ * from the screen's own header module, so the test checks the audited value, not itself.
+ */
+const TITLE01 = "      AWS Mainframe Modernization       ";
+const TITLE02 = "              CardDemo                  ";
+
+/**
+ * COPAUS0C-004: `CCDA-MSG-INVALID-KEY PIC X(50)` (`app/cpy/CSMSG01Y.cpy:20-21`), the literal
+ * padded with spaces to all 50 bytes, as the `MOVE` transfers it.
+ */
+const INVALID_KEY = "Invalid key pressed. Please see below...".padEnd(50, " ");
 
 /** The screen's messages, as `modern/audit/online/COPAUS0C.md` words them. */
 const INVALID_SELECTION = "Invalid selection. Valid value is S";

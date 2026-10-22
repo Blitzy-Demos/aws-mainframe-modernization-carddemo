@@ -477,6 +477,7 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     sessionStorage.clear();
   });
 
@@ -693,6 +694,9 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
   // audit: COACTVWC-027
   // audit: COACTVWC-028
   it("ENTER views the account through endpoint 4 with the bearer token, each output read-only at its width showing the response value verbatim", async () => {
+    // West of UTC, a `Date` parsed from "2014-11-20" (UTC midnight) falls on 19 November in local
+    // time, so the date assertions below fail for any `Date`-based rendering of the typed dates.
+    vi.stubEnv("TZ", "Pacific/Honolulu");
     const requests = stubFetch(() => json(200, view));
     renderScreen();
 

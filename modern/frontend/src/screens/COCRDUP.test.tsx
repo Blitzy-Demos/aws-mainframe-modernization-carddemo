@@ -311,6 +311,20 @@ function headerValue(name: string): string | null {
   return document.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
 }
 
+/** The `GridCell` classes that place map `POS=(row,col)` with `LENGTH=span`. */
+function cellClass(row: number, col: number, span: number): string {
+  return `row-start-${row} col-start-${col} col-span-${span}`;
+}
+
+/** The header-row literal whose whole text is `text`, inside the `CardHeader` of `ScreenShell`. */
+function headerLabel(text: string): HTMLElement {
+  const header = document.querySelector<HTMLElement>('[data-slot="card-header"]');
+  if (header === null) {
+    throw new Error("No card header");
+  }
+  return within(header).getByText(text, exactText);
+}
+
 /** The columns of map row `row` that a `GridCell` of the screen body covers. */
 function occupiedColumns(row: number): Set<number> {
   const form = screen.getByRole("form", { name: "Update Credit Card Details" });
@@ -499,6 +513,34 @@ describe("COCRDUP rendering", () => {
     }
     expect(key("F3=Exit").hidden).toBe(false);
     expectConfirmationKeys(false);
+  });
+
+  // The value fields themselves (COCRDUP-002, -003, -005, -007, -008, -010) are not tagged here:
+  // `ScreenShell` shows them as plain text of the title rows, not as the read-only `Input` those
+  // rows name; their contents are proved under COCRDUP-035 to COCRDUP-040 above.
+  // audit: COCRDUP-001
+  // audit: COCRDUP-004
+  // audit: COCRDUP-006
+  // audit: COCRDUP-009
+  it("header rows 1 and 2 place Tran:, Date:, Prog: and Time: before their values", async () => {
+    stubApi({});
+    renderScreen();
+    await settle();
+
+    // Each BLUE literal at its map POS with LENGTH 5; the value it labels starts at column + 6.
+    for (const { text, row, col, field, length } of [
+      { text: "Tran:", row: 1, col: 1, field: "TRNNAME", length: 4 },
+      { text: "Date:", row: 1, col: 65, field: "CURDATE", length: 8 },
+      { text: "Prog:", row: 2, col: 1, field: "PGMNAME", length: 8 },
+      { text: "Time:", row: 2, col: 65, field: "CURTIME", length: 8 },
+    ]) {
+      const label = headerLabel(text);
+      expect(label.className).toContain("text-muted-foreground");
+      expect(label.parentElement?.className).toBe(cellClass(row, col, 5));
+      expect(document.querySelector(`[data-field="${field}"]`)?.parentElement?.className).toBe(
+        cellClass(row, col + 6, length),
+      );
+    }
   });
 
   // audit: COCRDUPC-045

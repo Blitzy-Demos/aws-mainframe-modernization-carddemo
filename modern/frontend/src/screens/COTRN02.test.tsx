@@ -14,6 +14,12 @@ import { COTRN02 } from "./COTRN02";
  * `modern/audit/screens.md` (`COTRN02-nnn`) and `modern/audit/online/COTRN02C.md`
  * (`COTRN02C-nnn`). Every card number a response carries is redacted; the one full-width card
  * number below is synthetic request input, and no password appears.
+ *
+ * Not tagged here:
+ * - COTRN02-002, -003, -005, -007, -008 and -010 describe the header values as read-only `Input`
+ *   elements, while `ScreenShell` renders them as text; their content rows (COTRN02-062 to
+ *   COTRN02-067) are proved instead.
+ * - COTRN02C-001, the sign-on guard, belongs to `RequireSignon`, which this test does not mount.
  */
 
 const ENDPOINT = "/api/v1/transactions";

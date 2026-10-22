@@ -150,6 +150,12 @@ function headerField(container: HTMLElement, name: string): string | null {
   return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
 }
 
+/** The text of every map-grid cell whose `POS` is (`row`, `col`), as `GridCell` places it. */
+function cellsStartingAt(container: HTMLElement, row: number, col: number): (string | null)[] {
+  const selector = `[class~="row-start-${row}"][class~="col-start-${col}"]`;
+  return Array.from(container.querySelectorAll(selector), (cell) => cell.textContent);
+}
+
 function typeCredentials(userId: string, password: string): void {
   fireEvent.change(userIdInput(), { target: { value: userId } });
   fireEvent.change(passwordInput(), { target: { value: password } });
@@ -175,10 +181,13 @@ describe("COSGN00 sign-on screen", () => {
   // audit: COSGN00-024
   // audit: COSGN00-025
   // audit: COSGN00-026
+  // audit: COSGN00-028
   // audit: COSGN00-029
   // audit: COSGN00-030
+  // audit: COSGN00-032
   // audit: COSGN00-033
   // audit: COSGN00-034
+  // audit: COSGN00-035
   // audit: COSGN00-037
   // audit: COSGN00-038
   // audit: COSGN00-040
@@ -229,6 +238,13 @@ describe("COSGN00 sign-on screen", () => {
     expect(password.value).toBe("");
     // Only the two named inputs are editable: the unnamed dark field at (20,61) is not rendered.
     expect(container.querySelectorAll("input:not([readonly])")).toHaveLength(2);
+    expect(cellsStartingAt(container, 20, 61)).toEqual([]);
+    // The zero-length stoppers add no element. Those at (19,52) and (20,52) share their position
+    // with the `(8 Char)` literal declared after them, whose cell is the only one there
+    // (X-SCREENS-3); nothing starts at the stopper's position (20,63).
+    expect(cellsStartingAt(container, 19, 52)).toEqual(["(8 Char)"]);
+    expect(cellsStartingAt(container, 20, 52)).toEqual(["(8 Char)"]);
+    expect(cellsStartingAt(container, 20, 63)).toEqual([]);
 
     const keys = within(screen.getByRole("group", { name: "Function keys" })).getAllByRole(
       "button",
