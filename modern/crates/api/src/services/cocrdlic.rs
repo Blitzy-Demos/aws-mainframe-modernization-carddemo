@@ -198,7 +198,7 @@ async fn next_card<R: CardRepository>(
 /// A failed read of `CARDDAT`: the file-error text of COCRDLIC-031, a 500. The log line names the
 /// SQLSTATE and constraint only, never a key or a filter.
 fn browse_failed(error: &PersistenceError) -> ServiceError<ListFailure> {
-    tracing::warn!(error = %error, "card list browse failed");
+    tracing::error!(error = %error, "card list browse failed");
     ServiceError::Rule(ListFailure::file_error())
 }
 

@@ -6,6 +6,8 @@
 //!   `PostgreSQL` (R4), the [`JwtKeys`] that sign and verify the sign-on token, the injected
 //!   [`Clock`], their only time source, and the job-deck directory of endpoint 14
 //!   (`CARDDEMO_INTRDR_DIR`), the counterpart of CORPT00C's `JOBS` transient data queue.
+//!   [`check_intrdr_dir`] is the check `carddemo-api` runs on that directory before it connects,
+//!   through the one service that touches the filesystem (AAP 0.5.3).
 //! - [`router`] registers every handler through `utoipa_axum::routes!` and splits the result into
 //!   the axum router and the document, so each operation in the document is exactly one handler
 //!   and each handler is exactly one operation. [`openapi`] is that document alone. Building it
@@ -39,6 +41,7 @@
 //! only through the handlers registered here.
 
 use std::fmt;
+use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +64,7 @@ use utoipa_axum::routes;
 use crate::auth::jwt::JwtKeys;
 use crate::handlers;
 use crate::openapi::ApiDoc;
+use crate::services::corpt00c::{self, DECK_DIR_SETTING};
 
 /// Where [`app`] serves the `OpenAPI` document as JSON. It is added after the split, so it is not
 /// an operation of the document it serves.
@@ -119,6 +123,52 @@ impl AppState {
             config.intrdr_dir.clone(),
         ))
     }
+}
+
+/// Why `carddemo-api` refuses its job-deck directory at startup ([`check_intrdr_dir`]):
+/// `CARDDEMO_INTRDR_DIR` names something that is not a directory, or a path through one, so
+/// endpoint 14 could write no deck there. Its text names the setting and the I/O error kind,
+/// never the path (Cardholder Data Redaction keeps the server's directory layout out of every
+/// message, as it keeps it out of the response of endpoint 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IntrdrDirError {
+    /// What the check found, such as `io::ErrorKind::NotADirectory`.
+    kind: io::ErrorKind,
+}
+
+impl IntrdrDirError {
+    /// What the check found.
+    #[must_use]
+    pub fn kind(&self) -> io::ErrorKind {
+        self.kind
+    }
+}
+
+impl fmt::Display for IntrdrDirError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{DECK_DIR_SETTING}, cannot hold job decks: {}",
+            self.kind
+        )
+    }
+}
+
+impl std::error::Error for IntrdrDirError {}
+
+/// Checks, before the server starts, that the job-deck directory of `config`
+/// (`CARDDEMO_INTRDR_DIR`) can hold the decks of endpoint 14: an existing directory, or no entry
+/// at all, which the first submission creates (CORPT00C-036). Reads the filesystem once and
+/// creates nothing.
+///
+/// # Errors
+///
+/// [`IntrdrDirError`] when the directory exists and is not one, a dangling link included, or a
+/// path through something that is not a directory leads to it. Any other failure to read it is
+/// left to the submissions, each of which answers it with `Unable to Write TDQ (JOBS)...`
+/// (CORPT00C-037).
+pub fn check_intrdr_dir(config: &Config) -> Result<(), IntrdrDirError> {
+    corpt00c::check_deck_dir(&config.intrdr_dir).map_err(|kind| IntrdrDirError { kind })
 }
 
 /// Names every field but shows only the job-deck directory: the keys are secret, and neither the

@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { CORPT00 } from "./CORPT00";
 
 /*
@@ -16,9 +23,11 @@ import { CORPT00 } from "./CORPT00";
  * comes from the API's token extractor.
  *
  * Not tagged here: the `both` rows of the ten inputs (`LENGTH`, `NUM`), whose client half is
- * proved in `src/schemas/CORPT00.test.ts`, and the header label and value rows `CORPT00-001` to
- * `CORPT00-010`, which `ScreenShell` renders as plain text rather than the `Label` and read-only
- * `Input` those rows name. The server rows behind each fixture are proved by the endpoint tests.
+ * proved in `src/schemas/CORPT00.test.ts`, and the header label rows `CORPT00-001`, `-004`,
+ * `-006` and `-009`, which NAV (`frontend/e2e/nav.spec.ts`) proves. The header value rows
+ * `CORPT00-002`, `-003`, `-005`, `-007`, `-008` and `-010` are tagged here, on the title-row
+ * cells `ScreenShell` renders them in. The server rows behind each fixture are proved by the
+ * endpoint tests.
  *
  * A `ScreenError.field` is the request member's wire name (`start_month`), as endpoint 14 sends
  * it and the screen maps it; the dotted `start_date.month` of the CORPT00C audit's prose is not
@@ -283,6 +292,12 @@ const noEndDay: components["schemas"]["ScreenError"] = {
   field: "end_day",
 };
 
+/** CORPT00C-014: a blank end month. */
+const noEndMonth: components["schemas"]["ScreenError"] = {
+  message: "End Date - Month can NOT be empty...",
+  field: "end_month",
+};
+
 /** CORPT00C-029: no report selected. */
 const noReport: components["schemas"]["ScreenError"] = {
   message: "Select a report type to print report...",
@@ -422,6 +437,53 @@ function messageRow(): HTMLElement {
 /** The message row when it is of `kind` (`MessageLine`'s `data-message-kind`), else none. */
 function messageRows(kind: "error" | "info"): HTMLElement[] {
   return screen.getAllByRole("alert").filter((row) => row.dataset.messageKind === kind);
+}
+
+/** The ids in the input's `aria-describedby` that name a `FormMessage`. */
+function messageIdsOf(input: HTMLElement): string[] {
+  return (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter((id) => id.endsWith("-form-item-message"));
+}
+
+/** Every `FormMessage` on the screen. */
+function fieldMessages(): Element[] {
+  return Array.from(document.querySelectorAll('[data-slot="form-message"]'));
+}
+
+/**
+ * Asserts that the input named `name` alone is marked invalid with `text`: `aria-invalid`, and an
+ * `aria-describedby` naming the screen's one `FormMessage`, present, for screen readers only and
+ * reading `text`. The message row stays the one place `text` shows.
+ */
+function expectMarked(name: string, text: string): void {
+  const input = inputOf(name);
+  expect(input.getAttribute("aria-invalid")).toBe("true");
+  const ids = messageIdsOf(input);
+  expect(ids).toHaveLength(1);
+  const message = document.getElementById(ids[0] ?? "");
+  expect(message).not.toBeNull();
+  expect(fieldMessages()).toEqual([message]);
+  expect(message?.textContent).toBe(text);
+  expect(message?.classList.contains("sr-only")).toBe(true);
+  for (const field of FIELDS.filter((other) => other.name !== name)) {
+    expect(inputOf(field.name).getAttribute("aria-invalid")).toBe("false");
+    expect(messageIdsOf(inputOf(field.name))).toEqual([]);
+  }
+  const visible = screen
+    .getAllByText(text)
+    .filter((element) => element.closest(".sr-only") === null);
+  expect(visible).toHaveLength(1);
+  expect(messageRow().contains(visible[0] ?? null)).toBe(true);
+}
+
+/** Asserts that no input is marked invalid or described by a message, and that none exists. */
+function expectUnmarked(): void {
+  for (const field of FIELDS) {
+    expect(inputOf(field.name).getAttribute("aria-invalid")).toBe("false");
+    expect(messageIdsOf(inputOf(field.name))).toEqual([]);
+  }
+  expect(fieldMessages()).toEqual([]);
 }
 
 /** The text of the header field `name` (`data-field` of `ScreenShell`). */
@@ -594,6 +656,50 @@ describe("CORPT00 transaction reports screen", () => {
     expect(headerField(container, "PGMNAME")).toBe("CORPT00C");
     expect(headerField(container, "CURDATE")).toBe("12/31/25");
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
+  });
+
+  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
+  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
+  // are proved under CORPT00-043 to CORPT00-048.
+  // audit: CORPT00-002
+  // audit: CORPT00-003
+  // audit: CORPT00-005
+  // audit: CORPT00-007
+  // audit: CORPT00-008
+  // audit: CORPT00-010
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
+    stubApi();
+    const { container } = renderScreen();
+
+    const header = container.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
+    }
   });
 
   // audit: CORPT00-049
@@ -772,7 +878,8 @@ describe("CORPT00 transaction reports screen", () => {
 
   it("refuses a date part that is not digits before any request, focusing that part", async () => {
     // The `NUM` refusal itself is the client half of a `both` row, proved in the schema test;
-    // this shows what the screen does with it: zod's message in the red row, the inputs kept.
+    // this shows what the screen does with it: zod's message in the red row, the inputs kept,
+    // and the part marked invalid with that message for screen readers.
     // screens.md records no message for the row, so the text is zod 3's default for a `regex`.
     const requests = stubApi();
     renderScreen();
@@ -784,12 +891,138 @@ describe("CORPT00 transaction reports screen", () => {
       expect(messageRow().textContent).toBe("Invalid");
     });
     expect(messageRow().dataset.messageKind).toBe("error");
+    expectMarked("Start Date day", "Invalid");
     expect(shown()).toEqual(typed(request));
     await waitFor(() => {
       expect(document.activeElement).toBe(inputOf("Start Date day"));
     });
     await settle();
     expect(requests).toHaveLength(0);
+  });
+
+  it.each([
+    {
+      title: "a start month above 12",
+      request: badMonthRequest,
+      status: 400,
+      error: badMonth,
+      marked: "Start Date month",
+    },
+    {
+      title: "a blank end day",
+      request: noEndDayRequest,
+      status: 400,
+      error: noEndDay,
+      marked: "End Date day",
+    },
+    {
+      title: "no report selected",
+      request: noReportRequest,
+      status: 400,
+      error: noReport,
+      marked: MONTHLY,
+    },
+    {
+      title: "a confirmation of X",
+      request: badConfirmRequest,
+      status: 400,
+      error: badConfirm,
+      marked: CONFIRM,
+    },
+    {
+      title: "an unwritable job deck",
+      request: monthlyRequest,
+      status: 500,
+      error: writeFailed,
+      marked: MONTHLY,
+    },
+    // The two shapes below probe the screen's field mapping, not an audited answer: a failure
+    // whose `field` is absent, or names a member the map has no input for, marks no input.
+    {
+      title: "a failure naming no field",
+      request: monthlyRequest,
+      status: 500,
+      error: { message: writeFailed.message },
+      marked: null,
+    },
+    {
+      title: "a failure naming no input of the map",
+      request: monthlyRequest,
+      status: 500,
+      error: { message: writeFailed.message, field: "constructor" },
+      marked: null,
+    },
+  ])(
+    "the $status for $title marks the input it names, if any, its message for screen readers only",
+    async ({ request, status, error, marked }) => {
+      stubApi({ status, body: error });
+      renderScreen();
+      fill(request);
+      await pressEnter();
+
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(error.message);
+        if (marked === null) {
+          expectUnmarked();
+        } else {
+          expectMarked(marked, error.message);
+        }
+      });
+      expect(shown()).toEqual(typed(request));
+      await waitFor(() => {
+        expect(document.activeElement).toBe(inputOf(marked ?? MONTHLY));
+      });
+    },
+  );
+
+  it("drops a server mark when corrected and at the next ENTER; a 200 leaves none", async () => {
+    /** {@link noReportRequest} with Custom chosen, its end date still blank. */
+    const noEndRequest: components["schemas"]["ReportRequest"] = {
+      ...noReportRequest,
+      custom: "X",
+    };
+    const requests = stubApi(
+      { status: 400, body: noReport },
+      { status: 400, body: noEndMonth },
+      { status: 200, body: customSubmitted },
+    );
+    renderScreen();
+    fill(noReportRequest);
+    await pressEnter();
+    await waitFor(() => {
+      expect(messageRow().textContent).toBe(noReport.message);
+      expectMarked(MONTHLY, noReport.message);
+    });
+
+    // An edit of another input keeps the mark; the next ENTER drops it, and its answer marks the
+    // input it names.
+    fireEvent.change(inputOf("Custom (Date Range)"), { target: { value: "X" } });
+    await settle();
+    expectMarked(MONTHLY, noReport.message);
+    await pressEnter();
+    await waitFor(() => {
+      expect(messageRow().textContent).toBe(noEndMonth.message);
+      expectMarked("End Date month", noEndMonth.message);
+    });
+
+    // Correcting the marked input drops its mark at once; the row keeps the server's message
+    // until the next answer replaces it.
+    fireEvent.change(inputOf("End Date month"), { target: { value: "07" } });
+    await waitFor(() => {
+      expectUnmarked();
+    });
+    expect(messageRow().textContent).toBe(noEndMonth.message);
+    fireEvent.change(inputOf("End Date day"), { target: { value: "06" } });
+    fireEvent.change(inputOf("End Date year"), { target: { value: "2022" } });
+    await pressEnter();
+
+    await waitFor(() => {
+      expect(messageRow().textContent).toBe(customSubmitted.message);
+    });
+    expectUnmarked();
+    expect(shown()).toEqual(BLANK);
+    await settle();
+    expect(await bodies(requests)).toEqual([noReportRequest, noEndRequest, customRequest]);
   });
 
   it("sends no second request for an ENTER while the first is in flight", async () => {
@@ -874,5 +1107,38 @@ describe("CORPT00 transaction reports screen", () => {
     expect(within(stub).getByTestId("stub-state").textContent).toBe("null");
     await settle();
     expect(requests).toHaveLength(0);
+  });
+});
+
+// The sign-on guard lives in the application's route tree, not in the screen, so this group
+// renders that tree rather than the screen beside stubs.
+describe("CORPT00 behind the route guard", () => {
+  // audit: CORPT00C-001
+  it("sends a browser with no session from /reports to /signon, with no request", async () => {
+    clearSession();
+    const requests = stubApi();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.CORPT00] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "Transaction Reports" })).toBeNull();
+    expect(screen.queryByLabelText(MONTHLY)).toBeNull();
+    await settle();
+    expect(requests).toHaveLength(0);
+    router.dispose();
   });
 });

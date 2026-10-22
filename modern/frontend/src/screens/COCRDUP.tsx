@@ -7,7 +7,14 @@ import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import {
   KEY_ROWS,
@@ -368,7 +375,10 @@ function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean) {
 
 /**
  * One map field as two grid cells: its literal as the `FormLabel` and its `Input` in the
- * `FormControl`. `FormItem` is `contents`, so both cells sit on the `FieldGrid` itself.
+ * `FormControl`. `FormItem` is `contents`, so both cells sit on the `FieldGrid` itself. The
+ * field's error is its `FormMessage`, which the input's `aria-describedby` names while the field
+ * is invalid. The `ERRMSG` row is the map's one visible message, so the `FormMessage` is for
+ * assistive technology only: `sr-only` takes it out of the grid flow, and it fills no cell.
  */
 function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNode }): ReactNode {
   return (
@@ -379,6 +389,7 @@ function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNod
       <GridCell {...spec.inputCell}>
         <FormControl>{children}</FormControl>
       </GridCell>
+      <FormMessage className="sr-only" />
     </FormItem>
   );
 }
@@ -430,11 +441,16 @@ export function COCRDUP(): ReactNode {
 
   /**
    * Marks the field a server message names: red, `*` when blank, cursor there (COCRDUPC-046).
-   * `flag` is false for the no-change answer, which only moves the cursor to the name. Without
-   * a field the cursor goes to the account where it is enterable (`WHEN OTHER`).
+   * The field error carries the message the error row shows, so the field's `FormMessage` reads
+   * it with the input. `flag` is false for the no-change answer, which only moves the cursor to
+   * the name. Without a field the cursor goes to the account where it is enterable (`WHEN OTHER`).
    */
-  function markField(field: string | null | undefined, state: CocrdupKeyState, flag: boolean) {
-    const name = formFieldOf(field);
+  function markField(
+    error: components["schemas"]["ScreenError"],
+    state: CocrdupKeyState,
+    flag: boolean,
+  ) {
+    const name = formFieldOf(error.field);
     if (name === undefined) {
       pendingFocus.current = KEYS_ENTERABLE.has(state) ? "acctId" : undefined;
       return;
@@ -447,12 +463,12 @@ export function COCRDUP(): ReactNode {
       if (keyForm.getValues(name).trim() === "") {
         keyForm.setValue(name, "*");
       }
-      keyForm.setError(name, { type: "server" });
+      keyForm.setError(name, { type: "server", message: error.message });
     } else {
       if (detailForm.getValues(name).trim() === "") {
         detailForm.setValue(name, "*");
       }
-      detailForm.setError(name, { type: "server" });
+      detailForm.setError(name, { type: "server", message: error.message });
     }
   }
 
@@ -515,7 +531,7 @@ export function COCRDUP(): ReactNode {
         info: INFO.S,
         saveEnabled: false,
       });
-      markField(error.field, "S", true);
+      markField(error, "S", true);
       return;
     }
     setModel((current) => ({
@@ -525,7 +541,7 @@ export function COCRDUP(): ReactNode {
       info: INFO[otherwise],
       saveEnabled: false,
     }));
-    markField(error.field, otherwise, true);
+    markField(error, otherwise, true);
   }
 
   /** Endpoint 9 by `card_ref`, as the list entry and the 409 refresh call it (COCRDUPC-002). */
@@ -626,7 +642,7 @@ export function COCRDUP(): ReactNode {
       info: INFO[state],
       saveEnabled: false,
     });
-    markField(error.field, state, message !== NO_CHANGES_DETECTED);
+    markField(error, state, message !== NO_CHANGES_DETECTED);
   }
 
   /** ENTER (validate) or F5 (save) with the card shown: endpoint 10 by `card_ref`. */

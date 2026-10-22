@@ -60,19 +60,27 @@
 //!
 //! A CP00 request body holds a full card number. Every request span is the `mq.message` span
 //! of `runtime::telemetry::message_span`, which records the queue and the `message_id` and
-//! `correlation_id` as `runtime::telemetry::ScreenedText` shows them, one `*` per byte: the
-//! requester chooses both and either can be a card number, an SSN or a password, so the span
-//! records only whether each is present and its length, never its text. Events here name the
-//! queue, the outcome and the [`AmqpError`] or [`PublishFailure`] text, never a body byte or a
-//! record. The settlement event adds only the `redelivered` flag and the body length in bytes,
-//! and repeats neither ID: every line written inside the span already shows both, screened.
+//! `correlation_id` as `runtime::telemetry::ScreenedText` shows them under the worker's
+//! `runtime::telemetry::IdKey`: their base64url HMAC-SHA256, which matches every line about one
+//! request and the reply that copies its `correlation_id`. Each worker builds that key from its
+//! `CARDDEMO_AMQP_URL`, exactly as it connects with it: anyone who holds the broker credentials
+//! can already read every request and its properties from the broker, so the digest discloses
+//! nothing its key holder cannot read directly and is exactly as protected as the messages it
+//! identifies, which an unkeyed hash of a card number, open to brute force, would not be. The
+//! URL itself is never logged. The requester chooses both IDs and either can be a card number,
+//! an SSN or a password, so the span never records their text. A CP00 reply's `message_id`,
+//! which `crate::ids` generates, is recorded verbatim on the same span as `reply_message_id`.
+//! Events here name the queue, the outcome and the [`AmqpError`] or
+//! [`PublishFailure`] text, never a body byte or a record. The settlement event adds only the
+//! `redelivered` flag and the body length in bytes, and repeats no ID: every line written inside
+//! the span already shows them.
 
 use std::error::Error;
 use std::fmt;
 use std::time::Duration;
 
 use lapin::{BasicProperties, Connection};
-use runtime::telemetry;
+use runtime::telemetry::{self, IdKey};
 use tracing::Instrument;
 
 use crate::Stop;
@@ -106,8 +114,7 @@ pub enum Processed {
     ErrorRouted,
     /// CP00 rejected the request with `requeue: false`, and the dead-letter arguments of its
     /// request queue moved it to `CARD.DEMO.DEADLETTER.PAUTH`, where it is retained: an
-    /// unparseable card number, an unconfirmed reply (`M004`) or a failed store read
-    /// (COPAUA0C-006, COPAUA0C-117).
+    /// unparseable card number or an unconfirmed reply (`M004`) (COPAUA0C-006, COPAUA0C-117).
     DeadLettered,
     /// Neither the CDRD or CDRA reply nor its error message was confirmed, so the request was
     /// rejected with `requeue: false`. Those request queues carry no dead-letter arguments, so
@@ -361,27 +368,34 @@ pub(crate) fn check_request_queue(
 ///
 /// - The span is `runtime::telemetry::message_span` with the request's `message_id` and
 ///   `correlation_id` as [`Request::screened_message_id`] and
-///   [`Request::screened_correlation_id`] give them, one `*` per byte, so no field holds the text
-///   of either ID.
+///   [`Request::screened_correlation_id`] give them under `id_key`, the worker's key of its
+///   `CARDDEMO_AMQP_URL`: each ID's base64url HMAC-SHA256 under it, so no field holds the text of
+///   either ID and every request's span can be matched to its other lines. `handling` may record
+///   the reply's generated `message_id` on the span
+///   (`runtime::telemetry::record_reply_message_id`).
 /// - When `handling` returns [`Processed::Replied`], [`Processed::ErrorRouted`],
 ///   [`Processed::DeadLettered`] or [`Processed::Discarded`], one `INFO` event inside the span
 ///   records `queue`, `outcome` (`replied`, `error-routed`, `dead-lettered` or `discarded`),
 ///   `redelivered`, which shows a request the broker delivered before, and `body_len`, the
-///   body's length in bytes. The event repeats neither ID, which the span around it shows
-///   screened.
+///   body's length in bytes. The event repeats no ID, which the span around it shows.
 /// - [`Processed::Requeued`] adds no event here: [`drive`] warns of it after the span, as it
 ///   reopens the channels. [`Processed::Idle`] never reaches it, as no request was taken.
 ///
 /// No field of the span or the event holds a body byte or the `reply_to`. The future is `Send`
 /// whenever `handling` is, as [`Step::process_next`] requires.
-pub(crate) async fn in_message_span<F>(queue: &str, request: &Request, handling: F) -> Processed
+pub(crate) async fn in_message_span<F>(
+    queue: &str,
+    request: &Request,
+    id_key: &IdKey,
+    handling: F,
+) -> Processed
 where
     F: Future<Output = Processed>,
 {
     let span = telemetry::message_span(
         queue,
-        request.screened_message_id(),
-        request.screened_correlation_id(),
+        request.screened_message_id(Some(id_key)),
+        request.screened_correlation_id(Some(id_key)),
     );
     async {
         let processed = handling.await;
@@ -715,6 +729,7 @@ async fn acknowledged<A: Acknowledger>(
 
 #[cfg(test)]
 mod tests {
+    use runtime::telemetry::{IdKey, ScreenedText};
     use test_support::trace_capture;
 
     use super::{AMQP_QUEUE_NAME_LEN, Processed, cdrd, check_request_queue, cp00, in_message_span};
@@ -746,6 +761,15 @@ mod tests {
             (Processed::Discarded, Some("discarded"), true),
             (Processed::Requeued, None, true),
         ];
+        // The worker's key, made from its `CARDDEMO_AMQP_URL` (here the local default), and how
+        // the span shows each ID: its base64url HMAC-SHA256 under it.
+        let amqp_url = "amqp://carddemo:carddemo@localhost:5672/%2f";
+        let id_key = IdKey::new(amqp_url);
+        let shown_message_id = ScreenedText::keyed(&card, &id_key).to_string();
+        let shown_correlation_id = ScreenedText::keyed(&correlation_id, &id_key).to_string();
+        for digest in [&shown_message_id, &shown_correlation_id] {
+            assert_eq!(digest.len(), 43, "{digest}");
+        }
         for (processed, outcome, redelivered) in cases {
             let request = Request {
                 delivery_tag: 5,
@@ -757,7 +781,7 @@ mod tests {
             };
 
             let capture = trace_capture::capture();
-            let returned = in_message_span(QUEUE, &request, async { processed }).await;
+            let returned = in_message_span(QUEUE, &request, &id_key, async { processed }).await;
             assert_eq!(returned, processed);
 
             let lines = capture.lines();
@@ -774,8 +798,8 @@ mod tests {
                 for member in [
                     r#""level":"INFO""#.to_owned(),
                     r#""name":"mq.message""#.to_owned(),
-                    format!(r#""message_id":"{}""#, "*".repeat(card.len())),
-                    format!(r#""correlation_id":"{}""#, "*".repeat(correlation_id.len())),
+                    format!(r#""message_id":"{shown_message_id}""#),
+                    format!(r#""correlation_id":"{shown_correlation_id}""#),
                 ] {
                     assert!(event.contains(&member), "{member} missing from {event}");
                 }
@@ -801,13 +825,14 @@ mod tests {
                 assert_eq!(lines.len(), 2, "{processed:?}: {lines:?}");
             }
 
-            // The protected values, and the body's fields in the comma-delimited context they
-            // have in the body, so that a timestamp's digits cannot match them.
+            // The protected values, the key's URL, and the body's fields in the comma-delimited
+            // context they have in the body, so that a timestamp's digits cannot match them.
             let text = capture.text();
             for value in [
                 card.as_str(),
                 ssn.as_str(),
                 password.as_str(),
+                amqp_url,
                 "220718,",
                 ",102030,",
             ] {

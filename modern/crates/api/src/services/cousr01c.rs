@@ -165,7 +165,7 @@ fn hashed<T>(
     match joined {
         Ok((record, Ok(password_hash))) => Ok((record, password_hash)),
         Ok((_, Err(error))) => {
-            tracing::warn!(
+            tracing::error!(
                 program = PROGRAM,
                 paragraph = ENTER_PARAGRAPH,
                 error = %error,
@@ -174,7 +174,7 @@ fn hashed<T>(
             Err(ServiceError::Rule(cousr01c::write_failure()))
         }
         Err(error) => {
-            tracing::warn!(
+            tracing::error!(
                 program = PROGRAM,
                 paragraph = ENTER_PARAGRAPH,
                 panicked = error.is_panic(),
@@ -196,7 +196,7 @@ fn write_answer(error: &PersistenceError) -> UserAddFailure {
     if error.is_duplicate() {
         cousr01c::duplicate_user_id()
     } else {
-        tracing::warn!(
+        tracing::error!(
             program = PROGRAM,
             paragraph = WRITE_PARAGRAPH,
             error = %error,
@@ -483,7 +483,7 @@ mod tests {
                 return Err(format!("{shown}: {} lines", lines.len()).into());
             };
             for expected in [
-                r#""level":"WARN""#,
+                r#""level":"ERROR""#,
                 r#""program":"COUSR01C""#,
                 r#""paragraph":"WRITE-USER-SEC-FILE""#,
                 cause.as_str(),
@@ -528,7 +528,7 @@ mod tests {
                 return Err(format!("{texts:?}: {} lines", lines.len()).into());
             };
             for expected in [
-                r#""level":"WARN""#,
+                r#""level":"ERROR""#,
                 r#""program":"COUSR01C""#,
                 r#""paragraph":"PROCESS-ENTER-KEY""#,
             ]

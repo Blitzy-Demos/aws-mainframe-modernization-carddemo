@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+  useNavigate,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COTRN00 } from "./COTRN00";
 
 /**
@@ -338,6 +346,33 @@ function errorRow(): HTMLElement {
   return rows[0];
 }
 
+/**
+ * The message element `field`'s `aria-describedby` names. The form names it only while the
+ * field is invalid, so this is `undefined` for a valid field and fails when the name it gives
+ * resolves to no element.
+ */
+function fieldMessage(field: HTMLElement): HTMLElement | undefined {
+  const id = field
+    .getAttribute("aria-describedby")
+    ?.split(" ")
+    .find((name) => name.endsWith("-form-item-message"));
+  if (id === undefined) {
+    return undefined;
+  }
+  const message = document.getElementById(id);
+  expect(message).not.toBeNull();
+  return message ?? undefined;
+}
+
+/** Asserts that `text` is visible once, in the error row; any other copy is `sr-only`. */
+function expectShownOnceInErrorRow(text: string): void {
+  const visible = screen
+    .getAllByText(text)
+    .filter((element) => element.closest(".sr-only") === null);
+  expect(visible).toHaveLength(1);
+  expect(errorRow().contains(visible[0])).toBe(true);
+}
+
 /** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
 function headerField(name: string): string | null | undefined {
   return document.querySelector(`[data-field="${name}"]`)?.textContent;
@@ -443,6 +478,51 @@ describe("COTRN00 List Transactions", () => {
       expect(key.getAttribute("type")).toBe("button");
       expect(key.getAttribute("data-variant")).toBe("outline");
       expect(key.getAttribute("data-size")).toBe("sm");
+    }
+  });
+
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", async () => {
+    // `ScreenShell` realises each header value field as read-only text in its title-row cell
+    // rather than as an `Input` with `readOnly`, so these rows are proved on that cell. The values
+    // it shows are proved under COTRN00-090 to COTRN00-095.
+    // audit: COTRN00-002
+    // audit: COTRN00-003
+    // audit: COTRN00-005
+    // audit: COTRN00-007
+    // audit: COTRN00-008
+    // audit: COTRN00-010
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await answered(sent, 1);
+
+    const header = document.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = document.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
     }
   });
 
@@ -844,6 +924,67 @@ describe("COTRN00 List Transactions", () => {
     expect(errorRow().textContent).toBe(BOTTOM_REACHED);
   });
 
+  // audit: COTRN00-088
+  it.each([
+    {
+      clearance: "a correction, which sends nothing",
+      act: () => {
+        typeInto(searchField(), tranId(11));
+      },
+      replies: [],
+      requests: 2,
+      shown: NOT_NUMERIC,
+    },
+    {
+      clearance: "the next page",
+      act: () => {
+        press("F8=Forward");
+      },
+      replies: [json(200, SECOND_PAGE)],
+      requests: 3,
+      shown: BOTTOM_REACHED,
+    },
+    {
+      clearance: "the next failure, which names no field",
+      act: () => {
+        press("F7=Backward");
+      },
+      replies: [json(500, LOOKUP_ERROR)],
+      requests: 3,
+      shown: LOOKUP_FAILED,
+    },
+  ])(
+    "a 400 ScreenError on start_tran_id marks the search field invalid with the server message until $clearance",
+    async ({ act, replies, requests, shown }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE), json(400, NOT_NUMERIC_ERROR), ...replies);
+      renderList();
+      await answered(sent, 1);
+      expect(searchField().getAttribute("aria-invalid")).toBe("false");
+
+      typeInto(searchField(), "12AB");
+      press("ENTER=Continue");
+      await answered(sent, 2);
+      expect(sent[1].query.start_tran_id).toBe("12AB");
+      // The input is invalid and its description names the field message, which holds the
+      // server's text for assistive technology only: the error row is the one place it shows.
+      expect(searchField().getAttribute("aria-invalid")).toBe("true");
+      const message = fieldMessage(searchField());
+      expect(message?.textContent).toBe(NOT_NUMERIC);
+      expect(message?.classList.contains("sr-only")).toBe(true);
+      expectShownOnceInErrorRow(NOT_NUMERIC);
+      expect(document.activeElement).toBe(searchField());
+
+      act();
+      await answered(sent, requests);
+      await waitFor(() => {
+        expect(searchField().getAttribute("aria-invalid")).toBe("false");
+      });
+      expect(fieldMessage(searchField())).toBeUndefined();
+      // The error row keeps the server's message until the next answer replaces it.
+      expect(errorRow().textContent).toBe(shown);
+    },
+  );
+
   it.each([
     { failure: "a 500 ScreenError", reply: json(500, LOOKUP_ERROR), shown: LOOKUP_FAILED },
     {
@@ -1090,11 +1231,13 @@ describe("COTRN00 List Transactions", () => {
       shown: "String must contain at most 1 character(s)",
     },
   ])(
-    "ENTER with more characters in $field than the map allows sends nothing",
+    "ENTER with more characters in $field than the map allows sends nothing and marks the field invalid with the schema message",
     async ({ target, value, shown }) => {
       const sent = stubFetch(json(200, FIRST_PAGE));
       renderList();
       await answered(sent, 1);
+      expect(target().getAttribute("aria-invalid")).toBe("false");
+      expect(fieldMessage(target())).toBeUndefined();
 
       typeInto(target(), value);
       press("ENTER=Continue");
@@ -1104,6 +1247,49 @@ describe("COTRN00 List Transactions", () => {
       });
       expect(sent).toHaveLength(1);
       expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
+      // The field's message, which its description names, holds the schema text for assistive
+      // technology only; the error row is the one place it shows.
+      expect(target().getAttribute("aria-invalid")).toBe("true");
+      const message = fieldMessage(target());
+      expect(message?.textContent).toBe(shown);
+      expect(message?.classList.contains("sr-only")).toBe(true);
+      expectShownOnceInErrorRow(shown);
     },
   );
+});
+
+// The sign-on guard lives in the application's route tree, not in the screen, so this group
+// renders that tree rather than the screen beside stubs.
+describe("COTRN00 behind the route guard", () => {
+  // audit: COTRN00C-001
+  it("sends a visitor with no session from /transactions to /signon, with no request", async () => {
+    clearSession();
+    const sent = stubFetch();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRN00] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "List Transactions" })).toBeNull();
+    expect(screen.queryByLabelText("Search Tran ID:")).toBeNull();
+    // Gives a request the guarded screen would send time to leave before the count.
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+    expect(sent).toHaveLength(0);
+    router.dispose();
+  });
 });

@@ -449,9 +449,10 @@ function headerField(container: HTMLElement, name: string): string | null {
  * `COPAU01-009`): each `INITIAL` with the grid cell of its `POS` and `LENGTH`, and the value
  * field it labels with that field's cell.
  *
- * The six value rows of those lines (`COPAU01-002`, `-003`, `-005`, `-007`, `-008`, `-010`) are
- * not tagged: they describe read-only `Input` elements, while `ScreenShell` renders the header
- * values as plain text. Their content rows, `COPAU01-055` to `COPAU01-060`, are proved instead.
+ * The six value rows of those lines (`COPAU01-002`, `-003`, `-005`, `-007`, `-008`, `-010`)
+ * describe read-only `Input` elements, which `ScreenShell` renders as read-only text; their
+ * placement and read-only state are proved by {@link expectHeaderValues}, and their content rows,
+ * `COPAU01-055` to `COPAU01-060`, by the values shown.
  */
 const HEADER_LABELS = [
   {
@@ -487,6 +488,83 @@ function cardHeader(container: HTMLElement): HTMLElement {
     throw new Error("the screen renders no CardHeader");
   }
   return header;
+}
+
+/**
+ * Asserts the header value fields of rows 1 and 2 against their rows of `modern/audit/screens.md`
+ * (COPAU01-002, -003, -005, -007, -008 and -010). Each entry of `fields` is the BMS name, the `POS`
+ * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
+ *
+ * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
+ * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
+ * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
+ * or output fields). The assertions prove what the rows require of that text: it is read-only and
+ * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
+ * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
+ * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
+ * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ */
+function expectHeaderValues(
+  container: HTMLElement,
+  fields: readonly {
+    readonly name: string;
+    readonly row: number;
+    readonly col: number;
+    readonly length: number;
+    readonly value: string;
+    readonly title: boolean;
+  }[],
+): void {
+  const header = cardHeader(container);
+  // The header exposes no textbox that takes typing.
+  expect(
+    within(header)
+      .queryAllByRole("textbox")
+      .filter((box) =>
+        box instanceof HTMLInputElement || box instanceof HTMLTextAreaElement
+          ? !box.readOnly
+          : box.getAttribute("aria-readonly") !== "true",
+      ),
+  ).toEqual([]);
+  for (const { name, row, col, length, value, title } of fields) {
+    const found = container.querySelectorAll(`[data-field="${name}"]`);
+    expect(found).toHaveLength(1);
+    const element = found[0];
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`the screen renders no header field ${name}`);
+    }
+    // Placement: in the CardHeader title rows, not in the body or the footer.
+    expect(element.closest('[data-slot="card-header"]')).toBe(header);
+    expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+    // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
+    expect(element.parentElement?.className).toBe(
+      `row-start-${row} col-start-${col} col-span-${length}`,
+    );
+    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
+    expect(shown).toBe(value);
+    expect(shown).toHaveLength(length);
+    // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
+    // tab stop.
+    const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+    expect(
+      nodes.filter(
+        (node) =>
+          node instanceof HTMLSelectElement ||
+          ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) &&
+            !node.readOnly) ||
+          node.closest('[contenteditable]:not([contenteditable="false"])') !== null,
+      ),
+    ).toEqual([]);
+    expect(element.tabIndex).toBeLessThan(0);
+    expect(
+      nodes.filter(
+        (node) => (node instanceof HTMLElement || node instanceof SVGElement) && node.tabIndex >= 0,
+      ),
+    ).toEqual([]);
+    // Tokens: the foreground colour, with emphasis only on a YELLOW title.
+    expect(element.classList.contains("text-foreground")).toBe(true);
+    expect(element.classList.contains("font-semibold")).toBe(title);
+  }
 }
 
 /** The row-24 button labelled `label`, checked to be a plain `outline`, `sm` button. */
@@ -775,6 +853,48 @@ describe("COPAU01 authorization detail screen", () => {
     });
     expect(headerField(container, "CURDATE")).toBe("12/31/25");
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
+  });
+
+  // audit: COPAU01-002
+  // audit: COPAU01-003
+  // audit: COPAU01-005
+  // audit: COPAU01-007
+  // audit: COPAU01-008
+  // audit: COPAU01-010
+  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+    const requests = stubApi();
+    const { container } = renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(shown()).toEqual(SHOWN_SELECTED);
+    });
+
+    expectHeaderValues(container, [
+      { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CPVD", title: false },
+      {
+        name: "TITLE01",
+        row: 1,
+        col: 21,
+        length: 40,
+        value: "      AWS Mainframe Modernization       ",
+        title: true,
+      },
+      { name: "CURDATE", row: 1, col: 71, length: 8, value: "01/02/24", title: false },
+      { name: "PGMNAME", row: 2, col: 7, length: 8, value: "COPAUS1C", title: false },
+      {
+        name: "TITLE02",
+        row: 2,
+        col: 21,
+        length: 40,
+        value: "              CardDemo                  ",
+        title: true,
+      },
+      { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
+    ]);
+    // Only the entry read was sent, and the stub answered it in process.
+    expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
   });
 
   // audit: COPAUS1C-003

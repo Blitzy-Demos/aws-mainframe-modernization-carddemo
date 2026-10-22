@@ -318,7 +318,7 @@ fn store_result(error: &PersistenceError) -> StoreResult {
 
 /// Records a store error for the operator; the response carries only the program's message.
 fn log_store_error(paragraph: &'static str, error: &PersistenceError) {
-    tracing::warn!(paragraph, error = %error, "COTRTUPC store call failed");
+    tracing::error!(paragraph, error = %error, "COTRTUPC store call failed");
 }
 
 /// The service's answer to a step: a failure becomes the error, which carries its audited

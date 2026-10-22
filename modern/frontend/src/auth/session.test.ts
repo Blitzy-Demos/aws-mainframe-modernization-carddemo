@@ -1,12 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import {
   SESSION_KEY,
   type StoredSession,
   clearSession,
   getSession,
+  getSessionSnapshot,
   getToken,
   isAdmin,
   setSession,
+  subscribeSession,
 } from "./session";
 
 /**
@@ -156,6 +158,108 @@ describe("clearSession", () => {
   });
 });
 
+describe("subscribeSession and getSessionSnapshot", () => {
+  /** Registers `listener` for the current test only, and returns its remover. */
+  function subscribe(listener: () => void): () => void {
+    const unsubscribe = subscribeSession(listener);
+    onTestFinished(unsubscribe);
+    return unsubscribe;
+  }
+
+  it("notifies every listener once per setSession and clearSession, until it unsubscribes", () => {
+    const first = vi.fn();
+    const second = vi.fn();
+    const unsubscribeFirst = subscribe(first);
+    subscribe(second);
+    // The same function registered again is held once, so it is still called once per change.
+    subscribe(second);
+
+    setSession(TOKEN, "USER0001", "U");
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    clearSession();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(2);
+
+    unsubscribeFirst();
+    setSession(TOKEN, "ADMIN001", "A");
+    clearSession();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(4);
+  });
+
+  it("notifies after the change, so a listener reads the new session", () => {
+    const seen: Array<StoredSession | null> = [];
+    subscribe(() => {
+      seen.push(getSession());
+    });
+
+    setSession(TOKEN, "ADMIN001", "A");
+    clearSession();
+
+    expect(seen).toEqual([{ token: TOKEN, userId: "ADMIN001", userType: "A" }, null]);
+  });
+
+  it("returns the identical snapshot until the session changes", () => {
+    expect(getSessionSnapshot()).toBeNull();
+    expect(getSessionSnapshot()).toBe(getSessionSnapshot());
+
+    setSession(TOKEN, "USER0001", "U");
+    const signedOn = getSessionSnapshot();
+    expect(signedOn).toBe(store.getItem(SESSION_KEY));
+    expect(signedOn).not.toBeNull();
+    expect(getSessionSnapshot()).toBe(signedOn);
+
+    setSession(OTHER_TOKEN, "USER0001", "U");
+    expect(getSessionSnapshot()).not.toBe(signedOn);
+
+    clearSession();
+    expect(getSessionSnapshot()).toBeNull();
+  });
+
+  it("returns a null snapshot when reading storage throws", () => {
+    setSession(TOKEN, "USER0001", "U");
+    vi.spyOn(store, "getItem").mockImplementation(() => {
+      throw new DOMException("storage blocked", "SecurityError");
+    });
+
+    expect(() => getSessionSnapshot()).not.toThrow();
+    expect(getSessionSnapshot()).toBeNull();
+  });
+
+  it("lets a throwing listener stop neither the other listeners nor the caller", () => {
+    const failing = vi.fn(() => {
+      throw new Error("listener failure");
+    });
+    const after = vi.fn();
+    subscribe(failing);
+    subscribe(after);
+
+    expect(() => setSession(TOKEN, "USER0001", "U")).not.toThrow();
+    expect(getSession()).toEqual({ token: TOKEN, userId: "USER0001", userType: "U" });
+    expect(() => clearSession()).not.toThrow();
+    expect(getSession()).toBeNull();
+    expect(failing).toHaveBeenCalledTimes(2);
+    expect(after).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    { method: "setItem", name: "setSession", change: () => setSession(TOKEN, "USER0001", "U") },
+    { method: "removeItem", name: "setSession", change: () => setSession(TOKEN, "USER0001", "U") },
+    { method: "removeItem", name: "clearSession", change: () => clearSession() },
+  ] as const)("still notifies when $method throws during $name", ({ method, change }) => {
+    const listener = vi.fn();
+    subscribe(listener);
+    vi.spyOn(store, method).mockImplementation(() => {
+      throw new DOMException("storage blocked", "SecurityError");
+    });
+
+    expect(change).not.toThrow();
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("without reachable sessionStorage", () => {
   it.each([
     {
@@ -175,13 +279,17 @@ describe("without reachable sessionStorage", () => {
         });
       },
     },
-  ])("never throws and holds no session when $why", ({ install }) => {
+  ])("never throws, holds no session and still notifies when $why", ({ install }) => {
+    const listener = vi.fn();
+    onTestFinished(subscribeSession(listener));
     install();
 
     expect(() => setSession(TOKEN, "USER0001", "U")).not.toThrow();
     expect(getSession()).toBeNull();
     expect(getToken()).toBeNull();
+    expect(getSessionSnapshot()).toBeNull();
     expect(() => clearSession()).not.toThrow();
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 });
 

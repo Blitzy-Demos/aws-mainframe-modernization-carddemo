@@ -22,9 +22,10 @@ import { COBIL00 } from "./COBIL00";
  * `PIC +9999999999.99` edits (ARITH-019); it is compared as text, never read as an amount. The
  * endpoint carries no card number, and no SSN or password appears.
  *
- * Rows `COBIL00-001` to `COBIL00-010` place the header labels in a `Label` and the header values
- * in a read-only `Input`, while the shared `ScreenShell` renders both as plain text, so those rows
- * are not tagged here; their content rows (`COBIL00-025` to `COBIL00-030`) are.
+ * Of the header rows, the label rows `COBIL00-001`, `-004`, `-006` and `-009` are proved by NAV
+ * (`frontend/e2e/nav.spec.ts`). The value rows `COBIL00-002`, `-003`, `-005`, `-007`, `-008` and
+ * `-010` are tagged here, on the read-only title-row cells the shared `ScreenShell` renders them
+ * in, and so are their content rows (`COBIL00-025` to `COBIL00-030`).
  */
 
 const ENDPOINT = "/api/v1/bill-payments";
@@ -389,6 +390,33 @@ async function settle(): Promise<void> {
   });
 }
 
+/** Retypes the input `element` returns with `value`, then lets the form re-validate it. */
+function retype(element: () => HTMLInputElement, value: string): () => Promise<void> {
+  return async () => {
+    fireEvent.change(element(), { target: { value } });
+    await settle();
+  };
+}
+
+/** Presses ENTER and waits until the message row shows `text`. */
+function enterUntil(text: string): () => Promise<void> {
+  return async () => {
+    pressEnter();
+    await waitFor(() => {
+      expect(messageRow().textContent).toBe(text);
+    });
+  };
+}
+
+/** Presses F4=Clear and waits until the screen is empty. */
+async function clearScreen(): Promise<void> {
+  fireEvent.click(pfKeyButton("F4=Clear"));
+  await waitFor(() => {
+    expect(shown()).toEqual(BLANK);
+  });
+}
+
+
 beforeEach(() => {
   setSession("test-token", "USER0001", "U");
 });
@@ -547,6 +575,50 @@ describe("COBIL00 bill payment screen", () => {
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
   });
 
+  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
+  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
+  // are proved under COBIL00-025 to COBIL00-030.
+  // audit: COBIL00-002
+  // audit: COBIL00-003
+  // audit: COBIL00-005
+  // audit: COBIL00-007
+  // audit: COBIL00-008
+  // audit: COBIL00-010
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
+    stubApi();
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+
+    const header = container.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
+    }
+  });
+
   // audit: COBIL00C-035
   // audit: COBIL00C-037
   // audit: COBIL00-017
@@ -675,11 +747,96 @@ describe("COBIL00 bill payment screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(inputNamed(row.error.field));
     });
+    // The input the error names, and only it, is marked invalid; the text shows once, in ERRMSG.
+    const named = inputNamed(row.error.field);
+    for (const field of [acctInput(), confirmInput()]) {
+      expect(field.getAttribute("aria-invalid")).toBe(String(field === named));
+    }
+    expect(screen.getAllByText(row.error.message)).toHaveLength(1);
 
     expect(await bodies(requests)).toStrictEqual([
       { acct_id: ACCT, confirm: "" },
       { acct_id: row.acct, confirm: row.confirm },
     ]);
+  });
+
+  // The replacement's form state, which no audit row states: the input a `ScreenError` names stays
+  // marked invalid until it is retyped, the next ENTER is answered, or F4 clears the screen, and
+  // no 200 marks an input. A failed read is answered 500 once, then the read succeeds.
+  it.each([
+    {
+      title: "the account is retyped",
+      acct: "",
+      confirm: "",
+      answer: billPayment,
+      error: emptyAcct,
+      clear: retype(acctInput, ACCT),
+      sent: 0,
+    },
+    {
+      title: "the confirmation is retyped",
+      acct: ACCT,
+      confirm: "X",
+      answer: billPayment,
+      error: invalidConfirm,
+      clear: retype(confirmInput, ""),
+      sent: 0,
+    },
+    {
+      title: "the next ENTER shows the balance",
+      acct: ACCT,
+      confirm: "",
+      answer: () => json(500, lookupFailed),
+      error: lookupFailed,
+      clear: enterUntil("Confirm to make a bill payment..."),
+      sent: 1,
+    },
+    {
+      title: "the next ENTER pays",
+      acct: ACCT,
+      confirm: "Y",
+      answer: () => json(500, lookupFailed),
+      error: lookupFailed,
+      clear: enterUntil(PAID_MESSAGE),
+      sent: 1,
+    },
+    {
+      title: "F4 clears an account error",
+      acct: "",
+      confirm: "",
+      answer: billPayment,
+      error: emptyAcct,
+      clear: clearScreen,
+      sent: 0,
+    },
+    {
+      title: "F4 clears a confirmation error",
+      acct: ACCT,
+      confirm: "X",
+      answer: billPayment,
+      error: invalidConfirm,
+      clear: clearScreen,
+      sent: 0,
+    },
+  ])("marks the input a ScreenError names invalid until $title", async (row) => {
+    stubApi(undefined, row.answer);
+    renderScreen({ from: PATHS.COMEN01 });
+    typeInputs(row.acct, row.confirm);
+    pressEnter();
+    await waitFor(() => {
+      expect(errorText()).toBe(row.error.message);
+    });
+    expect(inputNamed(row.error.field).getAttribute("aria-invalid")).toBe("true");
+
+    // From here endpoint 15 answers as the fixtures do.
+    const requests = stubApi();
+    await row.clear();
+
+    await waitFor(() => {
+      expect(acctInput().getAttribute("aria-invalid")).toBe("false");
+      expect(confirmInput().getAttribute("aria-invalid")).toBe("false");
+    });
+    expect(requests).toHaveLength(row.sent);
   });
 
   // A failure of the replacement alone, which no audit row covers: the dev proxy answers an empty
@@ -702,6 +859,9 @@ describe("COBIL00 bill payment screen", () => {
     });
     expect(shown()).toEqual({ acct: ACCT, balance: BALANCE, confirm: "" });
     expect(document.activeElement).toBe(enter);
+    // A failure that names no field marks no input invalid.
+    expect(acctInput().getAttribute("aria-invalid")).toBe("false");
+    expect(confirmInput().getAttribute("aria-invalid")).toBe("false");
     expect(await bodies(requests)).toStrictEqual([{ acct_id: ACCT, confirm: "" }]);
   });
 

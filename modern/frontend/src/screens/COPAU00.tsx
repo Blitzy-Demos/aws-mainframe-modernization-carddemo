@@ -7,7 +7,14 @@ import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -55,6 +62,9 @@ const BLANK_SELECTOR = /^[ \u0000]*$/;
 /** COBOL `CDEMO-ACCT-ID IS NUMERIC` on `PIC 9(11)`: 11 ASCII digits (COPAUS0C-002). */
 const NUMERIC_ACCOUNT = /^[0-9]{11}$/;
 
+/** The one field endpoint 21 names in a `ScreenError` (`ScreenError.field`): the account. */
+const ACCT_ID_FIELD = "acct_id";
+
 /** Captions of map line 14 and the dashes of line 15, column by column (COPAU00-041 to -056). */
 const COLUMNS = [
   { caption: "Sel", dashes: "---" },
@@ -83,14 +93,24 @@ const FIELD = "w-auto min-w-full";
 const OUTPUT = `${FIELD} px-1 text-muted-foreground`;
 const CELL = "py-0 whitespace-pre text-muted-foreground";
 
+/** Entries of `CDEMO-CPVS-PAUKEY-PREV-PG PIC X(08) OCCURS 20 TIMES` (`COPAUS0C.cbl:120`). */
+const FIRST_KEY_PAGES = 20;
+
 /**
  * The paging state COPAUS0C keeps in `CDEMO-CPVS-INFO` of the COMMAREA between interactions
  * (COPAUS0C-039), kept here for as long as the screen is shown. It is program state, not a payload.
  *
  * - `account`: `CDEMO-ACCT-ID`, the account F7 and F8 page, never the field's current text.
  * - `pageNum`: `CDEMO-CPVS-PAGE-NUM`.
- * - `firstKeys`: `CDEMO-CPVS-PAUKEY-PREV-PG`, index `p - 1` holding page `p`'s first key. The
- *   COBOL table stops at 20 pages (COPAUS0C-050, HALTED(X-COPAUS0C-H3)); paging goes on here.
+ * - `firstKeys`: `CDEMO-CPVS-PAUKEY-PREV-PG`, the first key of each page by page number, for at
+ *   most {@link FIRST_KEY_PAGES} pages. A page read that shows a row stores its page `p`'s first
+ *   key and drops every later page and every page at or before `p - 20` (COPAUS0C-039). A later
+ *   page's key is always stored again before an F7 reads it, as F7 reads the page before the
+ *   page number (COPAUS0C-046). So while no page after the 20th has been shown since the page
+ *   number last became 0, every page from 1 to `p` is held, as in the COBOL table. From the 21st
+ *   page on the COBOL stores past its 20 entries (COPAUS0C-050, HALTED(X-COPAUS0C-H3)); paging
+ *   goes on here with the keys of the last 20 pages stored, which is not a parity result. Every
+ *   change of the page number to 0 empties it, because only keys stored after that are read.
  * - `lastKey`: `CDEMO-CPVS-PAUKEY-LAST`, the next F8's `page_key`.
  * - `nextPage`: `CDEMO-CPVS-NEXT-PAGE-FLG` = `'Y'`.
  * - `rowKeys`: `CDEMO-CPVS-AUTH-KEYS`, the key a selection on each row passes to COPAUS1C.
@@ -98,7 +118,7 @@ const CELL = "py-0 whitespace-pre text-muted-foreground";
 type CpvsPagingState = {
   readonly account: string | null;
   readonly pageNum: number;
-  readonly firstKeys: readonly string[];
+  readonly firstKeys: ReadonlyMap<number, string>;
   readonly lastKey: string | null;
   readonly nextPage: boolean;
   readonly rowKeys: readonly (string | null)[];
@@ -108,7 +128,7 @@ type CpvsPagingState = {
 const EMPTY_PAGING: CpvsPagingState = {
   account: null,
   pageNum: 0,
-  firstKeys: [],
+  firstKeys: new Map<number, string>(),
   lastKey: null,
   nextPage: false,
   rowKeys: Array.from({ length: ROWS }, () => null),
@@ -121,6 +141,27 @@ function accountFromRouteState(state: unknown): string | null {
   }
   const account = state.acct_id;
   return typeof account === "string" && NUMERIC_ACCOUNT.test(account) ? account : null;
+}
+
+/**
+ * `MOVE PA-AUTHORIZATION-KEY TO CDEMO-CPVS-PAUKEY-PREV-PG(CDEMO-CPVS-PAGE-NUM)` (COPAUS0C-039)
+ * over the window {@link CpvsPagingState} `firstKeys` describes: `key` becomes page `page`'s first
+ * key, and of the keys held only those of the {@link FIRST_KEY_PAGES} − 1 pages before `page` are
+ * kept. At most {@link FIRST_KEY_PAGES} entries are read and copied.
+ */
+function withFirstKey(
+  firstKeys: ReadonlyMap<number, string>,
+  page: number,
+  key: string,
+): ReadonlyMap<number, string> {
+  const kept = new Map<number, string>();
+  for (const [heldPage, heldKey] of firstKeys) {
+    if (heldPage < page && heldPage > page - FIRST_KEY_PAGES) {
+      kept.set(heldPage, heldKey);
+    }
+  }
+  kept.set(page, key);
+  return kept;
 }
 
 /**
@@ -137,14 +178,13 @@ function afterPageRead(
   const shown = page.rows.slice(0, ROWS);
   const first = shown.at(0);
   const pageNum = first === undefined ? state.pageNum : state.pageNum + 1;
-  const firstKeys = [...state.firstKeys];
-  if (first !== undefined) {
-    firstKeys[pageNum - 1] = first.auth_key;
-  }
   return {
     account: state.account,
     pageNum,
-    firstKeys,
+    firstKeys:
+      first === undefined
+        ? state.firstKeys
+        : withFirstKey(state.firstKeys, pageNum, first.auth_key),
     lastKey: shown.at(-1)?.auth_key ?? null,
     nextPage: typeof page.has_next_page === "boolean" ? page.has_next_page : state.nextPage,
     rowKeys: state.rowKeys.map((key, index) => shown.at(index)?.auth_key ?? key),
@@ -282,9 +322,16 @@ export function COPAU00(): ReactNode {
     form.setFocus("acctId");
   }
 
-  /** A failed read: its message alone, as the first failure's send shows it (X-COPAUS0C-1). */
+  /**
+   * A failed read: its message alone, as the first failure's send shows it (X-COPAUS0C-1). An
+   * error naming the account (`acct_id`, COPAUS0C-005, -006, -014) marks the account field
+   * invalid with the same text until the next key; the message row stays its only visible place.
+   */
   function fail(error: components["schemas"]["ScreenError"]): void {
     setErased(true);
+    if (error.field === ACCT_ID_FIELD) {
+      form.setError("acctId", { type: "server", message: error.message });
+    }
     settle(error.message);
   }
 
@@ -305,10 +352,12 @@ export function COPAU00(): ReactNode {
    * `GATHER-DETAILS` for `account`, on ENTER and on first entry (COPAUS0C-008): the account and
    * page number 0 enter the state at once, then endpoint 21 is read from its first page. The page
    * is accounted for only when the account has a summary (COPAUS0C-029). `selectionMessage` is the
-   * invalid-selection text, which shows only when the read sets no message (COPAUS0C-011).
+   * invalid-selection text, which shows only when the read sets no message (COPAUS0C-011). With
+   * the page number 0 no first key held is read again before a page read stores it anew
+   * (COPAUS0C-039, COPAUS0C-046), so the earlier account's first keys are dropped.
    */
   function readAccount(account: string, selectionMessage: string | undefined): void {
-    setPaging((state) => ({ ...state, account, pageNum: 0 }));
+    setPaging((state) => ({ ...state, account, pageNum: 0, firstKeys: EMPTY_PAGING.firstKeys }));
     summary.mutate(
       { path: { acct_id: account }, query: {} },
       {
@@ -383,11 +432,13 @@ export function COPAU00(): ReactNode {
   /**
    * ENTER refused by the account edits (COPAUS0C-007): the account field is blanked, the map goes
    * with `ERASE` and the page number becomes 0; nothing is read, and the selectors are not read.
+   * The COBOL keeps its first keys there, but with the page number 0 none is read again before a
+   * page read stores it anew (COPAUS0C-039, COPAUS0C-046), so they are dropped here.
    */
   function onRejected(errors: FieldErrors<Copau00Values>): void {
     if (errors.acctId !== undefined) {
       form.setValue("acctId", "");
-      setPaging((state) => ({ ...state, pageNum: 0 }));
+      setPaging((state) => ({ ...state, pageNum: 0, firstKeys: EMPTY_PAGING.firstKeys }));
       setErased(true);
     }
     settle(firstMessage(errors));
@@ -418,13 +469,20 @@ export function COPAU00(): ReactNode {
     if (summary.isPending) {
       return;
     }
-    if (paging.pageNum <= 1 || paging.account === null) {
+    form.clearErrors();
+    const pageNum = paging.pageNum - 1;
+    // While no page after the 20th has been shown since the page number last became 0, the key of
+    // every page before the page number is held (CpvsPagingState). One is missing only after such
+    // a page, once backward reads that found no row have taken the page number down to the
+    // earliest page still held: paging that HALTED(X-COPAUS0C-H3) covers (COPAUS0C-050). There
+    // the screen shows the top-of-page message without a request, which is not a parity result.
+    const pageKey = paging.firstKeys.get(pageNum);
+    if (paging.pageNum <= 1 || paging.account === null || pageKey === undefined) {
       settle(MSG_TOP_OF_PAGE);
       return;
     }
-    const pageNum = paging.pageNum - 1;
     setPaging((state) => ({ ...state, pageNum, nextPage: true }));
-    readPage(paging.account, paging.firstKeys[pageNum - 1], "backward");
+    readPage(paging.account, pageKey, "backward");
   }
 
   /**
@@ -437,6 +495,7 @@ export function COPAU00(): ReactNode {
     if (summary.isPending) {
       return;
     }
+    form.clearErrors();
     if (!paging.nextPage || paging.lastKey === null || paging.account === null) {
       settle(MSG_BOTTOM_OF_PAGE);
       return;
@@ -449,6 +508,7 @@ export function COPAU00(): ReactNode {
     if (summary.isPending) {
       return;
     }
+    form.clearErrors();
     setErased(true);
     settle(INVALID_KEY);
   }
@@ -509,6 +569,8 @@ export function COPAU00(): ReactNode {
                         className={FIELD}
                       />
                     </FormControl>
+                    {/* For assistive technology only: the message row is the visible message. */}
+                    <FormMessage className="sr-only" />
                   </GridCell>
                 </FormItem>
               )}
@@ -671,6 +733,7 @@ export function COPAU00(): ReactNode {
                                     className="w-9"
                                   />
                                 </FormControl>
+                                <FormMessage className="sr-only" />
                               </FormItem>
                             )}
                           />

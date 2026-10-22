@@ -7,7 +7,14 @@ import type { components, paths } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -19,7 +26,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 // The CSMSG01Y invalid-key text is shared by every screen through `@/lib/header` (AAP 0.5.4), so
-// it is imported here rather than restated, although the file list of this screen omits it.
+// it is imported here rather than restated.
 import { INVALID_KEY } from "@/lib/header";
 import { KEY_ROWS, keyRowItems, type PfKeyHandlers } from "@/lib/pfkeys";
 import { PATHS, SCREENS } from "@/routes";
@@ -79,6 +86,15 @@ const KEY_ITEMS = keyRowItems(KEY_ROWS.COUSR00);
 /** Whether a field holds only spaces or LOW-VALUES (`= SPACES OR LOW-VALUES`), empty included. */
 function isBlank(text: string): boolean {
   return /^[ \u0000]*$/.test(text);
+}
+
+/**
+ * The form field a `ScreenError.field` names, by its wire name. Endpoint 16 names only members
+ * of its query, and `start_user_id` (USRIDIN) is the only one typed on the map: the paging state
+ * it may name is the screen's own echo, and the selectors are never sent.
+ */
+function formFieldOf(field: string | null | undefined): keyof Cousr00Values | undefined {
+  return field === "start_user_id" ? "startUserId" : undefined;
 }
 
 /**
@@ -178,6 +194,9 @@ export function COUSR00(): ReactNode {
     // Selectors start blank only on a new entry; afterwards they keep what was typed in them,
     // row by row, across every redisplay (COUSR00C-030).
     defaultValues: { startUserId: "", selections: Array.from({ length: ROW_COUNT }, () => "") },
+    // After an ENTER, an edit of a field re-runs its schema check at once, which also drops a
+    // server rejection the field carried: the edited value is the server's to judge again.
+    reValidateMode: "onChange",
   });
 
   // `CDEMO-CU00-INFO` between interactions: keys, page number and next-page indicator.
@@ -200,12 +219,16 @@ export function COUSR00(): ReactNode {
    * Requests a page and shows the response. A response without rows read nothing: the rows, the
    * page number and the search field stay as shown (COUSR00C-020, COUSR00C-021). The last message
    * of the interaction wins; a failure shows the `ScreenError` message, the 403 of the admin gate
-   * included, and leaves the screen otherwise unchanged.
+   * included, marks the search field invalid when the error names it, and leaves the screen
+   * otherwise unchanged.
    */
   function requestPage(
     query: NonNullable<paths["/api/v1/users"]["get"]["parameters"]["query"]>,
     after: AfterPage,
   ): void {
+    // A request starts a new interaction: the field errors of the last one go with its message,
+    // and only this answer marks a field again.
+    form.clearErrors();
     list.mutate(
       { query },
       {
@@ -224,6 +247,11 @@ export function COUSR00(): ReactNode {
         },
         onError: (error) => {
           setMessage(error.message);
+          // The field keeps the text the error row shows, so its `FormMessage` repeats the row.
+          const name = formFieldOf(error.field);
+          if (name !== undefined) {
+            form.setError(name, { type: "server", message: error.message.slice(0, ERRMSG_LENGTH) });
+          }
           focusSearch();
         },
       },
@@ -374,6 +402,11 @@ export function COUSR00(): ReactNode {
                       />
                     </FormControl>
                   </GridCell>
+                  {/*
+                   * The error row is the map's only visible message, so a field's own message is
+                   * for assistive technology only, read with the input it rejects.
+                   */}
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -423,6 +456,7 @@ export function COUSR00(): ReactNode {
                                   className="w-10 text-center"
                                 />
                               </FormControl>
+                              <FormMessage className="sr-only" />
                             </FormItem>
                           )}
                         />

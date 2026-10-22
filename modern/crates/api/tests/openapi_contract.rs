@@ -8,6 +8,13 @@
 //!   require it, the schema names the frontend imports, the statuses Bounded Pagination and the
 //!   admin gate reserve, the formats of the typed dates and timestamps, and that the committed
 //!   `modern/openapi/openapi.json` is the same document.
+//! - `emitter_prints_the_committed_bytes_without_arguments`,
+//!   `emitter_prints_its_usage_for_a_help_flag` and `emitter_refuses_any_other_command_line`
+//!   need no Docker. They run the `carddemo-openapi` binary: with no argument it prints exactly
+//!   the bytes of the committed `modern/openapi/openapi.json` and nothing on standard error; a
+//!   single `-h` or `--help` prints the usage with status 0; any other command line prints
+//!   nothing on standard output, the same refusal and usage on standard error whatever the
+//!   input, and exits 2.
 //! - `every_operation_answers_with_a_declared_status` starts one fixture-loaded `postgres:16`
 //!   container of `test_support`, serves `api::app::app` on a loopback port and calls the 27
 //!   operations once each over HTTP, after signing on as `ADMIN001` through endpoint 1.
@@ -17,13 +24,14 @@
 //! validates without saving, endpoint 15's blank confirmation only shows the balance, and every
 //! other write names a record that does not exist or is refused by an edit, so no call depends
 //! on another's effects.
-//! Assertion messages name the endpoint, its method, its path template and the status, never a
-//! request URI or a response body (Cardholder Data Redaction).
+//! Assertion messages name the endpoint, its method, its path template and the status, or the
+//! emitter's command line, never a request URI or a response body (Cardholder Data Redaction).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
+use std::process::{Command, Output};
 use std::sync::Arc;
 
 use api::app::{AppState, app, openapi};
@@ -503,6 +511,98 @@ fn document_lists_exactly_the_27_operations() -> TestResult {
     check_statuses(&doc)?;
     check_dates(&doc)?;
     check_committed(&doc)
+}
+
+/// The emitter binary that `scripts/regen-api.sh` runs.
+const EMITTER: &str = env!("CARGO_BIN_EXE_carddemo-openapi");
+
+/// The start of the emitter's usage.
+const USAGE_LINE: &str = "Usage: carddemo-openapi";
+
+/// Command lines the emitter refuses: an unknown option with a word after it, a bare word, an
+/// unknown short option, and a help flag followed by anything.
+const REFUSED: [&[&str]; 5] = [
+    &["--bogus-arg", "extra"],
+    &["extra"],
+    &["-x"],
+    &["-h", "extra"],
+    &["--help", "--help"],
+];
+
+/// Runs the emitter with `args` in the test's own environment.
+fn emit(args: &[&str]) -> Fallible<Output> {
+    Ok(Command::new(EMITTER).args(args).output()?)
+}
+
+#[test]
+fn emitter_prints_the_committed_bytes_without_arguments() -> TestResult {
+    let output = emit(&[])?;
+    assert!(
+        output.status.success(),
+        "carddemo-openapi exited with {}",
+        output.status
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "carddemo-openapi wrote to standard error"
+    );
+    let committed = fs::read(test_support::modern_dir().join("openapi/openapi.json"))?;
+    assert!(
+        output.stdout == committed,
+        "carddemo-openapi printed bytes other than modern/openapi/openapi.json: run \
+         scripts/regen-api.sh and commit the regenerated files"
+    );
+    Ok(())
+}
+
+#[test]
+fn emitter_prints_its_usage_for_a_help_flag() -> TestResult {
+    for flag in ["-h", "--help"] {
+        let output = emit(&[flag])?;
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "carddemo-openapi {flag}: exit status"
+        );
+        assert!(
+            output.stdout.starts_with(USAGE_LINE.as_bytes()),
+            "carddemo-openapi {flag}: standard output does not start with the usage"
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "carddemo-openapi {flag} wrote to standard error"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn emitter_refuses_any_other_command_line() -> TestResult {
+    // Every refusal writes the same bytes, so none repeats its input.
+    let mut refusal: Option<Vec<u8>> = None;
+    for args in REFUSED {
+        let case = args.join(" ");
+        let output = emit(args)?;
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "carddemo-openapi {case}: exit status"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "carddemo-openapi {case} wrote to standard output"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(USAGE_LINE),
+            "carddemo-openapi {case}: standard error carries no usage"
+        );
+        let first = refusal.get_or_insert_with(|| output.stderr.clone());
+        assert!(
+            output.stderr == *first,
+            "carddemo-openapi {case}: standard error differs from the first refusal's"
+        );
+    }
+    Ok(())
 }
 
 /// The HS256 secret of the test state: a local-only value.

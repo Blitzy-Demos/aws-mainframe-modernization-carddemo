@@ -6,7 +6,14 @@ import { useCotrn01cView } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 // `@/lib/header` holds `CCDA-MSG-INVALID-KEY`, the text this screen shows for an unserved F-key
@@ -243,6 +250,15 @@ function entryTranId(state: TransferState): string | undefined {
 }
 
 /**
+ * The form input a `ScreenError.field` names, by its wire name: endpoint 12 names `tran_id`, the
+ * path parameter the Tran ID input is sent as, in every error it returns (COTRN01C-009,
+ * COTRN01C-012, COTRN01C-013). A failure naming no field marks no input.
+ */
+function formFieldOf(field: string | null | undefined): keyof Cotrn01Values | undefined {
+  return field === "tran_id" ? "tranId" : undefined;
+}
+
+/**
  * Map `COTRN01` (`COTRN1A`), transaction `CT01`, program `COTRN01C`: views one transaction by its
  * ID through endpoint 12, `GET /api/v1/transactions/{tran_id}`.
  *
@@ -253,7 +269,9 @@ function entryTranId(state: TransferState): string | undefined {
  *   program's message before any request (COTRN01C-009); every other message is the server's.
  *   The detail fields are blank while the read runs and after any failure, so a transaction shown
  *   before a failed fetch is no longer shown (COTRN01C-014). The cursor returns to the Tran ID
- *   input after every outcome, as every send of the program puts it there.
+ *   input after every outcome, as every send of the program puts it there. A failure naming
+ *   `tran_id`, like a schema refusal, marks the input invalid until it is edited or the next key
+ *   is answered.
  * - F3 returns to the screen that transferred here, else to the main menu (COTRN01C-004); F4 clears
  *   the screen (COTRN01C-005); F5 goes to the transaction list (COTRN01C-006); any other F-key
  *   shows the invalid-key message, keeps the Tran ID and blanks the details (COTRN01C-007).
@@ -282,9 +300,20 @@ export function COTRN01(): ReactNode {
   const fetchTransaction = useCallback(
     (tranId: string): void => {
       setKeyMessage(undefined);
+      // A new read replaces the last answer, so an input the last one rejected is unmarked, and
+      // a read that succeeds leaves it unmarked.
+      form.clearErrors("tranId");
       mutate(
         { path: { tran_id: tranId } },
         {
+          onError: (error) => {
+            // The input the server names is marked invalid with the message the message row
+            // shows, so its field message carries the server's text.
+            const name = formFieldOf(error.field);
+            if (name !== undefined) {
+              form.setError(name, { type: "server", message: error.message });
+            }
+          },
           onSettled: () => {
             form.setFocus("tranId");
           },
@@ -380,7 +409,9 @@ export function COTRN01(): ReactNode {
               control={form.control}
               name="tranId"
               render={({ field }) => (
-                // `contents` lets the label and the input each sit in their own grid cell.
+                // `contents` lets the label and the input each sit in their own grid cell. The
+                // message row is the one visible message, so the field message `FormMessage`
+                // adds is for assistive technology only, read with the input it rejects.
                 <FormItem className="contents">
                   <GridCell {...TRAN_ID_LABEL}>
                     <FormLabel className="h-full whitespace-pre text-foreground">
@@ -391,6 +422,16 @@ export function COTRN01(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        onChange={(event) => {
+                          // An edit replaces the value a server error rejected, so its mark
+                          // goes, also after the entry read, where the default `reValidateMode:
+                          // "onChange"` re-checks nothing until ENTER. Schema errors are left to
+                          // that re-check.
+                          if (form.getFieldState("tranId").error?.type === "server") {
+                            form.clearErrors("tranId");
+                          }
+                          field.onChange(event);
+                        }}
                         data-field="TRNIDIN"
                         maxLength={TRAN_ID_INPUT.span}
                         size={TRAN_ID_INPUT.span}
@@ -401,6 +442,7 @@ export function COTRN01(): ReactNode {
                       />
                     </FormControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />

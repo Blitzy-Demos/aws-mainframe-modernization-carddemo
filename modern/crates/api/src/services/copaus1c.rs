@@ -460,7 +460,7 @@ async fn replace_detail(tx: &mut PgTx<'_>, key: DetailKey, toggle: &FraudToggle)
 /// statement's name and the error's `Display`, which is only an SQLSTATE and a constraint name:
 /// never a key, a record or a row (Cardholder Data Redaction).
 fn note_store_error(statement: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = "COPAUS1C",
         statement,
         error = %error,

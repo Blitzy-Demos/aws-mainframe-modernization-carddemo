@@ -350,6 +350,31 @@ async function expectFocus(label: string) {
   });
 }
 
+/**
+ * The input `label` labels is invalid and its `aria-describedby` names a field message that
+ * exists and reads `message`. That message is `sr-only`, so the error row is the one place the
+ * text is visible.
+ */
+function expectFieldMessage(label: string, message: string) {
+  const input = field(label);
+  expect(input.getAttribute("aria-invalid")).toBe("true");
+  const described = (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .filter((id) => id !== "")
+    .map((id) => document.getElementById(id))
+    .filter((element) => element?.getAttribute("data-slot") === "form-message");
+  expect(described).toHaveLength(1);
+  const [fieldMessage] = described;
+  expect(fieldMessage?.textContent).toBe(message);
+  expect(fieldMessage?.classList.contains("sr-only")).toBe(true);
+  const visible = screen
+    .getAllByText(message, exactText)
+    .filter((element) => element.closest(".sr-only") === null);
+  expect(visible).toHaveLength(1);
+  const [shown] = visible;
+  expect(shown !== undefined && messageRow("error").contains(shown)).toBe(true);
+}
+
 function typeSearchKeys(account: string, card: string) {
   fireEvent.change(field(LABELS.account), { target: { value: account } });
   fireEvent.change(field(LABELS.card), { target: { value: card } });
@@ -515,9 +540,6 @@ describe("COCRDUP rendering", () => {
     expectConfirmationKeys(false);
   });
 
-  // The value fields themselves (COCRDUP-002, -003, -005, -007, -008, -010) are not tagged here:
-  // `ScreenShell` shows them as plain text of the title rows, not as the read-only `Input` those
-  // rows name; their contents are proved under COCRDUP-035 to COCRDUP-040 above.
   // audit: COCRDUP-001
   // audit: COCRDUP-004
   // audit: COCRDUP-006
@@ -540,6 +562,51 @@ describe("COCRDUP rendering", () => {
       expect(document.querySelector(`[data-field="${field}"]`)?.parentElement?.className).toBe(
         cellClass(row, col + 6, length),
       );
+    }
+  });
+
+  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
+  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
+  // are proved under COCRDUP-035 to COCRDUP-040.
+  // audit: COCRDUP-002
+  // audit: COCRDUP-003
+  // audit: COCRDUP-005
+  // audit: COCRDUP-007
+  // audit: COCRDUP-008
+  // audit: COCRDUP-010
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", async () => {
+    stubApi({});
+    renderScreen();
+    await settle();
+
+    const header = document.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = document.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(cellClass(row, col, length));
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
     }
   });
 
@@ -649,6 +716,7 @@ describe("COCRDUP rendering", () => {
     });
     expectEnterable(false, true);
     expect(field(LABELS.account).getAttribute("aria-invalid")).toBe("true");
+    expectFieldMessage(LABELS.account, notFound.message);
     expect(infoText()).toBe(INFO_SHOWN);
 
     // ENTER validates against a blank snapshot of the list row's account.
@@ -1172,6 +1240,7 @@ describe("COCRDUP messages", () => {
       expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT]);
       expect(field(marked).value).toBe(shown);
       expect(field(marked).getAttribute("aria-invalid")).toBe("true");
+      expectFieldMessage(marked, error.message);
       expect(field(other).getAttribute("aria-invalid")).toBe("false");
       await expectFocus(marked);
       expect(infoText()).toBe(INFO_SEARCH);
@@ -1287,6 +1356,9 @@ describe("COCRDUP messages", () => {
       expectConfirmationKeys(false);
       expect(field(LABELS.name).value).toBe(shownName);
       expect(field(LABELS.name).getAttribute("aria-invalid")).toBe(invalid);
+      if (invalid === "true") {
+        expectFieldMessage(LABELS.name, reply.body.message);
+      }
       if (focus !== undefined) {
         await expectFocus(focus);
       }
@@ -1316,6 +1388,7 @@ describe("COCRDUP messages", () => {
     await waitFor(() => {
       expect(errorText()).toBe("String must contain at most 50 character(s)");
     });
+    expectFieldMessage(LABELS.name, "String must contain at most 50 character(s)");
     await settle();
     expect(calls).toHaveLength(1);
     await expectFocus(LABELS.name);

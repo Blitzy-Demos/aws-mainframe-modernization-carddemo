@@ -1,10 +1,17 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COUSR00 } from "./COUSR00";
 
 /**
@@ -31,6 +38,10 @@ const LOOKUP_FAILED = "Unable to lookup User...";
 const ADMIN_ONLY = "No access - Admin Only function ...";
 /** zod's default message for the 8-character `USRIDIN` length (`src/schemas/COUSR00.ts`). */
 const SEARCH_TOO_LONG = "String must contain at most 8 character(s)";
+/** zod's default message for the 1-character length of a selector (`src/schemas/COUSR00.ts`). */
+const SELECTION_TOO_LONG = "String must contain at most 1 character(s)";
+/** Endpoint 16's 400 for a query member longer than its map field (`FIELD_LENGTH_MESSAGE`). */
+const FIELD_TOO_LONG = "Input does not fit the screen field...";
 /**
  * `CCDA-MSG-INVALID-KEY PIC X(50)` (`CSMSG01Y.cpy:20-21`): the 50-byte field value COUSR00C-005
  * shows, the short `VALUE` literal padded with spaces, written out so the length is visible.
@@ -318,6 +329,40 @@ function errorRow(): HTMLElement {
   return rows[0];
 }
 
+/** The elements the `aria-describedby` of `input` resolves to, in order, dangling ids left out. */
+function descriptionsOf(input: HTMLElement): HTMLElement[] {
+  const ids = (input.getAttribute("aria-describedby") ?? "").split(" ");
+  return ids.flatMap((id) => {
+    const element = id === "" ? null : document.getElementById(id);
+    return element === null ? [] : [element];
+  });
+}
+
+/**
+ * Asserts that `input` is marked invalid and described by exactly one field message, the
+ * `FormMessage` holding `text`, read by assistive technology only: the error row stays the one
+ * visible copy of the text.
+ */
+function expectFieldMessage(input: HTMLElement, text: string): void {
+  expect(input.getAttribute("aria-invalid")).toBe("true");
+  const descriptions = descriptionsOf(input);
+  expect(descriptions).toHaveLength(1);
+  expect(descriptions[0].getAttribute("data-slot")).toBe("form-message");
+  expect(descriptions[0].textContent).toBe(text);
+  expect(descriptions[0].classList.contains("sr-only")).toBe(true);
+  const visible = screen
+    .getAllByText(text)
+    .filter((holder) => !holder.classList.contains("sr-only"));
+  expect(visible).toHaveLength(1);
+  expect(errorRow().contains(visible[0])).toBe(true);
+}
+
+/** Asserts that `input` is marked valid and described by no field message. */
+function expectNoFieldMessage(input: HTMLElement): void {
+  expect(input.getAttribute("aria-invalid")).toBe("false");
+  expect(descriptionsOf(input)).toEqual([]);
+}
+
 /** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
 function headerField(name: string): string | null | undefined {
   return document.querySelector(`[data-field="${name}"]`)?.textContent;
@@ -390,9 +435,10 @@ describe("COUSR00 List Users", () => {
 
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("List Users");
     /*
-     * The header labels and value fields render as plain text rather than the `Label` and
-     * read-only `Input` that rows COUSR00-001 to COUSR00-010 name, so only their placement is
-     * asserted here, and only the values the program moves (COUSR00-090 to COUSR00-095) are tagged.
+     * The header labels' placement and the values the program moves (COUSR00-090 to COUSR00-095).
+     * The label rows COUSR00-001, -004, -006 and -009 are proved by NAV
+     * (`frontend/e2e/nav.spec.ts`), and the value-field rows COUSR00-002, -003, -005, -007, -008
+     * and -010 by the test of their read-only title-row cells below.
      */
     expect(screen.getByText("Tran:").parentElement?.className).toBe(
       "row-start-1 col-start-1 col-span-5",
@@ -478,6 +524,51 @@ describe("COUSR00 List Users", () => {
       expect(key.getAttribute("type")).toBe("button");
       expect(key.getAttribute("data-variant")).toBe("outline");
       expect(key.getAttribute("data-size")).toBe("sm");
+    }
+  });
+
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", async () => {
+    // `ScreenShell` realises each header value field as read-only text in its title-row cell
+    // rather than as an `Input` with `readOnly`, so these rows are proved on that cell. The values
+    // it shows are proved under COUSR00-090 to COUSR00-095.
+    // audit: COUSR00-002
+    // audit: COUSR00-003
+    // audit: COUSR00-005
+    // audit: COUSR00-007
+    // audit: COUSR00-008
+    // audit: COUSR00-010
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await listed(sent, 1, "ADMIN001");
+
+    const header = document.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = document.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
     }
   });
 
@@ -1036,6 +1127,132 @@ describe("COUSR00 List Users", () => {
     },
   );
 
+  /** Endpoint 16's 400 for a search value its query DTO refuses, naming `start_user_id`. */
+  const SEARCH_REFUSED: components["schemas"]["ScreenError"] = {
+    message: FIELD_TOO_LONG,
+    field: "start_user_id",
+  };
+
+  // audit: COUSR00-088
+  // audit: COUSR00C-032
+  // audit: COUSR00C-033
+  it.each([
+    { title: "its length message", reply: SEARCH_REFUSED, text: FIELD_TOO_LONG },
+    {
+      title: "an 80-character message",
+      reply: {
+        message: FULL_MESSAGE,
+        field: "start_user_id",
+      } satisfies components["schemas"]["ScreenError"],
+      text: "M".repeat(ERRMSG_WIDTH),
+    },
+  ])(
+    "a 400 ScreenError naming start_user_id with $title marks Search User ID invalid, its field message the error row's text for assistive technology only",
+    async ({ reply, text }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE), json(400, reply));
+      renderList();
+      await listed(sent, 1, "ADMIN001");
+      expectNoFieldMessage(searchField());
+
+      typeInto(searchField(), "USER0001");
+      await moveFocus(selector(1));
+      press("ENTER=Continue");
+      await shown(sent, 2, text);
+
+      expect(sent[1].query).toMatchObject({ start_user_id: "USER0001" });
+      expectFieldMessage(searchField(), text);
+      expect(valueOf(searchField())).toBe("USER0001");
+      expect(document.activeElement).toBe(searchField());
+      // The selectors are never sent, so no server answer marks one.
+      for (let row = 1; row <= 10; row += 1) {
+        expectNoFieldMessage(selector(row));
+      }
+    },
+  );
+
+  it.each([
+    {
+      answer: "a 400 naming the echoed page_key, which no map field holds",
+      key: "F8=Forward",
+      reply: json(400, {
+        message: FIELD_TOO_LONG,
+        field: "page_key",
+      } satisfies components["schemas"]["ScreenError"]),
+      text: FIELD_TOO_LONG,
+    },
+    {
+      answer: "a 500 naming no field",
+      key: "ENTER=Continue",
+      reply: json(500, LOOKUP_ERROR),
+      text: LOOKUP_FAILED,
+    },
+  ])("$answer shows its message and marks no field", async ({ key, reply, text }) => {
+    const sent = stubFetch(json(200, FIRST_PAGE), reply);
+    renderList();
+    await listed(sent, 1, "ADMIN001");
+
+    press(key);
+    await shown(sent, 2, text);
+
+    expectNoFieldMessage(searchField());
+    for (let row = 1; row <= 10; row += 1) {
+      expectNoFieldMessage(selector(row));
+    }
+  });
+
+  it.each([
+    {
+      via: "an edit of Search User ID, with no request",
+      act: () => {
+        typeInto(searchField(), "USER0002");
+      },
+      replies: [],
+      requests: 2,
+    },
+    {
+      via: "the page the next ENTER returns",
+      act: () => {
+        press("ENTER=Continue");
+      },
+      replies: [json(200, SEARCH_PAGE)],
+      requests: 3,
+    },
+    {
+      via: "the page F8 returns",
+      act: () => {
+        press("F8=Forward");
+      },
+      replies: [json(200, SECOND_PAGE)],
+      requests: 3,
+    },
+    {
+      via: "the next request, F7 answered by a 500 naming no field",
+      act: () => {
+        press("F7=Backward");
+      },
+      replies: [json(500, LOOKUP_ERROR)],
+      requests: 3,
+    },
+  ])(
+    "the server's mark on Search User ID goes after $via",
+    async ({ act, replies, requests }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE), json(400, SEARCH_REFUSED), ...replies);
+      renderList();
+      await listed(sent, 1, "ADMIN001");
+      typeInto(searchField(), "USER0001");
+      press("ENTER=Continue");
+      await shown(sent, 2, FIELD_TOO_LONG);
+      expectFieldMessage(searchField(), FIELD_TOO_LONG);
+
+      act();
+      await waitFor(() => {
+        expect(sent).toHaveLength(requests);
+        expect(searchField().getAttribute("aria-invalid")).toBe("false");
+      });
+      expectNoFieldMessage(searchField());
+    },
+  );
+
   it("keeps the keyboard locked while a request is outstanding", async () => {
     const releases: ((reply: Response) => void)[] = [];
     const outstanding = new Promise<Response>((resolve) => {
@@ -1077,6 +1294,91 @@ describe("COUSR00 List Users", () => {
     await shown(sent, 1, SEARCH_TOO_LONG);
 
     expect(valueOf(searchField())).toBe("USER00012");
+    expectFieldMessage(searchField(), SEARCH_TOO_LONG);
     expect(document.activeElement).toBe(searchField());
   });
+
+  it("refuses a selector longer than its 1 character with no request, its field message holding the error row's text", async () => {
+    // The schema's selector length is proved by src/schemas/COUSR00.test.ts; this test proves
+    // only that the screen shows the refusal against the selector it concerns.
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await listed(sent, 1, "ADMIN001");
+
+    // A change event sets the value past `maxlength`, as a paste through script would.
+    typeInto(selector(3), "UU");
+    press("ENTER=Continue");
+    await shown(sent, 1, SELECTION_TOO_LONG);
+
+    expect(valueOf(selector(3))).toBe("UU");
+    expectFieldMessage(selector(3), SELECTION_TOO_LONG);
+    for (const row of [1, 2, 4, 5, 6, 7, 8, 9, 10]) {
+      expectNoFieldMessage(selector(row));
+    }
+    expectNoFieldMessage(searchField());
+  });
+});
+
+// The sign-on and admin guards live in the application's route tree, not in the screen, so this
+// group renders that tree rather than the screen beside stubs.
+describe("COUSR00 behind the route guard", () => {
+  // audit: COUSR00C-002
+  it.each([
+    {
+      visitor: "a browser with no session",
+      signOn: () => {
+        clearSession();
+      },
+      target: PATHS.COSGN00,
+      landed: () => screen.getByRole("button", { name: "ENTER=Sign-on" }),
+      // The sign-on screen sends nothing until ENTER.
+      requested: [],
+    },
+    {
+      visitor: "a session of user type U",
+      signOn: () => {
+        setSession(TOKEN, "USER0001", "U");
+      },
+      target: PATHS.COMEN01,
+      landed: () => screen.getByRole("heading", { level: 1, name: "Main Menu" }),
+      // The main menu loads its own options from endpoint 2 once it mounts (COMEN01C-005).
+      requested: ["/api/v1/menus/main"],
+    },
+  ])(
+    "sends $visitor from /users to $target, with no request to endpoint 16",
+    async ({ signOn, target, landed, requested }) => {
+      signOn();
+      const sent = stubFetch();
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, { initialEntries: [PATHS.COUSR00] });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      // Both screens load lazily, through the route tree, before the target screen renders.
+      await waitFor(
+        () => {
+          expect(router.state.location.pathname).toBe(target);
+          expect(landed()).toBeDefined();
+        },
+        { timeout: 4000 },
+      );
+      expect(screen.queryByRole("heading", { level: 1, name: "List Users" })).toBeNull();
+      expect(screen.queryByLabelText("Search User ID:")).toBeNull();
+      await waitFor(() => {
+        expect(sent.map((request) => request.path)).toEqual(requested);
+      });
+      // Gives a request the guarded screen would send time to leave before the count.
+      await new Promise((resolve) => {
+        setTimeout(resolve, 20);
+      });
+      expect(sent.map((request) => request.path)).toEqual(requested);
+      expect(sent.filter((request) => request.path.startsWith(LIST_PATH))).toEqual([]);
+      router.dispose();
+    },
+  );
 });

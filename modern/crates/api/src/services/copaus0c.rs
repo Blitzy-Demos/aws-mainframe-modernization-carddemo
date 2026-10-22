@@ -184,7 +184,7 @@ fn detail_read_failed(
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = PROGRAM,
         paragraph,
         statement,
@@ -264,7 +264,7 @@ mod tests {
     }
 
     /// Asserts that `traces` holds exactly the events `logged` names, one line each, in order:
-    /// a `WARN` of COPAUS0C with the paragraph, the statement and the error's text.
+    /// an `ERROR` of COPAUS0C with the paragraph, the statement and the error's text.
     fn assert_logged(traces: &TraceCapture, logged: &[(&str, &str, &str)]) {
         let lines = traces.lines();
         assert_eq!(lines.len(), logged.len(), "{}", traces.text());
@@ -272,7 +272,7 @@ mod tests {
             let paragraph = format!(r#""paragraph":"{paragraph}""#);
             let statement = format!(r#""statement":"{statement}""#);
             for expected in [
-                r#""level":"WARN""#,
+                r#""level":"ERROR""#,
                 r#""program":"COPAUS0C""#,
                 paragraph.as_str(),
                 statement.as_str(),

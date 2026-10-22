@@ -27,6 +27,8 @@ opentelemetry = { workspace = true, features = ["trace"] }
 opentelemetry_sdk = { workspace = true, features = ["trace"] }
 opentelemetry-stdout = { workspace = true, features = ["trace"] }
 tracing-opentelemetry = { workspace = true }
+# Its HS256 signer is the pinned HMAC-SHA256 that keys the message IDs telemetry records.
+jsonwebtoken = { workspace = true }
 
 [lints]
 workspace = true

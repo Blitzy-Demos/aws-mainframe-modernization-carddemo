@@ -140,8 +140,11 @@ CREATE TABLE card_xref (
     PRIMARY KEY (card_num)
 );
 
--- Replaces the AIX on XREF-ACCT-ID, KEYS(11,25) NONUNIQUEKEY [app/jcl/XREFFILE.jcl:72-75].
-CREATE INDEX card_xref_acct_id_idx ON card_xref (acct_id);
+-- Replaces the AIX on XREF-ACCT-ID, KEYS(11,25) NONUNIQUEKEY [app/jcl/XREFFILE.jcl:72-75]. A
+-- non-unique AIX over a KSDS returns one account's cross-references in prime-key order, hence
+-- card_num as the second column, so the ordered LIMIT reads of the account path stop after the
+-- rows they return.
+CREATE INDEX card_xref_acct_id_idx ON card_xref (acct_id, card_num);
 
 -- TRAN-TYPE-RECORD, 60 bytes = RECORDSIZE(60 60) [app/jcl/TRANTYPE.jcl:41]. The VSAM data
 -- version, read only by tranrept; the Db2 version is db2.transaction_type (migration 0006), and

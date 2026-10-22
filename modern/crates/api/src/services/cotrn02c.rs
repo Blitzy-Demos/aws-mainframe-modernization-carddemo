@@ -300,7 +300,7 @@ async fn browse_highest(tx: &mut PgTx<'_>) -> Result<(PicX<16>, PicX<20>), Persi
 /// `condition` is a store error, which renders only its SQLSTATE and constraint name, or the
 /// CICS condition the replacement detects itself; no key or field is recorded.
 fn region_log(paragraph: &'static str, condition: &dyn fmt::Display) {
-    tracing::warn!(paragraph, condition = %condition, "COTRN02C file statement failed");
+    tracing::error!(paragraph, condition = %condition, "COTRN02C file statement failed");
 }
 
 #[cfg(test)]

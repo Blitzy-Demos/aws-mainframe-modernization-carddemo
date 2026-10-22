@@ -49,16 +49,18 @@
 //! # One request, one task
 //!
 //! Each request is processed as the first message of a CICS task, and `Worker` keeps no state
-//! from one request to the next: it holds its channels, its queue name and its store, never a
-//! request, a body, a key or a record (COACCT01-027; E14, E15). The `CICS RETRIEVE`, `MQOPEN`
-//! and `MQCLOSE` paths and their artefacts have no counterpart here (E17).
+//! from one request to the next: it holds its channels, its queue name, its store and the ID key
+//! of its spans, never a request, a body, an account key or a record (COACCT01-027; E14, E15).
+//! The `CICS RETRIEVE`, `MQOPEN` and `MQCLOSE` paths and their artefacts have no counterpart
+//! here (E17).
 //!
 //! # Redaction
 //!
 //! No CDRA reply or error body holds a card number, an SSN or a password: the account record
 //! has no such field, the not-found and bad-parameter replies mask the key, and a body that
-//! does not decode echoes nothing (COACCT01-035). Spans and events name the queue, the screened
-//! IDs, the outcome, the redelivery flag and the body length, never a body byte, a key, a
+//! does not decode echoes nothing (COACCT01-035). Spans and events name the queue, the request
+//! IDs as their keyed digest under the worker's key of its `CARDDEMO_AMQP_URL`, the outcome, the
+//! redelivery flag and the body length, never an ID's text, the URL, a body byte, a key, a
 //! balance or an `AccountRecord`.
 
 use std::fmt;
@@ -68,6 +70,7 @@ use domain::messaging::coacct01::{self, AccountLookup, CdraAction, CdraResponse}
 use lapin::Connection;
 use persistence::{AccountRepository, PgStore};
 use runtime::config::Config;
+use runtime::telemetry::IdKey;
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
@@ -85,8 +88,9 @@ const REQUEST_QUEUE_VARIABLE: &str = "CARDDEMO_QUEUE_REQUEST_ACCT";
 /// the name within what the broker takes.
 const QUEUE_NAME_LEN: usize = PicX::<48>::WIDTH;
 
-/// The CDRA worker: one consumer and one publisher channel, the configured request queue and
-/// the account store (COACCT01-004, COACCT01-027).
+/// The CDRA worker: one consumer and one publisher channel, the configured request queue, the
+/// account store (COACCT01-004, COACCT01-027) and the key under which its spans record the
+/// request IDs.
 ///
 /// `A` settles requests; production uses the [`Consumer`] channel itself, and tests substitute a
 /// failing or recording [`Acknowledger`] through [`Worker::with_acknowledger`].
@@ -94,13 +98,18 @@ pub struct Worker<A: Acknowledger = Consumer> {
     channels: Channels<A>,
     request_queue: String,
     store: PgStore,
+    /// The key of `config.amqp_url` under which the span records each request's IDs as their
+    /// keyed digests, as the `Redaction` section of `crate::workers` explains; never shown.
+    id_key: IdKey,
 }
 
 impl Worker<Consumer> {
     /// Opens the worker on `connection`: checks that `config.queue_request_acct` fits
     /// `MQ-APPL-QUEUE-NAME PIC X(48)` whole, then opens the consumer channel, checks the request
     /// queue, `CARD.DEMO.REPLY.ACCT` and `CARD.DEMO.ERROR` with a passive declare, and opens the
-    /// publisher channel in confirm mode. `store` serves every account read (COACCT01-004).
+    /// publisher channel in confirm mode. `store` serves every account read (COACCT01-004);
+    /// `config.amqp_url`, the `CARDDEMO_AMQP_URL` `carddemo-mq` connects with, keys the IDs each
+    /// request span records.
     ///
     /// # Errors
     ///
@@ -129,25 +138,28 @@ impl Worker<Consumer> {
             channels,
             request_queue: request_queue.to_owned(),
             store,
+            id_key: IdKey::new(&config.amqp_url),
         })
     }
 }
 
 impl<A: Acknowledger> Worker<A> {
     /// This worker with `acknowledger` settling every request in place of the consumer channel,
-    /// the seam of the failure-injection tests. The channels, queue and store are kept.
+    /// the seam of the failure-injection tests. The channels, queue, store and ID key are kept.
     #[must_use]
     pub fn with_acknowledger<B: Acknowledger>(self, acknowledger: B) -> Worker<B> {
         Worker {
             channels: self.channels.with_acknowledger(acknowledger),
             request_queue: self.request_queue,
             store: self.store,
+            id_key: self.id_key,
         }
     }
 }
 
 impl<A: Acknowledger> fmt::Debug for Worker<A> {
-    /// The request queue only: channels and store have nothing a reader of a log needs.
+    /// The request queue only: channels and store have nothing a reader of a log needs, and the
+    /// ID key is a secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
             .field("request_queue", &self.request_queue)
@@ -173,11 +185,12 @@ impl<A: Acknowledger> Step for Worker<A> {
             channels,
             request_queue,
             store,
+            id_key,
         } = self;
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
-        let processed = super::in_message_span(request_queue, &request, async {
+        let processed = super::in_message_span(request_queue, &request, id_key, async {
             match answer(store, request_queue, &request.body).await {
                 CdraResponse::Reply(body) => {
                     super::reply_fixed(channels, connection, &request, Flow::Cdra, &body).await

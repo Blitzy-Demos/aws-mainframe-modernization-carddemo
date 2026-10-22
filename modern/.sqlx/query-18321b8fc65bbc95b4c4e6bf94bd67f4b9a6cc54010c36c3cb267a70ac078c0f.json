@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT 'schema ' || nspname::text || ' oid ' || oid::text AS \"item!\"\n             FROM pg_namespace\n            WHERE NOT starts_with(nspname::text, 'pg_') AND nspname <> 'information_schema'\n           UNION ALL\n           SELECT 'relation ' || n.nspname::text || '.' || c.relname::text\n                  || ' kind ' || c.relkind::text || ' oid ' || c.oid::text\n             FROM pg_class c\n             JOIN pg_namespace n ON n.oid = c.relnamespace\n            WHERE n.nspname IN ('public', 'db2')\n           UNION ALL\n           SELECT 'attribute ' || n.nspname::text || '.' || c.relname::text || ' #'\n                  || a.attnum::text || ' ' || a.attname::text || ' type oid ' || a.atttypid::text\n             FROM pg_attribute a\n             JOIN pg_class c ON c.oid = a.attrelid\n             JOIN pg_namespace n ON n.oid = c.relnamespace\n            WHERE n.nspname IN ('public', 'db2') AND a.attnum > 0\n           UNION ALL\n           SELECT 'type ' || n.nspname::text || '.' || t.typname::text || ' oid ' || t.oid::text\n             FROM pg_type t\n             JOIN pg_namespace n ON n.oid = t.typnamespace\n            WHERE n.nspname IN ('public', 'db2')\n           UNION ALL\n           SELECT 'constraint ' || n.nspname::text || '.' || coalesce(r.relname::text, '-')\n                  || '.' || c.conname::text || ' oid ' || c.oid::text\n             FROM pg_constraint c\n             JOIN pg_namespace n ON n.oid = c.connamespace\n             LEFT JOIN pg_class r ON r.oid = c.conrelid\n            WHERE n.nspname IN ('public', 'db2')\n           UNION ALL\n           SELECT 'trigger ' || n.nspname::text || '.' || r.relname::text || '.'\n                  || g.tgname::text || ' oid ' || g.oid::text\n                  || CASE WHEN g.tgisinternal THEN ' internal' ELSE '' END\n             FROM pg_trigger g\n             JOIN pg_class r ON r.oid = g.tgrelid\n             JOIN pg_namespace n ON n.oid = r.relnamespace\n            WHERE n.nspname IN ('public', 'db2')\n           UNION ALL\n           SELECT 'routine ' || n.nspname::text || '.' || p.proname::text || ' oid ' || p.oid::text\n             FROM pg_proc p\n             JOIN pg_namespace n ON n.oid = p.pronamespace\n            WHERE n.nspname IN ('public', 'db2')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "18321b8fc65bbc95b4c4e6bf94bd67f4b9a6cc54010c36c3cb267a70ac078c0f"
+}

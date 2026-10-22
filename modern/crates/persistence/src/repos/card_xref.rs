@@ -4,8 +4,8 @@
 //! The KSDS `CARDXREF` is keyed by `XREF-CARD-NUM` (`KEYS(16 0)`, `XREFFILE.jcl:43`), which the
 //! table keeps as its primary key `card_xref_pkey` (LOADS-003). Its alternate index on
 //! `XREF-ACCT-ID` (`KEYS(11,25)` `NONUNIQUEKEY`, `XREFFILE.jcl:72-75`), read online through the
-//! path `CXACAIX`, is replaced by the non-unique index `card_xref_acct_id_idx` on `acct_id`
-//! (LOADS-023, LOADS-024).
+//! path `CXACAIX`, is replaced by the non-unique index `card_xref_acct_id_idx` on
+//! `(acct_id, card_num)`, which keeps an account's rows in prime-key order (LOADS-023, LOADS-024).
 //!
 //! | COBOL access | Method |
 //! |---|---|
@@ -86,7 +86,8 @@ pub trait CardXrefRepository: Send {
     ///
     /// The keyed `READ` through `CXACAIX` of COACTVWC and COACTUPC `9200-GETCARDXREF-BYACCT`,
     /// COBIL00C and COTRN02C `READ-CXACAIX-FILE` and COPAUS0C `GETCARDXREF-BYACCT`, and CBACT04C
-    /// `1110-GET-XREF-DATA`, served by `card_xref_acct_id_idx`. When other rows share the
+    /// `1110-GET-XREF-DATA`, served by `card_xref_acct_id_idx`, whose `card_num` order yields
+    /// that row first, so the read stops at it without a sort. When other rows share the
     /// account, CICS still returns this record but with the `DUPKEY` response, which this method
     /// does not report: a caller whose program branches on that response, as COACTVWC-039
     /// records, reads [`find_first_two_by_acct_id`](Self::find_first_two_by_acct_id) instead.
@@ -107,7 +108,8 @@ pub trait CardXrefRepository: Send {
     /// first row is the record [`find_by_acct_id`](Self::find_by_acct_id) returns.
     ///
     /// The `CXACAIX` read of the programs that branch on its response (COACTVWC-039,
-    /// COACTUPC-089, COPAUS0C-015, COTRN02C-014), served by `card_xref_acct_id_idx`. The
+    /// COACTUPC-089, COPAUS0C-015, COTRN02C-014), served by `card_xref_acct_id_idx`, whose
+    /// `card_num` order delivers the rows sorted, so the scan reads no row past the second. The
     /// statement's `LIMIT 2` bounds the read whatever the account holds: a second row already
     /// decides `DUPKEY`, so the rows after it would change no outcome, and an account with many
     /// cards returns, allocates and decodes no more rows than one with two. Each fixture account

@@ -6,6 +6,12 @@
 //! `GET /api/v1/accounts/{acct_id}` and `PUT /api/v1/accounts/{acct_id}` over the
 //! fixture-loaded database.
 //!
+//! They also bind the COMMAREA rows COCOM01Y-008 to COCOM01Y-013 of
+//! `modern/audit/copybooks.md`: `cocom01y_account_rows` proves that endpoint 4 takes the
+//! selected account from each request's path and that the customer ID, the three customer names
+//! and the active status it shows come from the stored records that account leads to, never from
+//! state a request carries.
+//!
 //! # Harness
 //!
 //! - Each `#[tokio::test]` owns one `postgres:16` container from
@@ -2970,6 +2976,113 @@ async fn save_narrowed_zip(h: &Harness) -> TestResult {
         &test_customer(ZIP_PLUS_4, "62701")?,
     )
     .await
+}
+
+// ---------------------------------------------------------------------------------------------
+// COCOM01Y: the COMMAREA's customer and account blocks
+// ---------------------------------------------------------------------------------------------
+
+/// The COMMAREA's customer and account blocks (COCOM01Y-008 to COCOM01Y-013), which COACTVWC
+/// fills from its reads and the replacement never carries: endpoint 4 takes the account from its
+/// path alone and reads the customer through the account's cross-reference. Account
+/// [`CLEAN`]'s active status is rewritten and restored, so the test owns its database.
+#[tokio::test]
+async fn cocom01y_account_rows() -> TestResult {
+    let harness = Harness::start().await?;
+    commarea_selected_account(&harness).await?;
+    commarea_account_status(&harness).await?;
+    Ok(())
+}
+
+/// One token views account 1, account [`CLEAN`] and account 1 again: each answer is the account
+/// its path names (COCOM01Y-012), with the customer the account's cross-reference names
+/// (COCOM01Y-008) and that customer's stored names (COCOM01Y-009 to COCOM01Y-011), though no
+/// request names a customer.
+async fn commarea_selected_account(h: &Harness) -> TestResult {
+    let first = h.view(ACCOUNT_1).await?;
+    let clean = h.view(&acct(CLEAN)).await?;
+    let again = h.view(ACCOUNT_1).await?;
+    for (reply, id) in [(&first, 1), (&clean, CLEAN), (&again, 1)] {
+        assert_eq!(reply.status, StatusCode::OK, "view of account {id}");
+        // audit: COCOM01Y-012
+        assert_eq!(reply.body["acct_id"], acct(id), "view of account {id}");
+    }
+    // audit: COCOM01Y-012
+    assert!(
+        again.body == first.body,
+        "account 1 answers otherwise after another account was viewed"
+    );
+    for (reply, id, customer_id) in [(&first, 1, 1), (&clean, CLEAN, CLEAN)] {
+        let mut store = h.store.clone();
+        let xref = CardXrefRepository::find_by_acct_id(&mut store, PicU::new(id)?)
+            .await?
+            .ok_or_else(|| format!("account {id} has no cross-reference"))?;
+        assert_eq!(xref.cust_id.get(), customer_id, "customer of account {id}");
+        // audit: COCOM01Y-008
+        assert_eq!(
+            reply.body["customer_id"],
+            format!("{customer_id:09}"),
+            "customer of account {id}"
+        );
+        let customer = h.customer(customer_id).await?;
+        // audit: COCOM01Y-009
+        assert_eq!(
+            reply.body["first_name"],
+            pad(&customer.first_name.to_text(), 25),
+            "first name of account {id}"
+        );
+        // audit: COCOM01Y-010
+        assert_eq!(
+            reply.body["middle_name"],
+            pad(&customer.middle_name.to_text(), 25),
+            "middle name of account {id}"
+        );
+        // audit: COCOM01Y-011
+        assert_eq!(
+            reply.body["last_name"],
+            pad(&customer.last_name.to_text(), 25),
+            "last name of account {id}"
+        );
+    }
+    Ok(())
+}
+
+/// The active status endpoint 4 shows is the stored account's, read by every request: another
+/// user's rewrite between two identical requests changes the second answer, and restoring it
+/// restores the answer (COCOM01Y-013).
+async fn commarea_account_status(h: &Harness) -> TestResult {
+    for id in [1, CLEAN] {
+        let stored = h.account(id).await?;
+        let reply = h.view(&acct(id)).await?;
+        // audit: COCOM01Y-013
+        assert_eq!(
+            reply.body["active_status"],
+            stored.active_status.to_text(),
+            "active status of account {id}"
+        );
+    }
+    let before = h.account(CLEAN).await?;
+    let shown = h.view(&acct(CLEAN)).await?;
+    assert_eq!(shown.body["active_status"], "Y");
+    let inactive = AccountRecord {
+        active_status: PicX::from_array(*b"N"),
+        ..before.clone()
+    };
+    rewrite_account(h, &inactive).await?;
+    let after = h.view(&acct(CLEAN)).await?;
+    // audit: COCOM01Y-013
+    assert_eq!(
+        (after.status, &after.body["active_status"]),
+        (StatusCode::OK, &json!("N"))
+    );
+    rewrite_account(h, &before).await?;
+    let restored = h.view(&acct(CLEAN)).await?;
+    // audit: COCOM01Y-013
+    assert!(
+        restored.body == shown.body,
+        "the restored active status is not shown"
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------------

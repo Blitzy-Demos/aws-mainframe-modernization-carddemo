@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COTRN01 } from "./COTRN01";
 
 /*
@@ -316,6 +323,45 @@ function errorText(): string {
   return rows[0]?.textContent ?? "";
 }
 
+/**
+ * The error state of the Tran ID input: its `aria-invalid`, and each element its
+ * `aria-describedby` resolves to, with its text and whether it is visually hidden (`sr-only`).
+ * An id that resolves to no element is left out, as assistive technology ignores it.
+ */
+function tranIdErrorState() {
+  const input = tranIdInput();
+  const described = (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .flatMap((id) => {
+      const element = id === "" ? null : document.getElementById(id);
+      return element === null
+        ? []
+        : [{ text: element.textContent, hidden: element.classList.contains("sr-only") }];
+    });
+  return { invalid: input.getAttribute("aria-invalid"), described };
+}
+
+/** The Tran ID input marked invalid, its field message holding `message`, visually hidden. */
+function markedWith(message: string) {
+  return { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
+/** The Tran ID input with no error: valid, and described by no message. */
+const UNMARKED = { invalid: "false", described: [] };
+
+/**
+ * Checks that `message` is shown once, in the `ERRMSG` row: every other element holding it is
+ * visually hidden, so the field's own message is read only by assistive technology.
+ */
+function expectShownOnce(message: string): void {
+  const [row] = messageRows("error");
+  const visible = screen
+    .getAllByText(message)
+    .filter((element) => element.closest(".sr-only") === null);
+  expect(visible).toHaveLength(1);
+  expect(row?.contains(visible[0] ?? null)).toBe(true);
+}
+
 /** The text of the header field `name` (`data-field` of `ScreenShell`). */
 function headerField(container: HTMLElement, name: string): string | null {
   return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
@@ -532,6 +578,50 @@ describe("COTRN01 transaction view screen", () => {
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
   });
 
+  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
+  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
+  // are proved under COTRN01-057 to COTRN01-062.
+  // audit: COTRN01-002
+  // audit: COTRN01-003
+  // audit: COTRN01-005
+  // audit: COTRN01-007
+  // audit: COTRN01-008
+  // audit: COTRN01-010
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
+    stubApi();
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+
+    const header = container.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
+    }
+  });
+
   // audit: COTRN01C-002
   it.each([
     { title: "from the main menu", state: { from: PATHS.COMEN01 } },
@@ -627,7 +717,7 @@ describe("COTRN01 transaction view screen", () => {
   it.each([
     { title: "the 404 of COTRN01C-012", tranId: UNKNOWN_ID, error: notFound },
     { title: "the 500 of COTRN01C-013", tranId: FAILING_ID, error: lookupFailed },
-  ])("shows $title, keeps the typed ID focused, blanks the details", async (row) => {
+  ])("shows $title, keeps the typed ID focused and marked invalid, blanks details", async (row) => {
     const requests = stubApi();
     renderScreen(FROM_LIST);
     await waitFor(() => {
@@ -638,6 +728,7 @@ describe("COTRN01 transaction view screen", () => {
     expect(errorRow?.getAttribute("aria-live")).toBe("polite");
     expect(errorRow?.classList.contains("text-destructive")).toBe(true);
     expect(errorText()).toBe("");
+    expect(tranIdErrorState()).toEqual(UNMARKED);
 
     const enter = screen.getByRole("button", { name: "ENTER=Fetch" });
     fireEvent.change(tranIdInput(), { target: { value: row.tranId } });
@@ -647,6 +738,11 @@ describe("COTRN01 transaction view screen", () => {
     await waitFor(() => {
       expect(errorText()).toBe(row.error.message);
     });
+    // The `tran_id` the error names marks the input, whose field message is the row's text.
+    await waitFor(() => {
+      expect(tranIdErrorState()).toEqual(markedWith(row.error.message));
+    });
+    expectShownOnce(row.error.message);
     expect(shownDetails()).toEqual(BLANK_DETAILS);
     expect(tranIdInput().value).toBe(row.tranId);
     await waitFor(() => {
@@ -669,11 +765,87 @@ describe("COTRN01 transaction view screen", () => {
     await waitFor(() => {
       expect(errorText()).toBe("Tran ID can NOT be empty...");
     });
+    // The refused input is marked, and its field message is the row's text.
+    expect(tranIdErrorState()).toEqual(markedWith("Tran ID can NOT be empty..."));
+    expectShownOnce("Tran ID can NOT be empty...");
     await waitFor(() => {
       expect(shownDetails()).toEqual(BLANK_DETAILS);
     });
     await settle();
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`]);
+  });
+
+  // The input's mark is the form's error state, which no audit row records, so none is tagged.
+  // A server error marks the value it rejected: an edit of it, or the answer to the next key,
+  // removes the mark, while the message row keeps the program's last message.
+  it.each([
+    {
+      title: "an edit after the 404 of the entry read",
+      byEntry: true,
+      act: () => {
+        fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
+      },
+      shown: BLANK_DETAILS,
+      message: notFound.message,
+    },
+    {
+      title: "an edit after the 404 of an ENTER",
+      byEntry: false,
+      act: () => {
+        fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
+      },
+      shown: BLANK_DETAILS,
+      message: notFound.message,
+    },
+    {
+      title: "an ENTER that finds the transaction",
+      byEntry: false,
+      act: () => {
+        fetchTyped(TYPED_ID);
+      },
+      shown: SHOWN_TYPED,
+      message: "",
+    },
+    {
+      title: "F4=Clear",
+      byEntry: false,
+      act: () => {
+        fireEvent.click(pfKeyButton("F4=Clear"));
+      },
+      shown: BLANK_DETAILS,
+      message: "",
+    },
+    {
+      title: "an unserved F-key",
+      byEntry: false,
+      act: () => {
+        pressKey("F7");
+      },
+      shown: BLANK_DETAILS,
+      message: INVALID_KEY_TEXT,
+    },
+  ])("$title unmarks the Tran ID input a server error marked", async (row) => {
+    stubApi();
+    renderScreen(row.byEntry ? { ...FROM_LIST, tran_id: UNKNOWN_ID } : FROM_LIST);
+    if (!row.byEntry) {
+      await waitFor(() => {
+        expect(shownDetails()).toEqual(SHOWN_SELECTED);
+      });
+      fetchTyped(UNKNOWN_ID);
+    }
+    await waitFor(() => {
+      expect(tranIdErrorState()).toEqual(markedWith(notFound.message));
+    });
+
+    row.act();
+
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(row.shown);
+    });
+    await waitFor(() => {
+      expect(tranIdErrorState()).toEqual(UNMARKED);
+    });
+    expect(errorText().trimEnd()).toBe(row.message);
   });
 
   // audit: COTRN01C-005
@@ -907,5 +1079,38 @@ describe("COTRN01 transaction view screen", () => {
     expect(stub.path).toBe("/transactions");
     expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: "pf3", list: LIST });
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`, `${ENDPOINT}${TYPED_ID}`]);
+  });
+});
+
+// The sign-on guard lives in the application's route tree, not in the screen, so this group
+// renders that tree rather than the screen beside stubs.
+describe("COTRN01 behind the route guard", () => {
+  // audit: COTRN01C-001
+  it("sends a user with no session from /transactions/view to /signon, with no request", async () => {
+    clearSession();
+    const requests = stubApi();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRN01] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "View Transaction" })).toBeNull();
+    expect(screen.queryByLabelText("Enter Tran ID:")).toBeNull();
+    await settle();
+    expect(requests).toHaveLength(0);
+    router.dispose();
   });
 });

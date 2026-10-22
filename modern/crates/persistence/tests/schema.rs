@@ -20,6 +20,15 @@
 //! table and name. A third test drives the constraints through the repository traits and checked
 //! statements, both mismatched `NULL` states of each timestamp pair included.
 //!
+//! A fourth test proves that the nine loads leave the catalog and the tables they do not load as
+//! migrated: LOADS-020 and the store clauses of FIXLOAD-011. It runs the loads through the
+//! harness's `load_fixtures`, which issues the statements the load subcommands issue, on the
+//! migrated database and again on the loaded one. After each run the catalog equals the migrated
+//! one, OIDs included; `transactions`, both pending-authorization tables, `auth_fraud` and
+//! `cssl_error_log` hold no row; and schema `db2` holds the seed of `DB2LTTYP.ctl` and
+//! `DB2LTCAT.ctl`, transcribed here from those members. FIXLOAD-011's `var/` clause is proved
+//! against the real binary in `crates/batch/tests/loads.rs`.
+//!
 //! Every database comes migrated from the `test-support` harness, and every statement is a
 //! compile-time-checked query macro (R4). Failure messages name schema objects, layout codes and
 //! fixture files, never a stored value (Cardholder Data Redaction).
@@ -38,7 +47,7 @@ use persistence::{
 };
 use sqlx::PgPool;
 use sqlx::postgres::PgQueryResult;
-use test_support::fixtures::fixture_path;
+use test_support::fixtures::{fixture_path, load_fixtures};
 use test_support::postgres::start_postgres;
 
 use Ty::{
@@ -612,9 +621,12 @@ const SECONDARY_INDEXES: [(bool, Key<'static>); 5] = [
         false,
         key("cards", "cards_acct_id_idx", "acct_id, card_num"),
     ),
-    // The AIX `KEYS(11,25) NONUNIQUEKEY` over `XREF-ACCT-ID`.
+    // The AIX `KEYS(11,25) NONUNIQUEKEY` over `XREF-ACCT-ID`, in prime-key order within it.
     // audit: LOADS-023
-    (false, key("card_xref", "card_xref_acct_id_idx", "acct_id")),
+    (
+        false,
+        key("card_xref", "card_xref_acct_id_idx", "acct_id, card_num"),
+    ),
     // The AIX `KEYS(26 304)` over `TRAN-PROC-TS`.
     // audit: CVTRA05Y-013
     (
@@ -1149,10 +1161,9 @@ fn check_constraints(constraints: &[CatalogConstraint], failures: &mut Vec<Strin
     compare_sets("check", &expected, &observed, failures);
 }
 
-/// The indexes of [`TABLES`] are exactly those of the primary keys, the unique constraints and
-/// [`SECONDARY_INDEXES`], each a B-tree over its listed columns in order.
-async fn check_indexes(pool: &PgPool, failures: &mut Vec<String>) {
-    let indexes = sqlx::query_as!(
+/// Every index of a table in `public` or `db2`, with the definition `pg_indexes` reconstructs.
+async fn fetch_indexes(pool: &PgPool) -> Vec<CatalogIndex> {
+    sqlx::query_as!(
         CatalogIndex,
         r#"SELECT schemaname::text AS "schema!", tablename::text AS "table!",
                   indexdef AS "def!"
@@ -1161,8 +1172,14 @@ async fn check_indexes(pool: &PgPool, failures: &mut Vec<String>) {
     )
     .fetch_all(pool)
     .await
-    .expect("list the indexes of public and db2");
-    let observed = indexes
+    .expect("list the indexes of public and db2")
+}
+
+/// The indexes of [`TABLES`] are exactly those of the primary keys, the unique constraints and
+/// [`SECONDARY_INDEXES`], each a B-tree over its listed columns in order.
+async fn check_indexes(pool: &PgPool, failures: &mut Vec<String>) {
+    let observed = fetch_indexes(pool)
+        .await
         .into_iter()
         .filter(|index| is_expected_table(&index.schema, &index.table))
         .map(|index| index.def)
@@ -1185,6 +1202,236 @@ async fn check_indexes(pool: &PgPool, failures: &mut Vec<String>) {
         )
         .collect();
     compare_sets("index", &expected, &observed, failures);
+}
+
+/// The objects of the schemas besides `PostgreSQL`'s own, one item each, every item naming an
+/// object and its OID: each schema, and each relation (table, index, sequence, view), attribute
+/// (a dropped column included), type, constraint, trigger (internal ones included) and routine
+/// of `public` and `db2`. An object dropped and created again under its old name takes a new
+/// OID, so it changes the set.
+async fn fetch_catalog_objects(pool: &PgPool) -> Vec<String> {
+    sqlx::query_scalar!(
+        r#"SELECT 'schema ' || nspname::text || ' oid ' || oid::text AS "item!"
+             FROM pg_namespace
+            WHERE NOT starts_with(nspname::text, 'pg_') AND nspname <> 'information_schema'
+           UNION ALL
+           SELECT 'relation ' || n.nspname::text || '.' || c.relname::text
+                  || ' kind ' || c.relkind::text || ' oid ' || c.oid::text
+             FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('public', 'db2')
+           UNION ALL
+           SELECT 'attribute ' || n.nspname::text || '.' || c.relname::text || ' #'
+                  || a.attnum::text || ' ' || a.attname::text || ' type oid ' || a.atttypid::text
+             FROM pg_attribute a
+             JOIN pg_class c ON c.oid = a.attrelid
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname IN ('public', 'db2') AND a.attnum > 0
+           UNION ALL
+           SELECT 'type ' || n.nspname::text || '.' || t.typname::text || ' oid ' || t.oid::text
+             FROM pg_type t
+             JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE n.nspname IN ('public', 'db2')
+           UNION ALL
+           SELECT 'constraint ' || n.nspname::text || '.' || coalesce(r.relname::text, '-')
+                  || '.' || c.conname::text || ' oid ' || c.oid::text
+             FROM pg_constraint c
+             JOIN pg_namespace n ON n.oid = c.connamespace
+             LEFT JOIN pg_class r ON r.oid = c.conrelid
+            WHERE n.nspname IN ('public', 'db2')
+           UNION ALL
+           SELECT 'trigger ' || n.nspname::text || '.' || r.relname::text || '.'
+                  || g.tgname::text || ' oid ' || g.oid::text
+                  || CASE WHEN g.tgisinternal THEN ' internal' ELSE '' END
+             FROM pg_trigger g
+             JOIN pg_class r ON r.oid = g.tgrelid
+             JOIN pg_namespace n ON n.oid = r.relnamespace
+            WHERE n.nspname IN ('public', 'db2')
+           UNION ALL
+           SELECT 'routine ' || n.nspname::text || '.' || p.proname::text || ' oid ' || p.oid::text
+             FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE n.nspname IN ('public', 'db2')"#
+    )
+    .fetch_all(pool)
+    .await
+    .expect("list the catalog objects of the non-system schemas")
+}
+
+/// The catalog as one set of items that name schema objects, never a stored value: the objects
+/// of [`fetch_catalog_objects`] with their OIDs; every column of [`fetch_columns`] with its
+/// position in its table, its type and default as [`observed_type`] describes them, and its
+/// nullability; every constraint of [`fetch_constraints`] with its kind, key columns and
+/// complete definition; and every index of [`fetch_indexes`] with its complete definition.
+async fn catalog_snapshot(pool: &PgPool) -> BTreeSet<String> {
+    let mut items: BTreeSet<String> = fetch_catalog_objects(pool).await.into_iter().collect();
+    for ((schema, table), columns) in fetch_columns(pool).await {
+        for (position, column) in (1_u32..).zip(&columns) {
+            items.insert(format!(
+                "column {schema}.{table} #{position} {}: {} {}",
+                column.name,
+                observed_type(column),
+                nullability(column.nullable)
+            ));
+        }
+    }
+    for constraint in fetch_constraints(pool).await {
+        items.insert(format!(
+            "constraint {}.{}.{} kind {} on ({}): {}",
+            constraint.schema,
+            constraint.table,
+            constraint.name,
+            constraint.kind,
+            constraint.columns.join(", "),
+            constraint.def
+        ));
+    }
+    for index in fetch_indexes(pool).await {
+        items.insert(format!(
+            "index {}.{}: {}",
+            index.schema, index.table, index.def
+        ));
+    }
+    items
+}
+
+/// `db2.transaction_type` as migration 0006 seeds it: `TR_TYPE` and `TR_DESCRIPTION` of the
+/// seven rows of `DB2LTTYP.ctl:17-23`, in their order, which is key order; `REVERAL` is the
+/// source's spelling (E23).
+const DB2_TYPE_SEED: [(&str, &str); 7] = [
+    ("01", "PURCHASE"),
+    ("02", "PAYMENT"),
+    ("03", "CREDIT"),
+    ("04", "AUTHORIZATION"),
+    ("05", "REFUND"),
+    ("06", "REVERAL"),
+    ("07", "ADJUSTMENT"),
+];
+
+/// `db2.transaction_type_category` as migration 0006 seeds it: `TRC_TYPE_CODE`,
+/// `TRC_TYPE_CATEGORY` and `TRC_CAT_DATA` of the eighteen rows of `DB2LTCAT.ctl:20-37`, in their
+/// order, which is key order.
+const DB2_CATEGORY_SEED: [(&str, &str, &str); 18] = [
+    ("01", "0001", "REGULAR SALES DRAFT"),
+    ("01", "0002", "REGULAR CASH ADVANCE"),
+    ("01", "0003", "CONVENIENCE CHECK DEBIT"),
+    ("01", "0004", "ATM CASH ADVANCE"),
+    ("01", "0005", "INTEREST AMOUNT"),
+    ("02", "0001", "CASH PAYMENT"),
+    ("02", "0002", "ELECTRONIC PAYMENT"),
+    ("02", "0003", "CHECK PAYMENT"),
+    ("03", "0001", "CREDIT TO ACCOUNT"),
+    ("03", "0002", "CREDIT TO PURCHASE BALANCE"),
+    ("03", "0003", "CREDIT TO CASH BALANCE"),
+    ("04", "0001", "ZERO DOLLAR AUTHORIZATION"),
+    ("04", "0002", "ONLINE PURCHASE AUTHORIZATION"),
+    ("04", "0003", "TRAVEL BOOKING AUTHORIZATION"),
+    ("05", "0001", "REFUND CREDIT"),
+    ("06", "0001", "FRAUD REVERSAL"),
+    ("06", "0002", "NON FRAUD REVERSAL"),
+    ("07", "0001", "SALES DRAFT CREDIT ADJUSTMENT"),
+];
+
+/// The tables no load writes hold no row after `run`: `transactions`, whose TRANFILE load is
+/// out of scope, both pending-authorization tables, `auth_fraud` and `cssl_error_log`
+/// (FIXLOAD-011). A failure names the table and its row count.
+async fn check_unloaded_tables(pool: &PgPool, run: &str, failures: &mut Vec<String>) {
+    let counts = sqlx::query!(
+        r#"SELECT (SELECT count(*) FROM transactions) AS "transactions!",
+                  (SELECT count(*) FROM pending_auth_summaries) AS "pending_auth_summaries!",
+                  (SELECT count(*) FROM pending_auth_details) AS "pending_auth_details!",
+                  (SELECT count(*) FROM auth_fraud) AS "auth_fraud!",
+                  (SELECT count(*) FROM cssl_error_log) AS "cssl_error_log!""#
+    )
+    .fetch_one(pool)
+    .await
+    .expect("count the rows of the tables no load writes");
+    let tables = [
+        ("transactions", counts.transactions),
+        ("pending_auth_summaries", counts.pending_auth_summaries),
+        ("pending_auth_details", counts.pending_auth_details),
+        ("auth_fraud", counts.auth_fraud),
+        ("cssl_error_log", counts.cssl_error_log),
+    ];
+    failures.extend(
+        tables
+            .into_iter()
+            .filter(|&(_, rows)| rows != 0)
+            .map(|(table, rows)| format!("{run}: {table} holds {rows} row(s); no load writes it")),
+    );
+}
+
+/// Records a failure when the rows of `table` differ from `seed`, whole row against whole row:
+/// the first row, counted from 1, that differs, or both row counts when one list is a prefix of
+/// the other. No value is shown.
+fn compare_seed<T: PartialEq>(
+    run: &str,
+    table: &str,
+    seed: &[T],
+    observed: &[T],
+    failures: &mut Vec<String>,
+) {
+    if let Some((row, _)) = (1_u32..)
+        .zip(seed.iter().zip(observed))
+        .find(|(_, (want, found))| want != found)
+    {
+        failures.push(format!(
+            "{run}: {table} row {row} differs from the migration 0006 seed"
+        ));
+    } else if seed.len() != observed.len() {
+        failures.push(format!(
+            "{run}: {table} holds {} row(s), the migration 0006 seed {}",
+            observed.len(),
+            seed.len()
+        ));
+    }
+}
+
+/// Schema `db2` holds after `run` what migration 0006 seeded and nothing a load wrote: each of
+/// its tables equals, in key order, the rows of its CTL member (FIXLOAD-011, E23). The
+/// catalog comparison of [`catalog_snapshot`] shows that `db2` holds no other table.
+async fn check_db2_seed(pool: &PgPool, run: &str, failures: &mut Vec<String>) {
+    let types =
+        sqlx::query!("SELECT tr_type, tr_description FROM db2.transaction_type ORDER BY tr_type")
+            .fetch_all(pool)
+            .await
+            .expect("read db2.transaction_type");
+    let observed: Vec<(&str, &str)> = types
+        .iter()
+        .map(|row| (row.tr_type.as_str(), row.tr_description.as_str()))
+        .collect();
+    compare_seed(
+        run,
+        "db2.transaction_type",
+        &DB2_TYPE_SEED,
+        &observed,
+        failures,
+    );
+
+    let categories = sqlx::query!(
+        "SELECT trc_type_code, trc_type_category, trc_cat_data FROM db2.transaction_type_category \
+         ORDER BY trc_type_code, trc_type_category"
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read db2.transaction_type_category");
+    let observed: Vec<(&str, &str, &str)> = categories
+        .iter()
+        .map(|row| {
+            (
+                row.trc_type_code.as_str(),
+                row.trc_type_category.as_str(),
+                row.trc_cat_data.as_str(),
+            )
+        })
+        .collect();
+    compare_seed(
+        run,
+        "db2.transaction_type_category",
+        &DB2_CATEGORY_SEED,
+        &observed,
+        failures,
+    );
 }
 
 /// Asserts that `result` is a check violation, of the constraint `constraint` when one is named.
@@ -1681,4 +1928,45 @@ async fn constraints_behave_as_declared() {
     detail_hierarchy_is_enforced(&mut store).await;
     timestamp_layout_codes_are_enforced(pool).await;
     db2_version_is_seeded_and_restricted(pool, &mut store).await;
+}
+
+/// The nine loads, run through the harness, which issues the load subcommands' statements (each
+/// table replaced by one delete and its inserts in one transaction), first on the freshly
+/// migrated database and then on the loaded one, issue no DDL: after each run the catalog of
+/// [`catalog_snapshot`] equals the migrated one, item for item and OID for OID, so no table,
+/// column, constraint or index was created, altered, dropped or dropped and recreated. They
+/// write no table but their own: the tables of [`check_unloaded_tables`] hold no row, and schema
+/// `db2` holds exactly the migration 0006 seed.
+// audit: LOADS-020
+// audit: FIXLOAD-011
+#[tokio::test]
+async fn loads_issue_no_ddl_and_leave_the_other_tables_as_migrated() {
+    let guard = start_postgres()
+        .await
+        .expect("start a migrated postgres:16 container");
+    let pool = guard.pool();
+    let migrated = catalog_snapshot(pool).await;
+    let mut failures = Vec::new();
+    for run in [
+        "the loads on the migrated database",
+        "the loads on the loaded database",
+    ] {
+        load_fixtures(pool)
+            .await
+            .unwrap_or_else(|err| panic!("{run}: {err}"));
+        let loaded = catalog_snapshot(pool).await;
+        compare_sets(
+            &format!("{run}: catalog item"),
+            &migrated,
+            &loaded,
+            &mut failures,
+        );
+        check_unloaded_tables(pool, run, &mut failures).await;
+        check_db2_seed(pool, run, &mut failures).await;
+    }
+    assert!(
+        failures.is_empty(),
+        "the loads changed the catalog or a table they do not load:\n{}",
+        failures.join("\n")
+    );
 }

@@ -8,8 +8,13 @@
 //! their first query. This file only wires configuration, telemetry, the database pool and the
 //! clock; the workers, their reconnects and their failure paths are `messaging::run`.
 //!
-//! The process runs until SIGTERM or SIGINT stops it, or `messaging::run` reports a fatal
-//! startup error. A stop is cooperative: each worker finishes the request it holds, reply,
+//! The process runs until SIGTERM or SIGINT stops it, or `messaging::run` reports a
+//! configuration error: a `CARDDEMO_AMQP_URL` that is not a valid AMQP URL, or a request queue
+//! name the workers refuse, such as a `CARDDEMO_QUEUE_REQUEST_ACCT` over 48 bytes. A broker that
+//! is down or still booting when the process starts, or one that lacks a queue, does not end
+//! it: `messaging::run` logs one `ERROR` event per failed attempt and retries with its backoff
+//! until the broker and its queues are there, so the process needs no supervisor to outlast a
+//! broker outage. A stop is cooperative: each worker finishes the request it holds, reply,
 //! acknowledgement and writes included, and takes no other; the three workers are joined, the
 //! AMQP connection and the database pool are closed, one `INFO` event names the signal, and the
 //! process exits 0 after the telemetry guard flushes. Every broker wait is bounded, so the stop
@@ -18,10 +23,11 @@
 //! process exits 0. Only SIGKILL, or a crash, ends the process mid-request, with the outcome E29
 //! accepts.
 //!
-//! The process exits non-zero on any failure: a configuration or telemetry error as one line on
-//! standard error, since no subscriber exists yet; a signal-handler, database or broker error as
-//! one JSON `ERROR` event on standard output. No message names the connection URLs or any value
-//! they carry.
+//! The process exits non-zero on any failure it does not retry: a configuration or telemetry
+//! error as one line on standard error, since no subscriber exists yet; a signal-handler or
+//! database error, or the broker configuration error `messaging::run` returns, as one JSON
+//! `ERROR` event on standard output. No message names the connection URLs or any value they
+//! carry.
 
 use std::io;
 use std::process::ExitCode;

@@ -30,9 +30,11 @@
 //!   generation file's name, and no report or statement content leaves (Cardholder Data
 //!   Redaction).
 //! - Every request writes a file of its own, so two decks never interleave. When two submissions
-//!   race for one generation, the exclusive create of the second fails and it answers the write
-//!   failure; a generation file is never overwritten (CORPT00C-037, halt candidate
-//!   X-CORPT00C-H2).
+//!   race for one generation, the exclusive create of the second fails, and it names the
+//!   generation again, one above the first's, and writes its deck there: each is answered with
+//!   its own generation and the submission message, as `WRITEQ TD` accepts every write, and a
+//!   generation file is never overwritten (CORPT00C-036, CORPT00C-038). What JES makes of decks
+//!   whose records interleave stays halt candidate X-CORPT00C-H2.
 //! - A deck whose write fails after its file was created is removed, so no incomplete deck is
 //!   left for a reader to pick up. The bytes a failed COBOL write leaves are halt candidate
 //!   X-CORPT00C-H2 and no parity claim rests on them.
@@ -62,6 +64,12 @@ const DECK_BASE: &str = "TRNRPT00";
 /// The terminator after every 80-byte record, as every generation file holds its fixed-length
 /// records (AAP 0.3.4.3).
 const RECORD_TERMINATOR: u8 = b'\n';
+
+/// The setting that names the job-deck directory, as the events and errors about that directory
+/// name it in place of its path: `CARDDEMO_INTRDR_DIR`, which defaults to `jobs` under
+/// `CARDDEMO_VAR_DIR` (`runtime::config`).
+pub(crate) const DECK_DIR_SETTING: &str =
+    "CARDDEMO_INTRDR_DIR, or jobs under CARDDEMO_VAR_DIR when CARDDEMO_INTRDR_DIR is unset";
 
 /// Submit the transaction report: the edits, the confirmation and, when confirmed, the job deck
 /// (CORPT00C-006 to CORPT00C-039).
@@ -199,25 +207,86 @@ impl DeckError {
 ///
 /// The name is checked before the file is created, so a name that cannot be answered leaves
 /// nothing written. A file created and then not fully written is removed.
+///
+/// `WRITEQ TD` accepts the deck of every concurrent `CR00` task, so a request whose exclusive
+/// create is refused because another request took the generation first names the generation
+/// again and creates that one; nothing is ever overwritten. It retries only while [`retries`]
+/// allows: each refused name must be a later generation than the one refused before it. A
+/// concurrent request always leaves a later name to take, because the rescan counts the
+/// generation it took, while generation numbers end at `runtime::gdg::MAX_GENERATION`, after
+/// which the generation step fails. So a request makes at most one attempt per generation number,
+/// and a refusal that names no later generation, which no concurrent deck explains, is the write
+/// failure of CORPT00C-037.
 fn write_deck(dir: &Path, deck: &[u8]) -> Result<String, DeckError> {
-    let path = runtime::gdg::next_generation(dir, DECK_BASE)
-        .map_err(|error| DeckError::before_create(DeckStep::Generation, &error))?;
-    let file_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .map(str::to_owned)
-        .ok_or(DeckError::FileName)?;
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|error| DeckError::before_create(DeckStep::Create, &error))?;
-    write_records(file, deck).map_err(|error| DeckError::Io {
-        step: DeckStep::Write,
-        kind: error.kind(),
-        removed: fs::remove_file(&path).is_ok(),
-    })?;
-    Ok(file_name)
+    let mut last_refused: Option<String> = None;
+    loop {
+        let path = runtime::gdg::next_generation(dir, DECK_BASE)
+            .map_err(|error| DeckError::before_create(DeckStep::Generation, &error))?;
+        let file_name = path
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(str::to_owned)
+            .ok_or(DeckError::FileName)?;
+        let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && retries(&file_name, last_refused.as_deref()) =>
+            {
+                last_refused = Some(file_name);
+                continue;
+            }
+            Err(error) => return Err(DeckError::before_create(DeckStep::Create, &error)),
+        };
+        write_records(file, deck).map_err(|error| DeckError::Io {
+            step: DeckStep::Write,
+            kind: error.kind(),
+            removed: fs::remove_file(&path).is_ok(),
+        })?;
+        return Ok(file_name);
+    }
+}
+
+/// Whether a request whose exclusive create of generation file `refused` found it taken names
+/// the generation again: only when no create was refused before, or `refused` is a later
+/// generation than `last_refused`, the name refused before it (CORPT00C-036).
+///
+/// Both names are [`DECK_BASE`], `.G` and four digits, so their order as text is the order of
+/// their generation numbers. A name no later than the one refused before means that what stands
+/// in the way is not a concurrent deck: a name the generation scan does not count, such as a
+/// differently cased name on a case-insensitive filesystem, or a generation removed again after a
+/// failed write.
+fn retries(refused: &str, last_refused: Option<&str>) -> bool {
+    last_refused.is_none_or(|last| refused > last)
+}
+
+/// Checks, before `carddemo-api` serves, that `dir` can hold job decks: an existing directory,
+/// or no entry at all, which the first submission creates with its missing parents.
+///
+/// Only an entry that can never be the directory is refused: `dir` exists and is no directory,
+/// a dangling link included, or a path through something that is not one. Any other failure to
+/// read it, such as a permission, is left to each submission, which answers it with CORPT00C-037
+/// and an event naming [`DECK_DIR_SETTING`], so the server keeps serving every other endpoint.
+/// The check reads the entry once; a directory replaced by a file later still gets that answer.
+///
+/// # Errors
+///
+/// `io::ErrorKind::NotADirectory` for a refused entry. Only the kind is kept: the error's own
+/// text could name the path.
+pub(crate) fn check_deck_dir(dir: &Path) -> Result<(), io::ErrorKind> {
+    match fs::metadata(dir) {
+        Ok(found) if found.is_dir() => Ok(()),
+        Ok(_) => Err(io::ErrorKind::NotADirectory),
+        // Nothing there, unless a link stands in the directory's place and leads nowhere.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match fs::symlink_metadata(dir) {
+            Ok(_) => Err(io::ErrorKind::NotADirectory),
+            Err(_) => Ok(()),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+            Err(io::ErrorKind::NotADirectory)
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 /// Writes `deck` to `file`, syncs it and closes it.
@@ -234,7 +303,8 @@ fn write_records(mut file: File, deck: &[u8]) -> io::Result<()> {
 /// (CORPT00C-037, CORPT00C-038).
 ///
 /// A failed step is logged with the step and the I/O error kind, the counterpart of the
-/// program's `DISPLAY` of `RESP` and `RESP2`, and never with the directory or a path.
+/// program's `DISPLAY` of `RESP` and `RESP2`, and with [`DECK_DIR_SETTING`], the setting the
+/// operator changes, never with the directory or a path.
 fn answer(
     kind: ReportKind,
     written: Result<String, DeckError>,
@@ -250,6 +320,7 @@ fn answer(
                 step = step.name(),
                 io_error = %io_kind,
                 partial_deck_removed = removed,
+                setting = DECK_DIR_SETTING,
                 "job deck not written"
             );
             Err(ServiceError::Rule(corpt00c::tdq_write_failure()))
@@ -271,14 +342,20 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+    use std::thread;
 
     use chrono::NaiveDate;
     use domain::FixedClock;
     use domain::online::corpt00c::{
         self, ConfirmOutcome, DECK_RECORD_COUNT, DECK_RECORD_LEN, ReportKind,
     };
+    use test_support::trace_capture;
 
-    use super::{DeckError, DeckStep, ReportRequestDto, answer, decide, deck_bytes, write_deck};
+    use super::{
+        DECK_DIR_SETTING, DeckError, DeckStep, ReportRequestDto, answer, check_deck_dir, decide,
+        deck_bytes, retries, write_deck,
+    };
     use crate::error::{ScreenError, ServiceError};
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -474,6 +551,72 @@ mod tests {
         Ok(())
     }
 
+    /// Decks written at once from many threads into one directory are each submitted: a write
+    /// whose generation another took first names the next one, so the names are exactly
+    /// `G0001` onward and every file holds one whole deck.
+    #[test]
+    fn concurrent_decks_each_take_a_generation_of_their_own() -> TestResult {
+        const WRITERS: usize = 32;
+        let scratch = ScratchDir::new("concurrent")?;
+        let deck = monthly_deck()?;
+        let start = Barrier::new(WRITERS);
+        let written: Vec<Result<String, DeckError>> = thread::scope(|scope| {
+            let writers: Vec<_> = (0..WRITERS)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        write_deck(scratch.path(), &deck)
+                    })
+                })
+                .collect();
+            writers
+                .into_iter()
+                .map(|writer| writer.join().unwrap_or(Err(DeckError::Task)))
+                .collect()
+        });
+
+        // audit: CORPT00C-036
+        let mut names = written
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("a concurrent deck was not submitted: {error:?}"))?;
+        names.sort_unstable();
+        let expected: Vec<String> = (1..=WRITERS)
+            .map(|generation| format!("TRNRPT00.G{generation:04}"))
+            .collect();
+        assert_eq!(names, expected);
+        for name in &expected {
+            assert_eq!(fs::read(scratch.path().join(name))?, deck, "{name}");
+        }
+        assert_eq!(fs::read_dir(scratch.path())?.count(), WRITERS);
+        Ok(())
+    }
+
+    /// A refused create is retried only while each refused name is a later generation than the
+    /// one refused before it.
+    #[test]
+    fn a_refused_generation_is_retried_only_while_the_names_advance() {
+        // audit: CORPT00C-036
+        // audit: CORPT00C-037
+        let cases = [
+            ("TRNRPT00.G0001", None, true),
+            ("TRNRPT00.G0010", Some("TRNRPT00.G0009"), true),
+            ("TRNRPT00.G9999", Some("TRNRPT00.G0001"), true),
+            ("TRNRPT00.G0009", Some("TRNRPT00.G0009"), false),
+            ("TRNRPT00.G0008", Some("TRNRPT00.G0009"), false),
+        ];
+        for (refused, last_refused, retried) in cases {
+            assert_eq!(
+                retries(refused, last_refused),
+                retried,
+                "{refused} after {last_refused:?}"
+            );
+        }
+    }
+
+    /// A regular file in place of the job-deck directory, or of one of its ancestors, is the TDQ
+    /// write failure. Its event names the generation step, the true cause and the setting the
+    /// operator changes, never the path, and the file is left as it was.
     #[test]
     fn a_directory_that_cannot_hold_generations_is_the_tdq_write_failure() -> TestResult {
         let scratch = ScratchDir::new("regular-file")?;
@@ -481,33 +624,75 @@ mod tests {
         let not_a_directory = scratch.path().join("jobs");
         fs::write(&not_a_directory, b"")?;
 
-        // audit: CORPT00C-037
-        let written = write_deck(&not_a_directory, &monthly_deck()?);
-        assert!(
-            matches!(
+        for dir in [not_a_directory.clone(), not_a_directory.join("decks")] {
+            let traces = trace_capture::capture();
+            // audit: CORPT00C-037
+            let written = write_deck(&dir, &monthly_deck()?);
+            assert_eq!(
                 written,
                 Err(DeckError::Io {
                     step: DeckStep::Generation,
+                    kind: io::ErrorKind::NotADirectory,
                     removed: true,
-                    ..
                 })
-            ),
-            "{written:?}"
-        );
-        assert_eq!(fs::read(&not_a_directory)?, b"");
-        let answered = answer(ReportKind::Monthly, written);
-        assert_eq!(
-            answered,
-            Err(ServiceError::Rule(corpt00c::tdq_write_failure()))
-        );
-        let error = answered
-            .err()
-            .map(ScreenError::from)
-            .ok_or("the failure was answered as a success")?;
-        assert_eq!(
-            (error.status().as_u16(), error.message(), error.field()),
-            (500, "Unable to Write TDQ (JOBS)...", Some("monthly"))
-        );
+            );
+            assert_eq!(fs::read(&not_a_directory)?, b"");
+            let answered = answer(ReportKind::Monthly, written);
+            assert_eq!(
+                answered,
+                Err(ServiceError::Rule(corpt00c::tdq_write_failure()))
+            );
+            let error = answered
+                .err()
+                .map(ScreenError::from)
+                .ok_or("the failure was answered as a success")?;
+            assert_eq!(
+                (error.status().as_u16(), error.message(), error.field()),
+                (500, "Unable to Write TDQ (JOBS)...", Some("monthly"))
+            );
+            for field in [
+                r#""step":"generation""#.to_owned(),
+                r#""io_error":"not a directory""#.to_owned(),
+                format!(r#""setting":"{DECK_DIR_SETTING}""#),
+            ] {
+                assert!(traces.contains(&field), "the event lacks {field}");
+            }
+            let shown = scratch.path().to_string_lossy();
+            assert!(!traces.contains(&shown), "an event names the directory");
+        }
+        Ok(())
+    }
+
+    /// The startup check refuses only an entry that can never be the job-deck directory: a
+    /// regular file, a path through one, or a link to nothing. An existing directory and a
+    /// missing one, which the first submission creates, pass, and nothing is created.
+    #[test]
+    fn the_startup_check_refuses_only_what_can_never_be_the_directory() -> TestResult {
+        let scratch = ScratchDir::new("startup-check")?;
+        fs::create_dir_all(scratch.path().join("decks"))?;
+        let file = scratch.path().join("file");
+        fs::write(&file, b"")?;
+        #[cfg(unix)]
+        let dangling = {
+            let link = scratch.path().join("dangling");
+            std::os::unix::fs::symlink(scratch.path().join("missing-target"), &link)?;
+            Some((link, Err(io::ErrorKind::NotADirectory)))
+        };
+        #[cfg(not(unix))]
+        let dangling = None;
+
+        let cases = [
+            (scratch.path().join("decks"), Ok(())),
+            (scratch.path().join("missing"), Ok(())),
+            (scratch.path().join("missing").join("jobs"), Ok(())),
+            (file.clone(), Err(io::ErrorKind::NotADirectory)),
+            (file.join("jobs"), Err(io::ErrorKind::NotADirectory)),
+        ];
+        for (dir, expected) in cases.into_iter().chain(dangling) {
+            assert_eq!(check_deck_dir(&dir), expected, "{}", dir.display());
+        }
+        assert!(!scratch.path().join("missing").exists());
+        assert_eq!(fs::read(&file)?, b"");
         Ok(())
     }
 

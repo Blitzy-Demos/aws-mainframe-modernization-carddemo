@@ -94,8 +94,8 @@ pub(crate) async fn view(
 /// the row, `DFHRESP(NOTFND)`, or any other response (COTRN01C-012, COTRN01C-013, COTRN01C-015).
 ///
 /// The store error does not choose the answer: every failure, whatever its SQLSTATE, gets the
-/// program's one `WHEN OTHER` answer (COTRN01C-013). It is logged first, once, as a `WARN` event
-/// naming the program and the paragraph, in place of the COBOL's `DISPLAY` of the CICS codes.
+/// program's one `WHEN OTHER` answer (COTRN01C-013). It is logged first, once, as an `ERROR`
+/// event naming the program and the paragraph, in place of the COBOL's `DISPLAY` of the CICS codes.
 fn lookup(read: &Result<Option<TransactionRecord>, PersistenceError>) -> TranLookup<'_> {
     match read {
         Ok(Some(record)) => TranLookup::Found(record),
@@ -103,7 +103,7 @@ fn lookup(read: &Result<Option<TransactionRecord>, PersistenceError>) -> TranLoo
         Err(error) => {
             // The error's `Display` holds only an SQLSTATE and a constraint or column name,
             // never the key or a stored value (Cardholder Data Redaction).
-            tracing::warn!(
+            tracing::error!(
                 program = "COTRN01C",
                 paragraph = "READ-TRANSACT-FILE",
                 error = %error,
@@ -234,7 +234,7 @@ mod tests {
                 return Err(format!("{cause}: {} lines", lines.len()).into());
             };
             for expected in [
-                r#""level":"WARN""#,
+                r#""level":"ERROR""#,
                 r#""program":"COTRN01C""#,
                 r#""paragraph":"READ-TRANSACT-FILE""#,
                 cause.as_str(),

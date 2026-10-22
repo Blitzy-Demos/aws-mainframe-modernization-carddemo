@@ -35,9 +35,10 @@
 //!
 //! Each request is processed as the first message of a CICS task, and
 //! [`Worker`](crate::workers::cdrd::Worker) keeps no state from one request to the next: it holds
-//! its channels, its queue name and its clock, never a request, a body or an ID (CODATE01-013;
-//! E14, E15). The date and time come only from the injected [`Clock`](domain::Clock), read once
-//! per reply, so the date and the time describe one instant (CODATE01-008).
+//! its channels, its queue name, its clock and the ID key of its spans, never a request, a body
+//! or an ID (CODATE01-013; E14, E15). The date and time come only from the injected
+//! [`Clock`](domain::Clock), read once per reply, so the date and the time describe one instant
+//! (CODATE01-008).
 //!
 //! The module's links are written as full paths because the `pub mod cdrd;` declaration carries
 //! an outer doc comment, and rustdoc resolves this merged documentation from the parent module.
@@ -56,6 +57,7 @@ use domain::Clock;
 use domain::messaging::codate01;
 use lapin::Connection;
 use runtime::config::Config;
+use runtime::telemetry::IdKey;
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
@@ -65,8 +67,9 @@ use crate::error_body::Flow;
 /// passive declare of the request queue name in place of the configured value.
 pub(super) const REQUEST_QUEUE_VARIABLE: &str = "CARDDEMO_QUEUE_REQUEST_DATE";
 
-/// The CDRD worker: one consumer and one publisher channel, the configured request queue and the
-/// injected clock (CODATE01-008, CODATE01-013).
+/// The CDRD worker: one consumer and one publisher channel, the configured request queue, the
+/// injected clock (CODATE01-008, CODATE01-013) and the key under which its spans record the
+/// request IDs.
 ///
 /// `A` settles requests; production uses the [`Consumer`] channel itself, and tests substitute a
 /// failing or recording [`Acknowledger`] through [`Worker::with_acknowledger`].
@@ -74,6 +77,9 @@ pub struct Worker<A: Acknowledger = Consumer> {
     channels: Channels<A>,
     request_queue: String,
     clock: Arc<dyn Clock>,
+    /// The key of `config.amqp_url` under which the span records each request's IDs as their
+    /// keyed digests, as the `Redaction` section of `crate::workers` explains; never shown.
+    id_key: IdKey,
 }
 
 impl Worker<Consumer> {
@@ -81,7 +87,8 @@ impl Worker<Consumer> {
     /// a queue name AMQP can carry, then opens the consumer channel, checks the request queue,
     /// `CARD.DEMO.REPLY.DATE` and `CARD.DEMO.ERROR` with a passive declare, and opens the
     /// publisher channel in confirm mode. `clock` supplies the date and time of every reply
-    /// (CODATE01-008).
+    /// (CODATE01-008); `config.amqp_url`, the `CARDDEMO_AMQP_URL` `carddemo-mq` connects with,
+    /// keys the IDs each request span records.
     ///
     /// # Errors
     ///
@@ -113,25 +120,28 @@ impl Worker<Consumer> {
             channels,
             request_queue: config.queue_request_date.clone(),
             clock,
+            id_key: IdKey::new(&config.amqp_url),
         })
     }
 }
 
 impl<A: Acknowledger> Worker<A> {
     /// This worker with `acknowledger` settling every request in place of the consumer channel,
-    /// the seam of the failure-injection tests. The channels, queue and clock are kept.
+    /// the seam of the failure-injection tests. The channels, queue, clock and ID key are kept.
     #[must_use]
     pub fn with_acknowledger<B: Acknowledger>(self, acknowledger: B) -> Worker<B> {
         Worker {
             channels: self.channels.with_acknowledger(acknowledger),
             request_queue: self.request_queue,
             clock: self.clock,
+            id_key: self.id_key,
         }
     }
 }
 
 impl<A: Acknowledger> fmt::Debug for Worker<A> {
-    /// The request queue only: channels and clock have nothing a reader of a log needs.
+    /// The request queue only: channels and clock have nothing a reader of a log needs, and the
+    /// ID key is a secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
             .field("request_queue", &self.request_queue)
@@ -157,11 +167,12 @@ impl<A: Acknowledger> Step for Worker<A> {
             channels,
             request_queue,
             clock,
+            id_key,
         } = self;
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
-        let processed = super::in_message_span(request_queue, &request, async {
+        let processed = super::in_message_span(request_queue, &request, id_key, async {
             let body = codate01::reply_body(clock.as_ref());
             super::reply_fixed(channels, connection, &request, Flow::Cdrd, &body).await
         })

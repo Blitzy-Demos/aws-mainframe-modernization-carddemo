@@ -97,7 +97,7 @@ async fn detail<R: CardRepository>(
         },
         Ok(None) => CardLookup::NotFound,
         Err(error) => {
-            tracing::warn!(%error, "CARDDAT read failed; answering the COCRDSLC file error");
+            tracing::error!(%error, "CARDDAT read failed; answering the COCRDSLC file error");
             CardLookup::Error
         }
     };

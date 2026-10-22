@@ -11,6 +11,8 @@ import { z } from "zod";
  * navigation. Storage holds exactly the token, user ID and user type, never a password,
  * card number or other payload, and this module logs nothing. The JWT is never decoded:
  * an expired token surfaces as the API's 401, on which `api/client.ts` clears the session.
+ * Every sign-on and every clear is announced to the listeners of {@link subscribeSession},
+ * through which the route guard follows the session as it changes.
  */
 
 /** The single `sessionStorage` key that holds the session. */
@@ -38,7 +40,56 @@ function storage(): Storage | null {
   }
 }
 
-/** Stores the session returned by sign-on. Never throws. */
+/** The functions {@link subscribeSession} registered, each told of every session change. */
+const listeners = new Set<() => void>();
+
+/**
+ * Tells every registered listener that the session may have changed. It runs whether or not
+ * storage took the change, because a failed write or removal can still change what
+ * {@link getSession} reads. Each listener runs on its own: one that throws neither stops the
+ * others nor reaches the caller, so {@link setSession} and {@link clearSession} never throw.
+ * The set is copied first, so a listener added or removed while the round runs does not change
+ * that round.
+ */
+function notify(): void {
+  for (const listener of [...listeners]) {
+    try {
+      listener();
+    } catch {
+      // The session change has already happened; a failing listener is the listener's concern.
+    }
+  }
+}
+
+/**
+ * Registers `listener` to run after every {@link setSession} and {@link clearSession}, and
+ * returns the function that removes it. This is the `subscribe` of React's
+ * `useSyncExternalStore`, through which `RequireSignon` re-renders as soon as a 401 clears the
+ * session. A function registered twice is held, and called, once.
+ */
+export function subscribeSession(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * The stored session's raw text, or `null` when nothing is stored or storage is unreachable: the
+ * `getSnapshot` of `useSyncExternalStore`. A string compares by value, so calls with no change in
+ * between return identical snapshots, as React requires. The text is not parsed here; whether it
+ * holds a session is {@link getSession}'s decision. Never throws.
+ */
+export function getSessionSnapshot(): string | null {
+  try {
+    return storage()?.getItem(SESSION_KEY) ?? null;
+  } catch {
+    // Refused storage access: the same snapshot as no session.
+    return null;
+  }
+}
+
+/** Stores the session returned by sign-on, then notifies the listeners. Never throws. */
 export function setSession(token: string, userId: string, userType: string): void {
   const store = storage();
   try {
@@ -49,6 +100,7 @@ export function setSession(token: string, userId: string, userType: string): voi
     // Quota or security failure: nothing is stored, the next getSession() returns null and
     // the route guard sends the user back to /signon.
   }
+  notify();
 }
 
 /**
@@ -75,13 +127,17 @@ export function getToken(): string | null {
   return getSession()?.token ?? null;
 }
 
-/** Ends the session (sign-off, or a 401 from the API). Never throws. */
+/**
+ * Ends the session (sign-off, or a 401 from the API), then notifies the listeners, so a mounted
+ * route guard sends the user to `/signon` at once. Never throws.
+ */
 export function clearSession(): void {
   try {
     storage()?.removeItem(SESSION_KEY);
   } catch {
     // Refused storage access: there is no stored session this module could reach.
   }
+  notify();
 }
 
 /**

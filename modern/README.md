@@ -73,7 +73,7 @@ Commands run from `modern/` in a shell where `.env` is exported; the scripts exp
 |---|---|
 | `cargo run -p runtime --bin carddemo-migrate` | Applies `crates/persistence/migrations/`, the only path by which the schema changes; a rerun applies nothing |
 | `cargo run -p api --bin carddemo-api` | Serves the 27 operations under `/api/v1` on `CARDDEMO_API_BIND`, and the contract at `/api-docs/openapi.json` |
-| `cargo run -p api --bin carddemo-openapi` | Prints the OpenAPI document; needs no database, broker or environment |
+| `cargo run -p api --bin carddemo-openapi` | Prints the OpenAPI document; needs no database, broker or environment; `-- --help` after it prints its usage |
 | `cargo run -p messaging --bin carddemo-mq` | Runs the CDRD, CDRA and CP00 workers on the three request queues |
 | `cargo run -p batch --bin carddemo-batch -- <subcommand>` | Runs one of the 15 batch jobs below; `--help` in place of the subcommand lists them |
 
@@ -97,7 +97,7 @@ A job that writes files prints each path it wrote, one per line. Outputs stay on
 | `scripts/protected-diff.sh` | Fails on any change to the COBOL tree or to any other path outside `modern/` |
 | `node scripts/frontend-policy.mjs` | Fails on a frontend dependency missing from `frontend/approved-dependencies.json`, or a hand-written type that restates a generated API type |
 
-`dev-up.sh`, `regen-api.sh`, `e2e.sh` and `protected-diff.sh` print their usage with `--help`. `check.sh` ignores its arguments and runs the whole pipeline, and `frontend-policy.mjs` reads its first argument as the directory to check in place of `modern/`, so pass neither of them `--help`.
+`dev-up.sh`, `check.sh`, `regen-api.sh`, `e2e.sh` and `protected-diff.sh` print their usage with `--help`. `frontend-policy.mjs` reads its first argument as the directory to check in place of `modern/`, so do not pass it `--help`.
 
 ### Frontend
 

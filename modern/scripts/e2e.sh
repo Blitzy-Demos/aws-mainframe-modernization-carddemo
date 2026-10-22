@@ -19,9 +19,13 @@
 #      answers. carddemo-mq is not started: NAV needs no broker worker;
 #   5. pnpm --dir frontend e2e (playwright test), whose exit status becomes this script's.
 # On every exit from step 1 on (success, failure, SIGINT or SIGTERM) both servers are stopped and
-# docker compose down -v removes the containers and the database volume, so no NAV data outlives
-# the run. A SIGTERM sent to this script alone takes effect once its current foreground command
-# returns. NAV itself submits no write, so the data stays as prepared here.
+# docker compose down -v removes the containers, the network and both data volumes (the
+# database's and the broker's), so no NAV data outlives the run. That down runs in a session of
+# its own where setsid exists, so a further Ctrl-C cannot interrupt it, and is retried up to 3
+# times. When a server cannot be stopped or the stack cannot be removed, stderr says what may
+# remain and a run that would have exited 0 exits 1.
+# A SIGTERM sent to this script alone takes effect once its current foreground command returns.
+# NAV itself submits no write, so the data stays as prepared here.
 #
 # Output: progress lines and the path of the DALYREJS generation posttran wrote. The output of
 # posttran and of both servers goes to var/e2e/*.log and is never echoed. The database is read
@@ -57,13 +61,16 @@ exports modern/.env when present; CARDDEMO_JWT_SECRET must be set. The output of
 both servers goes to var/e2e/*.log.
 
 Exit status:
-  0    NAV passed
+  0    NAV passed, and the cleanup stopped both servers and removed the stack
   1    CARDDEMO_JWT_SECRET is empty; posttran's exit status or a row count differs from the
-       audited one; a server exited or did not answer within 120 s; or its URL already answered
-       before it was started
+       audited one; a server exited or did not answer within 120 s; its URL already answered
+       before it was started; or, after an otherwise successful run, the cleanup could not stop
+       a server or remove the stack (docker compose down -v failed 3 times)
   2    usage error: an unexpected argument
   130  interrupted (SIGINT); 143 terminated (SIGTERM)
   Any other non-zero status is that of the docker, cargo, pnpm or Playwright command that failed.
+  A failed cleanup keeps any non-zero status, 130 and 143 included, and is reported on stderr
+  with what may remain.
 EOF
 }
 
@@ -118,31 +125,79 @@ mkdir -p "$LOG_DIR"
 API_PID=''
 VITE_PID=''
 
-# Stops a server this script started: SIGTERM (both stop gracefully on it), then SIGKILL when it
-# is still running 10 s later.
-stop_server() {
-  local pid=$1 name=$2 i
-  kill "$pid" 2>/dev/null || return 0
-  for ((i = 0; i < 100; i++)); do
-    kill -0 "$pid" 2>/dev/null || break
+# Exit status 0 once process PID no longer exists, polling every 0.1 s for at most TENTHS tenths
+# of a second; 1 when it still exists at the end.
+exited_within() {
+  local pid=$1 tenths=$2 i
+  for ((i = 0; i < tenths; i++)); do
+    kill -0 "$pid" 2>/dev/null || return 0
     sleep 0.1
   done
-  if kill -0 "$pid" 2>/dev/null; then
-    echo "e2e: $name still running 10 s after SIGTERM; sending SIGKILL" >&2
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+# Stops a server this script started: SIGTERM (both stop gracefully on it), then SIGKILL when it
+# is still running 10 s later. A refused or failed signal is never taken as success: exit status
+# 0 only once the server is observed gone, whatever its own exit status after the signal, also
+# when it had already exited. Exit status 1, without waiting for it, when it is still running 5 s
+# after SIGKILL, after naming it and its pid on stderr.
+stop_server() {
+  local pid=$1 name=$2 term=SIGTERM
+  kill "$pid" 2>/dev/null || term='a refused SIGTERM'
+  if ! exited_within "$pid" 100; then
+    echo "e2e: $name still running 10 s after $term; sending SIGKILL" >&2
     kill -KILL "$pid" 2>/dev/null || true
+    if ! exited_within "$pid" 50; then
+      echo "e2e: $name (pid $pid) is still running 5 s after SIGKILL and could not be stopped;" \
+        "end it before the next run" >&2
+      return 1
+    fi
   fi
   wait "$pid" 2>/dev/null || true
 }
 
-# Runs on every exit once installed, keeping the exit status. SIGINT and SIGTERM are ignored while
-# it runs, and by the commands it starts, so a second interrupt cannot leave the stack behind.
+# docker compose down -v, attempted at most 3 times, 2 s apart. Each attempt runs in a session of
+# its own when setsid (util-linux) is available, out of reach of a SIGINT or SIGTERM sent to this
+# script's process group, as a Ctrl-C is: the docker CLI installs its own SIGINT handler instead
+# of keeping an inherited ignored disposition, and an interrupted down leaves the stack behind.
+# Without setsid (macOS), the retry covers an interrupted attempt.
+remove_stack() {
+  local attempt
+  for ((attempt = 1; attempt <= 3; attempt++)); do
+    if command -v setsid > /dev/null; then
+      if setsid -w docker compose down -v; then return 0; fi
+    elif docker compose down -v; then
+      return 0
+    fi
+    if [ "$attempt" -lt 3 ]; then
+      echo "e2e: docker compose down -v failed (attempt $attempt of 3); retrying in 2 s" >&2
+      sleep 2
+    fi
+  done
+  return 1
+}
+
+# Runs on every exit once installed. SIGINT and SIGTERM are ignored while it runs, and the stack
+# is removed by remove_stack, so a second interrupt cannot cut the cleanup short. Every step is
+# attempted whatever an earlier one returned. A non-zero exit status is kept; status 0 becomes 1
+# when a server could not be stopped or the stack could not be removed, and stderr then says
+# what may remain.
 cleanup() {
-  local rc=$?
+  local rc=$? failed=0
   trap '' INT TERM
-  if [ -n "$API_PID" ]; then stop_server "$API_PID" carddemo-api; fi
-  if [ -n "$VITE_PID" ]; then stop_server "$VITE_PID" 'the Vite dev server'; fi
+  if [ -n "$API_PID" ] && ! stop_server "$API_PID" carddemo-api; then failed=1; fi
+  if [ -n "$VITE_PID" ] && ! stop_server "$VITE_PID" 'the Vite dev server'; then failed=1; fi
   echo 'e2e: removing the stack and its data (docker compose down -v)'
-  docker compose down -v || true
+  if ! remove_stack; then
+    echo 'e2e: docker compose down -v failed 3 times: the containers, the network and the data' \
+      'volumes, the database volume holding the NAV data included, may remain;' \
+      'run docker compose down -v in modern/' >&2
+    failed=1
+  fi
+  if [ "$failed" -ne 0 ]; then
+    echo 'e2e: the cleanup is incomplete (see above)' >&2
+    if [ "$rc" -eq 0 ]; then rc=1; fi
+  fi
   exit "$rc"
 }
 trap cleanup EXIT

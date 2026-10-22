@@ -56,9 +56,10 @@
 //! The `Display` and `Debug` of [`JobError`] are the text `main` writes to standard error and to
 //! the job's tracing event. They hold no record bytes and no card number, CVV, SSN, password or
 //! hash (Cardholder Data Redaction): an I/O failure carries a static context and the
-//! `std::io::ErrorKind`, never a path, a reached generation limit names the static base only,
-//! and a wrapped domain or persistence error is shown through its own `Display` only where that
-//! text carries none of them.
+//! `std::io::ErrorKind`, never a path, and one on the job's output directory also the setting
+//! that names the directory, such as `reports under CARDDEMO_VAR_DIR`; a reached generation
+//! limit names the static base only, and a wrapped domain or persistence error is shown through
+//! its own `Display` only where that text carries none of them.
 //!
 //! The one path an error shows is the input file of a load (`loads`, `dusrsecj`), as the job got
 //! it: the `--input` the operator gave, or its default, the fixture in `CARDDEMO_FIXTURE_DIR` or
@@ -148,6 +149,20 @@ pub(crate) enum JobError {
         /// What the operating system reported.
         kind: ErrorKind,
     },
+    /// A step on the job's output directory failed: allocating a generation, creating or locking
+    /// the directory, or creating an output file in it. Its text names the step, the setting
+    /// that names the directory, such as `reports under CARDDEMO_VAR_DIR`, and what the
+    /// operating system reported, never the path. [`JobError::naming_output_dir`] makes it from
+    /// the [`JobError::Io`] of such a step.
+    OutputDirectory {
+        /// The step that failed.
+        context: &'static str,
+        /// The configuration that names the directory, in words: the variable, and the
+        /// subdirectory when the directory lies under `CARDDEMO_VAR_DIR`.
+        setting: &'static str,
+        /// What the operating system reported.
+        kind: ErrorKind,
+    },
     /// The input file of a load could not be read (`loads`, `dusrsecj`; LOADS-019). Its text
     /// names the path as the job got it and what the operating system reported.
     UnreadableInput {
@@ -219,12 +234,39 @@ impl JobError {
             _ => None,
         }
     }
+
+    /// The error with `setting`, the configuration that names the job's output directory, when
+    /// it is the [`JobError::Io`] of a step on that directory: allocating a generation, creating
+    /// or locking the directory, or creating an output file in it, each of which only
+    /// [`OutputFile`] and [`DirectoryLock`] take. That error becomes
+    /// [`JobError::OutputDirectory`], so the operator learns which setting to correct without
+    /// the path being shown. Every other error is returned as it is, its exit code unchanged.
+    ///
+    /// `main` calls this for the jobs that write files, each of which writes into one directory
+    /// only, so every such step of the job is on that directory.
+    pub(crate) fn naming_output_dir(self, setting: &'static str) -> Self {
+        match self {
+            Self::Io { context, kind } if OUTPUT_DIRECTORY_STEPS.contains(&context) => {
+                Self::OutputDirectory {
+                    context,
+                    setting,
+                    kind,
+                }
+            }
+            other => other,
+        }
+    }
 }
 
 impl fmt::Display for JobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { context, kind } => write!(f, "{context}: {kind}"),
+            Self::OutputDirectory {
+                context,
+                setting,
+                kind,
+            } => write!(f, "{context} ({setting}): {kind}"),
             Self::UnreadableInput { input, kind } => write!(f, "{READING_INPUT} {input}: {kind}"),
             Self::GenerationLimit { base } => write!(
                 f,
@@ -492,6 +534,34 @@ const WRITING_OUTPUT: &str = "writing output";
 /// Writing the last buffered bytes and syncing an output file.
 const FINISHING_OUTPUT: &str = "finishing output";
 
+/// The steps on a job's output directory, whose errors [`JobError::naming_output_dir`] makes name
+/// the directory's setting.
+const OUTPUT_DIRECTORY_STEPS: [&str; 4] = [
+    ALLOCATING_GENERATION,
+    CREATING_OUTPUT_DIRECTORY,
+    LOCKING_OUTPUT_DIRECTORY,
+    CREATING_OUTPUT_FILE,
+];
+
+// The settings [`JobError::naming_output_dir`] takes, one per job that writes files: `main`
+// names them in the error a job returns, and `posttran` in the event of its `DALYREJS` open,
+// whose failure it reports itself before its abend.
+
+/// The setting of `posttran`'s `DALYREJS` generations: `dalyrejs` under `CARDDEMO_VAR_DIR`.
+pub(crate) const DALYREJS_DIR_SETTING: &str = "dalyrejs under CARDDEMO_VAR_DIR";
+
+/// The setting of `intcalc`'s `SYSTRAN` generations: `systran` under `CARDDEMO_VAR_DIR`.
+pub(crate) const SYSTRAN_DIR_SETTING: &str = "systran under CARDDEMO_VAR_DIR";
+
+/// The setting of `tranrept`'s `TRANREPT` generations: `reports` under `CARDDEMO_VAR_DIR`.
+pub(crate) const REPORTS_DIR_SETTING: &str = "reports under CARDDEMO_VAR_DIR";
+
+/// The setting of `creastmt`'s statement files: `CARDDEMO_STATEMENT_DIR` when it is set and
+/// `statements` under `CARDDEMO_VAR_DIR` otherwise (`runtime::config`), so the text names both.
+pub(crate) const STATEMENT_DIR_SETTING: &str = "CARDDEMO_STATEMENT_DIR, or statements under \
+                                                CARDDEMO_VAR_DIR when CARDDEMO_STATEMENT_DIR is \
+                                                unset";
+
 /// The cleanup operation of an output a job created and does not keep: the guard of an
 /// unfinished [`OutputFile`].
 const REMOVING_UNFINISHED_OUTPUT: &str = "removing unfinished output";
@@ -553,13 +623,27 @@ fn output_file_options() -> OpenOptions {
 ///
 /// # Errors
 ///
-/// The I/O error of a directory that could not be created.
+/// The I/O error of a directory that could not be created: `ErrorKind::NotADirectory` when `dir`
+/// or one of its ancestors exists and is not a directory, such as a regular file. A recursive
+/// create reports such an entry as already existing, which names no true cause, so that report
+/// becomes this kind.
 fn create_output_dir(dir: &Path) -> io::Result<()> {
     let mut builder = DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]
     std::os::unix::fs::DirBuilderExt::mode(&mut builder, OWNER_ONLY_DIR);
-    builder.create(dir)
+    // A recursive create succeeds whenever `dir` ends up a directory, so an existing entry it
+    // reports is never one.
+    builder.create(dir).map_err(|error| {
+        if error.kind() == ErrorKind::AlreadyExists {
+            io::Error::new(
+                ErrorKind::NotADirectory,
+                "the output directory exists and is not a directory",
+            )
+        } else {
+            error
+        }
+    })
 }
 
 /// Which file a directory entry names, so that a cleanup removes a name only while it still
@@ -1694,6 +1778,51 @@ mod tests {
             assert_eq!(fs::read(&last)?, b"sentinel\n");
             assert_eq!(names(scratch.path())?, ["SYSTRAN.G9999"]);
         }
+        Ok(())
+    }
+
+    /// A regular file in place of an output directory, or of one of its ancestors, is reported
+    /// as not a directory by the step that met it, whichever way the job writes, and the file is
+    /// left as it was; `main` then names the directory's setting.
+    #[tokio::test]
+    async fn a_file_in_place_of_an_output_directory_is_not_a_directory() -> TestResult {
+        let scratch = Scratch::new()?;
+        let file = scratch.path().join("var");
+        fs::write(&file, b"sentinel\n")?;
+        for dir in [file.clone(), file.join("reports")] {
+            let generation = OutputFile::next_generation(&dir, "TRANREPT")
+                .await
+                .err()
+                .ok_or("a generation was allocated")?;
+            let lock = DirectoryLock::acquire(&dir)
+                .await
+                .err()
+                .ok_or("a directory lock was taken")?;
+            assert_eq!(
+                [generation.to_string(), lock.to_string()],
+                [
+                    "allocating generation: not a directory",
+                    "creating output directory: not a directory"
+                ],
+                "{}",
+                dir.display()
+            );
+            let named = lock.naming_output_dir("statements under CARDDEMO_VAR_DIR");
+            assert!(
+                matches!(
+                    named,
+                    JobError::OutputDirectory {
+                        context: "creating output directory",
+                        setting: "statements under CARDDEMO_VAR_DIR",
+                        kind: ErrorKind::NotADirectory,
+                    }
+                ),
+                "{named}"
+            );
+            assert_eq!(named.exit_code(), None);
+        }
+        assert_eq!(fs::read(&file)?, b"sentinel\n");
+        assert_eq!(names(scratch.path())?, ["var"]);
         Ok(())
     }
 

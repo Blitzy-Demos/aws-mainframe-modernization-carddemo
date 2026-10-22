@@ -346,6 +346,40 @@ function redFields(): { code: boolean; description: boolean } {
   };
 }
 
+/**
+ * The error text `input` is marked with, or `null` when it is not marked. A marked input is
+ * `aria-invalid` and its `aria-describedby` names one rendered `sr-only` element holding the text,
+ * which is no message row: `ERRMSG` stays the screen's one visible error message.
+ */
+function markOf(input: HTMLElement): string | null {
+  const hidden = (input.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .filter((id) => id !== "")
+    .map((id) => document.getElementById(id))
+    .filter((described) => described?.classList.contains("sr-only") === true);
+  if (input.getAttribute("aria-invalid") !== "true") {
+    expect(hidden).toEqual([]);
+    return null;
+  }
+  expect(hidden).toHaveLength(1);
+  const [message] = hidden;
+  expect(message?.closest('[role="alert"]')).toBeNull();
+  return message?.textContent ?? null;
+}
+
+/** The marks of the two inputs, `null` for an input that is not marked. */
+function marks(): { code: string | null; description: string | null } {
+  return { code: markOf(field(LABELS.code)), description: markOf(field(LABELS.description)) };
+}
+
+/** The marks a screen with the error row `error` and the red fields `red` gives the inputs. */
+function marksFor(
+  red: { code: boolean; description: boolean },
+  error: string,
+): { code: string | null; description: string | null } {
+  return { code: red.code ? error : null, description: red.description ? error : null };
+}
+
 /** COTRTUPC-046: the screen moves the cursor in a layout effect after each screen it shows. */
 async function expectFocus(label: string) {
   await waitFor(() => {
@@ -419,6 +453,84 @@ function infoText(): string | null {
 /** The text of a header value field (`ScreenShell`), by its BMS name. */
 function headerValue(name: string): string | null {
   return document.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+}
+
+/**
+ * Asserts the header value fields of rows 1 and 2 against their rows of `modern/audit/screens.md`
+ * (COTRTUP-002, -003, -005, -007, -008 and -010). Each entry of `fields` is the BMS name, the `POS`
+ * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
+ *
+ * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
+ * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
+ * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
+ * or output fields). The assertions prove what the rows require of that text: it is read-only and
+ * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
+ * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
+ * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
+ * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ */
+function expectHeaderValues(
+  root: ParentNode,
+  fields: readonly {
+    readonly name: string;
+    readonly row: number;
+    readonly col: number;
+    readonly length: number;
+    readonly value: string;
+    readonly title: boolean;
+  }[],
+): void {
+  const header = root.querySelector('[data-slot="card-header"]');
+  if (!(header instanceof HTMLElement)) {
+    throw new Error("the screen renders no CardHeader");
+  }
+  // The header exposes no textbox that takes typing.
+  expect(
+    within(header)
+      .queryAllByRole("textbox")
+      .filter((box) =>
+        box instanceof HTMLInputElement || box instanceof HTMLTextAreaElement
+          ? !box.readOnly
+          : box.getAttribute("aria-readonly") !== "true",
+      ),
+  ).toEqual([]);
+  for (const { name, row, col, length, value, title } of fields) {
+    const found = root.querySelectorAll(`[data-field="${name}"]`);
+    expect(found).toHaveLength(1);
+    const element = found[0];
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`the screen renders no header field ${name}`);
+    }
+    // Placement: in the CardHeader title rows, not in the body or the footer.
+    expect(element.closest('[data-slot="card-header"]')).toBe(header);
+    expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+    // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
+    expect(cellOf(element)).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
+    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
+    expect(shown).toBe(value);
+    expect(shown).toHaveLength(length);
+    // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
+    // tab stop.
+    const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+    expect(
+      nodes.filter(
+        (node) =>
+          node instanceof HTMLSelectElement ||
+          ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) &&
+            !node.readOnly) ||
+          node.closest('[contenteditable]:not([contenteditable="false"])') !== null,
+      ),
+    ).toEqual([]);
+    expect(element.tabIndex).toBeLessThan(0);
+    expect(
+      nodes.filter(
+        (node) => (node instanceof HTMLElement || node instanceof SVGElement) && node.tabIndex >= 0,
+      ),
+    ).toEqual([]);
+    // Tokens: the foreground colour, with emphasis only on a YELLOW title.
+    expect(element.classList.contains("text-foreground")).toBe(true);
+    expect(element.classList.contains("font-semibold")).toBe(title);
+  }
 }
 
 /** The `GridCell` placement of the cell that holds `element`. */
@@ -663,6 +775,35 @@ describe("COTRTUP rendering", () => {
       expect(key(label).getAttribute("data-size")).toBe("sm");
     }
   });
+
+  // audit: COTRTUP-002
+  // audit: COTRTUP-003
+  // audit: COTRTUP-005
+  // audit: COTRTUP-007
+  // audit: COTRTUP-008
+  // audit: COTRTUP-010
+  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      const calls = stubApi({});
+      await open();
+      await settle();
+      expect(calls).toEqual([]);
+
+      expectHeaderValues(document, [
+        { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CTTU", title: false },
+        { name: "TITLE01", row: 1, col: 21, length: 40, value: TITLE01, title: true },
+        { name: "CURDATE", row: 1, col: 71, length: 8, value: "01/02/24", title: false },
+        { name: "PGMNAME", row: 2, col: 7, length: 8, value: "COTRTUPC", title: false },
+        { name: "TITLE02", row: 2, col: 21, length: 40, value: TITLE02, title: true },
+        { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("COTRTUP states", () => {
@@ -811,6 +952,8 @@ describe("COTRTUP states", () => {
       expect(shownValues()).toEqual(values);
       expectEditable(editable);
       expect(redFields()).toEqual(red);
+      // A red input is also marked invalid, described by the error row's text.
+      expect(marks()).toEqual(marksFor(red, error));
       await expectFocus(cursor);
       expect(infoText()).toBe(info);
       expect(errorText()).toBe(error);
@@ -887,6 +1030,8 @@ describe("COTRTUP fetch, endpoint 26", () => {
 
       expect(shownValues()).toEqual({ code: "*", description: "" });
       expect(redFields()).toEqual({ code: true, description: false });
+      // The `*` flag is a screen mark, not a form error: it still links the error row's text.
+      expect(marks()).toEqual({ code: MSG.codeNotSupplied, description: null });
       expectEditable({ code: true, description: false });
       await expectFocus(LABELS.code);
       expect(infoText()).toBe(INFO.search);
@@ -908,6 +1053,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
     expect(calls.map((call) => call.route)).toEqual([FETCH_NEW, FETCH]);
     expect(shownValues()).toEqual({ code: CODE, description: STORED });
     expect(redFields()).toEqual({ code: false, description: false });
+    expect(marks()).toEqual({ code: null, description: null });
     expect(errorText()).toBe("");
     expect(infoText()).toBe(INFO.search);
   });
@@ -962,6 +1108,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
       expect(calls.map((call) => call.route)).toEqual([route]);
       expect(shownValues()).toEqual(values);
       expect(redFields()).toEqual({ code: true, description: false });
+      expect(marks()).toEqual({ code: error.message, description: null });
       expectEditable({ code: true, description: false });
       await expectFocus(LABELS.code);
       expect(infoText()).toBe(info);
@@ -1133,6 +1280,7 @@ describe("COTRTUP save, endpoint 27", () => {
       });
       expect(shownValues()).toEqual(values);
       expect(redFields()).toEqual(red);
+      expect(marks()).toEqual(marksFor(red, error.message));
       expectEditable({ code: false, description: true });
       await expectFocus(LABELS.description);
       expect(infoText()).toBe(info);
@@ -1319,6 +1467,7 @@ describe("COTRTUP delete", () => {
     expect(infoText()).toBe(INFO.unsuccessful);
     expect(shownValues()).toEqual({ code: CODE, description: STORED });
     expect(redFields()).toEqual({ code: true, description: false });
+    expect(marks()).toEqual({ code: deleteFailed.message, description: null });
     expectEditable({ code: false, description: false });
     await expectFocus(LABELS.code);
     expect(shownKeys()).toEqual(["ENTER=Process", "F3=Exit"]);
@@ -1327,6 +1476,7 @@ describe("COTRTUP delete", () => {
     expect(shownValues()).toEqual({ code: "", description: "" });
     expect(errorText()).toBe("");
     expect(redFields()).toEqual({ code: false, description: false });
+    expect(marks()).toEqual({ code: null, description: null });
     await settle();
     expect(calls).toHaveLength(2);
   });

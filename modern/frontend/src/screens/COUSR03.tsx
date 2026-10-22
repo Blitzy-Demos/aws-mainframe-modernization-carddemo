@@ -7,7 +7,14 @@ import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KEY_ROWS, keyRowItems, type PfKeyHandlers, type PfKeyItem } from "@/lib/pfkeys";
@@ -43,6 +50,12 @@ const NEUTRAL_DELETE_ERRORS: ReadonlySet<string> = new Set([
   "User ID NOT found...",
   "Unable to Update User...",
 ]);
+
+/** The wire names of the three output fields a `ScreenError` can name (`ScreenError.field`). */
+const OUTPUT_FIELDS: ReadonlySet<string> = new Set(["first_name", "last_name", "user_type"]);
+
+/** The output field the last red `ScreenError` named, by wire name, with the error's text. */
+type OutputFieldError = { readonly field: string; readonly text: string };
 
 /** Every route of the application: the only values a route-state `from` is followed to. */
 const SCREEN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
@@ -113,11 +126,15 @@ type OutputFieldProps = {
   inputRef: RefObject<HTMLInputElement | null>;
   /** Width and colour utilities in place of the default `FIELD_WIDTH` and BLUE value colour. */
   inputClassName?: string;
+  /** The text of a red `ScreenError` that names this field, while the message row shows it. */
+  error?: string;
 };
 
 /**
  * One protected (`ASKIP`) output field with its TURQUOISE label: a read-only `Input` in the BLUE
- * value colour, bound to its `Label`.
+ * value colour, bound to its `Label`. While a red `ScreenError` names it, the field is marked
+ * invalid and described by that text, which only assistive technology reads: the message row is
+ * the screen's one visible message.
  */
 function OutputField({
   row,
@@ -129,8 +146,11 @@ function OutputField({
   value,
   inputRef,
   inputClassName,
+  error,
 }: OutputFieldProps): ReactNode {
   const id = useId();
+  const messageId = `${id}-message`;
+  const invalid = error !== undefined;
   return (
     <>
       <GridCell row={row} col={labelCol} span={labelSpan}>
@@ -146,8 +166,15 @@ function OutputField({
           value={value}
           maxLength={span}
           size={span}
+          aria-invalid={invalid || undefined}
+          aria-describedby={invalid ? messageId : undefined}
           className={inputClassName ?? `${FIELD_WIDTH} text-muted-foreground`}
         />
+        {invalid && (
+          <p id={messageId} className="sr-only">
+            {error}
+          </p>
+        )}
       </GridCell>
     </>
   );
@@ -189,6 +216,7 @@ export function COUSR03(): ReactNode {
   const deleteUser = useCousr03cDelete();
   const [shown, setShown] = useState<components["schemas"]["UserView"] | null>(null);
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
+  const [outputError, setOutputError] = useState<OutputFieldError | null>(null);
   const userIdRef = useRef<HTMLInputElement>(null);
   const firstNameRef = useRef<HTMLInputElement>(null);
   const lastNameRef = useRef<HTMLInputElement>(null);
@@ -211,17 +239,39 @@ export function COUSR03(): ReactNode {
     target.current?.focus();
   }
 
+  /**
+   * Marks the field a red `ScreenError` names as invalid, described by the error's text: the user
+   * ID through the form, an output field through its own state. Any other field marks nothing.
+   */
+  function markField(error: components["schemas"]["ScreenError"]): void {
+    if (error.field === "user_id") {
+      form.setError("userId", { type: "server", message: error.message });
+    } else if (typeof error.field === "string" && OUTPUT_FIELDS.has(error.field)) {
+      setOutputError({ field: error.field, text: error.message });
+    }
+  }
+
+  /** The text of the error marking the output field `field`, while one does. */
+  function outputErrorOf(field: string): string | undefined {
+    return outputError?.field === field ? outputError.text : undefined;
+  }
+
   /** The schema's blank-user-ID edit (COUSR03C-010, COUSR03C-016); the fields keep their values. */
   function showEditError(errors: FieldErrors<Cousr03Values>): void {
+    setOutputError(null);
     setMessage({ kind: "error", text: errors.userId?.message });
     focusField();
   }
 
-  /** ENTER (`PROCESS-ENTER-KEY`): endpoint 18 with the typed user ID. */
+  /**
+   * ENTER (`PROCESS-ENTER-KEY`): endpoint 18 with the typed user ID. The schema has already
+   * replaced the form's errors; an output field's mark goes too.
+   */
   function fetchById({ userId }: Cousr03Values): void {
     if (busy) {
       return;
     }
+    setOutputError(null);
     fetchUser.mutate(
       { path: { user_id: userId } },
       {
@@ -233,17 +283,19 @@ export function COUSR03(): ReactNode {
         onError: (error) => {
           setShown(null);
           setMessage({ kind: "error", text: error.message });
+          markField(error);
           focusField(error.field);
         },
       },
     );
   }
 
-  /** F5 (`DELETE-USER-INFO`): endpoint 20 with the typed user ID. */
+  /** F5 (`DELETE-USER-INFO`): endpoint 20 with the typed user ID, the marks cleared as for ENTER. */
   function deleteById({ userId }: Cousr03Values): void {
     if (busy) {
       return;
     }
+    setOutputError(null);
     deleteUser.mutate(
       { path: { user_id: userId } },
       {
@@ -254,10 +306,12 @@ export function COUSR03(): ReactNode {
           focusField();
         },
         onError: (error) => {
-          setMessage({
-            kind: NEUTRAL_DELETE_ERRORS.has(error.message) ? "info" : "error",
-            text: error.message,
-          });
+          const neutral = NEUTRAL_DELETE_ERRORS.has(error.message);
+          setMessage({ kind: neutral ? "info" : "error", text: error.message });
+          // A neutral failure only moves the cursor (COUSR03C-025).
+          if (!neutral) {
+            markField(error);
+          }
           focusField(error.field);
         },
       },
@@ -284,6 +338,7 @@ export function COUSR03(): ReactNode {
     }
     form.reset({ userId: "" });
     setShown(null);
+    setOutputError(null);
     setMessage(undefined);
     focusField();
   }
@@ -318,6 +373,9 @@ export function COUSR03(): ReactNode {
       keyOptions={{
         foldShifted: KEY_ROWS.COUSR03.foldShifted,
         onInvalidKey: () => {
+          // The invalid-key message replaces the error that marked a field, so the mark goes.
+          form.clearErrors();
+          setOutputError(null);
           setMessage({ kind: "error", text: INVALID_KEY_MESSAGE });
         },
       }}
@@ -351,6 +409,8 @@ export function COUSR03(): ReactNode {
                         className={FIELD_WIDTH}
                       />
                     </FormControl>
+                    {/* For assistive technology only: the message row is the visible message. */}
+                    <FormMessage className="sr-only" />
                   </GridCell>
                 </FormItem>
               )}
@@ -369,6 +429,7 @@ export function COUSR03(): ReactNode {
               span={20}
               value={shown?.first_name ?? ""}
               inputRef={firstNameRef}
+              error={outputErrorOf("first_name")}
             />
             <OutputField
               row={13}
@@ -379,6 +440,7 @@ export function COUSR03(): ReactNode {
               span={20}
               value={shown?.last_name ?? ""}
               inputRef={lastNameRef}
+              error={outputErrorOf("last_name")}
             />
             <OutputField
               row={15}
@@ -390,6 +452,7 @@ export function COUSR03(): ReactNode {
               value={shown?.user_type ?? ""}
               inputRef={userTypeRef}
               inputClassName={USER_TYPE_INPUT_CLASS}
+              error={outputErrorOf("user_type")}
             />
             <GridCell row={15} col={19} span={17}>
               <span className="flex h-full items-center whitespace-pre text-muted-foreground">

@@ -6,7 +6,14 @@ import { useCorpt00cSubmit } from "@/api/hooks";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 // The unserved-key text of CSMSG01Y is shared by every screen through the header module, so it
 // is imported rather than restated here.
@@ -219,11 +226,19 @@ const FIELD_OF_WIRE: Readonly<Record<string, Corpt00Field>> = {
 };
 
 /**
+ * The input a response names, or `undefined` when it names none or a member the map has no input
+ * for. An own-property check, so `constructor` and its kin name no input.
+ */
+function namedField(field: string | null | undefined): Corpt00Field | undefined {
+  return field != null && Object.hasOwn(FIELD_OF_WIRE, field) ? FIELD_OF_WIRE[field] : undefined;
+}
+
+/**
  * The input a response names, or `monthly`, where every CORPT00C send without a named field puts
- * the cursor (CORPT00C-042). An own-property check, so `constructor` and its kin name no input.
+ * the cursor (CORPT00C-042).
  */
 function focusTarget(field: string | null | undefined): Corpt00Field {
-  return field != null && Object.hasOwn(FIELD_OF_WIRE, field) ? FIELD_OF_WIRE[field] : "monthly";
+  return namedField(field) ?? "monthly";
 }
 
 /**
@@ -235,7 +250,8 @@ function focusTarget(field: string | null | undefined): Corpt00Field {
  *   text, is the one message the program colours green, so it shows as information (the `Alert`
  *   default variant; the theme has no green token), not as an error (CORPT00C-040). A
  *   `ScreenError` keeps every input as typed, shows its message in red and focuses the field it
- *   names, or `MONTHLY`.
+ *   names, or `MONTHLY`; the field it names stays marked invalid until it is corrected or ENTER is
+ *   pressed again.
  * - A value the map would not take (longer than its `LENGTH`, or a date part that is not digits)
  *   is stopped by the schema before any request, with zod's message in the message row; a
  *   message from the server replaces it on the next response.
@@ -251,8 +267,12 @@ export function CORPT00(): ReactNode {
   const form = useForm<Corpt00Values>({
     resolver: zodResolver(corpt00Schema),
     defaultValues: BLANK,
+    // After an ENTER every edit re-runs the schema on the field it changes, so correcting the
+    // field a `ScreenError` named drops that field's error at once; the next ENTER replaces every
+    // error with the schema's verdict, and the reset of a 200 clears them all.
+    reValidateMode: "onChange",
   });
-  const { reset, setFocus } = form;
+  const { reset, setError, setFocus } = form;
 
   const keys = useMemo<PfKeyBarEntry[]>(
     () =>
@@ -311,6 +331,12 @@ export function CORPT00(): ReactNode {
         },
         onError: (error) => {
           setMessage({ text: error.message, kind: "error" });
+          // The named input is marked invalid with the row's own text, which its `FormMessage`
+          // carries for assistive technology; a response naming no input marks none.
+          const named = namedField(error.field);
+          if (named !== undefined) {
+            setError(named, { type: "server", message: error.message });
+          }
           setFocus(focusTarget(error.field));
         },
       },
@@ -351,7 +377,10 @@ export function CORPT00(): ReactNode {
                 name={input.name}
                 render={({ field }) => (
                   // `contents` lets the label's cell and the input's cell sit on the map grid
-                  // itself while the item still binds the label to the input.
+                  // itself while the item still binds the label to the input. The message row is
+                  // the map's only visible message, so the field's own message, the schema's or
+                  // the server's, is for assistive technology only, read with the input it marks;
+                  // being `sr-only`, it takes no grid cell.
                   <FormItem className="contents">
                     <GridCell row={input.label.row} col={input.label.col} span={input.label.span}>
                       <FormLabel className={input.label.className}>{input.label.text}</FormLabel>
@@ -369,6 +398,7 @@ export function CORPT00(): ReactNode {
                         />
                       </FormControl>
                     </GridCell>
+                    <FormMessage className="sr-only" />
                   </FormItem>
                 )}
               />

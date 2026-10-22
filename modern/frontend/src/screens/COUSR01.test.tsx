@@ -1,11 +1,18 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { SESSION_KEY, setSession } from "@/auth/session";
+import { clearSession, SESSION_KEY, setSession } from "@/auth/session";
 import { INVALID_KEY } from "@/lib/header";
-import { PATHS } from "@/routes";
+import { PATHS, routes } from "@/routes";
 import { COUSR01 } from "./COUSR01";
 
 /*
@@ -214,9 +221,115 @@ function key(label: string): HTMLElement {
   });
 }
 
+/**
+ * The error text `input` is marked with, or `null` when it is not marked. A marked input is
+ * `aria-invalid` and its `aria-describedby` names one rendered `sr-only` element holding the text,
+ * which is no message row: the error row stays the screen's one visible message.
+ */
+function markOf(input: HTMLElement): string | null {
+  const hidden = (input.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .filter((id) => id !== "")
+    .map((id) => document.getElementById(id))
+    .filter((element) => element?.classList.contains("sr-only") === true);
+  if (input.getAttribute("aria-invalid") !== "true") {
+    expect(hidden).toEqual([]);
+    return null;
+  }
+  expect(hidden).toHaveLength(1);
+  const [message] = hidden;
+  expect(message?.closest('[role="alert"]')).toBeNull();
+  return message?.textContent ?? null;
+}
+
+/** The marks of the five inputs in map order, `null` for each input that is not marked. */
+function marks(): (string | null)[] {
+  return inputs().map(markOf);
+}
+
 /** The text of the header field `name` (`data-field` of `ScreenShell`). */
 function headerField(container: HTMLElement, name: string): string | null {
   return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+}
+
+/**
+ * Asserts the header value fields of rows 1 and 2 against their rows of `modern/audit/screens.md`
+ * (COUSR01-002, -003, -005, -007, -008 and -010). Each entry of `fields` is the BMS name, the `POS`
+ * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
+ *
+ * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
+ * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
+ * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
+ * or output fields). The assertions prove what the rows require of that text: it is read-only and
+ * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
+ * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
+ * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
+ * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ */
+function expectHeaderValues(
+  root: ParentNode,
+  fields: readonly {
+    readonly name: string;
+    readonly row: number;
+    readonly col: number;
+    readonly length: number;
+    readonly value: string;
+    readonly title: boolean;
+  }[],
+): void {
+  const header = root.querySelector('[data-slot="card-header"]');
+  if (!(header instanceof HTMLElement)) {
+    throw new Error("the screen renders no CardHeader");
+  }
+  // The header exposes no textbox that takes typing.
+  expect(
+    within(header)
+      .queryAllByRole("textbox")
+      .filter((box) =>
+        box instanceof HTMLInputElement || box instanceof HTMLTextAreaElement
+          ? !box.readOnly
+          : box.getAttribute("aria-readonly") !== "true",
+      ),
+  ).toEqual([]);
+  for (const { name, row, col, length, value, title } of fields) {
+    const found = root.querySelectorAll(`[data-field="${name}"]`);
+    expect(found).toHaveLength(1);
+    const element = found[0];
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`the screen renders no header field ${name}`);
+    }
+    // Placement: in the CardHeader title rows, not in the body or the footer.
+    expect(element.closest('[data-slot="card-header"]')).toBe(header);
+    expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+    // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
+    expect(element.parentElement?.className).toBe(
+      `row-start-${row} col-start-${col} col-span-${length}`,
+    );
+    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
+    expect(shown).toBe(value);
+    expect(shown).toHaveLength(length);
+    // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
+    // tab stop.
+    const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+    expect(
+      nodes.filter(
+        (node) =>
+          node instanceof HTMLSelectElement ||
+          ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) &&
+            !node.readOnly) ||
+          node.closest('[contenteditable]:not([contenteditable="false"])') !== null,
+      ),
+    ).toEqual([]);
+    expect(element.tabIndex).toBeLessThan(0);
+    expect(
+      nodes.filter(
+        (node) => (node instanceof HTMLElement || node instanceof SVGElement) && node.tabIndex >= 0,
+      ),
+    ).toEqual([]);
+    // Tokens: the foreground colour, with emphasis only on a YELLOW title.
+    expect(element.classList.contains("text-foreground")).toBe(true);
+    expect(element.classList.contains("font-semibold")).toBe(title);
+  }
 }
 
 /** The `POS` columns of the cells the form places on map line `line`, in DOM order. */
@@ -370,6 +483,48 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
     expect(fetchStub).not.toHaveBeenCalled();
   });
 
+  // audit: COUSR01-002
+  // audit: COUSR01-003
+  // audit: COUSR01-005
+  // audit: COUSR01-007
+  // audit: COUSR01-008
+  // audit: COUSR01-010
+  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", () => {
+    // Only `Date` is faked, so the timers that React and TanStack Query use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      const { fetchStub } = stubFetch();
+      const { container } = renderScreen();
+
+      expectHeaderValues(container, [
+        { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CU01", title: false },
+        {
+          name: "TITLE01",
+          row: 1,
+          col: 21,
+          length: 40,
+          value: "      AWS Mainframe Modernization       ",
+          title: true,
+        },
+        { name: "CURDATE", row: 1, col: 71, length: 8, value: "01/02/24", title: false },
+        { name: "PGMNAME", row: 2, col: 7, length: 8, value: "COUSR01C", title: false },
+        {
+          name: "TITLE02",
+          row: 2,
+          col: 21,
+          length: 40,
+          value: "              CardDemo                  ",
+          title: true,
+        },
+        { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
+      ]);
+      expect(fetchStub).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   // audit: COUSR01C-006
   // audit: COUSR01C-022
   // audit: COUSR01-035
@@ -466,9 +621,54 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       await waitFor(() => {
         expect(document.activeElement).toBe(inputFor(focus));
       });
+      // The field it names is marked invalid with the message, for assistive technology only; the
+      // four others are not, and the error row stays the one message row.
+      expect(marks()).toEqual(
+        Object.values(LABELS).map((label) => (label === focus ? failure.message : null)),
+      );
       expectNoNavigation();
     },
   );
+
+  it("a ScreenError that names no field marks no input, with the focus on First Name", async () => {
+    const adminOnly: components["schemas"]["ScreenError"] = {
+      message: "No access - Admin Only function ...",
+    };
+    stubFetch({ status: 403, body: adminOnly });
+    renderScreen();
+
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(adminOnly.message);
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(inputFor(LABELS.firstName));
+    });
+    expect(marks()).toEqual([null, null, null, null, null]);
+  });
+
+  // audit: COUSR01C-005
+  it.each([
+    { how: "F12=Exit, with the invalid-key message", label: "F12=Exit", message: INVALID_KEY },
+    { how: "F4=Clear, with the message row emptied", label: "F4=Clear", message: "" },
+  ])("the next key, $how, unmarks the field a server error named", async ({ label, message }) => {
+    stubFetch({ status: 400, body: duplicate });
+    renderScreen();
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+    await waitFor(() => {
+      expect(markOf(inputFor(LABELS.userId))).toBe(duplicate.message);
+    });
+
+    fireEvent.click(key(label));
+
+    expect(messageRow("error").textContent).toBe(message);
+    await waitFor(() => {
+      expect(marks()).toEqual([null, null, null, null, null]);
+    });
+  });
 
   // audit: COUSR01C-005
   it("each key clears the previous message first: ENTER empties the row before its answer arrives", async () => {
@@ -594,4 +794,56 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       expectNoNavigation();
     },
   );
+});
+
+// COUSR01C entered with no COMMAREA (`EIBCALEN = 0`) transfers to COSGN00C. The replacement is
+// the route guard that only the application's route table mounts in front of `/users/add`, so
+// this group renders that table rather than the screen alone, with nobody signed on.
+describe("COUSR01 /users/add opened with no session, through the route table", () => {
+  beforeEach(() => {
+    clearSession();
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  // audit: COUSR01C-003
+  it("the route guard sends /users/add to /signon before the screen renders, with no request", async () => {
+    // This case covers the row's no-session condition through the route table: the real routes
+    // and their `RequireSignon` guard, not a stub of either. The guard only hides the screen; the
+    // API's admin gate is the control.
+    const { fetchStub } = stubFetch();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COUSR01] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeTruthy();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "Add User" })).toBeNull();
+    for (const label of Object.values(LABELS)) {
+      expect(screen.queryByLabelText(label, exactText)).toBeNull();
+    }
+    expect(screen.queryByRole("button", { name: "ENTER=Add User" })).toBeNull();
+
+    // One timer turn, inside `act`, lets any effect or request the redirect left pending run.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(fetchStub).not.toHaveBeenCalled();
+    router.dispose();
+  });
 });

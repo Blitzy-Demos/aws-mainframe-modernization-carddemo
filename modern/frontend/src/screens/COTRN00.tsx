@@ -7,7 +7,14 @@ import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -186,6 +193,14 @@ function failureText(reason: unknown): string {
   return isRecord(reason) && typeof reason.message === "string" ? reason.message : LOOKUP_FAILED;
 }
 
+/**
+ * The form field a failure's `ScreenError` names by its wire name. Endpoint 11 names only the
+ * search field, `start_tran_id` (COTRN00C-013); the selectors are never sent.
+ */
+function formFieldOf(reason: unknown): "startTranId" | undefined {
+  return isRecord(reason) && reason.field === "start_tran_id" ? "startTranId" : undefined;
+}
+
 /** The first message the form schema reports, in field order. */
 function firstFormError(errors: FieldErrors<Cotrn00Values>): string | undefined {
   const selectors = Array.from(
@@ -259,6 +274,12 @@ export function COTRN00(): ReactNode {
     }
     inFlight.current = true;
     setBusy(true);
+    // A server error marks the field only until the next answer, so each request drops it. A
+    // correction drops it sooner: the server rejects the field only on ENTER, after which the
+    // form revalidates a field on every change (its default `reValidateMode`).
+    if (form.getFieldState("startTranId").error?.type === "server") {
+      form.clearErrors("startTranId");
+    }
     const sent = paging;
     void list
       .mutateAsync({ query: { ...query, ...echo(sent) } })
@@ -281,7 +302,14 @@ export function COTRN00(): ReactNode {
         },
         (reason: unknown) => {
           setPaging(afterFailure(sent, key));
-          setMessage(failureText(reason));
+          const text = failureText(reason);
+          setMessage(text);
+          // The field named turns invalid with the server's text, which replaces the schema's
+          // verdict; the error row stays the one place it shows.
+          const named = formFieldOf(reason);
+          if (named !== undefined) {
+            form.setError(named, { type: "server", message: text });
+          }
         },
       )
       .finally(() => {
@@ -409,6 +437,12 @@ export function COTRN00(): ReactNode {
                       />
                     </FormControl>
                   </GridCell>
+                  {/*
+                   * The error row is the map's only visible message, so the field's message is
+                   * for assistive technology only, read with the input it rejects; out of flow,
+                   * it takes no grid cell.
+                   */}
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -459,6 +493,7 @@ export function COTRN00(): ReactNode {
                                     className="w-9 text-center"
                                   />
                                 </FormControl>
+                                <FormMessage className="sr-only" />
                               </FormItem>
                             )}
                           />

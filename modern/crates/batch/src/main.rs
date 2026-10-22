@@ -46,6 +46,10 @@
 //! value, a telemetry failure, a database connection failure as the value-free summary of
 //! `runtime::db`, the job's error, or a failure to write standard output. None of them shows a
 //! record, a card number, an SSN, a password or the connection URL (Cardholder Data Redaction).
+//! A job's error on its output directory, such as `allocating generation (reports under
+//! CARDDEMO_VAR_DIR): not a directory`, names the setting of that directory instead of its path.
+//! `posttran` ends such a failure with its audited abend, `ERROR OPENING DALY REJECTS FILE`, and
+//! names the setting in the event that precedes the abend's lines.
 //!
 //! Input checks that need no database run before the pool is opened, so a refusal comes at once
 //! and without a connection attempt:
@@ -97,7 +101,10 @@ use tracing::Instrument;
 use crate::cli::{
     Cli, DusrsecjArgs, IntcalcArgs, Job, LoadArgs, Mnttrdb2Args, PosttranArgs, TranreptArgs,
 };
-use crate::jobs::{JobContext, JobError, JobOutcome};
+use crate::jobs::{
+    DALYREJS_DIR_SETTING, JobContext, JobError, JobOutcome, REPORTS_DIR_SETTING,
+    STATEMENT_DIR_SETTING, SYSTRAN_DIR_SETTING,
+};
 
 /// The prefix of every standard-error line, followed by the subcommand.
 const PROGRAM: &str = "carddemo-batch";
@@ -288,11 +295,35 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
         config,
         clock: &clock,
     };
-    let result = dispatch(selected, &ctx).await;
+    let setting = output_setting(&selected);
+    let result = dispatch(selected, &ctx)
+        .await
+        .map_err(|error| match setting {
+            Some(setting) => error.naming_output_dir(setting),
+            None => error,
+        });
     // Every job has committed or rolled back its work by now; closing ends the sessions cleanly
     // instead of dropping their connections when the runtime shuts down.
     store.pool().close().await;
     finish(job, result)
+}
+
+/// The setting that names the directory a job writes into, in the words its output-directory
+/// errors use (`JobError::naming_output_dir`): the variable and, under `CARDDEMO_VAR_DIR`, the
+/// subdirectory, as `runtime::config` builds the directory. Never its value. `None` for the jobs
+/// that write no file. The match names every variant and has no wildcard arm, so a new
+/// subcommand needs a decision here.
+fn output_setting(job: &CheckedJob<'_>) -> Option<&'static str> {
+    match job {
+        CheckedJob::Posttran(_) => Some(DALYREJS_DIR_SETTING),
+        CheckedJob::Intcalc(_) => Some(SYSTRAN_DIR_SETTING),
+        CheckedJob::Tranrept(_) => Some(REPORTS_DIR_SETTING),
+        CheckedJob::Creastmt => Some(STATEMENT_DIR_SETTING),
+        CheckedJob::Load(..)
+        | CheckedJob::Dusrsecj(_)
+        | CheckedJob::Cbpaup0j(_)
+        | CheckedJob::Mnttrdb2(_) => None,
+    }
 }
 
 /// Runs the job the subcommand selected. The match names every variant and has no wildcard
@@ -390,7 +421,7 @@ mod tests {
 
     use super::{
         CheckedJob, PROGRAM, STATEMENT_DIR_LINE_BREAK, VAR_DIR_LINE_BREAK, check, check_output_dir,
-        finish, write_paths,
+        finish, output_setting, write_paths,
     };
     use crate::cli::{Cli, Job};
     use crate::jobs::{JobError, JobOutcome};
@@ -557,6 +588,63 @@ mod tests {
         }
         for (args, env) in cases {
             assert_eq!(output_check(args, &env)?, Ok(()), "{args:?} {env:?}");
+        }
+        Ok(())
+    }
+
+    /// A failure of a step on the output directory names the setting of the job's directory and
+    /// the true cause, never a value, and keeps the generic failure status; the jobs that write
+    /// no file have no such setting, and every other error is reported as it was.
+    #[test]
+    fn an_output_directory_failure_names_the_setting_of_the_jobs_directory() -> TestResult {
+        let settings: [(&[&str], &str); 4] = [
+            (&["posttran"], "dalyrejs under CARDDEMO_VAR_DIR"),
+            (&["intcalc"], "systran under CARDDEMO_VAR_DIR"),
+            (&["tranrept"], "reports under CARDDEMO_VAR_DIR"),
+            (
+                &["creastmt"],
+                "CARDDEMO_STATEMENT_DIR, or statements under CARDDEMO_VAR_DIR when \
+                 CARDDEMO_STATEMENT_DIR is unset",
+            ),
+        ];
+        for (args, expected) in settings {
+            let job = parse(args)?;
+            let checked = check(&job).map_err(|refused| format!("{args:?}: {refused}"))?;
+            let setting = output_setting(&checked).ok_or("a writing job has no setting")?;
+            assert_eq!(setting, expected, "{args:?}");
+            for context in [
+                "allocating generation",
+                "creating output directory",
+                "locking output directory",
+                "creating output file",
+            ] {
+                let error = JobError::Io {
+                    context,
+                    kind: io::ErrorKind::NotADirectory,
+                }
+                .naming_output_dir(setting);
+                assert_eq!(
+                    error.to_string(),
+                    format!("{context} ({expected}): not a directory")
+                );
+                assert_eq!(finish(args[0], Err(error)), ExitCode::FAILURE);
+            }
+            let unchanged = JobError::Io {
+                context: "writing output",
+                kind: io::ErrorKind::StorageFull,
+            }
+            .naming_output_dir(setting);
+            assert_eq!(unchanged.to_string(), "writing output: no storage space");
+            let limit = JobError::GenerationLimit { base: "TRANREPT" }.naming_output_dir(setting);
+            assert_eq!(
+                limit.to_string(),
+                "allocating generation: generation limit 9999 reached for TRANREPT"
+            );
+        }
+        for args in WRITING_NO_FILE {
+            let job = parse(args)?;
+            let checked = check(&job).map_err(|refused| format!("{args:?}: {refused}"))?;
+            assert_eq!(output_setting(&checked), None, "{args:?}");
         }
         Ok(())
     }

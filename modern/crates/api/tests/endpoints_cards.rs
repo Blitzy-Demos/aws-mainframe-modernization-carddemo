@@ -3,6 +3,11 @@
 //! `COCRDLI`, `COCRDSL` and `COCRDUP` in `modern/audit/screens.md`, proved through endpoints 7
 //! to 10 over a fixture-loaded `PostgreSQL` (AAP 0.9.1).
 //!
+//! They also bind the COMMAREA row COCOM01Y-014 of `modern/audit/copybooks.md`:
+//! `cocom01y_card_rows` proves that the selected card travels from the list to the view and
+//! update fetches as its `card_ref` handle, never as its number, which each of those answers
+//! shows only as twelve `*` and the last four digits.
+//!
 //! # Harness
 //!
 //! Each test function starts its own container through
@@ -1944,6 +1949,45 @@ async fn update_lengths_and_store(h: &Harness) -> Outcome<()> {
     let failed = h.get_failing(EDIT, &by_ref(&card.acct, &handle)).await?;
     // audit: COCRDUPC-019
     assert_file_error(&failed, Some("acct_id"));
+    Ok(())
+}
+
+/// The selected card as route state (COCOM01Y-014): an endpoint 7 row filtered by the card's
+/// account carries its handle and its redacted number, and endpoints 8 and 9, sent that account
+/// and handle and no card number, read the same card and show it redacted the same way.
+#[tokio::test]
+async fn cocom01y_card_rows() -> TestResult {
+    let h = Harness::start().await?;
+    let card = h.line(1)?;
+    let listed = h.list(&query(&[("acct_id", &card.acct)])).await?;
+    assert_eq!(listed.status, StatusCode::OK);
+    let rows = listed.rows()?;
+    let (handle, number, _, _) = rows.first().ok_or("the card list lists no row")?;
+    // audit: COCOM01Y-014
+    assert!(
+        *handle == card.handle && *number == card.redacted,
+        "the listed row is not the card's handle and redacted number"
+    );
+    // audit: COCOM01Y-014
+    assert!(
+        number.len() == 16
+            && number.get(..12) == Some("************")
+            && number.get(12..) == card.number.get(12..)
+            && *number != card.number,
+        "the listed card number is not twelve * and the last four digits"
+    );
+    let sent = by_ref(&card.acct, &handle.to_string());
+    for path in [VIEW, EDIT] {
+        let reply = h.get(path, &sent, &h.user).await?;
+        assert_eq!(reply.status, StatusCode::OK, "{path}");
+        // audit: COCOM01Y-014
+        assert!(
+            reply.int("card_ref") == Some(*handle)
+                && reply.text("acct_id") == Some(card.acct.as_str())
+                && reply.text("card_num") == Some(number.as_str()),
+            "{path} reads another card by the listed handle"
+        );
+    }
     Ok(())
 }
 

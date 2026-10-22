@@ -49,12 +49,13 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use api::app::{AppState, app};
+use api::app::{AppState, app, check_intrdr_dir};
 use api::dto::{FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
 use axum::http::{Request, StatusCode};
+use axum::response::Response;
 use chrono::{NaiveDate, NaiveDateTime};
 use domain::clock::{Clock, FixedClock};
 use domain::copybook::{FixedRecord, PicU, PicX, TsForm};
@@ -82,6 +83,10 @@ const BILL_PAYMENTS: &str = "/api/v1/bill-payments";
 /// CORPT00C-036).
 const DECK_RECORDS: usize = 17;
 const DECK_RECORD_LEN: usize = 80;
+
+/// The confirmed report requests in flight at once in the concurrent submission row
+/// (CORPT00C-036).
+const CONCURRENT_SUBMISSIONS: usize = 16;
 
 // The CORPT00C literals, copied from `modern/audit/online/CORPT00C.md`. The audit names a date
 // part's field as a dotted path such as `start_date.month`; the request carries the parts as the
@@ -252,12 +257,42 @@ impl Api {
 
     /// `POST uri` with the JSON `body` and, when given, `token` as bearer token.
     async fn send(&self, uri: &str, body: &Value, token: Option<&str>) -> Outcome<Reply> {
+        let request = Self::request(uri, body, token)?;
+        let response = self.router.clone().oneshot(request).await?;
+        self.reply(response).await
+    }
+
+    /// `count` requests `POST uri` with `body` and the bearer token, each served by a task of
+    /// its own and all in flight at once, and their replies in the order they were sent.
+    async fn post_concurrently(
+        &self,
+        uri: &str,
+        body: &Value,
+        count: usize,
+    ) -> Outcome<Vec<Reply>> {
+        let mut tasks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let request = Self::request(uri, body, Some(&self.token))?;
+            tasks.push(tokio::spawn(self.router.clone().oneshot(request)));
+        }
+        let mut replies = Vec::with_capacity(count);
+        for task in tasks {
+            replies.push(self.reply(task.await??).await?);
+        }
+        Ok(replies)
+    }
+
+    /// The request `POST uri` with the JSON `body` and, when given, `token` as bearer token.
+    fn request(uri: &str, body: &Value, token: Option<&str>) -> Outcome<Request<Body>> {
         let mut request = Request::post(uri).header(CONTENT_TYPE, "application/json");
         if let Some(token) = token {
             request = request.header(AUTHORIZATION, format!("Bearer {token}"));
         }
-        let request = request.body(Body::from(serde_json::to_vec(body)?))?;
-        let response = self.router.clone().oneshot(request).await?;
+        Ok(request.body(Body::from(serde_json::to_vec(body)?))?)
+    }
+
+    /// The status and the JSON body of `response`, whose body joins the ledger.
+    async fn reply(&self, response: Response) -> Outcome<Reply> {
         let status = response.status();
         let text = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
         let body = serde_json::from_str(&text)?;
@@ -386,7 +421,9 @@ fn expected_deck(start: &str, end: &str) -> Vec<String> {
     .collect()
 }
 
-#[tokio::test]
+// Worker threads of its own, so that the requests of `report_concurrent_row` are served in
+// parallel and reach the job-deck directory at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn corpt00c_report_rows() -> TestResult {
     let db = start_loaded_postgres().await?;
     let dir = fresh_dir("corpt00c_report_rows")?;
@@ -396,6 +433,7 @@ async fn corpt00c_report_rows() -> TestResult {
     report_confirmation_rows(&api, &dir).await?;
     report_map_rows(&api, &dir).await?;
     report_submission_rows(&api, &dir).await?;
+    report_concurrent_row(&api).await?;
     report_month_end_rows(&api).await?;
     report_write_failure_row(&api).await?;
     assert_no_card_number(&api)
@@ -608,6 +646,43 @@ async fn report_submission_rows(api: &Api, dir: &Path) -> TestResult {
     Ok(())
 }
 
+/// CORPT00C-036 and CORPT00C-038: [`CONCURRENT_SUBMISSIONS`] confirmed Monthly requests in
+/// flight at once, as `WRITEQ TD` accepts every concurrent `CR00` task's deck. Each is
+/// submitted with a generation of its own, the generations are exactly `G0001` onward, and
+/// every file holds one whole deck, so no deck was overwritten.
+async fn report_concurrent_row(api: &Api) -> TestResult {
+    let dir = fresh_dir("corpt00c_concurrent")?;
+    let concurrent = api.sharing(dir.clone(), instant(2022, 7, 18)?)?;
+    let replies = concurrent
+        .post_concurrently(REPORTS, &report("X", "", "", "Y"), CONCURRENT_SUBMISSIONS)
+        .await?;
+    let mut decks = Vec::with_capacity(CONCURRENT_SUBMISSIONS);
+    for reply in &replies {
+        // audit: CORPT00C-036
+        // audit: CORPT00C-038
+        assert_eq!(
+            (reply.status, reply.text("message")),
+            (StatusCode::OK, Some(MONTHLY_SUBMITTED))
+        );
+        decks.push(reply.text("job_deck").ok_or("no job_deck")?.to_owned());
+    }
+    decks.sort_unstable();
+    let expected: Vec<String> = (1..=CONCURRENT_SUBMISSIONS)
+        .map(|generation| format!("TRNRPT00.G{generation:04}"))
+        .collect();
+    // audit: CORPT00C-036
+    assert_eq!(decks, expected);
+    assert_eq!(deck_names(&dir)?, expected);
+    for deck in &expected {
+        // audit: CORPT00C-036
+        assert_eq!(
+            read_deck(&dir, deck)?,
+            expected_deck("2022-07-01", "2022-07-31")
+        );
+    }
+    Ok(())
+}
+
 /// CORPT00C-009: the Monthly end date is the last day of the clock's month, across a year end,
 /// a leap February and a common February.
 async fn report_month_end_rows(api: &Api) -> TestResult {
@@ -636,8 +711,9 @@ async fn report_month_end_rows(api: &Api) -> TestResult {
 
 /// CORPT00C-037: `CARDDEMO_INTRDR_DIR` names an existing regular file, so the generation cannot
 /// be named or created: 500 with the TDQ message on `monthly`, no `job_deck`, and the file left
-/// as it was. What a COBOL write failure leaves behind is halt candidate X-CORPT00C-H2 and is
-/// not asserted.
+/// as it was, as when the directory becomes a file after `carddemo-api` started; at startup,
+/// `check_intrdr_dir` refuses it. What a COBOL write failure leaves behind is halt candidate
+/// X-CORPT00C-H2 and is not asserted.
 async fn report_write_failure_row(api: &Api) -> TestResult {
     let parent = fresh_dir("corpt00c_write_failure")?;
     let file = parent.join("not-a-directory");
@@ -658,6 +734,23 @@ async fn report_write_failure_row(api: &Api) -> TestResult {
     assert!(fs::metadata(&file)?.is_file());
     assert!(fs::read(&file)?.is_empty());
     assert_eq!(deck_names(&parent)?, ["not-a-directory"]);
+
+    // The same directory refused at startup, naming the variable and the cause, never the path.
+    let config = Config {
+        intrdr_dir: file,
+        ..Config::default()
+    };
+    let refused = check_intrdr_dir(&config)
+        .err()
+        .ok_or("the startup check accepted a regular file")?;
+    assert_eq!(refused.kind(), io::ErrorKind::NotADirectory);
+    let text = refused.to_string();
+    assert_eq!(
+        text,
+        "CARDDEMO_INTRDR_DIR, or jobs under CARDDEMO_VAR_DIR when CARDDEMO_INTRDR_DIR is unset, \
+         cannot hold job decks: not a directory"
+    );
+    assert!(!text.contains(&*parent.to_string_lossy()));
     Ok(())
 }
 
@@ -1491,9 +1584,10 @@ fn blocked_corpt00c_candidate_parts() -> TestResult {
     // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
     Err(
         "BLOCKED: NUMVAL-C of a date part that is not digits (CORPT00C-017; X-CORPT00C-H1), the \
-         records a failed or concurrent JOBS write leaves (CORPT00C-036, CORPT00C-037; \
-         X-CORPT00C-H2), and the Monthly end date of a clock outside January 1601 to November \
-         9999 (CORPT00C-009; X-CORPT00C-H3) have no single COBOL result"
+         records a failed JOBS write leaves and what JES makes of concurrent tasks' records \
+         interleaved in one reader (CORPT00C-036, CORPT00C-037; X-CORPT00C-H2), and the Monthly \
+         end date of a clock outside January 1601 to November 9999 (CORPT00C-009; \
+         X-CORPT00C-H3) have no single COBOL result"
             .into(),
     )
 }

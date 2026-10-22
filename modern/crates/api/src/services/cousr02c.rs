@@ -250,11 +250,11 @@ enum Unchanged {
 /// not complete.
 ///
 /// Each operational failure is logged here, once, rather than on the blocking pool, so that the
-/// event falls in the request's span: the unverifiable stored hash as `WARN`, since the
-/// program's own message answers it; the hash failure, by the fixed class text of
-/// [`PasswordError`], and the task failure, by whether it panicked and never its payload, as
-/// `ERROR`, since both answer the unaudited 500. A refusal for nothing modified is the user's
-/// input and logs nothing.
+/// event falls in the request's span, and as `ERROR`, since each answers a 500: the unverifiable
+/// stored hash with the program's own `Unable to lookup User...`; the hash failure, by the fixed
+/// class text of [`PasswordError`], and the task failure, by whether it panicked and never its
+/// payload, with the unaudited 500. A refusal for nothing modified is the user's input and logs
+/// nothing.
 fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<UserEntry, Refusal> {
     match joined {
         Ok(Ok(entry)) => Ok(entry),
@@ -262,7 +262,7 @@ fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<U
             // `rules::modified` refuses with a store-class failure only when the stored hash
             // cannot be verified; its other refusal is the input class's no-change message.
             if failure.class() == FailureClass::Store {
-                tracing::warn!(
+                tracing::error!(
                     program = PROGRAM,
                     paragraph = CHANGE_PARAGRAPH,
                     "stored password hash could not be verified; answering Unable to lookup User"
@@ -341,7 +341,7 @@ async fn abandon<T>(tx: PgTx<'_>, refusal: Refusal) -> Result<T, Refusal> {
 /// The error's `Display` holds only an SQLSTATE, a constraint name or a column name, never a
 /// stored or request value (Cardholder Data Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = PROGRAM,
         paragraph,
         error = %error,
@@ -745,7 +745,7 @@ mod tests {
             (
                 Ok(Err(Unchanged::Refused(unverified))),
                 Err(ServiceError::Rule(unverified)),
-                Some(("WARN", "stored password hash could not be verified")),
+                Some(("ERROR", "stored password hash could not be verified")),
             ),
             (
                 Ok(Err(Unchanged::Refused(unmodified))),

@@ -44,7 +44,7 @@ Install these once per machine:
   pnpm --dir frontend exec playwright install --with-deps chromium
   ```
 
-- **macOS only: GNU bash and stat for the check scripts.** [`scripts/protected-diff.sh`](../scripts/protected-diff.sh), which [`scripts/check.sh`](../scripts/check.sh) runs, uses bash 4.2 features (`mapfile`, `lastpipe`) and GNU `stat -c`. macOS ships bash 3.2 and BSD `stat`, so install `bash` and `coreutils` (for example with Homebrew) and put both ahead of the system tools on `PATH`; the scripts start through `/usr/bin/env bash`.
+- **macOS only: GNU bash and stat, and flock, for the check scripts.** [`scripts/protected-diff.sh`](../scripts/protected-diff.sh), which [`scripts/check.sh`](../scripts/check.sh) runs, uses bash 4.2 features (`mapfile`, `lastpipe`) and GNU `stat -c`. [`scripts/regen-api.sh`](../scripts/regen-api.sh), which `check.sh` also runs, makes concurrent runs in one checkout wait for each other with `flock`, which util-linux provides on Linux. macOS ships bash 3.2 and BSD `stat` and has no `flock`, so install `bash`, `coreutils` and `flock` (for example with Homebrew) and put them ahead of the system tools on `PATH`; the scripts start through `/usr/bin/env bash`.
 
 `curl` is optional; section 4 uses it for a sign-on check.
 
@@ -79,7 +79,7 @@ Every variable the code reads, with the value `.env.example` gives it:
 | `CARDDEMO_JWT_TTL_SECONDS` | `3600` (a positive integer) | api |
 | `CARDDEMO_VAR_DIR` | `./var` | batch (`dalyrejs/`, `systran/`, `reports/` under it); api, as the base of `CARDDEMO_INTRDR_DIR` when that is unset |
 | `CARDDEMO_STATEMENT_DIR` | `./var/statements/` | batch (`creastmt`) |
-| `CARDDEMO_INTRDR_DIR` | `./var/jobs/` | api (the job decks of the report request, endpoint 14) |
+| `CARDDEMO_INTRDR_DIR` | `./var/jobs/` (created by the first submission; a path that names something other than a directory is refused at startup) | api (the job decks of the report request, endpoint 14) |
 | `CARDDEMO_FIXTURE_DIR` | `../app/data/ASCII` | batch (the eight file loads) |
 | `CARDDEMO_OTEL_EXPORT` | unset (commented out): no span export; `stdout` enables it | every binary except `carddemo-openapi` |
 | `RUST_LOG` | `info` | every binary except `carddemo-openapi` (the tracing filter) |
@@ -90,6 +90,7 @@ Notes on these values:
 - Relative paths resolve against `modern/`, the working directory of every binary.
 - The database and broker credentials (`carddemo`/`carddemo`) are local-only values that match `compose.yaml` and [`rabbitmq/definitions.json`](../rabbitmq/definitions.json). The URLs must carry them: the libpq variables (`PGHOST`, `PGUSER`, `PGPASSWORD` and the others) are not read.
 - `CARDDEMO_OTEL_EXPORT=stdout` prints each finished span as a multi-line text block between the JSON event lines. Leave it unset when anything reads standard output line by line as JSON. Any other non-empty value is a configuration error.
+- `carddemo-mq` records a request's `message_id` and `correlation_id` in its message spans and the CP00 alert as their base64url HMAC-SHA256 keyed by its `CARDDEMO_AMQP_URL`, never as their text, and a CP00 reply's generated `message_id` verbatim as `reply_message_id`. Whoever holds the broker credentials in that URL can already read every request from the broker, so the digest is exactly as protected as the messages it identifies; the URL itself is never logged. To find the lines of a request whose ID you know, compute its digest in a shell whose `CARDDEMO_AMQP_URL` holds the URL `carddemo-mq` ran with (export `.env`, or set the default above if it ran with the variable unset) and search for it: `python3 -c 'import base64,hashlib,hmac,os,sys; print(base64.urlsafe_b64encode(hmac.new(os.environ["CARDDEMO_AMQP_URL"].encode(), sys.argv[1].encode(), hashlib.sha256).digest()).rstrip(b"=").decode())' "$ID"`.
 
 Variables that tools read, outside the table above:
 
@@ -115,7 +116,7 @@ This starts PostgreSQL 16 on `localhost:5432` and RabbitMQ 3.13 on `localhost:56
 | `CARD.DEMO.REPLY.DATE` | CDRD replies |
 | `CARD.DEMO.REPLY.ACCT` | CDRA replies |
 | `CARD.DEMO.ERROR` | CDRD and CDRA error messages |
-| `CARD.DEMO.DEADLETTER.PAUTH` | CP00 requests the worker rejects without requeue: an unparseable card number, a reply that was not confirmed, or a failed store read |
+| `CARD.DEMO.DEADLETTER.PAUTH` | CP00 requests the worker rejects without requeue: an unparseable card number or a reply that was not confirmed |
 
 Apply the schema:
 
@@ -290,6 +291,8 @@ Step 0 fails when any of the cloud credential variables the script lists is set,
 env -u AWS_ACCESS_KEY_ID -u AZURE_CLIENT_ID -u GOOGLE_APPLICATION_CREDENTIALS scripts/check.sh
 ```
 
+Step 2 fails before it builds when `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, a `CARGO_TARGET_<TRIPLE>_RUSTFLAGS`, a `CARGO_PROFILE_<NAME>_RUSTFLAGS` or `CLIPPY_CONF_DIR` is set; when the cargo home (`CARGO_HOME`, or `$HOME/.cargo` when it is unset) is a directory inside the repository; or when an entry named `.cargo`, `clippy.toml` or `.clippy.toml` exists anywhere in the repository, whether a directory, a file or a symbolic link and in any letter case. Each can lower the lint levels that `[workspace.lints]` sets. Unset the variable for the run (`env -u RUSTFLAGS scripts/check.sh`), remove it from `.env` if it is set there, point `CARGO_HOME` outside the repository (the default `~/.cargo` is accepted), and delete the entry.
+
 Narrower commands:
 
 - **Build without a database:** `SQLX_OFFLINE=true cargo build --workspace --locked`. Always build with `--locked`, and change `Cargo.lock` only with `cargo update -p <crate> --precise <version>`; a bare `cargo update` would move pinned crates off the versions Rust 1.85.0 can build.
@@ -300,7 +303,7 @@ Narrower commands:
 - **Protected paths:** `scripts/protected-diff.sh` fails on any change, staged or not, to a path outside `modern/`, untracked files included.
 - **Coverage on its own:** `cargo llvm-cov --workspace --locked --no-report`, then `cargo llvm-cov report --fail-under-lines 80 --ignore-filename-regex '/(tests|benches)/'`. The instrumented build takes several gigabytes under `target/llvm-cov-target`, and `scripts/check.sh` leaves it there too; remove that directory afterwards to reclaim the space.
 
-Every script accepts `-h` or `--help`. [SIGNOFF.md](SIGNOFF.md) gives the command for each acceptance criterion.
+Every `scripts/*.sh` script accepts `-h` or `--help`, prints its usage and runs nothing else. `scripts/frontend-policy.mjs` reads its optional first argument as the directory to check in place of `modern/`, so do not pass it `--help`. [SIGNOFF.md](SIGNOFF.md) gives the command for each acceptance criterion.
 
 **After changing a query or a migration.** Bring the stack up, apply the migrations, then regenerate the offline query cache and commit `.sqlx/` together with the change:
 

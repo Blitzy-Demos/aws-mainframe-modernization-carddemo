@@ -16,6 +16,8 @@
 //! - Create the returned file with `std::fs::OpenOptions::new().write(true).create_new(true)`.
 //!   A `NEW` data set never replaces an existing one, and `create_new` keeps that property: when
 //!   two runs race for the same generation, the second fails instead of overwriting the first.
+//!   A caller that loses the race may call [`next_generation`] again, which then counts the
+//!   generation the winner created and names a later one, and retry its exclusive create there.
 //! - Print the path written to standard output, one per line, so the operator learns the
 //!   generation number without listing the directory.
 //!
@@ -79,8 +81,10 @@ pub fn is_limit_reached(error: &io::Error) -> bool {
 /// - [`io::ErrorKind::InvalidInput`] when `name` is empty or contains `/`, `\` or a NUL
 ///   character, since the generation file would then leave `dir` or have no valid file name.
 ///   `dir` is left untouched in that case.
-/// - Any error from creating `dir`, reading it, or reading one of its entries, for example when
-///   `dir` names an existing regular file.
+/// - [`io::ErrorKind::NotADirectory`] when `dir`, or one of its ancestors, exists and is not a
+///   directory, such as a regular file. Creating a directory where such an entry stands reports
+///   that it already exists, which names no true cause, so that report becomes this kind.
+/// - Any other error from creating `dir`, reading it, or reading one of its entries.
 /// - An error of kind [`io::ErrorKind::Other`] when generation 9999 ([`MAX_GENERATION`]) of
 ///   `name` already exists, for which [`is_limit_reached`] is true and whose text is
 ///   `generation limit 9999 reached for <name>`. The number never wraps back to `G0001`, which
@@ -93,7 +97,19 @@ pub fn next_generation(dir: &Path, name: &str) -> io::Result<PathBuf> {
         ));
     }
 
-    fs::create_dir_all(dir)?;
+    // `create_dir_all` succeeds whenever `dir` ends up a directory, so it reports an existing
+    // entry only when that entry is no directory: `dir` itself or an ancestor, a file or a link
+    // to nothing. An entry that is a file further up yields `NotADirectory` directly.
+    fs::create_dir_all(dir).map_err(|error| {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "the generation directory exists and is not a directory",
+            )
+        } else {
+            error
+        }
+    })?;
 
     let prefix = format!("{name}.G");
     let mut highest: Option<u16> = None;
@@ -325,12 +341,33 @@ mod tests {
         assert!(!scratch.path().exists());
     }
 
+    /// An entry that is no directory in place of the directory, or of one of its ancestors, is
+    /// reported as not a directory: a regular file, which is left as it was, and on Unix a link
+    /// to nothing.
     #[test]
-    fn regular_file_in_place_of_the_directory_is_an_error() {
+    fn an_entry_in_place_of_the_directory_is_not_a_directory() {
         let scratch = ScratchDir::new("file-as-dir");
         scratch.create_file("not-a-directory");
+        let file = scratch.path().join("not-a-directory");
+        #[cfg(unix)]
+        let dangling = {
+            let link = scratch.path().join("dangling");
+            std::os::unix::fs::symlink(scratch.path().join("missing-target"), &link)
+                .expect("create dangling link");
+            Some(link)
+        };
+        #[cfg(not(unix))]
+        let dangling = None;
 
-        assert!(next_generation(&scratch.path().join("not-a-directory"), "DALYREJS").is_err());
+        for dir in [file.clone(), file.join("dalyrejs")]
+            .into_iter()
+            .chain(dangling)
+        {
+            let error = next_generation(&dir, "DALYREJS").expect_err("no directory in place");
+            assert_eq!(error.kind(), ErrorKind::NotADirectory, "{}", dir.display());
+        }
+        assert!(file.is_file());
+        assert_eq!(fs::read(&file).expect("read the file"), b"");
     }
 
     #[test]

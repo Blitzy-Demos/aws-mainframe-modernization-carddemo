@@ -12,6 +12,12 @@
 //! - the 50 fixture SSNs, each with and without dashes;
 //! - the fixture user passwords and the eight-digit numeric password the probes send.
 //!
+//! The workers key their spans and alert with the `CARDDEMO_AMQP_URL` they were opened with, and
+//! CDRD and CP00 requests carry a fixture card number, a dashed fixture SSN and the fixture
+//! password as their `message_id` and `correlation_id`: the trace must show each only as its
+//! digest keyed by that URL, which the scan checks is present, and never as its text, and it
+//! must never hold the URL.
+//!
 //! Request queues and `CARD.DEMO.DEADLETTER.PAUTH` are never searched: the test published those
 //! bodies itself, and the broker, not a worker, moves a dead-lettered request.
 //!
@@ -35,7 +41,7 @@ use messaging::broker;
 use messaging::workers::{Processed, Step, cdra, cdrd, cp00};
 use persistence::{AccountRepository, CardXrefRepository, CsslErrorLogRepository, PgStore};
 use runtime::config::Config;
-use runtime::telemetry::ALERT_TARGET;
+use runtime::telemetry::{ALERT_TARGET, IdKey, ScreenedText};
 use test_support::fixtures;
 use test_support::rabbitmq::{self, RabbitMqGuard};
 use test_support::trace_capture::{self, TraceCapture};
@@ -239,6 +245,41 @@ fn assert_settled(capture: &TraceCapture, label: &str, count: usize) {
         .filter(|line| line.contains(r#""message":"the request is settled""#))
         .count();
     assert_eq!(settled, count, "{label}: settlement events in the trace");
+}
+
+/// Request properties whose `message_id` and `correlation_id` are the requester's choice.
+fn id_properties(message_id: &str, correlation_id: &str) -> BasicProperties {
+    BasicProperties::default()
+        .with_message_id(message_id.into())
+        .with_correlation_id(correlation_id.into())
+}
+
+/// The digest that a worker opened with `config` shows for the request ID `id` in its span and
+/// alert: the base64url HMAC-SHA256 under the worker's key of `config.amqp_url`.
+fn keyed(config: &Config, id: &str) -> String {
+    ScreenedText::keyed(id, &IdKey::new(&config.amqp_url)).to_string()
+}
+
+/// Fails unless `capture` shows each of `ids`, request IDs set to protected values, as its digest
+/// keyed by `config.amqp_url` in a `message_id` or `correlation_id` field, so that the needle
+/// scan of the trace runs over the keyed form, and unless the trace never holds that URL, the
+/// key itself. A failure names `label` and the ID's position, never the ID or the URL.
+fn assert_keyed(capture: &TraceCapture, config: &Config, label: &str, ids: &[&str]) {
+    let text = capture.text();
+    assert!(
+        !text.contains(&config.amqp_url),
+        "{label}: the trace holds the AMQP URL"
+    );
+    for (position, id) in ids.iter().enumerate() {
+        let digest = keyed(config, id);
+        let shown = ["message_id", "correlation_id"]
+            .iter()
+            .any(|field| text.contains(&format!(r#""{field}":"{digest}""#)));
+        assert!(
+            shown,
+            "{label}: request ID {position} is not shown as its keyed digest"
+        );
+    }
 }
 
 /// Fixture values the requests themselves carry, to show that none comes back from the worker.
@@ -570,7 +611,9 @@ fn masked_cdra_requests(probes: &Probes) -> Vec<Vec<u8>> {
 /// CDRD never reads its request (CODATE01-001), so a request whose body holds a fixture card
 /// number, SSN and password is answered on `CARD.DEMO.REPLY.DATE`. With that queue deleted after
 /// the worker opened, the next reply comes back unroutable and the `MQPUT ERR` body goes to
-/// `CARD.DEMO.ERROR` (CODATE01-014). Neither body nor the trace holds a protected value.
+/// `CARD.DEMO.ERROR` (CODATE01-014). Both requests carry those values as their `message_id` and
+/// `correlation_id` too, which the trace shows only as their keyed digests. Neither body nor the
+/// trace holds a protected value.
 // audit: CODATE01-009
 #[tokio::test]
 async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
@@ -600,7 +643,11 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
     let queue = config.queue_request_date.as_str();
 
     client
-        .request(queue, &body, BasicProperties::default())
+        .request(
+            queue,
+            &body,
+            id_properties(&probes.card, &probes.ssn_dashed),
+        )
         .await?;
     assert_eq!(
         settle(&mut worker, connection, &dispatch).await?,
@@ -610,7 +657,7 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
 
     client.delete_queue(codate01::REPLY_QUEUE).await?;
     client
-        .request(queue, &body, BasicProperties::default())
+        .request(queue, &body, id_properties(&probes.password, &probes.card))
         .await?;
     assert_eq!(
         settle(&mut worker, connection, &dispatch).await?,
@@ -621,6 +668,12 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
 
     published.assert_redacted(&needles);
     assert_settled(&capture, "CDRD", 2);
+    assert_keyed(
+        &capture,
+        &config,
+        "CDRD",
+        &[&probes.card, &probes.ssn_dashed, &probes.password],
+    );
     assert_no_sensitive("the CDRD trace", capture.text().as_bytes(), &needles);
     client.close().await
 }
@@ -755,10 +808,13 @@ struct Cp00Request {
     body: Vec<u8>,
     /// How the worker settles it.
     outcome: Outcome,
+    /// The `message_id` and `correlation_id` it carries, or `None` for neither.
+    ids: Option<(String, String)>,
 }
 
 impl Cp00Request {
-    /// The request for `card` with `amount` in field 9 and `transaction_id` in field 18.
+    /// The request for `card` with `amount` in field 9 and `transaction_id` in field 18, and no
+    /// `message_id` or `correlation_id`.
     fn new(
         label: &'static str,
         card: String,
@@ -772,7 +828,14 @@ impl Cp00Request {
             card,
             body,
             outcome,
+            ids: None,
         }
+    }
+
+    /// This request carrying `message_id` and `correlation_id`.
+    fn with_ids(mut self, message_id: &str, correlation_id: &str) -> Self {
+        self.ids = Some((message_id.to_owned(), correlation_id.to_owned()));
+        self
     }
 }
 
@@ -790,7 +853,9 @@ fn cp00_body(card_field: &str, amount: &str, transaction_id: &str) -> Vec<u8> {
 /// The CP00 scenario of COPAUA0C-133, in processing order: the ordinary requests (an approval,
 /// an insufficient-funds decline, the `A001`, `M004` and `I004` cases, a field error and an
 /// unparseable card whose field 3 holds a fixture card number and one digit more), the five
-/// field-18 probes and the approved request whose amount holds an SSN's nine digits.
+/// field-18 probes and the approved request whose amount holds an SSN's nine digits. The
+/// approval, the `M004` case and the unparseable card carry a fixture card number, a dashed
+/// fixture SSN and the fixture password as their `message_id` and `correlation_id`.
 ///
 /// # Errors
 ///
@@ -805,7 +870,8 @@ fn cp00_requests(xrefs: &[CardXrefRecord], probes: &Probes) -> Result<Vec<Cp00Re
             "100.00",
             ORDER_ID,
             echoed,
-        ),
+        )
+        .with_ids(&probes.card, &probes.ssn_dashed),
         Cp00Request::new(
             "insufficient-funds decline",
             card_of(xrefs, DECLINE_ACCOUNT)?,
@@ -826,7 +892,8 @@ fn cp00_requests(xrefs: &[CardXrefRecord], probes: &Probes) -> Result<Vec<Cp00Re
             "1.00",
             ORDER_ID,
             Outcome::Unconfirmed,
-        ),
+        )
+        .with_ids(&probes.ssn_dashed, &probes.password),
         Cp00Request::new(
             "first approval of the instant",
             duplicate_key_card.clone(),
@@ -853,6 +920,7 @@ fn cp00_requests(xrefs: &[CardXrefRecord], probes: &Probes) -> Result<Vec<Cp00Re
             card: probes.card.clone(),
             body: cp00_body(&format!("{}1", probes.card), "1.00", ORDER_ID),
             outcome: Outcome::Unparseable,
+            ids: Some((probes.password.clone(), probes.card.clone())),
         },
     ];
     let identifiers = [
@@ -1024,7 +1092,11 @@ async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
     let opening = cp00::Worker::open(connection, &config, store.clone(), fixed_clock()?);
     let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
     for (request, reply_to) in requests.iter().zip(&reply_queues) {
-        let properties = BasicProperties::default().with_reply_to(reply_to.as_str().into());
+        let properties = match &request.ids {
+            Some((message_id, correlation_id)) => id_properties(message_id, correlation_id),
+            None => BasicProperties::default(),
+        }
+        .with_reply_to(reply_to.as_str().into());
         client
             .request(&config.queue_request_pauth, &request.body, properties)
             .await?;
@@ -1050,7 +1122,27 @@ async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
         copaua0c::ALERT_CARD_UNPARSEABLE,
         alerts.len()
     );
+    // The unparseable request's IDs are the fixture password and card number.
+    let alert_ids = [
+        format!(r#""message_id":"{}""#, keyed(&config, &probes.password)),
+        format!(r#""correlation_id":"{}""#, keyed(&config, &probes.card)),
+    ];
+    let shows_ids = |line: &String| {
+        alert_ids
+            .iter()
+            .all(|member| line.contains(member.as_str()))
+    };
+    assert!(
+        alerts.iter().all(shows_ids),
+        "the alert does not show the request IDs as their keyed digests"
+    );
     assert_settled(&capture, "CP00", requests.len());
+    assert_keyed(
+        &capture,
+        &config,
+        "CP00",
+        &[&probes.card, &probes.ssn_dashed, &probes.password],
+    );
     assert_no_sensitive("the CP00 trace", capture.text().as_bytes(), &needles);
     client.close().await
 }

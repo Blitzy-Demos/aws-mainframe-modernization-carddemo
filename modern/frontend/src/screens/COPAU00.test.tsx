@@ -18,8 +18,10 @@ import { COPAU00 } from "./COPAU00";
  * Expectations come from the `client` rows of `modern/audit/online/COPAUS0C.md` and
  * `modern/audit/screens.md`. Rows `COPAU00-001` to `COPAU00-010` place the header labels in a
  * `Label` and the header values in a read-only `Input`; the shared `ScreenShell` renders both as
- * plain text, so those rows are not tagged here, while their content rows (`COPAU00-105` to
- * `COPAU00-110`) are. The rows blocked by halts `X-COPAUS0C-H3` and `X-COPAUS0C-H4` are tested in
+ * plain text in the `CardHeader` title rows. The six value rows (`COPAU00-002`, `-003`, `-005`,
+ * `-007`, `-008`, `-010`) are proved by that text's read-only state, `POS`, width and placement,
+ * and their content rows (`COPAU00-105` to `COPAU00-110`) by the values it shows. The rows
+ * blocked by halts `X-COPAUS0C-H3` and `X-COPAUS0C-H4` are tested in
  * their own `BLOCKED` groups, which assert only the replacement's path the rows state, never a
  * COBOL result.
  */
@@ -399,9 +401,116 @@ function errorText(): string | null {
   return errorRow().textContent;
 }
 
+/**
+ * The error text `element` is marked with, or `null` when it is not marked. A marked input is
+ * `aria-invalid` and its `aria-describedby` names one rendered `sr-only` element holding the text,
+ * which is no message row: `ERRMSG` stays the screen's one visible message.
+ */
+function markOf(element: HTMLElement): string | null {
+  const hidden = (element.getAttribute("aria-describedby") ?? "")
+    .split(/\s+/)
+    .filter((id) => id !== "")
+    .map((id) => document.getElementById(id))
+    .filter((described) => described?.classList.contains("sr-only") === true);
+  if (element.getAttribute("aria-invalid") !== "true") {
+    expect(hidden).toEqual([]);
+    return null;
+  }
+  expect(hidden).toHaveLength(1);
+  const [message] = hidden;
+  expect(message?.closest('[role="alert"]')).toBeNull();
+  return message?.textContent ?? null;
+}
+
+/** The marks of the account field and the five selectors, `null` for each one unmarked. */
+function marks(): (string | null)[] {
+  return [accountField(), ...[1, 2, 3, 4, 5].map(selector)].map(markOf);
+}
+
+/** No input marked. */
+const UNMARKED = [null, null, null, null, null, null];
+
 /** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
 function headerField(name: string): string | null | undefined {
   return document.querySelector(`[data-field="${name}"]`)?.textContent;
+}
+
+/**
+ * Asserts the header value fields of rows 1 and 2 against their rows of `modern/audit/screens.md`
+ * (COPAU00-002, -003, -005, -007, -008 and -010). Each entry of `fields` is the BMS name, the `POS`
+ * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
+ *
+ * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
+ * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
+ * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
+ * or output fields). The assertions prove what the rows require of that text: it is read-only and
+ * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
+ * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
+ * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
+ * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ */
+function expectHeaderValues(
+  root: ParentNode,
+  fields: readonly {
+    readonly name: string;
+    readonly row: number;
+    readonly col: number;
+    readonly length: number;
+    readonly value: string;
+    readonly title: boolean;
+  }[],
+): void {
+  const header = root.querySelector('[data-slot="card-header"]');
+  if (!(header instanceof HTMLElement)) {
+    throw new Error("the screen renders no CardHeader");
+  }
+  // The header exposes no textbox that takes typing.
+  expect(
+    within(header)
+      .queryAllByRole("textbox")
+      .filter((box) =>
+        box instanceof HTMLInputElement || box instanceof HTMLTextAreaElement
+          ? !box.readOnly
+          : box.getAttribute("aria-readonly") !== "true",
+      ),
+  ).toEqual([]);
+  for (const { name, row, col, length, value, title } of fields) {
+    const found = root.querySelectorAll(`[data-field="${name}"]`);
+    expect(found).toHaveLength(1);
+    const element = found[0];
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`the screen renders no header field ${name}`);
+    }
+    // Placement: in the CardHeader title rows, not in the body or the footer.
+    expect(element.closest('[data-slot="card-header"]')).toBe(header);
+    expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+    // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
+    expect(element.parentElement?.className).toBe(cell(row, col, length));
+    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
+    expect(shown).toBe(value);
+    expect(shown).toHaveLength(length);
+    // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
+    // tab stop.
+    const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+    expect(
+      nodes.filter(
+        (node) =>
+          node instanceof HTMLSelectElement ||
+          ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) &&
+            !node.readOnly) ||
+          node.closest('[contenteditable]:not([contenteditable="false"])') !== null,
+      ),
+    ).toEqual([]);
+    expect(element.tabIndex).toBeLessThan(0);
+    expect(
+      nodes.filter(
+        (node) => (node instanceof HTMLElement || node instanceof SVGElement) && node.tabIndex >= 0,
+      ),
+    ).toEqual([]);
+    // Tokens: the foreground colour, with emphasis only on a YELLOW title.
+    expect(element.classList.contains("text-foreground")).toBe(true);
+    expect(element.classList.contains("font-semibold")).toBe(title);
+  }
 }
 
 /** The `GridCell` placement class of map position (`row`, `col`) and `LENGTH` `span`. */
@@ -699,6 +808,35 @@ describe("COPAU00 View Authorizations", () => {
     }
   });
 
+  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+    // audit: COPAU00-002
+    // audit: COPAU00-003
+    // audit: COPAU00-005
+    // audit: COPAU00-007
+    // audit: COPAU00-008
+    // audit: COPAU00-010
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      const sent = stubFetch();
+      renderScreen();
+
+      expectHeaderValues(document, [
+        { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CPVS", title: false },
+        { name: "TITLE01", row: 1, col: 21, length: 40, value: TITLE01, title: true },
+        { name: "CURDATE", row: 1, col: 71, length: 8, value: "01/02/24", title: false },
+        { name: "PGMNAME", row: 2, col: 7, length: 8, value: "COPAUS0C", title: false },
+        { name: "TITLE02", row: 2, col: 21, length: 40, value: TITLE02, title: true },
+        { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
+      ]);
+      await idle();
+      expect(sent).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ENTER 00000000050 reads endpoint 21 once, without page_key or page_size, and shows the block and the rows verbatim", async () => {
     // audit: COPAU00-016
     // audit: COPAU00-018
@@ -965,6 +1103,8 @@ describe("COPAU00 View Authorizations", () => {
       expect(sent[1].path).toBe(summaryPath(ACCOUNT));
       expect(sent[1].query).toEqual({});
       expect(errorText()).toBe(INVALID_SELECTION);
+      // The message names no field, so neither the account nor a selector is marked.
+      expect(marks()).toEqual(UNMARKED);
       // The page read leaves every selector blank.
       expectListed(PAGE_1.rows);
       for (let row = 1; row <= 5; row += 1) {
@@ -1140,6 +1280,99 @@ describe("COPAU00 View Authorizations", () => {
     expectListed(PAGE_1.rows);
   });
 
+  it("an F7 whose backward read finds no row leaves the page number n − 1, so the next F7 reads back from the first key of the page before that", async () => {
+    // audit: COPAUS0C-039
+    // audit: COPAUS0C-046
+    const page2: components["schemas"]["AuthSummaryResponse"] = fullPage(2, true);
+    const page3: components["schemas"]["AuthSummaryResponse"] = fullPage(3, false);
+    const sent = stubFetch(
+      json(200, PAGE_1),
+      json(200, page2),
+      json(200, page3),
+      json(200, EMPTY_PAGE),
+      json(200, PAGE_1),
+    );
+    renderScreen();
+    enter(ACCOUNT);
+    await answered(sent, 1);
+    press("F8=Forward");
+    await answered(sent, 2);
+    press("F8=Forward");
+    await answered(sent, 3);
+    expectListed(page3.rows);
+
+    // F7 at page 3 reads back from page 2's first key and finds no row, so no page is added.
+    press("F7=Backward");
+    await answered(sent, 4);
+    expect(sent[3].path).toBe(summaryPath(ACCOUNT));
+    expect(sent[3].query).toEqual({ page_key: authKey(6), direction: "backward" });
+    expectListed([]);
+    expect(errorText()).toBe("");
+
+    // The page number stayed 2, so this F7 reads back from page 1's first key.
+    press("F7=Backward");
+    await answered(sent, 5);
+    expect(sent[4].path).toBe(summaryPath(ACCOUNT));
+    expect(sent[4].query).toEqual({ page_key: authKey(1), direction: "backward" });
+    expectListed(PAGE_1.rows);
+    expect(errorText()).toBe("");
+  });
+
+  it("ENTER on another account pages that account from its own first keys, never from the earlier account's", async () => {
+    // audit: COPAUS0C-039
+    // audit: COPAUS0C-045
+    // audit: COPAUS0C-046
+    const second = "00000000049";
+    /** Page `n` of the second account: authorizations 5n + 96 to 5n + 100, none of ACCOUNT's. */
+    const secondPage = (
+      n: number,
+      hasNext: boolean,
+    ): components["schemas"]["AuthSummaryResponse"] => ({
+      ...fullPage(20 + n, hasNext),
+      acct_id: second,
+    });
+    const sent = stubFetch(
+      json(200, PAGE_1),
+      json(200, fullPage(2, true)),
+      json(200, fullPage(3, true)),
+      json(200, secondPage(1, true)),
+      json(200, secondPage(2, true)),
+      json(200, secondPage(1, true)),
+    );
+    renderScreen();
+    enter(ACCOUNT);
+    await answered(sent, 1);
+    press("F8=Forward");
+    await answered(sent, 2);
+    press("F8=Forward");
+    await answered(sent, 3);
+
+    // The ENTER sets the page number to 0 and its page read counts the second account's page 1.
+    enter(second);
+    await answered(sent, 4);
+    expect(sent[3].path).toBe(summaryPath(second));
+    expect(sent[3].query).toEqual({});
+    expectListed(secondPage(1, true).rows);
+
+    // F7 at page 1 is at the top, whatever pages the earlier account showed.
+    press("F7=Backward");
+    expect(errorText()).toBe(TOP_OF_PAGE);
+    await idle();
+    expect(sent).toHaveLength(4);
+
+    press("F8=Forward");
+    await answered(sent, 5);
+    expect(sent[4].query).toEqual({ page_key: authKey(105), direction: "forward" });
+    expectListed(secondPage(2, true).rows);
+
+    // F7 at page 2 reads back from the second account's page-1 key, not ACCOUNT's.
+    press("F7=Backward");
+    await answered(sent, 6);
+    expect(sent[5].path).toBe(summaryPath(second));
+    expect(sent[5].query).toEqual({ page_key: authKey(101), direction: "backward" });
+    expectListed(secondPage(1, true).rows);
+  });
+
   it.each([
     { title: "a blank account", account: "", message: ENTER_ACCT_ID },
     { title: "an account with a letter", account: "0000000005A", message: ACCT_ID_NOT_NUMERIC },
@@ -1163,6 +1396,8 @@ describe("COPAU00 View Authorizations", () => {
       typeInto(selector(1), "S");
       enter(account);
       await waitFor(() => expect(errorText()).toBe(message));
+      // The edit's message also marks the account field, for assistive technology only.
+      expect(marks()).toEqual([message, null, null, null, null, null]);
       await idle();
       expect(sent).toHaveLength(2);
       expect(screen.queryByRole("region", { name: "Authorization Details" })).toBeNull();
@@ -1172,9 +1407,10 @@ describe("COPAU00 View Authorizations", () => {
       expectListed(page2.rows);
       expect(document.activeElement).toBe(accountField());
 
-      // The page number is 0, so F7 is at the top.
+      // The page number is 0, so F7 is at the top; its message takes the mark off the account.
       press("F7=Backward");
       expect(errorText()).toBe(TOP_OF_PAGE);
+      expect(marks()).toEqual(UNMARKED);
       await idle();
       expect(sent).toHaveLength(2);
 
@@ -1256,7 +1492,38 @@ describe("COPAU00 View Authorizations", () => {
     expect(valueOf(accountField())).toBe(UNKNOWN_ACCOUNT);
     expect(shownBlock()).toEqual(expectedBlock(BLOCK, true));
     expect(document.activeElement).toBe(accountField());
+    // The error names `acct_id`: the account field is marked with its message, for assistive
+    // technology only, and no selector is.
+    expect(marks()).toEqual([XREF_NOT_FOUND, null, null, null, null, null]);
   });
+
+  it.each([
+    { title: "F7 at the top", act: () => press("F7=Backward"), message: TOP_OF_PAGE, reads: 1 },
+    { title: "F8 at the bottom", act: () => press("F8=Forward"), message: BOTTOM_OF_PAGE, reads: 1 },
+    {
+      title: "an invalid key",
+      act: () => fireEvent.keyDown(accountField(), { key: "F2" }),
+      message: INVALID_KEY,
+      reads: 1,
+    },
+    { title: "ENTER on an account found", act: () => enter(ACCOUNT), message: "", reads: 2 },
+  ])(
+    "the next key, $title, takes off the mark a ScreenError naming acct_id put on the account",
+    async ({ act, message, reads }) => {
+      const sent = stubFetch(json(404, NOT_FOUND), json(200, PAGE_1));
+      renderScreen();
+      enter(UNKNOWN_ACCOUNT);
+      await answered(sent, 1);
+      expect(marks()).toEqual([XREF_NOT_FOUND, null, null, null, null, null]);
+
+      act();
+
+      await answered(sent, reads);
+      await waitFor(() => expect(errorText()).toBe(message));
+      expect(marks()).toEqual(UNMARKED);
+      expect(document.activeElement).toBe(accountField());
+    },
+  );
 
   it("an F8 read that fails shows the server's message verbatim, its leading space included", async () => {
     // audit: COPAU00-103
@@ -1272,6 +1539,8 @@ describe("COPAU00 View Authorizations", () => {
     expect(shownBlock()).toEqual(expectedBlock(BLOCK, true));
     expectListed(PAGE_1.rows);
     expect(document.activeElement).toBe(accountField());
+    // The error names no field, so nothing is marked.
+    expect(marks()).toEqual(UNMARKED);
   });
 
   it("locks the keyboard while a read is outstanding: ENTER, F3, F7, F8 and an invalid key do nothing until it answers", async () => {
@@ -1388,5 +1657,52 @@ describe("BLOCKED X-COPAUS0C-H3: pages after the 20th, not a parity result", () 
     await answered(sent, 22);
     expect(sent[21].query).toEqual({ page_key: authKey(96), direction: "backward" });
     expectListed(pages[19].rows);
+  });
+
+  it("the screen holds the first keys of the last 20 pages: F7 at page 25 reads back from page 24's first key, and the F7 that would need page 5's key sends nothing", async () => {
+    // audit: COPAUS0C-050
+    const pages: components["schemas"]["AuthSummaryResponse"][] = Array.from(
+      { length: 25 },
+      (_, index) => fullPage(index + 1, true),
+    );
+    const sent = stubFetch(
+      ...pages.map((page) => json(200, page)),
+      json(200, pages[23]),
+      ...Array.from({ length: 19 }, () => json(200, EMPTY_PAGE)),
+    );
+    renderScreen();
+    enter(ACCOUNT);
+    await answered(sent, 1);
+    for (let page = 2; page <= 25; page += 1) {
+      press("F8=Forward");
+      await answered(sent, page);
+    }
+    expect(sent[24].query).toEqual({ page_key: authKey(120), direction: "forward" });
+    expectListed(pages[24].rows);
+
+    // F7 at page 25 reads back from page 24's first key, and that read counts page 25 again.
+    press("F7=Backward");
+    await answered(sent, 26);
+    expect(sent[25].query).toEqual({ page_key: authKey(116), direction: "backward" });
+    expectListed(pages[23].rows);
+
+    // Backward reads that find no row take the page number down one at a time, each from the
+    // first key of the page before it: pages 24 to 6, the earliest of the 20 pages held.
+    for (let page = 24; page >= 6; page -= 1) {
+      press("F7=Backward");
+      await answered(sent, 26 + 25 - page);
+      expect(sent.at(-1)?.query).toEqual({
+        page_key: authKey(5 * page - 4),
+        direction: "backward",
+      });
+    }
+    expectListed([]);
+
+    // Page 5's first key is no longer held: the top-of-page message, with no request.
+    press("F7=Backward");
+    expect(errorText()).toBe(TOP_OF_PAGE);
+    await idle();
+    expect(sent).toHaveLength(45);
+    expectListed([]);
   });
 });

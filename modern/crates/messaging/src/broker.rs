@@ -84,11 +84,15 @@
 //! printable bytes, spaces included, so nothing in a property tells it safe. [`Request`] keeps
 //! them as received, for the reply properties and the reply destination, and every diagnostic
 //! takes them through [`Request::screened_message_id`], [`Request::screened_correlation_id`] and
-//! [`Request::screened_reply_to`], which show only whether each is present and its length in
-//! bytes, never its text.
+//! [`Request::screened_reply_to`], never as their text. A worker's span and alert pass its
+//! [`IdKey`], keyed with its `CARDDEMO_AMQP_URL`, so the two IDs show as their base64url
+//! HMAC-SHA256 under it and the lines about one request can be matched to each other and to its
+//! reply. The `reply_to`, and `Debug` always, show only whether each is present and its length
+//! in bytes.
 
 use std::error::Error;
 use std::fmt;
+use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io;
 use std::net::{Shutdown, TcpStream as Socket, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,7 +112,7 @@ use lapin::uri::{AMQPScheme, AMQPUri};
 use lapin::{
     BasicProperties, Channel, ChannelState, Connection, ConnectionProperties, ConnectionState,
 };
-use runtime::telemetry::ScreenedText;
+use runtime::telemetry::{IdKey, ScreenedText};
 
 /// How long [`connect`] may take from the TCP connect to the broker's `connection.open-ok`: the
 /// socket, the protocol header and the `start`, `tune` and `open` exchanges together. The
@@ -169,10 +173,11 @@ pub fn is_direct_reply_to(queue: &str) -> bool {
 /// tenths of a second (`COPAUA0C.cbl:750`; COPAUA0C-067, E16). CDRD and CDRA replies carry none.
 pub const CP00_REPLY_EXPIRATION: &str = "5000";
 
-/// The longest delay [`Backoff`] waits between two reconnection attempts.
+/// The longest delay [`Backoff`] waits between two reconnection attempts: the largest base it
+/// doubles to, and so the most any delay drawn from that base can be.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(5);
 
-/// The shortest delay [`Backoff`] starts from: a zero delay would never grow, and the reconnect
+/// The shortest base [`Backoff`] starts from: a zero base would never grow, and the reconnect
 /// loop would spin.
 const BACKOFF_FLOOR: Duration = Duration::from_millis(1);
 
@@ -261,6 +266,26 @@ impl AmqpError {
             | Self::Get(fault)
             | Self::Ack(fault)
             | Self::Reject(fault) => fault.is_connection_lost(),
+        }
+    }
+
+    /// Whether the failure comes from the configuration, which is read once at startup, so that
+    /// no retry, on this connection or a new one, can cure it: [`AmqpError::InvalidUrl`] and
+    /// [`AmqpError::QueueName`] only.
+    ///
+    /// Every other failure concerns the broker as it stands now: one that is down or still
+    /// booting, refuses the login, misses a deadline, lacks a queue or refuses a channel. The
+    /// broker can recover from each of these, so they are retried with [`Backoff`].
+    #[must_use]
+    pub fn is_configuration(&self) -> bool {
+        match self {
+            Self::InvalidUrl | Self::QueueName { .. } => true,
+            Self::Connect(_)
+            | Self::Channel(_)
+            | Self::Declare { .. }
+            | Self::Get(_)
+            | Self::Ack(_)
+            | Self::Reject(_) => false,
         }
     }
 }
@@ -824,9 +849,12 @@ fn parse_url(amqp_url: &str) -> Result<AMQPUri, AmqpError> {
 /// creates nothing.
 ///
 /// A missing queue makes the broker close `channel` (AMQP `NOT_FOUND`, 404), so the first
-/// failure ends the check. At startup it is fatal: the queue set of
-/// `rabbitmq/definitions.json` is missing or a request queue name in the configuration is wrong.
-/// Each declare must be answered within [`OPERATION_DEADLINE`].
+/// failure ends the check: the queue set of `rabbitmq/definitions.json` is not loaded, a queue
+/// was deleted, or a request queue name in the configuration names no queue. The check never
+/// creates the queue. `messaging::run` logs the failure, closes the connection and opens the
+/// workers again on a new one after its backoff, at startup and after a reconnect alike, so the
+/// workers start once the queue exists. Each declare must be answered within
+/// [`OPERATION_DEADLINE`].
 ///
 /// # Errors
 ///
@@ -1032,8 +1060,9 @@ impl Publisher {
 /// The three properties are untrusted too. Their fields keep them as received, because the reply
 /// properties copy them and a CP00 reply goes to `reply_to`. Diagnostics, `Debug` included, show
 /// them only through [`Request::screened_message_id`], [`Request::screened_correlation_id`] and
-/// [`Request::screened_reply_to`], one `*` per byte, since a requester can put a card number, an
-/// SSN or a password in any of them.
+/// [`Request::screened_reply_to`], since a requester can put a card number, an SSN or a password
+/// in any of them: the two IDs as their keyed digest in a worker's span and alert, which pass the
+/// worker's [`IdKey`], and as one `*` per byte in `Debug` and for the `reply_to`.
 pub struct Request {
     /// The tag that acknowledges or rejects this delivery on the consumer channel.
     pub delivery_tag: u64,
@@ -1082,19 +1111,25 @@ impl Request {
     }
 
     /// The `message_id` property in the only form a span, an event or `Debug` may show it: a
-    /// [`ScreenedText`], one `*` per byte, so a diagnostic learns whether it is present and its
-    /// length, never its text.
+    /// [`ScreenedText`] keyed with `key`, the worker's [`IdKey`], which shows the base64url
+    /// HMAC-SHA256 of the ID under it so that every line about the request carries the same
+    /// digest; `Debug`, which has no key and passes `None`, shows one `*` per byte. Never its
+    /// text.
     #[must_use]
-    pub fn screened_message_id(&self) -> Option<ScreenedText<'_>> {
-        self.message_id.as_deref().map(ScreenedText::new)
+    pub fn screened_message_id<'a>(&'a self, key: Option<&'a IdKey>) -> Option<ScreenedText<'a>> {
+        self.message_id.as_deref().map(|id| screened(id, key))
     }
 
     /// The `correlation_id` property in the only form a span, an event or `Debug` may show it: a
-    /// [`ScreenedText`], one `*` per byte, so a diagnostic learns whether it is present and its
-    /// length, never its text.
+    /// [`ScreenedText`] keyed with `key`, the worker's [`IdKey`], which shows the base64url
+    /// HMAC-SHA256 of the ID under it, the digest of the `correlation_id` the reply copies;
+    /// `Debug`, which has no key and passes `None`, shows one `*` per byte. Never its text.
     #[must_use]
-    pub fn screened_correlation_id(&self) -> Option<ScreenedText<'_>> {
-        self.correlation_id.as_deref().map(ScreenedText::new)
+    pub fn screened_correlation_id<'a>(
+        &'a self,
+        key: Option<&'a IdKey>,
+    ) -> Option<ScreenedText<'a>> {
+        self.correlation_id.as_deref().map(|id| screened(id, key))
     }
 
     /// The `reply_to` property in the only form a span, an event or `Debug` may show it: a
@@ -1111,15 +1146,21 @@ fn owned(value: Option<&ShortString>) -> Option<String> {
     value.map(|text| text.as_str().to_owned())
 }
 
+/// A request ID as a [`ScreenedText`]: its keyed digest under `key`, or one `*` per byte when
+/// `key` is `None`.
+fn screened<'a>(id: &'a str, key: Option<&'a IdKey>) -> ScreenedText<'a> {
+    key.map_or_else(|| ScreenedText::new(id), |key| ScreenedText::keyed(id, key))
+}
+
 impl fmt::Debug for Request {
-    /// The delivery tag, the three properties as their [`ScreenedText`] shows them (one `*` per
-    /// byte, or `None` when absent), the redelivery flag and the body's length; never a body byte
-    /// or a byte of a property.
+    /// The delivery tag, the three properties as their unkeyed [`ScreenedText`] shows them (one
+    /// `*` per byte, or `None` when absent), the redelivery flag and the body's length; never a
+    /// body byte or a byte of a property.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Request")
             .field("delivery_tag", &self.delivery_tag)
-            .field("message_id", &self.screened_message_id())
-            .field("correlation_id", &self.screened_correlation_id())
+            .field("message_id", &self.screened_message_id(None))
+            .field("correlation_id", &self.screened_correlation_id(None))
             .field("reply_to", &self.screened_reply_to())
             .field("redelivered", &self.redelivered)
             .field("body_len", &self.body.len())
@@ -1219,17 +1260,22 @@ impl Acknowledger for Consumer {
     }
 }
 
-/// The delay before each attempt to reopen channels or reconnect: it starts at the poll
-/// interval (`Config::mq_poll_interval`, `CARDDEMO_MQ_POLL_MS`) and doubles after every attempt
-/// up to [`BACKOFF_CAP`], until [`Backoff::reset`] (COPAUA0C-118).
+/// The delay before each attempt to reopen channels or reconnect (COPAUA0C-118). A base delay
+/// starts at the poll interval (`Config::mq_poll_interval`, `CARDDEMO_MQ_POLL_MS`) and doubles
+/// after every attempt up to [`BACKOFF_CAP`], until [`Backoff::reset`]. Each delay is drawn
+/// afresh between half the base and the whole base, so `carddemo-mq` processes that lost the
+/// broker together spread their attempts instead of retrying in lockstep, and no delay exceeds
+/// the cap.
 #[derive(Debug, Clone)]
 pub struct Backoff {
+    /// The base the backoff starts from and returns to on [`Backoff::reset`].
     initial: Duration,
+    /// The base of the next delay.
     current: Duration,
 }
 
 impl Backoff {
-    /// A backoff starting at `initial`, held between 1 ms and [`BACKOFF_CAP`].
+    /// A backoff whose base starts at `initial`, held between 1 ms and [`BACKOFF_CAP`].
     #[must_use]
     pub fn new(initial: Duration) -> Self {
         let initial = initial.clamp(BACKOFF_FLOOR, BACKOFF_CAP);
@@ -1239,22 +1285,48 @@ impl Backoff {
         }
     }
 
-    /// The delay to wait now; the next call returns twice as much, up to [`BACKOFF_CAP`].
+    /// The delay to wait now, drawn between half the current base and the whole base; the next
+    /// call draws from twice that base, up to [`BACKOFF_CAP`].
     pub fn next_delay(&mut self) -> Duration {
-        let delay = self.current;
+        let base = self.current;
         self.current = self.current.saturating_mul(2).min(BACKOFF_CAP);
-        delay
+        jittered(base, random_word())
     }
 
-    /// Starts again from the initial delay, after a successfully processed message.
+    /// Starts again from the initial base, after a successfully processed message or once the
+    /// workers have opened.
     pub fn reset(&mut self) {
         self.current = self.initial;
     }
 
-    /// Sleeps for [`Backoff::next_delay`].
+    /// Sleeps for [`Backoff::next_delay`]: between half the current base and the whole base.
     pub async fn wait(&mut self) {
         tokio::time::sleep(self.next_delay()).await;
     }
+}
+
+/// The delay `random` picks between `base / 2` and `base`, both included: the lower half of
+/// `base` plus `random` modulo one more than the nanoseconds of the upper half. Integer
+/// arithmetic only, so the result never exceeds `base`, and a `random` taken from the whole
+/// `u64` range spreads the delays evenly but for a negligible bias.
+fn jittered(base: Duration, random: u64) -> Duration {
+    let floor = base / 2;
+    let spread = base.saturating_sub(floor);
+    let spread_nanos = spread
+        .as_secs()
+        .saturating_mul(1_000_000_000)
+        .saturating_add(u64::from(spread.subsec_nanos()));
+    floor.saturating_add(Duration::from_nanos(
+        random % spread_nanos.saturating_add(1),
+    ))
+}
+
+/// A word that differs from one call to the next and from one process to another, for the
+/// spread of [`Backoff`] delays only, never for secrecy: the hash of nothing under a fresh
+/// `RandomState`, whose keys the standard library seeds from the operating system once per
+/// thread and advances on every call. It needs no dependency and no shared state.
+fn random_word() -> u64 {
+    RandomState::new().build_hasher().finish()
 }
 
 /// Waits `poll_interval` (`CARDDEMO_MQ_POLL_MS`, default 250 ms) after [`Consumer::get`] found
@@ -1267,6 +1339,7 @@ pub async fn idle(poll_interval: Duration) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::error::Error;
     use std::io;
     use std::sync::Arc;
@@ -1276,15 +1349,30 @@ mod tests {
     use lapin::types::ShortString;
     use lapin::uri::AMQPUri;
     use lapin::{BasicProperties, ChannelState, ConnectionState};
+    use runtime::telemetry::{IdKey, ScreenedText};
 
     use super::{
         AmqpError, BACKOFF_CAP, Backoff, CONNECT_DEADLINE, CP00_REPLY_EXPIRATION,
         DEAD_LETTER_QUEUE, Fault, OPERATION_DEADLINE, PUBLISH_DEADLINE, PublishFailure, QueueCheck,
-        QueueLabel, Request, copied_properties, cp00_properties, parse_url, within,
+        QueueLabel, Request, copied_properties, cp00_properties, jittered, parse_url, within,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
     const CARD_NUMBER: &str = "0500024453765740";
+
+    /// Property values a requester may choose: a card number, whole and spaced out, an SSN with
+    /// and without dashes, an 8-byte password, a password holding a space, a short password and
+    /// a short ID.
+    const PROBES: [&str; 8] = [
+        CARD_NUMBER,
+        "123-45-6789",
+        "123456789",
+        "PASSWORD",
+        "PASS WOR",
+        "SECRET",
+        "M-1",
+        "0500 0244 5376 5740",
+    ];
 
     fn request(message_id: Option<&str>, correlation_id: Option<&str>) -> Request {
         Request {
@@ -1301,27 +1389,92 @@ mod tests {
         value.map(ShortString::as_str)
     }
 
-    #[test]
-    fn backoff_doubles_from_the_poll_interval_to_the_cap_and_resets() {
-        let mut backoff = Backoff::new(Duration::from_millis(250));
-        let delays: Vec<Duration> = (0..7).map(|_| backoff.next_delay()).collect();
-        let expected = [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000].map(Duration::from_millis);
-        assert_eq!(delays, expected);
-        backoff.reset();
-        assert_eq!(backoff.next_delay(), Duration::from_millis(250));
-        assert_eq!(backoff.next_delay(), Duration::from_millis(500));
+    /// Fails unless `delay` lies between half of `base` and `base`, both included.
+    fn assert_drawn_from(delay: Duration, base: Duration) {
+        assert!(
+            delay >= base / 2 && delay <= base,
+            "{delay:?} is outside [{:?}, {base:?}]",
+            base / 2
+        );
     }
 
     #[test]
-    fn backoff_starts_between_one_millisecond_and_the_cap() {
-        let mut from_zero = Backoff::new(Duration::ZERO);
-        assert_eq!(from_zero.next_delay(), Duration::from_millis(1));
-        assert_eq!(from_zero.next_delay(), Duration::from_millis(2));
-        let mut from_long = Backoff::new(Duration::from_secs(60));
-        assert_eq!(from_long.next_delay(), BACKOFF_CAP);
-        assert_eq!(from_long.next_delay(), BACKOFF_CAP);
-        from_long.reset();
-        assert_eq!(from_long.next_delay(), BACKOFF_CAP);
+    fn backoff_draws_each_delay_from_a_base_that_doubles_to_the_cap_and_resets() {
+        let ms = Duration::from_millis;
+        // (initial, the bases of the first delays, the bases after a reset): the base starts at
+        // the initial delay held between 1 ms and the cap, and doubles up to the cap.
+        let cases: [(Duration, Vec<Duration>, Vec<Duration>); 3] = [
+            (
+                ms(250),
+                [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000]
+                    .map(ms)
+                    .to_vec(),
+                vec![ms(250), ms(500)],
+            ),
+            (Duration::ZERO, vec![ms(1), ms(2), ms(4)], vec![ms(1)]),
+            (
+                Duration::from_secs(60),
+                vec![BACKOFF_CAP, BACKOFF_CAP, BACKOFF_CAP],
+                vec![BACKOFF_CAP, BACKOFF_CAP],
+            ),
+        ];
+        for (initial, bases, after_reset) in cases {
+            // Each delay is a fresh draw, so every sequence is checked over many rounds.
+            for _ in 0..200 {
+                let mut backoff = Backoff::new(initial);
+                for base in &bases {
+                    assert_drawn_from(backoff.next_delay(), *base);
+                }
+                backoff.reset();
+                for base in &after_reset {
+                    assert_drawn_from(backoff.next_delay(), *base);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_jittered_delay_spans_half_the_base_to_the_whole_base() {
+        let ms = Duration::from_millis;
+        let ns = Duration::from_nanos;
+        // (base, random word, delay): the lower half of the base, plus the word modulo one more
+        // than the nanoseconds of the upper half.
+        let cases = [
+            (ms(250), 0, ms(125)),
+            (ms(250), 125_000_000, ms(250)),
+            (ms(250), 125_000_001, ms(125)),
+            (ms(250), u64::MAX, ms(125) + ns(10_600_206)),
+            (ns(3), 0, ns(1)),
+            (ns(3), 2, ns(3)),
+            (ns(3), 3, ns(1)),
+            (ns(1), 1, ns(1)),
+            (ns(1), 2, Duration::ZERO),
+            (Duration::ZERO, u64::MAX, Duration::ZERO),
+            (BACKOFF_CAP, 0, ms(2_500)),
+            (BACKOFF_CAP, 2_500_000_000, BACKOFF_CAP),
+            (BACKOFF_CAP, 2_500_000_001, ms(2_500)),
+            (BACKOFF_CAP, u64::MAX, ms(2_500) + ns(1_330_853_989)),
+        ];
+        for (base, random, expected) in cases {
+            let delay = jittered(base, random);
+            assert_eq!(delay, expected, "base {base:?}, random {random}");
+            assert_drawn_from(delay, base);
+        }
+    }
+
+    #[test]
+    fn backoff_delays_differ_from_draw_to_draw_and_between_backoffs() {
+        let mut at_cap = Backoff::new(BACKOFF_CAP);
+        let delays: HashSet<Duration> = (0..64).map(|_| at_cap.next_delay()).collect();
+        assert!(delays.len() > 1, "64 delays at the cap were all {delays:?}");
+
+        // Two processes that lost the broker together start from the same poll interval; their
+        // delays must not repeat each other step for step.
+        let initial = Duration::from_millis(250);
+        let (mut first, mut second) = (Backoff::new(initial), Backoff::new(initial));
+        let first: Vec<Duration> = (0..8).map(|_| first.next_delay()).collect();
+        let second: Vec<Duration> = (0..8).map(|_| second.next_delay()).collect();
+        assert_ne!(first, second, "two backoffs drew the same delays");
     }
 
     // audit: CODATE01-010
@@ -1427,22 +1580,9 @@ mod tests {
 
     #[test]
     fn request_debug_shows_the_body_length_and_never_a_body_byte() {
-        // Property values a requester may choose: a card number, whole and spaced out, an SSN
-        // with and without dashes, an 8-byte password, a password holding a space, a short
-        // password and a short ID.
-        let probes = [
-            CARD_NUMBER,
-            "123-45-6789",
-            "123456789",
-            "PASSWORD",
-            "PASS WOR",
-            "SECRET",
-            "M-1",
-            "0500 0244 5376 5740",
-        ];
         // The body's fields, none of which `Debug` may show.
         let body_fields = ["000001", "120000", CARD_NUMBER, "100.00"];
-        for probe in probes {
+        for probe in PROBES {
             let mut protected = request(Some(probe), Some(probe));
             protected.reply_to = Some(probe.to_owned());
             let shown = format!("{protected:?}");
@@ -1455,7 +1595,7 @@ mod tests {
                 shown.contains(&format!("body_len: {}", protected.body.len())),
                 "{shown}"
             );
-            for value in probes.into_iter().chain(body_fields) {
+            for value in PROBES.into_iter().chain(body_fields) {
                 assert!(!shown.contains(value), "{value:?} in {shown}");
             }
         }
@@ -1471,6 +1611,43 @@ mod tests {
             assert!(shown.contains(expected), "{expected} missing from {shown}");
         }
         assert!(!shown.contains("M-1"), "{shown}");
+    }
+
+    #[test]
+    fn screened_ids_are_their_keyed_digest_with_a_key_and_stars_without() {
+        let key = IdKey::new("local-test-id-key");
+        let shown = |screened: Option<ScreenedText<'_>>| screened.map(|text| text.to_string());
+        for probe in PROBES {
+            let mut protected = request(Some(probe), Some(probe));
+            protected.reply_to = Some(probe.to_owned());
+            let digest = ScreenedText::keyed(probe, &key).to_string();
+            assert_eq!(digest.len(), 43, "{probe:?}: {digest}");
+            assert!(!digest.contains(probe), "{probe:?} in {digest}");
+            let stars = "*".repeat(probe.len());
+            // A worker's span and alert pass its key; `Debug` passes none.
+            for (given, expected) in [(Some(&key), &digest), (None, &stars)] {
+                assert_eq!(
+                    shown(protected.screened_message_id(given)).as_ref(),
+                    Some(expected),
+                    "{probe:?}"
+                );
+                assert_eq!(
+                    shown(protected.screened_correlation_id(given)).as_ref(),
+                    Some(expected),
+                    "{probe:?}"
+                );
+            }
+            // The reply destination is never keyed: it is no ID a log line is matched by.
+            assert_eq!(
+                shown(protected.screened_reply_to()),
+                Some(stars),
+                "{probe:?}"
+            );
+        }
+
+        let absent = request(None, None);
+        assert!(absent.screened_message_id(Some(&key)).is_none());
+        assert!(absent.screened_correlation_id(Some(&key)).is_none());
     }
 
     #[test]
@@ -1552,6 +1729,61 @@ mod tests {
         ];
         for error in &channel_only {
             assert!(!error.is_connection_lost(), "{error}");
+        }
+    }
+
+    #[test]
+    fn only_an_invalid_url_or_a_refused_queue_name_is_a_configuration_error() {
+        let refused = Fault::from(lapin::Error::IOError(Arc::new(io::Error::from(
+            io::ErrorKind::ConnectionRefused,
+        ))));
+        let not_found = Fault::from(lapin::Error::ProtocolError(AMQPError::new(
+            AMQPErrorKind::Soft(AMQPSoftError::NOTFOUND),
+            ShortString::from("no queue"),
+        )));
+        let login_refused = Fault::from(lapin::Error::ProtocolError(AMQPError::new(
+            AMQPErrorKind::Soft(AMQPSoftError::ACCESSREFUSED),
+            ShortString::from("ACCESS_REFUSED - login refused"),
+        )));
+        let cases = [
+            (AmqpError::InvalidUrl, true),
+            (
+                AmqpError::QueueName {
+                    variable: "CARDDEMO_QUEUE_REQUEST_ACCT",
+                    max_len: 48,
+                },
+                true,
+            ),
+            (AmqpError::Connect(refused), false),
+            (AmqpError::Connect(login_refused), false),
+            (
+                AmqpError::Connect(Fault::TimedOut {
+                    after: CONNECT_DEADLINE,
+                }),
+                false,
+            ),
+            (
+                AmqpError::Declare {
+                    queue: QueueLabel::Literal("CARD.DEMO.ERROR"),
+                    source: not_found,
+                },
+                false,
+            ),
+            (
+                AmqpError::Channel(Fault::from(lapin::Error::ChannelsLimitReached)),
+                false,
+            ),
+            (
+                AmqpError::Get(Fault::from(lapin::Error::InvalidChannelState(
+                    ChannelState::Closed,
+                ))),
+                false,
+            ),
+            (AmqpError::Ack(Fault::MissingHeartbeat), false),
+            (AmqpError::Reject(Fault::Unclassified), false),
+        ];
+        for (error, configuration) in cases {
+            assert_eq!(error.is_configuration(), configuration, "{error}");
         }
     }
 

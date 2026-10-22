@@ -14,6 +14,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 // `@/lib/header` holds the CSMSG01Y texts every screen shares, so the invalid-key message is taken
@@ -310,11 +311,15 @@ export function COUSR02(): ReactNode {
     transfer(PATHS.COADM01);
   }
 
-  /** An F-key the program does not serve, its `WHEN OTHER` (COUSR02C-009). */
+  /**
+   * An F-key the program does not serve, its `WHEN OTHER` (COUSR02C-009). The input an earlier
+   * error marked is no longer the subject of the message row, so its mark goes.
+   */
   function invalidKey(): void {
     if (leaving.current) {
       return;
     }
+    form.clearErrors();
     setMessage({ kind: "error", text: INVALID_KEY.trimEnd() });
   }
 
@@ -382,6 +387,11 @@ export function COUSR02(): ReactNode {
                         className={VALUE}
                       />
                     </FormControl>
+                    {/*
+                     * The message row is the only visible message, so each input's own error text
+                     * is for assistive technology only, read with the input it marks.
+                     */}
+                    <FormMessage className="sr-only" />
                   </GridCell>
                 </FormItem>
               )}
@@ -411,6 +421,7 @@ export function COUSR02(): ReactNode {
                         className={VALUE}
                       />
                     </FormControl>
+                    <FormMessage className="sr-only" />
                   </GridCell>
                 </FormItem>
               )}
@@ -434,6 +445,7 @@ export function COUSR02(): ReactNode {
                         className={VALUE}
                       />
                     </FormControl>
+                    <FormMessage className="sr-only" />
                   </GridCell>
                 </FormItem>
               )}
@@ -457,6 +469,7 @@ export function COUSR02(): ReactNode {
                         className={VALUE}
                       />
                     </FormControl>
+                    <FormMessage className="sr-only" />
                   </GridCell>
                   <GridCell row={13} col={25} span={8}>
                     <FormDescription className={HINT}>(8 Char)</FormDescription>
@@ -483,6 +496,7 @@ export function COUSR02(): ReactNode {
                         className={ONE_CHAR_VALUE}
                       />
                     </FormControl>
+                    <FormMessage className="sr-only" />
                   </GridCell>
                   <GridCell row={15} col={19} span={17}>
                     <FormDescription className={HINT}>(A=Admin, U=User)</FormDescription>

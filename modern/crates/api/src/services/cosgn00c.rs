@@ -26,7 +26,7 @@
 //! - no row (RESP 13, `NOTFND`) is `UserLookup::NotFound`, answered `User not found. Try again
 //!   ...` (COSGN00C-019);
 //! - any store error (`WHEN OTHER`) is `UserLookup::ReadError`, answered `Unable to verify the
-//!   User ...` (COSGN00C-020). The error is reported, inside the request span, as a warning event
+//!   User ...` (COSGN00C-020). The error is reported, inside the request span, as an error event
 //!   carrying the `PersistenceError` text alone, which names at most an SQLSTATE and a
 //!   constraint, never the database's detail text or the key.
 //!
@@ -88,7 +88,7 @@ pub(crate) async fn signon(
         // Reported here, inside the request span, before the decision leaves the runtime
         // worker. `PersistenceError` displays an SQLSTATE and a constraint name at most, never a
         // bound value, so the event names neither the user ID nor the row.
-        tracing::warn!(error = %error, "sign-on user read failed");
+        tracing::error!(error = %error, "sign-on user read failed");
     }
     let signed_on = decided(key, read)
         .await?

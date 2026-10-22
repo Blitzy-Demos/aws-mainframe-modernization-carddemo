@@ -1,6 +1,6 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
-import { useForm, type Control, type FieldErrors } from "react-hook-form";
+import { useForm, useFormContext, type Control, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn02cAdd } from "@/api/hooks";
 import type { components } from "@/api/schema";
@@ -14,6 +14,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 // `@/lib/header` is the one home of the CSMSG01Y messages every screen shows (AAP 0.5.4), so the
@@ -208,6 +209,11 @@ function inputOfMember(member: string | null | undefined): FieldName | undefined
   return Object.hasOwn(INPUT_OF_MEMBER, name) ? INPUT_OF_MEMBER[name] : undefined;
 }
 
+/** The key input a `cotrn02KeySchema` issue's path names: the card number, else the account. */
+function keyInput(path: readonly (string | number)[]): FieldName {
+  return path.at(0) === "cardNum" ? "cardNum" : "acctId";
+}
+
 /** A typed date of the response as the 10-character `YYYY-MM-DD` text of its map field. */
 function dateText(date: string | null | undefined): string {
   return date === undefined || date === null ? "" : date.slice(0, 10);
@@ -298,11 +304,14 @@ interface MapFieldProps {
 /**
  * One input with its label and hint, each in the grid cell of its map field. `FormItem` is
  * `contents`, so its cells sit on the screen's `FieldGrid` while the label and hint stay bound to
- * the input (`htmlFor`, `aria-describedby`).
+ * the input (`htmlFor`, `aria-describedby`). The message row is the only visible message, so the
+ * field's `FormMessage`, which repeats the text of the error that marks the input invalid, is for
+ * assistive technology only; being absolutely positioned, it takes no cell of the grid.
  */
 function MapField({ input, control }: MapFieldProps): ReactNode {
   const length = COTRN02_LENGTHS[input.name];
   const { label, hint } = input;
+  const { clearErrors, getFieldState } = useFormContext<Cotrn02Values>();
   return (
     <FormField
       control={control}
@@ -316,6 +325,16 @@ function MapField({ input, control }: MapFieldProps): ReactNode {
             <FormControl>
               <Input
                 {...field}
+                onChange={(event) => {
+                  // A change is the user's correction, so the input's mark goes with it; where the
+                  // form re-validates on change (after a submit), the resolver judges the new
+                  // value again. The form's current state is read, because this render need not
+                  // have seen the latest mark.
+                  if (getFieldState(input.name).error !== undefined) {
+                    clearErrors(input.name);
+                  }
+                  field.onChange(event);
+                }}
                 maxLength={length}
                 autoFocus={input.name === "acctId"}
                 autoComplete="off"
@@ -331,6 +350,7 @@ function MapField({ input, control }: MapFieldProps): ReactNode {
               </FormDescription>
             </GridCell>
           )}
+          <FormMessage className="sr-only" />
         </FormItem>
       )}
     />
@@ -388,6 +408,19 @@ export function COTRN02(): ReactNode {
     focus(name);
   }
 
+  /**
+   * A `ScreenError`: its message in the row, and the input it names marked invalid with that same
+   * text, which the input's `FormMessage` repeats, and given the cursor. The mark lasts until the
+   * user changes that input, or until ENTER, F4 or F5 replaces the screen's errors.
+   */
+  function showRejection(error: components["schemas"]["ScreenError"]): void {
+    const name = inputOfMember(error.field);
+    if (name !== undefined) {
+      form.setError(name, { type: "server", message: error.message });
+    }
+    showError(error.message, name);
+  }
+
   function showResult(result: components["schemas"]["TranAddResult"], sent: Cotrn02Values): void {
     const added = typeof result.new_tran_id === "string";
     if (added) {
@@ -395,6 +428,9 @@ export function COTRN02(): ReactNode {
       filledCard.current = undefined;
       form.reset(EMPTY);
     } else {
+      // A 200 without a new ID is only ever the confirmation prompt (`COTRN02C-041`,
+      // `COTRN02C-056`): it asks for the confirmation and rejects no value, so its `field` takes
+      // the cursor but no input is marked invalid; the reset clears every earlier mark.
       filledCard.current = result.card_num ?? filledCard.current;
       form.reset(promptValues(result, sent));
     }
@@ -414,7 +450,7 @@ export function COTRN02(): ReactNode {
           showResult(result, values);
         },
         onError: (error) => {
-          showError(error.message, inputOfMember(error.field));
+          showRejection(error);
         },
         onSettled: () => {
           pending.current = false;
@@ -441,12 +477,17 @@ export function COTRN02(): ReactNode {
     }
     const values = form.getValues();
     const keys = cotrn02KeySchema.safeParse({ acctId: values.acctId, cardNum: values.cardNum });
+    form.clearErrors();
     if (!keys.success) {
+      // Each key the schema rejects is marked invalid, as ENTER's resolver marks every field it
+      // rejects; the first one's message is shown and takes the cursor.
+      for (const issue of keys.error.issues) {
+        form.setError(keyInput(issue.path), { type: issue.code, message: issue.message });
+      }
       const issue = keys.error.issues.at(0);
-      showError(issue?.message ?? "", issue?.path.at(0) === "cardNum" ? "cardNum" : "acctId");
+      showError(issue?.message ?? "", keyInput(issue?.path ?? []));
       return;
     }
-    form.clearErrors();
     send("PF5", values);
   }
 

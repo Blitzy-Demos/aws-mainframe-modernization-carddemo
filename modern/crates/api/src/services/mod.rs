@@ -80,7 +80,14 @@
 //! - **Store errors.** A failed statement that the program answers with an audited text of its
 //!   own is logged by the service and mapped into the domain's lookup or result value, so it
 //!   arrives as `ServiceError::Rule`. `ServiceError::Store` is only for a store error with no
-//!   audited text, such as a failed `begin`, `commit`, `rollback` or savepoint.
+//!   audited text, such as a failed `begin`, `commit`, `rollback` or savepoint. The event that
+//!   records the cause of a failure answered with a 5xx, the program's store-class text or
+//!   `UNABLE_TO_PROCESS` for `ServiceError::Store` and `ServiceError::Internal`, is an `ERROR`,
+//!   so `RUST_LOG=error` shows the cause of every 500 that a failed store call or task produced.
+//!   A `WARN` is only for a failure the program's audited flow carries on past, so that the
+//!   request can still succeed: COBIL00C's cross-reference read (COBIL00C-022). An outcome the
+//!   audit gives the request itself logs nothing, whatever its status: a taken user ID (400), or
+//!   COUSR03C's `Unable to Update User...` (500) for an ID with no row (X-COUSR03C-H1).
 //! - **Savepoints.** A failed statement aborts a `PostgreSQL` transaction, so a statement after
 //!   whose failure the COBOL unit of work goes on runs inside its own savepoint: COACTUPC's
 //!   customer rewrite (COACTUPC-107), COBIL00C's payment statements (E11) and COPAUS2C's fraud

@@ -110,7 +110,7 @@ async fn read_card<R: CardRepository>(
         },
         Ok(None) => CardLookup::NotFound,
         Err(error) => {
-            tracing::warn!(%error, "CARDDAT read failed; answering the COCRDUPC file error");
+            tracing::error!(%error, "CARDDAT read failed; answering the COCRDUPC file error");
             CardLookup::Error
         }
     };
@@ -221,7 +221,7 @@ async fn rewrite<R: CardRepository>(
         Ok(Some((_, record))) => record.num,
         Ok(None) => return Err(CardUpdateFailure::lock_failed()),
         Err(error) => {
-            tracing::warn!(%error, "CARDDAT handle read failed; answering the lock error");
+            tracing::error!(%error, "CARDDAT handle read failed; answering the lock error");
             return Err(CardUpdateFailure::lock_failed());
         }
     };
@@ -229,7 +229,7 @@ async fn rewrite<R: CardRepository>(
         Ok(Some((_, record))) => record,
         Ok(None) => return Err(CardUpdateFailure::lock_failed()),
         Err(error) => {
-            tracing::warn!(%error, "CARDDAT read for update failed; answering the lock error");
+            tracing::error!(%error, "CARDDAT read for update failed; answering the lock error");
             return Err(CardUpdateFailure::lock_failed());
         }
     };
@@ -239,7 +239,7 @@ async fn rewrite<R: CardRepository>(
         Ok(true) => Ok(()),
         Ok(false) => Err(CardUpdateFailure::rewrite_failed()),
         Err(error) => {
-            tracing::warn!(%error, "CARDDAT rewrite failed; answering the update error");
+            tracing::error!(%error, "CARDDAT rewrite failed; answering the update error");
             Err(CardUpdateFailure::rewrite_failed())
         }
     }

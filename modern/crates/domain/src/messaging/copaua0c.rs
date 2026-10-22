@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | [`parse_request`], [`ParseError`] | `2100-EXTRACT-REQUEST-MSG` | COPAUA0C-002 to COPAUA0C-017 |
 //! | [`field_error_reply`] | `6000-MAKE-DECISION` for a field error (E31) | COPAUA0C-012 |
+//! | [`store_failure_reply`] | none: the critical read rows end the task before its reply (`X-COPAUA0C-1`) | COPAUA0C-122 to COPAUA0C-126 |
 //! | [`decide`], [`Decision`] | `5000-PROCESS-AUTH`, `6000-MAKE-DECISION`, the i10 guard (E30) | COPAUA0C-020 to COPAUA0C-024, COPAUA0C-040 to COPAUA0C-049 |
 //! | [`reply_body`] | the `STRING` into `W02-PUT-BUFFER` | COPAUA0C-060 to COPAUA0C-065 |
 //! | [`summary_template`], [`summary_update`] | `8400-UPDATE-SUMMARY` | COPAUA0C-025, COPAUA0C-090 to COPAUA0C-097 |
@@ -25,8 +26,9 @@
 //! The worker keeps the COBOL's order, reply before writes (COPAUA0C-080, COPAUA0C-081):
 //! [`parse_request`], then [`decide`] and [`reply_body`] before the publish; [`summary_update`]
 //! and [`detail_record`] only after the request's acknowledgement, inside the transaction that
-//! holds the summary row lock taken by the worker. A request whose card has no `card_xref` row
-//! and a field error write no authorization row (COPAUA0C-082, COPAUA0C-103).
+//! holds the summary row lock taken by the worker. A request whose card has no `card_xref` row,
+//! a field error and a request whose store read failed write no authorization row (COPAUA0C-082,
+//! COPAUA0C-103, COPAUA0C-122 to COPAUA0C-126).
 //!
 //! # One request is one task's first message
 //!
@@ -695,6 +697,30 @@ pub fn field_error_reply(error: &FieldError) -> AuthReply {
     }
 }
 
+/// The reply to a parsed `request` whose store read failed, the `C001`, `C002`, `C003`, `I001`
+/// or `I002` case: response `05`, reason `9000` (COPAUA0C's `WHEN OTHER` code,
+/// `COPAUA0C.cbl:715-716`) and approved amount 0.00, with the request's card, field 18 as the
+/// transaction ID and field 2 as the auth-ID code, as [`decide`] maps them (COPAUA0C-122 to
+/// COPAUA0C-126).
+///
+/// Interim handling, not a parity result: the COBOL's critical row ends the task before its
+/// reply, so it sends none. This is the second outcome of the open escalation candidate
+/// `X-COPAUA0C-1`, which keeps i11's one reply per removed request until the reviewer and the
+/// user decide it. The worker publishes it through [`reply_body`], which screens the transaction
+/// ID (COPAUA0C-062), after the critical row and the rollback, with no authorization write, and
+/// acknowledges the request after the confirmation.
+#[must_use]
+pub fn store_failure_reply(request: &AuthRequestRecord) -> AuthReply {
+    AuthReply {
+        card_num: request.card_num.clone(),
+        transaction_id: request.transaction_id.clone(),
+        auth_id_code: request.auth_time.clone(),
+        auth_resp_code: AuthStatus::Declined.response_code(),
+        auth_resp_reason: ReasonCode::Other9000.pic(),
+        approved_amt: Money::ZERO,
+    }
+}
+
 /// Whether the customer read of `5300-READ-CUST-RECORD` found the cross-reference's customer
 /// (COPAUA0C-023). Only the result matters: it feeds the decline reason (COPAUA0C-045).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -791,7 +817,8 @@ pub enum ReasonCode {
     /// COPAUA0C-046).
     InsufficientFunds4100,
     /// `9000`: `WHEN OTHER`, which a field error carries (`COPAUA0C.cbl:715-716`;
-    /// COPAUA0C-012).
+    /// COPAUA0C-012), and so does the interim reply to a failed store read,
+    /// [`store_failure_reply`] (COPAUA0C-122 to COPAUA0C-126, `X-COPAUA0C-1`).
     Other9000,
 }
 
@@ -1585,7 +1612,7 @@ mod tests {
         PROGRAM, ParseError, REPLY_WRITTEN_LEN, REQUEST_FIELDS, ReasonCode, RequestField, SqlState,
         SummaryError, SummaryState, TRANSACTION, amount_screen, decide, decline_reason,
         detail_record, error_log, field_error_reply, numval, parse_request, reply_body,
-        summary_template, summary_update, transaction_id_screen,
+        store_failure_reply, summary_template, summary_update, transaction_id_screen,
     };
     use crate::clock::FixedClock;
     use crate::money::{Decimal, Money, MoneyError};
@@ -1923,6 +1950,41 @@ mod tests {
         assert_eq!(
             reply_body(&reply),
             b"************5740,               ,143012,05,9000,          0.00,"
+        );
+        Ok(())
+    }
+
+    // The builder serves the five critical read rows alike.
+    // audit: COPAUA0C-122
+    // audit: COPAUA0C-123
+    // audit: COPAUA0C-124
+    // audit: COPAUA0C-125
+    // audit: COPAUA0C-126
+    #[test]
+    fn a_store_failure_reply_declines_with_reason_9000() -> TestResult {
+        let request = request(10_000)?;
+        let reply = store_failure_reply(&request);
+        assert_eq!(reply.card_num, CardNumber::parse(CARD)?);
+        assert_eq!(reply.auth_resp_code.as_bytes(), b"05");
+        assert_eq!(reply.auth_resp_reason.as_bytes(), b"9000");
+        assert!(reply.approved_amt.is_zero());
+        assert_eq!(reply.auth_id_code.as_bytes(), b"143012");
+        assert_eq!(reply.transaction_id.as_bytes(), b"ORDER-A        ");
+        let body = reply_body(&reply);
+        assert_eq!(body.len(), REPLY_WRITTEN_LEN);
+        assert_eq!(
+            body,
+            b"************5740,ORDER-A        ,143012,05,9000,          0.00,"
+        );
+        assert!(!contains(&body, CARD.as_bytes()), "COPAUA0C-061");
+        // The transaction-ID screen applies as in every reply (COPAUA0C-062).
+        let numeric_id = AuthRequestRecord {
+            transaction_id: PicX::from_array(*b"123456789012345"),
+            ..request
+        };
+        assert_eq!(
+            reply_body(&store_failure_reply(&numeric_id)),
+            b"************5740,***************,143012,05,9000,          0.00,"
         );
         Ok(())
     }

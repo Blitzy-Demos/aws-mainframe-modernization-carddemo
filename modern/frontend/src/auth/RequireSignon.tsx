@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useSyncExternalStore } from "react";
 import { Navigate, Outlet, useLocation } from "react-router";
-import { getSession, isAdmin } from "./session";
+import { getSession, getSessionSnapshot, isAdmin, subscribeSession } from "./session";
 
 /** Props of {@link RequireSignon}. */
 export type RequireSignonProps = {
@@ -22,17 +22,23 @@ export type RequireSignonProps = {
  * verified JWT, and its `AdminUser` extractor answers 403 on every admin endpoint for a
  * token whose user type is not `A`.
  *
- * The session is read on every render, with no state or memoisation, so a session cleared
- * after a 401 takes effect at the next render or navigation. The redirect carries no
+ * The guard subscribes to the session store, so a session that `api/client.ts` clears on a
+ * 401 re-renders it at once: the mounted screen gives way to `/signon` without waiting for a
+ * navigation, as a CICS program started without a COMMAREA transfers to COSGN00C. The session
+ * itself is read afresh on every render, with no state or memoisation. The redirect carries no
  * return-to location, because COSGN00C always starts the user at a menu. The target paths
  * are literals rather than imports from the route table, which imports this module.
  */
 export function RequireSignon({ admin = false, children }: RequireSignonProps): ReactNode {
   // Subscribes the guard to navigation. A layout route's `element` keeps one reference, so
   // without this React skips re-rendering the guard when navigation stays inside its layout
-  // (`/admin` to `/users`), and a session cleared in between would not be read again. This
-  // is a router subscription only, not a session cache.
+  // (`/admin` to `/users`), and a session removed from storage other than through
+  // `session.ts`, which announces nothing, would not be read again. This is a router
+  // subscription only, not a session cache.
   useLocation();
+  // Subscribes the guard to every setSession and clearSession. The snapshot only tells React
+  // when to render the guard again; the decision below still comes from getSession().
+  useSyncExternalStore(subscribeSession, getSessionSnapshot);
   const session = getSession();
   if (session === null) {
     return <Navigate to="/signon" replace />;

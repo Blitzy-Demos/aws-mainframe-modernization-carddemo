@@ -7,7 +7,15 @@ import { useCotrtupcAction, useCotrtupcFetch } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+  useFormField,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -461,17 +469,8 @@ type BoundInput =
   | ControllerRenderProps<CotrtupKeyValues, "typeCode">
   | ControllerRenderProps<CotrtupValues, "typeCode" | "description">;
 
-/** One map input with its label on their map line, inside a `FormField`. */
-function MapInput({
-  row,
-  label,
-  length,
-  input,
-  invalid,
-  editable,
-  mark,
-  autoFocus = false,
-}: {
+/** Props of {@link MapInput}. */
+type MapInputProps = {
   row: number;
   label: string;
   length: number;
@@ -479,30 +478,61 @@ function MapInput({
   invalid: boolean;
   editable: boolean;
   mark: Mark;
+  /** `ERRMSG`, the error row's text, which describes the input while the screen marks it. */
+  message: string;
   autoFocus?: boolean;
-}): ReactNode {
-  const red = mark !== "none";
+};
+
+/** One map input with its label on their map line, inside a `FormField`. */
+function MapInput({ row, label, ...cell }: MapInputProps): ReactNode {
   return (
     // `contents` lets the label and input cells sit on the `FieldGrid` itself.
     <FormItem className="contents">
       <GridCell row={row} col={LABEL_COLUMN} span={LABEL_LENGTH}>
         <FormLabel className={LABEL_CLASS}>{label}</FormLabel>
       </GridCell>
-      <GridCell row={row} col={INPUT_COLUMN} span={length}>
-        <FormControl>
-          <Input
-            {...input}
-            maxLength={length}
-            size={length}
-            autoFocus={autoFocus}
-            autoComplete="off"
-            readOnly={!editable}
-            aria-invalid={red || invalid}
-            className={cn(INPUT_CLASS, red && "text-destructive")}
-          />
-        </FormControl>
-      </GridCell>
+      <MapInputCell row={row} {...cell} />
     </FormItem>
+  );
+}
+
+/**
+ * The input cell of a {@link MapInput}, inside its `FormItem`. An input the step's screen marks
+ * (`Mark`) or the form edit refuses is invalid and described by an `sr-only` `FormMessage`, which
+ * holds the form edit's message, else the error row's text: the error row stays the screen's one
+ * visible message, and the marks stay the screen's.
+ */
+function MapInputCell({
+  row,
+  length,
+  input,
+  invalid,
+  editable,
+  mark,
+  message,
+  autoFocus = false,
+}: Omit<MapInputProps, "label">): ReactNode {
+  const { formMessageId } = useFormField();
+  const red = mark !== "none";
+  // The cases in which `FormMessage` has text to render.
+  const described = invalid || (red && message !== "");
+  return (
+    <GridCell row={row} col={INPUT_COLUMN} span={length}>
+      <FormControl>
+        <Input
+          {...input}
+          maxLength={length}
+          size={length}
+          autoFocus={autoFocus}
+          autoComplete="off"
+          readOnly={!editable}
+          aria-invalid={red || invalid}
+          aria-describedby={described ? formMessageId : undefined}
+          className={cn(INPUT_CLASS, red && "text-destructive")}
+        />
+      </FormControl>
+      <FormMessage className="sr-only">{red ? message : undefined}</FormMessage>
+    </GridCell>
   );
 }
 
@@ -834,6 +864,7 @@ export function COTRTUP(): ReactNode {
                     invalid={fieldState.invalid}
                     editable={CODE_EDITABLE.has(view.state)}
                     mark={view.codeMark}
+                    message={view.message}
                     autoFocus
                   />
                 )}
@@ -877,6 +908,7 @@ export function COTRTUP(): ReactNode {
                     invalid={fieldState.invalid}
                     editable={CODE_EDITABLE.has(view.state)}
                     mark={view.codeMark}
+                    message={view.message}
                     autoFocus
                   />
                 )}
@@ -893,6 +925,7 @@ export function COTRTUP(): ReactNode {
                     invalid={fieldState.invalid}
                     editable={DESCRIPTION_EDITABLE.has(view.state)}
                     mark={view.descriptionMark}
+                    message={view.message}
                   />
                 )}
               />

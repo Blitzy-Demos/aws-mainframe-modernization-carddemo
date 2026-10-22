@@ -11,8 +11,11 @@
 //! 2. installs the JSON tracing subscriber on standard output, with the optional span export of
 //!    `CARDDEMO_OTEL_EXPORT`;
 //! 3. refuses to start when `CARDDEMO_JWT_SECRET` is empty or unset, before any connection;
-//! 4. opens the `PostgreSQL` pool on `DATABASE_URL`;
-//! 5. listens on `CARDDEMO_API_BIND` and serves until SIGTERM or SIGINT.
+//! 4. refuses to start when `CARDDEMO_INTRDR_DIR`, the job-deck directory of endpoint 14, names
+//!    something that is not a directory or a path through one, before any connection; a missing
+//!    directory is no refusal, as the first submission creates it;
+//! 5. opens the `PostgreSQL` pool on `DATABASE_URL`;
+//! 6. listens on `CARDDEMO_API_BIND` and serves until SIGTERM or SIGINT.
 //!
 //! The server never changes the schema: only the schema executor binary of the `runtime` crate
 //! applies it (Single Schema Executor). Against a database without the schema, the server starts
@@ -23,7 +26,8 @@
 //! process exits 0 after the telemetry guard flushes. Any startup failure exits non-zero: a
 //! configuration or telemetry error as one line on standard error, since no subscriber exists
 //! yet, and every later failure as one JSON `ERROR` event on standard output. No message carries
-//! the JWT secret, the database URL or any value it holds, or the database driver's own text.
+//! the JWT secret, the database URL or any value it holds, the job-deck directory's path, or the
+//! database driver's own text.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -55,6 +59,12 @@ async fn main() -> ExitCode {
     // Checked before connecting, so a missing secret is reported as such whatever the state of
     // the database. The message names the variable, never a value.
     if let Err(error) = config.require_jwt_secret() {
+        tracing::error!(%error, "carddemo-api cannot start");
+        return ExitCode::FAILURE;
+    }
+    // Before connecting too: a job-deck directory that can never hold a deck is a configuration
+    // error. The message names the variable and the error kind, never the path.
+    if let Err(error) = api::app::check_intrdr_dir(&config) {
         tracing::error!(%error, "carddemo-api cannot start");
         return ExitCode::FAILURE;
     }

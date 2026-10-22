@@ -7,11 +7,14 @@
 #    0  no cloud credential in the environment, checked after .env is exported
 #       (Local-Only Runtime, R14)
 #    1  formatting (cargo fmt --check)
-#    2  warning-free build of every target, lockfile current (g2, R10)
+#    2  no lint override (a RUSTFLAGS-family or CLIPPY_CONF_DIR variable, a cargo home inside the
+#       repository, or any .cargo, clippy.toml or .clippy.toml entry), then a warning-free build
+#       of every target, lockfile current (g2, R15, R10)
 #    3  warning-free clippy, pedantic and float_arithmetic at deny (g2, R1)
 #    4  floating-point scan of financial code; crates/batch/src/pdf.rs is the one exclusion (R1)
 #    5  unsafe scan (R15)
-#    6  lint-suppression scans; every member opts in to the workspace edition, rust-version and
+#    6  lint-suppression scans, line by line and over each lexed whole file (so a multi-line
+#       cfg_attr is caught); every member opts in to the workspace edition, rust-version and
 #       lints; no non-macro SQL; no integer `as` casts; one schema executor, expand-only
 #       migrations; no process-local lock in the CP00 path; thin API handlers (R15, g2, R4,
 #       Checked Integer Narrowing, Single Schema Executor, i10, Thin Request Handlers)
@@ -42,14 +45,16 @@
 # Output: step banners, the tools' own output and the matches of a failing scan. No table row is
 # queried or printed (Cardholder Data Redaction).
 #
-# Usage: scripts/check.sh, from any working directory, with no arguments. Configuration comes from
-# modern/.env when present, exported before step 0. libtest reads RUST_TEST_THREADS, which bounds
-# how many tests, and so how many testcontainers, step 15 runs at once.
+# Usage: scripts/check.sh, from any working directory, with no arguments (-h or --help prints the
+# usage). Configuration comes from modern/.env when present, exported before step 0. libtest reads
+# RUST_TEST_THREADS, which bounds how many tests, and so how many testcontainers, step 15 runs at
+# once.
 #
 # Exit status: 0 when steps 0-17 all passed. Otherwise the status is non-zero and the last line on
 # stderr names the step: at "13-17", exit 2 means steps 0-12 passed and Docker is unavailable; at
-# any other step, the status is that of the failing command (1 for a forbidden match, a scan error
-# or a cloud credential), which a tool can also make 2.
+# "usage", exit 2 means a usage error, an unexpected argument; at any other step, the status is
+# that of the failing command (1 for a forbidden match, a scan error, a cloud credential or a
+# lint-level override), which a tool can also make 2.
 set -euo pipefail
 # modern/: REPO, the .env export and every relative path below resolve against it.
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -66,6 +71,39 @@ no_match() { local out rc=0; out=$(grep "$@") || rc=$?
 no_output() { local out; out=$("$@") || { printf 'COMMAND FAILED: %s\n' "$*"; exit 1; }
   [ -z "$out" ] || { printf 'UNEXPECTED OUTPUT: %s\n%s\n' "$*" "$out"; exit 1; }; }
 set -a; [ -f .env ] && . ./.env; set +a
+
+usage() {
+  cat <<'EOF'
+Usage: scripts/check.sh [-h | --help]
+
+Runs steps 0-17 of the CardDemo check pipeline in order and stops at the first failure. It
+changes to its own modern/ directory first and exports modern/.env when present. Steps 13-17
+need Docker Engine with Compose v2. RUST_TEST_THREADS bounds how many tests, and so how many
+testcontainers, step 15 runs at once.
+
+Exit status:
+  0  steps 0-17 all passed
+  1  a forbidden match, a scan error, a cloud credential, or a lint-level override (a
+     RUSTFLAGS-family or CLIPPY_CONF_DIR variable, or a cargo or clippy configuration file)
+  2  steps 0-12 passed and Docker is unavailable (the last stderr line names step 13-17), or a
+     usage error: an unexpected argument
+  Any other non-zero status is that of the failing tool, which can also be 1 or 2. The last line
+  on stderr names the failing step.
+EOF
+}
+
+if [ $# -eq 1 ] && { [ "$1" = -h ] || [ "$1" = --help ]; }; then
+  usage
+  exit 0
+fi
+if [ $# -gt 0 ]; then
+  # Named for the EXIT trap, so its last stderr line tells this exit 2 from the Docker one.
+  CURRENT_STEP=usage; CURRENT_NAME='unexpected argument'
+  echo 'check.sh: no arguments are taken other than a single -h or --help' >&2
+  usage >&2
+  exit 2
+fi
+
 # 0 no cloud credential in the environment, checked after .env is exported (Local-Only Runtime)
 step 0 "no cloud credentials (Local-Only Runtime, R14)"
 for v in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_ROLE_ARN \
@@ -78,6 +116,39 @@ done
 step 1 "formatting"
 cargo fmt --all -- --check
 step 2 "warning-free build, lockfile current (g2, R10)"
+# Lint levels come only from [workspace.lints] and the sources' own deny attributes. A rustc flag
+# variable, CLIPPY_CONF_DIR or a cargo or clippy configuration file can pass -A, --cap-lints or
+# --force-warn to rustc or relax clippy, so that steps 2-3 pass with warnings. Each fails the run
+# here, before any build: an exported variable with a value (its name is printed, never its value;
+# an empty one counts as unset, as in step 0); a cargo home inside the repository, whose
+# config.toml cargo reads (CARGO_HOME, or $HOME/.cargo when it is unset, compared by physical
+# path, so a home outside the repository such as ~/.cargo passes); and any entry named .cargo,
+# clippy.toml or .clippy.toml anywhere in the repository. Entries match by name, in any letter
+# case and whatever their type, so a symlinked .cargo that find does not follow still fails.
+exported=$(compgen -e)
+while read -r v; do
+  case $v in
+    RUSTFLAGS | CARGO_ENCODED_RUSTFLAGS | CARGO_BUILD_RUSTFLAGS | CARGO_TARGET_*_RUSTFLAGS \
+      | CARGO_PROFILE_*_RUSTFLAGS | CLIPPY_CONF_DIR)
+      [ -z "${!v:-}" ] || { echo "LINT OVERRIDE SET: $v"; exit 1; } ;;
+  esac
+done <<< "$exported"
+repo_dir=$(CDPATH='' cd -- "$REPO" && pwd -P)
+# Succeeds when $1 names an existing directory whose physical path lies inside the repository.
+# cd's own error is discarded because it would print the path.
+in_repo_dir() { local dir; dir=$(CDPATH='' cd -- "$1" 2>/dev/null && pwd -P) || return 1
+  case $dir/ in "${repo_dir%/}"/*) return 0 ;; esac
+  return 1; }
+if [ -n "${CARGO_HOME:-}" ]; then
+  if in_repo_dir "$CARGO_HOME"; then
+    echo 'LINT OVERRIDE SET: CARGO_HOME (inside the repository)'; exit 1
+  fi
+elif [ -n "${HOME:-}" ] && in_repo_dir "$HOME/.cargo"; then
+  echo 'LINT OVERRIDE SET: HOME (its .cargo is inside the repository)'; exit 1
+fi
+no_output find "$REPO" \( -path "$REPO/.git" -o -path "$REPO/modern/target" \
+  -o -name node_modules \) -prune -o \( -iname .cargo -o -iname clippy.toml \
+  -o -iname .clippy.toml \) -print
 SQLX_OFFLINE=true cargo build --workspace --all-targets --locked
 step 3 "warning-free clippy (g2, R1)"
 SQLX_OFFLINE=true cargo clippy --workspace --all-targets --locked
@@ -94,6 +165,180 @@ no_match -rnw unsafe crates --include='*.rs'
 step 6 "suppressions, member opt-in, SQL, casts, schema executor, CP00 lock, thin handlers \
 (R15, g2, R4, Checked Integer Narrowing, Single Schema Executor, i10, Thin Request Handlers)"
 no_match -rnE '#!?\[(allow|expect)\(|cfg_attr\(.*(allow|expect)\(' crates --include='*.rs'
+# The scan above reads one line at a time and so misses an attribute that rustfmt wraps over
+# several lines. This one lexes each whole file as rustc does and blanks every comment and
+# literal, so that no comment or literal can end or hide an attribute. It reports #[allow(,
+# #[expect( and #[warn( with any whitespace or comment between their tokens or as a raw
+# identifier (r#allow), and a cfg_attr( that holds one of them at any depth. warn counts because
+# #[warn(warnings)] turns the workspace's denied warnings back into warnings; deny and forbid only
+# tighten and never match. It follows symlinks, as cargo does, and fails on a dangling one or a
+# file that is not UTF-8. Any line it prints fails the step.
+cat > target/check-suppressions.cjs <<'JS'
+'use strict';
+// node check-suppressions.cjs <dir>: prints <path>:<line>: <line> for each #[allow(, #[expect( or
+// #[warn( and each cfg_attr( holding one, in every .rs file under <dir>; prints nothing if none.
+const fs = require('fs');
+const path = require('path');
+
+const WS = '\\s\\u0085\\u200e\\u200f'; // Rust's whitespace includes U+0085, U+200E and U+200F
+const S = `[${WS}]*`;
+const LEVEL = `(?:allow|expect|warn)${S}\\(`;
+const OPENER = new RegExp(`#${S}!?${S}\\[${S}(?:r#)?(?:(${LEVEL})|cfg_attr${S}\\()`, 'g');
+const NESTED = new RegExp(`(?<!\\p{XID_Continue})(?:r#)?${LEVEL}`, 'u');
+const TOKEN = new RegExp(`[^${WS}]`);
+const ID_START = /[\p{XID_Start}_]/u;
+const ID_CONTINUE = /\p{XID_Continue}/u;
+
+// A copy of src of the same length, newlines kept, with every comment blanked and every literal
+// blanked but its first character; identifiers, raw identifiers, lifetimes and labels stay. The
+// token rules are rustc_lexer's, so a comment or literal can neither end nor hide an attribute.
+function lex(src) {
+  const parts = [];
+  let last = 0;
+  const blank = (a, b) => {
+    parts.push(src.slice(last, a), src.slice(a, b).replace(/[^\n]/g, ' '));
+    last = b;
+  };
+  const width = (i) => (src.codePointAt(i) > 0xffff ? 2 : 1);
+  const is = (re, i) => re.test(String.fromCodePoint(src.codePointAt(i)));
+  const digit = (i) => src.charCodeAt(i) >= 48 && src.charCodeAt(i) <= 57; // false past the end
+  const start = (i) => {
+    const c = src.charCodeAt(i);
+    return ((c | 32) >= 97 && (c | 32) <= 122) || c === 95 || (c > 127 && is(ID_START, i));
+  };
+  const cont = (i) => start(i) || digit(i) || (src.charCodeAt(i) > 127 && is(ID_CONTINUE, i));
+  const ident = (i) => {
+    while (cont(i)) i += width(i);
+    return i;
+  };
+  const quoted = (i) => { // after the opening "; only \\ and \" can hide a closing quote
+    while (i < src.length) {
+      const c = src[i++];
+      if (c === '"') return i;
+      if (c === '\\' && (src[i] === '\\' || src[i] === '"')) i++;
+    }
+    return i;
+  };
+  const raw = (i) => { // at the first # or " after the r
+    const hashes = i;
+    while (src[i] === '#') i++;
+    if (src[i] !== '"') return i;
+    const close = `"${'#'.repeat(i - hashes)}`;
+    const end = src.indexOf(close, i + 1);
+    return end < 0 ? src.length : end + close.length;
+  };
+  const single = (i) => { // after the opening '
+    if (src[i + width(i)] === "'" && src[i] !== '\\') return i + width(i) + 1;
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "'") return i + 1;
+      if (c === '/' || (c === '\n' && src[i + 1] !== "'")) return i;
+      i += c === '\\' ? 1 + width(i + 1) : width(i);
+    }
+    return i;
+  };
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    const bc = c === 'b' || c === 'c';
+    let end;
+    if (c === '/' && n === '/') {
+      end = src.indexOf('\n', i);
+      blank(i, (end = end < 0 ? src.length : end));
+    } else if (c === '/' && n === '*') {
+      let depth = 1;
+      for (end = i + 2; end < src.length && depth > 0; end++) {
+        if (src[end] === '/' && src[end + 1] === '*') depth++, end++;
+        else if (src[end] === '*' && src[end + 1] === '/') depth--, end++;
+      }
+      blank(i, end);
+    } else if (c === '"') {
+      blank(i + 1, (end = quoted(i + 1)));
+    } else if (c === "'") { // a char literal, or a lifetime or label, which stays
+      const f = i + 1;
+      if (src[f] === 'r' && src[f + 1] === '#' && start(f + 2)) end = ident(f + 2); // 'r#name
+      else if (src[f + width(f)] === "'" || !(start(f) || digit(f))) blank(f, (end = single(f)));
+      else if (src[(end = ident(f + width(f)))] === "'") blank(f, ++end);
+    } else if (digit(i)) {
+      end = ident(i); // a number and its suffix
+    } else if (c === 'r' && n === '#' && start(i + 2)) {
+      end = ident(i + 2); // a raw identifier
+    } else if (c === 'r' && (n === '#' || n === '"')) {
+      blank(i + 1, (end = raw(i + 1)));
+    } else if (bc && n === '"') {
+      blank(i + 1, (end = quoted(i + 2)));
+    } else if (c === 'b' && n === "'") {
+      blank(i + 1, (end = single(i + 2)));
+    } else if (bc && n === 'r' && (src[i + 2] === '#' || src[i + 2] === '"')) {
+      blank(i + 1, (end = raw(i + 2)));
+    } else if (start(i)) {
+      end = ident(i); // whole, so a string prefix is only ever read at an identifier's start
+    } else {
+      end = i + width(i);
+    }
+    i = end;
+  }
+  parts.push(src.slice(last));
+  return parts.join('');
+}
+
+// rustc drops a first line that starts with #! unless its next token is [, as in #![attr].
+function lexFile(src) {
+  const code = lex(src);
+  if (!src.startsWith('#!')) return code;
+  const next = code.slice(2).search(TOKEN);
+  if (next >= 0 && code[2 + next] === '[') return code;
+  const eol = src.indexOf('\n');
+  return eol < 0 ? ' '.repeat(src.length) : ' '.repeat(eol) + lex(src.slice(eol));
+}
+
+function scan(file, out) {
+  const src = new TextDecoder('utf-8', { fatal: true }).decode(fs.readFileSync(file));
+  const code = lexFile(src);
+  const lines = src.split('\n');
+  for (const m of code.matchAll(OPENER)) {
+    if (m[1] === undefined) { // cfg_attr: its balanced body, or the rest of the file
+      const body = m.index + m[0].length;
+      let end = body;
+      for (let depth = 1; end < code.length && depth > 0; end++) {
+        if (code[end] === '(') depth++;
+        else if (code[end] === ')') depth--;
+      }
+      if (!NESTED.test(code.slice(body, end))) continue;
+    }
+    const line = code.slice(0, m.index).split('\n').length;
+    out.push(`${file}:${line}: ${lines[line - 1].trim()}`);
+  }
+}
+
+// Follows symlinks, as cargo does; a dangling one throws. A directory seen before is skipped.
+function walk(dir, seen, files) {
+  const real = fs.realpathSync(dir);
+  if (seen.has(real)) return;
+  seen.add(real);
+  for (const name of fs.readdirSync(dir).sort()) {
+    const entry = path.join(dir, name);
+    const stat = fs.statSync(entry);
+    if (stat.isDirectory()) walk(entry, seen, files);
+    else if (name.endsWith('.rs') && stat.isFile()) files.push(entry);
+    else if (name.endsWith('.rs')) throw new Error(`${entry}: not a regular file`);
+  }
+}
+
+try {
+  if (process.argv.length !== 3) throw new Error('usage: node check-suppressions.cjs <dir>');
+  const files = [];
+  walk(process.argv[2], new Set(), files);
+  const out = [];
+  for (const file of files) scan(file, out);
+  if (out.length > 0) process.stdout.write(`${out.join('\n')}\n`);
+} catch (err) {
+  process.stderr.write(`check-suppressions: ${err.message}\n`);
+  process.exit(1);
+}
+JS
+no_output node target/check-suppressions.cjs crates
 no_match -nE '= *"allow"|level *= *"allow"' Cargo.toml crates/*/Cargo.toml
 no_match -rnE '@ts-(ignore|expect-error|nocheck)|eslint-disable' frontend/src frontend/e2e
 test "$(ls crates/*/Cargo.toml | wc -l)" -eq 8

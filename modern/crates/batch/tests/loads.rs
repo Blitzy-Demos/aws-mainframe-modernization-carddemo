@@ -12,8 +12,12 @@
 //!
 //! Expected values are transcribed from the audit rows and the fixture bytes they cite, never
 //! from the code under test, and each assertion carries the rule IDs it proves. LOADS.md names
-//! no halt, so no assertion here is blocked. One row has no assertion here: LOADS-020, the
-//! unchanged catalog, which only a catalog query could observe, and this crate issues none.
+//! no halt, so no assertion here is blocked. This crate issues no query (R4), so LOADS-020, the
+//! unchanged catalog, and the clauses of FIXLOAD-011 no repository reads whole (`auth_fraud`,
+//! `pending_auth_details`, the whole of schema `db2`) are proved in
+//! `crates/persistence/tests/schema.rs`, over the loads' statements. This file proves
+//! FIXLOAD-011's `var/` clause and its empty tables that a repository reads whole
+//! (`transactions`, `pending_auth_summaries`, `cssl_error_log`) against the real binary.
 //!
 //! Cardholder Data Redaction: the fixtures hold card numbers, CVVs, SSNs and passwords. Records
 //! and input bytes are compared in memory and never printed; a failed comparison names the table
@@ -35,9 +39,10 @@ use domain::records::{
     UserEntry,
 };
 use persistence::{
-    AccountRepository, CardRepository, CardXrefRepository, CustomerRepository,
-    Db2TransactionTypeRepository, DisclosureGroupRepository, PgStore, TranCatBalanceRepository,
-    TransactionCategoryRepository, TransactionTypeRepository, UserRepository,
+    AccountRepository, CardRepository, CardXrefRepository, CsslErrorLogRepository,
+    CustomerRepository, Db2TransactionTypeRepository, DisclosureGroupRepository,
+    PendingAuthSummaryRepository, PgStore, TranCatBalanceRepository, TransactionCategoryRepository,
+    TransactionRepository, TransactionTypeRepository, UserRepository,
 };
 use test_support::fixtures::{
     dusrsecj_path, fixture_card_numbers, fixture_dir, fixture_path, fixture_ssn_forms,
@@ -799,6 +804,32 @@ fn assert_inputs_unchanged(inputs: &[(PathBuf, Vec<u8>)]) -> TestResult {
     Ok(())
 }
 
+/// Asserts that, after `run`, the tables no load writes and a repository reads whole hold no
+/// row: `transactions`, `pending_auth_summaries` and `cssl_error_log` (FIXLOAD-011). A failure
+/// names the run and the table only.
+async fn assert_unloaded_tables_empty(store: &mut PgStore, run: &str) -> TestResult {
+    // audit: FIXLOAD-011
+    assert!(
+        TransactionRepository::find_all_in_card_order(store)
+            .await?
+            .is_empty(),
+        "{run}: transactions holds a row"
+    );
+    // audit: FIXLOAD-011
+    assert!(
+        PendingAuthSummaryRepository::find_all(store)
+            .await?
+            .is_empty(),
+        "{run}: pending_auth_summaries holds a row"
+    );
+    // audit: FIXLOAD-011
+    assert!(
+        CsslErrorLogRepository::find_all(store).await?.is_empty(),
+        "{run}: cssl_error_log holds a row"
+    );
+    Ok(())
+}
+
 /// Asserts that no run created anything under `CARDDEMO_VAR_DIR`, which holds the statement and
 /// job-deck directories too.
 fn assert_no_file_written(scratch: &Scratch) -> TestResult {
@@ -895,6 +926,7 @@ async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
     assert_users(&first.users, &passwords)?;
     assert_account_reads(&mut store, &first).await?;
     assert_db2_untouched(&mut store, &seeded, &first).await?;
+    assert_unloaded_tables_empty(&mut store, "dev-up.sh order").await?;
 
     // audit: LOADS-014
     run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
@@ -910,6 +942,7 @@ async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
     // audit: LOADS-033
     // audit: FIXLOAD-009
     assert_users(&second.users, &passwords)?;
+    assert_unloaded_tables_empty(&mut store, "rerun in dev-up.sh order").await?;
 
     let reverse: Vec<&str> = DEV_UP_ORDER.into_iter().rev().collect();
     // audit: LOADS-025
@@ -921,10 +954,12 @@ async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
     // audit: LOADS-027
     assert_fresh_card_refs(&[&first, &second], &third);
     assert_users(&third.users, &passwords)?;
+    assert_unloaded_tables_empty(&mut store, "reverse dev-up.sh order").await?;
 
     assert_inputs_unchanged(&inputs)?;
     // audit: LOADS-035
     // audit: LOADS-038
+    // audit: FIXLOAD-011
     assert_no_file_written(&scratch)?;
     Ok(())
 }

@@ -22,6 +22,7 @@ import {
   FormField,
   FormItem,
   FormLabel,
+  FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { INVALID_KEY } from "@/lib/header";
@@ -159,8 +160,8 @@ type FocusRequest = { readonly name: FieldName };
  * Keys, as COUSR01C's AID `EVALUATE` serves them (`app/cbl/COUSR01C.cbl:90-103`):
  * - ENTER: the add. A 200 empties the fields and shows the program's message in the information
  *   style, the green COUSR01C gives `ERRMSG` on success (COUSR01C-022). A `ScreenError` keeps the
- *   typed fields and shows its message as an error, with the focus on the field it names
- *   (COUSR01C-025).
+ *   typed fields and shows its message as an error, with the focus on the field it names, which
+ *   is marked invalid until the next key (COUSR01C-025).
  * - F3: back to the admin menu, no request (COUSR01C-007).
  * - F4: empties the fields and the message row, no request (COUSR01C-008).
  * - F12 and every other function key: the invalid-key message, fields kept. The map labels
@@ -179,7 +180,7 @@ export function COUSR01(): ReactNode {
     resolver: zodResolver(cousr01Schema),
     defaultValues: EMPTY,
   });
-  const { handleSubmit, reset, setFocus } = form;
+  const { clearErrors, handleSubmit, reset, setError, setFocus } = form;
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
   const [focusRequest, setFocusRequest] = useState<FocusRequest | null>(null);
   // Set while an add is in flight, so a second ENTER cannot send the same user twice before the
@@ -208,10 +209,12 @@ export function COUSR01(): ReactNode {
     focusField(HOME_FIELD);
   }, [reset, focusField]);
 
+  // The previous outcome's field error goes with its message (COUSR01C-005).
   const invalidKey = useCallback(() => {
+    clearErrors();
     setMessage({ kind: "error", text: INVALID_KEY });
     focusField(HOME_FIELD);
-  }, [focusField]);
+  }, [clearErrors, focusField]);
 
   const keys = useMemo<PfKeyBarEntry[]>(() => {
     const actions: PfKeyHandlers = { F3: back, F4: clear, F12: invalidKey };
@@ -245,6 +248,11 @@ export function COUSR01(): ReactNode {
           const named =
             typeof error.field === "string" ? FIELD_BY_WIRE_NAME.get(error.field) : undefined;
           setMessage({ kind: "error", text: error.message });
+          // The input the error names is marked invalid and described by the same text; the
+          // message row stays the only place it shows.
+          if (named !== undefined) {
+            setError(named, { type: "server", message: error.message });
+          }
           focusField(named ?? HOME_FIELD);
         },
         onSettled: () => {
@@ -317,6 +325,11 @@ export function COUSR01(): ReactNode {
                             spellCheck={false}
                           />
                         </FormControl>
+                        {/*
+                         * The message row is the only visible message, so the field's own error
+                         * text is for assistive technology only, read with the input it names.
+                         */}
+                        <FormMessage className="sr-only" />
                       </GridCell>
                       {hint !== undefined && (
                         <GridCell row={row} col={hint.col} span={hint.span}>

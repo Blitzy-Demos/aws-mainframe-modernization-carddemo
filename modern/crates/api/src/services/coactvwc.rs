@@ -100,7 +100,7 @@ fn report_failed<T>(link: &ChainLink<T>, paragraph: &'static str, statement: &'s
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = PROGRAM,
         paragraph,
         statement,
@@ -363,7 +363,7 @@ mod tests {
                 let paragraph = format!(r#""paragraph":"{paragraph}""#);
                 let statement = format!(r#""statement":"{statement}""#);
                 for expected in [
-                    r#""level":"WARN""#,
+                    r#""level":"ERROR""#,
                     r#""program":"COACTVWC""#,
                     paragraph.as_str(),
                     statement.as_str(),

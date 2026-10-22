@@ -52,12 +52,23 @@
 //! | summary update fails | confirmed | `I003` | acknowledged, nothing written (COPAUA0C-119) |
 //! | detail insert fails | confirmed | `I004` | acknowledged, summary committed alone (COPAUA0C-120) |
 //! | commit fails | confirmed | none; an `ERROR` event | acknowledged, nothing written (COPAUA0C-121) |
-//! | a store read fails | none | `C001`, `C002`, `C003`, `I001` or `I002` | dead-lettered (COPAUA0C-122 to COPAUA0C-126) |
+//! | a store read fails | interim `05`/`9000` | `C001`, `C002`, `C003`, `I001` or `I002`, unless the database is unavailable | acknowledged, nothing written (COPAUA0C-122 to COPAUA0C-126, `X-COPAUA0C-1`) |
 //!
 //! A failed store read ends the COBOL task before its reply, with the request already removed by
-//! the get outside syncpoint. The worker writes the audited row and dead-letters the request, the
-//! handling closest to the COBOL that keeps the request: no reply is invented. That is the open
-//! escalation candidate `X-COPAUA0C-1` of the audit, in tension with i11's one reply per removal.
+//! the get outside syncpoint, so the COBOL sends none. i11 gives every removed request exactly
+//! one reply and names `M004` as the only parsed request without one, so the worker writes the
+//! audited row, rolls back and answers with `copaua0c::store_failure_reply`, a `05`/`9000`
+//! decline confirmed and then acknowledged, with no authorization write. That is interim
+//! handling, not a parity result: the second outcome of the open escalation candidate
+//! `X-COPAUA0C-1` of the audit, pending the reviewer's and the user's decision.
+//!
+//! A read that failed with
+//! [`PersistenceError::Unavailable`](persistence::PersistenceError::Unavailable) tells the
+//! worker that the database cannot be reached, and every further `cssl_error_log` write of that
+//! request would wait out another pool acquire before failing in turn. So no row is attempted
+//! for the rest of the request, neither the read's row nor an `M004` row should the decline go
+//! unconfirmed: one `ERROR` event stands for each row not written. The next request starts with
+//! no such knowledge.
 //!
 //! # Redaction
 //!
@@ -65,9 +76,14 @@
 //! No event, span or error here holds a body byte, a card number or a record: events name the
 //! outcome, a log location, a [`PersistenceError`](persistence::PersistenceError) (SQLSTATE and
 //! constraint only) or a broker condition. The alert carries the body length and the request's
-//! `message_id` and `correlation_id` as `runtime::telemetry::ScreenedText` shows them, one `*`
-//! per byte: the requester chooses both and either can be a card number, an SSN or a password,
-//! so the alert shows only whether each is present and its length, never its text.
+//! `message_id` and `correlation_id` as `runtime::telemetry::ScreenedText` shows them under the
+//! worker's `runtime::telemetry::IdKey`, made from its `CARDDEMO_AMQP_URL`: the base64url
+//! HMAC-SHA256 that the request's span records too, as the `Redaction` section of
+//! `crate::workers` explains. The requester chooses both and either can be a card number, an SSN
+//! or a password, so the alert never shows their text, nor the URL. The reply's `message_id`,
+//! which `crate::ids` generates and which holds no requester text, is recorded verbatim on the
+//! request's span as `reply_message_id` before the reply is published, so the settlement event,
+//! an `M004` warning and the exported span all tie the request to its reply.
 //!
 //! The module's links are written as full paths, because the `pub mod cp00;` declaration carries
 //! an outer doc comment and rustdoc resolves this merged documentation from the parent module.
@@ -92,7 +108,7 @@ use persistence::{
     PendingAuthDetailRepository, PendingAuthSummaryRepository, PersistenceError, PgStore, PgTx,
 };
 use runtime::config::Config;
-use runtime::telemetry;
+use runtime::telemetry::{self, IdKey};
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{self, Acknowledger, AmqpError, Consumer, PublishFailure, QueueCheck, Request};
@@ -327,7 +343,8 @@ impl AuthTx for PgTx<'static> {
 }
 
 /// The CP00 worker: one consumer and one publisher channel, the configured request queue, the
-/// store and the injected clock (COPAUA0C-130).
+/// store, the injected clock (COPAUA0C-130) and the key under which its span and alert record the
+/// request IDs.
 ///
 /// `S` is the store: production uses [`PgStore`], and tests substitute a failing one through
 /// [`Worker::with_store`]. `A` settles requests: production uses the [`Consumer`] channel itself,
@@ -339,6 +356,10 @@ pub struct Worker<S: AuthStore = PgStore, A: Acknowledger = Consumer> {
     request_queue: String,
     store: S,
     clock: Arc<dyn Clock>,
+    /// The key of `config.amqp_url` under which the span and the alert record each request's IDs
+    /// as their keyed digests, as the `Redaction` section of `crate::workers` explains; never
+    /// shown.
+    id_key: IdKey,
 }
 
 impl Worker<PgStore, Consumer> {
@@ -347,7 +368,8 @@ impl Worker<PgStore, Consumer> {
     /// `CARD.DEMO.DEADLETTER.PAUTH` with a passive declare, and opens the publisher channel in
     /// confirm mode. Reply queues are the requests' `reply_to` and are not declared. `store`
     /// serves every read, write and log row; `clock` supplies the detail keys, the log dates and
-    /// times and the reply message IDs.
+    /// times and the reply message IDs; `config.amqp_url`, the `CARDDEMO_AMQP_URL`
+    /// `carddemo-mq` connects with, keys the IDs each request span and alert records.
     ///
     /// # Errors
     ///
@@ -380,13 +402,14 @@ impl Worker<PgStore, Consumer> {
             request_queue: config.queue_request_pauth.clone(),
             store,
             clock,
+            id_key: IdKey::new(&config.amqp_url),
         })
     }
 }
 
 impl<S: AuthStore, A: Acknowledger> Worker<S, A> {
     /// This worker with `acknowledger` settling every request in place of the consumer channel,
-    /// the seam of the failure-injection tests. Channels, queue, store and clock are kept.
+    /// the seam of the failure-injection tests. Channels, queue, store, clock and ID key are kept.
     #[must_use]
     pub fn with_acknowledger<B: Acknowledger>(self, acknowledger: B) -> Worker<S, B> {
         Worker {
@@ -394,11 +417,12 @@ impl<S: AuthStore, A: Acknowledger> Worker<S, A> {
             request_queue: self.request_queue,
             store: self.store,
             clock: self.clock,
+            id_key: self.id_key,
         }
     }
 
     /// This worker with `store` in place of its store, the seam of the failure-injection tests.
-    /// Channels, queue, acknowledger and clock are kept.
+    /// Channels, queue, acknowledger, clock and ID key are kept.
     #[must_use]
     pub fn with_store<T: AuthStore>(self, store: T) -> Worker<T, A> {
         Worker {
@@ -406,12 +430,14 @@ impl<S: AuthStore, A: Acknowledger> Worker<S, A> {
             request_queue: self.request_queue,
             store,
             clock: self.clock,
+            id_key: self.id_key,
         }
     }
 }
 
 impl<S: AuthStore, A: Acknowledger> fmt::Debug for Worker<S, A> {
-    /// The request queue only: channels, store and clock have nothing a reader of a log needs.
+    /// The request queue only: channels, store and clock have nothing a reader of a log needs,
+    /// and the ID key is a secret.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Worker")
             .field("request_queue", &self.request_queue)
@@ -435,18 +461,22 @@ impl<S: AuthStore, A: Acknowledger> Step for Worker<S, A> {
             request_queue,
             store,
             clock,
+            id_key,
         } = self;
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
+        let id_key: &IdKey = id_key;
         let mut message = Message {
             channels,
             connection,
             store,
             clock: clock.as_ref(),
+            id_key,
             request: &request,
+            store_unavailable: false,
         };
-        Ok(super::in_message_span(request_queue, &request, message.process()).await)
+        Ok(super::in_message_span(request_queue, &request, id_key, message.process()).await)
     }
 
     async fn reopen(&mut self, connection: &Connection) -> Result<(), AmqpError> {
@@ -460,7 +490,14 @@ struct Message<'a, S: AuthStore, A: Acknowledger> {
     connection: &'a Connection,
     store: &'a S,
     clock: &'a dyn Clock,
+    /// The worker's ID key, under which the alert shows the request IDs.
+    id_key: &'a IdKey,
     request: &'a Request,
+    /// Whether a store read of this request failed with [`PersistenceError::Unavailable`], so
+    /// that [`Message::log`] attempts no further `cssl_error_log` write for it. It is knowledge
+    /// about this request only: each request starts with `false`, and nothing of it survives to
+    /// the next request.
+    store_unavailable: bool,
 }
 
 /// Why a reply left the request unacknowledged.
@@ -543,7 +580,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// A card number that cannot be read: the `unparseable_alert` event, then the rejection that
     /// dead-letters the request. No reply, lock, write or log row (COPAUA0C-006; i11, E31).
     async fn unparseable(&self, error: &CardNumberError) -> Processed {
-        unparseable_alert(self.request, error);
+        unparseable_alert(self.request, self.id_key, error);
         self.dead_letter().await
     }
 
@@ -562,7 +599,9 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     }
 
     /// A parsed request: the cross-reference read, then the found or not-found path
-    /// (COPAUA0C-020, COPAUA0C-021).
+    /// (COPAUA0C-020, COPAUA0C-021). A failed cross-reference read (`C001`) or `BEGIN` (`I001`)
+    /// takes [`Message::read_failed`], the interim `05`/`9000` decline (COPAUA0C-122,
+    /// COPAUA0C-126).
     ///
     /// The cross-reference is read on the pool, before the transaction opens, rather than inside
     /// it as COPAUA0C-020 and COPAUA0C-081 word it: the read takes no lock, so its result is the
@@ -581,13 +620,13 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                     card,
                     sqlstate: sqlstate(&error),
                 };
-                return self.read_failed(site, &error, None).await;
+                return self.read_failed(request, site, &error, None).await;
             }
         };
         let opened = self.store.begin().await;
         match opened {
             Ok(tx) => self.authorize_found(request, &xref, tx).await,
-            Err(error) => self.read_failed(LogSite::I001, &error, None).await,
+            Err(error) => self.read_failed(request, LogSite::I001, &error, None).await,
         }
     }
 
@@ -621,7 +660,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
             created,
             account,
             customer,
-        } = match self.read_found(&request.card_num, xref, tx).await {
+        } = match self.read_found(request, xref, tx).await {
             Ok(found) => found,
             Err(processed) => return processed,
         };
@@ -657,13 +696,15 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// # Errors
     ///
     /// The [`Processed`] outcome of a failed read, `I002`, `C002` or `C003`, which ends the
-    /// request before its decision ([`Message::read_failed`]).
+    /// request before its decision with the interim `05`/`9000` decline and no authorization
+    /// write ([`Message::read_failed`]; COPAUA0C-123 to COPAUA0C-125).
     async fn read_found(
-        &self,
-        card: &CardNumber,
+        &mut self,
+        request: &AuthRequestRecord,
         xref: &CardXrefRecord,
         mut tx: S::Tx,
     ) -> Result<Found<S::Tx>, Processed> {
+        let card = &request.card_num;
         let locked = tx
             .lock_or_create_summary(&copaua0c::summary_template(xref))
             .await;
@@ -674,7 +715,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                     card,
                     sqlstate: sqlstate(&error),
                 };
-                return Err(self.read_failed(site, &error, Some(tx)).await);
+                return Err(self.read_failed(request, site, &error, Some(tx)).await);
             }
         };
         let read = tx.find_account(xref.acct_id).await;
@@ -685,7 +726,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                     acct_id: xref.acct_id,
                     sqlstate: sqlstate(&error),
                 };
-                return Err(self.read_failed(site, &error, Some(tx)).await);
+                return Err(self.read_failed(request, site, &error, Some(tx)).await);
             }
         };
         if account.is_none() {
@@ -709,7 +750,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                     cust_id: xref.cust_id,
                     sqlstate: sqlstate(&error),
                 };
-                return Err(self.read_failed(site, &error, Some(tx)).await);
+                return Err(self.read_failed(request, site, &error, Some(tx)).await);
             }
         };
         Ok(Found {
@@ -817,11 +858,13 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// The body is the 63 written bytes of `copaua0c::reply_body`, its card field redacted; the
     /// COBOL's 64-byte length is HALTED(H6) (COPAUA0C-060 to COPAUA0C-065). The properties are
     /// `broker::cp00_properties` with a new `message_id` from the injected clock: the request's
-    /// `correlation_id`, persistent, `expiration` `"5000"` (E16). The destination is
-    /// [`reply_queue`]'s: an absent `reply_to` is not published; an empty one is, and comes back
-    /// unroutable (`X-COPAUA0C-7`); one naming the Direct Reply-to pseudo-queue is not published,
-    /// because `RabbitMQ` 3.13 would deliver it and also return it, and a delivered decision
-    /// must never take the `M004` path (COPAUA0C-117, `X-COPAUA0C-12`).
+    /// `correlation_id`, persistent, `expiration` `"5000"` (E16). That `message_id` is recorded
+    /// verbatim as `reply_message_id` on the current span, the request's `mq.message` span,
+    /// before the publication, so every later line of the request names its reply. The
+    /// destination is [`reply_queue`]'s: an absent `reply_to` is not published; an empty one is,
+    /// and comes back unroutable (`X-COPAUA0C-7`); one naming the Direct Reply-to pseudo-queue is
+    /// not published, because `RabbitMQ` 3.13 would deliver it and also return it, and a
+    /// delivered decision must never take the `M004` path (COPAUA0C-117, `X-COPAUA0C-12`).
     ///
     /// # Errors
     ///
@@ -831,7 +874,9 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     async fn answer(&self, reply: &AuthReply) -> Result<(), Unanswered> {
         let reply_to = reply_queue(self.request).map_err(Unanswered::NotConfirmed)?;
         let body = copaua0c::reply_body(reply);
-        let properties = broker::cp00_properties(self.request, ids::next_message_id(self.clock));
+        let message_id = ids::next_message_id(self.clock);
+        telemetry::record_reply_message_id(&tracing::Span::current(), &message_id);
+        let properties = broker::cp00_properties(self.request, message_id);
         self.channels
             .publish(reply_to, &body, properties)
             .await
@@ -847,7 +892,8 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     ///
     /// - Not confirmed: the `M004` row, the rollback, the rejection that dead-letters the
     ///   request, then a new publisher channel when a publication was attempted
-    ///   (COPAUA0C-117).
+    ///   (COPAUA0C-117). The row is not attempted when a store read of this request found the
+    ///   database unavailable ([`Message::log`]).
     /// - Acknowledgement failed: no row, as the reply was confirmed; the rollback, then the
     ///   consumer channel is closed so that the broker requeues the request, and its
     ///   redelivery is processed as a new request (COPAUA0C-118).
@@ -889,12 +935,21 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         }
     }
 
-    /// A store read that failed with `error`: the audited critical row of `site`, the rollback of
-    /// `tx`, if any, then the rejection that dead-letters the request, with no reply
-    /// (COPAUA0C-122 to COPAUA0C-126). The COBOL task ends at the critical row before its reply;
-    /// the outcome after the row is the open escalation candidate `X-COPAUA0C-1`.
+    /// A store read of `request` that failed with `error`: the audited critical row of `site`,
+    /// the rollback of `tx`, if any, which releases the summary lock with nothing written, then
+    /// `copaua0c::store_failure_reply`, the `05`/`9000` decline, confirmed and then acknowledged
+    /// (COPAUA0C-122 to COPAUA0C-126).
+    ///
+    /// The COBOL task ends at the critical row before its reply. The decline is interim
+    /// handling, not a parity result: the outcome of the open escalation candidate
+    /// `X-COPAUA0C-1` that keeps i11's one reply per removed request, pending the reviewer's and
+    /// the user's decision. A [`PersistenceError::Unavailable`] error marks the store down for
+    /// the rest of this request, so neither the row of `site` nor an `M004` row is attempted
+    /// ([`Message::log`]). A decline that is not confirmed takes the `M004` path and is
+    /// dead-lettered; one whose acknowledgement fails is requeued ([`Message::unanswered`]).
     async fn read_failed(
-        &self,
+        &mut self,
+        request: &AuthRequestRecord,
         site: LogSite<'_>,
         error: &PersistenceError,
         tx: Option<S::Tx>,
@@ -902,11 +957,23 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         tracing::error!(
             location = %location(site),
             error = %error,
-            "a CP00 store read failed; the request is dead-lettered without a reply"
+            "a CP00 store read failed; the request is declined 05/9000 with no authorization write"
         );
+        if matches!(error, PersistenceError::Unavailable) {
+            self.store_unavailable = true;
+        }
         self.log(site).await;
         rollback(tx).await;
-        self.dead_letter().await
+        // Boxed: the decline and its `M004` path, awaited this deep inside a found card's reads,
+        // would grow every CP00 request's future past the size `clippy::large_futures` allows;
+        // only a failed read pays for the allocation.
+        Box::pin(async {
+            match self.answer(&copaua0c::store_failure_reply(request)).await {
+                Ok(()) => Processed::Replied,
+                Err(why) => self.unanswered(why, &request.card_num, None).await,
+            }
+        })
+        .await
     }
 
     /// Rejects the request with `requeue: false`, which moves it to
@@ -930,12 +997,25 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// transaction, and emits its event: `ERROR` for a critical site, `WARN` for a warning
     /// (COPAUA0C-110). The record is the domain's, its event key redacted (COPAUA0C-113,
     /// E32); neither event carries the key. A failed write is traced and processing goes on.
+    ///
+    /// After a store read of this request found the database unavailable
+    /// ([`Message::read_failed`]), the write is not attempted, as it could only wait out another
+    /// pool acquire and fail: one more `ERROR` event, with the location and the message only,
+    /// stands for the row not written.
     async fn log(&self, site: LogSite<'_>) {
         let location = location(site);
         if site.ends_task() {
             tracing::error!(location = %location, err_message = site.message(), "CSSL error log");
         } else {
             tracing::warn!(location = %location, err_message = site.message(), "CSSL error log");
+        }
+        if self.store_unavailable {
+            tracing::error!(
+                location = %location,
+                err_message = site.message(),
+                "the cssl_error_log row is not written because the database is unavailable"
+            );
+            return;
         }
         let record = copaua0c::error_log(site, self.clock);
         if let Err(error) = self.store.log(&record).await {
@@ -951,14 +1031,20 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
 /// The alert of a request whose card number cannot be read (COPAUA0C-006; i11, E31): one
 /// `ERROR` event with target `runtime::telemetry::ALERT_TARGET`, `alert` set to
 /// `CP00_CARD_UNPARSEABLE`, the request's `message_id` and `correlation_id` as
-/// `Request::screened_message_id` and `Request::screened_correlation_id` give them, one `*` per
-/// byte, the body's length and the cause. It never carries a body byte or a byte of either ID.
-fn unparseable_alert(request: &Request, error: &CardNumberError) {
+/// `Request::screened_message_id` and `Request::screened_correlation_id` give them under
+/// `id_key`, the worker's key: the base64url HMAC-SHA256 the request's span records too, so the
+/// alert is matched to the span's other lines. Then the body's length and the cause. It never
+/// carries a body byte or the text of either ID.
+fn unparseable_alert(request: &Request, id_key: &IdKey, error: &CardNumberError) {
     tracing::error!(
         target: telemetry::ALERT_TARGET,
         alert = copaua0c::ALERT_CARD_UNPARSEABLE,
-        message_id = request.screened_message_id().map(tracing::field::display),
-        correlation_id = request.screened_correlation_id().map(tracing::field::display),
+        message_id = request
+            .screened_message_id(Some(id_key))
+            .map(tracing::field::display),
+        correlation_id = request
+            .screened_correlation_id(Some(id_key))
+            .map(tracing::field::display),
         body_len = error.body_len,
         cause = ?error.cause,
         "the CP00 request has no readable card number; it is dead-lettered without a reply"
@@ -993,7 +1079,7 @@ fn sqlstate(error: &PersistenceError) -> Option<SqlState> {
 #[cfg(test)]
 mod tests {
     use domain::messaging::copaua0c::{CardNumberCause, CardNumberError};
-    use runtime::telemetry::ALERT_TARGET;
+    use runtime::telemetry::{ALERT_TARGET, IdKey, ScreenedText};
     use test_support::trace_capture;
 
     use super::{Undelivered, reply_queue, unparseable_alert};
@@ -1001,7 +1087,7 @@ mod tests {
 
     // audit: COPAUA0C-006
     #[test]
-    fn the_unparseable_card_alert_shows_the_ids_as_stars_and_no_body_byte() {
+    fn the_unparseable_card_alert_shows_the_ids_screened_and_no_body_byte() {
         let body = b"220718,102030,ABC".to_vec();
         let body_len = body.len();
         let request = Request {
@@ -1016,9 +1102,19 @@ mod tests {
             body_len,
             cause: CardNumberCause::NotSixteenDigits,
         };
+        // The worker's key, made from its `CARDDEMO_AMQP_URL` (here the local default), and how
+        // the alert shows each ID: its base64url HMAC-SHA256 under it, as the request's span
+        // shows them.
+        let amqp_url = "amqp://carddemo:carddemo@localhost:5672/%2f";
+        let id_key = IdKey::new(amqp_url);
+        let shown_message_id = ScreenedText::keyed("PASS WOR", &id_key).to_string();
+        let shown_correlation_id = ScreenedText::keyed("SECRET", &id_key).to_string();
+        for digest in [&shown_message_id, &shown_correlation_id] {
+            assert_eq!(digest.len(), 43, "{digest}");
+        }
 
         let capture = trace_capture::capture();
-        unparseable_alert(&request, &error);
+        unparseable_alert(&request, &id_key, &error);
 
         let alerts = capture.lines_with_target(ALERT_TARGET);
         let [alert] = alerts.as_slice() else {
@@ -1029,8 +1125,8 @@ mod tests {
             r#""target":"carddemo::alert""#.to_owned(),
             r#""alert":"CP00_CARD_UNPARSEABLE""#.to_owned(),
             format!(r#""body_len":{body_len}"#),
-            r#""message_id":"********""#.to_owned(),
-            r#""correlation_id":"******""#.to_owned(),
+            format!(r#""message_id":"{shown_message_id}""#),
+            format!(r#""correlation_id":"{shown_correlation_id}""#),
             r#""cause":"NotSixteenDigits""#.to_owned(),
             concat!(
                 r#""message":"the CP00 request has no readable card number; "#,
@@ -1046,13 +1142,14 @@ mod tests {
         }
         assert_eq!(capture.lines().len(), 1, "{}", capture.text());
 
-        // The three properties, and the body's fields in the comma-delimited context they have
-        // in the body, so that a timestamp's digits cannot match them.
+        // The three properties, the key's URL, and the body's fields in the comma-delimited
+        // context they have in the body, so that a timestamp's digits cannot match them.
         let text = capture.text();
         for value in [
             "PASS WOR",
             "SECRET",
             "123-45-6789",
+            amqp_url,
             "220718,102030,ABC",
             "220718,",
             ",102030,",

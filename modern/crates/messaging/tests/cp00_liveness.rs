@@ -12,6 +12,11 @@
 //! `HALTED(H6)`, so no test here asserts either. Each reply is taken as soon as the step that
 //! published it returns, because a CP00 reply expires five seconds after its publication (E16).
 //!
+//! The worker keys its span and alert with the `CARDDEMO_AMQP_URL` it was opened with, the test
+//! broker's URL, so they show each request ID as its keyed digest under that URL; a replied
+//! request's settlement event is checked to carry those digests and the reply's generated
+//! `message_id` verbatim, which ties the log lines of a request to its reply.
+//!
 //! Fixture card numbers are used only to build request bodies and as search needles; no
 //! assertion message formats one (Cardholder Data Redaction).
 
@@ -35,7 +40,7 @@ use persistence::{
     PendingAuthSummaryRepository, PgStore,
 };
 use runtime::config::Config;
-use runtime::telemetry::ALERT_TARGET;
+use runtime::telemetry::{ALERT_TARGET, IdKey, ScreenedText};
 use rust_decimal::Decimal;
 use test_support::fixtures::{fixture_card_numbers, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
@@ -65,6 +70,8 @@ const POLL: Duration = Duration::from_millis(100);
 const BROKER_OP_TIMEOUT: Duration = Duration::from_secs(10);
 /// AMQP 0-9-1 `reply-success`, sent with the close of the worker's connection.
 const CLOSE_NORMAL: u16 = 200;
+/// The settlement event every taken request leaves inside its span.
+const SETTLED_MESSAGE: &str = r#""message":"the request is settled""#;
 
 /// Field 9 of a request the decision approves, and the approved amount its reply echoes.
 const APPROVED_AMOUNT: &str = "100.00";
@@ -169,9 +176,10 @@ impl Ids {
     }
 }
 
-/// The text the worker's events show for an ID: one `*` per byte, never the ID itself.
-fn screened(id: &str) -> String {
-    "*".repeat(id.len())
+/// The text the worker's span and alert show for a requester's ID: its base64url HMAC-SHA256
+/// under `id_key`, the worker's key, never the ID itself.
+fn screened(id_key: &IdKey, id: &str) -> String {
+    ScreenedText::keyed(id, id_key).to_string()
 }
 
 /// What a mixed-batch request is, and so what each of its replies must carry.
@@ -211,6 +219,7 @@ struct Probe {
 /// code, the reason and the amount. It derives no `Debug`, so a failing assertion cannot print
 /// a card field that was not redacted.
 struct Reply {
+    message_id: Option<String>,
     correlation_id: Option<String>,
     card: String,
     response: String,
@@ -247,10 +256,13 @@ impl Reply {
         if !end.is_empty() {
             return Err("a reply's written bytes do not end with a comma".into());
         }
+        let properties = &message.delivery.properties;
         Ok(Self {
-            correlation_id: message
-                .delivery
-                .properties
+            message_id: properties
+                .message_id()
+                .as_ref()
+                .map(|id| id.as_str().to_owned()),
+            correlation_id: properties
                 .correlation_id()
                 .as_ref()
                 .map(|id| id.as_str().to_owned()),
@@ -297,6 +309,8 @@ struct Harness {
     reply_queue: String,
     request_queue: String,
     store: PgStore,
+    /// The worker's ID key, made as the worker makes it from the URL it was opened with.
+    id_key: IdKey,
     _postgres: PostgresGuard,
     _rabbit: RabbitMqGuard,
 }
@@ -312,6 +326,7 @@ impl Harness {
             database_url: postgres.database_url().to_owned(),
             ..Config::default()
         };
+        let id_key = IdKey::new(&config.amqp_url);
         let store = PgStore::new(postgres.pool().clone());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         let worker_connection = rabbit.connect().await?;
@@ -332,6 +347,7 @@ impl Harness {
             reply_queue,
             request_queue: config.queue_request_pauth,
             store,
+            id_key,
             _postgres: postgres,
             _rabbit: rabbit,
         })
@@ -655,8 +671,14 @@ async fn unparseable_card_is_dead_lettered_with_alert_and_no_reply() -> TestResu
     for member in [
         r#""level":"ERROR""#.to_owned(),
         format!(r#""alert":"{ALERT_CARD_UNPARSEABLE}""#),
-        format!(r#""message_id":"{}""#, screened(&ids.message_id)),
-        format!(r#""correlation_id":"{}""#, screened(&ids.correlation_id)),
+        format!(
+            r#""message_id":"{}""#,
+            screened(&harness.id_key, &ids.message_id)
+        ),
+        format!(
+            r#""correlation_id":"{}""#,
+            screened(&harness.id_key, &ids.correlation_id)
+        ),
         format!(r#""body_len":{}"#, body.len()),
     ] {
         assert!(alert.contains(&member), "{member} missing from {alert}");
@@ -695,6 +717,71 @@ async fn unparseable_card_is_dead_lettered_with_alert_and_no_reply() -> TestResu
         before,
         "an unparseable card wrote a row"
     );
+
+    harness.close_worker().await?;
+    harness.assert_len_stays(&harness.request_queue, 0).await?;
+    Ok(())
+}
+
+/// The settlement event of a replied request carries the reply's generated `message_id`
+/// verbatim and the request's `message_id` and `correlation_id` as their keyed digests, the
+/// latter equal to the digest of the `correlation_id` the reply carries: an operator finds the
+/// request's log lines from either message and never reads an ID's text.
+#[tokio::test(flavor = "current_thread")]
+async fn a_replied_request_is_logged_with_its_reply_message_id_and_keyed_ids() -> TestResult {
+    let mut harness = Harness::start().await?;
+    let fixture = harness.fixture_card(SINGLE_ACCOUNT).await?;
+    let ids = Ids::new("CORRELATED");
+    let body = body_of(&request_fields(&fixture.card, APPROVED_AMOUNT));
+    harness.send(&body, &ids).await?;
+
+    let capture = trace_capture::capture();
+    let processed = harness.step().with_subscriber(capture.dispatch()).await?;
+    assert_eq!(processed, Processed::Replied);
+    let reply = harness.take_reply().await?;
+    let reply_message_id = reply
+        .message_id
+        .as_deref()
+        .ok_or("the reply carries no message_id")?;
+    let reply_correlation_id = reply
+        .correlation_id
+        .as_deref()
+        .ok_or("the reply carries no correlation_id")?;
+    assert_eq!(reply_correlation_id, ids.correlation_id);
+    assert_ne!(
+        reply_message_id, ids.message_id,
+        "the reply's message_id is new"
+    );
+
+    let lines = capture.lines();
+    let settled: Vec<&String> = lines
+        .iter()
+        .filter(|line| line.contains(SETTLED_MESSAGE))
+        .collect();
+    let [event] = settled.as_slice() else {
+        return Err(format!("{} settlement events, not exactly one", settled.len()).into());
+    };
+    let message_digest = screened(&harness.id_key, &ids.message_id);
+    let correlation_digest = screened(&harness.id_key, reply_correlation_id);
+    for digest in [&message_digest, &correlation_digest] {
+        assert_eq!(digest.len(), 43, "{digest} is no keyed digest");
+    }
+    for member in [
+        r#""outcome":"replied""#.to_owned(),
+        format!(r#""reply_message_id":"{reply_message_id}""#),
+        format!(r#""message_id":"{message_digest}""#),
+        format!(r#""correlation_id":"{correlation_digest}""#),
+    ] {
+        assert!(event.contains(&member), "{member} missing from {event}");
+    }
+    let text = capture.text();
+    for needle in [ids.message_id.as_str(), ids.correlation_id.as_str()] {
+        assert!(!text.contains(needle), "{needle:?} captured in {text}");
+    }
+    for card in fixture_card_numbers()? {
+        assert!(!text.contains(&card), "a fixture card number was captured");
+    }
+    drop(capture);
 
     harness.close_worker().await?;
     harness.assert_len_stays(&harness.request_queue, 0).await?;

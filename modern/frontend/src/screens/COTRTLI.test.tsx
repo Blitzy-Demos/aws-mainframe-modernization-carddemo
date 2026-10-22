@@ -608,6 +608,86 @@ function pressKey(key: string, shiftKey = false): void {
   fireEvent.keyDown(document.activeElement ?? window, { key, shiftKey });
 }
 
+/**
+ * Asserts the header value fields of rows 1 and 2 against their rows of `modern/audit/screens.md`
+ * (COTRTLI-002, -003, -005, -007, -008 and -010). Each entry of `fields` is the BMS name, the `POS`
+ * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
+ *
+ * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
+ * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
+ * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
+ * or output fields). The assertions prove what the rows require of that text: it is read-only and
+ * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
+ * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
+ * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
+ * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ */
+function expectHeaderValues(
+  root: ParentNode,
+  fields: readonly {
+    readonly name: string;
+    readonly row: number;
+    readonly col: number;
+    readonly length: number;
+    readonly value: string;
+    readonly title: boolean;
+  }[],
+): void {
+  const header = root.querySelector('[data-slot="card-header"]');
+  if (!(header instanceof HTMLElement)) {
+    throw new Error("the screen renders no CardHeader");
+  }
+  // The header exposes no textbox that takes typing.
+  expect(
+    within(header)
+      .queryAllByRole("textbox")
+      .filter((box) =>
+        box instanceof HTMLInputElement || box instanceof HTMLTextAreaElement
+          ? !box.readOnly
+          : box.getAttribute("aria-readonly") !== "true",
+      ),
+  ).toEqual([]);
+  for (const { name, row, col, length, value, title } of fields) {
+    const found = root.querySelectorAll(`[data-field="${name}"]`);
+    expect(found).toHaveLength(1);
+    const element = found[0];
+    if (!(element instanceof HTMLElement)) {
+      throw new Error(`the screen renders no header field ${name}`);
+    }
+    // Placement: in the CardHeader title rows, not in the body or the footer.
+    expect(element.closest('[data-slot="card-header"]')).toBe(header);
+    expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+    // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
+    expect(element.parentElement?.className).toBe(
+      `row-start-${row} col-start-${col} col-span-${length}`,
+    );
+    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
+    expect(shown).toBe(value);
+    expect(shown).toHaveLength(length);
+    // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
+    // tab stop.
+    const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
+    expect(
+      nodes.filter(
+        (node) =>
+          node instanceof HTMLSelectElement ||
+          ((node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement) &&
+            !node.readOnly) ||
+          node.closest('[contenteditable]:not([contenteditable="false"])') !== null,
+      ),
+    ).toEqual([]);
+    expect(element.tabIndex).toBeLessThan(0);
+    expect(
+      nodes.filter(
+        (node) => (node instanceof HTMLElement || node instanceof SVGElement) && node.tabIndex >= 0,
+      ),
+    ).toEqual([]);
+    // Tokens: the foreground colour, with emphasis only on a YELLOW title.
+    expect(element.classList.contains("text-foreground")).toBe(true);
+    expect(element.classList.contains("font-semibold")).toBe(title);
+  }
+}
+
 beforeEach(() => {
   setSession("test-token", "ADMIN001", "A");
 });
@@ -791,6 +871,50 @@ describe("COTRTLI", () => {
       ["button", "outline", "sm"],
     ]);
     expect(keys.every((key) => !key.hidden)).toBe(true);
+  });
+
+  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+    // audit: COTRTLI-002
+    // audit: COTRTLI-003
+    // audit: COTRTLI-005
+    // audit: COTRTLI-007
+    // audit: COTRTLI-008
+    // audit: COTRTLI-010
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      const seen = stubFetch([[200, LOADED]]);
+      renderScreen();
+      // The first entry's page read, answered in process by the stub.
+      await answered(seen, 1);
+      sent(seen, 1, `GET ${LIST_PATH}`);
+
+      expectHeaderValues(document, [
+        { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CTLI", title: false },
+        {
+          name: "TITLE01",
+          row: 1,
+          col: 21,
+          length: 40,
+          value: "      AWS Mainframe Modernization       ",
+          title: true,
+        },
+        { name: "CURDATE", row: 1, col: 71, length: 8, value: "01/02/24", title: false },
+        { name: "PGMNAME", row: 2, col: 7, length: 8, value: "COTRTLIC", title: false },
+        {
+          name: "TITLE02",
+          row: 2,
+          col: 21,
+          length: 40,
+          value: "              CardDemo                  ",
+          title: true,
+        },
+        { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("ENTER sends the filters, seven rows and loaded state, then shows the prompt", async () => {

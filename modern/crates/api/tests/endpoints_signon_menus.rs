@@ -5,6 +5,12 @@
 //! the two `both` rows of the sign-on map in `modern/audit/screens.md` (`COSGN00-027`,
 //! `COSGN00-031`). The main and admin maps have no `both` row: their option input is never sent.
 //!
+//! They also bind the COMMAREA rows COCOM01Y-001 to COCOM01Y-007, COCOM01Y-015 and COCOM01Y-016
+//! of `modern/audit/copybooks.md`: `cocom01y_commarea_rows` proves that the user ID and type
+//! COSGN00C moves into the COMMAREA travel only as the verified claims `sub` and `usr_type`, that
+//! the transfer target is the route `next_route`, and that the from-transaction, from-program,
+//! program context, map and mapset travel in no answer, no token and no `OpenAPI` name.
+//!
 //! Each test drives the whole router in process (`tower::ServiceExt::oneshot`) over its own
 //! `postgres:16` testcontainer, which the `test-support` harness brings up holding the schema and,
 //! except in the store-failure test, loaded with the fixtures and the ten DUSRSECJ users. Every
@@ -881,4 +887,268 @@ async fn coadm01c_admin_menu_rows() -> TestResult {
         "/paths/~1api~1v1~1menus~1admin/get"
     )?);
     admin_menu_gate(&app, &first_admin).await
+}
+
+/// A `GET` of `uri` under `token` that also sends the header `name: value`, as a caller naming
+/// its own user type would send it.
+async fn get_with_header(
+    app: &Router,
+    uri: &str,
+    token: &str,
+    (name, value): (&str, &str),
+) -> TestResult<(u16, Value)> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .header(header::AUTHORIZATION, bearer(token))
+        .header(name, value)
+        .body(Body::empty())?;
+    let response = app.clone().oneshot(request).await?;
+    let status = response.status().as_u16();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    let value = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes)?
+    };
+    Ok((status, value))
+}
+
+/// Every parameter name and every schema property name of the `OpenAPI` document `value`, at
+/// any depth, added to `names`.
+fn document_names(value: &Value, names: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(object) => {
+            let parameters = object.get("parameters").and_then(Value::as_array);
+            names.extend(
+                parameters
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|parameter| parameter.get("name").and_then(Value::as_str))
+                    .map(str::to_owned),
+            );
+            if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+                names.extend(properties.keys().cloned());
+            }
+            for nested in object.values() {
+                document_names(nested, names);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                document_names(nested, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Endpoint 1 for `case`'s typed user ID with the DUSRSECJ password, held to what COSGN00C
+/// moves into the COMMAREA before its `XCTL` (`COSGN00C.cbl:224-238`): the user ID and type
+/// become the claims `sub` and `usr_type`, the transfer target becomes `next_route`, and no other
+/// field travels. `case` is the typed ID, the stored ID, the user type and the target route.
+/// Returns the token.
+async fn commarea_signon(
+    app: &Router,
+    state: &AppState,
+    case: (&str, &str, &str, &str),
+) -> TestResult<String> {
+    let (typed_id, user_id, user_type, next_route) = case;
+    let (status, body) = sign_on(app, typed_id, DUSRSECJ_PASSWORD).await?;
+    assert_eq!(status, 200, "{typed_id}");
+    let token = body
+        .get("token")
+        .and_then(Value::as_str)
+        .ok_or("no token")?
+        .to_owned();
+    let claims = state.jwt.verify(&token)?;
+    // audit: COCOM01Y-005
+    assert_eq!(claims.sub, user_id, "{typed_id}: sub");
+    // audit: COCOM01Y-006
+    assert_eq!(claims.usr_type, user_type, "{typed_id}: usr_type");
+    // The token holds the user ID, the user type and its own times, and nothing else.
+    // audit: COCOM01Y-001
+    // audit: COCOM01Y-002
+    // audit: COCOM01Y-007
+    assert_eq!(
+        claim_names(&token, SECRET)?,
+        BTreeSet::from(["exp", "iat", "sub", "usr_type"].map(str::to_owned)),
+        "{typed_id}: claims"
+    );
+    // audit: COCOM01Y-001
+    // audit: COCOM01Y-002
+    // audit: COCOM01Y-003
+    // audit: COCOM01Y-004
+    // audit: COCOM01Y-007
+    assert_eq!(
+        keys(&body),
+        BTreeSet::from(["next_route", "token", "user_id", "user_type"]),
+        "{typed_id}: members"
+    );
+    // The target screen is named by its route, never by its program, transaction, map or mapset.
+    // audit: COCOM01Y-003
+    // audit: COCOM01Y-004
+    // audit: COCOM01Y-015
+    // audit: COCOM01Y-016
+    assert_eq!(
+        body.get("next_route"),
+        Some(&json!(next_route)),
+        "{typed_id}: next_route"
+    );
+    let mut shown = body;
+    if let Some(object) = shown.as_object_mut() {
+        object.remove("token");
+    }
+    let shown = shown.to_string();
+    // What COSGN00C moves or names (`WS-TRANID`, `WS-PGMNAME`, the `XCTL` targets and their
+    // transactions, the maps and mapsets of the three screens): no member of the answer holds it.
+    let moved: [(&str, &[&str]); 6] = [
+        // audit: COCOM01Y-001
+        ("CDEMO-FROM-TRANID", &["CC00"]),
+        // audit: COCOM01Y-002
+        ("CDEMO-FROM-PROGRAM", &["COSGN00C"]),
+        // audit: COCOM01Y-003
+        ("CDEMO-TO-TRANID", &["CA00", "CM00"]),
+        // audit: COCOM01Y-004
+        ("CDEMO-TO-PROGRAM", &["COADM01C", "COMEN01C"]),
+        // audit: COCOM01Y-015
+        ("CDEMO-LAST-MAP", &["COSGN0A", "COADM1A", "COMEN1A"]),
+        // audit: COCOM01Y-016
+        ("CDEMO-LAST-MAPSET", &["COSGN00", "COADM01", "COMEN01"]),
+    ];
+    for (field, values) in moved {
+        assert!(
+            values.iter().all(|value| !shown.contains(value)),
+            "{typed_id}: the answer carries {field}"
+        );
+    }
+    Ok(token)
+}
+
+/// The user ID and type of every request come from its verified token alone (COCOM01Y-005,
+/// COCOM01Y-006), whatever the query string or the headers name, and no request depends on the
+/// one before it (COCOM01Y-007).
+async fn commarea_from_token_only(
+    app: &Router,
+    state: &AppState,
+    admin_token: &str,
+    user_token: &str,
+) -> TestResult {
+    // ADMIN001's claims under USER0001's signature: a payload alone names nobody.
+    let forged = bearer(&spliced(admin_token, user_token)?);
+    let (status, refused) = call(app, Method::GET, MAIN_MENU, Some(&forged), None).await?;
+    // audit: COCOM01Y-005
+    assert!(
+        status == 401 && refused == screen_error(SIGNON_REQUIRED, None),
+        "a spliced token is served"
+    );
+    let named_admin = format!("{MAIN_MENU}?usr_type=A");
+    for token in [admin_token, user_token] {
+        let claimed = state.jwt.verify(token)?.usr_type;
+        let (status, menu) =
+            get_with_header(app, &named_admin, token, ("x-user-type", "A")).await?;
+        // audit: COCOM01Y-006
+        assert_eq!(
+            (status, menu.get("user_type")),
+            (200, Some(&json!(claimed))),
+            "main menu for the {claimed} token"
+        );
+    }
+    let named_user = format!("{ADMIN_MENU}?usr_type=U");
+    let (status, _) = get_with_header(app, &named_user, admin_token, ("x-user-type", "U")).await?;
+    // audit: COCOM01Y-006
+    assert_eq!(status, 200, "an A token whose request names type U");
+    let named_admin = format!("{ADMIN_MENU}?usr_type=A");
+    let (status, refused) =
+        get_with_header(app, &named_admin, user_token, ("x-user-type", "A")).await?;
+    // audit: COCOM01Y-006
+    assert!(
+        status == 403 && refused == screen_error(ADMIN_REQUIRED, None),
+        "a U token whose request names type A is served the admin menu"
+    );
+    // No first entry is told from a re-entry: the same request twice answers the same body.
+    for (uri, token) in [(MAIN_MENU, user_token), (ADMIN_MENU, admin_token)] {
+        let first = get(app, uri, Some(token)).await?;
+        let second = get(app, uri, Some(token)).await?;
+        // audit: COCOM01Y-007
+        assert!(
+            first.0 == 200 && first == second,
+            "{uri}: a repeated request answers otherwise"
+        );
+    }
+    Ok(())
+}
+
+/// Whether an `OpenAPI` name would carry a COMMAREA field.
+type Carries = fn(&str) -> bool;
+
+/// No parameter and no schema property of the `OpenAPI` document, at any depth, carries a
+/// COMMAREA field the replacement drops: no from- or to- name, no program context and no map
+/// (COCOM01Y-001 to COCOM01Y-004, COCOM01Y-007, COCOM01Y-015, COCOM01Y-016).
+async fn commarea_document_absence(app: &Router) -> TestResult {
+    let (status, document) = get(app, DOCUMENT_ROUTE, None).await?;
+    assert_eq!(status, 200);
+    let mut names = BTreeSet::new();
+    document_names(&document, &mut names);
+    // The scan reaches query parameters and nested schema properties, so no result is vacuous.
+    for reached in [
+        "acct_id",
+        "card_ref",
+        "first_name",
+        "next_route",
+        "page_size",
+    ] {
+        assert!(names.contains(reached), "the scan misses {reached}");
+    }
+    let absent: [(&str, Carries); 7] = [
+        // audit: COCOM01Y-001
+        ("CDEMO-FROM-TRANID", |name| {
+            name.starts_with("from_") || name.contains("tranid")
+        }),
+        // audit: COCOM01Y-002
+        ("CDEMO-FROM-PROGRAM", |name| {
+            name.starts_with("from_") || name.contains("pgm")
+        }),
+        // audit: COCOM01Y-003
+        ("CDEMO-TO-TRANID", |name| {
+            name.starts_with("to_") || name.contains("tranid")
+        }),
+        // audit: COCOM01Y-004
+        ("CDEMO-TO-PROGRAM", |name| {
+            name.starts_with("to_") || name.contains("pgm")
+        }),
+        // audit: COCOM01Y-007
+        ("CDEMO-PGM-CONTEXT", |name| {
+            name.contains("context") || name.contains("reenter")
+        }),
+        // audit: COCOM01Y-015
+        ("CDEMO-LAST-MAP", |name| name.contains("map")),
+        // audit: COCOM01Y-016
+        ("CDEMO-LAST-MAPSET", |name| name.contains("map")),
+    ];
+    for (field, carries) in absent {
+        let carried: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .filter(|name| carries(name))
+            .collect();
+        assert!(carried.is_empty(), "{field} is carried as {carried:?}");
+    }
+    Ok(())
+}
+
+/// COCOM01Y's general and more-info blocks as the replacement carries them (COCOM01Y-001 to
+/// COCOM01Y-007, COCOM01Y-015, COCOM01Y-016): COSGN00C's moves before its `XCTL` become the
+/// claims `sub` and `usr_type` and the route `next_route`, every request takes its user from its
+/// verified token, and nothing else travels.
+#[tokio::test]
+async fn cocom01y_commarea_rows() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let (app, state) = app_over(&guard, &config(SECRET))?;
+    let admin = ("admin001", "ADMIN001", "A", "/admin");
+    let admin_token = commarea_signon(&app, &state, admin).await?;
+    let user = ("USER0001", "USER0001", "U", "/menu");
+    let user_token = commarea_signon(&app, &state, user).await?;
+    commarea_from_token_only(&app, &state, &admin_token, &user_token).await?;
+    commarea_document_absence(&app).await
 }

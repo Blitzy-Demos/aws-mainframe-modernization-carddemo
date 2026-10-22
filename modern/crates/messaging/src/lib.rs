@@ -94,7 +94,8 @@ use crate::workers::{Step, cdra, cdrd, cp00};
 /// The reply text of the connection close with which the first worker to stop ends a session.
 const SESSION_CLOSE_TEXT: &str = "carddemo-mq worker stopped; reconnecting";
 
-/// The reply text of the connection close with which [`run`] ends, on a stop or a fatal error.
+/// The reply text of the connection close with which [`run`] ends, on a stop or a configuration
+/// error.
 const STOP_CLOSE_TEXT: &str = "carddemo-mq stopped";
 
 /// The reply text of the connection close of a session whose workers could not all be opened.
@@ -179,18 +180,21 @@ impl Stop {
 /// names only an operation, a variable, a queue by its value-free label (the environment
 /// variable that configures a request queue, or the source constant that names any other
 /// queue), and the value-free class of the broker or client condition.
+///
+/// Only a configuration error ([`AmqpError::is_configuration`]) is returned, because no retry
+/// cures it. A broker that is down or still booting, refuses the login or misses its handshake
+/// deadline, a missing request, reply, error or dead-letter queue, and a refused channel are
+/// each logged and retried with the backoff, at startup and after a reconnect alike, since the
+/// broker or its operator can put each right while the process waits.
 #[derive(Debug, Clone)]
 pub enum StartupError {
-    /// The first connection to the broker failed: `CARDDEMO_AMQP_URL` is not a valid AMQP URL
-    /// ([`AmqpError::InvalidUrl`]), or the broker cannot be reached or refuses the login
-    /// ([`AmqpError::Connect`]). A connection lost later is retried and never returned.
+    /// `CARDDEMO_AMQP_URL` is not a valid AMQP URL ([`AmqpError::InvalidUrl`]), so no
+    /// connection can be attempted.
     Connect(AmqpError),
-    /// The workers could not be opened on a live connection: a request, reply, error or
-    /// dead-letter queue is missing from the broker ([`AmqpError::Declare`]), a configured request
-    /// queue name is refused before its worker opens a channel ([`AmqpError::QueueName`]: CDRD's
-    /// or CP00's is longer than the 255-byte AMQP short string, CDRA's does not fit the 48-byte
-    /// COBOL field that reports it, or a name holds a byte outside printable ASCII), or the
-    /// broker refused a channel. Each is a misconfiguration that no reconnect cures.
+    /// A configured request queue name is refused before its worker opens a channel
+    /// ([`AmqpError::QueueName`]): CDRD's or CP00's is longer than the 255-byte AMQP short
+    /// string, CDRA's does not fit the 48-byte COBOL field that reports it, or a name holds a
+    /// byte outside printable ASCII.
     Declare(AmqpError),
 }
 
@@ -217,7 +221,8 @@ impl Error for StartupError {
 }
 
 /// Runs the CDRD, CDRA and CP00 workers on one AMQP connection until `stop` is requested or a
-/// fatal error, and reconnects whenever that connection is lost.
+/// configuration error, and connects again whenever that connection fails, is lost or cannot
+/// open the workers.
 ///
 /// The caller reads `config` with `Config::from_env`, installs `runtime::telemetry`, opens
 /// `store` over the pool of `runtime::db::connect`, passes the clock, `SystemClock` in
@@ -225,30 +230,39 @@ impl Error for StartupError {
 /// environment nor the schema. `store` serves CDRA's account reads and every CP00 read, write and
 /// log row; `clock` supplies the CDRD date and time and the CP00 keys, log dates and message IDs.
 ///
-/// Each session opens the three workers, which check their queues with passive declares, then
-/// drives them concurrently until the connection is lost or the stop is requested. Every worker
-/// finishes the request it holds through its own path; none is cancelled mid-message, for
-/// example between a CP00 acknowledgement and its commit. The broker requeues every request left
-/// unsettled. After a lost connection, `run` closes it within [`broker::OPERATION_DEADLINE`]
-/// and, when the broker does not answer the close in time, shuts its socket down, so that the
-/// broker ends the old connection before a new one replaces it ([`Session::close`]). It then
-/// reconnects with a backoff that starts at `config.mq_poll_interval()` and doubles up to
-/// [`broker::BACKOFF_CAP`] over consecutive failed attempts, and opens the workers again
-/// (COPAUA0C-118).
+/// The first connection is attempted at once. Each session opens the three workers, which check
+/// their queues with passive declares and never create one, then drives them concurrently until
+/// the connection is lost or the stop is requested. Every worker finishes the request it holds
+/// through its own path; none is cancelled mid-message, for example between a CP00
+/// acknowledgement and its commit. The broker requeues every request left unsettled.
 ///
-/// The stop is observed while connecting, during a reconnect's backoff and, by each worker,
-/// between requests. Once the three workers have ended, the connection is closed within
-/// [`broker::OPERATION_DEADLINE`], its socket shut down if the broker does not answer, and `run`
-/// returns `Ok`.
+/// A failed connection attempt, the first included, is logged with its [`AmqpError`] text and
+/// retried. So is a session whose workers cannot be opened, whether its connection was lost or
+/// it is still up while a queue is missing or a channel is refused, at startup or after a
+/// reconnect. Such a session, like one whose connection is lost while the workers run, is closed
+/// within [`broker::OPERATION_DEADLINE`] and, when the broker does not answer the close in time,
+/// has its socket shut down, so that the broker ends the old connection before a new one
+/// replaces it ([`Session::close`]). `run` then connects again after the next delay of a
+/// [`Backoff`] whose base starts at `config.mq_poll_interval()` and doubles up to
+/// [`broker::BACKOFF_CAP`] over consecutive failures, and opens the workers again
+/// (COPAUA0C-118). Each delay is drawn between half its base and the whole base, so processes
+/// that lost the broker together spread their attempts. The base returns to the poll interval
+/// only once the workers have opened.
+///
+/// The stop is observed during every connection attempt, during every backoff delay and, by
+/// each worker, between requests. Once the three workers have ended, the connection is closed
+/// within [`broker::OPERATION_DEADLINE`], its socket shut down if the broker does not answer,
+/// and `run` returns `Ok`. A stop that comes while no session is open returns `Ok` at once.
 ///
 /// # Errors
 ///
-/// - [`StartupError::Connect`] when the first connection fails.
-/// - [`StartupError::Declare`] when the workers cannot be opened on a live connection, at
-///   startup or after a reconnect.
+/// Only configuration errors, which no retry cures:
 ///
-/// A connection lost after startup, while opening the workers or while they run, is never
-/// returned: it is logged and retried.
+/// - [`StartupError::Connect`] when `CARDDEMO_AMQP_URL` is not a valid AMQP URL.
+/// - [`StartupError::Declare`] when a configured request queue name is refused before its worker
+///   opens a channel ([`AmqpError::QueueName`]).
+///
+/// Every other failure, of the broker, its queues or the connection, is logged and retried.
 pub async fn run(
     config: &Config,
     store: PgStore,
@@ -257,13 +271,9 @@ pub async fn run(
 ) -> Result<(), StartupError> {
     let poll_interval = config.mq_poll_interval();
     let mut backoff = Backoff::new(poll_interval);
-    let Some(first) = stop
-        .unless_requested(broker::connect(&config.amqp_url))
-        .await
-    else {
+    let Some(mut session) = connect_first(&config.amqp_url, &mut backoff, &mut stop).await? else {
         return Ok(());
     };
-    let mut session = first.map_err(StartupError::Connect)?;
     loop {
         match Workers::open(&session, config, &store, &clock).await {
             Ok(mut workers) => {
@@ -293,6 +303,11 @@ pub async fn run(
                 // race this one and fail it.
                 session.close(reason).await;
             }
+            // A refused request queue name comes from the configuration, and no session cures it.
+            Err(OpenFailure { error, .. }) if error.is_configuration() => {
+                session.close(STOP_CLOSE_TEXT).await;
+                return Err(StartupError::Declare(error));
+            }
             Err(OpenFailure {
                 error,
                 connection_lost: true,
@@ -303,9 +318,16 @@ pub async fn run(
                     "opening the workers failed because the AMQP connection is lost; reconnecting"
                 );
             }
+            // A missing queue (404) or a refused channel on a live connection: the operator can
+            // load the definitions or the broker free a channel, so the session is replaced
+            // after the backoff, which keeps growing until the workers open. No queue is ever
+            // declared here: the queues come only from `rabbitmq/definitions.json`.
             Err(OpenFailure { error, .. }) => {
-                session.close(STOP_CLOSE_TEXT).await;
-                return Err(StartupError::Declare(error));
+                tracing::error!(
+                    outcome = "open failed",
+                    error = %error,
+                    "opening the workers failed on the AMQP connection; reconnecting after backoff"
+                );
             }
         }
         if stop.is_requested() {
@@ -318,26 +340,70 @@ pub async fn run(
         // before a new connection replaces it.
         session.close(SESSION_CLOSE_TEXT).await;
         drop(session);
-        let Some(reconnected) = reconnect(&config.amqp_url, &mut backoff, &mut stop).await else {
+        let Some(reconnected) = reconnect(&config.amqp_url, &mut backoff, &mut stop).await? else {
             return Ok(());
         };
         session = reconnected;
     }
 }
 
-/// Connects again after the next `backoff` delay, retrying until the broker accepts, or `None`
-/// once `stop` is requested during a delay or an attempt. Each failure is logged with the
-/// [`AmqpError`] text, never the URL. A failed or abandoned attempt has its socket shut down
-/// before the next one starts (see [`broker::connect`]).
-async fn reconnect(amqp_url: &str, backoff: &mut Backoff, stop: &mut Stop) -> Option<Session> {
+/// Makes the first connection attempt at once: `Some` with its session, or `None` once `stop`
+/// is requested during it. A broker that is down, still booting or refusing the login does not
+/// end the process: the failure is logged with the [`AmqpError`] text, never the URL, and the
+/// connection is retried through [`reconnect`] with `backoff`.
+///
+/// # Errors
+///
+/// [`StartupError::Connect`] when the attempt fails on the configuration
+/// ([`AmqpError::is_configuration`]): `CARDDEMO_AMQP_URL` is not a valid AMQP URL.
+async fn connect_first(
+    amqp_url: &str,
+    backoff: &mut Backoff,
+    stop: &mut Stop,
+) -> Result<Option<Session>, StartupError> {
+    match stop.unless_requested(broker::connect(amqp_url)).await {
+        None => Ok(None),
+        Some(Ok(session)) => Ok(Some(session)),
+        Some(Err(error)) if error.is_configuration() => Err(StartupError::Connect(error)),
+        Some(Err(error)) => {
+            tracing::error!(
+                outcome = "connect failed",
+                error = %error,
+                "connecting to the AMQP broker failed; retrying after backoff"
+            );
+            reconnect(amqp_url, backoff, stop).await
+        }
+    }
+}
+
+/// Connects again after the next `backoff` delay, retrying until the broker accepts: `Some`
+/// with the new session, or `None` once `stop` is requested during a delay or an attempt. Each
+/// failure is logged with the [`AmqpError`] text, never the URL. A failed or abandoned attempt
+/// has its socket shut down before the next one starts (see [`broker::connect`]).
+///
+/// # Errors
+///
+/// [`StartupError::Connect`] when an attempt fails on the configuration
+/// ([`AmqpError::is_configuration`]), which no further attempt can cure.
+async fn reconnect(
+    amqp_url: &str,
+    backoff: &mut Backoff,
+    stop: &mut Stop,
+) -> Result<Option<Session>, StartupError> {
     loop {
-        stop.unless_requested(backoff.wait()).await?;
-        match stop.unless_requested(broker::connect(amqp_url)).await? {
-            Ok(session) => {
+        if stop.unless_requested(backoff.wait()).await.is_none() {
+            return Ok(None);
+        }
+        match stop.unless_requested(broker::connect(amqp_url)).await {
+            None => return Ok(None),
+            Some(Ok(session)) => {
                 tracing::info!("reconnected to the AMQP broker");
-                return Some(session);
+                return Ok(Some(session));
             }
-            Err(error) => tracing::error!(
+            Some(Err(error)) if error.is_configuration() => {
+                return Err(StartupError::Connect(error));
+            }
+            Some(Err(error)) => tracing::error!(
                 outcome = "reconnect failed",
                 error = %error,
                 "reconnecting to the AMQP broker failed; retrying after backoff"
@@ -410,8 +476,10 @@ impl Workers {
 /// and whether it showed the connection lost, decided before any close of the connection.
 struct OpenFailure {
     error: AmqpError,
-    /// [`AmqpError::is_connection_lost`], or the connection already down: [`run`] reconnects.
-    /// Otherwise the failure is a misconfiguration no reconnect cures, and `run` returns it.
+    /// [`AmqpError::is_connection_lost`], or the connection already down. [`run`] reconnects
+    /// either way, unless the error is a configuration error ([`AmqpError::is_configuration`]),
+    /// which it returns; this flag only tells a lost connection from a missing queue or a
+    /// refused channel in the event `run` logs.
     connection_lost: bool,
 }
 

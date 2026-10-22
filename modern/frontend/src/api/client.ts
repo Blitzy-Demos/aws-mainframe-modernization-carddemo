@@ -11,8 +11,9 @@ import type { paths } from "./schema";
  * caller is: the API takes identity only from the verified token.
  *
  * A 401 means either a failed sign-on (endpoint 1) or a missing, expired or invalid token. Either
- * way the stored session is cleared, which is harmless after a failed sign-on; `RequireSignon`
- * then sends the user to `/signon` at the next render, so nothing navigates from here.
+ * way the stored session is cleared, which is harmless after a failed sign-on. `RequireSignon`
+ * is subscribed to the session, so a 401 on a guarded screen takes the user to `/signon` at once,
+ * without waiting for a navigation; nothing navigates from here.
  *
  * Neither callback reads, copies or logs a request or response body: the client is a conduit,
  * so no card number, SSN or password can reach any other sink through it.

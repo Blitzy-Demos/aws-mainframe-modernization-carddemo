@@ -147,7 +147,7 @@ fn delete_result(result: Result<bool, PersistenceError>) -> DeleteResult {
 /// The error's `Display` holds only an SQLSTATE, a constraint name or a column name, never a
 /// stored or request value (Cardholder Data Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = PROGRAM,
         paragraph,
         error = %error,

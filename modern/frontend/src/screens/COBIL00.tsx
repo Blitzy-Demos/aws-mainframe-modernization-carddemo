@@ -130,8 +130,8 @@ function resultMessage(result: components["schemas"]["BillPaymentResult"]): Shel
  * - ENTER sends the two inputs as typed. A 200 shows its balance, or none, and its message; when
  *   `cleared` (after `N` and after a payment) the inputs are emptied and the cursor goes to the
  *   account, otherwise the cursor goes to the confirmation of the prompt (COBIL00C-019,
- *   COBIL00C-037). A `ScreenError` shows its message and moves the cursor to the field it names;
- *   the account, balance and confirmation keep what they showed.
+ *   COBIL00C-037). A `ScreenError` shows its message, marks the field it names invalid and moves
+ *   the cursor to it; the account, balance and confirmation keep what they showed.
  * - F3 goes back (COBIL00C-004); F4 empties the screen and the message row (COBIL00C-005); any
  *   other function key shows the invalid-key message (COBIL00C-006). None sends a request.
  */
@@ -141,11 +141,15 @@ export function COBIL00(): ReactNode {
   const navigate = useNavigate();
   const { state } = useLocation();
   const pay = useCobil00cPay();
+  // A field the server rejects stays marked invalid until it is retyped, which re-validates it
+  // on change; or until the next ENTER, whose schema pass replaces every error; or until a clear,
+  // whose `reset` keeps none.
   const form = useForm<Cobil00Values>({
     resolver: zodResolver(cobil00Schema),
     defaultValues: EMPTY_VALUES,
+    reValidateMode: "onChange",
   });
-  const { reset, setFocus, setValue } = form;
+  const { reset, setError, setFocus, setValue } = form;
   const [balance, setBalance] = useState("");
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
 
@@ -204,6 +208,8 @@ export function COBIL00(): ReactNode {
           setMessage({ text: error.message, kind: "error" });
           const field = fieldOf(error.field);
           if (field !== undefined) {
+            // The named input is marked invalid; its text stays in the map's one message row.
+            setError(field, { type: "server", message: error.message });
             setFocus(field);
           }
         },

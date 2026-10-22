@@ -161,7 +161,10 @@ use persistence::{
     TranCatBalanceRepository, TransactionRepository,
 };
 
-use super::{JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking, read_input};
+use super::{
+    DALYREJS_DIR_SETTING, JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking,
+    read_input,
+};
 
 /// The generation base of the reject file, `AWS.M2.CARDDEMO.DALYREJS(+1)` (`POSTTRAN.jcl:38`;
 /// CBTRN02C-028).
@@ -436,9 +439,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     let xrefs = CardXrefRepository::find_all(&mut session)
         .await
         .map_err(|error| unshown_failure(READ_XREFFILE_OP, XREF_READ_FAILED, &error))?;
-    let mut rejects = OutputFile::next_generation(&ctx.config.dalyrejs_dir(), REJECTS_BASE)
-        .await
-        .map_err(|error| file_failure(OPEN_DALYREJS_OP, OPEN_DALYREJS, &error))?;
+    let mut rejects = open_dalyrejs(&ctx.config.dalyrejs_dir()).await?;
     open_for_writing(&mut session, &ACCTFILE).await?;
     let accounts = AccountRepository::find_all(&mut session)
         .await
@@ -558,6 +559,24 @@ async fn open_for_writing(session: &mut PgSession, open: &WriterOpen) -> Result<
         Ok(false) => Err(abend(open.refused())),
         Err(error) => Err(shown_failure(open.operation, open.line, &error)),
     }
+}
+
+/// `0300-DALYREJS-OPEN`: the `OPEN OUTPUT` of `DALYREJS(+1)`, the next generation in `dir`,
+/// `Config::dalyrejs_dir`, created empty before the first record is read (CBTRN02C-028).
+///
+/// # Errors
+///
+/// [`JobError::Abend`] with `ERROR OPENING DALY REJECTS FILE` and the stand-in status when the
+/// generation cannot be allocated or created (CBTRN02C-031). The event before those lines names
+/// the step, the setting of the directory, `dalyrejs under CARDDEMO_VAR_DIR`, and the error kind,
+/// never the path, so the operator learns which setting to correct.
+async fn open_dalyrejs(dir: &Path) -> Result<OutputFile, JobError> {
+    OutputFile::next_generation(dir, REJECTS_BASE)
+        .await
+        .map_err(|error| {
+            let error = error.naming_output_dir(DALYREJS_DIR_SETTING);
+            file_failure(OPEN_DALYREJS_OP, OPEN_DALYREJS, &error)
+        })
 }
 
 /// `9100-TRANFILE-CLOSE`, `9400-ACCTFILE-CLOSE` and `9500-TCATBALF-CLOSE` for the claims: the
@@ -755,7 +774,8 @@ fn report(operation: &'static str, error: &PersistenceError) {
 }
 
 /// Reports why a local-file call failed: the file operation and the error's text, a static step
-/// and the I/O error kind, or the generation limit and the `DALYREJS` base, never the path.
+/// and the I/O error kind, with the setting of the reject directory for a step on it, or the
+/// generation limit and the `DALYREJS` base, never the path.
 fn report_file(operation: &'static str, error: &JobError) {
     tracing::error!(operation, error = %error, "CBTRN02C file operation failed");
 }
@@ -799,8 +819,9 @@ mod tests {
 
     use super::{
         ABEND_LINE, ACCTFILE, CLUSTER_NOT_EMPTY, Failure, JobContext, JobError, LINE_REFUSED,
-        OPEN_DALYTRAN, OutputFile, REJECTS_BASE, Status, TCATBALF, TRANFILE, WRITE_TRANFILE,
-        XREF_READ_FAILED, abend, close_dalyrejs, open_dalytran, run, write_reject,
+        OPEN_DALYREJS, OPEN_DALYTRAN, OutputFile, REJECTS_BASE, Status, TCATBALF, TRANFILE,
+        WRITE_TRANFILE, XREF_READ_FAILED, abend, close_dalyrejs, open_dalyrejs, open_dalytran, run,
+        write_reject,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1107,6 +1128,65 @@ mod tests {
             ]
         );
         assert!(!capture.contains("missing-dailytran"));
+        Ok(())
+    }
+
+    /// A file in place of the reject directory, or of `CARDDEMO_VAR_DIR` above it, is the failed
+    /// `DALYREJS` open: its event names the step, the setting of the directory and the error
+    /// kind, never the path, and its lines, the abend and exit status 12 are those of every
+    /// failed open. The file is left as it was (CBTRN02C-031).
+    // audit: CBTRN02C-031
+    #[tokio::test]
+    async fn a_file_in_place_of_the_reject_directory_names_its_setting() -> TestResult {
+        let scratch = Scratch::new()?;
+        let var_file = scratch.file("var", b"sentinel\n")?;
+        let var_dir = scratch.path().join("var-dir");
+        fs::create_dir_all(&var_dir)?;
+        let rejects_file = var_dir.join("dalyrejs");
+        fs::write(&rejects_file, b"sentinel\n")?;
+        let scratch_name = scratch
+            .path()
+            .file_name()
+            .ok_or("the scratch directory has no name")?
+            .to_string_lossy()
+            .into_owned();
+        for dir in [var_file.join("dalyrejs"), rejects_file.clone()] {
+            let shown = dir.display().to_string();
+            let capture = trace_capture::capture();
+            let error = open_dalyrejs(&dir)
+                .await
+                .err()
+                .ok_or("a reject generation was created")?;
+            assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYREJS)), "{shown}");
+            assert_eq!(
+                error.to_string(),
+                "ABEND: ERROR OPENING DALY REJECTS FILE (return code 12)"
+            );
+            assert_eq!(
+                messages(&capture),
+                [
+                    "CBTRN02C file operation failed",
+                    OPEN_DALYREJS,
+                    "FILE STATUS IS: NNNN0030",
+                    ABEND_LINE,
+                ],
+                "{shown}"
+            );
+            assert!(
+                capture.contains(r#""operation":"OPEN DALYREJS""#),
+                "{shown}"
+            );
+            assert!(
+                capture.contains(
+                    r#""error":"allocating generation (dalyrejs under CARDDEMO_VAR_DIR): not a directory""#
+                ),
+                "{shown}"
+            );
+            assert!(!capture.contains(&scratch_name), "{shown} is shown");
+        }
+        for file in [var_file, rejects_file] {
+            assert_eq!(fs::read(&file)?, b"sentinel\n", "{}", file.display());
+        }
         Ok(())
     }
 

@@ -3204,6 +3204,7 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "jsonwebtoken",
  "opentelemetry",
  "opentelemetry-stdout",
  "opentelemetry_sdk",

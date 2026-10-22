@@ -21,17 +21,35 @@
 //! The rows are those the audit's "How the rows are proved" assigns to this file, the
 //! injected-store cases included: the order of the store calls around the acknowledgement
 //! (COPAUA0C-080, COPAUA0C-081), the failed commit (COPAUA0C-121), the store-read failures
-//! (COPAUA0C-122 to COPAUA0C-126) and the not-found warnings (COPAUA0C-115, COPAUA0C-116). The
-//! `HALTED` rows get no parity assertion; the ignored `blocked_*` tests at the end report them
-//! `BLOCKED` (AAP 0.8.5).
+//! (COPAUA0C-122 to COPAUA0C-126) and the not-found warnings (COPAUA0C-115, COPAUA0C-116). A
+//! store-read failure is asserted with its critical row after a server error and with no row
+//! attempted after an unavailable database, and in both cases with the interim `05`/`9000`
+//! decline of `X-COPAUA0C-1`: one reply, acknowledged, nothing written. The `HALTED` rows get
+//! no parity assertion; the ignored `blocked_*` tests at the end report them `BLOCKED` (AAP
+//! 0.8.5).
+//!
+//! # Startup through `messaging::run`
+//!
+//! The `run_*` tests start the three workers as the `carddemo-mq` binary does, through
+//! `messaging::run` with a 20 ms poll interval, under `test_support::trace_capture`, and request
+//! its stop through a `StopHandle`. They prove the startup resilience of the process, which no
+//! audit row states, so they carry no audit tag:
+//!
+//! - a broker that refuses the first connection is retried with the backoff, one `ERROR` event
+//!   per failed attempt, until the stop, and no event shows the AMQP URL or its password;
+//! - a queue missing at startup is retried, one `ERROR` event per session whose workers cannot
+//!   open, until it is declared, after which the workers open and CP00 answers a request;
+//! - a configuration error, an AMQP URL that does not parse or a refused request queue name,
+//!   ends the run at once with its `StartupError`, without a retry.
 //!
 //! # Doubles
 //!
 //! [`InjectedStore`] and [`InjectedTx`] wrap the real `PgStore` and `PgTx` and delegate every
-//! call, except the one [`StoreFault`] names; [`StandInAcknowledger`] stands in for the consumer
-//! channel's settlement. Both record the order of their calls in a [`CallOrder`] of atomics. They
-//! implement only the worker's seams (`AuthStore`, `AuthTx`, `Acknowledger`), never a
-//! `persistence` repository trait.
+//! call, except the one [`StoreFault`] names, which fails with the store's [`Failure`];
+//! [`StandInAcknowledger`] stands in for the consumer channel's settlement. Both record the
+//! order of their calls in a [`CallOrder`] of atomics, the store's `cssl_error_log` writes
+//! included. They implement only the worker's seams (`AuthStore`, `AuthTx`, `Acknowledger`),
+//! never a `persistence` repository trait.
 //!
 //! # Redaction
 //!
@@ -41,24 +59,27 @@
 //! whose `Debug` shows only the redacted form.
 
 use std::error::Error;
+use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::NaiveDate;
 use copybook::{PicS, PicU, PicX};
+use domain::messaging::codate01::ERROR_QUEUE;
 use domain::records::{
     AccountRecord, CardXrefRecord, CustomerRecord, ErrorLogRecord, PendingAuthDetailRecord,
     PendingAuthSummaryRecord,
 };
 use domain::{CardNumber, Clock, FixedClock};
 use lapin::message::BasicGetMessage;
-use lapin::options::ConfirmSelectOptions;
-use lapin::types::ShortString;
+use lapin::options::{ConfirmSelectOptions, QueueDeclareOptions, QueueDeleteOptions};
+use lapin::types::{FieldTable, ShortString};
 use lapin::{BasicProperties, Channel, Connection};
 use messaging::broker::{self, Acknowledger, AmqpError, Fault, Session};
 use messaging::workers::cp00::{AuthStore, AuthTx, Worker};
 use messaging::workers::{Processed, Step};
+use messaging::{StartupError, StopHandle, run};
 use persistence::{
     CardXrefRepository, CsslErrorLogRepository, PendingAuthDetailRepository,
     PendingAuthSummaryRepository, PersistenceError, PgStore, PgTx,
@@ -68,7 +89,9 @@ use rust_decimal::Decimal;
 use test_support::fixtures::{fixture_card_numbers, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
 use test_support::rabbitmq::{self, RabbitMqGuard, start_rabbitmq};
+use test_support::trace_capture::{self, TraceCapture};
 use tokio::time::{Instant, sleep, timeout};
+use tracing::instrument::WithSubscriber;
 
 type BoxError = Box<dyn Error + Send + Sync>;
 type TestResult = Result<(), BoxError>;
@@ -92,6 +115,27 @@ const NO_SUCH_REPLY_QUEUE: &str = "CARD.DEMO.NO.SUCH.REPLY";
 /// A well-formed card number that `cardxref.txt` does not hold; each test that uses it checks
 /// its absence first.
 const UNKNOWN_CARD: &str = "1000000000000001";
+
+/// `CARDDEMO_MQ_POLL_MS` of the `messaging::run` tests, and so the first backoff base: short,
+/// so that several retries fit in a fraction of a second.
+const RUN_POLL_MS: u64 = 20;
+/// Bound on a whole `messaging::run` of this file, from its start to its return.
+const RUN_BOUND: Duration = Duration::from_secs(60);
+/// How soon `messaging::run` must return once its stop is requested, or, on a configuration
+/// error, once it starts: well under one backoff cap, so a run that went on retrying fails.
+const RUN_RETURN_BOUND: Duration = Duration::from_secs(3);
+/// The message of the event of every failed connection attempt: the first attempt's
+/// ("connecting to ...") and each reconnect's ("reconnecting to ...").
+const CONNECT_RETRIED: &str = "connecting to the AMQP broker failed; retrying after backoff";
+/// The message of the event of a session whose workers could not be opened on a live
+/// connection, for example over a missing queue.
+const OPEN_RETRIED: &str =
+    "opening the workers failed on the AMQP connection; reconnecting after backoff";
+/// The message of the event of a session whose three workers have opened.
+const WORKERS_CONSUME: &str = "the CDRD, CDRA and CP00 workers consume their request queues";
+
+/// Whether a [`StartupError`] is the one a case expects.
+type IsExpected = fn(&StartupError) -> bool;
 
 /// The request fields other than the card number, the amount and the transaction ID, in
 /// `CCPAURQY` order (`COPAUA0C.cbl:354-373`): fields 1, 2 and 4 to 8, then 10 to 17.
@@ -231,11 +275,24 @@ impl Harness {
         Ok((session, worker))
     }
 
-    /// A store that fails as `fault` names and records its calls in `calls`.
+    /// A store that fails as `fault` names, with a server error ([`Failure::Server`]), and
+    /// records its calls in `calls`.
     fn injected(&self, fault: StoreFault, calls: &Arc<CallOrder>) -> InjectedStore {
+        self.injected_failing(fault, Failure::Server, calls)
+    }
+
+    /// A store that fails as `fault` names, with the error of `failure`, and records its calls in
+    /// `calls`.
+    fn injected_failing(
+        &self,
+        fault: StoreFault,
+        failure: Failure,
+        calls: &Arc<CallOrder>,
+    ) -> InjectedStore {
         InjectedStore {
             inner: self.store(),
             fault,
+            failure,
             calls: Arc::clone(calls),
         }
     }
@@ -321,6 +378,78 @@ impl Harness {
         Ok(rows.into_iter().map(|(_, record)| record).collect())
     }
 
+    /// The harness configuration with a [`RUN_POLL_MS`] poll interval, for `messaging::run`.
+    fn run_config(&self) -> Config {
+        Config {
+            mq_poll_ms: RUN_POLL_MS,
+            ..self.config.clone()
+        }
+    }
+
+    /// Deletes `queue` from the broker, as an operator who has not loaded every definition
+    /// leaves it missing.
+    async fn delete_queue(&self, queue: &str) -> TestResult {
+        let delete = self
+            .channel
+            .queue_delete(queue, QueueDeleteOptions::default());
+        timeout(WAIT, delete).await??;
+        Ok(())
+    }
+
+    /// Declares `queue` durable with no arguments, as `rabbitmq/definitions.json` declares
+    /// `CARD.DEMO.ERROR`.
+    async fn declare_durable(&self, queue: &str) -> TestResult {
+        let options = QueueDeclareOptions {
+            durable: true,
+            ..QueueDeclareOptions::default()
+        };
+        let declare = self
+            .channel
+            .queue_declare(queue, options, FieldTable::default());
+        timeout(WAIT, declare).await??;
+        Ok(())
+    }
+
+    /// Runs `messaging::run` with `config` under `capture` beside `driver`, requests the stop
+    /// once `driver` has ended, and returns the run's outcome, how long the run took to return
+    /// after the stop request, and what `driver` returned. The whole run is bounded by
+    /// [`RUN_BOUND`].
+    async fn run_beside<T>(
+        &self,
+        config: &Config,
+        capture: &TraceCapture,
+        driver: impl Future<Output = Result<T, BoxError>>,
+    ) -> Result<(Result<(), StartupError>, Duration, T), BoxError> {
+        let handle = StopHandle::new();
+        // Boxed: the three workers' futures exceed the stack budget of `clippy::large_futures`.
+        let running = Box::pin(
+            run(
+                config,
+                self.store(),
+                Arc::clone(&self.clock),
+                handle.subscribe(),
+            )
+            .with_subscriber(capture.dispatch()),
+        );
+        let returned = async {
+            let outcome = timeout(RUN_BOUND, running).await;
+            (outcome, Instant::now())
+        };
+        let driving = async {
+            let finished = driver.await;
+            handle.request();
+            (finished, Instant::now())
+        };
+        let ((outcome, returned_at), (finished, stopped_at)) = tokio::join!(returned, driving);
+        let outcome = outcome?;
+        let finished = finished?;
+        Ok((
+            outcome,
+            returned_at.saturating_duration_since(stopped_at),
+            finished,
+        ))
+    }
+
     /// Closes the test's connection; the containers go with the harness.
     async fn finish(self) -> TestResult {
         timeout(WAIT, self.connection.close(REPLY_SUCCESS, CLOSE_REASON)).await??;
@@ -336,6 +465,42 @@ async fn process<W: Step>(worker: &mut W, session: &Session) -> Result<Processed
         let processed = timeout(WAIT, worker.process_next(session.connection())).await??;
         if processed != Processed::Idle || Instant::now() >= deadline {
             return Ok(processed);
+        }
+        sleep(POLL).await;
+    }
+}
+
+/// A local TCP port on which nothing listens: the operating system hands it to a listener that
+/// is closed again at once, so a connection to it is refused.
+fn closed_port() -> Result<u16, BoxError> {
+    let listener = TcpListener::bind(("127.0.0.1", 0))?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+/// The lines of `lines` that contain `needle`.
+fn matching<'a>(lines: &'a [String], needle: &str) -> Vec<&'a String> {
+    lines.iter().filter(|line| line.contains(needle)).collect()
+}
+
+/// Waits until `capture` holds at least `expected` lines containing `needle`, polling every
+/// [`POLL`] for at most [`WAIT`], and returns how many it holds then.
+async fn captured(
+    capture: &TraceCapture,
+    needle: &str,
+    expected: usize,
+) -> Result<usize, BoxError> {
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let found = matching(&capture.lines(), needle).len();
+        if found >= expected {
+            return Ok(found);
+        }
+        if Instant::now() >= deadline {
+            return Err(
+                format!("{found} of {expected} \"{needle}\" events within {WAIT:?}").into(),
+            );
         }
         sleep(POLL).await;
     }
@@ -599,6 +764,7 @@ struct CallOrder {
     commit: AtomicUsize,
     rollback: AtomicUsize,
     reject: AtomicUsize,
+    log: AtomicUsize,
 }
 
 impl CallOrder {
@@ -615,8 +781,7 @@ impl CallOrder {
 }
 
 /// The one store call an [`InjectedStore`] fails, or [`StoreFault::Healthy`] for none. A failing
-/// call returns [`PersistenceError::Unavailable`], which carries no SQLSTATE; a `*Missing` read
-/// finds no row.
+/// call returns the error of the store's [`Failure`]; a `*Missing` read finds no row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreFault {
     Healthy,
@@ -631,10 +796,36 @@ enum StoreFault {
     Commit,
 }
 
+/// The error a [`StoreFault`] call fails with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Failure {
+    /// The database answered with an error, [`PersistenceError::Database`] with SQLSTATE
+    /// `XX000` (`internal_error`), so the worker still writes the call's log row. The codes it
+    /// leaves in the row are HALTED(H4) and never compared.
+    Server,
+    /// [`PersistenceError::Unavailable`]: the database cannot be reached, as when the pool's
+    /// acquire times out.
+    Unavailable,
+}
+
+impl Failure {
+    /// The error a failing call returns.
+    fn error(self) -> PersistenceError {
+        match self {
+            Self::Server => PersistenceError::Database {
+                sqlstate: Some("XX000".to_owned()),
+                constraint: None,
+            },
+            Self::Unavailable => PersistenceError::Unavailable,
+        }
+    }
+}
+
 /// The real store with one injected fault: every other call goes to `inner`.
 struct InjectedStore {
     inner: PgStore,
     fault: StoreFault,
+    failure: Failure,
     calls: Arc<CallOrder>,
 }
 
@@ -647,7 +838,7 @@ impl AuthStore for InjectedStore {
     ) -> Result<Option<CardXrefRecord>, PersistenceError> {
         self.calls.mark(&self.calls.xref);
         if self.fault == StoreFault::XrefRead {
-            return Err(PersistenceError::Unavailable);
+            return Err(self.failure.error());
         }
         AuthStore::find_xref(&self.inner, card).await
     }
@@ -655,25 +846,29 @@ impl AuthStore for InjectedStore {
     async fn begin(&self) -> Result<InjectedTx, PersistenceError> {
         self.calls.mark(&self.calls.begin);
         if self.fault == StoreFault::Begin {
-            return Err(PersistenceError::Unavailable);
+            return Err(self.failure.error());
         }
         let inner = AuthStore::begin(&self.inner).await?;
         Ok(InjectedTx {
             inner,
             fault: self.fault,
+            failure: self.failure,
             calls: Arc::clone(&self.calls),
         })
     }
 
     async fn log(&self, record: &ErrorLogRecord) -> Result<i64, PersistenceError> {
+        self.calls.mark(&self.calls.log);
         AuthStore::log(&self.inner, record).await
     }
 }
 
-/// The real authorization transaction with the fault of the [`InjectedStore`] that opened it.
+/// The real authorization transaction with the fault and failure of the [`InjectedStore`] that
+/// opened it.
 struct InjectedTx {
     inner: PgTx<'static>,
     fault: StoreFault,
+    failure: Failure,
     calls: Arc<CallOrder>,
 }
 
@@ -684,7 +879,7 @@ impl AuthTx for InjectedTx {
     ) -> Result<(PendingAuthSummaryRecord, bool), PersistenceError> {
         self.calls.mark(&self.calls.lock);
         if self.fault == StoreFault::SummaryLock {
-            return Err(PersistenceError::Unavailable);
+            return Err(self.failure.error());
         }
         AuthTx::lock_or_create_summary(&mut self.inner, template).await
     }
@@ -695,7 +890,7 @@ impl AuthTx for InjectedTx {
     ) -> Result<Option<AccountRecord>, PersistenceError> {
         self.calls.mark(&self.calls.account);
         match self.fault {
-            StoreFault::AccountRead => Err(PersistenceError::Unavailable),
+            StoreFault::AccountRead => Err(self.failure.error()),
             StoreFault::AccountMissing => Ok(None),
             _ => AuthTx::find_account(&mut self.inner, id).await,
         }
@@ -707,7 +902,7 @@ impl AuthTx for InjectedTx {
     ) -> Result<Option<CustomerRecord>, PersistenceError> {
         self.calls.mark(&self.calls.customer);
         match self.fault {
-            StoreFault::CustomerRead => Err(PersistenceError::Unavailable),
+            StoreFault::CustomerRead => Err(self.failure.error()),
             StoreFault::CustomerMissing => Ok(None),
             _ => AuthTx::find_customer(&mut self.inner, id).await,
         }
@@ -719,7 +914,7 @@ impl AuthTx for InjectedTx {
     ) -> Result<bool, PersistenceError> {
         self.calls.mark(&self.calls.update);
         if self.fault == StoreFault::SummaryUpdate {
-            return Err(PersistenceError::Unavailable);
+            return Err(self.failure.error());
         }
         AuthTx::update_summary(&mut self.inner, record).await
     }
@@ -738,7 +933,7 @@ impl AuthTx for InjectedTx {
         if self.fault == StoreFault::Commit {
             // A refused commit ends the transaction rolled back, so nothing it wrote stands.
             AuthTx::rollback(self.inner).await?;
-            return Err(PersistenceError::Unavailable);
+            return Err(self.failure.error());
         }
         AuthTx::commit(self.inner).await
     }
@@ -1372,16 +1567,9 @@ impl FaultRow {
     }
 }
 
-// audit: COPAUA0C-110
-// audit: COPAUA0C-122
-// audit: COPAUA0C-123
-// audit: COPAUA0C-124
-// audit: COPAUA0C-125
-// audit: COPAUA0C-126
-#[tokio::test]
-async fn store_read_failures_log_their_critical_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
+/// The five store reads whose failure ends the COBOL task at a critical row, each with that row
+/// (COPAUA0C-122 to COPAUA0C-126).
+fn critical_reads() -> [FaultRow; 5] {
     let critical = |fault, location, subsystem, message, key| FaultRow {
         fault,
         location,
@@ -1390,7 +1578,7 @@ async fn store_read_failures_log_their_critical_rows() -> TestResult {
         message,
         key,
     };
-    let cases = [
+    [
         critical(
             StoreFault::XrefRead,
             "C001",
@@ -1426,21 +1614,78 @@ async fn store_read_failures_log_their_critical_rows() -> TestResult {
             "FAILED TO READ CUST FILE",
             KeySource::Customer,
         ),
-    ];
+    ]
+}
+
+/// Sends one request for `xref`'s card, with field 18 `tran_id`, to a worker whose store fails
+/// `case`'s read with `failure`, and asserts the interim handling of `X-COPAUA0C-1`, not a
+/// parity result: one reply carrying the CP00 properties, the request acknowledged and not
+/// dead-lettered, and neither a summary nor a detail for the account. The reply's `05`/`9000`
+/// bytes are the domain's unit test's, as no CP00 body is compared here (HALTED(H6)). Returns
+/// the store's calls.
+async fn declined_after_failed_read(
+    harness: &Harness,
+    xref: &CardXrefRecord,
+    case: &FaultRow,
+    failure: Failure,
+    tran_id: &str,
+) -> Result<Arc<CallOrder>, BoxError> {
+    let location = case.location;
+    let body = auth_request(card_text(&xref.card_num)?, "100.00", tran_id);
+    let sent = harness.send(&body, &harness.reply_queue, location).await?;
+    let calls = Arc::new(CallOrder::default());
+    let (session, worker) = harness.open_worker().await?;
+    let mut worker = worker.with_store(harness.injected_failing(case.fault, failure, &calls));
+    // Boxed: the step's future, kept inline beside this helper's own state, would grow the
+    // helper's future past `clippy::large_futures`.
+    assert_eq!(
+        Box::pin(process(&mut worker, &session)).await?,
+        Processed::Replied,
+        "{location}: the failed read is answered"
+    );
+    let reply = harness.next_reply().await?;
+    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+    assert!(
+        harness.remaining_replies().await?.is_empty(),
+        "{location}: exactly one reply"
+    );
+
+    close_worker(session, worker).await;
+    let left = harness.settled_count(harness.request_queue(), 0).await?;
+    assert_eq!(left, 0, "{location}: the request was acknowledged");
+    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 0).await?;
+    assert_eq!(dead, 0, "{location}: the request was not dead-lettered");
+    assert!(
+        harness.summary(xref.acct_id).await?.is_none(),
+        "{location}: no summary after a failed read"
+    );
+    assert!(
+        harness.details(xref.acct_id).await?.is_empty(),
+        "{location}: no detail after a failed read"
+    );
+    Ok(calls)
+}
+
+// audit: COPAUA0C-110
+// audit: COPAUA0C-122
+// audit: COPAUA0C-123
+// audit: COPAUA0C-124
+// audit: COPAUA0C-125
+// audit: COPAUA0C-126
+#[tokio::test]
+async fn store_read_failures_log_their_critical_rows_and_decline_without_writes() -> TestResult {
+    let harness = Harness::start().await?;
+    let xref = harness.xref(1).await?;
     let cards = protected_cards(&[])?;
-    for (written, case) in cases.iter().enumerate() {
+    for (written, case) in critical_reads().iter().enumerate() {
         let tran_id = format!("CP00T10 000000{written}");
-        let body = auth_request(card_text(&xref.card_num)?, "100.00", &tran_id);
-        harness
-            .send(&body, &harness.reply_queue, case.location)
-            .await?;
-        let calls = Arc::new(CallOrder::default());
-        let (session, worker) = harness.open_worker().await?;
-        let mut worker = worker.with_store(harness.injected(case.fault, &calls));
-        // What follows the row, reply or dead letter, is X-COPAUA0C-1 and undecided, so only
-        // the row is asserted.
-        process(&mut worker, &session).await?;
-        close_worker(session, worker).await;
+        let calls =
+            declined_after_failed_read(&harness, &xref, case, Failure::Server, &tran_id).await?;
+        assert!(
+            CallOrder::at(&calls.log) > 0,
+            "{}: the row was written",
+            case.location
+        );
 
         let rows = harness.log_rows().await?;
         assert_keys_redacted(&rows, &cards);
@@ -1453,6 +1698,96 @@ async fn store_read_failures_log_their_critical_rows() -> TestResult {
         let row = rows.last().ok_or("no cssl_error_log row")?;
         assert_log_row(row, &case.expectation(&xref));
     }
+    harness.finish().await
+}
+
+/// The text of the `ERROR` event that stands for a `cssl_error_log` row not written.
+const ROW_NOT_WRITTEN: &str =
+    "the cssl_error_log row is not written because the database is unavailable";
+
+/// How many captured lines report a `cssl_error_log` row not written.
+fn rows_not_written(capture: &TraceCapture) -> usize {
+    capture
+        .lines()
+        .iter()
+        .filter(|line| line.contains(ROW_NOT_WRITTEN))
+        .count()
+}
+
+// audit: COPAUA0C-122
+// audit: COPAUA0C-123
+// audit: COPAUA0C-124
+// audit: COPAUA0C-125
+// audit: COPAUA0C-126
+#[tokio::test]
+async fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() -> TestResult {
+    let harness = Harness::start().await?;
+    let xref = harness.xref(1).await?;
+    let capture = trace_capture::capture();
+    for (nth, case) in critical_reads().iter().enumerate() {
+        let location = case.location;
+        let tran_id = format!("CP00T12 000000{nth}");
+        capture.clear();
+        let calls =
+            declined_after_failed_read(&harness, &xref, case, Failure::Unavailable, &tran_id)
+                .await?;
+        assert_eq!(
+            CallOrder::at(&calls.log),
+            0,
+            "{location}: no cssl_error_log write was attempted"
+        );
+        assert_eq!(
+            rows_not_written(&capture),
+            1,
+            "{location}: one ERROR event stands for the row"
+        );
+        assert!(
+            !capture.contains("the cssl_error_log row could not be written"),
+            "{location}: no write failed"
+        );
+    }
+    assert!(
+        harness.log_rows().await?.is_empty(),
+        "an unavailable database leaves no cssl_error_log row"
+    );
+
+    // A decline that cannot be delivered takes the M004 path, and its row is skipped too.
+    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T12 0000009");
+    harness.send(&body, NO_SUCH_REPLY_QUEUE, "m004").await?;
+    let calls = Arc::new(CallOrder::default());
+    let (session, worker) = harness.open_worker().await?;
+    let mut worker = worker.with_store(harness.injected_failing(
+        StoreFault::XrefRead,
+        Failure::Unavailable,
+        &calls,
+    ));
+    capture.clear();
+    assert_eq!(
+        process(&mut worker, &session).await?,
+        Processed::DeadLettered
+    );
+    assert_eq!(
+        CallOrder::at(&calls.log),
+        0,
+        "neither the C001 nor the M004 row was attempted"
+    );
+    assert_eq!(
+        rows_not_written(&capture),
+        2,
+        "one ERROR event stands for each of the C001 and M004 rows"
+    );
+    close_worker(session, worker).await;
+    let left = harness.settled_count(harness.request_queue(), 0).await?;
+    assert_eq!(left, 0, "the request was rejected, not requeued");
+    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
+    assert_eq!(
+        dead, 1,
+        "the undelivered decline's request is retained on the dead-letter queue"
+    );
+    assert!(
+        harness.log_rows().await?.is_empty(),
+        "no cssl_error_log row after the M004 path either"
+    );
     harness.finish().await
 }
 
@@ -1537,6 +1872,201 @@ async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> 
         close_worker(session, worker).await;
         let left = harness.settled_count(harness.request_queue(), 0).await?;
         assert_eq!(left, 0, "{}: the request was acknowledged", case.location);
+    }
+    harness.finish().await
+}
+
+/// `messaging::run` started while no broker listens at `CARDDEMO_AMQP_URL` keeps running
+/// instead of ending the process: the first attempt fails at once, and it and every reconnect
+/// after it is logged and retried after a backoff delay. A stop then ends the run with `Ok`,
+/// although it never connected. No event shows the URL or its password, only the value-free
+/// failure.
+#[tokio::test]
+async fn run_retries_a_refused_first_connection_until_it_is_stopped() -> TestResult {
+    let harness = Harness::start().await?;
+    // A password assembled at run time, in a URL whose port nothing listens on.
+    let password = ["no-broker", "-", "secret"].concat();
+    let amqp_url = format!(
+        "amqp://carddemo:{password}@127.0.0.1:{}/%2f",
+        closed_port()?
+    );
+    let config = Config {
+        amqp_url: amqp_url.clone(),
+        ..harness.run_config()
+    };
+    let capture = trace_capture::capture();
+    let driver = captured(&capture, CONNECT_RETRIED, 3);
+    let (outcome, stop_took, retried) = harness.run_beside(&config, &capture, driver).await?;
+    let lines = capture.lines();
+    drop(capture);
+
+    if let Err(error) = outcome {
+        return Err(format!("run ended with {error} instead of retrying").into());
+    }
+    assert!(
+        stop_took < RUN_RETURN_BOUND,
+        "run returned {stop_took:?} after the stop"
+    );
+    assert!(retried >= 3, "{retried} failed attempts were logged");
+    let first = matching(&lines, r#""outcome":"connect failed""#);
+    assert_eq!(first.len(), 1, "the first attempt logs one event");
+    let later = matching(&lines, r#""outcome":"reconnect failed""#);
+    assert!(later.len() >= 2, "{} reconnect events", later.len());
+    for line in first.iter().chain(&later) {
+        assert!(line.contains(r#""level":"ERROR""#), "{line}");
+        assert!(line.contains("cannot connect to the AMQP broker"), "{line}");
+    }
+    assert!(
+        matching(&lines, WORKERS_CONSUME).is_empty(),
+        "no worker opened without a broker"
+    );
+    for line in &lines {
+        assert!(!line.contains(&amqp_url), "an event shows the AMQP URL");
+        assert!(
+            !line.contains(&password),
+            "an event shows the AMQP password"
+        );
+    }
+    harness.finish().await
+}
+
+/// A queue missing from the broker when `messaging::run` starts, here `CARD.DEMO.ERROR`, which
+/// CDRD checks first, does not end the run: each session whose workers cannot open is logged,
+/// closed and replaced after a backoff delay, and no worker declares the queue. Once the
+/// operator declares it as `rabbitmq/definitions.json` does, the next session opens the three
+/// workers, and CP00 answers a request and acknowledges it.
+#[tokio::test]
+async fn run_opens_the_workers_once_a_missing_queue_is_declared() -> TestResult {
+    let harness = Harness::start().await?;
+    // Account 1 approves 100.00 (see `approval_creates_summary_and_pending_detail`).
+    let xref = harness.xref(1).await?;
+    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T20 0000001");
+    harness.delete_queue(ERROR_QUEUE).await?;
+    let config = harness.run_config();
+    let capture = trace_capture::capture();
+    let driver = async {
+        let failed = captured(&capture, OPEN_RETRIED, 2).await?;
+        harness.declare_durable(ERROR_QUEUE).await?;
+        captured(&capture, WORKERS_CONSUME, 1).await?;
+        let sent = harness
+            .send(&body, &harness.reply_queue, "run-reopened")
+            .await?;
+        let reply = harness.next_reply().await?;
+        Ok::<_, BoxError>((failed, sent, reply))
+    };
+    let (outcome, stop_took, (failed, sent, reply)) =
+        harness.run_beside(&config, &capture, driver).await?;
+    let lines = capture.lines();
+    drop(capture);
+
+    if let Err(error) = outcome {
+        return Err(format!("run ended with {error} instead of retrying").into());
+    }
+    assert!(
+        stop_took < RUN_RETURN_BOUND,
+        "run returned {stop_took:?} after the stop"
+    );
+    assert!(failed >= 2, "{failed} failed sessions were logged");
+    for line in matching(&lines, OPEN_RETRIED) {
+        assert!(line.contains(r#""level":"ERROR""#), "{line}");
+        assert!(line.contains(r#""outcome":"open failed""#), "{line}");
+        assert!(
+            line.contains(
+                "passive declare of queue CARD.DEMO.ERROR failed: AMQP soft error NOT-FOUND \
+                 (reply code 404)"
+            ),
+            "{line}"
+        );
+    }
+    assert_eq!(
+        matching(&lines, WORKERS_CONSUME).len(),
+        1,
+        "the workers opened once, on the first session after the declare"
+    );
+    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+    let amqp_url = harness.broker.amqp_url();
+    assert!(
+        lines.iter().all(|line| !line.contains(amqp_url)),
+        "an event shows the AMQP URL"
+    );
+    let left = harness.settled_count(harness.request_queue(), 0).await?;
+    assert_eq!(left, 0, "the answered request was acknowledged");
+    harness.finish().await
+}
+
+/// A configuration error ends `messaging::run` at once with that error, because no retry cures
+/// it: a `CARDDEMO_AMQP_URL` that does not parse, before any connection, and a 49-byte
+/// `CARDDEMO_QUEUE_REQUEST_ACCT`, which CDRA refuses on the live broker because its error body
+/// names the request queue in 48 bytes. Neither is retried, and neither the error nor any event
+/// shows the configured value.
+#[tokio::test]
+async fn run_returns_a_configuration_error_without_retrying() -> TestResult {
+    let harness = Harness::start().await?;
+    let invalid_url = "amqp:carddemo-invalid-url".to_owned();
+    let long_queue = "Q".repeat(49);
+    let cases: [(Config, &str, IsExpected); 2] = [
+        (
+            Config {
+                amqp_url: invalid_url.clone(),
+                ..harness.run_config()
+            },
+            invalid_url.as_str(),
+            |error| matches!(error, StartupError::Connect(AmqpError::InvalidUrl)),
+        ),
+        (
+            Config {
+                queue_request_acct: long_queue.clone(),
+                ..harness.run_config()
+            },
+            long_queue.as_str(),
+            |error| {
+                matches!(
+                    error,
+                    StartupError::Declare(AmqpError::QueueName {
+                        variable: "CARDDEMO_QUEUE_REQUEST_ACCT",
+                        max_len: 48,
+                    })
+                )
+            },
+        ),
+    ];
+    for (config, value, expected) in cases {
+        let capture = trace_capture::capture();
+        // Held until `run` returns: dropping every handle would request the stop.
+        let handle = StopHandle::new();
+        let running = Box::pin(
+            run(
+                &config,
+                harness.store(),
+                Arc::clone(&harness.clock),
+                handle.subscribe(),
+            )
+            .with_subscriber(capture.dispatch()),
+        );
+        let outcome = timeout(RUN_RETURN_BOUND, running).await?;
+        drop(handle);
+        let lines = capture.lines();
+        drop(capture);
+
+        let Err(error) = outcome else {
+            return Err(format!("run returned Ok with {value:?} configured").into());
+        };
+        assert!(
+            expected(&error),
+            "unexpected error for {value:?}: {error:?}"
+        );
+        let shown = format!("{error} | {error:?}");
+        assert!(!shown.contains(value), "the error shows {value:?}: {shown}");
+        for needle in [CONNECT_RETRIED, OPEN_RETRIED, WORKERS_CONSUME] {
+            assert!(
+                matching(&lines, needle).is_empty(),
+                "{value:?}: \"{needle}\" was logged"
+            );
+        }
+        assert!(
+            lines.iter().all(|line| !line.contains(value)),
+            "an event shows {value:?}"
+        );
     }
     harness.finish().await
 }

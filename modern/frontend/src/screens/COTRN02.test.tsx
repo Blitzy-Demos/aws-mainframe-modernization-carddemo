@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { clearSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COTRN02 } from "./COTRN02";
 
 /*
@@ -14,12 +21,6 @@ import { COTRN02 } from "./COTRN02";
  * `modern/audit/screens.md` (`COTRN02-nnn`) and `modern/audit/online/COTRN02C.md`
  * (`COTRN02C-nnn`). Every card number a response carries is redacted; the one full-width card
  * number below is synthetic request input, and no password appears.
- *
- * Not tagged here:
- * - COTRN02-002, -003, -005, -007, -008 and -010 describe the header values as read-only `Input`
- *   elements, while `ScreenShell` renders them as text; their content rows (COTRN02-062 to
- *   COTRN02-067) are proved instead.
- * - COTRN02C-001, the sign-on guard, belongs to `RequireSignon`, which this test does not mount.
  */
 
 const ENDPOINT = "/api/v1/transactions";
@@ -302,6 +303,12 @@ const cardNotFound: components["schemas"]["ScreenError"] = {
   field: "card_num",
 };
 
+/** COTRN02C-009: ENTER or PF5 with the account and the card both blank. */
+const keyMissing: components["schemas"]["ScreenError"] = {
+  message: "Account or Card Number must be entered...",
+  field: "acct_id",
+};
+
 /** A JSON response, as the API sends every success and every `ScreenError`. */
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -440,6 +447,40 @@ function messageRow(): { kind: string | undefined; text: string; red: boolean } 
     text: row?.textContent ?? "",
     red: row?.classList.contains("text-destructive") ?? false,
   };
+}
+
+/**
+ * The error state of the input of form member `name`: its `aria-invalid`, the text of the form
+ * message its `aria-describedby` names (`null` when it names none that exists), and whether that
+ * message is for assistive technology only.
+ */
+function fieldError(name: keyof typeof LABELS): {
+  invalid: string | null;
+  message: string | null;
+  srOnly: boolean;
+} {
+  const input = field(name);
+  const message = (input.getAttribute("aria-describedby") ?? "")
+    .split(" ")
+    .map((id) => document.getElementById(id))
+    .find((element) => element?.dataset.slot === "form-message");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    message: message?.textContent ?? null,
+    srOnly: message?.classList.contains("sr-only") ?? false,
+  };
+}
+
+/** The form members whose input is marked invalid, in map order. */
+function markedInputs(): string[] {
+  return NAMES.filter((name) => field(name).getAttribute("aria-invalid") === "true");
+}
+
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (shown) => shown })
+    .filter((element) => element.closest(".sr-only") === null);
 }
 
 /** `aria-busy` of the screen's form: `"true"` while a request is outstanding. */
@@ -673,6 +714,50 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
   });
 
+  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
+  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
+  // are proved under COTRN02-062 to COTRN02-067.
+  // audit: COTRN02-002
+  // audit: COTRN02-003
+  // audit: COTRN02-005
+  // audit: COTRN02-007
+  // audit: COTRN02-008
+  // audit: COTRN02-010
+  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
+    stubApi([]);
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+
+    const header = container.querySelector('[data-slot="card-header"]');
+    expect(header).not.toBeNull();
+    // The title rows hold no form control.
+    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
+    for (const { name, row, col, length } of [
+      { name: "TRNNAME", row: 1, col: 7, length: 4 },
+      { name: "TITLE01", row: 1, col: 21, length: 40 },
+      { name: "CURDATE", row: 1, col: 71, length: 8 },
+      { name: "PGMNAME", row: 2, col: 7, length: 8 },
+      { name: "TITLE02", row: 2, col: 21, length: 40 },
+      { name: "CURTIME", row: 2, col: 71, length: 8 },
+    ]) {
+      // The field's one element stands in the title rows, not in the body or the footer.
+      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      expect(shown).toHaveLength(1);
+      const value = shown.item(0);
+      expect(header?.contains(value)).toBe(true);
+      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
+      // centres the titles included.
+      const cell = value?.parentElement;
+      expect(cell?.className).toBe(cellClass([row, col, length]));
+      expect(value?.textContent).toHaveLength(length);
+      // Neither the value nor anything in its cell takes input or focus.
+      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
+      for (const element of [value, cell]) {
+        expect(element?.hasAttribute("contenteditable")).toBe(false);
+        expect(element?.hasAttribute("tabindex")).toBe(false);
+      }
+    }
+  });
+
   // audit: COTRN02-068
   // audit: COTRN02C-058
   // audit: COTRN02C-060
@@ -870,6 +955,7 @@ describe("COTRN02 Add Transaction screen", () => {
       typed: { acctId: `${ACCOUNT}0` },
       message: "String must contain at most 11 character(s)",
       focus: "acctId",
+      marked: [["acctId", "String must contain at most 11 character(s)"]],
     },
     {
       title: "F5 with a card number longer than its 16 columns",
@@ -877,6 +963,7 @@ describe("COTRN02 Add Transaction screen", () => {
       typed: { cardNum: `${TYPED_CARD}0` },
       message: "String must contain at most 16 character(s)",
       focus: "cardNum",
+      marked: [["cardNum", "String must contain at most 16 character(s)"]],
     },
     {
       title: "ENTER with two data fields too long, the first in map order",
@@ -884,6 +971,10 @@ describe("COTRN02 Add Transaction screen", () => {
       typed: { ...TYPED_BY_ACCOUNT, description: "D".repeat(61), merchantZip: "Z".repeat(11) },
       message: "String must contain at most 60 character(s)",
       focus: "description",
+      marked: [
+        ["description", "String must contain at most 60 character(s)"],
+        ["merchantZip", "String must contain at most 10 character(s)"],
+      ],
     },
   ] as const)("$title shows the map-length message and sends nothing", async (row) => {
     const requests = stubApi([]);
@@ -901,6 +992,20 @@ describe("COTRN02 Add Transaction screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(field(row.focus));
     });
+    // Each input the schema rejects is invalid and names a form message with its own text, which
+    // only assistive technology reads: the message row stays the one visible copy.
+    const marked = new Map<string, string>(row.marked);
+    for (const name of NAMES) {
+      const message = marked.get(name);
+      expect(fieldError(name)).toEqual(
+        message === undefined
+          ? { invalid: "false", message: null, srOnly: false }
+          : { invalid: "true", message, srOnly: true },
+      );
+    }
+    expect(
+      visibleCopies(row.message).map((copy) => copy.closest("[role='alert']") !== null),
+    ).toEqual([true]);
     await settle();
     expect(requests).toHaveLength(0);
   });
@@ -952,7 +1057,7 @@ describe("COTRN02 Add Transaction screen", () => {
       message: "HTTP 500 Internal Server Error",
       focus: undefined,
     },
-  ] as const)("$title shows its message, keeps every field, moves the cursor", async (row) => {
+  ] as const)("$title shows its message, keeps every field, marks its input", async (row) => {
     const requests = stubApi([row.reply]);
     renderScreen({ from: PATHS.COMEN01 });
     typeInto(row.typed);
@@ -975,7 +1080,115 @@ describe("COTRN02 Add Transaction screen", () => {
     });
     await settle();
     expect(document.activeElement).toBe(row.focus === undefined ? enter : field(row.focus));
+    // The named input, by its bare or `fields.` wire name, is invalid and names a form message
+    // with the row's text for assistive technology only; with no field named, none is marked.
+    for (const name of NAMES) {
+      expect(fieldError(name)).toEqual(
+        name === row.focus
+          ? { invalid: "true", message: row.message, srOnly: true }
+          : { invalid: "false", message: null, srOnly: false },
+      );
+    }
+    expect(
+      visibleCopies(row.message).map((copy) => copy.closest("[role='alert']") !== null),
+    ).toEqual([true]);
     expect(requests).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      title: "typing in it, after ENTER",
+      typed: { ...TYPED_BY_ACCOUNT, acctId: "" },
+      rejection: json(400, keyMissing),
+      message: keyMissing.message,
+      via: "ENTER=Continue",
+      then: "type",
+      answer: undefined,
+    },
+    {
+      // F5 runs no resolver, so only the correction itself can clear the mark.
+      title: "typing in it, after F5",
+      typed: {},
+      rejection: json(400, keyMissing),
+      message: keyMissing.message,
+      via: "F5=Copy Last Tran.",
+      then: "type",
+      answer: undefined,
+    },
+    {
+      title: "the next ENTER as soon as it is sent, the add that answers it included",
+      typed: { ...TYPED_BY_ACCOUNT, confirm: "Y" },
+      rejection: json(500, addFailed),
+      message: addFailed.message,
+      via: "ENTER=Continue",
+      then: "ENTER=Continue",
+      answer: added,
+    },
+    {
+      title: "an F5 as soon as it is sent, the prompt that answers it included",
+      typed: { ...TYPED_BY_ACCOUNT, confirm: "Y" },
+      rejection: json(500, addFailed),
+      message: addFailed.message,
+      via: "ENTER=Continue",
+      then: "F5=Copy Last Tran.",
+      answer: promptCopied,
+    },
+    {
+      title: "F4=Clear",
+      typed: { ...TYPED_BY_ACCOUNT, acctId: "" },
+      rejection: json(400, keyMissing),
+      message: keyMissing.message,
+      via: "ENTER=Continue",
+      then: "F4=Clear",
+      answer: undefined,
+    },
+  ] as const)("a server-marked input is unmarked by $title", async (row) => {
+    const held = heldReply();
+    const requests = stubApi([row.rejection, held.reply]);
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+    typeInto(row.typed);
+    fireEvent.click(keyButton(row.via));
+    await waitFor(() => {
+      expect(fieldError("acctId")).toEqual({
+        invalid: "true",
+        message: row.message,
+        srOnly: true,
+      });
+    });
+    expect(markedInputs()).toEqual(["acctId"]);
+
+    if (row.then === "type") {
+      typeInto({ acctId: ACCOUNT });
+    } else {
+      fireEvent.click(keyButton(row.then));
+    }
+
+    const unmarked = { invalid: "false", message: null, srOnly: false };
+    await waitFor(() => {
+      expect(fieldError("acctId")).toEqual(unmarked);
+    });
+    expect(markedInputs()).toEqual([]);
+    const { answer } = row;
+    if (answer === undefined) {
+      await settle();
+      expect(requests).toHaveLength(1);
+      return;
+    }
+    // The send itself clears the mark: its answer is still held.
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    await waitFor(() => {
+      expect(formBusy(container)).toBe("true");
+    });
+    expect(markedInputs()).toEqual([]);
+    held.release(json(200, answer));
+    await waitFor(() => {
+      expect(messageRow().text).toBe(answer.message);
+    });
+    // Neither the add nor the confirmation prompt marks an input: the prompt rejects no value.
+    expect(markedInputs()).toEqual([]);
+    expect(fieldError("confirm")).toEqual(unmarked);
   });
 
   // audit: COTRN02-070
@@ -1137,5 +1350,38 @@ describe("COTRN02 Add Transaction screen", () => {
     held.release(json(200, promptByAccount));
     await settle();
     expect(requests).toHaveLength(1);
+  });
+});
+
+// The sign-on guard lives in the application's route tree, not in the screen, so this group
+// renders that tree rather than the screen beside stubs.
+describe("COTRN02 behind the route guard", () => {
+  // audit: COTRN02C-001
+  it("sends a browser with no session from /transactions/add to /signon, with no request", async () => {
+    clearSession();
+    const requests = stubApi([]);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRN02] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+
+    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      },
+      { timeout: 4000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "Add Transaction" })).toBeNull();
+    expect(screen.queryByLabelText(LABELS.acctId)).toBeNull();
+    await settle();
+    expect(requests).toHaveLength(0);
+    router.dispose();
   });
 });

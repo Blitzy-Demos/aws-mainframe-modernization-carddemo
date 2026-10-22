@@ -23,8 +23,9 @@
 //!
 //! # Redaction boundary
 //!
-//! [`request_span`], [`record_response`], [`message_span`] and [`job_span`] are the only span
-//! shapes the services create, and each carries only the fields its documentation lists.
+//! [`request_span`], [`record_response`], [`message_span`], [`record_reply_message_id`] and
+//! [`job_span`] are the only span shapes the services create and fill in, and each carries only
+//! the fields its documentation lists.
 //! Everything a span or event records reaches standard output, so a caller never adds a field
 //! holding a request or message body, a URI, a query string, a header or a protected value (card
 //! number, CVV, SSN, password), and never interpolates one into an event message.
@@ -33,8 +34,26 @@
 //! properties, can itself be a card number, an SSN or a password, and a `CardDemo` password is
 //! any one to eight printable bytes, spaces included, so nothing in the text tells a protected
 //! value from a harmless one. Such text reaches a span or an event only as a [`ScreenedText`],
-//! which shows that the text is present and how many bytes it has, never a byte of it;
-//! [`message_span`] takes its two message IDs in that form.
+//! never as itself; [`message_span`] takes its two message IDs in that form.
+//!
+//! A message ID must still let an operator find the log lines of one request and tie them to its
+//! reply. A [`ScreenedText`] made with an [`IdKey`] therefore shows the base64url HMAC-SHA256 of
+//! the text under that key, never the text: the same ID gives the same 43 characters on every
+//! line. The caller supplies the key's secret; `carddemo-mq` keys it with its
+//! `CARDDEMO_AMQP_URL`, so an operator who holds the broker credentials recomputes the digest of
+//! an ID they already know, in a shell that exported `modern/.env`, with
+//!
+//! ```text
+//! python3 -c 'import base64,hashlib,hmac,os,sys; print(base64.urlsafe_b64encode(hmac.new(
+//!   os.environ["CARDDEMO_AMQP_URL"].encode(), sys.argv[1].encode(), hashlib.sha256).digest()
+//!   ).rstrip(b"=").decode())' "$ID"
+//! ```
+//!
+//! The digest is keyed because an unkeyed hash would not hide a card number: its issuer prefix
+//! is public and its last digit a check digit, so every candidate could be hashed and compared
+//! with the log. An ID this system generates, the CP00 reply's `message_id` from
+//! `messaging::ids`, holds no requester text and is recorded verbatim through
+//! [`record_reply_message_id`].
 //!
 //! # Dependency boundary
 //!
@@ -66,6 +85,7 @@ use std::fmt;
 use std::path::Path;
 use std::time::Duration;
 
+use jsonwebtoken::{Algorithm, EncodingKey};
 use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;
@@ -87,9 +107,10 @@ use crate::config::OtelExport;
 ///
 /// An alert is emitted as
 /// `tracing::error!(target: runtime::telemetry::ALERT_TARGET, alert = "…", …)`. Its field values
-/// name the condition and give each message identifier only as its [`ScreenedText`] shows it,
-/// one `*` per byte; they never hold a message body, the text of a requester's property or a
-/// protected value.
+/// name the condition and give each requester-chosen message identifier only as its keyed
+/// [`ScreenedText`] shows it, the base64url HMAC-SHA256 under the same [`IdKey`] as the message
+/// spans, so an alert is matched to the message spans of the same request; they never hold a
+/// message body, the text of a requester's property or a protected value.
 pub const ALERT_TARGET: &str = "carddemo::alert";
 
 /// Route the api records when axum provides no `MatchedPath` (a request no route matched), so a
@@ -409,37 +430,105 @@ pub fn record_response(span: &Span, status: u16, latency: Duration) {
     span.record("latency_ms", latency_ms);
 }
 
+/// The secret key of the message IDs that telemetry records, under which a [`ScreenedText`]
+/// shows a requester's ID as its base64url HMAC-SHA256.
+///
+/// The digest lets an operator match every log line of one request, and recompute it for an ID
+/// they already know, without the log holding the ID: an ID can be a card number, an SSN or a
+/// password, and only a holder of the key can test a guess against a digest.
+///
+/// The caller supplies the secret. `carddemo-mq` keys its workers with its `CARDDEMO_AMQP_URL`,
+/// exactly the string it connects with: anyone who holds the broker credentials can already read
+/// every request and its properties from the broker, so a digest keyed by them discloses nothing
+/// its key holder cannot read directly. The digest is exactly as protected as the messages it
+/// identifies, which an unkeyed hash would not be, since a card number can be brute-forced.
+/// `Debug` never shows the secret, and no `Display` or `Serialize` exists.
+#[derive(Clone)]
+pub struct IdKey(EncodingKey);
+
+impl IdKey {
+    /// The key of `secret`. Any bytes, an empty secret's included, make an HMAC key, so every
+    /// secret makes one.
+    #[must_use]
+    pub fn new(secret: &str) -> Self {
+        Self(EncodingKey::from_secret(secret.as_bytes()))
+    }
+
+    /// The base64url HMAC-SHA256 of `text` under this key, without padding: 43 characters of
+    /// `A`-`Z`, `a`-`z`, `0`-`9`, `-` and `_`. `None` when signing fails, so that the caller
+    /// withholds the text rather than showing it.
+    fn digest(&self, text: &str) -> Option<String> {
+        jsonwebtoken::crypto::sign(text.as_bytes(), &self.0, Algorithm::HS256).ok()
+    }
+}
+
+impl fmt::Debug for IdKey {
+    /// A fixed placeholder, never a byte of the secret.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("IdKey(<redacted>)")
+    }
+}
+
 /// Text a requester chose, such as an AMQP property, in the only form a span, an event or a
-/// `Debug` output may show it: one `*` for each of its bytes.
+/// `Debug` output may show it: its keyed digest, or one `*` for each of its bytes.
 ///
 /// The requester chooses the text, so it can be a card number, an SSN or a password, and a
 /// `CardDemo` password is any one to eight printable bytes, spaces included. Nothing in the text
-/// tells such a value from a harmless one, so every non-empty text is withheld whole: a
-/// diagnostic learns that the text is present and how many bytes it has, and never a byte of it.
-/// An empty text, which has no byte to hide, shows as empty.
+/// tells such a value from a harmless one, so every non-empty text is withheld whole, never a
+/// byte of it shown:
 ///
-/// `Display` writes the stars and `Debug` writes them quoted, as `str`'s `Debug` writes a string;
-/// neither ever formats the text. The value only borrows the text, so the caller keeps the
-/// original for the wire.
+/// - made by [`ScreenedText::keyed`] with an [`IdKey`], it shows the base64url HMAC-SHA256 of
+///   the text under that key, 43 characters that are the same for the same text on every line,
+///   so the log lines of one message can be matched; an operator recomputes the digest of a
+///   known ID with the `python3` line of the module documentation. The digest is keyed because
+///   an unkeyed hash of a card number could be brute-forced from the log;
+/// - made by [`ScreenedText::new`], it shows one `*` per byte: a diagnostic learns that the text
+///   is present and how many bytes it has. Should signing ever fail, a keyed text falls back to
+///   this form rather than show the text.
+///
+/// An empty text, which has no byte to hide, shows as empty in either form.
+///
+/// `Display` writes the shown form and `Debug` writes it quoted, as `str`'s `Debug` writes a
+/// string; neither ever formats the text. The value only borrows the text, so the caller keeps
+/// the original for the wire.
 #[derive(Clone, Copy)]
-pub struct ScreenedText<'a>(&'a str);
+pub struct ScreenedText<'a> {
+    text: &'a str,
+    key: Option<&'a IdKey>,
+}
 
 impl<'a> ScreenedText<'a> {
-    /// Wraps `text`, which no formatting of the value ever shows.
+    /// Wraps `text`, which shows as one `*` per byte, never as itself.
     #[must_use]
     pub const fn new(text: &'a str) -> Self {
-        Self(text)
+        Self { text, key: None }
     }
 
-    /// Whether the text is withheld, which every non-empty text is.
+    /// Wraps `text`, which shows as its base64url HMAC-SHA256 under `key`, never as itself.
+    #[must_use]
+    pub const fn keyed(text: &'a str, key: &'a IdKey) -> Self {
+        Self {
+            text,
+            key: Some(key),
+        }
+    }
+
+    /// Whether the text is withheld, which every non-empty text is: it shows as its digest or
+    /// its stars, never as itself.
     #[must_use]
     pub fn is_withheld(&self) -> bool {
-        !self.0.is_empty()
+        !self.text.is_empty()
     }
 
-    /// One `*` for each byte of the text, and nothing for an empty text.
+    /// The keyed digest of the text, or one `*` for each of its bytes when it was made without a
+    /// key or signing fails, and nothing for an empty text.
     fn shown(&self) -> String {
-        "*".repeat(self.0.len())
+        if self.text.is_empty() {
+            return String::new();
+        }
+        self.key
+            .and_then(|key| key.digest(self.text))
+            .unwrap_or_else(|| "*".repeat(self.text.len()))
     }
 }
 
@@ -458,12 +547,15 @@ impl fmt::Debug for ScreenedText<'_> {
 /// The span of one broker message, named `mq.message`.
 ///
 /// It records the `queue` the message was taken from and, when the message carries them, its
-/// `message_id` and `correlation_id` properties, each as its [`ScreenedText`] displays it, one
-/// `*` per byte: the requester chooses both and either can be a card number, an SSN or a
-/// password, so the span records only that an ID is present and its length in bytes, never its
-/// text. Never the body: request and reply bodies hold card numbers and account data. A worker
-/// runs its processing future inside the span through `tracing::Instrument::instrument`; never
-/// hold `Span::enter` across an `.await`.
+/// `message_id` and `correlation_id` properties, each as its [`ScreenedText`] displays it. The
+/// workers pass both keyed with their [`IdKey`], so the span shows each as its base64url
+/// HMAC-SHA256, which matches the span to every other line about the same message and to the
+/// reply that copies the `correlation_id`. The requester chooses both and either can be a card
+/// number, an SSN or a password, so the span never records their text. A fourth field,
+/// `reply_message_id`, stays empty until [`record_reply_message_id`] records the ID this system
+/// generated for the reply. Never the body: request and reply bodies hold card numbers and
+/// account data. A worker runs its processing future inside the span through
+/// `tracing::Instrument::instrument`; never hold `Span::enter` across an `.await`.
 #[must_use]
 pub fn message_span(
     queue: &str,
@@ -474,7 +566,8 @@ pub fn message_span(
         "mq.message",
         queue,
         message_id = Empty,
-        correlation_id = Empty
+        correlation_id = Empty,
+        reply_message_id = Empty
     );
     if let Some(message_id) = message_id {
         span.record("message_id", tracing::field::display(message_id));
@@ -483,6 +576,18 @@ pub fn message_span(
         span.record("correlation_id", tracing::field::display(correlation_id));
     }
     span
+}
+
+/// Records `message_id`, verbatim, as the `reply_message_id` of a span made by
+/// [`message_span`], so that every later line of the span, and the exported span, ties the
+/// request to its reply.
+///
+/// Only for an ID this system generates, such as the CP00 reply's `message_id` from
+/// `messaging::ids`, which is made of a timestamp and a process counter and holds no requester
+/// text. Never pass a requester's property here: that reaches a span only as a [`ScreenedText`].
+/// On any other span it records nothing.
+pub fn record_reply_message_id(span: &Span, message_id: &str) {
+    span.record("reply_message_id", message_id);
 }
 
 /// The span of one batch job run, named `batch.job`, recording only the `job` (subcommand) name.
@@ -516,13 +621,30 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, InitError, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS, ScreenedText,
-        UNMATCHED_ROUTE, env_filter, init, job_span, json_layer, json_subscriber, message_span,
-        otel_layer, record_response, request_span, service_name, service_resource, tracer_provider,
+        ALERT_TARGET, IdKey, InitError, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS,
+        ScreenedText, UNMATCHED_ROUTE, env_filter, init, job_span, json_layer, json_subscriber,
+        message_span, otel_layer, record_reply_message_id, record_response, request_span,
+        service_name, service_resource, tracer_provider,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
     const CARD_NUMBER: &str = "0500024453765740";
+
+    /// The ID key secret of the keyed cases, and a second one that must give other digests.
+    const ID_KEY: &str = "local-test-id-key";
+    const OTHER_ID_KEY: &str = "local-test-id-key-2";
+
+    /// A CP00 reply `message_id` as `messaging::ids` generates it: a timestamp to the millisecond,
+    /// the process ID and a counter.
+    const REPLY_MESSAGE_ID: &str = "20220718193005250-4242-0";
+
+    /// Whether `shown` has the form of a keyed digest: 43 base64url characters, no padding.
+    fn is_digest(shown: &str) -> bool {
+        shown.len() == 43
+            && shown
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    }
 
     /// Property values a requester may choose, none of which a diagnostic may show: a card
     /// number, whole and spaced out, an SSN with and without dashes, an 8-byte password, a
@@ -729,6 +851,120 @@ mod tests {
     }
 
     #[test]
+    fn the_keyed_digest_is_the_base64url_hmac_sha256_of_rfc_4231_test_case_2() {
+        let key = IdKey::new("Jefe");
+        let screened = ScreenedText::keyed("what do ya want for nothing?", &key);
+        let expected = "W9zBRr9gdU5qBCQmCJV1x1oAPwidJzmDnexYuWTsOEM";
+        assert_eq!(screened.to_string(), expected);
+        assert_eq!(format!("{screened:?}"), format!("\"{expected}\""));
+        assert!(screened.is_withheld());
+    }
+
+    #[test]
+    fn keyed_screened_text_shows_a_stable_digest_that_hides_every_probe() {
+        let key = IdKey::new(ID_KEY);
+        let other = IdKey::new(OTHER_ID_KEY);
+        let mut digests = Vec::with_capacity(PROBES.len());
+        for text in PROBES {
+            let screened = ScreenedText::keyed(text, &key);
+            let shown = screened.to_string();
+            assert!(is_digest(&shown), "{text:?}: {shown}");
+            assert!(!shown.contains(text), "{text:?} in {shown}");
+            assert!(screened.is_withheld(), "{text:?}");
+            assert_eq!(format!("{screened:?}"), format!("\"{shown}\""), "{text:?}");
+            assert_eq!(
+                ScreenedText::keyed(text, &key).to_string(),
+                shown,
+                "{text:?}: the same key gives the same digest"
+            );
+            assert_ne!(
+                ScreenedText::keyed(text, &other).to_string(),
+                shown,
+                "{text:?}: another key gives another digest"
+            );
+            digests.push(shown);
+        }
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(digests.len(), PROBES.len(), "two probes share a digest");
+
+        let empty = ScreenedText::keyed("", &key);
+        assert!(!empty.is_withheld());
+        assert_eq!(empty.to_string(), "");
+    }
+
+    #[test]
+    fn an_empty_secret_still_hides_ids_and_a_key_never_shows_its_secret() {
+        let empty_secret = IdKey::new("");
+        for text in PROBES {
+            let shown = ScreenedText::keyed(text, &empty_secret).to_string();
+            assert!(is_digest(&shown), "{text:?}: {shown}");
+            assert!(!shown.contains(text), "{text:?} in {shown}");
+        }
+
+        let secret = "s3cret-id-key";
+        let key = IdKey::new(secret);
+        let copy = key.clone();
+        assert_eq!(
+            ScreenedText::keyed(CARD_NUMBER, &copy).to_string(),
+            ScreenedText::keyed(CARD_NUMBER, &key).to_string(),
+            "a copied key gives the same digest"
+        );
+        for shown in [format!("{key:?}"), format!("{copy:?}"), format!("{key:#?}")] {
+            assert_eq!(shown, "IdKey(<redacted>)");
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    #[test]
+    fn message_span_records_keyed_digests_and_the_reply_message_id_verbatim() {
+        let key = IdKey::new(ID_KEY);
+        for (message_id, correlation_id) in PROBES.into_iter().zip(PROBES.into_iter().rev()) {
+            let output = capture(|| {
+                let span = message_span(
+                    "CARD.DEMO.REQUEST.PAUTH",
+                    Some(ScreenedText::keyed(message_id, &key)),
+                    Some(ScreenedText::keyed(correlation_id, &key)),
+                );
+                span.in_scope(|| tracing::info!("before the reply"));
+                record_reply_message_id(&span, REPLY_MESSAGE_ID);
+                span.in_scope(|| tracing::info!("after the reply"));
+            });
+            let lines: Vec<&str> = output.lines().collect();
+            let [before, after] = lines.as_slice() else {
+                panic!("expected two event lines, got {output}");
+            };
+            let message_digest = format!(
+                r#""message_id":"{}""#,
+                ScreenedText::keyed(message_id, &key)
+            );
+            let correlation_digest = format!(
+                r#""correlation_id":"{}""#,
+                ScreenedText::keyed(correlation_id, &key)
+            );
+            for line in [before, after] {
+                assert_contains_all(
+                    line,
+                    &[
+                        r#""name":"mq.message""#,
+                        r#""queue":"CARD.DEMO.REQUEST.PAUTH""#,
+                        &message_digest,
+                        &correlation_digest,
+                    ],
+                );
+            }
+            assert!(!before.contains("reply_message_id"), "{before}");
+            assert_contains_all(
+                after,
+                &[&format!(r#""reply_message_id":"{REPLY_MESSAGE_ID}""#)],
+            );
+            for probe in PROBES {
+                assert!(!output.contains(probe), "{probe:?} in {output}");
+            }
+        }
+    }
+
+    #[test]
     fn job_span_records_the_job_name() {
         let output = capture(|| job_span("posttran").in_scope(|| tracing::info!("probe")));
         assert_contains_all(&output, &[r#""name":"batch.job""#, r#""job":"posttran""#]);
@@ -889,6 +1125,67 @@ mod tests {
             assert_eq!(
                 attribute("correlation_id"),
                 Some("*".repeat(correlation_id.len())),
+                "{span:?}"
+            );
+            let values: Vec<String> = span
+                .attributes
+                .iter()
+                .chain(span.events.iter().flat_map(|event| &event.attributes))
+                .map(|kv| kv.value.as_str().into_owned())
+                .collect();
+            for probe in PROBES {
+                assert!(
+                    values.iter().all(|value| !value.contains(probe)),
+                    "{probe:?} in {span:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn exported_message_spans_carry_keyed_digests_and_the_reply_message_id_verbatim() {
+        let key = IdKey::new(ID_KEY);
+        let exported = Exported::default();
+        let provider = TracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        let cases: Vec<(&str, &str)> = PROBES.into_iter().zip(PROBES.into_iter().rev()).collect();
+        tracing::subscriber::with_default(subscriber, || {
+            for &(message_id, correlation_id) in &cases {
+                let span = message_span(
+                    "CARD.DEMO.REQUEST.PAUTH",
+                    Some(ScreenedText::keyed(message_id, &key)),
+                    Some(ScreenedText::keyed(correlation_id, &key)),
+                );
+                record_reply_message_id(&span, REPLY_MESSAGE_ID);
+                span.in_scope(|| tracing::info!("probe"));
+            }
+        });
+
+        let spans = exported.spans();
+        assert_eq!(spans.len(), cases.len(), "{spans:?}");
+        for (span, &(message_id, correlation_id)) in spans.iter().zip(&cases) {
+            assert_eq!(span.name, "mq.message");
+            let attribute = |name: &str| {
+                span.attributes
+                    .iter()
+                    .find(|kv| kv.key.as_str() == name)
+                    .map(|kv| kv.value.as_str().into_owned())
+            };
+            assert_eq!(
+                attribute("message_id"),
+                Some(ScreenedText::keyed(message_id, &key).to_string()),
+                "{span:?}"
+            );
+            assert_eq!(
+                attribute("correlation_id"),
+                Some(ScreenedText::keyed(correlation_id, &key).to_string()),
+                "{span:?}"
+            );
+            assert_eq!(
+                attribute("reply_message_id").as_deref(),
+                Some(REPLY_MESSAGE_ID),
                 "{span:?}"
             );
             let values: Vec<String> = span

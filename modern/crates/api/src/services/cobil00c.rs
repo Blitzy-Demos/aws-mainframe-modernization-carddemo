@@ -35,10 +35,11 @@
 //! [`ServiceError::Store`]. Returned in the middle of the payment, it drops the open `PgTx`,
 //! which rolls the transaction back, so nothing of the payment stands.
 //!
-//! A failed file statement, answered with the program's message or, for the cross-reference
-//! read, not answered at all, is logged once by [`traced`] before it becomes the domain's value,
-//! in place of the CICS codes the COBOL does not show. It is the only record of a failure whose
-//! message a later step overwrites.
+//! A failed file statement is logged once before it becomes the domain's value, in place of the
+//! CICS codes the COBOL does not show: by [`traced`], as an `ERROR`, when the program's message
+//! answers it, and by [`traced_unanswered`], as a `WARN`, for the cross-reference read, which is
+//! not answered at all. It is the only record of a failure whose message a later step
+//! overwrites.
 //!
 //! # Money and cardholder data
 //!
@@ -216,7 +217,7 @@ async fn read_xref(
             Ok(found)
         }
         Err(error) => {
-            traced(READ_CXACAIX, &error);
+            traced_unanswered(READ_CXACAIX, &error);
             savepoint.rollback().await?;
             Ok(None)
         }
@@ -302,13 +303,27 @@ async fn rewrite_account(
     }
 }
 
-/// The tracing event of a failed file statement of `paragraph`, in place of the CICS `RESP`
-/// and `RESP2` codes the COBOL neither shows nor keeps.
+/// The tracing event of a failed file statement of `paragraph` that the request answers with
+/// the program's 500 message, in place of the CICS `RESP` and `RESP2` codes the COBOL neither
+/// shows nor keeps: an `ERROR` (COBIL00C-015, COBIL00C-024, COBIL00C-029, COBIL00C-030,
+/// COBIL00C-033).
 ///
 /// `paragraph` is a constant of this module; the error's `Display` holds only an SQLSTATE and a
 /// constraint or column name, never a key, an amount or a card number (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
+    tracing::error!(
+        program = PROGRAM,
+        paragraph,
+        error = %error,
+        "COBIL00C file statement failed"
+    );
+}
+
+/// [`traced`] for the failed statement of `paragraph` that the payment carries on past, the
+/// cross-reference read, whose message never reaches the answer (COBIL00C-021, COBIL00C-022,
+/// X-COBIL00C-1): a `WARN`, since the payment can still succeed.
+fn traced_unanswered(paragraph: &'static str, error: &PersistenceError) {
     tracing::warn!(
         program = PROGRAM,
         paragraph,
@@ -336,6 +351,7 @@ mod tests {
 
     use super::{
         BROWSE_TRANSACT, READ_ACCTDAT, READ_CXACAIX, UPDATE_ACCTDAT, WRITE_TRANSACT, pay, traced,
+        traced_unanswered,
     };
     use crate::app::AppState;
     use crate::auth::extract::SignedOnUser;
@@ -365,19 +381,27 @@ mod tests {
         Ok(TransactionRecord::decode(body)?)
     }
 
+    /// The event function a paragraph's failure goes through.
+    type Traced = fn(&'static str, &PersistenceError);
+
     /// COBIL00C-015, COBIL00C-022, COBIL00C-024, COBIL00C-029, COBIL00C-030, COBIL00C-033:
     /// the event of each statement's failure names the program, the paragraph and the store
-    /// error, and nothing else.
+    /// error, and nothing else. It is an `ERROR` for a failure the program answers with a 500,
+    /// and a `WARN` for the cross-reference read, which the payment carries on past.
     #[test]
     fn a_failed_statement_is_logged_with_its_paragraph_and_cause() -> TestResult {
         let traces = trace_capture::capture();
-        let cases = [
+        let cases: [(Traced, &str, &str, PersistenceError, &str); 5] = [
             (
+                traced,
+                "ERROR",
                 READ_ACCTDAT,
                 PersistenceError::Unavailable,
                 "database unavailable",
             ),
             (
+                traced_unanswered,
+                "WARN",
                 READ_CXACAIX,
                 PersistenceError::Database {
                     sqlstate: Some("57014".to_owned()),
@@ -386,11 +410,15 @@ mod tests {
                 "database error (SQLSTATE 57014)",
             ),
             (
+                traced,
+                "ERROR",
                 BROWSE_TRANSACT,
                 PersistenceError::decode("tran_id", DecodeKind::NotNumeric),
                 "column tran_id does not fit its picture: not all digits",
             ),
             (
+                traced,
+                "ERROR",
                 WRITE_TRANSACT,
                 PersistenceError::Duplicate {
                     constraint: Some("transactions_pkey".to_owned()),
@@ -398,21 +426,24 @@ mod tests {
                 "duplicate key (constraint transactions_pkey)",
             ),
             (
+                traced,
+                "ERROR",
                 UPDATE_ACCTDAT,
                 PersistenceError::Check { constraint: None },
                 "check constraint violated",
             ),
         ];
-        for (paragraph, error, cause) in cases {
+        for (log, level, paragraph, error, cause) in cases {
             traces.clear();
-            traced(paragraph, &error);
+            log(paragraph, &error);
             let lines = traces.lines();
             let [line] = lines.as_slice() else {
                 return Err(format!("{paragraph}: {} lines", lines.len()).into());
             };
+            let level = format!(r#""level":"{level}""#);
             let paragraph = format!(r#""paragraph":"{paragraph}""#);
             for expected in [
-                r#""level":"WARN""#,
+                level.as_str(),
                 r#""program":"COBIL00C""#,
                 paragraph.as_str(),
                 cause,

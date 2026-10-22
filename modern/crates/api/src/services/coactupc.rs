@@ -385,7 +385,7 @@ fn rewritten(result: Result<bool, PersistenceError>, statement: &'static str) ->
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::warn!(
+    tracing::error!(
         program = PROGRAM,
         paragraph,
         statement,
@@ -411,7 +411,7 @@ mod tests {
     /// The parts every event of a failed statement carries.
     fn event_parts(paragraph: &str, statement: &str) -> [String; 4] {
         [
-            r#""level":"WARN""#.to_owned(),
+            r#""level":"ERROR""#.to_owned(),
             r#""program":"COACTUPC""#.to_owned(),
             format!(r#""paragraph":"{paragraph}""#),
             format!(r#""statement":"{statement}""#),
