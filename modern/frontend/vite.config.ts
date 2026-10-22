@@ -62,6 +62,8 @@ export default defineConfig({
           name: "dom",
           environment: "jsdom",
           include: ["src/**/*.test.tsx"],
+          // jsdom screen render tests run 1-5 s each on a loaded host, past Vitest's 5 s default.
+          testTimeout: 30_000,
         },
       },
     ],

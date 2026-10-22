@@ -4,7 +4,6 @@ import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
-import { INVALID_KEY, TITLE01, TITLE02 } from "@/lib/header";
 import { PATHS, PROGRAM_ROUTES } from "@/routes";
 import { COMEN01 } from "./COMEN01";
 
@@ -28,6 +27,20 @@ import { COMEN01 } from "./COMEN01";
  */
 
 const TOKEN = "test-token";
+
+/*
+ * The header titles and the invalid-key text are written out from their copybooks rather than
+ * imported from `@/lib/header`, which the screen itself uses, so a wrong value there fails here.
+ */
+
+/** `CCDA-TITLE01 PIC X(40)`, header row 1 (`app/cpy/COTTL01Y.cpy:18-19`, COMEN01-030). */
+const TITLE01 = "      AWS Mainframe Modernization       ";
+
+/** `CCDA-TITLE02 PIC X(40)`, header row 2 (`app/cpy/COTTL01Y.cpy:20-22`, COMEN01-033). */
+const TITLE02 = "              CardDemo                  ";
+
+/** `CCDA-MSG-INVALID-KEY PIC X(50)`, padded to its 50 bytes (`app/cpy/CSMSG01Y.cpy:20-21`). */
+const INVALID_KEY = "Invalid key pressed. Please see below...".padEnd(50, " ");
 
 /** `'Please enter a valid option number...'` (COMEN01C.cbl:131-132, COMEN01C-011). */
 const INVALID_OPTION = "Please enter a valid option number...";
