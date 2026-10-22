@@ -378,31 +378,76 @@ fn entity_of(name: &str) -> Option<&str> {
         .filter(|entity| !entity.is_empty())
 }
 
-/// From `from`, the index of the first `{`; `None` when a `;` or the end of the tokens comes
-/// first, as for a declaration without a body.
-fn body_open(tokens: &[Token], from: usize) -> Option<usize> {
-    let (at, token) = tokens
-        .iter()
-        .enumerate()
-        .skip(from)
-        .find(|(_, token)| matches!(token.kind, Kind::Punct('{' | ';')))?;
-    matches!(token.kind, Kind::Punct('{')).then_some(at)
+/// Applies one token of an item header to `groups`, the delimiters open at that point, innermost
+/// last, and reports whether the header is still balanced.
+///
+/// `(`, `[` and `{` open a group. `)`, `]` and `}` close the innermost open group of their kind
+/// together with anything opened inside it; one with no such group open unbalances the header.
+/// `<` opens a generic list only at the top level or directly inside another generic list, and
+/// `>` closes one only while a generic list is innermost, so a comparison in a braced const
+/// expression such as `{ 2 > 1 }` or `{ 1 < 2 }`, and a `<` or `>` inside parentheses or
+/// brackets, leaves the nesting alone. `->` and `=>` are tokens of their own and never count.
+fn nest(groups: &mut Vec<char>, kind: &Kind) -> bool {
+    match *kind {
+        Kind::Punct('<') if groups.last().is_none_or(|&top| top == '<') => groups.push('<'),
+        Kind::Punct('>') if groups.last() == Some(&'<') => {
+            groups.pop();
+        }
+        Kind::Punct(opener @ ('(' | '[' | '{')) => groups.push(opener),
+        Kind::Punct(closer @ (')' | ']' | '}')) => {
+            let opener = match closer {
+                ')' => '(',
+                ']' => '[',
+                _ => '{',
+            };
+            let Some(at) = groups.iter().rposition(|&group| group == opener) else {
+                return false;
+            };
+            groups.truncate(at);
+        }
+        _ => {}
+    }
+    true
 }
 
-/// At a `<`, the index just past its matching `>`; `None` when the tokens end first. Only `<`
-/// and `>` count, because `->` and `=>` are tokens of their own.
-fn skip_angles(tokens: &[Token], open: usize) -> Option<usize> {
-    let mut depth: usize = 0;
-    for (at, token) in tokens.iter().enumerate().skip(open) {
-        match token.kind {
-            Kind::Punct('<') => depth += 1,
-            Kind::Punct('>') => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    return Some(at + 1);
-                }
+/// From `from`, the index of the `{` that opens the item's body: the first `{` at the top level
+/// of the header, outside every generic list, parenthesis, bracket and brace that [`nest`]
+/// tracks, so neither a braced const default or argument (`<const N: usize = { 4 }>`,
+/// `Store<{ 4 }>`) nor the `;` of an array type (`[Widget; 4]`) ends the header. `None` when a
+/// top-level `;` comes first, as for a declaration without a body, when the header is
+/// unbalanced, or when the tokens end.
+fn body_open(tokens: &[Token], from: usize) -> Option<usize> {
+    let mut groups = Vec::new();
+    for (at, token) in tokens.iter().enumerate().skip(from) {
+        if groups.is_empty() {
+            match token.kind {
+                Kind::Punct('{') => return Some(at),
+                Kind::Punct(';') => return None,
+                _ => {}
             }
-            _ => {}
+        }
+        if !nest(&mut groups, &token.kind) {
+            return None;
+        }
+    }
+    None
+}
+
+/// At a `<`, the index just past the `>` that closes it, nesting as [`nest`] does, so a braced
+/// const argument holding a comparison (`<{ 2 > 1 }>`) or an array type (`<[u8; 4]>`) stays
+/// inside the list. `None` when the token at `open` is not `<`, when the list is unbalanced, or
+/// when the tokens end first.
+fn skip_angles(tokens: &[Token], open: usize) -> Option<usize> {
+    if !is_punct(tokens, open, '<') {
+        return None;
+    }
+    let mut groups = Vec::new();
+    for (at, token) in tokens.iter().enumerate().skip(open) {
+        if !nest(&mut groups, &token.kind) {
+            return None;
+        }
+        if groups.is_empty() {
+            return Some(at + 1);
         }
     }
     None
@@ -624,7 +669,12 @@ fn repository_methods_never_repeat_their_entity() {
 /// step over. Being a raw string, it is invisible to the workspace scan. The fourth matching
 /// implementation, on `Generic`, carries a leading `::`, a `Fn() -> u8` bound, trait generic
 /// arguments, a `where` clause, a raw byte string and a byte char holding `}`, and a raw
-/// identifier method name.
+/// identifier method name. The six items after it put delimiters in their headers that must not
+/// end the header: braced const defaults, one holding a comparison; a braced const target
+/// argument; braced const trait arguments holding `>` and `<`; an array target type; and array
+/// types in a generic default and in `where` clauses. Each declares one compliant method and one
+/// that repeats its entity, so the method count proves the real body is read and the flagged
+/// list proves its offender is caught.
 const FIXTURE: &str = r##"
 pub trait WidgetRepository: Send {
     fn find_widget_by_id(&self);
@@ -664,16 +714,46 @@ impl<T: Fn() -> u8> ::persistence::WidgetRepository<T> for Generic<T> where T: S
     fn find_by_id(&self) { let _s = br#"}"#; let _b = b'}'; }
     fn r#type(&self) {}
 }
+
+pub trait GizmoRepository<const N: usize = { 4 }, const B: bool = { 2 > 1 }> {
+    fn gizmo_total(&self);
+    fn find_by_id(&self);
+}
+
+impl WidgetRepository for Store<{ 4 }> {
+    fn widget_total(&self) {}
+    fn page_after(&self) {}
+}
+
+impl WidgetRepository<{ 2 > 1 }, { 1 < 2 }> for Store {
+    fn first_widget(&self) {}
+    fn next_id(&self) {}
+}
+
+impl WidgetRepository for [Widget; 4] {
+    fn widgets_after(&self) {}
+    fn find_by_id(&self) {}
+}
+
+trait SprocketRepository<T = [u8; 4]> where [T; 2]: Sized {
+    fn sprocket_ids(&self);
+    fn page_after(&self);
+}
+
+impl<T> GizmoRepository for Wrapper<T> where [T; 2]: Sized {
+    fn page_gizmos(&self) {}
+    fn next_id(&self) {}
+}
 "##;
 
 #[test]
 fn scanner_self_check() {
     let report = scan_source("fixture.rs", FIXTURE);
-    assert_eq!(report.traits, 1, "repository traits in the fixture");
-    assert_eq!(report.impls, 4, "repository implementations in the fixture");
+    assert_eq!(report.traits, 3, "repository traits in the fixture");
+    assert_eq!(report.impls, 8, "repository implementations in the fixture");
     assert_eq!(
-        report.methods, 14,
-        "methods declared directly in the five bodies"
+        report.methods, 26,
+        "methods declared directly in the eleven bodies"
     );
 
     let flagged: Vec<(&str, &str, usize)> = report
@@ -687,10 +767,16 @@ fn scanner_self_check() {
             ("trait WidgetRepository", "find_widget_by_id", 3),
             ("impl WidgetRepository for FakeStore", "widget_count", 11),
             ("impl WidgetRepository for PgTx", "find_widgets", 31),
+            ("trait GizmoRepository", "gizmo_total", 42),
+            ("impl WidgetRepository for Store", "widget_total", 47),
+            ("impl WidgetRepository for Store", "first_widget", 52),
+            ("impl WidgetRepository for Widget", "widgets_after", 57),
+            ("trait SprocketRepository", "sprocket_ids", 62),
+            ("impl GizmoRepository for Wrapper", "page_gizmos", 67),
         ],
         "flagged methods with their lines"
     );
-    assert_eq!(report.violations.len(), 3);
+    assert_eq!(report.violations.len(), 9);
     assert!(
         report.violations.contains(
             &"fixture.rs:31: impl WidgetRepository for PgTx method find_widgets repeats entity \
@@ -725,7 +811,7 @@ fn scanner_self_check() {
     for (cut, _) in FIXTURE.char_indices() {
         let partial = scan_source("cut.rs", FIXTURE.get(..cut).unwrap_or_default());
         assert!(
-            partial.traits <= 1 && partial.impls <= 4,
+            partial.traits <= 3 && partial.impls <= 8,
             "prefix of {cut} characters"
         );
     }
