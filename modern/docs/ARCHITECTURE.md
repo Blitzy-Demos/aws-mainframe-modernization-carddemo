@@ -178,7 +178,7 @@ A behaviour that files in more than one folder must perform identically lives in
 
 ## 8. Legacy disposition
 
-- A COBOL program or paragraph is carried over if and only if it is reachable, through `XCTL`, `LINK`, `CALL` or `EXEC PGM`, from a README online row or from one of the 15 in-scope jobs. [API.md](API.md) lists the 27 endpoints and the 15 jobs that scope it.
+- A COBOL program or paragraph is carried over if and only if it is reachable, through `XCTL`, `LINK`, `CALL` or `EXEC PGM`, from a README online row or from one of the 15 in-scope jobs. [API.md](API.md) lists the 27 endpoints, and [SETUP.md, section 6](SETUP.md#6-batch-jobs) the 15 jobs as `carddemo-batch` subcommands, that scope it.
 - Every reachable paragraph is ported with its audited behaviour, defects included. Stub paragraphs stay no-ops: `1400-COMPUTE-FEES` ([`app/cbl/CBACT04C.cbl:518-520`](../../app/cbl/CBACT04C.cbl)) and `5600-READ-PROFILE-DATA` ([`app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:647-651`](../../app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl)).
 - Unreachable programs are not ported: `CBACT01C`, `CBACT02C`, `CBACT03C`, `CBCUS01C`, `CBTRN01C`, `CBEXPORT`, `CBIMPORT`, `COBSWAIT`, `DBUNLDGS`, `PAUDBLOD`, `PAUDBUNL`, and the assembler modules `COBDATFT` and `MVSWAIT`.
 - Screens follow the same rule. A BMS map is carried over when its README transaction is in scope, which holds for all 21 maps.
