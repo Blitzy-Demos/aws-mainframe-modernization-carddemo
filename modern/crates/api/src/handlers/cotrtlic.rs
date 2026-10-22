@@ -30,12 +30,16 @@
 //!
 //! COTRTLIC re-sends the whole screen with every message (`COTRTLIC.cbl:699-720`), so an input
 //! error, a row another user deleted and a Db2 failure still answer with the page and the
-//! state. `TranTypeListResponse` and `TranTypeListActionResult` carry that audited status and
-//! answer with it through their own `IntoResponse`, so each handler returns the DTO itself and
-//! never wraps it in `Json`, which would answer 200 for every outcome. One status can declare
-//! only one JSON body, so the documented 400 and 500 bodies are the page, the program's own
-//! answer, and their descriptions name the [`ScreenError`] a request rejected before the
-//! program runs gets instead.
+//! state. The one exception is a database the service cannot reach, the failed
+//! `9998-PRIMING-QUERY`, which sends no screen: 500 with a [`ScreenError`] carrying
+//! `Db2 access failure. ` in the Db2 format (COTRTLIC-053).
+//!
+//! `TranTypeListResponse` and `TranTypeListActionResult` carry the audited status and answer
+//! with it through their own `IntoResponse`, so each handler returns the DTO itself and never
+//! wraps it in `Json`, which would answer 200 for every outcome. One status can declare only one
+//! JSON body, so the documented 400 and 500 bodies are the page, the program's own answer, and
+//! their descriptions name the [`ScreenError`] answered instead: to a request rejected before
+//! the program runs, and to an unreachable database.
 
 use axum::extract::State;
 
@@ -66,7 +70,8 @@ use crate::services;
 /// 400 with the page for a filter in error, or with a `ScreenError` for a query the request rules
 /// reject or a `page_key` this API did not issue; 401 without a valid token; 403 for a token whose
 /// user type is not `A`; 422 for a `page_size` outside 1 to 100; 500 with the page and its Db2
-/// message when the count or the page read fails.
+/// message when the count or the page read fails, or with a `ScreenError` carrying
+/// `Db2 access failure. ` when the database cannot be reached (COTRTLIC-053).
 #[utoipa::path(
     get,
     path = "/api/v1/transaction-types",
@@ -104,7 +109,8 @@ use crate::services;
         (
             status = 500,
             description = "The count or the page read failed: the rows read before the failure \
-                and the program's Db2 message",
+                and the program's Db2 message; a database that cannot be reached \
+                (`Db2 access failure. `) is answered with a `ScreenError` instead",
             body = TranTypeListResponse
         ),
     ),
@@ -144,8 +150,9 @@ pub(crate) async fn list(
 /// restrict, or with a `ScreenError` for a body the request rules reject or a `state` no screen
 /// could hold; 401 without a valid token; 403 for a token whose user type is not `A`; 404 with the
 /// page when the row to commit was deleted by another user; 422 for a `page_size` outside 1 to
-/// 100; 500 with the page and its Db2 message when a Db2 statement fails, or with a `ScreenError`
-/// when the commit's transaction cannot be opened, committed or rolled back.
+/// 100; 500 with the page and its Db2 message when a Db2 statement fails, with a `ScreenError`
+/// carrying `Db2 access failure. ` when the database cannot be reached (COTRTLIC-053), or with a
+/// `ScreenError` when the commit's transaction cannot be opened, committed or rolled back.
 // The static `list-actions` segment coexists with endpoint 26's `{type_code}` parameter: axum's
 // matcher prefers the static segment, so this POST never reaches COTRTUPC.
 #[utoipa::path(
@@ -191,8 +198,9 @@ pub(crate) async fn list(
         (
             status = 500,
             description = "The page and the program's Db2 message of a failed statement; a \
-                commit transaction that cannot be opened, committed or rolled back is answered \
-                with a `ScreenError` instead",
+                database that cannot be reached (`Db2 access failure. `) and a commit \
+                transaction that cannot be opened, committed or rolled back are answered with a \
+                `ScreenError` instead",
             body = TranTypeListActionResult
         ),
     ),

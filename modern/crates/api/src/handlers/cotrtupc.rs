@@ -22,30 +22,32 @@
 //! `crate::dto::cotrtupc` and [`ScreenError`]. The key and description edits, the state served
 //! for each key, the update-then-insert fallback and the reading of a delete refused by the
 //! categories' `ON DELETE RESTRICT` are the service's and the domain's. The path parameter is
-//! passed on unparsed, so a malformed code gets the program's own message. A handler never
-//! reads the key or a state from the body to decide anything: the screen's state carries no
-//! authority, and the service derives the state it serves from the key and the row it re-reads
-//! (AAP 0.5.1).
+//! checked for its map length only ([`TypeCodePath`], `COTRTUP-013`) and otherwise passed on
+//! unparsed, so a malformed code gets the program's own message. A handler never reads the key
+//! or a state from the body to decide anything: the screen's state carries no authority, and the
+//! service derives the state it serves from the key and the row it re-reads (AAP 0.5.1).
 //!
 //! # Statuses
 //!
-//! 400 for an edit, an unserved key or a body the extractor rejects; 401 without a valid token;
-//! 403 for a token whose user type is not `A`; 500 for every store failure, the delete refused
-//! while categories exist (`Please delete associated child records first:`) included. Its Db2
-//! text after that prefix is `HALTED(H3)` (E19). Neither endpoint answers 404 or 409: a code no
-//! row holds is a 200 offering the add path (COTRTUPC-010), and the changed-by-another-user
-//! text is never set (COTRTUPC-025).
+//! 400 for an edit, an unserved key, a code longer than its map field or a body the extractor
+//! rejects; 401 without a valid token; 403 for a token whose user type is not `A`; 500 for every
+//! store failure, the delete refused while categories exist (`Please delete associated child
+//! records first:`) included. Its Db2 text after that prefix is `HALTED(H3)` (E19). Neither
+//! endpoint answers 404 or 409: a code no row holds is a 200 offering the add path
+//! (COTRTUPC-010), and the changed-by-another-user text is never set (COTRTUPC-025).
 //!
 //! No value these endpoints handle is protected, and nothing here logs (Cardholder Data
 //! Redaction).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
 use crate::dto::ValidJson;
-use crate::dto::cotrtupc::{TranTypeActionRequest, TranTypeActionResult, TranTypeView};
+use crate::dto::cotrtupc::{
+    TranTypeActionRequest, TranTypeActionResult, TranTypeView, TypeCodePath,
+};
 use crate::error::ScreenError;
 use crate::services;
 
@@ -61,8 +63,9 @@ use crate::services;
 ///
 /// # Errors
 ///
-/// - 400 naming `type_code` when the key edits refuse the code: blank, not numeric or zero
-///   (COTRTUPC-005 to COTRTUPC-007). Nothing is read.
+/// - 400 naming `type_code` when the code is longer than its two-character map field
+///   (`COTRTUP-013`) or the key edits refuse it: blank, not numeric or zero (COTRTUPC-005 to
+///   COTRTUPC-007). Nothing is read.
 /// - 401 without a valid token; 403 for a token whose user type is not `A`.
 /// - 500 when the read fails, with the program's fixed message prefix (COTRTUPC-011).
 // The responses are exactly the statuses COTRTUPC's audit assigns: a code no row holds is a 200
@@ -76,6 +79,7 @@ use crate::services;
         (
             "type_code" = String,
             Path,
+            max_length = 2,
             description = "Transaction type code as typed on the screen (2 characters)"
         )
     ),
@@ -87,7 +91,7 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "The key edits refused the code",
+            description = "The code is longer than 2 characters, or the key edits refused it",
             body = ScreenError
         ),
         (
@@ -111,9 +115,9 @@ use crate::services;
 pub(crate) async fn fetch(
     State(state): State<AppState>,
     admin: AdminUser,
-    Path(type_code): Path<String>,
+    path: TypeCodePath,
 ) -> Result<Json<TranTypeView>, ScreenError> {
-    services::cotrtupc::fetch(&state, &admin, &type_code)
+    services::cotrtupc::fetch(&state, &admin, &path.type_code)
         .await
         .map(TranTypeView::from)
         .map(Json)
@@ -141,9 +145,9 @@ pub(crate) async fn fetch(
 ///
 /// # Errors
 ///
-/// - 400 for an unserved key, a description longer than 50 characters, a body that does not
-///   deserialise, and the key, description and no-change edits (COTRTUPC-005, COTRTUPC-017 to
-///   COTRTUPC-019, COTRTUPC-043). Nothing is written.
+/// - 400 for an unserved key, a code longer than 2 or a description longer than 50 characters,
+///   a body that does not deserialise, and the key, description and no-change edits
+///   (COTRTUPC-005, COTRTUPC-017 to COTRTUPC-019, COTRTUPC-043). Nothing is written.
 /// - 401 without a valid token; 403 for a token whose user type is not `A`.
 /// - 500 when a store statement fails, with the program's fixed message prefix and nothing
 ///   written: the update, insert, lock and delete failures, the delete refused while categories
@@ -160,6 +164,7 @@ pub(crate) async fn fetch(
         (
             "type_code" = String,
             Path,
+            max_length = 2,
             description = "Transaction type code as typed on the screen (2 characters)"
         )
     ),
@@ -196,10 +201,10 @@ pub(crate) async fn fetch(
 pub(crate) async fn action(
     State(state): State<AppState>,
     admin: AdminUser,
-    Path(type_code): Path<String>,
+    path: TypeCodePath,
     ValidJson(request): ValidJson<TranTypeActionRequest>,
 ) -> Result<Json<TranTypeActionResult>, ScreenError> {
-    services::cotrtupc::act(&state, &admin, &type_code, request)
+    services::cotrtupc::act(&state, &admin, &path.type_code, request)
         .await
         .map(TranTypeActionResult::from)
         .map(Json)

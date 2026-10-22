@@ -44,9 +44,13 @@
 //!   program's `WHEN OTHER`. Every outcome but a write is rolled back.
 //! - The text Db2 appends after ` SQLCODE:` is `HALTED(H3)`, and the domain leaves it empty
 //!   (COTRTLIC-054, COTRTLIC-055).
-//! - `9998-PRIMING-QUERY` has no repository counterpart and no call here: the replacement does
-//!   not probe the database before the request's own calls, so a database it cannot reach fails
-//!   the count or the read, answered as above (COTRTLIC-053).
+//! - `9998-PRIMING-QUERY` is no call of its own: the COBOL runs it on every request after the
+//!   edits and before any read or commit, and ends the conversation when Db2 cannot be reached
+//!   (`COTRTLIC.cbl:684-691`). Here the first store call that finds the database unreachable
+//!   ([`PersistenceError::Unavailable`]: the count, the read, or any call of the commit's
+//!   transaction) stands in for it, and the request is answered with [`ListError::Unreachable`]:
+//!   500, `Db2 access failure. ` in the Db2 format, no page and no state, nothing committed
+//!   (COTRTLIC-053). Any other failure of those calls keeps the answer above.
 //! - [`ServiceError::Store`], a 500 with no page, is kept for what no COBOL statement stands
 //!   for: opening, committing or rolling back the commit transaction, and the re-read of the row
 //!   an F10 targets, which the replacement adds.
@@ -58,9 +62,12 @@
 //! [`page_after`]: Db2TransactionTypeRepository::page_after
 //! [`page_before`]: Db2TransactionTypeRepository::page_before
 
+use core::fmt;
+
 use domain::online::cotrtlic::{
-    self, CommitEffect, CommitResult, ListActionOutcome, ListFailure, ListInput, PageSize,
-    Progress, ReadDirection, ReadStep, RowInput, StoreFailure, TranTypeListPage,
+    self, CommitEffect, CommitResult, Db2Action, ListActionOutcome, ListFailure, ListInput,
+    ListMessage, PageSize, Progress, ReadDirection, ReadStep, RowInput, StoreFailure,
+    TranTypeListPage,
 };
 use domain::records::Db2TransactionType;
 use persistence::{Db2TransactionTypeRepository, PersistenceError, PgStore, PgTx};
@@ -69,7 +76,74 @@ use crate::app::AppState;
 use crate::auth::extract::AdminUser;
 use crate::dto::cotrtlic::{TranTypeListActionRequest, TranTypeListQuery};
 use crate::dto::resolve_page_size;
-use crate::error::ServiceError;
+use crate::error::{ScreenError, ServiceError};
+
+/// Why COTRTLIC answers a request with no screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ListError {
+    /// An echoed state, or the state a `page_key` encodes, that no COTRTLIC screen could hold.
+    State(ListFailure),
+    /// `9998-PRIMING-QUERY` found the database unreachable: the conversation ends with
+    /// `SEND-LONG-TEXT` and no map (COTRTLIC-053).
+    Unreachable,
+}
+
+impl fmt::Display for ListError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::State(failure) => failure.fmt(f),
+            Self::Unreachable => f.write_str("the database cannot be reached"),
+        }
+    }
+}
+
+impl std::error::Error for ListError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::State(failure) => Some(failure),
+            Self::Unreachable => None,
+        }
+    }
+}
+
+/// A state no screen could hold is request input, answered as the domain's failure; an
+/// unreachable database is 500 with the domain's `Db2 access failure. ` message in the Db2
+/// format, whose `SQLCODE` tail is `HALTED(H3)`, and no field (COTRTLIC-053, COTRTLIC-054).
+impl From<ListError> for ScreenError {
+    fn from(error: ListError) -> Self {
+        match error {
+            ListError::State(failure) => Self::from(failure),
+            ListError::Unreachable => {
+                Self::store(ListMessage::Db2(Db2Action::AccessFailure).text(), None)
+            }
+        }
+    }
+}
+
+/// `error` as the service's answer: [`ListError::Unreachable`], reported here, when the
+/// database cannot be reached, which stands for the failed `9998-PRIMING-QUERY` (COTRTLIC-053);
+/// otherwise a store error with no audited message, which its conversion to [`ScreenError`]
+/// reports.
+fn unanswered(call: &'static str, error: PersistenceError) -> ServiceError<ListError> {
+    if matches!(error, PersistenceError::Unavailable) {
+        report(call, &error);
+        ServiceError::Rule(ListError::Unreachable)
+    } else {
+        ServiceError::Store(error)
+    }
+}
+
+/// `result` as the store returned it, unless the call found the database unreachable, which
+/// ends the request with [`ListError::Unreachable`] (COTRTLIC-053).
+fn reachable<T>(
+    call: &'static str,
+    result: Result<T, PersistenceError>,
+) -> Result<Result<T, PersistenceError>, ServiceError<ListError>> {
+    match result {
+        Err(error @ PersistenceError::Unavailable) => Err(unanswered(call, error)),
+        other => Ok(other),
+    }
+}
 
 /// The SQLSTATEs that stand for Db2's `SQLCODE` -911, a deadlock or lock timeout, on the
 /// update of `9200-UPDATE-RECORD`: `deadlock_detected`, `lock_not_available` and
@@ -85,14 +159,15 @@ const LOCK_FAILURES: [&str; 3] = ["40P01", "55P03", "40001"];
 ///
 /// # Errors
 ///
-/// [`ServiceError::Rule`] with the domain's [`ListFailure`] for a `page_key` that encodes no
-/// state a COTRTLIC screen could hold. Every audited outcome, a store failure of the count or
-/// the read included, is the returned page with its status class.
+/// [`ServiceError::Rule`] with [`ListError::State`] for a `page_key` that encodes no state a
+/// COTRTLIC screen could hold, and with [`ListError::Unreachable`] when the database cannot be
+/// reached (COTRTLIC-053). Every other audited outcome, a failure of the count or the read
+/// included, is the returned page with its status class.
 pub(crate) async fn list(
     state: &AppState,
     _admin: &AdminUser,
     query: TranTypeListQuery,
-) -> Result<TranTypeListPage, ServiceError<ListFailure>> {
+) -> Result<TranTypeListPage, ServiceError<ListError>> {
     list_on(&state.store, query).await
 }
 
@@ -101,15 +176,16 @@ pub(crate) async fn list(
 ///
 /// # Errors
 ///
-/// [`ServiceError::Rule`] with the domain's [`ListFailure`] for an echoed state no COTRTLIC
-/// screen could hold; [`ServiceError::Store`] when the transaction of an F10 commit cannot be
-/// opened, committed or rolled back, or its re-read of the target row fails. Every audited
-/// outcome is the returned outcome with its status class.
+/// [`ServiceError::Rule`] with [`ListError::State`] for an echoed state no COTRTLIC screen
+/// could hold, and with [`ListError::Unreachable`] when the database cannot be reached
+/// (COTRTLIC-053); [`ServiceError::Store`] when the transaction of an F10 commit cannot be
+/// opened, committed or rolled back, or its re-read of the target row fails. Every other
+/// audited outcome is the returned outcome with its status class.
 pub(crate) async fn list_actions(
     state: &AppState,
     _admin: &AdminUser,
     request: TranTypeListActionRequest,
-) -> Result<ListActionOutcome, ServiceError<ListFailure>> {
+) -> Result<ListActionOutcome, ServiceError<ListError>> {
     act_on(&state.store, request).await
 }
 
@@ -117,10 +193,10 @@ pub(crate) async fn list_actions(
 async fn list_on(
     store: &PgStore,
     query: TranTypeListQuery,
-) -> Result<TranTypeListPage, ServiceError<ListFailure>> {
+) -> Result<TranTypeListPage, ServiceError<ListError>> {
     // The screen load ignores the key, so only a page move decodes it.
     let echoed = if query.direction.is_some() {
-        query.state().map_err(ServiceError::Rule)?
+        query.state().map_err(invalid_state)?
     } else {
         None
     };
@@ -149,7 +225,7 @@ async fn list_on(
 async fn act_on(
     store: &PgStore,
     request: TranTypeListActionRequest,
-) -> Result<ListActionOutcome, ServiceError<ListFailure>> {
+) -> Result<ListActionOutcome, ServiceError<ListError>> {
     let TranTypeListActionRequest {
         aid,
         type_filter,
@@ -158,7 +234,7 @@ async fn act_on(
         state,
         page_size: requested,
     } = request;
-    let received = cotrtlic::TranTypeListState::try_from(&state).map_err(ServiceError::Rule)?;
+    let received = cotrtlic::TranTypeListState::try_from(&state).map_err(invalid_state)?;
     let row_inputs: Vec<RowInput<'_>> = rows.iter().map(RowInput::from).collect();
     let input = ListInput {
         type_filter: &type_filter,
@@ -167,6 +243,11 @@ async fn act_on(
     };
     let progress = cotrtlic::act(aid.into(), &input, &received, page_size(requested));
     drive(store, progress).await
+}
+
+/// An echoed state no COTRTLIC screen could hold, as the service's answer.
+const fn invalid_state(failure: ListFailure) -> ServiceError<ListError> {
+    ServiceError::Rule(ListError::State(failure))
 }
 
 /// The rows a page holds: `requested`, 7 when absent (Bounded Pagination). The domain serves at
@@ -182,7 +263,7 @@ fn page_size(requested: Option<i64>) -> PageSize {
 async fn drive(
     store: &PgStore,
     mut progress: Progress,
-) -> Result<ListActionOutcome, ServiceError<ListFailure>> {
+) -> Result<ListActionOutcome, ServiceError<ListError>> {
     let mut reader = store.clone();
     loop {
         progress = match progress {
@@ -196,12 +277,12 @@ async fn drive(
                     )
                     .await
                 };
-                step.finish(count.map_err(|error| store_failure("count_matching", &error)))
+                step.finish(read_failure("count_matching", count)?)
             }
             commit @ (Progress::Verify(_) | Progress::Commit(_)) => {
                 commit_effect(store, commit).await?
             }
-            Progress::Read(step) => return Ok(read_page(&mut reader, step).await),
+            Progress::Read(step) => return read_page(&mut reader, step).await,
             Progress::Done(outcome) => return Ok(*outcome),
         };
     }
@@ -210,7 +291,14 @@ async fn drive(
 /// The page read of `step`: forward from its start key, ascending, or backward below it,
 /// descending, under its filters and with its limit, the look-ahead row of a forward read
 /// included (COTRTLIC-004, COTRTLIC-005, COTRTLIC-011). The rows go to the domain as returned.
-async fn read_page(store: &mut PgStore, step: ReadStep) -> ListActionOutcome {
+///
+/// # Errors
+///
+/// [`ListError::Unreachable`] when the read finds the database unreachable (COTRTLIC-053).
+async fn read_page(
+    store: &mut PgStore,
+    step: ReadStep,
+) -> Result<ListActionOutcome, ServiceError<ListError>> {
     let rows = {
         let query = step.query();
         let filters = query.filters();
@@ -237,7 +325,7 @@ async fn read_page(store: &mut PgStore, step: ReadStep) -> ListActionOutcome {
             }
         }
     };
-    step.finish(rows.map_err(|error| store_failure("page_read", &error)))
+    Ok(step.finish(read_failure("page_read", rows)?))
 }
 
 /// An F10 commit, from its `Verify` or `Commit` step, in one transaction: the target row is
@@ -252,31 +340,43 @@ async fn read_page(store: &mut PgStore, step: ReadStep) -> ListActionOutcome {
 ///
 /// # Errors
 ///
-/// [`ServiceError::Store`] when the transaction cannot be opened, committed or rolled back, or
-/// the re-read fails; the transaction is then discarded with nothing written.
+/// [`ListError::Unreachable`] when any call of the transaction finds the database unreachable
+/// (COTRTLIC-053); [`ServiceError::Store`] when the transaction cannot be opened, committed or
+/// rolled back, or the re-read fails, for any other reason. The transaction is then discarded
+/// with nothing written.
 async fn commit_effect(
     store: &PgStore,
     mut progress: Progress,
-) -> Result<Progress, ServiceError<ListFailure>> {
-    let mut tx = store.begin().await?;
+) -> Result<Progress, ServiceError<ListError>> {
+    let mut tx = store
+        .begin()
+        .await
+        .map_err(|error| unanswered("begin", error))?;
     loop {
         progress = match progress {
             Progress::Verify(step) => {
-                let current =
-                    Db2TransactionTypeRepository::find_by_id(&mut tx, step.code()).await?;
+                let current = Db2TransactionTypeRepository::find_by_id(&mut tx, step.code())
+                    .await
+                    .map_err(|error| unanswered("find_by_id", error))?;
                 step.finish(current.as_ref())
             }
             Progress::Commit(step) => {
-                let result = write(&mut tx, step.effect()).await;
+                let result = write(&mut tx, step.effect()).await?;
                 if result == CommitResult::Done {
-                    tx.commit().await?;
+                    tx.commit()
+                        .await
+                        .map_err(|error| unanswered("commit", error))?;
                 } else {
-                    tx.rollback().await?;
+                    tx.rollback()
+                        .await
+                        .map_err(|error| unanswered("rollback", error))?;
                 }
                 return Ok(step.finish(result));
             }
             next => {
-                tx.rollback().await?;
+                tx.rollback()
+                    .await
+                    .map_err(|error| unanswered("rollback", error))?;
                 return Ok(next);
             }
         };
@@ -284,23 +384,34 @@ async fn commit_effect(
 }
 
 /// The write of `effect` on `tx`, as the `SQLCODE` class the COBOL tests.
-async fn write(tx: &mut PgTx<'_>, effect: &CommitEffect) -> CommitResult {
-    match effect {
+///
+/// # Errors
+///
+/// [`ListError::Unreachable`] when the write finds the database unreachable (COTRTLIC-053).
+async fn write(
+    tx: &mut PgTx<'_>,
+    effect: &CommitEffect,
+) -> Result<CommitResult, ServiceError<ListError>> {
+    Ok(match effect {
         // `9200-UPDATE-RECORD`: the description the domain trimmed and padded to 50 bytes
         // (COTRTLIC-044).
         CommitEffect::Update { code, description } => {
             match Db2TransactionType::new(code.clone(), description.clone()) {
-                Ok(row) => update_result(Db2TransactionTypeRepository::update(tx, &row).await),
+                Ok(row) => update_result(reachable(
+                    "update",
+                    Db2TransactionTypeRepository::update(tx, &row).await,
+                )?),
                 // The domain hands over at most 50 bytes, which the constructor accepts; a
                 // longer text is never written, as a failed update.
                 Err(_) => CommitResult::Failed,
             }
         }
         // `9300-DELETE-RECORD` (COTRTLIC-049).
-        CommitEffect::Delete { code } => {
-            delete_result(Db2TransactionTypeRepository::delete(tx, code).await)
-        }
-    }
+        CommitEffect::Delete { code } => delete_result(reachable(
+            "delete",
+            Db2TransactionTypeRepository::delete(tx, code).await,
+        )?),
+    })
 }
 
 /// `9200-UPDATE-RECORD`'s `EVALUATE SQLCODE`: 0, +100, -911 or below 0 (COTRTLIC-045 to
@@ -341,10 +452,16 @@ fn is_lock_failure(error: &PersistenceError) -> bool {
         .is_some_and(|sqlstate| LOCK_FAILURES.contains(&sqlstate))
 }
 
-/// A failed count or page read as the domain's [`StoreFailure`], reported first.
-fn store_failure(call: &'static str, error: &PersistenceError) -> StoreFailure {
-    report(call, error);
-    StoreFailure
+/// A count or page read for the domain: a failure is its [`StoreFailure`], reported first,
+/// unless the database cannot be reached (COTRTLIC-053).
+fn read_failure<T>(
+    call: &'static str,
+    read: Result<T, PersistenceError>,
+) -> Result<Result<T, StoreFailure>, ServiceError<ListError>> {
+    Ok(reachable(call, read)?.map_err(|error| {
+        report(call, &error);
+        StoreFailure
+    }))
 }
 
 /// One event for a store failure whose cause the response does not carry. The error's text is
@@ -364,14 +481,14 @@ mod tests {
     use persistence::{Db2TransactionTypeRepository, PersistenceError, PgStore};
     use test_support::postgres::{PostgresGuard, start_postgres};
 
-    use super::{act_on, delete_result, list_on, page_size, update_result};
+    use super::{ListError, act_on, delete_result, list_on, page_size, update_result};
     use crate::dto::PageDirection;
     use crate::dto::cotrtlic::{
         Aid, TranTypeListActionRequest, TranTypeListActionResult, TranTypeListCommitted,
         TranTypeListPendingAction, TranTypeListQuery, TranTypeListResponse, TranTypeListRowInput,
         TranTypeListState,
     };
-    use crate::error::ServiceError;
+    use crate::error::{ScreenError, ServiceError};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -757,9 +874,9 @@ mod tests {
         Ok(())
     }
 
-    // audit: COTRTLIC-052
+    // audit: COTRTLIC-053
     #[tokio::test]
-    async fn a_database_the_service_cannot_reach_fails_the_read_or_the_commit() -> TestResult {
+    async fn a_database_the_service_cannot_reach_ends_the_request_without_a_screen() -> TestResult {
         let (guard, store) = database(&[]).await?;
         let state = load(&store).await?.state;
         let prompted = act(
@@ -769,13 +886,11 @@ mod tests {
         .await?;
         guard.pool().close().await;
 
-        let unread = load(&store).await?;
-        assert_eq!(unread.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let unread = list_on(&store, TranTypeListQuery::default()).await;
         assert_eq!(
-            unread.message.as_deref(),
-            Some("C-TR-TYPE-FORWARD Open SQLCODE:")
+            unread.map(drop),
+            Err(ServiceError::Rule(ListError::Unreachable))
         );
-
         let uncommitted = act_on(
             &store,
             request(Aid::Pf10, &prompted.state, ("", ""), &[(2, "D", "")]),
@@ -783,7 +898,16 @@ mod tests {
         .await;
         assert_eq!(
             uncommitted.map(drop),
-            Err(ServiceError::Store(PersistenceError::Unavailable))
+            Err(ServiceError::Rule(ListError::Unreachable))
+        );
+        let screen = ScreenError::from(ListError::Unreachable);
+        assert_eq!(
+            (screen.status(), screen.message(), screen.field()),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Db2 access failure. SQLCODE:",
+                None
+            )
         );
         Ok(())
     }

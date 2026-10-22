@@ -6,8 +6,8 @@
 //!
 //! Every edit, state rule and text is `domain::online::cotrtupc`'s; this module only converts
 //! (Thin Request Handlers). The `{type_code}` path parameter is the raw text of
-//! `TRTYPCDI PIC X(2)`, which the handler passes on unparsed and the domain stores and edits
-//! (COTRTUPC-004 to COTRTUPC-008).
+//! `TRTYPCDI PIC X(2)`: [`TypeCodePath`] checks its map length only (`COTRTUP-013`), and the
+//! domain stores and edits it (COTRTUPC-004 to COTRTUPC-008).
 //!
 //! # State
 //!
@@ -38,10 +38,51 @@
 //!
 //! No value this program handles is protected (Cardholder Data Redaction).
 
+use axum::extract::{FromRequestParts, Path};
+use axum::http::request::Parts;
 use domain::online::cotrtupc as rules;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
+
+use crate::error::ScreenError;
+
+/// The wire name of the `{type_code}` path parameter, the field a refused code names.
+const TYPE_CODE_FIELD: &str = "type_code";
+
+/// The `{type_code}` path parameter of endpoints 26 and 27: `TRTYPCDI PIC X(2)` as typed.
+///
+/// Only the map `LENGTH` is checked here, the server half of `COTRTUP-013`: a code longer than
+/// two characters is input the 3270 field would not admit, answered 400 naming `type_code`
+/// before anything is read. Every other edit, the blank, numeric and zero tests and the
+/// normalisation included, is the domain's (COTRTUPC-004 to COTRTUPC-008), so the code reaches
+/// it otherwise unparsed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Validate)]
+pub struct TypeCodePath {
+    /// The code as typed: up to 2 characters.
+    #[validate(length(max = 2))]
+    pub type_code: String,
+}
+
+impl<S: Send + Sync> FromRequestParts<S> for TypeCodePath {
+    type Rejection = ScreenError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // A segment that does not decode to UTF-8 fits no `PIC X(2)` field either. The
+        // rejection's own text quotes the offending input, so it is dropped unread.
+        let Path(path) = Path::<Self>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| {
+                ScreenError::input(
+                    super::FIELD_LENGTH_MESSAGE,
+                    Some(TYPE_CODE_FIELD.to_owned()),
+                )
+            })?;
+        path.validate()
+            .map_err(|errors| super::validation_error(&errors))?;
+        Ok(path)
+    }
+}
 
 /// The key of an endpoint 27 request (`EIBAID`): `ENTER`, `PF4` or `PF5` (COTRTUPC-043).
 ///
