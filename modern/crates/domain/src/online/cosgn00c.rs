@@ -61,6 +61,7 @@ use core::fmt;
 use copybook::PicX;
 
 use crate::password;
+use crate::records::UserEntry;
 use crate::sensitive::Password;
 
 /// Width of the two inputs: `USERIDI` and `PASSWDI PIC X(8)` (`COSGN00.CPY`), `WS-USER-ID` and
@@ -395,6 +396,19 @@ impl fmt::Debug for StoredUser<'_> {
     }
 }
 
+/// What sign-on needs of the row `READ-USER-SEC-FILE` found: the stored type and the hash to
+/// verify the password against (COSGN00C-013, CSUSR01Y-004, CSUSR01Y-005).
+///
+/// The value borrows the entry's hash, so the entry outlives the decision.
+impl<'a> From<&'a UserEntry> for StoredUser<'a> {
+    fn from(entry: &'a UserEntry) -> Self {
+        Self::new(
+            UserType::from_code(entry.usr_type.clone()),
+            &entry.password_hash,
+        )
+    }
+}
+
 /// The result of reading `users` by [`SignonKey::user_id`], the `EVALUATE WS-RESP-CD` of
 /// `READ-USER-SEC-FILE` (`COSGN00C.cbl:211-257`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -497,6 +511,7 @@ mod tests {
         decide, edit,
     };
     use crate::password::{self, PasswordError};
+    use crate::records::UserEntry;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -693,6 +708,28 @@ mod tests {
         assert_eq!(failure.field().name(), "user_id");
         assert_eq!(failure.class(), FailureClass::Store);
         assert_eq!(failure.class().http_status(), 500);
+        Ok(())
+    }
+
+    // audit: COSGN00C-013
+    // audit: CSUSR01Y-004
+    // audit: CSUSR01Y-005
+    #[test]
+    fn a_stored_entry_lends_its_type_unchanged_and_its_hash_to_sign_on() -> TestResult {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$ZmFrZWhhc2hmb3J0ZXN0c29ubHk";
+        for code in [b'A', b'U', b' ', b'a'] {
+            let entry = UserEntry {
+                id: PicX::from_text("ADMIN001")?,
+                fname: PicX::from_text("MARGARET")?,
+                lname: PicX::from_text("GOLD")?,
+                password_hash: hash.to_owned(),
+                usr_type: PicX::from_array([code]),
+                filler: PicX::spaces(),
+            };
+            let stored = StoredUser::from(&entry);
+            assert_eq!(stored, StoredUser::new(user_type(code), hash));
+            assert!(!format!("{stored:?}").contains(hash));
+        }
         Ok(())
     }
 

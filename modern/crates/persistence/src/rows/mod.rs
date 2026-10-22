@@ -79,7 +79,7 @@ pub use tran_cat_balances::TranCatBalanceRow;
 pub use transaction_categories::TransactionCategoryRow;
 pub use transaction_types::TransactionTypeRow;
 pub use transactions::TransactionRow;
-pub use users::{UserEntry, UserListEntry, UserListRow, UserRow};
+pub use users::{UserListRow, UserRow};
 
 use chrono::{NaiveDate, NaiveDateTime};
 use copybook::{CobolTimestamp, Count, PicDate, PicS, PicTimestamp, PicU, PicX, TsForm};

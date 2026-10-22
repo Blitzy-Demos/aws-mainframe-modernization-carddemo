@@ -22,7 +22,7 @@
 //! | [`transaction_category`] | [`TransactionCategoryRecord`] | `CVTRA04Y` `TRAN-CAT-RECORD` | 60 |
 //! | [`db2_transaction_type`] | [`Db2TransactionType`] | DCLGEN `DCLTRTYP`, the Db2 data version (E23) | row only |
 //! | [`db2_transaction_category`] | [`Db2TransactionCategory`] | DCLGEN `DCLTRCAT`, the Db2 data version (E23) | row only |
-//! | [`user_security`] | [`UserSecurityRecord`] | `CSUSR01Y` `SEC-USER-DATA` | 80 |
+//! | [`user_security`] | [`UserSecurityRecord`]; [`UserEntry`], [`UserListEntry`] | `CSUSR01Y` `SEC-USER-DATA`; its `users` projections, `password_hash` in place of `SEC-USR-PWD` (E25) | 80; row only |
 //! | [`pending_auth_summary`] | [`PendingAuthSummaryRecord`] | `CIPAUSMY`, IMS segment `PAUTSUM0` | 100 |
 //! | [`pending_auth_detail`] | [`PendingAuthDetailRecord`] | `CIPAUDTY`, IMS segment `PAUTDTL1` | 200 |
 //! | [`auth_request`] | [`AuthRequestRecord`] | `CCPAURQY`, the CP00 request storage | 153 |
@@ -30,9 +30,10 @@
 //! | [`error_log`] | [`ErrorLogRecord`], [`ErrorLevel`], [`ErrorSubsystem`] | `CCPAUERY` `ERROR-LOG-RECORD` | 122 |
 //!
 //! The two Db2 row types follow the DCLGEN host variables and have no byte form or fixture
-//! framing. The CP00 wire bodies are comma-delimited and are parsed and built by
-//! `crate::messaging`; the `auth_request` and `auth_reply` byte forms are the copybook storage
-//! layouts, not the wire text.
+//! framing. [`UserEntry`] and [`UserListEntry`] are the stored projections of `SEC-USER-DATA`
+//! that codec B reads and writes, and have no byte form either. The CP00 wire bodies are
+//! comma-delimited and are parsed and built by `crate::messaging`; the `auth_request` and
+//! `auth_reply` byte forms are the copybook storage layouts, not the wire text.
 //!
 //! # Byte identity
 //!
@@ -116,7 +117,7 @@ pub use tran_cat_balance::TranCatBalanceRecord;
 pub use transaction::TransactionRecord;
 pub use transaction_category::TransactionCategoryRecord;
 pub use transaction_type::TransactionTypeRecord;
-pub use user_security::UserSecurityRecord;
+pub use user_security::{UserEntry, UserListEntry, UserSecurityRecord};
 
 use copybook::edited::EditedPicture;
 use copybook::{Error, ErrorKind, PicU, RecordReader, RecordWriter};

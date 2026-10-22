@@ -45,7 +45,6 @@
 
 use domain::online::cousr00c::{self as rules, Direction, Plan, UserListFailure, UserPage};
 use persistence::UserRepository;
-use persistence::rows::UserListEntry;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
@@ -100,10 +99,7 @@ async fn browse<R: UserRepository>(
         tracing::error!(error = %error, "COUSR00C user browse failed");
         ServiceError::Rule(UserListFailure::LookupFailed)
     })?;
-    let rows = entries
-        .into_iter()
-        .map(UserListEntry::into_list_row)
-        .collect();
+    let rows = entries.into_iter().map(rules::UserListRow::from).collect();
     rules::page(read, rows).map_err(ServiceError::Rule)
 }
 
@@ -118,7 +114,7 @@ mod tests {
     use domain::online::cousr00c::{
         LOW_KEY, ListMessage, NextPage, PageRows, UserListFailure, UserPage,
     };
-    use persistence::rows::{UserEntry, UserListEntry};
+    use domain::records::{UserEntry, UserListEntry};
     use persistence::{PersistenceError, UserRepository};
 
     use super::browse;

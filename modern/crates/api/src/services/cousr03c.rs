@@ -46,13 +46,13 @@
 //! The path ID names the target user and is validated input. The caller acts only as the
 //! verified token's `AdminUser`, and nothing compares the two, so an admin may delete any user,
 //! their own and the last admin's included (COUSR03C-024). The row's hash is dropped unread by
-//! `UserEntry::into_stored_view`; no value of the row is logged, and the success message names
+//! `StoredUserView::from`; no value of the row is logged, and the success message names
 //! only the user ID.
 
 use domain::copybook::PicX;
 use domain::online::cousr02c::{StoredUserView, UserMaintFailure, UserRead};
 use domain::online::cousr03c::{self as rules, DeleteResult};
-use persistence::rows::UserEntry;
+use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
 
 use crate::app::AppState;
@@ -120,7 +120,7 @@ fn looked_up(
     result: Result<Option<UserEntry>, PersistenceError>,
 ) -> Result<StoredUserView, UserRead<'static>> {
     match result {
-        Ok(Some(entry)) => Ok(entry.into_stored_view()),
+        Ok(Some(entry)) => Ok(StoredUserView::from(entry)),
         Ok(None) => Err(UserRead::NotFound),
         Err(error) => {
             traced(READ_PARAGRAPH, &error);
@@ -168,7 +168,7 @@ mod tests {
     use domain::online::cosgn00c::UserType;
     use domain::online::cousr02c::UserMaintFailure;
     use domain::online::cousr03c::edit_delete;
-    use persistence::rows::{UserEntry, UserListEntry};
+    use domain::records::{UserEntry, UserListEntry};
     use persistence::{PersistenceError, PgStore, UserRepository};
     use test_support::postgres::start_postgres;
     use test_support::trace_capture;

@@ -72,7 +72,7 @@ use core::fmt;
 use copybook::PicX;
 
 use crate::password::verify;
-use crate::records::user_security::UserSecurityRecord;
+use crate::records::user_security::{UserEntry, UserSecurityRecord};
 use crate::sensitive::Password;
 
 /// The info prompt COUSR02C's read sends on success, in the neutral colour (`DFHNEUTR`;
@@ -324,6 +324,19 @@ impl From<&UserSecurityRecord> for StoredUserView {
             first_name: record.fname.clone(),
             last_name: record.lname.clone(),
             user_type: record.usr_type.clone(),
+        }
+    }
+}
+
+/// The stored user the COUSR02C and COUSR03C read shows: ID, names and type, with neither the
+/// hash nor `FILLER` (COUSR02C-012, CSUSR01Y-001 to CSUSR01Y-003, CSUSR01Y-005).
+impl From<UserEntry> for StoredUserView {
+    fn from(entry: UserEntry) -> Self {
+        Self {
+            user_id: entry.id,
+            first_name: entry.fname,
+            last_name: entry.lname,
+            user_type: entry.usr_type,
         }
     }
 }
@@ -677,7 +690,7 @@ mod tests {
         read, reread, rewrite_outcome, updated_message,
     };
     use crate::password::{PasswordError, hash};
-    use crate::records::user_security::UserSecurityRecord;
+    use crate::records::user_security::{UserEntry, UserSecurityRecord};
     use crate::sensitive::Password;
 
     type TestResult = Result<(), String>;
@@ -836,6 +849,31 @@ mod tests {
         let view = read(UserRead::Found(&stored)).map_err(|failure| failure.to_string())?;
         assert!(!format!("{stored:?} {view:?}").contains(STORED_TEXT));
         Ok(())
+    }
+
+    // audit: COUSR02C-012
+    #[test]
+    fn the_view_of_a_stored_entry_leaves_its_hash_and_filler_out() {
+        let hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$ZmFrZWhhc2hmb3J0ZXN0c29ubHk";
+        let entry = UserEntry {
+            id: text("ADMIN001"),
+            fname: text("MARGARET"),
+            lname: text("GOLD"),
+            password_hash: hash.to_owned(),
+            usr_type: text("A"),
+            filler: PicX::from_array(*b"0123456789ABCDEFGHIJKLM"),
+        };
+        let stored = StoredUserView::from(entry);
+        let expected = StoredUserView {
+            user_id: text("ADMIN001"),
+            first_name: text("MARGARET"),
+            last_name: text("GOLD"),
+            user_type: text("A"),
+        };
+        assert_eq!(stored, expected);
+        let shown = format!("{stored:?}");
+        assert!(!shown.contains("argon2id"), "{shown}");
+        assert!(!shown.contains("0123456789"), "{shown}");
     }
 
     // audit: COUSR02C-014

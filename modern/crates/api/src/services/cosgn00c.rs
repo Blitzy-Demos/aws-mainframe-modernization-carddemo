@@ -52,9 +52,9 @@
 //! Data Redaction, AAP 0.3.4.8).
 
 use domain::online::cosgn00c::{
-    self, SignedOn, SignonFailure, SignonKey, SignonOutcome, UserLookup,
+    self, SignedOn, SignonFailure, SignonKey, SignonOutcome, StoredUser, UserLookup,
 };
-use persistence::rows::UserEntry;
+use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
 
 use crate::app::AppState;
@@ -130,7 +130,7 @@ async fn decided(
 /// has already been reported by `signon`, so this mapping emits nothing.
 fn lookup(read: &Result<Option<UserEntry>, PersistenceError>) -> UserLookup<'_> {
     match read {
-        Ok(Some(entry)) => UserLookup::Found(entry.as_stored_user()),
+        Ok(Some(entry)) => UserLookup::Found(StoredUser::from(entry)),
         Ok(None) => UserLookup::NotFound,
         Err(_) => UserLookup::ReadError,
     }
@@ -163,7 +163,7 @@ mod tests {
     use domain::copybook::PicX;
     use domain::online::cosgn00c::{SignonFailure, SignonField, UserType};
     use domain::password;
-    use persistence::rows::UserEntry;
+    use domain::records::UserEntry;
     use persistence::{PgStore, UserRepository};
     use test_support::postgres::start_postgres;
     use test_support::trace_capture;

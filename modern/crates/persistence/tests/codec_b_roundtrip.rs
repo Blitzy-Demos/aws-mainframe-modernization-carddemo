@@ -37,10 +37,9 @@ use domain::password;
 use domain::records::{
     AccountRecord, CardRecord, CardXrefRecord, CustomerRecord, DailyTransactionRecord,
     DisclosureGroupRecord, TranCatBalanceRecord, TransactionCategoryRecord, TransactionRecord,
-    TransactionTypeRecord, UserSecurityRecord,
+    TransactionTypeRecord, UserEntry, UserSecurityRecord,
 };
 use domain::sensitive::{CardNumber, Cvv, Ssn};
-use persistence::rows::UserEntry;
 use persistence::{
     AccountRepository, CardRepository, CardXrefRepository, CustomerRepository,
     DisclosureGroupRepository, PersistenceError, PgStore, TranCatBalanceRepository,

@@ -57,7 +57,7 @@
 
 use domain::online::cousr01c::{self, UserAddFailure, UserAddInput};
 use domain::password::{self, PasswordError};
-use persistence::rows::UserEntry;
+use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
 use tokio::task::JoinError;
 
@@ -215,7 +215,7 @@ mod tests {
     use domain::copybook::PicX;
     use domain::online::cousr01c::{self, UserAddFailure};
     use domain::password::{self, PasswordError};
-    use persistence::rows::{UserEntry, UserListEntry};
+    use domain::records::{UserEntry, UserListEntry};
     use persistence::{DecodeKind, PersistenceError, PgStore, UserRepository};
     use test_support::trace_capture;
 

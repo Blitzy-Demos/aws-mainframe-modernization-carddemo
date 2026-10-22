@@ -67,7 +67,7 @@ use domain::online::cousr02c::{
     UserUpdateInput, UserView, ValidatedUpdate,
 };
 use domain::password::{self, PasswordError};
-use persistence::rows::UserEntry;
+use domain::records::UserEntry;
 use persistence::{PersistenceError, PgTx, UserRepository};
 use tokio::task::JoinError;
 
@@ -108,8 +108,8 @@ pub(crate) async fn fetch(
 ) -> Result<UserView, Refusal> {
     let id = rules::edit_user_id(user_id).map_err(ServiceError::Rule)?;
     let mut store = state.store.clone();
-    let looked = looked_up(UserRepository::find_by_id(&mut store, &id).await)
-        .map(UserEntry::into_stored_view);
+    let looked =
+        looked_up(UserRepository::find_by_id(&mut store, &id).await).map(StoredUserView::from);
     let read = looked
         .as_ref()
         .map_or_else(|&absent| absent, UserRead::Found);
@@ -176,7 +176,7 @@ impl From<UserEntry> for Held {
         let password_hash = core::mem::take(&mut entry.password_hash);
         let filler = entry.filler.clone();
         Self {
-            stored: entry.into_stored_view(),
+            stored: StoredUserView::from(entry),
             password_hash,
             filler,
         }
@@ -360,7 +360,7 @@ mod tests {
     use domain::online::cosgn00c::UserType;
     use domain::online::cousr02c::{self as rules, RewriteResult, UserMaintFailure, UserRead};
     use domain::password::{self, PasswordError};
-    use persistence::rows::UserEntry;
+    use domain::records::UserEntry;
     use persistence::{PersistenceError, PgStore, UserRepository};
     use test_support::postgres::start_postgres;
     use test_support::trace_capture;

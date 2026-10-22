@@ -72,7 +72,7 @@ use core::fmt;
 
 use copybook::{PicU, PicX};
 
-use crate::records::UserSecurityRecord;
+use crate::records::{UserListEntry, UserSecurityRecord};
 
 /// The rows of one page when the request names no `page_size`: the ten row groups of map
 /// `COUSR0A`, filled by the loops to `WS-IDX > 10` and `WS-IDX >= 11` (COUSR00C-013).
@@ -161,6 +161,14 @@ impl From<&UserSecurityRecord> for UserListRow {
             record.lname.clone(),
             record.usr_type.clone(),
         )
+    }
+}
+
+impl From<UserListEntry> for UserListRow {
+    /// The list row the COUSR00C page rule shows for a user a page query read: its four fields,
+    /// as stored (COUSR00C-028).
+    fn from(entry: UserListEntry) -> Self {
+        row_from(entry.id, entry.fname, entry.lname, entry.usr_type)
     }
 }
 
@@ -737,7 +745,7 @@ mod tests {
         PageRows, PagingState, Plan, UserListFailure, UserListRow, UserPage, page, plan, row_from,
         start_user_id,
     };
-    use crate::records::UserSecurityRecord;
+    use crate::records::{UserListEntry, UserSecurityRecord};
     use crate::sensitive::Password;
 
     type TestResult = Result<(), String>;
@@ -1349,6 +1357,21 @@ mod tests {
         assert!(!debug.contains("FAKE-PW1"));
         assert!(!debug.contains("FILLER BYTES"));
         assert!(debug.contains("USER0003"));
+    }
+
+    // audit: COUSR00C-028
+    #[test]
+    fn a_page_entry_becomes_the_row_of_its_four_fields_as_stored() {
+        let entry = UserListEntry {
+            id: key("USER0001"),
+            fname: PicX::moved_from(b"LAWRENCE"),
+            lname: PicX::moved_from(b"THOMAS"),
+            usr_type: PicX::moved_from(b"U"),
+        };
+        assert_eq!(
+            UserListRow::from(entry),
+            row("USER0001", "LAWRENCE", "THOMAS", "U")
+        );
     }
 
     // audit: COUSR00C-006, COUSR00C-014, COUSR00C-020, COUSR00C-021, COUSR00C-023

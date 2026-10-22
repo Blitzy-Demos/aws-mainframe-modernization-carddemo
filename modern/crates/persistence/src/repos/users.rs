@@ -74,10 +74,11 @@
 
 use copybook::PicX;
 use domain::batch::loads::HashedUser;
+use domain::records::{UserEntry, UserListEntry};
 use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::PersistenceError;
-use crate::rows::{UserEntry, UserListEntry, UserListRow, UserRow, pic_x_to_string};
+use crate::rows::{UserListRow, UserRow, pic_x_to_string};
 use crate::{PgStore, PgTx};
 
 /// The key column, `SEC-USR-ID PIC X(08)` (CSUSR01Y-001), as errors name it.
@@ -566,11 +567,11 @@ mod tests {
 
     use copybook::PicX;
     use domain::batch::loads::{HashedUser, decode_usrsec};
+    use domain::records::{UserEntry, UserListEntry};
     use test_support::postgres::{PostgresGuard, start_postgres};
 
     use super::UserRepository;
     use crate::error::{DecodeKind, PersistenceError};
-    use crate::rows::{UserEntry, UserListEntry};
     use crate::{PgStore, PgTx};
 
     type TestResult = Result<(), Box<dyn StdError>>;

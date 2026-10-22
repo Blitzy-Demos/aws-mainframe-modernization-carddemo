@@ -17,27 +17,26 @@
 //! LOADS-033, LOADS-034). No conversion here reads a password: the load path takes the hash of a
 //! [`HashedUser`] and never its `record.pwd`, and the add and update paths arrive with a hash.
 //!
-//! Four types carry the table:
+//! Two row types carry the table:
 //!
 //! - [`UserRow`]: the six columns, built from a [`HashedUser`] (`dusrsecj`) or a [`UserEntry`]
-//!   (user add and update), and read back by the single-user query.
+//!   (user add and update), and read back by the single-user query as a [`UserEntry`].
 //! - [`UserListRow`]: the four columns the COUSR00C page queries select,
 //!   `queries/users_page_forward.sql` and `queries/users_page_backward.sql`, and nothing more, so
-//!   a page never reads a hash (COUSR00C-028, Bounded Pagination).
-//! - [`UserEntry`] and [`UserListEntry`]: their typed values, which the services hand to the
-//!   COSGN00C, COUSR02C and COUSR00C rules.
+//!   a page never reads a hash (COUSR00C-028, Bounded Pagination). It reads back as a
+//!   [`UserListEntry`].
+//!
+//! Their typed values, [`UserEntry`] and [`UserListEntry`], are the domain's stored projections
+//! of `SEC-USER-DATA` (`domain::records::user_security`); the domain converts them into what the
+//! COSGN00C, COUSR02C and COUSR00C rules take.
 //!
 //! No type here derives `Serialize`, and no `Debug` prints a hash: the row types leave `Debug`
-//! underived and [`UserEntry`] prints `<redacted>` in its place (PIC-024, Cardholder Data
-//! Redaction). Errors name the column and the class, never the value.
-
-use std::fmt;
+//! underived, and the domain's [`UserEntry`] prints `<redacted>` in its place (PIC-024,
+//! Cardholder Data Redaction). Errors name the column and the class, never the value.
 
 use copybook::PicX;
 use domain::batch::loads::HashedUser;
-use domain::online::cosgn00c::{StoredUser, UserType};
-use domain::online::cousr00c::{self, row_from};
-use domain::online::cousr02c::StoredUserView;
+use domain::records::{UserEntry, UserListEntry};
 
 use super::{pic_x_to_string, string_to_pic_x};
 use crate::error::{DecodeKind, PersistenceError};
@@ -195,92 +194,6 @@ impl UserListRow {
     }
 }
 
-/// A user as the store holds it: the `SEC-USER-DATA` fields other than `SEC-USR-PWD`, and the
-/// argon2id PHC string that stands for it (CSUSR01Y-001 to CSUSR01Y-006, E25).
-///
-/// `Debug` prints `<redacted>` in place of the hash; no `Display` or `Serialize` exists
-/// (PIC-024, Cardholder Data Redaction).
-#[derive(Clone, PartialEq, Eq)]
-pub struct UserEntry {
-    /// `SEC-USR-ID PIC X(08)`, the key (CSUSR01Y-001).
-    pub id: PicX<8>,
-    /// `SEC-USR-FNAME PIC X(20)`, padding kept (CSUSR01Y-002).
-    pub fname: PicX<20>,
-    /// `SEC-USR-LNAME PIC X(20)`, padding kept (CSUSR01Y-003).
-    pub lname: PicX<20>,
-    /// The argon2id PHC string over the 8 `SEC-USR-PWD` bytes, beginning `$argon2id$`
-    /// (CSUSR01Y-004, LOADS-033, E25). Sign-on and the update's change check verify a password
-    /// against it with `domain::password::verify` (E26, E27).
-    pub password_hash: String,
-    /// `SEC-USR-TYPE PIC X(01)`: `A` administrator, `U` user (CSUSR01Y-005).
-    pub usr_type: PicX<1>,
-    /// `SEC-USR-FILLER PIC X(23)`, kept byte for byte; a rewrite stores it unchanged
-    /// (CSUSR01Y-006, PIC-012).
-    pub filler: PicX<23>,
-}
-
-impl UserEntry {
-    /// What sign-on needs of the row `READ-USER-SEC-FILE` found: the stored type and the hash to
-    /// verify the password against (COSGN00C-013, CSUSR01Y-004, CSUSR01Y-005).
-    //
-    // Named `as_` rather than `into_`: `StoredUser` borrows the hash, so the conversion cannot
-    // consume the entry, and the workspace names borrowing views `as_*`.
-    #[must_use]
-    pub fn as_stored_user(&self) -> StoredUser<'_> {
-        StoredUser::new(
-            UserType::from_code(self.usr_type.clone()),
-            &self.password_hash,
-        )
-    }
-
-    /// The stored user the COUSR02C and COUSR03C read shows: ID, names and type, with neither
-    /// the hash nor `FILLER` (COUSR02C-012, CSUSR01Y-001 to CSUSR01Y-003, CSUSR01Y-005).
-    #[must_use]
-    pub fn into_stored_view(self) -> StoredUserView {
-        StoredUserView {
-            user_id: self.id,
-            first_name: self.fname,
-            last_name: self.lname,
-            user_type: self.usr_type,
-        }
-    }
-}
-
-impl fmt::Debug for UserEntry {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("UserEntry")
-            .field("id", &self.id)
-            .field("fname", &self.fname)
-            .field("lname", &self.lname)
-            .field("password_hash", &format_args!("<redacted>"))
-            .field("usr_type", &self.usr_type)
-            .field("filler", &self.filler)
-            .finish()
-    }
-}
-
-/// A user as a COUSR00C page lists it: the four fields `POPULATE-USER-DATA` moves to the map, as
-/// stored, padding kept (COUSR00C-028). It has no hash field.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserListEntry {
-    /// `SEC-USR-ID PIC X(08)` (CSUSR01Y-001).
-    pub id: PicX<8>,
-    /// `SEC-USR-FNAME PIC X(20)` (CSUSR01Y-002).
-    pub fname: PicX<20>,
-    /// `SEC-USR-LNAME PIC X(20)` (CSUSR01Y-003).
-    pub lname: PicX<20>,
-    /// `SEC-USR-TYPE PIC X(01)` (CSUSR01Y-005).
-    pub usr_type: PicX<1>,
-}
-
-impl UserListEntry {
-    /// The list row the COUSR00C page rule shows for this user (COUSR00C-028).
-    #[must_use]
-    pub fn into_list_row(self) -> cousr00c::UserListRow {
-        row_from(self.id, self.fname, self.lname, self.usr_type)
-    }
-}
-
 /// `hash` unchanged, when it is text the `password_hash TEXT` column stores and returns byte for
 /// byte: ASCII without NUL, which every PHC string is (PIC-002). `TEXT` declares no width, so
 /// nothing else is checked, and the `CHAR(n)` and `VARCHAR(n)` conversions of `rows` do not
@@ -302,12 +215,9 @@ mod tests {
 
     use copybook::{FixedRecord, PicX};
     use domain::batch::loads::HashedUser;
-    use domain::online::cosgn00c::{StoredUser, UserType};
-    use domain::online::cousr00c::row_from;
-    use domain::online::cousr02c::StoredUserView;
-    use domain::records::UserSecurityRecord;
+    use domain::records::{UserEntry, UserListEntry, UserSecurityRecord};
 
-    use super::{UserEntry, UserListEntry, UserListRow, UserRow};
+    use super::{UserListRow, UserRow};
     use crate::error::{DecodeKind, PersistenceError};
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -424,20 +334,6 @@ mod tests {
         Ok(())
     }
 
-    // audit: PIC-024
-    #[test]
-    fn debug_never_shows_the_hash() -> TestResult {
-        let entry = admin001_entry()?;
-        let text = format!("{entry:?}");
-        assert!(!text.contains(HASH), "{text}");
-        assert!(!text.contains("argon2id"), "{text}");
-        assert!(text.contains("<redacted>"), "{text}");
-        for shown in ["ADMIN001", "MARGARET", "GOLD", "usr_type: PicX(\"A\")"] {
-            assert!(text.contains(shown), "{text}");
-        }
-        Ok(())
-    }
-
     #[test]
     fn row_values_that_do_not_fit_their_picture_are_typed_errors() {
         let user0001 = format!("{:<20}", "LAWRENCE");
@@ -514,39 +410,18 @@ mod tests {
         Ok(())
     }
 
-    // audit: COSGN00C-013
-    // audit: COUSR02C-012
-    #[test]
-    fn entry_converts_to_the_sign_on_and_maintenance_views() -> TestResult {
-        let user = admin001()?;
-        let entry = UserRow::from_hashed(&user)?.into_entry()?;
-
-        let stored = entry.as_stored_user();
-        assert_eq!(stored, StoredUser::new(UserType::ADMIN, HASH));
-        assert!(!format!("{stored:?}").contains(HASH));
-
-        let view = entry.into_stored_view();
-        assert_eq!(view, StoredUserView::from(&user.record));
-        Ok(())
-    }
-
     // audit: COUSR00C-028
     #[test]
-    fn page_rows_convert_to_the_list_rule_s_rows() -> TestResult {
+    fn page_rows_read_back_as_their_four_typed_fields() -> TestResult {
         let lname = format!("{:<20}", "THOMAS");
-        let entry = list_row("USER0001", &lname).into_entry()?;
         assert_eq!(
-            entry,
+            list_row("USER0001", &lname).into_entry()?,
             UserListEntry {
                 id: PicX::from_text("USER0001")?,
                 fname: PicX::from_text("LAWRENCE")?,
                 lname: PicX::from_text("THOMAS")?,
                 usr_type: PicX::from_text("U")?,
             }
-        );
-        assert_eq!(
-            entry.clone().into_list_row(),
-            row_from(entry.id, entry.fname, entry.lname, entry.usr_type)
         );
 
         assert_eq!(

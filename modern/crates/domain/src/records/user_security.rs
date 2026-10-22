@@ -16,6 +16,15 @@
 //! `LRECL=80` card image IEBGENER reads (LOADS-012) and decodes that, so codec A round-trips the
 //! full 80 bytes (LOADS-034, i8). This module does no I/O: the deck is read by the batch job and
 //! the tests.
+//!
+//! # The stored projections
+//!
+//! [`UserEntry`] and [`UserListEntry`] are the values codec B reads and writes for table
+//! `users`: the user as the store holds it, and the four fields a COUSR00C page selects. Neither
+//! has a byte form, because the store holds the argon2id PHC string in place of `SEC-USR-PWD`
+//! (E25), so neither implements [`FixedRecord`].
+
+use core::fmt;
 
 use copybook::{Error, FixedRecord, PicX, RecordReader, RecordWriter};
 
@@ -109,13 +118,69 @@ impl FixedRecord for UserSecurityRecord {
     }
 }
 
+/// A user as the store holds it: the `SEC-USER-DATA` fields other than `SEC-USR-PWD`, and the
+/// argon2id PHC string that stands for it (CSUSR01Y-001 to CSUSR01Y-006, E25).
+///
+/// It is the stored projection codec B reads and writes for a `users` row. It has no byte form:
+/// the store holds the argon2id PHC string in place of `SEC-USR-PWD`.
+///
+/// `Debug` prints `<redacted>` in place of the hash; no `Display` or `Serialize` exists
+/// (PIC-024, Cardholder Data Redaction).
+#[derive(Clone, PartialEq, Eq)]
+pub struct UserEntry {
+    /// `SEC-USR-ID PIC X(08)`, the key (CSUSR01Y-001).
+    pub id: PicX<8>,
+    /// `SEC-USR-FNAME PIC X(20)`, padding kept (CSUSR01Y-002).
+    pub fname: PicX<20>,
+    /// `SEC-USR-LNAME PIC X(20)`, padding kept (CSUSR01Y-003).
+    pub lname: PicX<20>,
+    /// The argon2id PHC string over the 8 `SEC-USR-PWD` bytes, beginning `$argon2id$`
+    /// (CSUSR01Y-004, LOADS-033, E25). Sign-on and the update's change check verify a password
+    /// against it with `crate::password::verify` (E26, E27).
+    pub password_hash: String,
+    /// `SEC-USR-TYPE PIC X(01)`: `A` administrator, `U` user (CSUSR01Y-005).
+    pub usr_type: PicX<1>,
+    /// `SEC-USR-FILLER PIC X(23)`, kept byte for byte; a rewrite stores it unchanged
+    /// (CSUSR01Y-006, PIC-012).
+    pub filler: PicX<23>,
+}
+
+impl fmt::Debug for UserEntry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("UserEntry")
+            .field("id", &self.id)
+            .field("fname", &self.fname)
+            .field("lname", &self.lname)
+            .field("password_hash", &format_args!("<redacted>"))
+            .field("usr_type", &self.usr_type)
+            .field("filler", &self.filler)
+            .finish()
+    }
+}
+
+/// A user as a COUSR00C page lists it: the four fields `POPULATE-USER-DATA` moves to the map, as
+/// stored, padding kept (COUSR00C-028). It has no hash field.
+///
+/// It is the stored projection codec B reads from the page queries, and has no byte form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserListEntry {
+    /// `SEC-USR-ID PIC X(08)` (CSUSR01Y-001).
+    pub id: PicX<8>,
+    /// `SEC-USR-FNAME PIC X(20)` (CSUSR01Y-002).
+    pub fname: PicX<20>,
+    /// `SEC-USR-LNAME PIC X(20)` (CSUSR01Y-003).
+    pub lname: PicX<20>,
+    /// `SEC-USR-TYPE PIC X(01)` (CSUSR01Y-005).
+    pub usr_type: PicX<1>,
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
 
     use copybook::{Error, ErrorKind, FixedRecord, Framed, Line, LineFraming, PicX, Terminator};
 
-    use super::UserSecurityRecord;
+    use super::{UserEntry, UserSecurityRecord};
     use crate::sensitive::Password;
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -126,6 +191,10 @@ mod tests {
 
     /// The 8 bytes of `SEC-USR-PWD` in [`ADMIN001`], at offset 48.
     const ADMIN001_PWD: &[u8; 8] = b"PASSWORD";
+
+    /// A fixed PHC-shaped string: no test here calls argon2, and nothing checked depends on the
+    /// hash being one `crate::password::hash` produced.
+    const HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$ZmFrZWhhc2hmb3J0ZXN0c29ubHk";
 
     /// `line` padded with spaces to the 80-byte card image `dusrsecj` decodes (LOADS-012).
     fn card_image(line: &[u8]) -> Vec<u8> {
@@ -225,6 +294,27 @@ mod tests {
             assert!(!text.contains("PASSWORD"), "{text}");
             assert!(text.contains("********"), "{text}");
             assert!(text.contains("ADMIN001"), "{text}");
+        }
+        Ok(())
+    }
+
+    // audit: PIC-024
+    #[test]
+    fn entry_debug_never_shows_the_hash() -> TestResult {
+        let entry = UserEntry {
+            id: PicX::from_text("ADMIN001")?,
+            fname: PicX::from_text("MARGARET")?,
+            lname: PicX::from_text("GOLD")?,
+            password_hash: HASH.to_owned(),
+            usr_type: PicX::from_text("A")?,
+            filler: PicX::spaces(),
+        };
+        let text = format!("{entry:?}");
+        assert!(!text.contains(HASH), "{text}");
+        assert!(!text.contains("argon2id"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+        for shown in ["ADMIN001", "MARGARET", "GOLD", "usr_type: PicX(\"A\")"] {
+            assert!(text.contains(shown), "{text}");
         }
         Ok(())
     }

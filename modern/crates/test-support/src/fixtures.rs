@@ -26,9 +26,13 @@
 //!   each load must report (`modern/audit/fixtures.md`).
 //!
 //! No foreign key joins the loaded tables, so the loads succeed on an empty or a loaded
-//! database, and a rerun leaves the same copybook-derived contents. Only `cards.card_ref`,
-//! which the database assigns anew to every inserted card, and the salted
-//! `users.password_hash` differ between two runs.
+//! database, and a rerun leaves the same copybook-derived contents. Between two loads in one
+//! process only `cards.card_ref`, which the database assigns anew to every inserted card,
+//! differs: the harness hashes the deck once per process, and every load writes that same set
+//! of salted argon2id hashes. A new process, such as another test binary, hashes the deck again
+//! with fresh salts, as each separate `carddemo-batch dusrsecj` run does, because
+//! `domain::batch::loads::hash_user` draws a new salt per call (LOADS-033, E25). Those runs
+//! therefore store different `users.password_hash` strings that verify the same passwords.
 //!
 //! The loads write through the repository traits of `persistence` only: this module holds no
 //! SQL text and applies no migration, which [`start_postgres`] has done before.
