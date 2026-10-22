@@ -1,6 +1,7 @@
 //! The request and response contracts of the 27 REST operations (AAP 0.3.4.1), and what all of
 //! them share: the [`ScreenResult`] and [`PageDirection`] schemas, the `page_size` rule of
-//! Bounded Pagination, and the validating extractors [`ValidJson`] and [`ValidQuery`].
+//! Bounded Pagination, and the validating extractors [`ValidJson`], [`ValidQuery`] and
+//! [`ValidPath`].
 //!
 //! # Folder contract
 //!
@@ -23,14 +24,16 @@
 //!
 //! # Extractors
 //!
-//! A handler takes a body as [`ValidJson<T>`] and a query string as [`ValidQuery<T>`]. utoipa
-//! cannot see through either, so a handler taking `ValidJson<T>` declares `request_body = T` and
-//! one taking `ValidQuery<T>` declares `params(T)` in its `#[utoipa::path]`.
+//! A handler takes a body as [`ValidJson<T>`], a query string as [`ValidQuery<T>`] and path
+//! parameters that carry a map field as [`ValidPath<T>`]. utoipa cannot see through any of
+//! them, so a handler taking `ValidJson<T>` declares `request_body = T` and one taking
+//! `ValidQuery<T>` or `ValidPath<T>` declares `params(T)` in its `#[utoipa::path]`.
 //!
 //! Every rejection is a [`ScreenError`]:
 //!
-//! - A body or query string that does not deserialise into `T`: 400 with [`INVALID_BODY`] or
-//!   [`INVALID_QUERY`] and no field. That covers malformed JSON, a missing JSON content type, a
+//! - A body, query string or path that does not deserialise into `T`: 400 with
+//!   [`INVALID_BODY`], [`INVALID_QUERY`] or [`INVALID_PATH`] and no field. That covers malformed
+//!   JSON, a missing JSON content type, a
 //!   value of the wrong type (text where an integer belongs, for instance) and an unknown enum
 //!   value. An attention key whose program answers unserved keys itself (`cotrtupc`,
 //!   `cotrn02c`) reads every other key name as a hidden variant instead, so that the program's
@@ -104,7 +107,7 @@ pub mod cotrtlic; // endpoints 24 and 25
 pub mod cotrtupc; // endpoints 26 and 27
 
 use axum::Json;
-use axum::extract::{FromRequest, FromRequestParts, Query, Request};
+use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
 use domain::copybook::{PicU, PicX};
 use serde::de::DeserializeOwned;
@@ -205,6 +208,13 @@ pub const INVALID_BODY: &str = "Invalid request body...";
 /// value of the query.
 pub const INVALID_QUERY: &str = "Invalid query parameters...";
 
+/// The message of path parameters that do not deserialise into their DTO, such as a segment
+/// whose percent-encoding is not UTF-8.
+///
+/// A fixed text of this crate: it never includes the deserialiser's error, the URI or any
+/// segment of the path.
+pub const INVALID_PATH: &str = "Invalid path parameters...";
+
 /// The message of a field longer than its map `LENGTH`, of a text that does not fit its
 /// `PIC X(n)` field byte for byte as printable ASCII ([`pic_x`], code [`PIC_X_CODE`]), and of
 /// every rule code without a text of its own: input the 3270 field would not have admitted.
@@ -293,6 +303,36 @@ where
         let Query(value) = Query::<T>::from_request_parts(parts, state)
             .await
             .map_err(|_| ScreenError::input(INVALID_QUERY, None))?;
+        value
+            .validate()
+            .map_err(|errors| validation_error(&errors))?;
+        Ok(Self(value))
+    }
+}
+
+/// Path parameters deserialised into `T` and checked against `T`'s `validator` rules, for a
+/// path segment that carries the text of a map field, such as the user ID of endpoints 18 to 20
+/// (`USRIDIN`, 8).
+///
+/// A handler that takes it declares `params(T)` in its `#[utoipa::path]`, `T` deriving
+/// `utoipa::IntoParams` with `parameter_in = Path`. The rejection is a [`ScreenError`]: 400 with
+/// [`INVALID_PATH`] when the path does not deserialise, otherwise the error of the first failing
+/// rule, such as [`FIELD_LENGTH_MESSAGE`] naming a segment longer than its map `LENGTH`.
+#[derive(Debug, Clone)]
+pub struct ValidPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for ValidPath<T>
+where
+    T: DeserializeOwned + Validate + Send,
+    S: Send + Sync,
+{
+    type Rejection = ScreenError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // The rejection's own text quotes the offending segment, so it is dropped unread.
+        let Path(value) = Path::<T>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ScreenError::input(INVALID_PATH, None))?;
         value
             .validate()
             .map_err(|errors| validation_error(&errors))?;

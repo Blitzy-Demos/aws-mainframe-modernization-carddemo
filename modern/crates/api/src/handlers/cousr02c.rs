@@ -11,7 +11,8 @@
 //!
 //! Each handler extracts, calls its one `services::cousr02c` function and maps the outcome
 //! through the `From` conversions of `crate::dto` and `crate::error` (Thin Request Handlers).
-//! The path `user_id` is passed unparsed: the service's domain edit answers a blank one with the
+//! The path `user_id` is a `UserIdPath`, revalidated against the map `LENGTH` of `USRIDIN`
+//! (COUSR02-013) and passed on as typed: the service's domain edit answers a blank one with the
 //! program's own message. The caller's authority comes from the `AdminUser` token alone; the
 //! path and the body only name the target user (AAP 0.5.1).
 //!
@@ -21,12 +22,12 @@
 //! Redaction).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
-use crate::dto::cousr02c::{UserUpdateRequest, UserView};
-use crate::dto::{ScreenResult, ValidJson};
+use crate::dto::cousr02c::{UserIdPath, UserUpdateRequest, UserView};
+use crate::dto::{ScreenResult, ValidJson, ValidPath};
 use crate::error::ScreenError;
 use crate::services;
 
@@ -39,7 +40,8 @@ use crate::services;
 ///
 /// # Errors
 ///
-/// - 400 `User ID can NOT be empty...` (`field` `user_id`) for a blank user ID.
+/// - 400 `User ID can NOT be empty...` (`field` `user_id`) for a blank user ID, and the API's
+///   fixed text naming `user_id` for one longer than 8 bytes or not printable ASCII.
 /// - 401 without a valid bearer token; 403 for a token whose user type is not `A`.
 /// - 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.
 /// - 500 `Unable to lookup User...` (`field` `first_name`) when the read fails.
@@ -48,12 +50,14 @@ use crate::services;
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr02c_fetch",
     tag = "COUSR02C",
-    params(
-        ("user_id" = String, Path, description = "User ID as typed on the screen (8 characters)")
-    ),
+    params(UserIdPath),
     responses(
         (status = 200, description = "The stored user, without its password", body = UserView),
-        (status = 400, description = "Blank user ID", body = ScreenError),
+        (
+            status = 400,
+            description = "Blank user ID, or one that does not fit the screen field",
+            body = ScreenError
+        ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
         (status = 403, description = "The token's user type is not A", body = ScreenError),
         (status = 404, description = "No user has this ID", body = ScreenError),
@@ -65,9 +69,9 @@ use crate::services;
 pub(crate) async fn fetch(
     State(state): State<AppState>,
     admin: AdminUser,
-    Path(user_id): Path<String>,
+    ValidPath(path): ValidPath<UserIdPath>,
 ) -> Result<Json<UserView>, ScreenError> {
-    services::cousr02c::fetch(&state, &admin, &user_id)
+    services::cousr02c::fetch(&state, &admin, &path.user_id)
         .await
         .map(UserView::from)
         .map(Json)
@@ -85,9 +89,10 @@ pub(crate) async fn fetch(
 ///
 /// # Errors
 ///
-/// - 400 for a body that does not fit the screen fields, for the first empty-field edit that
-///   fails, in the program's order (user ID, first name, last name, a supplied password, user
-///   type), and `Please modify to update ...` when nothing differs from the stored row.
+/// - 400 for a path user ID or a body that does not fit the screen fields, for the first
+///   empty-field edit that fails, in the program's order (user ID, first name, last name, a
+///   supplied password, user type), and `Please modify to update ...` when nothing differs from
+///   the stored row.
 /// - 401 without a valid bearer token; 403 for a token whose user type is not `A`.
 /// - 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.
 /// - 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when
@@ -97,15 +102,13 @@ pub(crate) async fn fetch(
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr02c_update",
     tag = "COUSR02C",
-    params(
-        ("user_id" = String, Path, description = "User ID as typed on the screen (8 characters)")
-    ),
+    params(UserIdPath),
     request_body = UserUpdateRequest,
     responses(
         (status = 200, description = "The user was rewritten", body = ScreenResult),
         (
             status = 400,
-            description = "Invalid body, an empty field, or nothing modified",
+            description = "Invalid path or body, an empty field, or nothing modified",
             body = ScreenError
         ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
@@ -123,10 +126,10 @@ pub(crate) async fn fetch(
 pub(crate) async fn update(
     State(state): State<AppState>,
     admin: AdminUser,
-    Path(user_id): Path<String>,
+    ValidPath(path): ValidPath<UserIdPath>,
     ValidJson(request): ValidJson<UserUpdateRequest>,
 ) -> Result<Json<ScreenResult>, ScreenError> {
-    services::cousr02c::update(&state, &admin, &user_id, request)
+    services::cousr02c::update(&state, &admin, &path.user_id, request)
         .await
         .map(ScreenResult::from)
         .map(Json)

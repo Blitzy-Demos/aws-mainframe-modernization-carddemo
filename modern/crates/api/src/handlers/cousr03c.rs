@@ -8,18 +8,19 @@
 //! registers this handler in the one `routes!` of `/api/v1/users/{user_id}`, beside the
 //! `GET` and `PUT` of `handlers::cousr02c`.
 //!
-//! The handler extracts the admin gate and the raw path ID, calls
-//! `services::cousr03c::delete` and maps its answer through `ScreenResult::from` and
-//! `ScreenError::from` (Thin Request Handlers). Every edit, message and status is the domain's
-//! and `crate::error`'s: a failed delete keeps the program's `Unable to Update User...`,
-//! `Update` included (COUSR03C-022).
+//! The handler extracts the admin gate and the path ID, a `UserIdPath` revalidated against the
+//! map `LENGTH` of `USRIDIN` (COUSR03-013), calls `services::cousr03c::delete` with its text as
+//! typed and maps the answer through `ScreenResult::from` and `ScreenError::from` (Thin Request
+//! Handlers). Every edit, message and status is the domain's and `crate::error`'s: a failed
+//! delete keeps the program's `Unable to Update User...`, `Update` included (COUSR03C-022).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
-use crate::dto::ScreenResult;
+use crate::dto::cousr02c::UserIdPath;
+use crate::dto::{ScreenResult, ValidPath};
 use crate::error::ScreenError;
 use crate::services;
 
@@ -27,10 +28,11 @@ use crate::services;
 ///
 /// F5 deletes the user whose ID is in the path, the ID the screen fetched through the shared
 /// user read (endpoint 18) or typed afresh: the screen sends it as it stands and asks no other
-/// confirmation (COUSR03C-023). The path `user_id` is the raw text of the user ID input; it is
-/// padded to its 8-byte key, neither upper-cased nor trimmed, and a blank one is rejected before
-/// any read (COUSR03C-016, COUSR03C-017). A deleted user answers with the program's message,
-/// such as `User USER0001 has been deleted ...` (COUSR03C-019, COUSR03C-020).
+/// confirmation (COUSR03C-023). The path `user_id` is the text of the user ID input, at most its
+/// 8 bytes; it is padded to its 8-byte key, neither upper-cased nor trimmed, and a blank one is
+/// rejected before any read (COUSR03C-016, COUSR03C-017). A deleted user answers with the
+/// program's message, such as `User USER0001 has been deleted ...` (COUSR03C-019,
+/// COUSR03C-020).
 ///
 /// F4, F12 and F3 are handled by the screen and call no endpoint. An administrator token is
 /// required: the caller acts only as the verified `AdminUser`, and nothing compares it with the
@@ -41,7 +43,9 @@ use crate::services;
 ///
 /// A `ScreenError` with its audited status:
 ///
-/// - 400 `User ID can NOT be empty...` on `user_id` for a blank path ID (COUSR03C-016);
+/// - 400 `User ID can NOT be empty...` on `user_id` for a blank path ID (COUSR03C-016), and the
+///   API's fixed text on `user_id` for one longer than 8 bytes or not printable ASCII
+///   (COUSR03-013);
 /// - 401 without a valid bearer token and 403 for a token whose user type is not `A`, from the
 ///   `AdminUser` extractor, before the service runs (COUSR03C-001, COUSR03C-002);
 /// - 404 `User ID NOT found...` on `user_id` for a delete that affects no row (COUSR03C-021);
@@ -54,9 +58,7 @@ use crate::services;
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr03c_delete",
     tag = "COUSR03C",
-    params(
-        ("user_id" = String, Path, description = "User ID as typed on the screen (8 characters)")
-    ),
+    params(UserIdPath),
     responses(
         (
             status = 200,
@@ -66,7 +68,8 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "Blank user ID: `User ID can NOT be empty...`",
+            description = "Blank user ID: `User ID can NOT be empty...`; or a user ID that does \
+                           not fit the screen field",
             body = ScreenError,
             example = json!({"message": "User ID can NOT be empty...", "field": "user_id"})
         ),
@@ -99,9 +102,9 @@ use crate::services;
 pub(crate) async fn delete(
     State(state): State<AppState>,
     admin: AdminUser,
-    Path(user_id): Path<String>,
+    ValidPath(path): ValidPath<UserIdPath>,
 ) -> Result<Json<ScreenResult>, ScreenError> {
-    services::cousr03c::delete(&state, &admin, &user_id)
+    services::cousr03c::delete(&state, &admin, &path.user_id)
         .await
         .map(ScreenResult::from)
         .map(Json)

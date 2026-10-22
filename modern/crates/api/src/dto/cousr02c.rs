@@ -8,11 +8,13 @@
 //!   `ScreenResult::from` over the message `rules::rewrite_outcome` returns
 //!   (`User USER0001 has been updated ...`, COUSR02C-029).
 //!
-//! The path `user_id` is a raw `String` the handler passes to the service, which edits it with
-//! `rules::edit_user_id`; its map `LENGTH` (`USRIDIN`, 8, COUSR02-013) is the domain's
-//! alphanumeric `MOVE`, so no DTO here carries it. F3, F4 and F12 are client-side. A failure of
-//! either endpoint is a `rules::UserMaintFailure`, which `crate::error` maps to a
-//! `ScreenError`.
+//! The path `user_id` of endpoints 18 to 20 is a [`UserIdPath`], which the handlers extract with
+//! the parent module's `ValidPath`. It revalidates the map `LENGTH` of `USRIDIN`, 8 (COUSR02-013,
+//! COUSR03-013), and the `PIC X(8)` key the ID is moved into: a longer segment, or one holding a
+//! byte outside printable ASCII, is a 400 naming `user_id`, never a key cut to its first 8 bytes.
+//! The text that passes reaches the service raw, which edits it with `rules::edit_user_id` or
+//! `cousr03c::edit_delete`. F3, F4 and F12 are client-side. A failure of any of the three
+//! endpoints is a `rules::UserMaintFailure`, which `crate::error` maps to a `ScreenError`.
 //!
 //! # Prompts
 //!
@@ -45,13 +47,32 @@ use core::fmt;
 use domain::online::cousr02c as rules;
 use domain::online::cousr03c;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
 use super::text;
 
 /// What `Debug` shows in place of a supplied password.
 const PASSWORD_SHOWN: &str = "********";
+
+/// The path of endpoints 18, 19 and 20, `/api/v1/users/{user_id}`: the user ID input of the
+/// update and delete maps (`USRIDIN`).
+///
+/// The segment is validated against the map `LENGTH`, the server half of the `both` rows
+/// COUSR02-013 and COUSR03-013 of `modern/audit/screens.md`, and against the `PIC X(8)` key
+/// the programs move it into: at most 8 bytes, each printable ASCII (`0x20`–`0x7E`), or
+/// `LOW-VALUES`. A segment that passes, a blank one included, goes to the domain's edit as
+/// typed, so a blank ID gets the program's own `User ID can NOT be empty...` (COUSR02C-010,
+/// COUSR02C-018, COUSR03C-016).
+#[derive(Debug, Clone, Deserialize, IntoParams, Validate)]
+#[into_params(parameter_in = Path)]
+pub struct UserIdPath {
+    /// User ID as typed on the screen: at most 8 bytes of printable ASCII, neither upper-cased
+    /// nor trimmed, so `admin001` does not find `ADMIN001` (COUSR02C-011, COUSR03C-017).
+    #[validate(length(max = 8), custom(function = "super::pic_x::<8>"))]
+    #[param(max_length = 8)]
+    pub user_id: String,
+}
 
 /// The answer of endpoint 18 for a user that has a row: the row's ID, names and type, and the
 /// prompt each of the two sharing programs sends after its read (COUSR02C-012, COUSR02C-014,
@@ -197,19 +218,22 @@ fn never_serialized<T>(_: &T) -> bool {
 mod tests {
     use std::error::Error as StdError;
 
-    use axum::body::Body;
+    use axum::body::{self, Body};
     use axum::extract::{FromRequest, Request};
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
+    use axum::routing::get;
+    use axum::{Json, Router};
     use domain::copybook::PicX;
     use domain::online::cosgn00c;
     use domain::password;
     use serde_json::{Value, json};
-    use utoipa::{PartialSchema, ToSchema};
+    use tower::ServiceExt as _;
+    use utoipa::{IntoParams, PartialSchema, ToSchema};
     use validator::Validate;
 
-    use super::{UserUpdateRequest, UserView, rules};
-    use crate::dto::{FIELD_LENGTH_MESSAGE, ScreenResult, ValidJson};
+    use super::{UserIdPath, UserUpdateRequest, UserView, rules};
+    use crate::dto::{FIELD_LENGTH_MESSAGE, INVALID_PATH, ScreenResult, ValidJson, ValidPath};
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -654,6 +678,80 @@ mod tests {
             .err()
             .ok_or("a blank first name passed the edit")?;
         assert_eq!(failure.message(), "First Name can NOT be empty...");
+        Ok(())
+    }
+
+    /// The status and body a route of endpoints 18 to 20 gives `uri` once `ValidPath` has
+    /// extracted its [`UserIdPath`]: the user ID it would pass on, or the rejection.
+    async fn through_path(uri: &str) -> Result<(StatusCode, Value), Box<dyn StdError>> {
+        let router = Router::new().route(
+            "/api/v1/users/{user_id}",
+            get(|ValidPath(path): ValidPath<UserIdPath>| async move {
+                Json(json!({ "user_id": path.user_id }))
+            }),
+        );
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    #[tokio::test]
+    async fn the_path_user_id_is_revalidated_against_its_map_length() -> TestResult {
+        // COUSR02-013, COUSR03-013: within the map `LENGTH` the text passes as typed, blank,
+        // spaced and lower-case IDs included, to the programs' own edits (COUSR02C-010,
+        // COUSR02C-011, COUSR03C-016, COUSR03C-017).
+        for (uri, passed) in [
+            ("/api/v1/users/USER0001", "USER0001"),
+            ("/api/v1/users/admin001", "admin001"),
+            ("/api/v1/users/AB%20CD", "AB CD"),
+            ("/api/v1/users/%20AB", " AB"),
+            ("/api/v1/users/%20%20%20", "   "),
+        ] {
+            assert_eq!(
+                through_path(uri).await?,
+                (StatusCode::OK, json!({ "user_id": passed })),
+                "{uri}"
+            );
+        }
+        // Beyond 8 bytes, or a byte the `PIC X(8)` key cannot hold: rejected naming the
+        // segment, never moved into the key cut to its first 8 bytes.
+        for uri in [
+            "/api/v1/users/USER00019",
+            "/api/v1/users/%C3%A9",
+            "/api/v1/users/AB%09CD",
+        ] {
+            assert_eq!(
+                through_path(uri).await?,
+                (
+                    StatusCode::BAD_REQUEST,
+                    json!({ "message": FIELD_LENGTH_MESSAGE, "field": "user_id" })
+                ),
+                "{uri}"
+            );
+        }
+        // A segment that is not UTF-8 does not deserialise.
+        assert_eq!(
+            through_path("/api/v1/users/%FF").await?,
+            (StatusCode::BAD_REQUEST, json!({ "message": INVALID_PATH }))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_path_parameter_publishes_its_map_length() -> TestResult {
+        let parameters = serde_json::to_value(UserIdPath::into_params(|| None))?;
+        assert_eq!(parameters[0]["name"], json!("user_id"), "{parameters}");
+        assert_eq!(parameters[0]["in"], json!("path"), "{parameters}");
+        assert_eq!(parameters[0]["required"], json!(true), "{parameters}");
+        assert_eq!(
+            parameters[0]["schema"]["maxLength"],
+            json!(8),
+            "{parameters}"
+        );
+        assert_eq!(parameters.as_array().map(Vec::len), Some(1), "{parameters}");
         Ok(())
     }
 

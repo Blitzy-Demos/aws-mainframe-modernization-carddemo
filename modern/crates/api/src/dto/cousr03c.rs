@@ -2,7 +2,9 @@
 //! only (`[A]`; transaction `CU03`, map `COUSR3A`; AAP 0.3.4.1).
 //!
 //! F5 (`F5=Delete`) is the only key the endpoint serves (COUSR03C-023). The request has no body:
-//! the path `user_id` is the raw text of the `USRIDIN` input, which the handler passes unchanged
+//! the path `user_id` is the text of the `USRIDIN` input, the
+//! [`UserIdPath`](super::cousr02c::UserIdPath) endpoints 18 to 20 share, which rejects a segment
+//! longer than the map's 8 bytes (COUSR03-013). The handler passes the text that fits unchanged
 //! to `api::services::cousr03c`. There `domain::online::cousr03c::edit_delete` pads it to its
 //! `PIC X(8)` key, neither upper-cased nor trimmed, or rejects a blank one with
 //! `User ID can NOT be empty...` before any read (COUSR03C-016, COUSR03C-017).
