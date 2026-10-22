@@ -78,7 +78,7 @@ Source lines use short names: `.cbl` is in `app/cbl/`, `.cpy` in `app/cpy/`, `CO
 
 ## Escalation candidates
 
-Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `../ESCALATIONS.md` under the next free ID (E44 onward), as its `## Later entries` section describes; until then the rows above cite the candidate names.
+Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `../ESCALATIONS.md` under the next free ID (E45 onward), as its `## Later entries` section describes; until then the rows above cite the candidate names.
 
 - `X-COUSR03C-1`
   - Found in: `app/cbl/COUSR03C.cbl:5,329-335`; `app/cbl/COUSR02C.cbl:383-389`.

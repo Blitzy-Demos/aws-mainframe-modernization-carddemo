@@ -108,7 +108,7 @@ Under Cardholder Data Redaction, no audit file contains a full card number, SSN,
   - Name: `X-<FILE>-<n>`. `<FILE>` is the file's upper-case short name (`COPYBOOKS`, `ARITH`, `FIXTURES`, `SCREENS`, `HALTS`; the program or job name for the online, batch and messaging files), and `<n>` is a number unique within the file, which a file may prefix with `H` for its halt candidates (`X-FIXTURES-H1`).
   - An escalation candidate gives `Found in` (path:lines), `Anomaly class` (a class of `ESCALATIONS.md`), `Finding` and `Proposed resolution`. A halt candidate gives `Path`, `Why no single result`, `Bindings blocked`, `Escalation` and `Candidate resolution`, and says whether it proposes a new halt or joins an existing one.
   - Until the reviewer folds a halt candidate in or rejects it, no parity assertion is written for what it names.
-- During review the reviewer folds escalation candidates into `ESCALATIONS.md` under its next free ID (E44 onward; E01–E43 are assigned) and halt candidates into `HALTS.md`, as a new row from H7 onward or into the existing halt whose case they share. The candidate's file then cites the assigned ID. The `## Later entries` sections of both files give the procedure.
+- During review the reviewer folds escalation candidates into `ESCALATIONS.md` under its next free ID (E45 onward; E01–E44 are assigned) and halt candidates into `HALTS.md`, as a new row from H7 onward or into the existing halt whose case they share. The candidate's file then cites the assigned ID. The `## Later entries` sections of both files give the procedure.
 
 ### Rules governing the audit
 
