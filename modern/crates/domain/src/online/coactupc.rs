@@ -1073,9 +1073,9 @@ fn written<const N: usize>(field: &str) -> Option<PicX<N>> {
 /// - `No input received` when the field is blank, `*` followed by spaces or low-values; the
 ///   paragraph's own `Account number not provided` is always replaced (COACTUPC-045, X-COACTUPC-2);
 /// - `Account Number if supplied must be a 11 digit Non-Zero Number` when it is not eleven digits
-///   `0` to `9`, a shorter entry padded with spaces included, or is eleven zeros (COACTUPC-046).
+///   `0` to `9`, a shorter entry padded with spaces included, a text longer than the 11-character
+///   field, or eleven zeros (COACTUPC-046, `screens.md` COACTUP-013).
 pub fn account_key(acct_id_raw: &str) -> Result<PicU<11>, UpdateFailure> {
-    let field = receive(acct_id_raw, W_ACCOUNT_ID);
     let input_error = |message| {
         UpdateFailure::new(
             message,
@@ -1084,6 +1084,14 @@ pub fn account_key(acct_id_raw: &str) -> Result<PicU<11>, UpdateFailure> {
             UpdateState::NotFetched,
         )
     };
+    // A text longer than the 11-character `ACCTSID` field cannot be what the terminal sent, and
+    // the COBOL `MOVE` would drop its tail; it is refused by the numeric edit rather than cut, so
+    // a request never reads or saves an account other than the one typed (COACTUP-013, as
+    // `coactvwc::edit_account` refuses it).
+    if acct_id_raw.chars().count() > W_ACCOUNT_ID {
+        return Err(input_error(ACCOUNT_NOT_VALID));
+    }
+    let field = receive(acct_id_raw, W_ACCOUNT_ID);
     if is_blank(&field) {
         return Err(input_error(NO_INPUT_RECEIVED));
     }
@@ -3277,6 +3285,8 @@ mod tests {
             "00000000000",
             "-0000000001",
             "1.000000000",
+            // Longer than the field: refused, never cut to the account `00000000001`.
+            "000000000012",
         ] {
             let failure = account_key(bad).err().ok_or("bad key passed")?;
             assert_eq!(
