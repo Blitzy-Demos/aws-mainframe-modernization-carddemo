@@ -50,7 +50,7 @@ use sqlx::{PgConnection, PgExecutor};
 use crate::error::PersistenceError;
 use crate::rows::CardXrefRow;
 use crate::rows::{pic_u_to_i64, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx};
 
 /// Column of `XREF-CARD-NUM`, named by a key conversion error.
 const CARD_NUM: &str = "card_num";
@@ -58,7 +58,8 @@ const CARD_NUM: &str = "card_num";
 const ACCT_ID: &str = "acct_id";
 
 /// The `card_xref` table, implemented by [`PgStore`] (each statement on a pooled connection,
-/// committed on its own) and [`PgTx`] (inside the caller's transaction).
+/// committed on its own), [`PgTx`] (inside the caller's transaction) and [`PgSession`] (each
+/// statement on the session's one connection, committed on its own).
 ///
 /// Every method takes and returns `domain` records and `copybook` keys and converts them through
 /// codec B, [`CardXrefRow`], byte for byte: nothing is trimmed, padded or defaulted.
@@ -161,10 +162,15 @@ pub trait CardXrefRepository: Send {
     /// `DEFINE CLUSTER` and `REPRO` into the new, empty cluster (LOADS-014); an empty table is
     /// not an error (LOADS-015).
     ///
-    /// The delete and the inserts form one unit: [`PgStore`] runs them in a transaction of its
-    /// own and commits it, [`PgTx`] inside the caller's transaction. No foreign key joins
-    /// `card_xref` to another table, so the load succeeds whatever any other load did first
-    /// (LOADS-025).
+    /// The delete and the inserts form one unit: [`PgStore`] and [`PgSession`] run them in a
+    /// transaction of their own and commit it, [`PgTx`] inside the caller's transaction. No
+    /// foreign key joins `card_xref` to another table, so the load succeeds whatever any other
+    /// load did first (LOADS-025).
+    ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
     ///
     /// # Errors
     ///
@@ -172,9 +178,9 @@ pub trait CardXrefRepository: Send {
     /// converted before the delete, so the call fails with nothing written, leaving the table
     /// and a [`PgTx`] caller's transaction as they were. [`PersistenceError::Duplicate`] when two
     /// records share a card number, and [`PersistenceError::Unavailable`] or
-    /// [`PersistenceError::Database`] when a statement or the commit fails. On [`PgStore`] the
-    /// transaction is then rolled back and the previous contents remain (LOADS-018); on [`PgTx`]
-    /// the failed statement aborts the caller's transaction.
+    /// [`PersistenceError::Database`] when a statement or the commit fails. On [`PgStore`] and
+    /// [`PgSession`] the transaction is then rolled back and the previous contents remain
+    /// (LOADS-018); on [`PgTx`] the failed statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[CardXrefRecord],
@@ -271,6 +277,56 @@ impl CardXrefRepository for PgTx<'_> {
         records: &[CardXrefRecord],
     ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
         replace_all_in(self.conn(), records)
+    }
+}
+
+impl CardXrefRepository for PgSession {
+    fn find_by_id(
+        &mut self,
+        card: &CardNumber,
+    ) -> impl Future<Output = Result<Option<CardXrefRecord>, PersistenceError>> + Send {
+        select_by_card(self.conn(), card)
+    }
+
+    fn find_by_acct_id(
+        &mut self,
+        acct_id: PicU<11>,
+    ) -> impl Future<Output = Result<Option<CardXrefRecord>, PersistenceError>> + Send {
+        select_first_by_acct_id(self.conn(), acct_id)
+    }
+
+    fn find_first_two_by_acct_id(
+        &mut self,
+        acct_id: PicU<11>,
+    ) -> impl Future<Output = Result<Vec<CardXrefRecord>, PersistenceError>> + Send {
+        select_first_two_by_acct_id(self.conn(), acct_id)
+    }
+
+    fn find_all(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<CardXrefRecord>, PersistenceError>> + Send {
+        select_all(self.conn())
+    }
+
+    fn insert(
+        &mut self,
+        record: &CardXrefRecord,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        insert_one(self.conn(), record)
+    }
+
+    fn replace_all(
+        &mut self,
+        records: &[CardXrefRecord],
+    ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+        let begin = self.begin();
+        async move {
+            // Dropping `tx` on an error rolls the delete and every insert back together.
+            let mut tx = begin.await?;
+            let inserted = replace_all_in(tx.conn(), records).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
     }
 }
 
@@ -393,6 +449,10 @@ async fn insert_row<'e, E: PgExecutor<'e>>(
 /// Every record is converted through codec B before the delete, so a record that
 /// [`CardXrefRow::from_record`] cannot store fails the call before any statement is sent: the
 /// table, and a caller's transaction, are left as they were (LOADS-018).
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `card_xref` run one at a time and the last to commit leaves its input
+/// (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[CardXrefRecord],
@@ -401,6 +461,13 @@ async fn replace_all_in(
         .iter()
         .map(CardXrefRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE card_xref IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM card_xref")
         .execute(&mut *conn)
         .await?;

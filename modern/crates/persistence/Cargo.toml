@@ -20,7 +20,7 @@ rust_decimal = { workspace = true }
 # test-support depends on this crate, so Cargo compiles it twice for these tests: only sqlx,
 # path and byte-buffer types may cross the test_support boundary, never a crate type.
 test-support = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 proptest = { workspace = true }
 serde_json = { workspace = true }
 

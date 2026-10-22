@@ -12,12 +12,16 @@
 //!      decoded whole by codec A, line n as record n (CBTRN02C-001). A line codec A refuses, or
 //!      whose body is not one 350-byte record, ends the job before any other effect: no table
 //!      changes and no reject generation is created (CBTRN02C-032, CBTRN02C-045).
-//!    - `TRANFILE`: `transactions` must hold no row, the only state in which the `OPEN OUTPUT` of
-//!      the cluster, defined without `REUSE`, succeeds (CBTRN02C-030).
+//!    - `TRANFILE`: the run opens its session, the `PgSession` that holds its writer claims and
+//!      runs every statement of the run, and claims `transactions` for writing on it
+//!      (CBTRN02C-046); then `transactions` must hold no row, the only state in which the
+//!      `OPEN OUTPUT` of the cluster, defined without `REUSE`, succeeds (CBTRN02C-030).
 //!    - `XREFFILE`, `ACCTFILE` and `TCATBALF`: `card_xref`, `accounts` and `tran_cat_balances`
 //!      are read whole into [`Posttran::new`], which serves the program's keyed reads and holds
 //!      the values each posting leaves for the next record (CBTRN02C-004, CBTRN02C-005,
-//!      CBTRN02C-016, CBTRN02C-022).
+//!      CBTRN02C-016, CBTRN02C-022). The `OPEN I-O` of `ACCTFILE` and of `TCATBALF` claims
+//!      `accounts` and `tran_cat_balances` for writing on the session before the table is read
+//!      (CBTRN02C-046); `XREFFILE` is opened for input, which claims nothing.
 //!    - `DALYREJS`: the next `DALYREJS` generation in `Config::dalyrejs_dir`, created before the
 //!      first record is read, so that it exists, empty, when nothing is rejected (CBTRN02C-028).
 //! 2. Each record goes to [`Posttran::process`] in input order (CBTRN02C-002). A posting's writes
@@ -30,15 +34,41 @@
 //!    file is complete, and exit status 4 when any record was rejected, 0 otherwise
 //!    (CBTRN02C-028, CBTRN02C-029, CBTRN02C-035). The counters are `processed` and `rejected`
 //!    (CBTRN02C-036).
+//! 4. Once the end line is out, the run's session is closed, which gives up its three writer
+//!    claims, as the closes of `TRANFILE`, `ACCTFILE` and `TCATBALF` end the program's hold on
+//!    the clusters (CBTRN02C-046).
+//!
+//! # One writer per cluster
+//!
+//! `TRANFILE`, `ACCTFILE` and `TCATBALF` are defined `SHAREOPTIONS(2 3)` (`TRANFILE.jcl:55`,
+//! `ACCTFILE.jcl:42`, `TCATBALF.jcl:42`) and allocated `DISP=SHR` (`POSTTRAN.jcl:28,39,41`), so
+//! nothing but VSAM keeps two writers apart, and VSAM fails the second writer's `OPEN` with
+//! status `93`. The job keeps that rule through `PgSession::claim_writer`: each of the three
+//! opens takes its table's claim on the run's session before the table is read, and a claim
+//! another run holds, a second `posttran` or an `intcalc` holding `accounts`, takes the open's
+//! failure path. Without it two runs would each rewrite the balances from their own
+//! start-of-run read, and the later write would wipe out the other run's postings.
+//!
+//! The claims fence the run's writes because every statement of the run, each read and each
+//! write, runs on the session that holds them, a connection that is never replaced. A session
+//! the server ends, through `pg_terminate_backend`, `idle_session_timeout` or a lost network,
+//! takes the claims with it, and the run's next statement fails on it: the run abends there
+//! with exit status 12, through that statement's failure path, and writes nothing after its
+//! claims are gone, so a second run that claims the tables then is the only writer. The claims
+//! are held to the run's end and given up by closing the session on success; on every failure
+//! path the session drops with the run, which closes it and ends the locks on the server. A
+//! close that fails is reported in a warning event and changes nothing else: the run's writes
+//! are done, and the session's connection is closed either way, which ends its locks.
 //!
 //! # No unit of work
 //!
 //! VSAM keeps every completed write, so a run that fails part way leaves that record's category
 //! balance and account changed and every earlier record's effects in place (CBTRN02C-015,
-//! CBTRN02C-025, CBTRN02C-044). Each write is therefore its own statement on the pool
-//! (`PgStore`), committed as it completes, and never part of a transaction a later failure would
-//! undo; no transaction is opened here (X-POSTTRAN-1). A rerun after such a failure meets the
-//! non-empty `transactions` of CBTRN02C-030, as the mainframe rerun meets a non-empty cluster.
+//! CBTRN02C-025, CBTRN02C-044). Each write is therefore its own statement on the run's session
+//! (`PgSession`), in autocommit mode, committed as it completes, and never part of a transaction
+//! a later failure would undo; no transaction is opened here (X-POSTTRAN-1). A rerun after such
+//! a failure meets the non-empty `transactions` of CBTRN02C-030, as the mainframe rerun meets a
+//! non-empty cluster.
 //!
 //! # Failure paths
 //!
@@ -46,10 +76,15 @@
 //! |---|---|---|---|
 //! | `--dalytran` cannot be read | `ERROR OPENING DALYTRAN` | stand-in `0030` | CBTRN02C-031 |
 //! | a line codec A refuses, or a body that is not 350 bytes | none; an event names the file, the line and the failing rule | none | CBTRN02C-032, CBTRN02C-045 |
-//! | `transactions` cannot be read | `ERROR OPENING TRANSACTION FILE` | stand-in `0030` | CBTRN02C-031 |
+//! | another run holds the claim on `transactions` | `ERROR OPENING TRANSACTION FILE` | `9243`, not claimed as parity | CBTRN02C-046 |
+//! | the run's session cannot be opened, the claim on `transactions` fails, or `transactions` cannot be read | `ERROR OPENING TRANSACTION FILE` | stand-in `0030` | CBTRN02C-031 |
 //! | `transactions` holds a row | `ERROR OPENING TRANSACTION FILE` | `0037`, not claimed as parity | CBTRN02C-030 |
 //! | `card_xref` or `accounts` cannot be read; an account update fails | none; an event names the operation and the error | none | CBTRN02C-039 |
 //! | the generation cannot be allocated or created | `ERROR OPENING DALY REJECTS FILE` | stand-in `0030` | CBTRN02C-031 |
+//! | another run holds the claim on `accounts` | `ERROR OPENING ACCOUNT MASTER FILE` | `9243`, not claimed as parity | CBTRN02C-046 |
+//! | the claim on `accounts` fails | `ERROR OPENING ACCOUNT MASTER FILE` | stand-in `0030` | CBTRN02C-031 |
+//! | another run holds the claim on `tran_cat_balances` | `ERROR OPENING TRANSACTION BALANCE FILE` | `9243`, not claimed as parity | CBTRN02C-046 |
+//! | the claim on `tran_cat_balances` fails | `ERROR OPENING TRANSACTION BALANCE FILE` | stand-in `0030` | CBTRN02C-031 |
 //! | `tran_cat_balances` cannot be read | `ERROR READING TRANSACTION BALANCE FILE` | stand-in `0030` | CBTRN02C-038 |
 //! | a category balance insert fails | `ERROR WRITING TRANSACTION BALANCE FILE` | `0022` for a duplicate key, else stand-in `0030` | CBTRN02C-038 |
 //! | a category balance update fails or matches no row | `ERROR REWRITING TRANSACTION BALANCE FILE` | stand-in `0030`, or `0023` for no row | CBTRN02C-038 |
@@ -63,7 +98,8 @@
 //!   cross-reference close has set it to `00` (CBTRN02C-040). Every other status is
 //!   `HALTED(H4)`: a `PostgreSQL` or file-system error has no file status, so the job shows `0023`
 //!   for a rewrite that found no row, `0037` for the non-empty cluster IBM documents
-//!   (X-POSTTRAN-H1) and `0030`, the permanent-error status, for any other failure, none of them
+//!   (X-POSTTRAN-H1), `9243`, the line of status `93`, for a cluster another run holds open
+//!   (CBTRN02C-046), and `0030`, the permanent-error status, for any other failure, none of them
 //!   a parity result (CBTRN02C-042, X-POSTTRAN-H3).
 //! - Every path ends with `ABENDING PROGRAM` and [`JobError::Abend`] with exit status 12, the
 //!   value X-POSTTRAN-2 proposes for the user abend `U0999` that `CEE3ABD` raises: neither 0 nor
@@ -72,6 +108,8 @@
 //!   `DISP=(NEW,CATLG,DELETE)` deletes it at abend; nothing is rolled back (CBTRN02C-044).
 //! - Before the program's lines, a failed database call adds one event naming the file operation
 //!   it replaces and the error, whose text is an SQLSTATE, a constraint or a column only.
+//! - A session lost during the run has no row of its own: the statement after the loss fails,
+//!   whichever it is, and takes its row above (CBTRN02C-046).
 //! - A run counter that outgrows 64 bits ends the job with [`JobError::Posttran`]; no run can
 //!   reach it, and it has no COBOL path (CBTRN02C-036).
 //!
@@ -109,7 +147,8 @@
 //!   and nothing here indexes input bytes.
 //! - Local-Only Runtime: the job writes only the generation under `Config::dalyrejs_dir` and the
 //!   `PostgreSQL` tables.
-//! - R4: every statement is a repository call of `persistence` on the pool.
+//! - R4: every statement is a call of `persistence` on the run's session: a repository call, a
+//!   writer claim of `PgSession::claim_writer`, or the session's close.
 
 use std::path::{Path, PathBuf};
 
@@ -118,8 +157,8 @@ use domain::batch::cbtrn02c::{Posting, Posttran, RecordOutcome, START_LINE, Tcat
 use domain::batch::loads::{LoadError, decode_fixture};
 use domain::records::{AccountRecord, DailyTransactionRecord, RejectRecord, TransactionRecord};
 use persistence::{
-    AccountRepository, CardXrefRepository, PersistenceError, PgStore, TranCatBalanceRepository,
-    TransactionRepository,
+    AccountRepository, CardXrefRepository, Dataset, PersistenceError, PgSession, PgStore,
+    TranCatBalanceRepository, TransactionRepository,
 };
 
 use super::{JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking, read_input};
@@ -146,11 +185,19 @@ const ABEND_LINE: &str = "ABENDING PROGRAM";
 /// The failed open of the input (`CBTRN02C.cbl:247`; CBTRN02C-031).
 const OPEN_DALYTRAN: &str = "ERROR OPENING DALYTRAN";
 
-/// The failed open of the transaction file (`CBTRN02C.cbl:265`; CBTRN02C-030, CBTRN02C-031).
+/// The failed open of the transaction file (`CBTRN02C.cbl:265`; CBTRN02C-030, CBTRN02C-031,
+/// CBTRN02C-046).
 const OPEN_TRANFILE: &str = "ERROR OPENING TRANSACTION FILE";
 
 /// The failed open of the reject generation (`CBTRN02C.cbl:302`; CBTRN02C-031).
 const OPEN_DALYREJS: &str = "ERROR OPENING DALY REJECTS FILE";
+
+/// The failed open of the account file (`CBTRN02C.cbl:320`; CBTRN02C-031, CBTRN02C-046).
+const OPEN_ACCTFILE: &str = "ERROR OPENING ACCOUNT MASTER FILE";
+
+/// The failed open of the category balance file (`CBTRN02C.cbl:338`; CBTRN02C-031,
+/// CBTRN02C-046).
+const OPEN_TCATBALF: &str = "ERROR OPENING TRANSACTION BALANCE FILE";
 
 /// A failed write of a reject record (`CBTRN02C.cbl:460`; CBTRN02C-038).
 const WRITE_DALYREJS: &str = "ERROR WRITING TO REJECTS FILE";
@@ -199,6 +246,10 @@ const OPEN_TRANFILE_OP: &str = "OPEN TRANFILE";
 const READ_XREFFILE_OP: &str = "READ XREFFILE";
 /// `0300-DALYREJS-OPEN`.
 const OPEN_DALYREJS_OP: &str = "OPEN DALYREJS";
+/// `0400-ACCTFILE-OPEN`.
+const OPEN_ACCTFILE_OP: &str = "OPEN ACCTFILE";
+/// `0500-TCATBALF-OPEN`.
+const OPEN_TCATBALF_OP: &str = "OPEN TCATBALF";
 /// The keyed reads of `1500-B-LOOKUP-ACCT`, done at once.
 const READ_ACCTFILE_OP: &str = "READ ACCTFILE";
 /// The keyed reads of `2700-UPDATE-TCATBAL`, done at once.
@@ -215,10 +266,13 @@ const WRITE_TRANFILE_OP: &str = "WRITE TRANFILE";
 const WRITE_DALYREJS_OP: &str = "WRITE DALYREJS";
 /// `9300-DALYREJS-CLOSE`.
 const CLOSE_DALYREJS_OP: &str = "CLOSE DALYREJS";
+/// `9100-TRANFILE-CLOSE`, `9400-ACCTFILE-CLOSE` and `9500-TCATBALF-CLOSE`, which the close of
+/// the run's session, and with it of the three writer claims it holds, stands for.
+const CLOSE_CLAIMED_FILES_OP: &str = "CLOSE TRANFILE ACCTFILE TCATBALF";
 
-/// The file status `9910-DISPLAY-IO-STATUS` shows after a failure line (CBTRN02C-041). Each is
-/// numeric and does not start with `9`, so the line is `FILE STATUS IS: NNNN`, `00` and the two
-/// status characters.
+/// The file status `9910-DISPLAY-IO-STATUS` shows after a failure line (CBTRN02C-041). Every
+/// status but `93` is numeric and does not start with `9`, so its line is
+/// `FILE STATUS IS: NNNN`, `00` and the two status characters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Status {
     /// `00`: the reject close shows `XREFFILE-STATUS`, which the cross-reference close has just
@@ -235,6 +289,13 @@ enum Status {
     /// `30`, a permanent error: the stand-in for every other database or file-system failure,
     /// `HALTED(H4)` (CBTRN02C-042, X-POSTTRAN-H3).
     Permanent,
+    /// `93`, resource not available: VSAM fails the `OPEN OUTPUT` or `OPEN I-O` of a
+    /// `SHAREOPTIONS(2 3)` cluster that another job has open for output or update
+    /// (CBTRN02C-046). The status starts with `9`, so the line shows `9`, then the binary value
+    /// of the second character's EBCDIC byte as three digits, `3` being `X'F3'`, 243
+    /// (CBTRN02C-041). `HALTED(H4)`: the status VSAM returns there is not claimed as parity
+    /// (CBTRN02C-042).
+    ResourceUnavailable,
 }
 
 impl Status {
@@ -256,6 +317,7 @@ impl Status {
             Self::NotFound => "FILE STATUS IS: NNNN0023",
             Self::ClusterNotEmpty => "FILE STATUS IS: NNNN0037",
             Self::Permanent => "FILE STATUS IS: NNNN0030",
+            Self::ResourceUnavailable => "FILE STATUS IS: NNNN9243",
         }
     }
 }
@@ -298,6 +360,56 @@ const CLUSTER_NOT_EMPTY: Failure = Failure {
              (BLOCKED, X-POSTTRAN-H1)",
 };
 
+/// One of the program's three opens for output or update, each of which claims its table for
+/// writing before the table is read (CBTRN02C-046).
+struct WriterOpen {
+    /// The table claimed.
+    dataset: Dataset,
+    /// The file operation the claim replaces, named in the event of a claim that fails as a
+    /// database call.
+    operation: &'static str,
+    /// The open's failure line, shown on every failure of its claim (CBTRN02C-031).
+    line: &'static str,
+    /// The abend reason of a claim another run holds: the failure line and the cause, static
+    /// text naming the table only.
+    in_use: &'static str,
+}
+
+impl WriterOpen {
+    /// The path of a claim another run holds: the open's failure line, the status line of `93`
+    /// and the abend (CBTRN02C-041, CBTRN02C-046).
+    const fn refused(&self) -> Failure {
+        Failure {
+            shown: Some((self.line, Status::ResourceUnavailable)),
+            reason: self.in_use,
+        }
+    }
+}
+
+/// `0100-TRANFILE-OPEN`, the `OPEN OUTPUT` of the transaction cluster (CBTRN02C-046).
+const TRANFILE: WriterOpen = WriterOpen {
+    dataset: Dataset::Transactions,
+    operation: OPEN_TRANFILE_OP,
+    line: OPEN_TRANFILE,
+    in_use: "ERROR OPENING TRANSACTION FILE: another run is writing transactions",
+};
+
+/// `0400-ACCTFILE-OPEN`, the `OPEN I-O` of the account cluster (CBTRN02C-046).
+const ACCTFILE: WriterOpen = WriterOpen {
+    dataset: Dataset::Accounts,
+    operation: OPEN_ACCTFILE_OP,
+    line: OPEN_ACCTFILE,
+    in_use: "ERROR OPENING ACCOUNT MASTER FILE: another run is writing accounts",
+};
+
+/// `0500-TCATBALF-OPEN`, the `OPEN I-O` of the category balance cluster (CBTRN02C-046).
+const TCATBALF: WriterOpen = WriterOpen {
+    dataset: Dataset::TranCatBalances,
+    operation: OPEN_TCATBALF_OP,
+    line: OPEN_TCATBALF,
+    in_use: "ERROR OPENING TRANSACTION BALANCE FILE: another run is writing tran_cat_balances",
+};
+
 /// Runs POSTTRAN over the daily transaction file at `dalytran`: posts every record that passes
 /// validation, writes the rejected ones to the next `DALYREJS` generation under
 /// `Config::dalyrejs_dir`, and returns that generation's path, the program's return code, 4 when
@@ -308,33 +420,37 @@ const CLUSTER_NOT_EMPTY: Failure = Failure {
 ///
 /// - [`JobError::Abend`] with exit status 12 on every failure path of the module documentation,
 ///   after its job-log lines and `ABENDING PROGRAM` (CBTRN02C-025, CBTRN02C-030 to CBTRN02C-032,
-///   CBTRN02C-038 to CBTRN02C-045). The writes completed before the failure stand, and the
-///   reject generation is removed.
+///   CBTRN02C-038 to CBTRN02C-046). The writes completed before the failure stand, the reject
+///   generation is removed and the run's session is dropped, which gives its writer claims up.
+///   A session lost during the run fails the statement that follows the loss, which takes that
+///   statement's path (CBTRN02C-046).
 /// - [`JobError::Posttran`] when a run counter outgrows 64 bits (CBTRN02C-036).
 pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutcome, JobError> {
     tracing::info!("{START_LINE}");
     let records = open_dalytran(dalytran).await?;
-    // The store is a handle on the shared pool, cloned for the `&mut self` repository calls.
-    // Every statement on it commits on its own, as VSAM keeps each completed write
-    // (CBTRN02C-015, X-POSTTRAN-1).
-    let mut store = ctx.store.clone();
-    open_tranfile(&mut store).await?;
-    let xrefs = CardXrefRepository::find_all(&mut store)
+    // Every statement of the run goes to its one session, the one holding its writer claims, so
+    // that a session the server ends takes the claims and the run's next statement with it, and
+    // no write follows the loss (CBTRN02C-046). Each statement on the session commits on its
+    // own, as VSAM keeps each completed write (CBTRN02C-015, X-POSTTRAN-1).
+    let mut session = open_tranfile(ctx.store).await?;
+    let xrefs = CardXrefRepository::find_all(&mut session)
         .await
         .map_err(|error| unshown_failure(READ_XREFFILE_OP, XREF_READ_FAILED, &error))?;
     let mut rejects = OutputFile::next_generation(&ctx.config.dalyrejs_dir(), REJECTS_BASE)
         .await
         .map_err(|error| file_failure(OPEN_DALYREJS_OP, OPEN_DALYREJS, &error))?;
-    let accounts = AccountRepository::find_all(&mut store)
+    open_for_writing(&mut session, &ACCTFILE).await?;
+    let accounts = AccountRepository::find_all(&mut session)
         .await
         .map_err(|error| unshown_failure(READ_ACCTFILE_OP, ACCOUNTS_READ_FAILED, &error))?;
-    let tcatbals = TranCatBalanceRepository::find_all(&mut store)
+    open_for_writing(&mut session, &TCATBALF).await?;
+    let tcatbals = TranCatBalanceRepository::find_all(&mut session)
         .await
         .map_err(|error| shown_failure(READ_TCATBALF_OP, READ_TCATBAL, &error))?;
     let mut posttran = Posttran::new(accounts, xrefs, tcatbals);
     for daily in &records {
         match posttran.process(daily, ctx.clock)? {
-            RecordOutcome::Posted(posting) => apply_posting(&mut store, &posting).await?,
+            RecordOutcome::Posted(posting) => apply_posting(&mut session, &posting).await?,
             RecordOutcome::Rejected(reject) => write_reject(&mut rejects, &reject).await?,
         }
     }
@@ -345,6 +461,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     for line in summary.sysout_lines() {
         tracing::info!("{line}");
     }
+    close_claimed_files(session).await;
     Ok(JobOutcome {
         written: vec![path],
         return_code: summary.return_code(),
@@ -401,34 +518,77 @@ enum DalytranFailure {
     Refused(LoadError),
 }
 
-/// `0100-TRANFILE-OPEN`: the `OPEN OUTPUT` of the transaction cluster, which succeeds only when
-/// it holds no record (CBTRN02C-030).
+/// `0100-TRANFILE-OPEN`: the `OPEN OUTPUT` of the transaction cluster, which admits one writer
+/// (CBTRN02C-046) and succeeds only when the cluster holds no record (CBTRN02C-030). Opens the
+/// run's session, claims `transactions` on it, checks the table on it and returns it.
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] with `ERROR OPENING TRANSACTION FILE` when `transactions` cannot be read,
-/// the database being unreachable or its schema not applied (CBTRN02C-031), and when it holds a
-/// row (X-POSTTRAN-H1).
-async fn open_tranfile(store: &mut PgStore) -> Result<(), JobError> {
-    match TransactionRepository::find_last(store).await {
-        Ok(None) => Ok(()),
+/// [`JobError::Abend`] with `ERROR OPENING TRANSACTION FILE` when another run holds the claim
+/// (status `93`, CBTRN02C-046); when the session cannot be opened, the claim fails or
+/// `transactions` cannot be read, the database being unreachable or its schema not applied
+/// (CBTRN02C-031); and when it holds a row (X-POSTTRAN-H1). The session, when it was opened, is
+/// dropped as the error returns, which gives up the claim it holds.
+async fn open_tranfile(store: &PgStore) -> Result<PgSession, JobError> {
+    let mut session = store
+        .session()
+        .await
+        .map_err(|error| shown_failure(OPEN_TRANFILE_OP, OPEN_TRANFILE, &error))?;
+    open_for_writing(&mut session, &TRANFILE).await?;
+    match TransactionRepository::find_last(&mut session).await {
+        Ok(None) => Ok(session),
         // The row read is dropped unformatted: it holds a card number (CBTRN02C-037).
         Ok(Some(_)) => Err(abend(CLUSTER_NOT_EMPTY)),
         Err(error) => Err(shown_failure(OPEN_TRANFILE_OP, OPEN_TRANFILE, &error)),
     }
 }
 
-/// `2000-POST-TRANSACTION`'s three writes, in its order: the category balance, the account, then
-/// the transaction, each committed as it completes (CBTRN02C-015).
+/// The claim of the open `open` stands for: its table claimed on the run's session for the
+/// run's writes, before the table is read (CBTRN02C-046).
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] when a write fails; the writes before it stand (CBTRN02C-025,
-/// CBTRN02C-038, CBTRN02C-039).
-async fn apply_posting(store: &mut PgStore, posting: &Posting) -> Result<(), JobError> {
-    write_category_balance(store, &posting.tcatbal).await?;
-    rewrite_account(store, &posting.account).await?;
-    write_transaction(store, &posting.transaction).await
+/// [`JobError::Abend`] with the open's failure line and status `93` when another run holds the
+/// claim (CBTRN02C-046), and with that line and the stand-in status when the claim fails as a
+/// database call, a lost session included (CBTRN02C-031, CBTRN02C-042). No table has been read
+/// then.
+async fn open_for_writing(session: &mut PgSession, open: &WriterOpen) -> Result<(), JobError> {
+    match session.claim_writer(open.dataset).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(abend(open.refused())),
+        Err(error) => Err(shown_failure(open.operation, open.line, &error)),
+    }
+}
+
+/// `9100-TRANFILE-CLOSE`, `9400-ACCTFILE-CLOSE` and `9500-TCATBALF-CLOSE` for the claims: the
+/// run's session is closed once the run's job log is complete, which gives its three claims up
+/// at once (CBTRN02C-046).
+///
+/// A close that fails neither changes the run's outcome nor leaves a claim held: every write of
+/// the run has completed, and the session's connection is closed whether or not the unlock was
+/// answered, which ends the locks on the server. The failure is reported in one warning event
+/// naming the closes and the error, and the run keeps its outcome.
+async fn close_claimed_files(session: PgSession) {
+    if let Err(error) = session.close().await {
+        tracing::warn!(
+            operation = CLOSE_CLAIMED_FILES_OP,
+            error = %error,
+            "CBTRN02C writer claim release failed; the closed session ends the claim"
+        );
+    }
+}
+
+/// `2000-POST-TRANSACTION`'s three writes, in its order: the category balance, the account, then
+/// the transaction, each committed on the run's session as it completes (CBTRN02C-015).
+///
+/// # Errors
+///
+/// [`JobError::Abend`] when a write fails, as every write does once the session is lost; the
+/// writes before it stand (CBTRN02C-025, CBTRN02C-038, CBTRN02C-039).
+async fn apply_posting(session: &mut PgSession, posting: &Posting) -> Result<(), JobError> {
+    write_category_balance(session, &posting.tcatbal).await?;
+    rewrite_account(session, &posting.account).await?;
+    write_transaction(session, &posting.transaction).await
 }
 
 /// `2700-UPDATE-TCATBAL`: a created balance is announced by its job-log line, then written; an
@@ -439,18 +599,21 @@ async fn apply_posting(store: &mut PgStore, posting: &Posting) -> Result<(), Job
 /// [`JobError::Abend`] with `ERROR WRITING TRANSACTION BALANCE FILE` when the insert fails, and
 /// with `ERROR REWRITING TRANSACTION BALANCE FILE` when the update fails or matches no row, the
 /// `REWRITE` that ends with status `23` (CBTRN02C-038).
-async fn write_category_balance(store: &mut PgStore, write: &TcatbalWrite) -> Result<(), JobError> {
+async fn write_category_balance(
+    session: &mut PgSession,
+    write: &TcatbalWrite,
+) -> Result<(), JobError> {
     match write {
         TcatbalWrite::Create(record) => {
             if let Some(line) = write.sysout_line() {
                 tracing::info!("{line}");
             }
-            TranCatBalanceRepository::insert(store, record)
+            TranCatBalanceRepository::insert(session, record)
                 .await
                 .map_err(|error| shown_failure(WRITE_TCATBALF_OP, WRITE_TCATBAL, &error))
         }
         TcatbalWrite::Update(record) => {
-            match TranCatBalanceRepository::update(store, record).await {
+            match TranCatBalanceRepository::update(session, record).await {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     tracing::error!(
@@ -476,8 +639,8 @@ async fn write_category_balance(store: &mut PgStore, write: &TcatbalWrite) -> Re
 ///
 /// [`JobError::Abend`] when the update fails, which the COBOL has no status test for: an event
 /// carrying the error, then `ABENDING PROGRAM` (CBTRN02C-039).
-async fn rewrite_account(store: &mut PgStore, account: &AccountRecord) -> Result<(), JobError> {
-    match AccountRepository::update(store, account).await {
+async fn rewrite_account(session: &mut PgSession, account: &AccountRecord) -> Result<(), JobError> {
+    match AccountRepository::update(session, account).await {
         Ok(true | false) => Ok(()),
         Err(error) => Err(unshown_failure(
             REWRITE_ACCTFILE_OP,
@@ -495,10 +658,10 @@ async fn rewrite_account(store: &mut PgStore, account: &AccountRecord) -> Result
 /// already has the ID, as when an earlier record of the run had the same `DALYTRAN-ID`, or the
 /// stand-in status for any other failure (CBTRN02C-025).
 async fn write_transaction(
-    store: &mut PgStore,
+    session: &mut PgSession,
     transaction: &TransactionRecord,
 ) -> Result<(), JobError> {
-    TransactionRepository::insert(store, transaction)
+    TransactionRepository::insert(session, transaction)
         .await
         .map_err(|error| shown_failure(WRITE_TRANFILE_OP, WRITE_TRANFILE, &error))
 }
@@ -616,23 +779,41 @@ fn abend(failure: Failure) -> JobError {
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use chrono::NaiveDate;
     use copybook::FixedRecord;
-    use domain::batch::cbtrn02c::{RejectReason, reject_record};
-    use domain::records::DailyTransactionRecord;
-    use persistence::PersistenceError;
+    use domain::batch::cbtrn02c::{RejectReason, START_LINE, reject_record};
+    use domain::clock::FixedClock;
+    use domain::records::{AccountRecord, DailyTransactionRecord, TranCatBalanceRecord};
+    use persistence::{
+        AccountRepository, PersistenceError, PgStore, TranCatBalanceRepository,
+        TransactionRepository,
+    };
+    use runtime::config::Config;
+    use test_support::fixtures::start_loaded_postgres;
     use test_support::trace_capture::{self, TraceCapture};
 
     use super::{
-        ABEND_LINE, CLUSTER_NOT_EMPTY, Failure, JobError, LINE_REFUSED, OPEN_DALYTRAN, OutputFile,
-        REJECTS_BASE, Status, WRITE_TRANFILE, XREF_READ_FAILED, abend, close_dalyrejs,
-        open_dalytran, write_reject,
+        ABEND_LINE, ACCTFILE, CLUSTER_NOT_EMPTY, Failure, JobContext, JobError, LINE_REFUSED,
+        OPEN_DALYTRAN, OutputFile, REJECTS_BASE, Status, TCATBALF, TRANFILE, WRITE_TRANFILE,
+        XREF_READ_FAILED, abend, close_dalyrejs, open_dalytran, run, write_reject,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// What a run changes in the database: every account and category balance, and the number
+    /// of transactions (the rows themselves hold card numbers and are not kept).
+    type Tables = (Vec<AccountRecord>, Vec<TranCatBalanceRecord>, usize);
+
+    /// The status line of status `93` (CBTRN02C-041, CBTRN02C-046).
+    const IN_USE_STATUS: &str = "FILE STATUS IS: NNNN9243";
+
+    /// The transactions a run over the fixtures posts (FIXPOST-901).
+    const POSTED: usize = 262;
 
     /// Tells apart the scratch directories of the tests of one process.
     static SCRATCH_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -697,8 +878,21 @@ mod tests {
 
     /// The messages of the captured events, in order.
     fn messages(capture: &TraceCapture) -> Vec<String> {
-        capture
-            .lines()
+        message_texts(&capture.lines())
+    }
+
+    /// The messages of the job's own events, in order, leaving out the statement events `sqlx`
+    /// writes under its own target.
+    fn job_messages(capture: &TraceCapture) -> Vec<String> {
+        let job = module_path!()
+            .strip_suffix("::tests")
+            .unwrap_or(module_path!());
+        message_texts(&capture.lines_with_target(job))
+    }
+
+    /// The `message` member of each line that has one, in order.
+    fn message_texts(lines: &[String]) -> Vec<String> {
+        lines
             .iter()
             .filter_map(|line| {
                 let (_, rest) = line.split_once(r#""message":""#)?;
@@ -706,6 +900,51 @@ mod tests {
                 Some(message.to_owned())
             })
             .collect()
+    }
+
+    /// The configuration of a run whose outputs go under `var_dir`, every other variable unset.
+    fn var_config(var_dir: &Path) -> Result<Config, Box<dyn Error>> {
+        let var_dir = var_dir.display().to_string();
+        Ok(Config::from_lookup(|name| {
+            (name == "CARDDEMO_VAR_DIR").then(|| var_dir.clone())
+        })?)
+    }
+
+    /// The instant `fixtures.md` posts at, `2022-07-01 12:00:00.000000`.
+    fn fixture_clock() -> Result<FixedClock, Box<dyn Error>> {
+        let at = NaiveDate::from_ymd_opt(2022, 7, 1)
+            .and_then(|day| day.and_hms_opt(12, 0, 0))
+            .ok_or("2022-07-01 12:00:00 is a valid instant")?;
+        Ok(FixedClock::new(at))
+    }
+
+    /// The tables a run writes, read back through `store`.
+    async fn tables(store: &PgStore) -> Result<Tables, Box<dyn Error>> {
+        let mut store = store.clone();
+        let accounts = AccountRepository::find_all(&mut store).await?;
+        let balances = TranCatBalanceRepository::find_all(&mut store).await?;
+        let transactions = TransactionRepository::find_all_in_card_order(&mut store)
+            .await?
+            .len();
+        Ok((accounts, balances, transactions))
+    }
+
+    /// The names of the `DALYREJS` generations in `dir`; none when `dir` does not exist.
+    fn generations(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let name = entry?.file_name().to_string_lossy().into_owned();
+            if name.starts_with("DALYREJS.") {
+                names.push(name);
+            }
+        }
+        names.sort();
+        Ok(names)
     }
 
     /// The exit code and the reason of an abend, `None` for any other error.
@@ -719,6 +958,7 @@ mod tests {
     // audit: CBTRN02C-025
     // audit: CBTRN02C-040
     // audit: CBTRN02C-041
+    // audit: CBTRN02C-046
     #[test]
     fn status_lines_are_those_9910_displays() {
         let cases = [
@@ -727,6 +967,7 @@ mod tests {
             (Status::NotFound, "FILE STATUS IS: NNNN0023"),
             (Status::Permanent, "FILE STATUS IS: NNNN0030"),
             (Status::ClusterNotEmpty, "FILE STATUS IS: NNNN0037"),
+            (Status::ResourceUnavailable, IN_USE_STATUS),
         ];
         for (status, line) in cases {
             assert_eq!(status.line(), line, "{status:?}");
@@ -901,6 +1142,127 @@ mod tests {
         let empty = close_dalyrejs(OutputFile::next_generation(&dir, REJECTS_BASE).await?).await?;
         assert_eq!(empty, dir.join("DALYREJS.G0002"));
         assert!(fs::read(&empty)?.is_empty());
+        Ok(())
+    }
+
+    /// Each open for output or update meets the claim another run holds on its table: the run
+    /// shows the open's line, the status line of `93` and `ABENDING PROGRAM`, ends with exit
+    /// status 12, changes no table and keeps no reject generation, the one created before the
+    /// account open included. Once the claim is given up, the run posts the fixtures and gives
+    /// its own claims up at its end (FIXPOST-903).
+    // audit: CBTRN02C-031
+    // audit: CBTRN02C-044
+    // audit: CBTRN02C-046
+    #[tokio::test]
+    async fn an_open_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
+        let guard = start_loaded_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new()?;
+        let config = var_config(scratch.path())?;
+        let clock = fixture_clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        let before = tables(&store).await?;
+        assert_eq!(before.2, 0, "the loaded database holds no transaction");
+
+        for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
+            let mut held = store.session().await?;
+            assert!(
+                held.claim_writer(open.dataset).await?,
+                "the test claims a free {:?}",
+                open.dataset
+            );
+            let capture = trace_capture::capture();
+            let error = run(&ctx, &dailytran())
+                .await
+                .err()
+                .ok_or("a run passed an open another run holds")?;
+            assert_eq!(
+                abend_of(&error),
+                Some((Some(12), open.in_use)),
+                "{}",
+                open.line
+            );
+            assert_eq!(
+                job_messages(&capture),
+                [START_LINE, open.line, IN_USE_STATUS, ABEND_LINE],
+                "{}",
+                open.line
+            );
+            drop(capture);
+            assert!(
+                tables(&store).await? == before,
+                "{} changed a table",
+                open.line
+            );
+            assert!(
+                generations(&config.dalyrejs_dir())?.is_empty(),
+                "{}",
+                open.line
+            );
+            held.close().await?;
+        }
+
+        let outcome = run(&ctx, &dailytran()).await?;
+        assert_eq!(outcome.return_code, 4);
+        assert_eq!(
+            outcome.written,
+            [config.dalyrejs_dir().join("DALYREJS.G0001")]
+        );
+        assert_eq!(tables(&store).await?.2, POSTED);
+        let mut free = store.session().await?;
+        for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
+            assert!(
+                free.claim_writer(open.dataset).await?,
+                "a finished run still holds {:?}",
+                open.dataset
+            );
+        }
+        free.close().await?;
+        Ok(())
+    }
+
+    /// Two runs started together over the same database: one claims the transaction cluster
+    /// and posts the fixtures, the other meets that claim at its first open and ends before it
+    /// reads a table, so the tables hold one run's postings and one reject generation exists.
+    // audit: CBTRN02C-046
+    #[tokio::test]
+    async fn of_two_runs_at_once_one_posts_and_the_other_is_refused() -> TestResult {
+        let guard = start_loaded_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new()?;
+        let config = var_config(scratch.path())?;
+        let clock = fixture_clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        let input = dailytran();
+
+        let (first, second) = tokio::join!(run(&ctx, &input), run(&ctx, &input));
+        let (posted, refused) = match (first, second) {
+            (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
+            (first, second) => {
+                return Err(format!(
+                    "one run must post and one be refused: {:?}, {:?}",
+                    first.map(|outcome| outcome.return_code),
+                    second.map(|outcome| outcome.return_code)
+                )
+                .into());
+            }
+        };
+        assert_eq!(posted.return_code, 4);
+        assert_eq!(
+            posted.written,
+            [config.dalyrejs_dir().join("DALYREJS.G0001")]
+        );
+        assert_eq!(abend_of(&refused), Some((Some(12), TRANFILE.in_use)));
+        assert_eq!(tables(&store).await?.2, POSTED);
+        assert_eq!(generations(&config.dalyrejs_dir())?, ["DALYREJS.G0001"]);
         Ok(())
     }
 }

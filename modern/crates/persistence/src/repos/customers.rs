@@ -142,6 +142,11 @@ pub trait CustomerRepository: Send {
     /// table is no error (LOADS-015). No foreign key joins `customers`, so the load may run in
     /// any order with the other loads.
     ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
+    ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] when a record holds a byte codec B cannot store, as for
@@ -318,6 +323,10 @@ async fn update_one<'e, E: PgExecutor<'e>>(
 /// Every record is converted through codec B before the delete, so a record that
 /// [`CustomerRow::from_record`] cannot store fails the call before any statement is sent: the
 /// table, and a caller's transaction, are left as they were (LOADS-018).
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `customers` run one at a time and the last to commit leaves its input
+/// (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[CustomerRecord],
@@ -326,6 +335,13 @@ async fn replace_all_in(
         .iter()
         .map(CustomerRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE customers IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM customers")
         .execute(&mut *conn)
         .await?;

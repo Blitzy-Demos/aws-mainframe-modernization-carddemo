@@ -242,6 +242,11 @@ pub trait CardRepository: Send {
     /// On [`PgStore`] the delete and the inserts run in one transaction of their own, which
     /// commits only when every insert succeeded. On a [`PgTx`] they run in the caller's.
     ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
+    ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] when a record cannot be stored, before anything is deleted;
@@ -635,6 +640,10 @@ where
 /// Every record is converted before the delete, so a record codec B cannot store fails the load
 /// with nothing changed. The delete keeps the identity sequence where it stands, so each insert
 /// takes a `card_ref` the table never held before (LOADS-027).
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `cards` run one at a time and the last to commit leaves its input
+/// (LOADS-014, LOADS-040).
 // A `TRUNCATE … RESTART IDENTITY` would give the same records the same handles on every reload;
 // the delete is kept because LOADS-027 requires a handle from before a reload to name no card
 // after it, and a recycled one could name a different card.
@@ -646,6 +655,13 @@ async fn replace_in(
         .iter()
         .map(CardBinds::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE cards IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM cards")
         .execute(&mut *conn)
         .await?;

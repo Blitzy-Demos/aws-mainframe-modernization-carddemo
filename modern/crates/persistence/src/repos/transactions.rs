@@ -19,8 +19,8 @@
 //! Every method returns domain values: rows pass through codec B
 //! ([`TransactionRow::from_record`] and [`TransactionRow::into_record`]) and no byte is trimmed,
 //! padded or normalised here. Each statement is written once, in a private function over any
-//! executor, and both [`PgStore`] (pool, autocommit) and [`PgTx`] (the caller's transaction)
-//! run it. Every column is `COLLATE "C"`, so key comparisons and orders are byte order, which
+//! executor, and [`PgStore`] (pool, autocommit), [`PgTx`] (the caller's transaction) and
+//! [`PgSession`] (a batch job's session, autocommit) run it. Every column is `COLLATE "C"`, so key comparisons and orders are byte order, which
 //! is the numeric order of the 16-digit IDs every in-scope writer stores (COTRN02C-043).
 //!
 //! The processing-date window is the one statement two methods share:
@@ -43,7 +43,7 @@ use sqlx::PgExecutor;
 
 use crate::error::{DecodeKind, PersistenceError};
 use crate::rows::{TransactionRow, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx};
 
 /// Column `tran_id`, `TRAN-ID PIC X(16)` (CVTRA05Y-001): the key every keyed statement binds
 /// and the column a failed allocation names.
@@ -63,9 +63,10 @@ type PollRecord<'a> = Box<dyn FnMut(&mut Context<'_>) -> PolledRecord + Send + '
 /// The rows of a selection, read one at a time and in the selection's order: what
 /// [`TransactionRepository::stream_processed_between`] returns.
 ///
-/// - On [`PgStore`] and [`PgTx`] the statement runs at the first [`next`](Self::next), and each
-///   row is decoded through codec B ([`TransactionRow::into_record`]) as `next` reads it, so no
-///   more than the row being read is held, whatever the selection holds.
+/// - On [`PgStore`], [`PgTx`] and [`PgSession`] the statement runs at the first
+///   [`next`](Self::next), and each row is decoded through codec B
+///   ([`TransactionRow::into_record`]) as `next` reads it, so no more than the row being read is
+///   held, whatever the selection holds.
 /// - The rows borrow the executor they are read through, and hold its connection (a pooled
 ///   one for [`PgStore`]) until they end, fail or are dropped. Dropping them stops the read;
 ///   no later row is decoded.
@@ -128,8 +129,9 @@ impl<'a> TransactionRows<'a> {
 /// and `tranrept` read and write (AAP 0.5.4).
 ///
 /// Implemented by [`PgStore`], where each call runs and commits on its own pooled connection,
-/// and by [`PgTx`], where each call runs inside the caller's open transaction. Test doubles in
-/// other crates implement it too.
+/// by [`PgTx`], where each call runs inside the caller's open transaction, and by
+/// [`PgSession`], where each call runs and commits on the session's one connection. Test
+/// doubles in other crates implement it too.
 pub trait TransactionRepository: Send {
     /// The transaction whose `TRAN-ID` is `id`, or `None` when no row has it: COTRN01C's
     /// `READ` by key, whose `NOTFND` the caller answers with `Transaction ID NOT found...`
@@ -309,19 +311,20 @@ pub trait TransactionRepository: Send {
     /// records `CBTRN03C` reads from the sorted file, one `READ` per pass of its loop
     /// (`CBTRN03C.cbl:170-206,248-272`; CBTRN03C-003, CBTRN03C-010).
     ///
-    /// - [`PgStore`] and [`PgTx`] run the one statement of `find_processed_between` at the
-    ///   first [`TransactionRows::next`] and decode each row as it is read, so one decoded row
-    ///   at a time is held, whatever the window holds. The rows hold their connection, a
-    ///   pooled one for [`PgStore`], until they end, fail or are dropped.
+    /// - [`PgStore`], [`PgTx`] and [`PgSession`] run the one statement of
+    ///   `find_processed_between` at the first [`TransactionRows::next`] and decode each row as
+    ///   it is read, so one decoded row at a time is held, whatever the window holds. The rows
+    ///   hold their connection, a pooled one for [`PgStore`], until they end, fail or are
+    ///   dropped.
     /// - The default body, for implementations that hold their rows, such as test doubles,
     ///   awaits `find_processed_between` and yields its records.
     ///
     /// # Errors
     ///
     /// The returned future fails only in the default body, as `find_processed_between` fails.
-    /// On [`PgStore`] and [`PgTx`] the failures of the statement and of each row, those of
-    /// `find_processed_between`, come from [`TransactionRows::next`] (CBTRN03C-007,
-    /// CBTRN03C-010).
+    /// On [`PgStore`], [`PgTx`] and [`PgSession`] the failures of the statement and of each
+    /// row, those of `find_processed_between`, come from [`TransactionRows::next`]
+    /// (CBTRN03C-007, CBTRN03C-010).
     fn stream_processed_between(
         &mut self,
         start: NaiveDate,
@@ -399,6 +402,70 @@ impl TransactionRepository for PgStore {
 }
 
 impl TransactionRepository for PgTx<'_> {
+    fn find_by_id(
+        &mut self,
+        id: &PicX<16>,
+    ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send {
+        select_by_id(self.conn(), id)
+    }
+
+    fn find_last(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send {
+        select_last(self.conn())
+    }
+
+    fn next_id(&mut self) -> impl Future<Output = Result<PicX<16>, PersistenceError>> + Send {
+        allocate_id(self.conn())
+    }
+
+    fn insert(
+        &mut self,
+        record: &TransactionRecord,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        insert_row(self.conn(), record)
+    }
+
+    fn page_after(
+        &mut self,
+        start: &PicX<16>,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_page_forward(self.conn(), start, limit)
+    }
+
+    fn page_before(
+        &mut self,
+        start: &PicX<16>,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_page_backward(self.conn(), start, limit)
+    }
+
+    fn find_all_in_card_order(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_in_card_order(self.conn())
+    }
+
+    fn find_processed_between(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_processed_between(self.conn(), start, end)
+    }
+
+    fn stream_processed_between(
+        &mut self,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(processed_between_rows(self.conn(), start, end)))
+    }
+}
+
+impl TransactionRepository for PgSession {
     fn find_by_id(
         &mut self,
         id: &PicX<16>,

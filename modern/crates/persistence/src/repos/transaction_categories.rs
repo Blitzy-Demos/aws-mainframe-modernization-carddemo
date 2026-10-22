@@ -108,6 +108,11 @@ pub trait TransactionCategoryRepository: Send {
     /// (LOADS-017); the primary key refuses a duplicate. On [`PgStore`] the replacement runs in a
     /// transaction of its own; on [`PgTx`] it runs in the caller's and is undone with it.
     ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
+    ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] when codec B cannot store a field of any record, before any
@@ -273,6 +278,10 @@ where
 
 /// Deletes every row, then inserts `records` in slice order on `conn`, inside the transaction
 /// `conn` holds; returns the number of rows inserted.
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `transaction_categories` run one at a time and the last to commit leaves its
+/// input (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[TransactionCategoryRecord],
@@ -283,6 +292,13 @@ async fn replace_all_in(
         .iter()
         .map(TransactionCategoryRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE transaction_categories IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM transaction_categories")
         .execute(&mut *conn)
         .await?;

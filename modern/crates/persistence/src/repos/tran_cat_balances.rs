@@ -50,7 +50,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::PersistenceError;
 use crate::rows::{TranCatBalanceRow, pic_u_to_i64, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx};
 
 /// Column of `TRANCAT-ACCT-ID`, the first part of the key (CVTRA01Y-001).
 const ACCT_ID: &str = "acct_id";
@@ -62,9 +62,10 @@ const TRAN_CAT_CD: &str = "tran_cat_cd";
 /// Every access CBTRN02C, CBACT04C and the TCATBALF load make to the category balance file.
 ///
 /// [`PgStore`] runs each method on a pooled connection in autocommit mode, except
-/// [`replace_all`](Self::replace_all), which runs in a transaction of its own. [`PgTx`] runs
-/// every method inside the caller's transaction, where a failed statement aborts the whole
-/// transaction: a caller that must go on after one runs it inside [`PgTx::savepoint`].
+/// [`replace_all`](Self::replace_all), which runs in a transaction of its own. [`PgSession`]
+/// does the same on the session's one connection. [`PgTx`] runs every method inside the
+/// caller's transaction, where a failed statement aborts the whole transaction: a caller that
+/// must go on after one runs it inside [`PgTx::savepoint`].
 pub trait TranCatBalanceRepository: Send {
     /// The balance whose `TRAN-CAT-KEY` is (`acct_id`, `type_cd`, `cat_cd`), or `None` when no
     /// row has that key: the `INVALID KEY` of the keyed read, status `23`, on which CBTRN02C
@@ -129,7 +130,13 @@ pub trait TranCatBalanceRepository: Send {
     /// many were inserted: the TCATBALF job's delete and redefinition of the cluster, then its
     /// `REPRO` (LOADS-006, LOADS-014). An empty table is no error (LOADS-015), and `FILLER`
     /// bytes are stored whatever they hold (LOADS-032). The delete and every insert form one
-    /// transaction: [`PgStore`] opens and commits its own, [`PgTx`] uses the caller's.
+    /// transaction: [`PgStore`] and [`PgSession`] open and commit their own, [`PgTx`] uses the
+    /// caller's.
+    ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
     ///
     /// # Errors
     ///
@@ -137,9 +144,9 @@ pub trait TranCatBalanceRepository: Send {
     /// non-ASCII byte: every record is converted before the delete, so the call fails with
     /// nothing written, leaving the table and a [`PgTx`] caller's transaction as they were.
     /// [`PersistenceError::Duplicate`] when two records share a key, or any other error of the
-    /// delete or an insert, as for [`insert`](Self::insert). On [`PgStore`] the transaction then
-    /// rolls back and the previous contents remain (LOADS-018); on [`PgTx`] the failed statement
-    /// aborts the caller's transaction.
+    /// delete or an insert, as for [`insert`](Self::insert). On [`PgStore`] and [`PgSession`]
+    /// the transaction then rolls back and the previous contents remain (LOADS-018); on [`PgTx`]
+    /// the failed statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[TranCatBalanceRecord],
@@ -227,6 +234,51 @@ impl TranCatBalanceRepository for PgTx<'_> {
         records: &[TranCatBalanceRecord],
     ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
         replace_all_in(self.conn(), records)
+    }
+}
+
+impl TranCatBalanceRepository for PgSession {
+    fn find_by_id(
+        &mut self,
+        acct_id: PicU<11>,
+        type_cd: &PicX<2>,
+        cat_cd: PicU<4>,
+    ) -> impl Future<Output = Result<Option<TranCatBalanceRecord>, PersistenceError>> + Send {
+        select_by_id(self.conn(), acct_id, type_cd, cat_cd)
+    }
+
+    fn find_all(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<TranCatBalanceRecord>, PersistenceError>> + Send {
+        select_all(self.conn())
+    }
+
+    fn insert(
+        &mut self,
+        record: &TranCatBalanceRecord,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        insert_one(self.conn(), record)
+    }
+
+    fn update(
+        &mut self,
+        record: &TranCatBalanceRecord,
+    ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
+        update_one(self.conn(), record)
+    }
+
+    fn replace_all(
+        &mut self,
+        records: &[TranCatBalanceRecord],
+    ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+        let begin = self.begin();
+        async move {
+            // Dropped without a commit when a statement fails, which rolls the delete back.
+            let mut tx = begin.await?;
+            let inserted = replace_all_in(tx.conn(), records).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
     }
 }
 
@@ -350,6 +402,10 @@ where
 /// Every record is converted through codec B before the delete, so a record that
 /// [`TranCatBalanceRow::from_record`] cannot store fails the call before any statement is sent:
 /// the table, and a caller's transaction, are left as they were (LOADS-018).
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `tran_cat_balances` run one at a time and the last to commit leaves its
+/// input (LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[TranCatBalanceRecord],
@@ -358,6 +414,13 @@ async fn replace_all_in(
         .iter()
         .map(TranCatBalanceRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE tran_cat_balances IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM tran_cat_balances")
         .execute(&mut *conn)
         .await?;

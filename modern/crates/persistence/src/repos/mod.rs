@@ -9,6 +9,12 @@
 //!   statement commits on its own, and by [`PgTx`](crate::PgTx), one open transaction, on which
 //!   every statement runs inside the caller's unit of work. Test doubles in other crates
 //!   implement the same traits.
+//! - The five traits the single-writer batch jobs use, [`AccountRepository`],
+//!   [`CardXrefRepository`], [`DisclosureGroupRepository`], [`TranCatBalanceRepository`] and
+//!   [`TransactionRepository`], are also implemented by [`PgSession`](crate::PgSession), the
+//!   session that holds a job's writer claims: each statement commits on its own there too, on
+//!   the session's one connection, so the claims fence every write (see "Single-writer claims"
+//!   in the crate documentation).
 //! - `api::services::*` (never the handlers: Thin Request Handlers), `messaging::workers::*`,
 //!   `batch::jobs::*` and `test-support` reach the database only through these traits.
 //! - Methods take and return `domain::records` values, `copybook` keys and the
@@ -30,7 +36,7 @@
 //!
 //! - Each statement is written once, in a private function over the executor (generic over
 //!   `sqlx::PgExecutor`, or on one `&mut PgConnection` where several statements must share a
-//!   connection), and both implementations call it, so the offline cache in `modern/.sqlx/`
+//!   connection), and every implementation calls it, so the offline cache in `modern/.sqlx/`
 //!   holds one entry per statement.
 //! - Statements are written only with the `sqlx` query macros (`query!`, `query_as!`,
 //!   `query_scalar!`), checked at build time against the migrated schema or the offline cache.
@@ -62,9 +68,14 @@
 //!   rolls back to it: CP00 for its detail insert (`I004`), COPAUS2C for the insert that its
 //!   update follows on a duplicate key (COPAUS2C-008).
 //! - `replace_all` empties a table and inserts every record in one transaction, its own on
-//!   [`PgStore`](crate::PgStore) and the caller's on [`PgTx`](crate::PgTx), as IDCAMS
+//!   [`PgStore`](crate::PgStore) and [`PgSession`](crate::PgSession) and the caller's on
+//!   [`PgTx`](crate::PgTx), as IDCAMS
 //!   `DELETE`, `DEFINE CLUSTER` and `REPRO` replace a cluster (LOADS-014). No foreign key joins
 //!   the tables the loads replace, so the loads run in any order (LOADS-025, AAP 0.3.3.4).
+//!   Before the delete it locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+//!   two replacements of one table run one after the other: the later one's delete removes the
+//!   rows the earlier one committed, and the table ends with the input committed last, never
+//!   the union of both (LOADS-040). Reads do not wait; row writes to the table wait for it.
 //!
 //! # Locking
 //!
@@ -75,8 +86,9 @@
 //!   absent and locks it, the i10 serialisation of every CP00 decision for the account
 //!   (COPAUA0C-026, AAP 0.3.4.2).
 //! - Both hold their row lock until the transaction ends only on a [`PgTx`](crate::PgTx); on
-//!   [`PgStore`](crate::PgStore) the lock ends with the call. No process-local lock is used:
-//!   only the database serialises, so a second process sees every lock the first one holds.
+//!   [`PgStore`](crate::PgStore) and [`PgSession`](crate::PgSession) the lock ends with the
+//!   call. No process-local lock is used: only the database serialises, so a second process
+//!   sees every lock the first one holds.
 //!
 //! # Two transaction-type data versions (E23)
 //!
@@ -167,3 +179,296 @@ pub use transaction_categories::TransactionCategoryRepository;
 pub use transaction_types::TransactionTypeRepository;
 pub use transactions::{TransactionRepository, TransactionRows};
 pub use users::UserRepository;
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error as StdError;
+    use std::time::Duration;
+
+    use copybook::{FixedRecord, PicX};
+    use domain::batch::loads::{HashedUser, LoadJob, decode_fixture, decode_usrsec};
+    use domain::records::{
+        AccountRecord, CardRecord, CardXrefRecord, CustomerRecord, DisclosureGroupRecord,
+        TranCatBalanceRecord, TransactionCategoryRecord, TransactionTypeRecord,
+    };
+    use test_support::fixtures::{dusrsecj_path, fixture_path};
+    use test_support::postgres::start_postgres;
+
+    use super::{
+        AccountRepository, CardRepository, CardXrefRepository, CustomerRepository,
+        DisclosureGroupRepository, TranCatBalanceRepository, TransactionCategoryRepository,
+        TransactionTypeRepository, UserRepository,
+    };
+    use crate::{PersistenceError, PgStore, PgTx};
+
+    type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// How long the later replacement is left running while the earlier one's transaction stays
+    /// open; it must still be waiting when this has passed.
+    const HELD: Duration = Duration::from_millis(300);
+
+    /// Bound on a read made while a replacement holds its table: the read must not wait for the
+    /// replacement, and the bound turns a wait into a failure instead of a test that never ends.
+    const READ_BOUND: Duration = Duration::from_secs(10);
+
+    /// PHC-shaped stand-in for the hash `domain::password::hash` computes: the repository stores
+    /// whatever hash it is given, so no test calls argon2.
+    const HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$Y29uY3VycmVudA$Y29uY3VycmVudGhhc2g";
+
+    /// More rows than the `DUSRSECJ.jcl` deck holds, so one page lists every stored user.
+    const USER_PAGE: i64 = 100;
+
+    /// One of the nine tables the loads replace, driven through its repository's `replace_all`.
+    ///
+    /// Every repository trait names the method `replace_all`, so each implementation names its
+    /// trait to choose one.
+    trait Replaced: Clone + Send + Sync + 'static {
+        /// `replace_all` inside the open transaction `tx`, the way `carddemo-batch` loads run.
+        fn replace_in(
+            tx: &mut PgTx<'_>,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send;
+
+        /// `replace_all` on `store`, in a transaction of its own.
+        fn replace(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send;
+
+        /// Whether the committed table holds exactly `records`: one row for each, equal in
+        /// every copybook-derived column, and no other row.
+        fn holds_exactly(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> impl Future<Output = Result<bool, PersistenceError>> + Send;
+    }
+
+    /// Implements [`Replaced`] for a layout whose repository's `find_all` returns its records.
+    macro_rules! replaced {
+        ($($record:ty => $repository:ident;)+) => {$(
+            impl Replaced for $record {
+                fn replace_in(
+                    tx: &mut PgTx<'_>,
+                    records: &[Self],
+                ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+                    $repository::replace_all(tx, records)
+                }
+
+                fn replace(
+                    store: &mut PgStore,
+                    records: &[Self],
+                ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+                    $repository::replace_all(store, records)
+                }
+
+                async fn holds_exactly(
+                    store: &mut PgStore,
+                    records: &[Self],
+                ) -> Result<bool, PersistenceError> {
+                    Ok(same_rows(&$repository::find_all(store).await?, records))
+                }
+            }
+        )+};
+    }
+
+    replaced! {
+        AccountRecord => AccountRepository;
+        CardXrefRecord => CardXrefRepository;
+        CustomerRecord => CustomerRepository;
+        DisclosureGroupRecord => DisclosureGroupRepository;
+        TranCatBalanceRecord => TranCatBalanceRepository;
+        TransactionCategoryRecord => TransactionCategoryRepository;
+        TransactionTypeRecord => TransactionTypeRepository;
+    }
+
+    /// Cards are read back with their `card_ref` handles, which the comparison leaves out: the
+    /// database assigns them anew on every insert (LOADS-027).
+    impl Replaced for CardRecord {
+        fn replace_in(
+            tx: &mut PgTx<'_>,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+            CardRepository::replace_all(tx, records)
+        }
+
+        fn replace(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+            CardRepository::replace_all(store, records)
+        }
+
+        async fn holds_exactly(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> Result<bool, PersistenceError> {
+            let stored: Vec<CardRecord> = CardRepository::find_all(store)
+                .await?
+                .into_iter()
+                .map(|(_, record)| record)
+                .collect();
+            Ok(same_rows(&stored, records))
+        }
+    }
+
+    /// Users have no `find_all`: one page lists every stored user, and each is read back by its
+    /// key with its hash.
+    impl Replaced for HashedUser {
+        fn replace_in(
+            tx: &mut PgTx<'_>,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+            UserRepository::replace_all(tx, records)
+        }
+
+        fn replace(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+            UserRepository::replace_all(store, records)
+        }
+
+        async fn holds_exactly(
+            store: &mut PgStore,
+            records: &[Self],
+        ) -> Result<bool, PersistenceError> {
+            let listed = UserRepository::page_after(store, &PicX::spaces(), USER_PAGE).await?;
+            if listed.len() != records.len() {
+                return Ok(false);
+            }
+            for user in records {
+                let record = &user.record;
+                let Some(stored) = UserRepository::find_by_id(store, &record.id).await? else {
+                    return Ok(false);
+                };
+                let same = stored.fname == record.fname
+                    && stored.lname == record.lname
+                    && stored.password_hash == user.password_hash
+                    && stored.usr_type == record.usr_type
+                    && stored.filler == record.filler;
+                if !same {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    /// Whether `stored` holds exactly `expected`, in any order. Keys are unique on both sides,
+    /// so equal lengths and every expected record present make the two the same set.
+    fn same_rows<R: PartialEq>(stored: &[R], expected: &[R]) -> bool {
+        stored.len() == expected.len() && expected.iter().all(|record| stored.contains(record))
+    }
+
+    /// The records of `job`'s fixture in `app/data/ASCII/`, read in place and decoded by
+    /// codec A, in file order.
+    fn fixture<R: FixedRecord>(job: LoadJob) -> Result<Vec<R>, Box<dyn StdError>> {
+        let file = job.fixture_file().ok_or("the job loads no fixture file")?;
+        let bytes = std::fs::read(fixture_path(file))?;
+        Ok(decode_fixture::<R>(&bytes)?
+            .into_iter()
+            .map(|framed| framed.record)
+            .collect())
+    }
+
+    /// The ten in-stream records of `app/jcl/DUSRSECJ.jcl`, read in place and decoded as
+    /// `dusrsecj` decodes them (LOADS-012), each with [`HASH`] for its password.
+    fn deck() -> Result<Vec<HashedUser>, Box<dyn StdError>> {
+        let jcl = std::fs::read(dusrsecj_path())?;
+        Ok(decode_usrsec(&jcl)?
+            .into_iter()
+            .map(|framed| HashedUser {
+                record: framed.record,
+                password_hash: HASH.to_owned(),
+            })
+            .collect())
+    }
+
+    /// The row count a replacement with `records` reports.
+    fn count<R>(records: &[R]) -> Result<u64, Box<dyn StdError>> {
+        Ok(u64::try_from(records.len())?)
+    }
+
+    /// Two loads of `job`'s table at once, on a loaded database: the earlier one replaces the
+    /// table with the first half of `all` inside a transaction it keeps open, the later one with
+    /// the second half in a transaction of its own. The later one waits until the earlier
+    /// commits, a reader meanwhile sees the previous contents without waiting, and once both
+    /// have committed the table holds exactly the second half: no row of the first half or of
+    /// the previous contents, and no duplicate-key failure.
+    async fn last_writer_wins<R: Replaced>(store: &PgStore, job: LoadJob, all: &[R]) -> TestResult {
+        let table = job.subcommand();
+        let (first, second) = all.split_at(all.len() / 2);
+        assert!(!first.is_empty(), "{table}: the first half holds records");
+        let mut reader = store.clone();
+        assert_eq!(R::replace(&mut reader, all).await?, count(all)?);
+
+        let mut earlier = store.begin().await?;
+        assert_eq!(R::replace_in(&mut earlier, first).await?, count(first)?);
+        let mut writer = store.clone();
+        let input = second.to_vec();
+        let later = tokio::spawn(async move { R::replace(&mut writer, &input).await });
+        tokio::time::sleep(HELD).await;
+        assert!(
+            !later.is_finished(),
+            "{table}: the later load waits for the earlier one's transaction"
+        );
+        let unblocked = tokio::time::timeout(READ_BOUND, R::holds_exactly(&mut reader, all));
+        assert!(
+            unblocked.await??,
+            "{table}: a reader sees the previous contents while both loads are open"
+        );
+
+        earlier.commit().await?;
+        assert_eq!(later.await??, count(second)?);
+        assert!(
+            R::holds_exactly(&mut reader, second).await?,
+            "{table}: the table holds exactly the input of the load that committed last"
+        );
+        Ok(())
+    }
+
+    /// Two replacements of one table at once, for each of the nine tables the loads replace: the
+    /// later waits for the earlier, then replaces its committed contents, so the table ends with
+    /// the input of the one that committed last, never the union of both.
+    // audit: LOADS-014
+    // audit: LOADS-040
+    #[tokio::test]
+    async fn concurrent_replacements_leave_the_input_committed_last() -> TestResult {
+        let guard = start_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        for job in LoadJob::ALL {
+            match job {
+                LoadJob::Acctfile => {
+                    last_writer_wins(&store, job, &fixture::<AccountRecord>(job)?).await?;
+                }
+                LoadJob::Cardfile => {
+                    last_writer_wins(&store, job, &fixture::<CardRecord>(job)?).await?;
+                }
+                LoadJob::Xreffile => {
+                    last_writer_wins(&store, job, &fixture::<CardXrefRecord>(job)?).await?;
+                }
+                LoadJob::Custfile => {
+                    last_writer_wins(&store, job, &fixture::<CustomerRecord>(job)?).await?;
+                }
+                LoadJob::Discgrp => {
+                    let records = fixture::<DisclosureGroupRecord>(job)?;
+                    last_writer_wins(&store, job, &records).await?;
+                }
+                LoadJob::Tcatbalf => {
+                    let records = fixture::<TranCatBalanceRecord>(job)?;
+                    last_writer_wins(&store, job, &records).await?;
+                }
+                LoadJob::Trancatg => {
+                    let records = fixture::<TransactionCategoryRecord>(job)?;
+                    last_writer_wins(&store, job, &records).await?;
+                }
+                LoadJob::Trantype => {
+                    let records = fixture::<TransactionTypeRecord>(job)?;
+                    last_writer_wins(&store, job, &records).await?;
+                }
+                LoadJob::Dusrsecj => last_writer_wins(&store, job, &deck()?).await?,
+            }
+        }
+        Ok(())
+    }
+}

@@ -48,7 +48,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::PersistenceError;
 use crate::rows::{DisclosureGroupRow, pic_u_to_i64, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx};
 
 /// Column of `DIS-ACCT-GROUP-ID PIC X(10)`, the first key part (CVTRA02Y-001).
 const GROUP_ID: &str = "group_id";
@@ -63,8 +63,9 @@ const TRAN_CAT_CD: &str = "tran_cat_cd";
 /// type, transaction category) key.
 ///
 /// Implemented by [`PgStore`], where each call commits on its own and
-/// [`replace_all`](Self::replace_all) opens a transaction of its own, and by [`PgTx`], where
-/// every call runs inside the caller's transaction.
+/// [`replace_all`](Self::replace_all) opens a transaction of its own, by [`PgSession`], which
+/// does the same on the session's one connection, and by [`PgTx`], where every call runs inside
+/// the caller's transaction.
 pub trait DisclosureGroupRepository: Send {
     /// The record whose key is (`group_id`, `type_cd`, `cat_cd`), or `None` when no row has that
     /// key: CBACT04C's keyed `READ DISCGRP-FILE` and its `INVALID KEY` status `23`
@@ -114,20 +115,25 @@ pub trait DisclosureGroupRepository: Send {
 
     /// Replaces the table's contents with `records`, the `discgrp` load: every row is deleted,
     /// then every record is inserted in slice order, and the number of rows inserted is returned
-    /// (LOADS-005, LOADS-014). An empty table is not an error (LOADS-015). On [`PgStore`] the
-    /// delete and the inserts run in a transaction of their own, committed only when all of them
-    /// succeed; on [`PgTx`] they run in the caller's transaction.
+    /// (LOADS-005, LOADS-014). An empty table is not an error (LOADS-015). On [`PgStore`] and
+    /// [`PgSession`] the delete and the inserts run in a transaction of their own, committed only
+    /// when all of them succeed; on [`PgTx`] they run in the caller's transaction.
     ///
     /// Every record is converted before any statement runs, so a record the table cannot store
     /// leaves the contents untouched.
+    ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
     ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] when a record holds a NUL or non-ASCII byte;
     /// [`PersistenceError::Duplicate`] when two records share a key; [`PersistenceError::Check`],
     /// [`PersistenceError::Unavailable`] or [`PersistenceError::Database`] when a statement or
-    /// the commit fails. On [`PgStore`] the transaction then rolls back and the previous contents
-    /// remain (LOADS-018).
+    /// the commit fails. On [`PgStore`] and [`PgSession`] the transaction then rolls back and the
+    /// previous contents remain (LOADS-018).
     fn replace_all(
         &mut self,
         records: &[DisclosureGroupRecord],
@@ -199,6 +205,43 @@ impl DisclosureGroupRepository for PgTx<'_> {
         records: &[DisclosureGroupRecord],
     ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
         replace_all_in(self.conn(), records)
+    }
+}
+
+impl DisclosureGroupRepository for PgSession {
+    fn find_by_id(
+        &mut self,
+        group_id: &PicX<10>,
+        type_cd: &PicX<2>,
+        cat_cd: PicU<4>,
+    ) -> impl Future<Output = Result<Option<DisclosureGroupRecord>, PersistenceError>> + Send {
+        select_by_id(self.conn(), group_id, type_cd, cat_cd)
+    }
+
+    fn find_all(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<DisclosureGroupRecord>, PersistenceError>> + Send {
+        select_all(self.conn())
+    }
+
+    fn insert(
+        &mut self,
+        record: &DisclosureGroupRecord,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        insert_record(self.conn(), record)
+    }
+
+    fn replace_all(
+        &mut self,
+        records: &[DisclosureGroupRecord],
+    ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+        let begin = self.begin();
+        async move {
+            let mut tx = begin.await?;
+            let inserted = replace_all_in(tx.conn(), records).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
     }
 }
 
@@ -281,6 +324,10 @@ async fn insert_one<'e, E: PgExecutor<'e>>(
 /// [`DisclosureGroupRepository::replace_all`] on one connection, inside the transaction the
 /// caller holds on it: convert every record, delete every row, then insert the rows in slice
 /// order and count them.
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `disclosure_groups` run one at a time and the last to commit leaves its
+/// input (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[DisclosureGroupRecord],
@@ -289,6 +336,13 @@ async fn replace_all_in(
         .iter()
         .map(DisclosureGroupRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE disclosure_groups IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM disclosure_groups")
         .execute(&mut *conn)
         .await?;

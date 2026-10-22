@@ -41,9 +41,9 @@
 //!
 //! # Statements
 //!
-//! Each statement is written once, in a private function over the executor, and both
-//! [`PgStore`] (the pool) and [`PgTx`] (the caller's transaction) call it, so the offline query
-//! cache holds one entry per statement. The chain reuses the cross-reference and customer
+//! Each statement is written once, in a private function over the executor, and [`PgStore`]
+//! (the pool), [`PgTx`] (the caller's transaction) and [`PgSession`] (a batch job's session)
+//! call it, so the offline query cache holds one entry per statement. The chain reuses the cross-reference and customer
 //! statements of `repos::card_xref` and `repos::customers` rather than repeating them. Column
 //! lists name all 13 columns in table order, which are the field names of [`AccountRow`].
 //! Records reach SQL only through [`AccountRow::from_record`] and come back only through
@@ -65,7 +65,7 @@ use super::card_xref::select_first_two_by_acct_id;
 use super::customers;
 use crate::error::PersistenceError;
 use crate::rows::{AccountRow, pic_u_to_i64};
-use crate::{PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx};
 
 /// Column of `ACCT-ID`, named by a key conversion error.
 const ACCT_ID: &str = "acct_id";
@@ -128,13 +128,14 @@ impl AccountCustomerChain {
     }
 }
 
-/// The statements on `accounts`, implemented by [`PgStore`] and [`PgTx`]; test doubles in other
-/// crates implement the same trait.
+/// The statements on `accounts`, implemented by [`PgStore`], [`PgTx`] and [`PgSession`]; test
+/// doubles in other crates implement the same trait.
 ///
 /// On [`PgStore`] each call runs in autocommit, except [`replace_all`](Self::replace_all),
 /// which opens a transaction of its own, and
 /// [`find_with_customer`](Self::find_with_customer), which runs its reads on one pooled
-/// connection. On [`PgTx`] every call runs inside the caller's transaction.
+/// connection. On [`PgTx`] every call runs inside the caller's transaction. On [`PgSession`]
+/// every call runs on the session's one connection, in autocommit as on [`PgStore`].
 pub trait AccountRepository: Send {
     /// The reads of `9000-READ-ACCT` for account `acct_id`, each reported as its own
     /// [`ChainLink`] (COACTVWC-033, COACTUPC-084):
@@ -249,10 +250,15 @@ pub trait AccountRepository: Send {
     /// many rows it inserted: the ACCTFILE job's `DELETE`, `DEFINE CLUSTER` and `REPRO` into the
     /// new, empty cluster (LOADS-001, LOADS-014).
     ///
-    /// The delete and every insert form one unit: on a [`PgStore`] a transaction of their own,
-    /// committed when the last insert succeeds; on a [`PgTx`] the caller's transaction. An empty
-    /// table is no error (LOADS-015). No foreign key joins `accounts`, so the load may run in
-    /// any order with the other loads (LOADS-025).
+    /// The delete and every insert form one unit: on a [`PgStore`] or a [`PgSession`] a
+    /// transaction of their own, committed when the last insert succeeds; on a [`PgTx`] the
+    /// caller's transaction. An empty table is no error (LOADS-015). No foreign key joins
+    /// `accounts`, so the load may run in any order with the other loads (LOADS-025).
+    ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
     ///
     /// # Errors
     ///
@@ -260,9 +266,9 @@ pub trait AccountRepository: Send {
     /// [`insert`](Self::insert): every record is converted before the delete, so the call fails
     /// with nothing written, leaving the table and a [`PgTx`] caller's transaction as they were.
     /// Otherwise the first failure of the delete or of an insert, as [`insert`](Self::insert)
-    /// reports it, a duplicate key in `records` included. On a [`PgStore`] the transaction is
-    /// then rolled back and the previous contents remain (LOADS-018); on a [`PgTx`] the failed
-    /// statement aborts the caller's transaction.
+    /// reports it, a duplicate key in `records` included. On a [`PgStore`] or a [`PgSession`]
+    /// the transaction is then rolled back and the previous contents remain (LOADS-018); on a
+    /// [`PgTx`] the failed statement aborts the caller's transaction.
     fn replace_all(
         &mut self,
         records: &[AccountRecord],
@@ -453,6 +459,10 @@ async fn update_one<'e, E: PgExecutor<'e>>(
 /// Every record is converted through codec B before the delete, so a record that
 /// [`AccountRow::from_record`] cannot store fails the call before any statement is sent: the
 /// table, and a caller's transaction, are left as they were (LOADS-018).
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `accounts` run one at a time and the last to commit leaves its input
+/// (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[AccountRecord],
@@ -461,6 +471,13 @@ async fn replace_all_in(
         .iter()
         .map(AccountRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM accounts")
         .execute(&mut *conn)
         .await?;
@@ -591,6 +608,68 @@ impl AccountRepository for PgTx<'_> {
         records: &[AccountRecord],
     ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
         replace_all_in(self.conn(), records)
+    }
+}
+
+impl AccountRepository for PgSession {
+    fn find_with_customer(
+        &mut self,
+        acct_id: PicU<11>,
+    ) -> impl Future<Output = AccountCustomerChain> + Send {
+        chain_in(self.conn(), acct_id)
+    }
+
+    fn find_by_id(
+        &mut self,
+        id: PicU<11>,
+    ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
+        select_by_id(self.conn(), id)
+    }
+
+    fn lock_by_id(
+        &mut self,
+        id: PicU<11>,
+    ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
+        select_for_update(self.conn(), id)
+    }
+
+    fn find_all(
+        &mut self,
+    ) -> impl Future<Output = Result<Vec<AccountRecord>, PersistenceError>> + Send {
+        select_all(self.conn())
+    }
+
+    fn insert(
+        &mut self,
+        record: &AccountRecord,
+    ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+        let conn = self.conn();
+        async move {
+            insert_one(conn, record).await?;
+            Ok(())
+        }
+    }
+
+    fn update(
+        &mut self,
+        record: &AccountRecord,
+    ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
+        update_one(self.conn(), record)
+    }
+
+    fn replace_all(
+        &mut self,
+        records: &[AccountRecord],
+    ) -> impl Future<Output = Result<u64, PersistenceError>> + Send {
+        let begin = self.begin();
+        async move {
+            // Dropping the transaction on an error rolls it back, so the previous contents
+            // remain (LOADS-018).
+            let mut tx = begin.await?;
+            let inserted = replace_all_in(tx.conn(), records).await?;
+            tx.commit().await?;
+            Ok(inserted)
+        }
     }
 }
 

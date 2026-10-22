@@ -10,10 +10,14 @@
 //! 1. `--parm-date` arrives as the domain's typed `ParmDate`: the command line has already
 //!    refused any value that is not 10 or more printable ASCII bytes, so a refused PARM reads no
 //!    table and creates no file (CBACT04C-001).
-//! 2. The opens (CBACT04C-002). `accounts`, `card_xref` and `disclosure_groups` are read whole
-//!    into `Intcalc::new`, which serves the program's keyed reads from them, the
-//!    cross-references grouped by account as the alternate index over `XREF-ACCT-ID` holds them
-//!    (CBACT04C-004 to CBACT04C-011). The next `SYSTRAN` generation is then created under
+//! 2. The opens (CBACT04C-002). The run first opens its session, the `PgSession` that holds its
+//!    writer claim and runs every statement of the run, and claims `accounts` for writing on it,
+//!    the `OPEN I-O` of `0300-ACCTFILE-OPEN` (CBACT04C-039): the opens before it are for input
+//!    and claim nothing, so the claim comes before the first read. `accounts`, `card_xref` and
+//!    `disclosure_groups` are then read whole into `Intcalc::new`, which serves the program's
+//!    keyed reads from them, the cross-references grouped by account as the alternate index over
+//!    `XREF-ACCT-ID` holds them (CBACT04C-004 to CBACT04C-011). The next `SYSTRAN` generation is
+//!    then created under
 //!    `Config::systran_dir`, before any category balance is read, as `0400-TRANFILE-OPEN`
 //!    creates `SYSTRAN(+1)` (CBACT04C-024).
 //! 3. Every `tran_cat_balances` row, in the KSDS key order its repository returns
@@ -28,26 +32,53 @@
 //!    keeps its balance and cycle fields while its SYSTRAN records are still written (E08;
 //!    CBACT04C-027, ARITH-017, FIXINT-903).
 //! 5. The generation file is flushed, synced and kept. Its path is the one path returned, and
-//!    the run returns code 0, as `RETURN-CODE` is never set (CBACT04C-030).
+//!    the run returns code 0, as `RETURN-CODE` is never set (CBACT04C-030). The run's session is
+//!    then closed, which gives up the claim on `accounts`, as `9300-ACCTFILE-CLOSE` ends the
+//!    program's hold on the cluster (CBACT04C-039).
+//!
+//! # One writer of the account file
+//!
+//! `ACCTFILE` is defined `SHAREOPTIONS(2 3)` (`ACCTFILE.jcl:42`) and allocated `DISP=SHR`
+//! (`INTCALC.jcl:33`), so only VSAM keeps two writers apart: it fails the `OPEN I-O` of a second
+//! one with status `93`. The job keeps that rule through `PgSession::claim_writer`. A claim
+//! another run holds, a second `intcalc` or a `posttran` holding `accounts`, ends the job with
+//! [`JobError::Abend`] and `ERROR OPENING ACCOUNT MASTER FILE` before any table is read and
+//! before the generation is created (CBACT04C-034, CBACT04C-039). Without it two runs would each
+//! rewrite every balance from their own start-of-run read, and one run's interest would be lost.
+//!
+//! The claim fences the run's rewrites because every statement of the run, each read and each
+//! rewrite, runs on the session that holds it, a connection that is never replaced. A session
+//! the server ends, through `pg_terminate_backend`, `idle_session_timeout` or a lost network,
+//! takes the claim with it, and the run's next statement fails on it, a read or a rewrite: the
+//! run ends there with [`JobError::Persistence`] and rewrites nothing after its claim is gone,
+//! so a second run that claims the file then is the only writer. The claim is held to the run's
+//! end and given up by closing the session on success; on every error the session drops with
+//! the run, which closes it and ends the lock on the server. A close that fails is reported in a
+//! warning event and changes nothing else: every rewrite is done, and the session's connection
+//! is closed either way, which ends its lock.
 //!
 //! # Every rewrite commits when it is made
 //!
 //! A VSAM `REWRITE` has no unit of work to back out, so each account update is its own
-//! autocommitted statement on the pool, never part of a job transaction, and the updates made
-//! before an abend stand (CBACT04C-026, CBACT04C-038). When the first record of a new account
-//! abends a lookup, the previous account's `1050-UPDATE-ACCOUNT` has already run, as it comes
-//! before `1100-GET-ACCT-DATA`; the domain returns that update with its error, and the job
-//! persists it before it ends (CBACT04C-005, CBACT04C-007, CBACT04C-008, CBACT04C-011). Should
-//! that rewrite fail, its failure is the abend, as it is in the program.
+//! autocommitted statement on the run's session, never part of a job transaction, and the
+//! updates made before an abend stand (CBACT04C-026, CBACT04C-038). When the first record of a
+//! new account abends a lookup, the previous account's `1050-UPDATE-ACCOUNT` has already run, as
+//! it comes before `1100-GET-ACCT-DATA`; the domain returns that update with its error, and the
+//! job persists it before it ends (CBACT04C-005, CBACT04C-007, CBACT04C-008, CBACT04C-011).
+//! Should that rewrite fail, its failure is the abend, as it is in the program.
 //!
 //! # Abends
 //!
 //! - [`JobError::Intcalc`]: an account, cross-reference or `DEFAULT` disclosure lookup the
 //!   domain refuses (CBACT04C-005, CBACT04C-007, CBACT04C-008, CBACT04C-011).
+//! - [`JobError::Abend`] with `ERROR OPENING ACCOUNT MASTER FILE`: another run holds the claim on
+//!   `accounts` (CBACT04C-039).
 //! - [`JobError::Abend`] with `ERROR RE-WRITING ACCOUNT FILE`: a rewrite that finds no row
 //!   (CBACT04C-032).
-//! - [`JobError::Persistence`]: a read or a rewrite that fails as a statement (CBACT04C-032,
-//!   CBACT04C-033), and any query against a database whose schema has not been applied.
+//! - [`JobError::Persistence`]: the session that cannot be opened, the claim, a read or a
+//!   rewrite that fails as a statement (CBACT04C-032, CBACT04C-033), every statement after the
+//!   session is lost (CBACT04C-039), and any query against a database whose schema has not been
+//!   applied.
 //! - [`JobError::Io`]: the generation cannot be allocated, created, written or synced
 //!   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
 //! - [`JobError::GenerationLimit`]: generation 9999 of `SYSTRAN` exists, so no generation is
@@ -76,7 +107,8 @@
 //! The program's `DISPLAY` lines, the record shown for every category balance read included
 //! (CBACT04C-003), are not written: standard output carries only the path `main` prints from
 //! [`JobOutcome::written`] (AAP 0.3.4.3), and the job emits no tracing of its own, as `tranrept`
-//! does not. Each SYSTRAN record carries the full `XREF-CARD-NUM` (CBACT04C-021) in the local
+//! does not, but for the warning of a session close that failed, which names the close and the
+//! error only. Each SYSTRAN record carries the full `XREF-CARD-NUM` (CBACT04C-021) in the local
 //! generation file only, which is batch output and not egress; the job's errors are the fixed
 //! texts of [`JobError`] and its counts are plain numbers, so nothing it emits carries a card
 //! number (Cardholder Data Redaction).
@@ -85,7 +117,8 @@
 //!
 //! - Single Schema Executor: no schema work here; against a database whose schema has not been
 //!   applied the job fails at its first read with [`JobError::Persistence`].
-//! - R4: every statement is a repository call of `persistence`.
+//! - R4: every statement is a call of `persistence` on the run's session: a repository call, the
+//!   writer claim of `PgSession::claim_writer`, or the session's close.
 //! - Local-Only Runtime: the job writes `PostgreSQL` and the directory `Config::systran_dir`
 //!   names, nothing else.
 //! - Typed Dates and Timestamps: `ParmDate` is passed on as it was parsed, never rendered as
@@ -93,11 +126,12 @@
 //!   (CBACT04C-022).
 
 use copybook::FixedRecord;
-use domain::batch::cbact04c::{Intcalc, IntcalcEffect, REWRITE_ACCOUNT_ERROR};
+use domain::batch::cbact04c::{Intcalc, IntcalcEffect, OPEN_ACCOUNT_ERROR, REWRITE_ACCOUNT_ERROR};
 use domain::clock::Clock;
 use domain::records::{AccountRecord, TranCatBalanceRecord};
 use persistence::{
-    AccountRepository, CardXrefRepository, DisclosureGroupRepository, TranCatBalanceRepository,
+    AccountRepository, CardXrefRepository, Dataset, DisclosureGroupRepository, PgSession, PgStore,
+    TranCatBalanceRepository,
 };
 
 use super::{JobContext, JobError, JobOutcome, OutputFile, count};
@@ -107,6 +141,10 @@ use crate::cli::IntcalcArgs;
 /// (`INTCALC.jcl:37-41`; CBACT04C-024).
 const SYSTRAN_BASE: &str = "SYSTRAN";
 
+/// `9300-ACCTFILE-CLOSE`, which the close of the run's session, holding the `accounts` claim,
+/// stands for, named in the warning of a close that failed.
+const CLOSE_ACCTFILE_OP: &str = "CLOSE ACCTFILE";
+
 /// Runs INTCALC with the PARM of `args`: rewrites every account in key order but the last,
 /// writes the next `SYSTRAN` generation under `Config::systran_dir` and returns its path,
 /// return code 0, and the counts `records` (category balances read), `transactions` (SYSTRAN
@@ -114,8 +152,11 @@ const SYSTRAN_BASE: &str = "SYSTRAN";
 ///
 /// # Errors
 ///
-/// - [`JobError::Persistence`] when a table cannot be read or a rewrite fails as a statement
-///   (CBACT04C-032, CBACT04C-033).
+/// - [`JobError::Abend`] with `ERROR OPENING ACCOUNT MASTER FILE` when another run holds the
+///   claim on `accounts`, before any table is read or file created (CBACT04C-039).
+/// - [`JobError::Persistence`] when the run's session cannot be opened, the claim fails, a
+///   table cannot be read or a rewrite fails as a statement, as every statement does once the
+///   session is lost (CBACT04C-032, CBACT04C-033, CBACT04C-039).
 /// - [`JobError::Intcalc`] for the lookup abends of `CBACT04C` (CBACT04C-005, CBACT04C-007,
 ///   CBACT04C-008, CBACT04C-011), after the account rewrite that preceded the failed lookup is
 ///   persisted.
@@ -125,25 +166,34 @@ const SYSTRAN_BASE: &str = "SYSTRAN";
 ///   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
 /// - [`JobError::GenerationLimit`] when generation 9999 of `SYSTRAN` exists (CBACT04C-034).
 ///
-/// Every rewrite committed before an error stands, and the generation file is removed
-/// (CBACT04C-038).
+/// Every rewrite committed before an error stands, the generation file is removed and the run's
+/// session is dropped, which gives up its claim on `accounts` (CBACT04C-038).
 pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobOutcome, JobError> {
-    // The store is a handle on the shared pool, cloned for the `&mut self` repository calls.
-    // Each statement on it commits on its own, as each VSAM rewrite stands once made
-    // (CBACT04C-026), so the job opens no transaction.
-    let mut store = ctx.store.clone();
-    let accounts = AccountRepository::find_all(&mut store).await?;
-    let xrefs = CardXrefRepository::find_all(&mut store).await?;
-    let groups = DisclosureGroupRepository::find_all(&mut store).await?;
+    // Every statement of the run goes to its one session, the one holding its claim on
+    // `accounts`, so that a session the server ends takes the claim and the run's next statement
+    // with it, and no rewrite follows the loss (CBACT04C-039). Each statement on the session
+    // commits on its own, as each VSAM rewrite stands once made (CBACT04C-026), so the job opens
+    // no transaction.
+    let mut session = open_acctfile(ctx.store).await?;
+    let accounts = AccountRepository::find_all(&mut session).await?;
+    let xrefs = CardXrefRepository::find_all(&mut session).await?;
+    let groups = DisclosureGroupRepository::find_all(&mut session).await?;
     let mut intcalc = Intcalc::new(args.parm_date.clone(), accounts, xrefs, groups);
     let mut systran = OutputFile::next_generation(&ctx.config.systran_dir(), SYSTRAN_BASE).await?;
-    let balances = TranCatBalanceRepository::find_all(&mut store).await?;
-    let rewritten =
-        post_interest(&mut intcalc, &balances, ctx.clock, &mut store, &mut systran).await?;
+    let balances = TranCatBalanceRepository::find_all(&mut session).await?;
+    let rewritten = post_interest(
+        &mut intcalc,
+        &balances,
+        ctx.clock,
+        &mut session,
+        &mut systran,
+    )
+    .await?;
     // E08: the summary's unapplied last account and total are discarded, never rewritten;
     // only its counters are reported (CBACT04C-027).
     let summary = intcalc.finish();
     let path = systran.finish().await?;
+    close_acctfile(session).await;
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
@@ -153,6 +203,45 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
             ("accounts", count(rewritten)),
         ],
     })
+}
+
+/// `0300-ACCTFILE-OPEN`, the `OPEN I-O` of the account cluster, which admits one writer: opens
+/// the run's session and claims `accounts` on it (`CBACT04C.cbl:289-305`; CBACT04C-039).
+/// Returns the session, on which the run then issues every statement.
+///
+/// # Errors
+///
+/// [`JobError::Abend`] with the open's `ERROR OPENING ACCOUNT MASTER FILE` and no return code
+/// when another run holds the claim (CBACT04C-034, CBACT04C-038), and
+/// [`JobError::Persistence`] when the session cannot be opened or the claim fails as a
+/// statement. The session, when it was opened, is dropped as the error returns.
+async fn open_acctfile(store: &PgStore) -> Result<PgSession, JobError> {
+    let mut session = store.session().await?;
+    if session.claim_writer(Dataset::Accounts).await? {
+        Ok(session)
+    } else {
+        Err(JobError::Abend {
+            code: None,
+            reason: OPEN_ACCOUNT_ERROR,
+        })
+    }
+}
+
+/// `9300-ACCTFILE-CLOSE` for the claim: the run's session is closed once the generation is
+/// complete, which gives the claim up (CBACT04C-039).
+///
+/// A close that fails neither changes the run's outcome nor leaves the claim held: every
+/// rewrite has completed, and the session's connection is closed whether or not the unlock was
+/// answered, which ends the lock on the server. The failure is reported in one warning event
+/// naming the close and the error, and the run keeps its outcome.
+async fn close_acctfile(session: PgSession) {
+    if let Err(error) = session.close().await {
+        tracing::warn!(
+            operation = CLOSE_ACCTFILE_OP,
+            error = %error,
+            "CBACT04C writer claim release failed; the closed session ends the claim"
+        );
+    }
 }
 
 /// The main loop of `CBACT04C` over `balances`, in order (`CBACT04C.cbl:188-222`): each record
@@ -241,10 +330,17 @@ mod tests {
         TransactionRecord,
     };
     use domain::sensitive::CardNumber;
-    use persistence::{AccountCustomerChain, AccountRepository, ChainLink, PersistenceError};
+    use persistence::{
+        AccountCustomerChain, AccountRepository, CardXrefRepository, ChainLink, Dataset,
+        DisclosureGroupRepository, PersistenceError, PgStore, TranCatBalanceRepository,
+    };
+    use runtime::config::Config;
+    use test_support::fixtures::{fixture_path, start_loaded_postgres};
+    use test_support::postgres::PostgresGuard;
 
-    use super::post_interest;
-    use crate::jobs::{JobError, OutputFile};
+    use super::{OPEN_ACCOUNT_ERROR, post_interest, run};
+    use crate::cli::IntcalcArgs;
+    use crate::jobs::{JobContext, JobError, OutputFile, posttran};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -287,6 +383,78 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// The configuration of a run whose outputs go under `var_dir`, every other variable unset.
+    fn var_config(var_dir: &Path) -> Result<Config, Box<dyn Error>> {
+        let var_dir = var_dir.display().to_string();
+        Ok(Config::from_lookup(|name| {
+            (name == "CARDDEMO_VAR_DIR").then(|| var_dir.clone())
+        })?)
+    }
+
+    /// Every account, read back through `store`.
+    async fn accounts(store: &PgStore) -> Result<Vec<AccountRecord>, Box<dyn Error>> {
+        let mut store = store.clone();
+        Ok(AccountRepository::find_all(&mut store).await?)
+    }
+
+    /// A fixture-loaded database after `posttran` has posted `dailytran.txt` to it, the
+    /// `INTEREST-POSTED` scenario of `fixtures.md`, whose category balances earn interest
+    /// (FIXINT-901). The reject generation goes to `var_dir`.
+    async fn posted_database(var_dir: &Path) -> Result<PostgresGuard, Box<dyn Error>> {
+        let guard = start_loaded_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let config = var_config(var_dir)?;
+        let clock = clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        posttran::run(&ctx, &fixture_path("dailytran.txt")).await?;
+        Ok(guard)
+    }
+
+    /// The accounts one interest run leaves over the tables `store` holds, computed by the loop
+    /// over the in-memory table, its SYSTRAN records going to a generation in `dir` that is
+    /// dropped unfinished.
+    async fn after_one_run(
+        store: &PgStore,
+        dir: &Path,
+    ) -> Result<Vec<AccountRecord>, Box<dyn Error>> {
+        let mut reads = store.clone();
+        let before = AccountRepository::find_all(&mut reads).await?;
+        let mut single = Intcalc::new(
+            ParmDate::DEFAULT,
+            before.clone(),
+            CardXrefRepository::find_all(&mut reads).await?,
+            DisclosureGroupRepository::find_all(&mut reads).await?,
+        );
+        let balances = TranCatBalanceRepository::find_all(&mut reads).await?;
+        let mut ledger = Ledger::holding(&before, false);
+        let mut systran = OutputFile::next_generation(dir, "SYSTRAN").await?;
+        post_interest(&mut single, &balances, &clock()?, &mut ledger, &mut systran).await?;
+        let after: Vec<AccountRecord> = ledger.rows.into_values().collect();
+        if after == before {
+            return Err("one interest run over the posted tables rewrites no account".into());
+        }
+        Ok(after)
+    }
+
+    /// The names of the files in `dir`, sorted; none when `dir` does not exist.
+    fn file_names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
+        names.sort();
+        Ok(names)
     }
 
     /// An in-memory `accounts` table. `update` rewrites a row it holds and answers `false` for
@@ -665,6 +833,123 @@ mod tests {
             drop(systran);
             assert_eq!(fs::read_dir(scratch.path())?.count(), 0, "{ends:?}");
         }
+        Ok(())
+    }
+
+    /// While another run holds the claim on `accounts`, the `OPEN I-O` of the account file
+    /// fails: the job ends with `ERROR OPENING ACCOUNT MASTER FILE` and no return code, reads
+    /// and rewrites nothing and creates no generation. Once the claim is given up, the run posts
+    /// one run's interest and gives its own claim up at its end.
+    // audit: CBACT04C-034
+    // audit: CBACT04C-038
+    // audit: CBACT04C-039
+    #[tokio::test]
+    async fn an_account_file_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
+        let scratch = Scratch::new()?;
+        let guard = posted_database(&scratch.path().join("posttran")).await?;
+        let store = PgStore::new(guard.pool().clone());
+        let config = var_config(scratch.path())?;
+        let clock = clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        let args = IntcalcArgs {
+            parm_date: ParmDate::DEFAULT,
+        };
+        let before = accounts(&store).await?;
+
+        let mut held = store.session().await?;
+        assert!(
+            held.claim_writer(Dataset::Accounts).await?,
+            "the test claims the free account file"
+        );
+        let error = run(&ctx, &args)
+            .await
+            .err()
+            .ok_or("a run passed an account file another run holds")?;
+        assert!(
+            matches!(&error, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
+            "{error}"
+        );
+        assert_eq!(error.exit_code(), None);
+        assert_eq!(
+            error.to_string(),
+            "ABEND: ERROR OPENING ACCOUNT MASTER FILE"
+        );
+        assert!(
+            accounts(&store).await? == before,
+            "a refused run rewrote an account"
+        );
+        assert!(file_names(&config.systran_dir())?.is_empty());
+        held.close().await?;
+
+        let once = after_one_run(&store, &scratch.path().join("expected")).await?;
+        let outcome = run(&ctx, &args).await?;
+        assert_eq!(outcome.return_code, 0);
+        assert_eq!(
+            outcome.written,
+            [config.systran_dir().join("SYSTRAN.G0001")]
+        );
+        assert!(
+            accounts(&store).await? == once,
+            "the accounts differ from one run's interest"
+        );
+        let mut free = store.session().await?;
+        assert!(
+            free.claim_writer(Dataset::Accounts).await?,
+            "a finished run still holds the account file"
+        );
+        free.close().await?;
+        Ok(())
+    }
+
+    /// Two runs started together over the same database: one claims the account file and posts
+    /// its interest, the other meets that claim before its first read and ends, so every account
+    /// holds what one run leaves, as the in-memory table computes it over the same tables, and
+    /// one generation exists.
+    // audit: CBACT04C-039
+    #[tokio::test]
+    async fn of_two_runs_at_once_one_posts_interest_and_the_other_is_refused() -> TestResult {
+        let scratch = Scratch::new()?;
+        let guard = posted_database(&scratch.path().join("posttran")).await?;
+        let store = PgStore::new(guard.pool().clone());
+        let config = var_config(scratch.path())?;
+        let clock = clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        let args = IntcalcArgs {
+            parm_date: ParmDate::DEFAULT,
+        };
+        let once = after_one_run(&store, &scratch.path().join("expected")).await?;
+
+        let (first, second) = tokio::join!(run(&ctx, &args), run(&ctx, &args));
+        let (posted, refused) = match (first, second) {
+            (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
+            (first, second) => {
+                return Err(format!(
+                    "one run must post and one be refused: {:?}, {:?}",
+                    first.map(|outcome| outcome.return_code),
+                    second.map(|outcome| outcome.return_code)
+                )
+                .into());
+            }
+        };
+        assert_eq!(posted.return_code, 0);
+        assert_eq!(posted.written, [config.systran_dir().join("SYSTRAN.G0001")]);
+        assert!(
+            matches!(&refused, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
+            "{refused}"
+        );
+        assert_eq!(file_names(&config.systran_dir())?, ["SYSTRAN.G0001"]);
+        assert!(
+            accounts(&store).await? == once,
+            "the accounts differ from one run's interest"
+        );
         Ok(())
     }
 }

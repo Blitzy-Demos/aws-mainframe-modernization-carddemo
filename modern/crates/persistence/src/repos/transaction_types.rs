@@ -108,6 +108,11 @@ pub trait TransactionTypeRepository: Send {
     /// the call returns and rolls back on any error, leaving the previous contents (LOADS-018).
     /// On a [`PgTx`] it runs in the caller's transaction, which a failed statement aborts.
     ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
+    ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] when a record holds a NUL or non-ASCII byte; every record is
@@ -253,6 +258,10 @@ where
 /// Deletes every row on `conn`, then inserts `records` in slice order, returning the number of
 /// rows inserted. Every record is converted first, so a record codec B cannot store fails the
 /// call before the delete, and even a caller's transaction is left as it was.
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `transaction_types` run one at a time and the last to commit leaves its
+/// input (LOADS-014, LOADS-040).
 async fn replace_all_in(
     conn: &mut PgConnection,
     records: &[TransactionTypeRecord],
@@ -261,6 +270,13 @@ async fn replace_all_in(
         .iter()
         .map(TransactionTypeRow::from_record)
         .collect::<Result<Vec<_>, _>>()?;
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE transaction_types IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     sqlx::query!("DELETE FROM transaction_types")
         .execute(&mut *conn)
         .await?;

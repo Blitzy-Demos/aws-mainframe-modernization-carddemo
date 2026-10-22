@@ -198,6 +198,11 @@ pub trait UserRepository: Send {
     /// Every user is converted through codec B before any statement runs, so a value the table
     /// cannot store leaves the contents untouched.
     ///
+    /// The delete is preceded by a `SHARE ROW EXCLUSIVE` lock on the table, held until the
+    /// transaction ends, so a concurrent replacement or row write waits for it and then sees its
+    /// committed rows: two loads at once leave the input of the one that commits last, never
+    /// their union (LOADS-040). Reads do not wait.
+    ///
     /// # Errors
     ///
     /// [`PersistenceError::Decode`] for a field holding a NUL or non-ASCII byte, before any
@@ -446,7 +451,18 @@ async fn replace_all_in(
 
 /// Deletes every row, then inserts `rows` in order, on one connection; returns the rows
 /// inserted.
+///
+/// The first statement locks the table `SHARE ROW EXCLUSIVE` until the transaction ends, so
+/// replacements of `users` run one at a time and the last to commit leaves its input
+/// (LOADS-014, LOADS-040).
 async fn replace_rows(conn: &mut PgConnection, rows: &[UserRow]) -> Result<u64, PersistenceError> {
+    // One replacement of the table at a time (LOADS-014, LOADS-040): this mode conflicts with
+    // itself and with the ROW EXCLUSIVE lock of every row write, so a second load waits here
+    // until this transaction ends, and its delete then removes the rows this one committed.
+    // Readers take ACCESS SHARE and never wait.
+    sqlx::query!("LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *conn)
+        .await?;
     delete_every(&mut *conn).await?;
     let mut inserted: u64 = 0;
     for row in rows {
