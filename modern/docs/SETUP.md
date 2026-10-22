@@ -105,7 +105,7 @@ Start both services and wait until their healthchecks pass:
 docker compose up -d --wait
 ```
 
-This starts PostgreSQL 16 on `localhost:5432` and RabbitMQ 3.13 on `localhost:5672`, both bound to 127.0.0.1 only. The database's data lives in the named volume `pgdata`. RabbitMQ imports [`rabbitmq/definitions.json`](../rabbitmq/definitions.json) at boot, through [`rabbitmq/rabbitmq.conf`](../rabbitmq/rabbitmq.conf): vhost `/`, user `carddemo` with the local-only password `carddemo`, and seven durable queues. The management console at <http://localhost:15672> accepts that user and lists the queues:
+This starts PostgreSQL 16 on `localhost:5432` and RabbitMQ 3.13 on `localhost:5672`, both bound to 127.0.0.1 only. The database's data lives in the named volume `pgdata`, and the broker's queues and persistent messages in the named volume `rabbitmq-data`. RabbitMQ imports [`rabbitmq/definitions.json`](../rabbitmq/definitions.json) at boot, through [`rabbitmq/rabbitmq.conf`](../rabbitmq/rabbitmq.conf): vhost `/`, user `carddemo` with the local-only password `carddemo`, and seven durable queues. The management console at <http://localhost:15672> accepts that user and lists the queues:
 
 | Queue | Role |
 |---|---|
@@ -221,7 +221,7 @@ Things to know when running them:
 - A job prints every file it wrote, one path per line, among its JSON log events; a path line is any line that does not begin with `{`. With `RUST_LOG=off` only the path lines remain. The loads, `cbpaup0j` and `mnttrdb2` write no file and print no path.
 - The `.G<nnnn>` outputs mirror a GDG `(+1)`: each run writes the generation one above the highest one in its directory.
 - On the fixture data, `posttran` rejects some records and exits 4. That is the audited result ([`audit/fixtures.md`](../audit/fixtures.md)), not a failure.
-- The loads do not empty `transactions` or the pending-authorization tables. To start again from the fixtures, remove the database volume and reload:
+- The loads do not empty `transactions` or the pending-authorization tables. To start again from the fixtures, remove the database and broker volumes and reload:
 
   ```bash
   docker compose down -v
@@ -312,7 +312,7 @@ cargo sqlx prepare --workspace -- --all-targets
 
 `.sqlx/` is derived from `crates/persistence/migrations/` and the queries, so it is never edited by hand; step 14 of `scripts/check.sh` fails when it is stale. Migrations only add: none drops, renames or retypes a column.
 
-**Stopping.** `docker compose down` stops the stack and keeps the database volume; `docker compose down -v` also removes the volume and every loaded row.
+**Stopping.** `docker compose down` stops the stack and keeps both volumes, `pgdata` and `rabbitmq-data`; `docker compose down -v` also removes both, with every loaded row and every queued message.
 
 ## 9. Troubleshooting
 

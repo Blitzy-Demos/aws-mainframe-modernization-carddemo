@@ -117,7 +117,7 @@ A job that writes files prints each path it wrote, one per line. Outputs stay on
 | `SQLX_OFFLINE=true cargo build --workspace --locked` | Builds without a database, against the committed `.sqlx/` |
 | `cargo test -p <crate> --locked` | One crate's tests, with `SQLX_OFFLINE=true` when the stack is not running. `copybook` and `domain` need no Docker; `persistence`, `api`, `messaging`, `batch` and `test-support` start their own test containers and remove them afterwards |
 | `docker compose up -d --wait` | Starts PostgreSQL on `localhost:5432` and RabbitMQ on `localhost:5672`, with its management console at `http://localhost:15672` |
-| `docker compose down [-v]` | Stops the stack; `-v` also removes the database volume and every loaded row |
+| `docker compose down [-v]` | Stops the stack; `-v` also removes the database and broker volumes, with every loaded row and every queued message |
 
 ## Layout
 

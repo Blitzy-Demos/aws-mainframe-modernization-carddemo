@@ -33,6 +33,12 @@ services:
 
   rabbitmq:
     image: rabbitmq:3.13-management
+    # The node is named rabbit@<hostname> and keeps its message store under
+    # /var/lib/rabbitmq/mnesia/rabbit@<hostname>. A fixed hostname and the named volume
+    # rabbitmq-data keep both stable across container recreation, so durable queues and
+    # persistent messages survive `docker compose down` and `up` as the database does, and no
+    # anonymous volume is left behind. `docker compose down -v` removes rabbitmq-data with pgdata.
+    hostname: rabbitmq
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
@@ -42,6 +48,7 @@ services:
     volumes:
       - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
       - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - rabbitmq-data:/var/lib/rabbitmq
     healthcheck:
       # The probe runs as the rabbitmq user through the image's gosu. Healthchecks run as root, and
       # a root probe that runs before the server creates /var/lib/rabbitmq/.erlang.cookie writes it
@@ -58,3 +65,4 @@ services:
 
 volumes:
   pgdata: {}
+  rabbitmq-data: {}
