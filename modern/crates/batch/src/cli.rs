@@ -56,14 +56,184 @@ const DAILY_TRANSACTIONS: &str = "../app/data/ASCII/dailytran.txt";
 /// `clap` adds the rejected value, a date, which is no protected value.
 const DATE_ERROR: &str = "date must be YYYY-MM-DD naming a calendar date";
 
+// The help printed after the options names the environment each job reads, with the defaults
+// of `runtime::config::Config`, the only reader of it. `clap` prints this text exactly as
+// written, so every line break is explicit. `concat!` takes only literals, so the text that
+// several help texts share is written as macros that expand to string literals.
+
+/// The `DATABASE_URL` entry of an environment list. The default is described, never printed,
+/// because the URL carries the password.
+macro_rules! database_url_entry {
+    () => {
+        concat!(
+            "  DATABASE_URL            PostgreSQL connection URL, read by every job\n",
+            "                          [default: the Compose database localhost:5432/carddemo]\n",
+        )
+    };
+}
+
+/// The `CARDDEMO_FIXTURE_DIR` entry of an environment list.
+macro_rules! fixture_dir_entry {
+    () => {
+        concat!(
+            "  CARDDEMO_FIXTURE_DIR    Fixture directory of the eight file loads, read when\n",
+            "                          --input is absent [default: ../app/data/ASCII]\n",
+        )
+    };
+}
+
+/// The `CARDDEMO_STATEMENT_DIR` entry of an environment list.
+macro_rules! statement_dir_entry {
+    () => {
+        concat!(
+            "  CARDDEMO_STATEMENT_DIR  Directory of the creastmt statements STATEMNT.PS,\n",
+            "                          .HTML and .PDF; when unset, statements under\n",
+            "                          CARDDEMO_VAR_DIR [default: ./var/statements]\n",
+        )
+    };
+}
+
+/// The example that ends the help of a subcommand: `$args` is the subcommand with any option
+/// it needs, run from `modern/` with `.env` exported.
+macro_rules! job_example {
+    ($args:literal) => {
+        concat!(
+            "\nExample, from modern/:\n",
+            "  set -a; . ./.env; set +a; carddemo-batch ",
+            $args,
+        )
+    };
+}
+
+/// The help after the options of the file load `$job`.
+macro_rules! load_help {
+    ($job:literal) => {
+        concat!(
+            "Environment:\n",
+            fixture_dir_entry!(),
+            database_url_entry!(),
+            job_example!($job),
+        )
+    };
+}
+
+/// The help after the commands of `carddemo-batch`: where to run, the environment of every
+/// job and two invocations.
+const CLI_HELP: &str = concat!(
+    "Run from modern/ after carddemo-migrate has applied the schema. Every job prints each\n",
+    "file it writes, one path per line.\n",
+    "\n",
+    "Environment:\n",
+    database_url_entry!(),
+    fixture_dir_entry!(),
+    "  CARDDEMO_VAR_DIR        Root of the outputs: posttran writes DALYREJS.G<nnnn>\n",
+    "                          in dalyrejs, intcalc SYSTRAN.G<nnnn> in systran and\n",
+    "                          tranrept TRANREPT.G<nnnn> in reports [default: ./var]\n",
+    statement_dir_entry!(),
+    "  RUST_LOG                Tracing filter of the log events [default: info]\n",
+    "  CARDDEMO_OTEL_EXPORT    OpenTelemetry span export: unset or empty means none,\n",
+    "                          exactly stdout enables span export to standard output,\n",
+    "                          and any other non-empty value is a configuration error\n",
+    "                          [default: unset, no span export]\n",
+    "\n",
+    "No program loads .env: export it in the shell first with set -a; . ./.env; set +a.\n",
+    "Relative paths resolve against modern/. modern/.env.example lists every variable.\n",
+    "\n",
+    "Examples, from modern/:\n",
+    "  set -a; . ./.env; set +a; carddemo-batch acctfile\n",
+    "  cargo run -p batch --bin carddemo-batch -- posttran",
+);
+
+/// The help after the options of `acctfile`.
+const ACCTFILE_HELP: &str = load_help!("acctfile");
+
+/// The help after the options of `cardfile`.
+const CARDFILE_HELP: &str = load_help!("cardfile");
+
+/// The help after the options of `xreffile`.
+const XREFFILE_HELP: &str = load_help!("xreffile");
+
+/// The help after the options of `custfile`.
+const CUSTFILE_HELP: &str = load_help!("custfile");
+
+/// The help after the options of `discgrp`.
+const DISCGRP_HELP: &str = load_help!("discgrp");
+
+/// The help after the options of `tcatbalf`.
+const TCATBALF_HELP: &str = load_help!("tcatbalf");
+
+/// The help after the options of `trancatg`.
+const TRANCATG_HELP: &str = load_help!("trancatg");
+
+/// The help after the options of `trantype`.
+const TRANTYPE_HELP: &str = load_help!("trantype");
+
+/// The help after the options of `dusrsecj`.
+const DUSRSECJ_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    job_example!("dusrsecj"),
+);
+
+/// The help after the options of `posttran`.
+const POSTTRAN_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    "  CARDDEMO_VAR_DIR        Root of the outputs; each run writes a new\n",
+    "                          DALYREJS.G<nnnn> of rejects in dalyrejs under it,\n",
+    "                          ./var/dalyrejs by default [default: ./var]\n",
+    job_example!("posttran"),
+);
+
+/// The help after the options of `intcalc`.
+const INTCALC_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    "  CARDDEMO_VAR_DIR        Root of the outputs; each run writes a new\n",
+    "                          SYSTRAN.G<nnnn> in systran under it, ./var/systran\n",
+    "                          by default [default: ./var]\n",
+    job_example!("intcalc"),
+);
+
+/// The help after the options of `creastmt`.
+const CREASTMT_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    statement_dir_entry!(),
+    job_example!("creastmt"),
+);
+
+/// The help after the options of `tranrept`.
+const TRANREPT_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    "  CARDDEMO_VAR_DIR        Root of the outputs; each run writes a new\n",
+    "                          TRANREPT.G<nnnn> in reports under it, ./var/reports\n",
+    "                          by default [default: ./var]\n",
+    job_example!("tranrept"),
+);
+
+/// The help after the options of `cbpaup0j`.
+const CBPAUP0J_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    job_example!("cbpaup0j"),
+);
+
+/// The help after the options of `mnttrdb2`, whose example names the required `--input`.
+const MNTTRDB2_HELP: &str = concat!(
+    "Environment:\n",
+    database_url_entry!(),
+    job_example!("mnttrdb2 --input maintenance.txt"),
+);
+
 /// Run one batch job of the COBOL replacement: each subcommand stands in for one JCL job
 #[derive(Debug, clap::Parser)]
 #[command(
     name = "carddemo-batch",
     version,
     disable_help_subcommand = true,
-    after_help = "Run from modern/ after carddemo-migrate has applied the schema. Every job \
-                  prints each file it writes, one path per line."
+    after_help = CLI_HELP
 )]
 pub(crate) struct Cli {
     /// The job to run.
@@ -76,57 +246,57 @@ pub(crate) struct Cli {
 #[derive(Debug, clap::Subcommand)]
 pub(crate) enum Job {
     /// ACCTFILE (IDCAMS REPRO): replace the accounts with acctdata.txt
-    #[command(name = "acctfile")]
+    #[command(name = "acctfile", after_help = ACCTFILE_HELP)]
     Acctfile(LoadArgs),
     /// CARDFILE (IDCAMS REPRO): replace the cards with carddata.txt
-    #[command(name = "cardfile")]
+    #[command(name = "cardfile", after_help = CARDFILE_HELP)]
     Cardfile(LoadArgs),
     /// XREFFILE (IDCAMS REPRO): replace the card cross-references with cardxref.txt
-    #[command(name = "xreffile")]
+    #[command(name = "xreffile", after_help = XREFFILE_HELP)]
     Xreffile(LoadArgs),
     /// CUSTFILE (IDCAMS REPRO): replace the customers with custdata.txt
-    #[command(name = "custfile")]
+    #[command(name = "custfile", after_help = CUSTFILE_HELP)]
     Custfile(LoadArgs),
     /// DISCGRP (IDCAMS REPRO): replace the disclosure groups with discgrp.txt
-    #[command(name = "discgrp")]
+    #[command(name = "discgrp", after_help = DISCGRP_HELP)]
     Discgrp(LoadArgs),
     /// TCATBALF (IDCAMS REPRO): replace the transaction category balances with tcatbal.txt
-    #[command(name = "tcatbalf")]
+    #[command(name = "tcatbalf", after_help = TCATBALF_HELP)]
     Tcatbalf(LoadArgs),
     /// TRANCATG (IDCAMS REPRO): replace the VSAM version of the transaction categories with
     /// trancatg.txt
-    #[command(name = "trancatg")]
+    #[command(name = "trancatg", after_help = TRANCATG_HELP)]
     Trancatg(LoadArgs),
     /// TRANTYPE (IDCAMS REPRO): replace the VSAM version of the transaction types with
     /// trantype.txt
-    #[command(name = "trantype")]
+    #[command(name = "trantype", after_help = TRANTYPE_HELP)]
     Trantype(LoadArgs),
     /// DUSRSECJ (IEBGENER): replace the users with the in-stream records of the DUSRSECJ deck,
     /// passwords stored hashed
-    #[command(name = "dusrsecj")]
+    #[command(name = "dusrsecj", after_help = DUSRSECJ_HELP)]
     Dusrsecj(DusrsecjArgs),
     /// POSTTRAN (CBTRN02C): post the daily transactions; rejects go to a new DALYREJS
     /// generation, and the exit code is 4 when any record is rejected
-    #[command(name = "posttran")]
+    #[command(name = "posttran", after_help = POSTTRAN_HELP)]
     Posttran(PosttranArgs),
     /// INTCALC (CBACT04C): compute the monthly interest into a new SYSTRAN generation and
     /// update the account balances
-    #[command(name = "intcalc")]
+    #[command(name = "intcalc", after_help = INTCALC_HELP)]
     Intcalc(IntcalcArgs),
     /// CREASTMT (CBSTM03A, CBSTM03B): write the account statements STATEMNT.PS, STATEMNT.HTML
     /// and STATEMNT.PDF
-    #[command(name = "creastmt")]
+    #[command(name = "creastmt", after_help = CREASTMT_HELP)]
     Creastmt,
     /// TRANREPT (CBTRN03C): write the transaction detail report for a processing-date window
     /// to a new TRANREPT generation
-    #[command(name = "tranrept")]
+    #[command(name = "tranrept", after_help = TRANREPT_HELP)]
     Tranrept(TranreptArgs),
     /// CBPAUP0J (CBPAUP0C): purge the expired pending authorizations
-    #[command(name = "cbpaup0j")]
+    #[command(name = "cbpaup0j", after_help = CBPAUP0J_HELP)]
     Cbpaup0j(Cbpaup0jArgs),
     /// MNTTRDB2 (COBTUPDT): apply transaction type maintenance records to the Db2 version of
     /// the transaction types
-    #[command(name = "mnttrdb2")]
+    #[command(name = "mnttrdb2", after_help = MNTTRDB2_HELP)]
     Mnttrdb2(Mnttrdb2Args),
 }
 
@@ -160,7 +330,8 @@ impl Job {
 pub(crate) struct LoadArgs {
     // No `clap` default: the default lies in `CARDDEMO_FIXTURE_DIR`, which `Config` reads only
     // after parsing; `input_path` joins the two (LOADS-010).
-    /// Fixture file to load [default: the job's fixture file in `CARDDEMO_FIXTURE_DIR`]
+    /// Fixture file to load [default: the job's file in `CARDDEMO_FIXTURE_DIR`, ../app/data/ASCII
+    /// when unset]
     #[arg(long, value_name = "PATH")]
     input: Option<PathBuf>,
 }
@@ -316,12 +487,18 @@ mod tests {
     use domain::batch::cbpaup0c::{DEFAULT_SYSIN, PurgeParams, SysinError};
     use domain::batch::cbtrn03c::DateParm;
     use domain::batch::loads::LoadJob;
+    use runtime::config::{Config, OtelExport};
 
     use super::{Cli, DAILY_TRANSACTIONS, DUSRSECJ_DECK, Job, parse_iso_date};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
     const BIN: &str = "carddemo-batch";
+
+    /// The two forms of an example line in the help, both run from `modern/`: the binary with
+    /// `.env` exported, and `cargo run`.
+    const EXPORTED: &str = "set -a; . ./.env; set +a; carddemo-batch ";
+    const CARGO_RUN: &str = "cargo run -p batch --bin carddemo-batch -- ";
 
     /// The 15 in-scope jobs (AAP 0.2.3).
     const NAMES: [&str; 15] = [
@@ -332,6 +509,59 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Job, clap::Error> {
         Cli::try_parse_from(std::iter::once(BIN).chain(args.iter().copied())).map(|cli| cli.job)
+    }
+
+    /// The jobs the example lines of `help` run, each as its form followed by the subcommand
+    /// its arguments select. An example whose arguments do not parse is an error.
+    fn example_jobs(help: &str) -> Result<BTreeSet<String>, clap::Error> {
+        let mut jobs = BTreeSet::new();
+        for line in help.lines().map(str::trim) {
+            for form in [EXPORTED, CARGO_RUN] {
+                if let Some(args) = line.strip_prefix(form) {
+                    let args: Vec<&str> = args.split_whitespace().collect();
+                    jobs.insert(format!("{form}{}", parse(&args)?.name()));
+                }
+            }
+        }
+        Ok(jobs)
+    }
+
+    /// Checks `help`, as the program (`name` `None`) or subcommand `name` prints it: it names
+    /// every needle, shows no connection URL and no variable the batch does not read, and ends
+    /// with its examples, which are exactly `examples` and parse.
+    fn check_help(
+        name: Option<&str>,
+        help: &str,
+        needles: &[&str],
+        examples: &BTreeSet<String>,
+    ) -> TestResult {
+        for needle in needles {
+            assert!(
+                help.contains(needle),
+                "{name:?} help names {needle:?}:\n{help}"
+            );
+        }
+        assert!(!help.contains("carddemo:carddemo@"), "{name:?}:\n{help}");
+        assert!(
+            !help.contains(&Config::default().database_url),
+            "{name:?}:\n{help}"
+        );
+        assert!(!help.contains("CARDDEMO_INTRDR_DIR"), "{name:?}:\n{help}");
+        assert_eq!(&example_jobs(help)?, examples, "{name:?}:\n{help}");
+        let last = help
+            .trim_end()
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .trim_start();
+        let ends_with_example = [EXPORTED, CARGO_RUN]
+            .iter()
+            .any(|form| last.starts_with(form));
+        assert!(
+            ends_with_example,
+            "{name:?} help ends with an example:\n{help}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -360,6 +590,131 @@ mod tests {
         }
         let err = parse(&["help"]).err();
         assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::InvalidSubcommand));
+    }
+
+    // Each help text names the variables its jobs read, with the defaults of `Config` and the
+    // output directories `Config` derives, shows no connection URL, and ends with examples that
+    // parse to the subcommand they illustrate.
+    #[test]
+    fn help_names_the_environment_with_the_code_defaults_and_ends_with_an_example() -> TestResult {
+        let config = Config::default();
+        let stated = |path: &Path| format!("[default: {}]", path.display());
+        let (fixture_dir, var_dir) = (stated(&config.fixture_dir), stated(&config.var_dir));
+        let statement_dir = stated(&config.statement_dir);
+        let input = format!("{} when unset]", config.fixture_dir.display());
+        let dirs = [
+            config.dalyrejs_dir(),
+            config.systran_dir(),
+            config.reports_dir(),
+        ];
+        let [dalyrejs, systran, reports] = dirs.each_ref().map(|dir| dir.display().to_string());
+        let mut subdirs = Vec::new();
+        for dir in &dirs {
+            subdirs.push(format!(
+                "in {}",
+                dir.strip_prefix(&config.var_dir)?.display()
+            ));
+        }
+        let subdirs: Vec<&str> = subdirs.iter().map(String::as_str).collect();
+
+        let database: &[&str] = &["DATABASE_URL", "localhost:5432/carddemo"];
+        let fixtures: &[&str] = &["CARDDEMO_FIXTURE_DIR", fixture_dir.as_str()];
+        let var_root: &[&str] = &["CARDDEMO_VAR_DIR", var_dir.as_str()];
+        let statements: &[&str] = &[
+            "CARDDEMO_STATEMENT_DIR",
+            statement_dir.as_str(),
+            "STATEMNT.PS",
+        ];
+        let logging: &[&str] = &[
+            "RUST_LOG",
+            "[default: info]",
+            "CARDDEMO_OTEL_EXPORT",
+            "unset or empty",
+        ];
+        let exported: &[&str] = &[
+            "set -a; . ./.env; set +a",
+            ".env.example",
+            "carddemo-migrate",
+        ];
+        let top = [
+            database, fixtures, var_root, statements, &subdirs, logging, exported,
+        ]
+        .concat();
+        let load = [fixtures, database, &[input.as_str()]].concat();
+        let posttran = [database, var_root, &["DALYREJS.G", dalyrejs.as_str()]].concat();
+        let intcalc = [database, var_root, &["SYSTRAN.G", systran.as_str()]].concat();
+        let creastmt = [database, statements].concat();
+        let tranrept = [database, var_root, &["TRANREPT.G", reports.as_str()]].concat();
+        let cases: [(Option<&str>, &[&str]); 16] = [
+            (None, &top),
+            (Some("acctfile"), &load),
+            (Some("cardfile"), &load),
+            (Some("xreffile"), &load),
+            (Some("custfile"), &load),
+            (Some("discgrp"), &load),
+            (Some("tcatbalf"), &load),
+            (Some("trancatg"), &load),
+            (Some("trantype"), &load),
+            (Some("dusrsecj"), database),
+            (Some("posttran"), &posttran),
+            (Some("intcalc"), &intcalc),
+            (Some("creastmt"), &creastmt),
+            (Some("tranrept"), &tranrept),
+            (Some("cbpaup0j"), database),
+            (Some("mnttrdb2"), database),
+        ];
+
+        for (name, needles) in cases {
+            let mut cli = Cli::command();
+            let (command, examples) = match name {
+                Some(name) => (
+                    cli.find_subcommand_mut(name)
+                        .ok_or_else(|| format!("no subcommand {name}"))?,
+                    BTreeSet::from([format!("{EXPORTED}{name}")]),
+                ),
+                None => (
+                    &mut cli,
+                    BTreeSet::from([
+                        format!("{EXPORTED}acctfile"),
+                        format!("{CARGO_RUN}posttran"),
+                    ]),
+                ),
+            };
+            // What `-h` and `--help` print.
+            for help in [command.render_help(), command.render_long_help()] {
+                check_help(name, &help.to_string(), needles, &examples)?;
+            }
+        }
+        Ok(())
+    }
+
+    // The `CARDDEMO_OTEL_EXPORT` entry of the program's help states what `Config` makes of an
+    // empty value, of exactly `stdout` and of any other value.
+    #[test]
+    fn help_states_how_config_reads_the_span_export() {
+        let help = Cli::command().render_help().to_string();
+        let read = |value: &str| {
+            Config::from_lookup(|var| (var == "CARDDEMO_OTEL_EXPORT").then(|| value.to_owned()))
+                .map(|config| config.otel_export)
+                .ok()
+        };
+        let cases = [
+            ("", "unset or empty means none", Some(OtelExport::Off)),
+            (
+                "stdout",
+                "exactly stdout enables span export",
+                Some(OtelExport::Stdout),
+            ),
+            (
+                "otlp",
+                "any other non-empty value is a configuration error",
+                None,
+            ),
+        ];
+        for (value, stated, read_as) in cases {
+            assert!(help.contains(stated), "--help states {stated:?}:\n{help}");
+            assert_eq!(read(value), read_as, "CARDDEMO_OTEL_EXPORT={value:?}");
+        }
     }
 
     #[test]
