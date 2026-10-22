@@ -13,26 +13,67 @@
 //! # Local-only runtime
 //!
 //! The stores run only as testcontainers on the local Docker engine and are removed when their
-//! guard drops. Their credentials are the local values `carddemo`/`carddemo`.
+//! guard drops, or when SIGINT or SIGTERM interrupts the run. Their credentials are the local
+//! values `carddemo`/`carddemo`.
 //!
 //! Every start labels its container `org.carddemo.test-support.instance=<token>` and names it
-//! `carddemo-test-<image>-<token>`, with a token no other start shares. Docker creates a
-//! container before testcontainers hands back the handle that removes it, and a start cut off
-//! while Docker creates the container cannot learn whether Docker made it. Each start therefore
-//! runs to its end on a thread and Tokio runtime of its own, which nothing outside can cut off,
-//! so every request it makes gets Docker's answer. That thread hands the handle to the caller or,
-//! when the start failed or the caller gave up on it, removes the containers carrying its own
-//! token, and no other. A caller that gives up part-way, through a timeout, a runtime shutdown
-//! or a panic, waits in the drop of the start's future until the thread has done so.
+//! `carddemo-test-<image>-<token>`, with a token no other start shares, and labels it
+//! `org.carddemo.test-support.process=<token>` with the token of its process, which every start
+//! of that process shares. Docker creates a container before testcontainers hands back the
+//! handle that removes it, and a start cut off while Docker creates the container cannot learn
+//! whether Docker made it. Each start therefore runs to its end on a thread and Tokio runtime of
+//! its own, which nothing outside can cut off, so every request it makes gets Docker's answer.
+//! That thread hands the handle to the caller or, when the start failed or the caller gave up on
+//! it, removes the containers carrying its own token, and no other. A caller that gives up
+//! part-way, through a timeout, a runtime shutdown or a panic, waits in the drop of the start's
+//! future until the thread has done so.
 //!
-//! A container stays behind, labelled with its token for removal by hand, only when the process
-//! is killed or aborts while a start runs; when Docker keeps a start waiting past the bound that
-//! drop waits for, which standard error reports, and the process ends before Docker answers;
-//! when Docker does not answer the cleanup within its bound, which the start error or standard
-//! error reports; when a request of the start fails at the transport level, for example at the
-//! Docker client's 120-second answer timeout, while Docker still finishes it later, which the
-//! start error reports; or when a panic inside testcontainers' start drops it while Docker is
-//! creating the container and Docker finishes that create more than four seconds later.
+//! # Interrupted runs
+//!
+//! The default action of SIGINT and SIGTERM ends a process without running a destructor, so no
+//! guard would remove its container. Before its first start reaches Docker, a process therefore
+//! installs a watcher for both signals on a thread and Tokio runtime of its own. The watcher first
+//! obtains, on that runtime, the Docker client its cleanup uses, and a start fails without
+//! contacting Docker when the watcher cannot be installed or cannot obtain that client. On the
+//! first of the two signals the watcher force-removes every container labelled with the process's
+//! token. From then on nothing the harness does lets a test end, as the end of the last test would
+//! end the run before its cleanup: a later start waits, without contacting Docker, until the
+//! process ends, and so do a start whose outcome arrives after the signal, `start_postgres`,
+//! `start_rabbitmq`, and the drop of a guard or of an abandoned start. Such a drop holds its
+//! thread, and with it any runtime that thread drives, so the cleanup never waits for
+//! testcontainers' shared client, which a task of that runtime may keep, and sends its requests
+//! from the watcher's runtime. A removal round that Docker does not finish within 10 seconds counts
+//! as failed, and the next round starts. The watcher repeats its removal, a quarter of a second
+//! apart, until no start is running and one more removal has succeeded after that, so that a
+//! container Docker finishes creating after the signal goes too, within 30 seconds in all. It then
+//! writes one line to standard error, with the signal, how many containers it removed and what it
+//! could not finish, and exits with status 128 plus the signal number: 130 for SIGINT, 143 for
+//! SIGTERM. A second of the two signals during that cleanup ends the process at once, with a line
+//! saying that containers may remain. A signal the process inherited as ignored, as a background
+//! job of a non-interactive shell inherits SIGINT, stays ignored: it does not end the process, so
+//! it leaves nothing behind.
+//!
+//! # Residual containers
+//!
+//! A container stays behind, labelled with both tokens for removal by hand, only:
+//!
+//! - when the process ends by SIGKILL or another signal the watcher does not handle, or aborts,
+//!   while a guard or a start is alive;
+//! - when a start is still running when the cleanup after a signal reaches its bound, or Docker
+//!   does not answer that cleanup within it, which the watcher's line reports;
+//! - when Docker keeps a start waiting past the bound the drop of an abandoned start waits for,
+//!   which standard error reports, and the process ends before Docker answers;
+//! - when Docker does not answer a start's cleanup within its bound, which the start error or
+//!   standard error reports;
+//! - when a request of the start fails at the transport level, for example at the Docker
+//!   client's 120-second answer timeout, while Docker still finishes it later, which the start
+//!   error reports;
+//! - or when a panic inside testcontainers' start drops it while Docker is creating the
+//!   container and Docker finishes that create more than four seconds later.
+//!
+//! `docker rm -f -v $(docker ps -aq --filter label=org.carddemo.test-support.process=<token>)`
+//! removes what one process left; the filter `label=org.carddemo.test-support.instance=<token>`
+//! narrows it to one start.
 //!
 //! # Modules
 //!
@@ -54,16 +95,20 @@ pub mod rabbitmq;
 pub mod trace_capture;
 
 use std::collections::HashMap;
+use std::ffi::c_int;
 use std::fmt;
-use std::future::Future;
+use std::fs;
+use std::future::{self, Future};
 use std::hash::{BuildHasher, RandomState};
 use std::io::{self, Write};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::{LazyLock, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -75,6 +120,7 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers::{
     ContainerAsync, ContainerRequest, GenericImage, Image, ImageExt, TestcontainersError,
 };
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::oneshot;
 use tokio::time;
 
@@ -82,8 +128,34 @@ use tokio::time;
 /// the container, so a cleanup finds exactly that start's containers.
 const INSTANCE_LABEL: &str = "org.carddemo.test-support.instance";
 
+/// Label on every container this crate starts. Its value is the token of the process that
+/// started it ([`process_token`]), which every start of the process shares, so the cleanup after
+/// an interrupting signal ([`drain`]) finds exactly this process's containers.
+const PROCESS_LABEL: &str = "org.carddemo.test-support.process";
+
 /// Bound on one [`sweep`]: the listings of a start's containers and every removal they make.
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The signals the watcher handles ([`watch_signals`]), by name: the two whose default action
+/// ends a test run, an interactive interrupt and a runner's or timeout's termination request.
+const HANDLED_SIGNALS: [(&str, SignalKind); 2] = [
+    ("SIGINT", SignalKind::interrupt()),
+    ("SIGTERM", SignalKind::terminate()),
+];
+/// Bound on the cleanup after an interrupting signal ([`drain`]): every removal it makes and its
+/// wait for the starts still running, three times the 10 seconds a busy engine took to finish
+/// the creates an interrupt left in flight.
+const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound on one removal round of that cleanup, a listing and the removals it leads to. A round
+/// cut off at it counts as failed and the next one starts, so that a request Docker does not
+/// answer, such as the removal of a container whose kill hangs, holds the cleanup up for this
+/// long rather than for the client's [`DOCKER_ANSWER_TIMEOUT`]. A third of
+/// [`INTERRUPT_CLEANUP_TIMEOUT`], so that two more rounds fit after one cut off.
+const INTERRUPT_ROUND_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause between the removals of that cleanup while a start is still running.
+const INTERRUPT_SWEEP_PAUSE: Duration = Duration::from_millis(250);
+/// The process status file whose `SigIgn:` line names the signals the process ignores.
+const PROCESS_STATUS: &str = "/proc/self/status";
 
 /// Further listings, [`PANIC_SETTLE_PAUSE`] apart, that the [`sweep`] after a panic inside
 /// testcontainers' start makes: the one case in which a start does not run to its end, as the
@@ -111,6 +183,18 @@ type Outcome = Result<ContainerAsync<GenericImage>, HarnessError>;
 
 /// Tells apart the starts of one process that read the same clock value.
 static NEXT_START: AtomicU64 = AtomicU64::new(0);
+
+/// This process's value of [`PROCESS_LABEL`], made at its first use ([`new_process_token`]).
+static PROCESS_TOKEN: LazyLock<String> = LazyLock::new(new_process_token);
+
+/// The outcome of installing the signal watcher, which the first start sets ([`watch_signals`]).
+static SIGNAL_WATCH: OnceLock<Result<(), String>> = OnceLock::new();
+
+/// Set by the first interrupting signal: from then on no start contacts Docker.
+static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// How many starts have passed the [`STOPPING`] check and not yet ended ([`InFlight`]).
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// The `modern/` directory, for example `/src/carddemo/modern/crates/test-support/../..` for a
 /// checkout at `/src/carddemo`.
@@ -199,8 +283,26 @@ impl Instance {
     }
 }
 
+/// This process's token, its value of [`PROCESS_LABEL`].
+fn process_token() -> &'static str {
+    PROCESS_TOKEN.as_str()
+}
+
+/// A fresh process token: the process ID, the nanoseconds since the UNIX epoch and a randomly
+/// keyed hash of the two, so that no two processes on one Docker engine share one. It starts
+/// with the process ID, as every [`Instance`] token does.
+fn new_process_token() -> String {
+    let process = process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    let salt = RandomState::new().hash_one((process, nanos));
+    format!("{process:x}-{nanos:x}-{salt:016x}")
+}
+
 /// Starts `request` as a container this start owns, labelled and named from a fresh
-/// [`Instance`], and returns the testcontainers handle whose drop removes it.
+/// [`Instance`] and labelled with this process's token, and returns the testcontainers handle
+/// whose drop removes it.
 ///
 /// testcontainers creates the container, then starts it, and only then builds that handle, so a
 /// start error or a startup timeout in between would leave the created container behind, and a
@@ -213,8 +315,13 @@ impl Instance {
 /// - A caller that gives up part-way, as a timeout, a runtime shutdown or a panic makes it,
 ///   waits in the drop of the returned future until the thread has ended the start and removed
 ///   its container, a handle already on its way to the caller included ([`PendingStart`]).
+/// - SIGINT or SIGTERM, from the start's first poll on, removes the container with every other
+///   container of this process and ends the process ([`watch_signals`]); a start that polls
+///   first after the signal, or whose outcome arrives after it, never returns, and the first
+///   does not contact Docker.
 ///
-/// A container stays behind only in the cases the crate documentation lists.
+/// A container stays behind only in the cases the crate documentation lists under "Residual
+/// containers".
 pub(crate) async fn start_owned(
     request: ContainerRequest<GenericImage>,
     context: &'static str,
@@ -232,6 +339,7 @@ async fn start_as(
     let bound = finish_bound(request.startup_timeout());
     let starting = request
         .with_label(INSTANCE_LABEL, instance.token.as_str())
+        .with_label(PROCESS_LABEL, process_token())
         .with_container_name(instance.name.as_str())
         .start();
     start_with(starting, context, instance, bound).await
@@ -263,12 +371,24 @@ fn finish_bound(startup: Option<Duration>) -> Duration {
 /// the thread has finished.
 ///
 /// The thread starts at the first poll: a future dropped before it was polled never started.
+/// That poll first installs the process's signal watcher ([`watch_signals`]) and counts the
+/// start in [`IN_FLIGHT`] until its thread ends. It fails without contacting Docker when the
+/// watcher cannot be installed. Once a signal has stopped the run, a start that has not yet
+/// counted itself in waits, without contacting Docker, for the watcher to end the process, and
+/// so does a caller whose outcome arrives after the signal ([`unless_stopping`]).
 async fn start_with(
     starting: Starting,
     context: &'static str,
     instance: &Instance,
     bound: Duration,
 ) -> Outcome {
+    if let Err(failure) = watch_signals() {
+        return Err(HarnessError::new(context, failure));
+    }
+    let Some(in_flight) = InFlight::enter() else {
+        // Returning would let the test, and with it the run, end before the cleanup.
+        return future::pending().await;
+    };
     let (outcome_sender, outcome) = oneshot::channel();
     let (returns, returned) = mpsc::channel();
     let (report, finished) = mpsc::channel();
@@ -280,6 +400,9 @@ async fn start_with(
             // The receiver is gone only once the caller took the outcome, and then nothing reads
             // the report.
             let _ = report.send(finish);
+            // Counted out only now, when every create the start made has returned. A spawn that
+            // fails drops the closure, and the count with it.
+            drop(in_flight);
         })
         .map_err(|err| {
             HarnessError::new(
@@ -295,7 +418,10 @@ async fn start_with(
         bound,
         received: false,
     };
-    pending.wait(context).await
+    let outcome = pending.wait(context).await;
+    // The start's thread, and with it the count, ends only once this side has let go.
+    drop(pending);
+    unless_stopping(outcome).await
 }
 
 /// The work of a start's thread: runs `starting` to its end, sends its outcome through
@@ -397,17 +523,18 @@ async fn sweep(token: &str, panicked: bool) -> Result<usize, String> {
         let docker = docker_client_instance()
             .await
             .map_err(|err| err.to_string())?;
-        let mut outcome = remove_labelled(&docker, token).await;
+        let mut removed = 0;
+        let mut outcome = remove_labelled(&docker, INSTANCE_LABEL, token, &mut removed).await;
         if panicked {
             for _ in 0..PANIC_SETTLE_ROUNDS {
-                if matches!(outcome, Ok(removed) if removed > 0) {
+                if outcome.is_ok() && removed > 0 {
                     break;
                 }
                 time::sleep(PANIC_SETTLE_PAUSE).await;
-                outcome = remove_labelled(&docker, token).await;
+                outcome = remove_labelled(&docker, INSTANCE_LABEL, token, &mut removed).await;
             }
         }
-        outcome
+        outcome.map(|()| removed)
     };
     time::timeout(CLEANUP_TIMEOUT, swept)
         .await
@@ -465,7 +592,8 @@ impl Drop for PendingStart {
     /// `bound`. The thread needs nothing from the caller's runtime, so blocking even that
     /// runtime's only worker cannot hold it up. A failed removal, or a thread that did not finish
     /// within `bound` (it carries on, and removes the container once the start ends), goes to
-    /// standard error, as `drop` cannot return it. The drop never panics.
+    /// standard error, as `drop` cannot return it. The drop never panics. Once a signal has
+    /// stopped the run, it then holds the thread until the process ends ([`hold_if_stopping`]).
     fn drop(&mut self) {
         if self.received {
             return;
@@ -506,34 +634,37 @@ impl Drop for PendingStart {
                 failures.join("; ")
             );
         }
+        hold_if_stopping();
     }
 }
 
-/// Force-removes, with their anonymous volumes, the containers labelled
-/// [`INSTANCE_LABEL`]`=token`, stopped and never-started ones included, and returns how many
-/// this call removed.
+/// Force-removes, with their anonymous volumes, the containers labelled `label=token`, where
+/// `label` is [`INSTANCE_LABEL`] or [`PROCESS_LABEL`], stopped and never-started ones included,
+/// and adds each removal Docker confirms to `removed` as its answer arrives, so that a caller
+/// that cuts the call off, or sees it fail part-way, still counts what it removed.
 ///
-/// Only a container whose label carries exactly `token` is touched. One already gone (404) or
+/// Only a container whose `label` carries exactly `token` is touched. One already gone (404) or
 /// already being removed (409), for example by the drop of its testcontainers handle, counts as
-/// done but not as removed here. [`sweep`] bounds the listing and the removals.
-async fn remove_labelled(docker: &Docker, token: &str) -> Result<usize, String> {
+/// done but not as removed here. [`sweep`] and [`drain`] bound the listing and the removals.
+async fn remove_labelled(
+    docker: &Docker,
+    label: &str,
+    token: &str,
+    removed: &mut usize,
+) -> Result<(), String> {
     let removal = async {
         let listed = docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: HashMap::from([(
-                    "label".to_owned(),
-                    vec![format!("{INSTANCE_LABEL}={token}")],
-                )]),
+                filters: HashMap::from([("label".to_owned(), vec![format!("{label}={token}")])]),
                 ..ListContainersOptions::default()
             }))
             .await?;
-        let mut removed = 0;
         for summary in listed {
             let owned = summary
                 .labels
                 .as_ref()
-                .and_then(|labels| labels.get(INSTANCE_LABEL))
+                .and_then(|labels| labels.get(label))
                 .is_some_and(|value| value == token);
             let Some(id) = summary.id.filter(|_| owned) else {
                 continue;
@@ -544,7 +675,7 @@ async fn remove_labelled(docker: &Docker, token: &str) -> Result<usize, String> 
                 ..RemoveContainerOptions::default()
             };
             match docker.remove_container(&id, Some(options)).await {
-                Ok(()) => removed += 1,
+                Ok(()) => *removed += 1,
                 Err(DockerError::DockerResponseServerError {
                     status_code: 404 | 409,
                     ..
@@ -552,21 +683,298 @@ async fn remove_labelled(docker: &Docker, token: &str) -> Result<usize, String> 
                 Err(err) => return Err(err),
             }
         }
-        Ok::<_, DockerError>(removed)
+        Ok::<_, DockerError>(())
     };
     removal.await.map_err(|err| err.to_string())
+}
+
+/// Returns `outcome` at once, or, once a signal has stopped the run, never: the calling task
+/// then waits for the watcher to end the process, so that its test, and with it the run, cannot
+/// end before the watcher has removed this process's containers. The thread stays free for the
+/// runtime's other tasks.
+pub(crate) async fn unless_stopping<T>(outcome: T) -> T {
+    if STOPPING.load(Ordering::SeqCst) {
+        future::pending::<()>().await;
+    }
+    outcome
+}
+
+/// Returns at once, or, once a signal has stopped the run, holds the calling thread until the
+/// watcher ends the process: the [`unless_stopping`] of a `drop`, which cannot wait otherwise.
+pub(crate) fn hold_if_stopping() {
+    while STOPPING.load(Ordering::SeqCst) {
+        thread::park();
+    }
+}
+
+/// A start counted in [`IN_FLIGHT`] from before it can contact Docker until its thread ends.
+struct InFlight;
+
+impl InFlight {
+    /// Counts a start in, or returns `None`, counted out again, once a signal has stopped the
+    /// run. The count comes before the check, and the watcher sets [`STOPPING`] before it reads
+    /// the count, all sequentially consistent, so either the watcher sees this start or this
+    /// start sees the stop.
+    fn enter() -> Option<Self> {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        let entered = Self;
+        (!STOPPING.load(Ordering::SeqCst)).then_some(entered)
+    }
+}
+
+impl Drop for InFlight {
+    /// Counts the start out.
+    fn drop(&mut self) {
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One of [`HANDLED_SIGNALS`] as the watcher holds it.
+struct Handler {
+    /// The signal's name, such as `SIGINT`, which the watcher's line reports.
+    name: &'static str,
+    /// The signal, whose number sets the exit status.
+    kind: SignalKind,
+    /// The stream of its deliveries; none for a signal the process inherited as ignored, which
+    /// keeps that disposition.
+    stream: Option<Signal>,
+}
+
+/// Installs the process's signal watcher on its first call and returns the outcome of that
+/// installation, on later calls too.
+///
+/// The watcher runs on a thread and current-thread Tokio runtime of its own ([`watch`]), which
+/// report back before this returns, so no start contacts Docker before the watcher holds the
+/// client of its cleanup and both signals are handled.
+fn watch_signals() -> &'static Result<(), String> {
+    SIGNAL_WATCH.get_or_init(install_watcher)
+}
+
+/// Spawns the watcher's thread and returns its report: its client and the handlers are in
+/// place, or why not.
+fn install_watcher() -> Result<(), String> {
+    let (report, reported) = mpsc::channel();
+    thread::Builder::new()
+        .name("test-support-signals".to_owned())
+        .spawn(move || watch(&report))
+        .map_err(|err| format!("the signal watcher thread did not start: {err}"))?;
+    reported
+        .recv()
+        .unwrap_or_else(|_| Err("the signal watcher thread ended without a report".to_owned()))
+}
+
+/// The watcher's thread: obtains the Docker client of its cleanup, installs a handler for each
+/// of [`HANDLED_SIGNALS`] the process did not inherit as ignored, reports through `report`, then
+/// waits for the first of them and ends the process ([`interrupt`]).
+///
+/// The client is testcontainers' ([`docker_client_instance`]), obtained here, on this thread's
+/// runtime, before the report, and kept for the cleanup ([`drain`]). After a signal the cleanup
+/// therefore never waits for testcontainers' shared client lock, which a task on a runtime a held
+/// thread drives ([`hold_if_stopping`]) could keep, and the connections it opens run on this
+/// runtime, which no drop holds. When the client cannot be obtained, the report carries the
+/// reason, the installation fails, and so does every start, without contacting Docker. The
+/// client comes before the handlers, as a handler stays registered for the life of the process
+/// once installed: that failure then leaves both signals at their default action.
+fn watch(report: &mpsc::Sender<Result<(), String>>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            // The installing start waits for this report.
+            let _ = report.send(Err(format!(
+                "the signal watcher runtime did not start: {err}"
+            )));
+            return;
+        }
+    };
+    runtime.block_on(async {
+        let docker = match docker_client_instance().await {
+            Ok(docker) => docker,
+            Err(err) => {
+                let _ = report.send(Err(format!(
+                    "the signal watcher's Docker client could not be obtained: {err}"
+                )));
+                return;
+            }
+        };
+        // The handlers need the runtime's signal driver, so they are made inside it.
+        let mut handlers = match handlers() {
+            Ok(handlers) => handlers,
+            Err(failure) => {
+                let _ = report.send(Err(failure));
+                return;
+            }
+        };
+        let _ = report.send(Ok(()));
+        let first = next_signal(&mut handlers).await;
+        interrupt(&docker, first, &mut handlers).await;
+    });
+}
+
+/// A [`Handler`] for each of [`HANDLED_SIGNALS`], with no stream for a signal that
+/// [`PROCESS_STATUS`] shows as ignored. A status file that cannot be read shows none as ignored.
+fn handlers() -> Result<[Handler; 2], String> {
+    let status = fs::read_to_string(PROCESS_STATUS).unwrap_or_default();
+    let [first, second] = HANDLED_SIGNALS.map(|(name, kind)| -> Result<Handler, String> {
+        let stream = if ignored_signal(&status, kind.as_raw_value()) {
+            None
+        } else {
+            Some(signal(kind).map_err(|err| format!("the {name} handler did not install: {err}"))?)
+        };
+        Ok(Handler { name, kind, stream })
+    });
+    Ok([first?, second?])
+}
+
+/// Whether `status`, the text of [`PROCESS_STATUS`], shows signal `number` as ignored: its
+/// `SigIgn:` line is a hexadecimal mask whose bit `number - 1` stands for signal `number`. A text
+/// without that line, or whose mask is not hexadecimal, shows no signal as ignored.
+fn ignored_signal(status: &str, number: c_int) -> bool {
+    let Some(mask) = status
+        .lines()
+        .find_map(|line| line.strip_prefix("SigIgn:"))
+        .map(str::trim)
+    else {
+        return false;
+    };
+    let Some(bit) = number
+        .checked_sub(1)
+        .and_then(|bit| u32::try_from(bit).ok())
+    else {
+        return false;
+    };
+    mask.chars().all(|c| c.is_ascii_hexdigit())
+        && u64::from_str_radix(mask, 16)
+            .ok()
+            .and_then(|mask| mask.checked_shr(bit))
+            .is_some_and(|mask| mask & 1 == 1)
+}
+
+/// Waits for the next delivery of either handled signal and returns its name and kind.
+async fn next_signal([first, second]: &mut [Handler; 2]) -> (&'static str, SignalKind) {
+    tokio::select! {
+        delivered = arrival(first) => delivered,
+        delivered = arrival(second) => delivered,
+    }
+}
+
+/// Waits for the next delivery of `handler`'s signal and returns its name and kind. It never
+/// returns for a signal the process inherited as ignored, nor once the stream has ended.
+async fn arrival(handler: &mut Handler) -> (&'static str, SignalKind) {
+    if let Some(stream) = handler.stream.as_mut() {
+        if stream.recv().await.is_some() {
+            return (handler.name, handler.kind);
+        }
+    }
+    future::pending().await
+}
+
+/// Ends the process after `first`, the first signal delivered: sets [`STOPPING`], removes this
+/// process's containers through `docker`, the watcher's client ([`drain`]), writes one line to
+/// standard error and exits with 128 plus the signal's number. A second signal during the
+/// removals ends it at once, with that signal's status.
+async fn interrupt(
+    docker: &Docker,
+    first: (&'static str, SignalKind),
+    handlers: &mut [Handler; 2],
+) {
+    let (name, kind) = first;
+    STOPPING.store(true, Ordering::SeqCst);
+    let (line, kind) = tokio::select! {
+        drained = drain(docker, process_token()) => (format!("{name} received; {drained}"), kind),
+        (again, again_kind) = next_signal(handlers) => (
+            format!(
+                "{again} received during the cleanup after {name}; containers labelled \
+                 {PROCESS_LABEL}={} may remain",
+                process_token()
+            ),
+            again_kind,
+        ),
+    };
+    let status = 128_i32.saturating_add(kind.as_raw_value());
+    // Standard error is the only place left to report to, and the process ends next, so a failed
+    // write of this line is dropped.
+    let _ = writeln!(
+        io::stderr(),
+        "test-support: {line}; exiting with status {status}"
+    );
+    process::exit(status)
+}
+
+/// The cleanup after an interrupting signal, once [`STOPPING`] is set: removes, through
+/// `docker`, the client the watcher obtained when it installed ([`watch`]), the containers
+/// labelled [`PROCESS_LABEL`]`=token`, then again every [`INTERRUPT_SWEEP_PAUSE`] until a
+/// removal round has succeeded after the last running start ([`IN_FLIGHT`]) ended, within
+/// [`INTERRUPT_CLEANUP_TIMEOUT`] in all. Returns what to report: how many containers it removed
+/// and what it could not finish.
+///
+/// A start that has ended has had an answer to every create it made, so that removal finds
+/// every container a start of this process made, the ones Docker created after the signal
+/// included.
+///
+/// Each round is bounded by [`INTERRUPT_ROUND_TIMEOUT`]: a round cut off there counts as failed,
+/// and the next one starts over a new connection, as the Docker client keeps no idle ones. The
+/// count covers every removal Docker confirmed, a cut-off round's included ([`remove_labelled`]);
+/// a removal whose answer the cut cost is not counted, although Docker carries it out.
+async fn drain(docker: &Docker, token: &str) -> String {
+    let label = format!("{PROCESS_LABEL}={token}");
+    let mut removed = 0;
+    let mut last: Result<(), String> = Ok(());
+    let drained = time::timeout(INTERRUPT_CLEANUP_TIMEOUT, async {
+        loop {
+            // Read before the removal, so that a zero means the removal runs after every start
+            // has ended.
+            let running = IN_FLIGHT.load(Ordering::SeqCst);
+            let round = remove_labelled(docker, PROCESS_LABEL, token, &mut removed);
+            last = time::timeout(INTERRUPT_ROUND_TIMEOUT, round)
+                .await
+                .unwrap_or_else(|_| {
+                    Err(format!(
+                        "a removal round did not finish within {} s",
+                        INTERRUPT_ROUND_TIMEOUT.as_secs()
+                    ))
+                });
+            if last.is_ok() && running == 0 {
+                return;
+            }
+            time::sleep(INTERRUPT_SWEEP_PAUSE).await;
+        }
+    })
+    .await;
+    let mut notes = vec![format!("removed {removed} container(s) labelled {label}")];
+    if drained.is_err() {
+        notes.push(format!(
+            "the cleanup did not finish within {} s, with {} start(s) still running",
+            INTERRUPT_CLEANUP_TIMEOUT.as_secs(),
+            IN_FLIGHT.load(Ordering::SeqCst)
+        ));
+        if let Err(failure) = last {
+            notes.push(format!("the last removal failed: {failure}"));
+        }
+        notes.push(format!("containers labelled {label} may remain"));
+    }
+    notes.join("; ")
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::env;
+    use std::fs;
+    use std::io::{self, BufRead, BufReader, Read};
+    use std::net::TcpListener;
     use std::pin::Pin;
+    use std::process::{self, Child, ChildStderr, Command, Stdio};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, TryRecvError};
     use std::task::{Context, Wake, Waker};
     use std::thread;
     use std::time::Duration;
 
+    use testcontainers::bollard::API_DEFAULT_VERSION;
     use testcontainers::bollard::Docker;
     use testcontainers::bollard::container::{
         Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions,
@@ -577,14 +985,18 @@ mod tests {
     use testcontainers::{
         ContainerAsync, ContainerRequest, GenericImage, Image, ImageExt, TestcontainersError,
     };
-    use tokio::runtime::Builder;
+    use tokio::runtime::{Builder, Handle};
+    use tokio::signal::unix::SignalKind;
     use tokio::sync::oneshot;
     use tokio::time::{self, Instant};
 
     use super::{
-        HarnessError, INSTANCE_LABEL, Instance, PANIC_SETTLE_PAUSE, PANIC_SETTLE_ROUNDS, Starting,
-        finish_bound, modern_dir, repo_root, start_as, start_with,
+        DOCKER_ANSWER_TIMEOUT, HANDLED_SIGNALS, HarnessError, INSTANCE_LABEL,
+        INTERRUPT_CLEANUP_TIMEOUT, INTERRUPT_ROUND_TIMEOUT, Instance, PANIC_SETTLE_PAUSE,
+        PANIC_SETTLE_ROUNDS, PROCESS_LABEL, PROCESS_STATUS, STOPPING, Starting, drain,
+        finish_bound, ignored_signal, modern_dir, process_token, repo_root, start_as, start_with,
     };
+    use crate::postgres::start_postgres;
 
     /// An entrypoint no image has: Docker creates the container, then fails to start it.
     pub(crate) const MISSING_ENTRYPOINT: &str = "/carddemo-missing-entrypoint";
@@ -619,6 +1031,29 @@ mod tests {
     const LATE_CUT: Duration = Duration::from_millis(50);
     /// Bound on the start of [`abandoned_start_case`] sending its outcome, a first pull included.
     const SENT_BOUND: Duration = Duration::from_secs(180);
+
+    /// Environment variable that turns [`an_interrupt_child_holds_containers_until_its_signal`]
+    /// from a no-op into the child process of [`interrupted_run_case`].
+    const INTERRUPT_CHILD: &str = "CARDDEMO_TEST_SUPPORT_INTERRUPT_CHILD";
+    /// That child test's name in this test binary.
+    const INTERRUPT_CHILD_TEST: &str =
+        "tests::an_interrupt_child_holds_containers_until_its_signal";
+    /// Precedes the process token the child prints once its containers are in place.
+    const CHILD_READY: &str = "test-support interrupt child ready: ";
+    /// Bound on the child getting there, a first pull of the image included.
+    const CHILD_READY_BOUND: Duration = Duration::from_secs(180);
+    /// How long a child must outlive a signal it inherited as ignored.
+    const IGNORED_GRACE: Duration = Duration::from_secs(2);
+    /// Bound on the child exiting after its signal: the watcher's cleanup bound, and as much
+    /// again for the child's runtime and its last removal.
+    const CHILD_EXIT_BOUND: Duration = INTERRUPT_CLEANUP_TIMEOUT.saturating_mul(2);
+    /// The longest a case keeps its child, and so the bound on [`start_after_stop`]'s wait for
+    /// the signal.
+    const CHILD_HOLD_BOUND: Duration = CHILD_READY_BOUND
+        .saturating_add(IGNORED_GRACE)
+        .saturating_add(CHILD_EXIT_BOUND);
+    /// Bound on reading a child's standard error once it has exited.
+    const OUTPUT_BOUND: Duration = Duration::from_secs(10);
 
     /// What [`cancelled_start_case`] saw of one start it dropped part-way.
     #[derive(Debug)]
@@ -816,13 +1251,20 @@ mod tests {
 
     /// The IDs of the containers labelled with `token`, stopped and never-started ones included.
     async fn labelled(docker: &Docker, token: &str) -> Result<Vec<String>, HarnessError> {
+        labelled_by(docker, INSTANCE_LABEL, token).await
+    }
+
+    /// The IDs of the containers labelled `label=token`, stopped and never-started ones
+    /// included.
+    async fn labelled_by(
+        docker: &Docker,
+        label: &str,
+        token: &str,
+    ) -> Result<Vec<String>, HarnessError> {
         let listed = docker
             .list_containers(Some(ListContainersOptions {
                 all: true,
-                filters: HashMap::from([(
-                    "label".to_owned(),
-                    vec![format!("{INSTANCE_LABEL}={token}")],
-                )]),
+                filters: HashMap::from([("label".to_owned(), vec![format!("{label}={token}")])]),
                 ..ListContainersOptions::default()
             }))
             .await
@@ -1095,8 +1537,9 @@ mod tests {
     }
 
     /// Creates, without starting it, a container of `request`'s image labelled and named from
-    /// `instance`, as testcontainers does before it starts one. An image the engine does not
-    /// have yet is pulled first.
+    /// `instance` and labelled with this process's token, as testcontainers does before it
+    /// starts one for [`start_as`], so that an interrupted run removes it too. An image the
+    /// engine does not have yet is pulled first.
     async fn create_unstarted(
         docker: &Docker,
         request: &ContainerRequest<GenericImage>,
@@ -1110,10 +1553,10 @@ mod tests {
                 }),
                 Config {
                     image: Some(request.descriptor()),
-                    labels: Some(HashMap::from([(
-                        INSTANCE_LABEL.to_owned(),
-                        instance.token.clone(),
-                    )])),
+                    labels: Some(HashMap::from([
+                        (INSTANCE_LABEL.to_owned(), instance.token.clone()),
+                        (PROCESS_LABEL.to_owned(), process_token().to_owned()),
+                    ])),
                     ..Config::default()
                 },
             )
@@ -1189,8 +1632,8 @@ mod tests {
     }
 
     /// Checks that container `id` of image `image`, held by `guard`, carries an instance label
-    /// whose token also ends its name, and that dropping `guard` removes it. A container the drop
-    /// left behind is removed before the failure.
+    /// whose token also ends its name and the process label of this process, and that dropping
+    /// `guard` removes it. A container the drop left behind is removed before the failure.
     pub(crate) async fn guarded_container_case<G>(
         guard: G,
         id: &str,
@@ -1207,16 +1650,21 @@ mod tests {
         };
 
         let inspected = inspected.map_err(|err| HarnessError::new("inspect container", &err))?;
-        let token = inspected
+        let mut labels = inspected
             .config
             .and_then(|config| config.labels)
-            .and_then(|mut labels| labels.remove(INSTANCE_LABEL));
-        let Some(token) = token else {
+            .unwrap_or_default();
+        let Some(token) = labels.remove(INSTANCE_LABEL) else {
             panic!("container {id} carries no {INSTANCE_LABEL} label");
         };
         assert_eq!(
             inspected.name,
             Some(format!("/carddemo-test-{image}-{token}"))
+        );
+        assert_eq!(
+            labels.remove(PROCESS_LABEL).as_deref(),
+            Some(process_token()),
+            "container {id}: {PROCESS_LABEL}"
         );
         assert!(matches!(kept, Ok(false)), "{kept:?}; removal: {leftover:?}");
         Ok(())
@@ -1239,6 +1687,7 @@ mod tests {
         let (release, held) = mpsc::channel::<()>();
         let start = request
             .with_label(INSTANCE_LABEL, instance.token.as_str())
+            .with_label(PROCESS_LABEL, process_token())
             .with_container_name(instance.name.as_str())
             .start();
         let starting: Starting = Box::pin(async move {
@@ -1277,6 +1726,320 @@ mod tests {
         assert!(
             left.as_ref().is_ok_and(Vec::is_empty) && matches!(named, Ok(false)),
             "the abandoned start left {left:?}, {named:?}; removal: {leftovers_removed:?}"
+        );
+        Ok(())
+    }
+
+    /// `postgres:16` running `sleep infinity` in place of the server: a container that runs
+    /// until it is removed, and that a start hands over once Docker has started it, as nothing
+    /// waits for readiness.
+    fn sleeping_request() -> ContainerRequest<GenericImage> {
+        GenericImage::new("postgres", "16")
+            .with_entrypoint("sleep")
+            .with_cmd(["infinity"])
+    }
+
+    /// A fake start admitted before the signal whose container Docker creates after it. It tells
+    /// `began` at its first poll, waits until a signal has stopped the run, at most
+    /// [`CHILD_HOLD_BOUND`], and then starts [`sleeping_request`] as `instance`, labelled as
+    /// [`start_as`] labels a start.
+    async fn start_after_stop(
+        instance: Instance,
+        began: oneshot::Sender<()>,
+    ) -> Result<ContainerAsync<GenericImage>, TestcontainersError> {
+        // The receiver is gone only once the child has stopped waiting for it.
+        let _ = began.send(());
+        if time::timeout(CHILD_HOLD_BOUND, stopped()).await.is_err() {
+            return Err(TestcontainersError::other("no signal stopped the run"));
+        }
+        sleeping_request()
+            .with_label(INSTANCE_LABEL, instance.token.as_str())
+            .with_label(PROCESS_LABEL, process_token())
+            .with_container_name(instance.name.as_str())
+            .start()
+            .await
+    }
+
+    /// Returns once a signal has stopped the run.
+    async fn stopped() {
+        while !STOPPING.load(Ordering::SeqCst) {
+            time::sleep(POLL).await;
+        }
+    }
+
+    /// `signal`, a name of [`HANDLED_SIGNALS`], without its `SIG` prefix, as `kill -s` and the
+    /// shell's `trap` take it.
+    fn short_name(signal: &str) -> &str {
+        signal.strip_prefix("SIG").unwrap_or(signal)
+    }
+
+    /// Sends `signal`, a name of [`HANDLED_SIGNALS`], to process `pid` through `kill`.
+    fn send_signal(pid: u32, signal: &str) -> Result<(), HarnessError> {
+        let name = short_name(signal);
+        let status = Command::new("kill")
+            .args(["-s", name, pid.to_string().as_str()])
+            .status()
+            .map_err(|err| HarnessError::new("send signal", &err))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(HarnessError::new(
+                "send signal",
+                &format_args!("kill -s {name} {pid} exited with {status}"),
+            ))
+        }
+    }
+
+    /// Starts this test binary as the child of [`interrupted_run_case`], through `sh` with
+    /// `trap ''` for `trapped` first when it names a signal, so that the child inherits that
+    /// signal as ignored. Returns the child, the receiver of the process token its ready line
+    /// reports, and the receiver of its standard error once that has closed.
+    ///
+    /// The child's standard input stays open while the returned [`Child`] lives: a case that
+    /// ends early drops it, and the child, seeing its input close, ends itself by SIGTERM.
+    fn spawn_child(
+        trapped: Option<&str>,
+    ) -> Result<(Child, mpsc::Receiver<String>, mpsc::Receiver<String>), HarnessError> {
+        let binary =
+            env::current_exe().map_err(|err| HarnessError::new("find the test binary", &err))?;
+        let mut command = match trapped {
+            Some(signal) => {
+                let mut command = Command::new("sh");
+                command
+                    .arg("-c")
+                    .arg(format!(
+                        "trap '' {}; exec \"$0\" \"$@\"",
+                        short_name(signal)
+                    ))
+                    .arg(&binary);
+                command
+            }
+            None => Command::new(&binary),
+        };
+        let mut child = command
+            .args([
+                "--exact",
+                INTERRUPT_CHILD_TEST,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(INTERRUPT_CHILD, "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| HarnessError::new("spawn the interrupt child", &err))?;
+        let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
+            return Err(HarnessError::new(
+                "spawn the interrupt child",
+                &"its output is not piped",
+            ));
+        };
+        let (ready_sender, ready) = mpsc::channel();
+        thread::Builder::new()
+            .name("test-support-child-stdout".to_owned())
+            .spawn(move || {
+                for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                    // The test harness opens the line with the test's name, which a single test
+                    // thread prints before the test's own output.
+                    if let Some((_, token)) = line.split_once(CHILD_READY) {
+                        // The receiver is gone only once the case has stopped waiting.
+                        let _ = ready_sender.send(token.to_owned());
+                    }
+                }
+            })
+            .map_err(|err| HarnessError::new("spawn the child's stdout reader", &err))?;
+        let (errors_sender, errors) = mpsc::channel();
+        thread::Builder::new()
+            .name("test-support-child-stderr".to_owned())
+            .spawn(move || {
+                // The receiver is gone only once the case has stopped waiting.
+                let _ = errors_sender.send(read_lossy(stderr));
+            })
+            .map_err(|err| HarnessError::new("spawn the child's stderr reader", &err))?;
+        Ok((child, ready, errors))
+    }
+
+    /// Everything `stderr` yields until it closes, as text; a read error ends it early, and the
+    /// text read so far is what the case reports.
+    fn read_lossy(mut stderr: ChildStderr) -> String {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Waits up to [`CHILD_EXIT_BOUND`] for `child` to exit and returns its exit code, none when
+    /// a signal ended it. A child still running at the bound, or whose status cannot be read,
+    /// is killed, and the error says so.
+    async fn wait_exit(child: &mut Child) -> Result<Option<i32>, String> {
+        let deadline = Instant::now() + CHILD_EXIT_BOUND;
+        loop {
+            let failure = match child.try_wait() {
+                Ok(Some(status)) => return Ok(status.code()),
+                Ok(None) if Instant::now() < deadline => {
+                    time::sleep(POLL).await;
+                    continue;
+                }
+                Ok(None) => format!("the child did not exit within {CHILD_EXIT_BOUND:?}"),
+                Err(err) => format!("the child's status cannot be read: {err}"),
+            };
+            let killed = child.kill().and_then(|()| child.wait());
+            return Err(format!("{failure}; killed: {killed:?}"));
+        }
+    }
+
+    /// How [`observe_child`] interrupts its child.
+    #[derive(Clone, Copy, Debug)]
+    struct Plan {
+        /// A signal the child starts with ignored, as `trap ''` in its shell leaves it.
+        trapped: Option<&'static str>,
+        /// The signal sent once the child is ready.
+        first: &'static str,
+        /// Whether the child ignores `first`, and so must outlive it.
+        ignored: bool,
+        /// The signal sent [`IGNORED_GRACE`] after an ignored `first`, when the child handles
+        /// one.
+        ender: Option<&'static str>,
+    }
+
+    /// What [`observe_child`] saw.
+    #[derive(Debug)]
+    struct Interrupted {
+        /// The process token of the child's ready line.
+        token: Result<String, String>,
+        /// The outcome of each signal sent, in order.
+        sent: Vec<Result<(), HarnessError>>,
+        /// Whether the child still ran [`IGNORED_GRACE`] after a signal it ignores.
+        alive_after_ignored: Option<bool>,
+        /// The child's exit code, or why it was not seen to exit.
+        exit: Result<Option<i32>, String>,
+        /// The child's standard error.
+        stderr: Result<String, String>,
+        /// The containers carrying the child's process token once it had exited.
+        left: Result<Vec<String>, HarnessError>,
+        /// The same, [`RECHECK_AFTER`] later.
+        later: Result<Vec<String>, HarnessError>,
+    }
+
+    /// Runs the child of [`interrupted_run_case`] as `plan` says, waits for it to exit, and
+    /// lists and then removes the containers carrying its process token. Returns what it saw and
+    /// the outcome of each removal it made. A child that never reports ready gets SIGTERM, so
+    /// that a watcher it installed still removes what it made.
+    async fn observe_child(
+        docker: &Docker,
+        plan: Plan,
+    ) -> Result<(Interrupted, Vec<Result<(), HarnessError>>), HarnessError> {
+        let (mut child, ready, errors) = spawn_child(plan.trapped)?;
+        let token = ready
+            .recv_timeout(CHILD_READY_BOUND)
+            .map_err(|err| format!("no ready line within {CHILD_READY_BOUND:?}: {err}"));
+        let mut sent = Vec::new();
+        let mut alive_after_ignored = None;
+        if token.is_ok() {
+            sent.push(send_signal(child.id(), plan.first));
+            if plan.ignored {
+                time::sleep(IGNORED_GRACE).await;
+                alive_after_ignored = Some(matches!(child.try_wait(), Ok(None)));
+                if let Some(ender) = plan.ender {
+                    sent.push(send_signal(child.id(), ender));
+                }
+            }
+        } else {
+            sent.push(send_signal(child.id(), "SIGTERM"));
+        }
+        let exit = wait_exit(&mut child).await;
+        let stderr = errors
+            .recv_timeout(OUTPUT_BOUND)
+            .map_err(|err| format!("no standard error within {OUTPUT_BOUND:?}: {err}"));
+        let (left, later) = if let Ok(token) = &token {
+            let left = labelled_by(docker, PROCESS_LABEL, token).await;
+            time::sleep(RECHECK_AFTER).await;
+            (left, labelled_by(docker, PROCESS_LABEL, token).await)
+        } else {
+            let unknown = || HarnessError::new("list the child's containers", &"no process token");
+            (Err(unknown()), Err(unknown()))
+        };
+        let removed = remove_leftovers(
+            docker,
+            [&left, &later]
+                .into_iter()
+                .flat_map(|listed| listed.as_deref().unwrap_or_default())
+                .map(String::as_str),
+        )
+        .await;
+        let seen = Interrupted {
+            token,
+            sent,
+            alive_after_ignored,
+            exit,
+            stderr,
+            left,
+            later,
+        };
+        Ok((seen, removed))
+    }
+
+    /// Interrupts a child process holding two containers, a migrated database and one whose start
+    /// was admitted before the signal but whose create comes after it, with `signal`, which the
+    /// child starts with ignored when `trapped`. Checks that the child exits with 128 plus the
+    /// signal's number, that its standard error reports both containers removed, and that no
+    /// container carries its process token once it has exited, nor [`RECHECK_AFTER`] later.
+    ///
+    /// A signal the child ignores, through `trapped` or as one this process ignores and the
+    /// child inherits, must leave it running for [`IGNORED_GRACE`]; the other handled signal
+    /// then ends it, and the checks apply to that one. When the child ignores both, only the
+    /// check that it outlives the signal applies, and [`wait_exit`] kills it.
+    ///
+    /// Every observation is collected, and anything left behind removed, before the first
+    /// assertion, so a failing check leaks nothing.
+    async fn interrupted_run_case(
+        signal: (&'static str, SignalKind),
+        trapped: bool,
+    ) -> Result<(), HarnessError> {
+        let docker = docker().await?;
+        let status = fs::read_to_string(PROCESS_STATUS).unwrap_or_default();
+        let inherited = |kind: SignalKind| ignored_signal(&status, kind.as_raw_value());
+        let (first, kind) = signal;
+        let ignored = trapped || inherited(kind);
+        let ender = if ignored {
+            HANDLED_SIGNALS
+                .into_iter()
+                .find(|&(_, other)| other != kind && !inherited(other))
+        } else {
+            Some(signal)
+        };
+        let plan = Plan {
+            trapped: trapped.then_some(first),
+            first,
+            ignored,
+            ender: ender.filter(|_| ignored).map(|(name, _)| name),
+        };
+        let (seen, removed) = observe_child(&docker, plan).await?;
+
+        assert!(seen.token.is_ok(), "{plan:?}: {seen:?}");
+        assert!(seen.sent.iter().all(Result::is_ok), "{plan:?}: {seen:?}");
+        if ignored {
+            assert_eq!(seen.alive_after_ignored, Some(true), "{plan:?}: {seen:?}");
+        }
+        let (Some((ender, ender_kind)), Ok(token)) = (ender, &seen.token) else {
+            return Ok(());
+        };
+        let code = 128_i32.saturating_add(ender_kind.as_raw_value());
+        let line = format!(
+            "test-support: {ender} received; removed 2 container(s) labelled \
+             {PROCESS_LABEL}={token}; exiting with status {code}"
+        );
+        assert_eq!(seen.exit, Ok(Some(code)), "{plan:?}: {seen:?}");
+        assert!(
+            seen.stderr
+                .as_ref()
+                .is_ok_and(|text| text.lines().any(|reported| reported == line)),
+            "{plan:?}: expected {line:?}: {seen:?}"
+        );
+        assert!(
+            seen.left.as_ref().is_ok_and(Vec::is_empty)
+                && seen.later.as_ref().is_ok_and(Vec::is_empty),
+            "{plan:?}: {seen:?}; removal: {removed:?}"
         );
         Ok(())
     }
@@ -1397,6 +2160,185 @@ mod tests {
         assert!(
             left.as_ref().is_ok_and(Vec::is_empty) && matches!(named, Ok(false)),
             "{left:?}, {named:?}; removal: {leftovers_removed:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ignored_signals_are_read_from_the_status_mask() {
+        for (status, number, ignored) in [
+            (
+                "Name:\tx\nSigIgn:\t0000000000000002\nSigCgt:\t0000000000004000\n",
+                2,
+                true,
+            ),
+            ("SigIgn:\t0000000000000002\n", 15, false),
+            ("SigIgn:\t0000000000004002\n", 15, true),
+            ("SigIgn:\t8000000000000000\n", 64, true),
+            ("SigIgn:\tffffffffffffffff\n", 0, false),
+            ("SigIgn:\tffffffffffffffff\n", 65, false),
+            ("Name:\tx\nSigCgt:\t0000000000000002\n", 2, false),
+            ("", 2, false),
+            ("SigIgn:\t00000000000000zz\n", 2, false),
+            ("SigIgn:\t+2\n", 2, false),
+            ("SigIgn:\t\n", 2, false),
+            ("SigIgn:\t10000000000000000\n", 1, false),
+        ] {
+            assert_eq!(
+                ignored_signal(status, number),
+                ignored,
+                "{status:?}, signal {number}"
+            );
+        }
+    }
+
+    /// The child process of [`interrupted_run_case`]; a no-op unless [`INTERRUPT_CHILD`] is set.
+    ///
+    /// It holds a migrated database ([`start_postgres`]) and a start whose container Docker
+    /// creates only after the signal ([`start_after_stop`]), prints [`CHILD_READY`] with this
+    /// process's token, and waits for the signal. After it, the held-back start's outcome, a new
+    /// start and the drop of the guard must each wait for the watcher to end the process: the
+    /// first that returns instead fails this test, whose end then ends the run with the test
+    /// harness's status rather than the watcher's. A case that ends first closes the child's
+    /// standard input, and the child then sends itself SIGTERM, so that it leaves nothing behind
+    /// either.
+    #[tokio::test]
+    async fn an_interrupt_child_holds_containers_until_its_signal() -> Result<(), HarnessError> {
+        const CONTEXT: &str = "start sleeping container";
+        if env::var_os(INTERRUPT_CHILD).is_none() {
+            return Ok(());
+        }
+        let guard = start_postgres().await?;
+        let (began_sender, began) = oneshot::channel();
+        let held_back = Instance::new("postgres");
+        let in_flight = tokio::spawn(async move {
+            let starting: Starting = Box::pin(start_after_stop(same(&held_back), began_sender));
+            start_with(starting, CONTEXT, &held_back, finish_bound(None)).await
+        });
+        began
+            .await
+            .map_err(|err| HarnessError::new("begin the held-back start", &err))?;
+        println!("{CHILD_READY}{}", process_token());
+
+        let (closed_sender, closed) = oneshot::channel();
+        thread::Builder::new()
+            .name("test-support-child-stdin".to_owned())
+            .spawn(move || {
+                // Any end of the input, a read error included, means the case is gone.
+                let _ = io::copy(&mut io::stdin(), &mut io::sink());
+                let _ = closed_sender.send(());
+            })
+            .map_err(|err| HarnessError::new("spawn the child's stdin reader", &err))?;
+        tokio::select! {
+            // The sender drops unsent only if its thread panicked; either way the case is gone.
+            _ = closed => send_signal(process::id(), "SIGTERM")?,
+            () = stopped() => {}
+        }
+        stopped().await;
+
+        let runtime = Handle::current();
+        let (dropped_sender, dropped) = oneshot::channel();
+        thread::Builder::new()
+            .name("test-support-child-drop".to_owned())
+            .spawn(move || {
+                // The container handle's own drop needs the runtime, should the guard's return.
+                let _entered = runtime.enter();
+                drop(guard);
+                let _ = dropped_sender.send(());
+            })
+            .map_err(|err| HarnessError::new("spawn the child's drop thread", &err))?;
+        let late = Instance::new("postgres");
+        let went_on = tokio::select! {
+            outcome = in_flight => format!(
+                "the held-back start returned, ok: {}",
+                matches!(outcome, Ok(Ok(_)))
+            ),
+            started = start_as(sleeping_request(), CONTEXT, &late) => {
+                format!("a start after the signal returned, ok: {}", started.is_ok())
+            }
+            _ = dropped => "the drop of the guard returned".to_owned(),
+        };
+        Err(HarnessError::new("interrupt child", &went_on))
+    }
+
+    /// SIGTERM, as a runner's timeout sends it, and SIGINT, as Ctrl-C sends it, each remove every
+    /// container of the process, one created after the signal included, and end it with 143 and
+    /// 130; a SIGINT the process inherited as ignored leaves it running.
+    #[tokio::test]
+    async fn an_interrupted_run_leaves_no_container_of_its_process() -> Result<(), HarnessError> {
+        let [interrupt, terminate] = HANDLED_SIGNALS;
+        for (signal, trapped) in [(terminate, false), (interrupt, false), (interrupt, true)] {
+            interrupted_run_case(signal, trapped).await?;
+        }
+        Ok(())
+    }
+
+    /// Against an endpoint that accepts every connection and never answers, the cleanup after a
+    /// signal cuts each removal round off at [`INTERRUPT_ROUND_TIMEOUT`], starts the next over a
+    /// connection of its own, and ends at [`INTERRUPT_CLEANUP_TIMEOUT`] with a line naming the
+    /// cut, rather than waiting out the client's [`DOCKER_ANSWER_TIMEOUT`] on its first request.
+    #[tokio::test]
+    async fn a_cleanup_round_without_an_answer_is_cut_off_and_the_next_starts()
+    -> Result<(), HarnessError> {
+        const TOKEN: &str = "unanswered";
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+            .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
+        let address = listener
+            .local_addr()
+            .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let endpoint = thread::Builder::new()
+            .name("test-support-silent-endpoint".to_owned())
+            .spawn(move || {
+                // Every connection stays open, unread and unanswered, until the case ends.
+                let mut held = Vec::new();
+                while !stopping.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((stream, _)) => held.push(stream),
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
+                        Err(_) => break,
+                    }
+                }
+                held.len()
+            })
+            .map_err(|err| HarnessError::new("spawn the silent endpoint", &err))?;
+        let docker = Docker::connect_with_http(
+            &format!("tcp://{address}"),
+            DOCKER_ANSWER_TIMEOUT.as_secs(),
+            API_DEFAULT_VERSION,
+        )
+        .map_err(|err| HarnessError::new("connect to the silent endpoint", &err))?;
+        let began = Instant::now();
+        let line = drain(&docker, TOKEN).await;
+        let took = began.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let connections = endpoint.join();
+
+        let label = format!("{PROCESS_LABEL}={TOKEN}");
+        let opening = format!(
+            "removed 0 container(s) labelled {label}; the cleanup did not finish within {} s, \
+             with ",
+            INTERRUPT_CLEANUP_TIMEOUT.as_secs()
+        );
+        let closing = format!(
+            "; the last removal failed: a removal round did not finish within {} s; containers \
+             labelled {label} may remain",
+            INTERRUPT_ROUND_TIMEOUT.as_secs()
+        );
+        assert!(
+            line.starts_with(&opening) && line.ends_with(&closing),
+            "{line:?}"
+        );
+        assert!(
+            took >= INTERRUPT_CLEANUP_TIMEOUT
+                && took < INTERRUPT_CLEANUP_TIMEOUT.saturating_add(INTERRUPT_ROUND_TIMEOUT),
+            "{took:?}"
+        );
+        assert!(
+            matches!(connections, Ok(rounds) if rounds >= 2),
+            "{connections:?}"
         );
         Ok(())
     }

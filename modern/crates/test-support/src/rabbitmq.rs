@@ -64,7 +64,10 @@ const GET_POLL: Duration = Duration::from_millis(50);
 /// A running broker container and the URLs that reach it.
 ///
 /// Dropping the guard removes the container. Drop it inside the test's Tokio runtime, because
-/// the removal runs on that runtime; never keep a guard in a `static`, which outlives it.
+/// the removal runs on that runtime; never keep a guard in a `static`, which outlives it. A run
+/// that SIGINT or SIGTERM interrupts removes the container too, while the guard is alive, and a
+/// guard dropped after the signal holds its thread until the process ends (see the [crate
+/// documentation](crate)).
 pub struct RabbitMqGuard {
     amqp_url: String,
     management_url: String,
@@ -78,6 +81,15 @@ impl fmt::Debug for RabbitMqGuard {
             .field("container_id", &self.container.id())
             .field("management_url", &self.management_url)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for RabbitMqGuard {
+    /// Once a signal has stopped the run, holds the dropping thread until the process ends, so
+    /// that the test cannot end the run before the cleanup (see the [crate documentation](crate)).
+    /// Otherwise the container handle then drops and removes the container.
+    fn drop(&mut self) {
+        crate::hold_if_stopping();
     }
 }
 
@@ -137,7 +149,16 @@ impl RabbitMqGuard {
 /// does not confirm the close of that probe connection within 10 seconds. Every such error
 /// removes the container; when Docker created it but the start failed, the error also reports
 /// how many containers of this start that removal found, or why it failed.
+///
+/// Once SIGINT or SIGTERM has interrupted the run, it does not return: the process ends instead
+/// (see the [crate documentation](crate)).
 pub async fn start_rabbitmq() -> Result<RabbitMqGuard, HarnessError> {
+    crate::unless_stopping(start_broker().await).await
+}
+
+/// The start of [`start_rabbitmq`]: the mounts, the container, its ports and the readiness
+/// probe.
+async fn start_broker() -> Result<RabbitMqGuard, HarnessError> {
     let modern = modern_dir();
     let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
     let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;

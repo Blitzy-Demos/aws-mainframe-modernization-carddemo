@@ -59,7 +59,9 @@ const MAX_CONNECTIONS: u32 = 16;
 /// Dropping the guard drops its pool handle and then removes the container: the pool is declared
 /// first because fields drop in declaration order. The removal runs on the
 /// test's Tokio runtime, so drop the guard inside that runtime and never keep one in a `static`
-/// or `OnceLock`, which outlives it.
+/// or `OnceLock`, which outlives it. A run that SIGINT or SIGTERM interrupts removes the
+/// container too, while the guard is alive, and a guard dropped after the signal holds its
+/// thread until the process ends (see the [crate documentation](crate)).
 ///
 /// An integration test that spawns a binary (`carddemo-mq`, `carddemo-batch`) sets that
 /// process's `DATABASE_URL` to [`database_url`](Self::database_url) and runs it from the
@@ -78,6 +80,15 @@ impl fmt::Debug for PostgresGuard {
             .field("container_id", &self.container.id())
             .field("address", &address(&self.database_url))
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for PostgresGuard {
+    /// Once a signal has stopped the run, holds the dropping thread until the process ends, so
+    /// that the test cannot end the run before the cleanup (see the [crate documentation](crate)).
+    /// Otherwise the fields then drop as described above.
+    fn drop(&mut self) {
+        crate::hold_if_stopping();
     }
 }
 
@@ -109,10 +120,16 @@ impl PostgresGuard {
 /// became ready. Each of these errors drops the pool, when one was opened, and removes the
 /// container; when Docker created the container but the start failed, the error also reports
 /// how many containers of this start that removal found, or why it failed.
+///
+/// Once SIGINT or SIGTERM has interrupted the run, it does not return: the process ends instead
+/// (see the [crate documentation](crate)).
 pub async fn start_postgres() -> Result<PostgresGuard, HarnessError> {
-    let container = start_container(image()).await?;
-    let unmigrated = connect(container).await?;
-    migrate(unmigrated, MIGRATION_TIMEOUT).await
+    let started = async {
+        let container = start_container(image()).await?;
+        let unmigrated = connect(container).await?;
+        migrate(unmigrated, MIGRATION_TIMEOUT).await
+    };
+    crate::unless_stopping(started.await).await
 }
 
 /// Reads the address of `container`, waits until the server accepts connections and opens the

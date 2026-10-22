@@ -18,7 +18,8 @@ testcontainers = { workspace = true }
 lapin = { workspace = true }
 # Pool and readiness probe only: this crate issues no query and embeds no migrations.
 sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
-tokio = { workspace = true, features = ["time"] }
+# `signal`: the watcher that removes this process's containers when SIGINT or SIGTERM ends a run.
+tokio = { workspace = true, features = ["time", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["json"] }
 
