@@ -28,6 +28,9 @@ use crate::dto::cobil00c::{BillPaymentRequest, BillPaymentResult};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`pay`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct PayOperation;
+
 /// Pay the account balance (CB00 / COBIL00C).
 ///
 /// ENTER on the bill-payment screen. With a blank confirmation it shows the current balance of
@@ -46,6 +49,7 @@ use crate::services;
 /// - 404: no account with the ID.
 /// - 500: the account, the transactions or the store could not be read or written.
 #[utoipa::path(
+    impl_for = PayOperation,
     post,
     path = "/api/v1/bill-payments",
     operation_id = "cobil00c_pay",

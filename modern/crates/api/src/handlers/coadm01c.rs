@@ -23,6 +23,9 @@ use crate::dto::comen01c::MenuResponse;
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`admin_menu`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct AdminMenuOperation;
+
 /// Admin menu (CA00 / COADM01C)
 ///
 /// Returns the administrator option table: the six `COADM02Y` options in table order, each with
@@ -37,6 +40,7 @@ use crate::services;
 // An `async fn`, so that the extracted identity moves into the future the service borrows it
 // from; the same form as the main menu's handler.
 #[utoipa::path(
+    impl_for = AdminMenuOperation,
     get,
     path = "/api/v1/menus/admin",
     operation_id = "coadm01c_admin_menu",

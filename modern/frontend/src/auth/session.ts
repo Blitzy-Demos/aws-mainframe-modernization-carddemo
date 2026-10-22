@@ -12,7 +12,8 @@ import { z } from "zod";
  * card number or other payload, and this module logs nothing. The JWT is never decoded:
  * an expired token surfaces as the API's 401, on which `api/client.ts` clears the session.
  * Every sign-on and every clear is announced to the listeners of {@link subscribeSession},
- * through which the route guard follows the session as it changes.
+ * through which the route guard follows the session as it changes. The module stays free of
+ * React: the subscription is a plain callback set.
  */
 
 /** The single `sessionStorage` key that holds the session. */

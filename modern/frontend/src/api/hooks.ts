@@ -27,8 +27,11 @@ import type { components, paths } from "./schema";
 declare module "@tanstack/react-query" {
   /**
    * Every query and mutation error is typed as the API's `ScreenError` body, which the message
-   * row shows. The two failures without such a body, the browser's network `TypeError` and the
-   * status `Error` of `settle`, carry a string `message` too.
+   * row shows. The three failures without such a body, the browser's network `TypeError`, the
+   * `TimeoutError` `DOMException` of the request deadline in `client.ts` and the status `Error`
+   * of `settle`, carry a string `message` too. The page that endpoints 24 and 25 may throw on an
+   * error status can lack a string `message`, so COTRTLI reads it only through its
+   * `isListPage` and `isActionResult` guards.
    */
   interface Register {
     defaultError: components["schemas"]["ScreenError"];
@@ -38,8 +41,10 @@ declare module "@tanstack/react-query" {
 /**
  * Resolves an openapi-fetch call to its success body, or throws its failure.
  *
- * A failure whose body is a JSON object throws that object unchanged: the `ScreenError` the API
- * declares for every error status, with the program's message. Any other failure has no object
+ * A failure whose body is a JSON object throws that object unchanged: the error body the API
+ * declares for its status. That is a `ScreenError` with the program's message or, for endpoints
+ * 24 and 25, the page their 400 or 500 (and endpoint 25's 404) may carry instead, which COTRTLI
+ * tells apart with its `isListPage` and `isActionResult` guards. Any other failure has no object
  * to throw: openapi-fetch hands over an empty or non-JSON error body as its text, as for the dev
  * proxy's empty, chunked 500 while the API is down, and a declared-empty one as `undefined`. Such
  * a failure, and a success without a body, reject with an `Error` naming the HTTP status, so the

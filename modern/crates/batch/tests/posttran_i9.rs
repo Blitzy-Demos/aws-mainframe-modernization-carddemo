@@ -14,6 +14,35 @@
 //! - The other tests drive the job-level rows no fixture record reaches, over scratch input that
 //!   holds no fixture card number: input the job cannot take, an empty input, a writer claim held
 //!   elsewhere, two runs at once and a duplicate transaction ID.
+//! - `a_failed_category_balance_or_reject_write_abends_at_that_write`: a category balance update
+//!   and insert refused in a read-only session, an input that opens but cannot be read, then the
+//!   fixture run's first reject bytes refused by a file-size limit, each abend at that operation
+//!   with the effects before it standing (CBTRN02C-038).
+//! - `a_failed_account_rewrite_abends_after_its_category_balance_is_written`: an account update
+//!   that gives up on a row lock the test holds ends the job with no failure line of its own
+//!   (CBTRN02C-039).
+//! - `a_failed_table_read_abends_before_the_first_record`: the job's reads of `card_xref`,
+//!   `accounts` and `tran_cat_balances`, each failed by a relay that closes its connection, end
+//!   the job before its first record with no table changed and no generation kept: the category
+//!   balance read with `ERROR READING TRANSACTION BALANCE FILE` and a status line
+//!   (CBTRN02C-038), the other two with no line of their own (CBTRN02C-039).
+//! - `a_failed_reject_close_shows_the_cross_reference_status`: rejects that only the close can
+//!   write, refused by a file-size limit, show `ERROR CLOSING DAILY REJECTS FILE` with status
+//!   `0000` and no counts (CBTRN02C-040).
+//! - `an_account_update_that_matches_no_row_changes_no_outcome`: an account removed after the job
+//!   has read it is passed over at its update, and its record is still posted and never
+//!   rejected (CBTRN02C-023).
+//!
+//! The batch crate is a binary only, so no repository double can replace a store call inside the
+//! job; the failure paths are provoked from outside the process instead, each through a seam the
+//! job cannot tell from a real failure: session options on the database URL (a read-only session,
+//! a `lock_timeout`), a lock or an uncommitted replacement the test holds on its own connection,
+//! a [`Relay`] between the job and the container that closes the job's connection at the row
+//! description of one table's read, and a file-size limit the job is started under. Which write
+//! such a limit refuses first follows from the 8 KiB the job buffers its rejects in,
+//! `std::io::BufWriter`'s default. A failure's event is matched by the COBOL statement and DD it
+//! names and by `persistence::error`'s rendering of the error, the SQLSTATE or the lost
+//! connection, the only text CBTRN02C-039 lets it carry.
 //!
 //! Every expected value comes from the audit rows transcribed here and from the fixture bytes
 //! they cite, never from `domain::batch::cbtrn02c` or the job. Codec A, which i8 proves, only
@@ -29,14 +58,18 @@
 //! A value that a halt or a halt candidate blocks is reported `BLOCKED` on standard output and
 //! asserted as nothing (AAP 0.8.5).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::error::Error;
 use std::fs;
-use std::io;
+use std::io::{self, BufReader, Read, Write};
 use std::iter;
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use copybook::{FixedRecord, PicU, PicX, TsForm};
 use domain::batch::loads::decode_fixture;
@@ -46,8 +79,8 @@ use domain::records::{
 };
 use domain::sensitive::CardNumber;
 use persistence::{
-    AccountRepository, CardXrefRepository, Dataset, PgStore, TranCatBalanceRepository,
-    TransactionRepository,
+    AccountRepository, CardXrefRepository, Dataset, PersistenceError, PgStore, PgTx,
+    TranCatBalanceRepository, TransactionRepository,
 };
 use test_support::fixtures::{
     fixture_card_numbers, fixture_dir, fixture_path, start_loaded_postgres,
@@ -108,23 +141,94 @@ const EMPTY_COUNT_LINES: [&str; 2] = [
     "TRANSACTIONS PROCESSED :000000000",
     "TRANSACTIONS REJECTED  :000000000",
 ];
+/// The counts of the run whose posted record's account is removed: the 41 records read and the
+/// 40 of an unknown card rejected, the record whose account update matches no row not among
+/// them (CBTRN02C-023, CBTRN02C-034).
+const REMOVED_ACCOUNT_COUNT_LINES: [&str; 2] = [
+    "TRANSACTIONS PROCESSED :000000041",
+    "TRANSACTIONS REJECTED  :000000040",
+];
 /// The line shown before each category balance is created: this literal, the 17 key bytes,
 /// which halt candidate X-POSTTRAN-H2 blocks, then `.. Creating.` (CBTRN02C-016).
 const NOT_FOUND_PREFIX: &str = "TCATBAL record not found for key : ";
 const NOT_FOUND_SUFFIX: &str = ".. Creating.";
 
-// The failure lines of the paths the tests provoke (CBTRN02C-025, CBTRN02C-031, CBTRN02C-041,
-// CBTRN02C-043).
+// The failure lines of the paths the tests provoke (CBTRN02C-025, CBTRN02C-031, CBTRN02C-038,
+// CBTRN02C-040, CBTRN02C-041, CBTRN02C-043).
 const OPEN_DALYTRAN: &str = "ERROR OPENING DALYTRAN";
 const OPEN_DALYREJS: &str = "ERROR OPENING DALY REJECTS FILE";
 const OPEN_ACCTFILE: &str = "ERROR OPENING ACCOUNT MASTER FILE";
 const WRITE_TRANFILE: &str = "ERROR WRITING TO TRANSACTION FILE";
+const READ_DALYTRAN: &str = "ERROR READING DALYTRAN FILE";
+const WRITE_DALYREJS: &str = "ERROR WRITING TO REJECTS FILE";
+const READ_TCATBALF: &str = "ERROR READING TRANSACTION BALANCE FILE";
+const WRITE_TCATBALF: &str = "ERROR WRITING TRANSACTION BALANCE FILE";
+const REWRITE_TCATBALF: &str = "ERROR REWRITING TRANSACTION BALANCE FILE";
+const CLOSE_DALYREJS: &str = "ERROR CLOSING DAILY REJECTS FILE";
+/// What every failure line above starts with, and no other line of a run does.
+const FAILURE_LINE_PREFIX: &str = "ERROR ";
 /// `9910-DISPLAY-IO-STATUS`: this 20-character literal, then four status characters.
 const STATUS_PREFIX: &str = "FILE STATUS IS: NNNN";
 const STATUS_LEN: usize = 24;
 /// The status line of a duplicate transaction key, status `22` (CBTRN02C-025, CBTRN02C-041).
 const DUPLICATE_KEY_STATUS: &str = "FILE STATUS IS: NNNN0022";
+/// The status line of a failed reject close, whatever the reject file's own status: it shows
+/// `XREFFILE-STATUS`, which the cross-reference close has just set to `00` (CBTRN02C-040,
+/// X-POSTTRAN-6).
+const REJECT_CLOSE_STATUS: &str = "FILE STATUS IS: NNNN0000";
 const ABEND_LINE: &str = "ABENDING PROGRAM";
+
+/// The reason and description of a record whose card no cross-reference holds (CBTRN02C-004).
+const INVALID_CARD_REASON: &str = "0100";
+const INVALID_CARD_DESC: &str = "INVALID CARD NUMBER FOUND";
+
+// The file operation the event of a failed call names, as a JSON string: the COBOL statement
+// and the DD of the file it reaches (`CBTRN02C.cbl`: `1000-DALYTRAN-GET-NEXT`,
+// `1500-A-LOOKUP-XREF`, `1500-B-LOOKUP-ACCT`, `2700-UPDATE-TCATBAL`, `2500-WRITE-REJECT-REC`,
+// `2700-A-CREATE-TCATBAL-REC`, `2700-B-UPDATE-TCATBAL-REC`, `2800-UPDATE-ACCOUNT-REC`,
+// `9300-DALYREJS-CLOSE`).
+const READ_DALYTRAN_OP: &str = r#""READ DALYTRAN""#;
+const READ_XREFFILE_OP: &str = r#""READ XREFFILE""#;
+const READ_ACCTFILE_OP: &str = r#""READ ACCTFILE""#;
+const READ_TCATBALF_OP: &str = r#""READ TCATBALF""#;
+const WRITE_DALYREJS_OP: &str = r#""WRITE DALYREJS""#;
+const WRITE_TCATBALF_OP: &str = r#""WRITE TCATBALF""#;
+const REWRITE_TCATBALF_OP: &str = r#""REWRITE TCATBALF""#;
+const REWRITE_ACCTFILE_OP: &str = r#""REWRITE ACCTFILE""#;
+const CLOSE_DALYREJS_OP: &str = r#""CLOSE DALYREJS""#;
+
+/// SQLSTATE `read_only_sql_transaction`: a write in a session whose every transaction is
+/// read-only ([`READ_ONLY_SESSION`]).
+const READ_ONLY_SQLSTATE: &str = "25006";
+/// SQLSTATE `lock_not_available`: a lock wait the session's `lock_timeout` ended
+/// ([`LOCK_TIMEOUT_SESSION`]).
+const LOCK_TIMEOUT_SQLSTATE: &str = "55P03";
+/// The session option, on the job's database URL, that makes every transaction of its session
+/// read-only: its reads and claims succeed and its first write fails.
+const READ_ONLY_SESSION: &str = "options[default_transaction_read_only]=on";
+/// The session option, on the job's database URL, that ends any lock wait of its session after
+/// one second.
+const LOCK_TIMEOUT_SESSION: &str = "options[lock_timeout]=1s";
+
+/// A column of each whole-table read the job makes at its opens that no other statement of a
+/// run returns, by which the [`Relay`] tells that read apart in its row description (migration
+/// 0001): the run's other statements, the check of `transactions` and the writer claims, return
+/// none of them.
+const CARD_XREF_COLUMN: &str = "cust_id";
+const ACCOUNTS_COLUMN: &str = "acct_active_status";
+const TRAN_CAT_BALANCES_COLUMN: &str = "tran_cat_bal";
+
+/// The launcher of [`Launch::FileSizeLimited`], run by `/bin/sh -c` with the binary as `$0` and
+/// its arguments after it. `ulimit -f` counts 512-byte blocks, so no regular file the job writes
+/// can grow past 512 bytes. `trap ''` ignores `SIGXFSZ`, a disposition `exec` keeps, so a write
+/// past the limit fails with `EFBIG` instead of the signal ending the process. Standard output
+/// and standard error are pipes, which the limit does not reach.
+const FILE_SIZE_LIMITED: &str = "trap '' XFSZ; ulimit -f 1 && exec \"$0\" \"$@\"";
+
+/// How long the account-removal test waits for the job's first reject bytes.
+const READS_DONE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often the account-removal test looks for them.
+const READS_DONE_POLL: Duration = Duration::from_millis(10);
 
 /// What precedes an event's message in the JSON lines of `runtime::telemetry`.
 const MESSAGE_KEY: &str = r#""message":""#;
@@ -138,6 +242,21 @@ const SCRATCH_ACCOUNT: u64 = 1;
 /// The type of the scratch records of the duplicate-ID test: `03`, whose category balance
 /// (account 1, `03`, `0001`) the loads do not hold (FIXFRM-007), so the run creates it.
 const SCRATCH_TYPE: [u8; 2] = *b"03";
+/// The type of the scratch records whose category balance, (account 1, `01`, `0001`), the loads
+/// hold with 0.00 (FIXFRM-007), so a posting updates it; the category, `0001`, is that of
+/// `dailytran.txt` line 1, the records' template (FIXPOST-001).
+const LOADED_TYPE: [u8; 2] = *b"01";
+/// The category balance key a scratch record of [`LOADED_TYPE`] posts to.
+const LOADED_KEY: CategoryKey = (SCRATCH_ACCOUNT, LOADED_TYPE, 1);
+/// The amount of the failure tests' scratch records in hundredths, −10.00, which account 1
+/// takes as it takes those of the duplicate-ID test (CBTRN02C-009).
+const SCRATCH_CENTS: i64 = -1_000;
+/// The card number of the scratch records no cross-reference holds, each rejected with reason
+/// `0100` (CBTRN02C-004): printable and no fixture card number, as [`SCRATCH_CARD`].
+const UNKNOWN_CARD: [u8; 16] = *b"SCRATCH-CARD-999";
+/// The unknown-card records before the posted one in the account-removal test: 40 rejects of 431
+/// bytes, so the job's 8 KiB reject buffer first reaches the file at the twentieth.
+const UNKNOWN_CARD_RECORDS: usize = 40;
 
 /// The `FIXPOST-001` to `FIXPOST-300` rows of `fixtures.md`, one per `dailytran.txt` line in
 /// input order, as [`parse_row`] reads them: `<line> <account> posted <create|update> <type>
@@ -878,23 +997,66 @@ fn generation(var_dir: &Path, name: &str) -> PathBuf {
 
 /// Runs `carddemo-batch posttran --dalytran <dalytran>` from `modern/` against the database of
 /// `guard`, with every output directory under `var_dir`, and returns its exit status and output.
-///
-/// The child inherits the test's environment, so the coverage profile variables reach it
-/// (Coverage Floors), with the variables the job reads set for this run. `RUST_LOG` is `info`, so
-/// the job-log events reach standard output (CBTRN02C-034), and span export is off, so that every
-/// event is one JSON line.
 async fn run_posttran(
     guard: &PostgresGuard,
     var_dir: &Path,
     dalytran: &Path,
 ) -> TestResult<Output> {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_carddemo-batch"));
+    run_posttran_with(guard.database_url(), var_dir, dalytran, Launch::Direct).await
+}
+
+/// How [`run_posttran_with`] starts the binary.
+#[derive(Clone, Copy)]
+enum Launch {
+    /// The binary itself.
+    Direct,
+    /// The binary under a file-size limit of 512 bytes ([`FILE_SIZE_LIMITED`]), so the reject
+    /// generation cannot grow past it.
+    FileSizeLimited,
+}
+
+/// The database URL of `guard` with the session option `option`: the job's session then runs
+/// under it, and the test's own connections do not.
+fn session_url(guard: &PostgresGuard, option: &str) -> String {
+    format!("{}?{option}", guard.database_url())
+}
+
+/// [`run_posttran`] against `database_url`, started as `launch` says.
+///
+/// The child inherits the test's environment, so the coverage profile variables reach it
+/// (Coverage Floors) unless the launch is limited, with the variables the job reads set for this
+/// run. `RUST_LOG` is `info`, so
+/// the job-log events reach standard output (CBTRN02C-034), and span export is off, so that every
+/// event is one JSON line.
+async fn run_posttran_with(
+    database_url: &str,
+    var_dir: &Path,
+    dalytran: &Path,
+    launch: Launch,
+) -> TestResult<Output> {
+    let binary = env!("CARGO_BIN_EXE_carddemo-batch");
+    let mut command = match launch {
+        Launch::Direct => Command::new(binary),
+        Launch::FileSizeLimited => {
+            let mut shell = Command::new("/bin/sh");
+            // Under `cargo llvm-cov` the instrumented binary writes its coverage profile when it
+            // exits, which the limit would truncate, and a truncated profile breaks the merged
+            // report: a limited run writes its profile to `/dev/null`, so its coverage is not
+            // counted.
+            shell
+                .arg("-c")
+                .arg(FILE_SIZE_LIMITED)
+                .arg(binary)
+                .env("LLVM_PROFILE_FILE", "/dev/null");
+            shell
+        }
+    };
     command
         .arg("posttran")
         .arg("--dalytran")
         .arg(dalytran)
         .current_dir(test_support::modern_dir())
-        .env("DATABASE_URL", guard.database_url())
+        .env("DATABASE_URL", database_url)
         .env("CARDDEMO_VAR_DIR", var_dir)
         .env("CARDDEMO_STATEMENT_DIR", var_dir.join("statements"))
         .env("CARDDEMO_INTRDR_DIR", var_dir.join("jobs"))
@@ -988,8 +1150,18 @@ fn scratch_record(
     type_cd: [u8; 2],
     cents: i64,
 ) -> TestResult<Vec<u8>> {
+    card_record(template, SCRATCH_CARD, type_cd, cents)
+}
+
+/// [`scratch_record`] with `card`, a scratch card number, in place of [`SCRATCH_CARD`].
+fn card_record(
+    template: &DailyTransactionRecord,
+    card: [u8; 16],
+    type_cd: [u8; 2],
+    cents: i64,
+) -> TestResult<Vec<u8>> {
     let mut record = template.clone();
-    record.card_num = CardNumber::new(PicX::from_array(SCRATCH_CARD));
+    record.card_num = CardNumber::new(PicX::from_array(card));
     record.type_cd = PicX::from_array(type_cd);
     record.amt = Money::new(Decimal::new(cents, 2))?;
     Ok(record.encode())
@@ -1521,6 +1693,387 @@ fn assert_both_postings_stand(before: &Tables, after: &Tables, added: Decimal) -
     Ok(())
 }
 
+/// The JSON value of the `error` field of the event reporting a database call that failed with
+/// `sqlstate`: the SQLSTATE alone, as `persistence::error` renders a database error that names
+/// no constraint, never the server's detail text (CBTRN02C-039; Cardholder Data Redaction).
+fn database_error(sqlstate: &str) -> String {
+    let error = PersistenceError::Database {
+        sqlstate: Some(sqlstate.to_owned()),
+        constraint: None,
+    };
+    format!("\"{error}\"")
+}
+
+/// The JSON value of the `error` field of the event reporting a database call whose connection
+/// was lost: `persistence::error`'s rendering of a database that cannot be reached, which names
+/// no URL, no SQLSTATE detail and no value (CBTRN02C-039; Cardholder Data Redaction).
+fn unavailable_error() -> String {
+    format!("\"{}\"", PersistenceError::Unavailable)
+}
+
+/// Asserts that exactly one event of `output` names the file operation `operation`, that it
+/// carries the error `error`, and that it comes before `ABENDING PROGRAM`, which ends the run;
+/// on failure the events are shown with every fixture card number masked.
+fn assert_cause_before_abend(output: &Output, operation: &str, error: &str, needles: &Needles) {
+    let events = events(output);
+    let causes: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| has_field(event, "operation", operation))
+        .map(|(index, _)| index)
+        .collect();
+    let abend_message = format!("\"{ABEND_LINE}\"");
+    let abend = events
+        .iter()
+        .position(|event| has_field(event, "message", &abend_message));
+    let [cause] = causes.as_slice() else {
+        panic!(
+            "{} events name {operation}, not one; events: {}",
+            causes.len(),
+            needles.mask(events.join("\n").as_bytes())
+        );
+    };
+    let cause_event = events.get(*cause).map_or("", String::as_str);
+    assert!(
+        has_field(cause_event, "error", error),
+        "the event naming {operation} does not carry {error}: {}",
+        needles.mask(cause_event.as_bytes())
+    );
+    assert!(
+        abend.is_some_and(|abend| *cause < abend),
+        "the event naming {operation} does not precede `{ABEND_LINE}`"
+    );
+}
+
+/// Asserts that `after` holds the category balances of `before` but for the one under `key`,
+/// which holds `added` more: the category-balance write of a posting, standing whatever came
+/// after it. The amount is a few dollars, so no receiving picture drops a digit.
+fn assert_balance_moved(
+    before: &[TranCatBalanceRecord],
+    after: &[TranCatBalanceRecord],
+    key: CategoryKey,
+    added: Decimal,
+) -> TestResult {
+    let mut expected = before.to_vec();
+    let balance = expected
+        .iter_mut()
+        .find(|balance| category_key(balance) == key)
+        .ok_or_else(|| format!("no category balance {key:?} is loaded"))?;
+    balance.bal = Money::new(balance.bal.as_decimal() + added)?;
+    assert!(
+        after == expected.as_slice(),
+        "the category balances do not hold the posting to {key:?} alone"
+    );
+    Ok(())
+}
+
+/// Asserts that `stored`, the transactions of a fixture run that ended part way, are the records
+/// of the first postings of the `FIXPOST` rows in input order, at least one and not all of them:
+/// every posting before the failure committed, and nothing after it.
+fn assert_posted_prefix(
+    stored: &[TransactionRecord],
+    rows: &[PostRow],
+    daily: &[DailyTransactionRecord],
+) -> TestResult {
+    let posted = rows
+        .iter()
+        .filter(|row| matches!(row.outcome, Outcome::Posted(_)))
+        .map(|row| {
+            row.line
+                .checked_sub(1)
+                .and_then(|index| daily.get(index))
+                .map(|input| input.id.as_bytes())
+                .ok_or_else(|| format!("dailytran.txt has no line {}", row.line))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(
+        !stored.is_empty() && stored.len() < posted.len(),
+        "{} of the {} postings committed, not some of them",
+        stored.len(),
+        posted.len()
+    );
+    let ids: HashSet<&[u8; 16]> = stored.iter().map(|record| record.id.as_bytes()).collect();
+    assert_eq!(ids.len(), stored.len(), "transaction IDs are not unique");
+    let first = posted
+        .get(..stored.len())
+        .ok_or("more transactions than postings")?;
+    assert!(
+        first.iter().all(|id| ids.contains(id)),
+        "the {} committed transactions are not the first postings in input order",
+        stored.len()
+    );
+    Ok(())
+}
+
+/// Commits `replacement` once `rejects`, the reject generation of the run under way, holds
+/// bytes, which shows the run past its reads of the tables (see the account-removal test), and
+/// fails when no byte arrives within [`READS_DONE_TIMEOUT`]. It then rolls the replacement back,
+/// so the run is never left waiting on it.
+async fn commit_after_reads(replacement: PgTx<'static>, rejects: &Path) -> TestResult {
+    let flushed = tokio::time::timeout(READS_DONE_TIMEOUT, async {
+        while !fs::metadata(rejects).is_ok_and(|metadata| metadata.len() > 0) {
+            tokio::time::sleep(READS_DONE_POLL).await;
+        }
+    })
+    .await;
+    if flushed.is_ok() {
+        Ok(replacement.commit().await?)
+    } else {
+        replacement.rollback().await?;
+        Err(format!(
+            "the run wrote no reject byte within {READS_DONE_TIMEOUT:?}, so its reads were \
+             never shown done"
+        )
+        .into())
+    }
+}
+
+/// The type byte of a `RowDescription`, the backend message (protocol 3.0) that names the
+/// columns a statement returns.
+const ROW_DESCRIPTION: u8 = b'T';
+/// Bytes of a message's length field, which counts itself.
+const LENGTH_LEN: usize = 4;
+/// Bytes after each field name of a `RowDescription`: the table OID (4), the column number (2),
+/// the type OID (4), the type size (2), the type modifier (4) and the format code (2).
+const FIELD_TRAILER_LEN: usize = 18;
+/// How long the relay waits for the container to accept a connection.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A TCP relay on `127.0.0.1` between `carddemo-batch` and the test's `PostgreSQL` container. It
+/// forwards every connection unchanged until the container first sends a row description that
+/// names its column: that description is not forwarded and the connection is closed there, as a
+/// lost connection ends, so the statement fails before it returns a row.
+///
+/// The binary connects with `sslmode=disable`, so the container's side of every connection is a
+/// sequence of typed messages from its first byte: a type byte, a big-endian `u32` length that
+/// counts itself, then the body. The binary's side is copied as it is. Each connection is served
+/// by two threads; dropping the relay wakes its accept loop, shuts every socket down and joins
+/// every thread, so no relay outlives its test.
+struct Relay {
+    /// The port the relay listens on.
+    port: u16,
+    /// The `DATABASE_URL` that points the binary at the relay.
+    database_url: String,
+    /// What the relay's threads share.
+    state: Arc<RelayState>,
+    /// The accept loop.
+    accept: Option<JoinHandle<()>>,
+}
+
+/// What the threads of a [`Relay`] share.
+struct RelayState {
+    /// The container's `host:port`.
+    upstream: String,
+    /// The column whose row description the cut waits for.
+    column: &'static str,
+    /// Set when the relay is dropped: the accept loop ends at its next connection.
+    stopping: AtomicBool,
+    /// Set once a connection has been cut, so that no other one is.
+    cut_made: AtomicBool,
+    /// A handle on every socket, shut down when the relay is dropped.
+    sockets: Mutex<Vec<TcpStream>>,
+    /// The threads of every connection, joined when the relay is dropped.
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// `mutex` locked, even if a relay thread panicked while it held the lock: a list of sockets or
+/// threads stays valid whatever its holder did.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Relay {
+    /// Starts a relay to the container that `database_url`, as `PostgresGuard::database_url`
+    /// gives it, names, cutting the first connection whose row description names `column`.
+    fn start(database_url: &str, column: &'static str) -> TestResult<Self> {
+        let (scheme, rest) = database_url
+            .split_once("://")
+            .ok_or("the database URL has no scheme")?;
+        let (credentials, rest) = rest
+            .split_once('@')
+            .ok_or("the database URL has no credentials")?;
+        let (upstream, database) = rest
+            .split_once('/')
+            .ok_or("the database URL names no database")?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let state = Arc::new(RelayState {
+            upstream: upstream.to_owned(),
+            column,
+            stopping: AtomicBool::new(false),
+            cut_made: AtomicBool::new(false),
+            sockets: Mutex::new(Vec::new()),
+            threads: Mutex::new(Vec::new()),
+        });
+        let accepting = Arc::clone(&state);
+        let accept = thread::spawn(move || accept_connections(&accepting, &listener));
+        Ok(Self {
+            port,
+            database_url: format!(
+                "{scheme}://{credentials}@127.0.0.1:{port}/{database}?sslmode=disable"
+            ),
+            state,
+            accept: Some(accept),
+        })
+    }
+
+    /// The `DATABASE_URL` that points the binary at the relay.
+    fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    /// Whether the relay has cut a connection.
+    fn cut_made(&self) -> bool {
+        self.state.cut_made.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.state.stopping.store(true, Ordering::SeqCst);
+        // A connection of the relay's own wakes the accept loop, which sees `stopping` and ends.
+        // Should none get through, the loop is left blocked rather than waited for.
+        let woken = TcpStream::connect(("127.0.0.1", self.port)).is_ok();
+        if let Some(accept) = self.accept.take().filter(|_| woken) {
+            // A thread that panicked has nothing left to clean up, and a drop must not panic.
+            let _ = accept.join();
+        }
+        for socket in lock(&self.state.sockets).drain(..) {
+            // A socket the other side has closed already is no failure.
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        let threads: Vec<JoinHandle<()>> = lock(&self.state.threads).drain(..).collect();
+        for relaying in threads {
+            let _ = relaying.join();
+        }
+    }
+}
+
+/// Serves every connection `listener` accepts until the relay stops.
+fn accept_connections(state: &Arc<RelayState>, listener: &TcpListener) {
+    for client in listener.incoming() {
+        if state.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        // A failed accept leaves the binary to connect again; the relay keeps listening.
+        if let Ok(client) = client {
+            serve(state, client);
+        }
+    }
+}
+
+/// Connects `client` to the container and starts the two threads that relay it. A connection
+/// the container does not accept is closed at once, which the binary meets as a refused one.
+fn serve(state: &Arc<RelayState>, client: TcpStream) {
+    let server = state
+        .upstream
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .and_then(|address| TcpStream::connect_timeout(&address, UPSTREAM_TIMEOUT).ok());
+    let Some(server) = server else {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
+    let handles = (
+        client.try_clone(),
+        client.try_clone(),
+        server.try_clone(),
+        server.try_clone(),
+    );
+    let (Ok(mut client_reader), Ok(client_kept), Ok(mut server_writer), Ok(server_kept)) = handles
+    else {
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = server.shutdown(Shutdown::Both);
+        return;
+    };
+    lock(&state.sockets).extend([client_kept, server_kept]);
+    let upward = thread::spawn(move || forward_client(&mut client_reader, &mut server_writer));
+    let relaying = Arc::clone(state);
+    let mut client_writer = client;
+    let downward = thread::spawn(move || forward_server(&relaying, server, &mut client_writer));
+    lock(&state.threads).extend([upward, downward]);
+}
+
+/// Copies what the binary sends to the container until either side ends, then ends the
+/// container's side for writing, so the container sees the binary's end.
+fn forward_client(client: &mut TcpStream, server: &mut TcpStream) {
+    // An error ends the copy as the end of the stream does; a relay thread has no one to tell.
+    let _ = io::copy(client, server);
+    let _ = server.shutdown(Shutdown::Write);
+}
+
+/// Forwards the container's messages to the binary one at a time until the container ends or
+/// the cut is made, then ends the binary's side for writing, so the binary reads the end of the
+/// stream after the last message forwarded. The cut, made at the first row description of any
+/// connection that names the relay's column, forwards no part of that description and also
+/// closes the container's side.
+fn forward_server(state: &RelayState, server: TcpStream, client: &mut TcpStream) {
+    let mut reader = BufReader::new(server);
+    while let Ok(message) = read_message(&mut reader) {
+        let cut = message.first() == Some(&ROW_DESCRIPTION)
+            && describes(&message, state.column)
+            && state
+                .cut_made
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+        if cut {
+            let _ = reader.get_ref().shutdown(Shutdown::Both);
+            break;
+        }
+        if client.write_all(&message).is_err() {
+            break;
+        }
+    }
+    let _ = client.shutdown(Shutdown::Write);
+}
+
+/// The next backend message `reader` holds, whole: its type byte, its length and its body.
+///
+/// # Errors
+///
+/// The read's error, `UnexpectedEof` at the end of the stream included, or `InvalidData` for a
+/// length shorter than its own field.
+fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut header = [0; 1 + LENGTH_LEN];
+    reader.read_exact(&mut header)?;
+    let [_, length @ ..] = header;
+    let body_len = usize::try_from(u32::from_be_bytes(length))
+        .ok()
+        .and_then(|length| length.checked_sub(LENGTH_LEN))
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let mut body = vec![0; body_len];
+    reader.read_exact(&mut body)?;
+    let mut message = header.to_vec();
+    message.append(&mut body);
+    Ok(message)
+}
+
+/// Whether the `RowDescription` `message` describes a field named `column`: after the header, a
+/// big-endian `i16` field count, then each field's NUL-terminated name and its trailer.
+fn describes(message: &[u8], column: &str) -> bool {
+    let Some((count, mut fields)) = message
+        .get(1 + LENGTH_LEN..)
+        .and_then(|body| body.split_first_chunk::<2>())
+    else {
+        return false;
+    };
+    for _ in 0..i16::from_be_bytes(*count) {
+        let Some(end) = fields.iter().position(|&byte| byte == 0) else {
+            return false;
+        };
+        let (name, rest) = fields.split_at(end);
+        if name == column.as_bytes() {
+            return true;
+        }
+        let Some(rest) = rest.get(1 + FIELD_TRAILER_LEN..) else {
+            return false;
+        };
+        fields = rest;
+    }
+    false
+}
+
 /// i9: over `dailytran.txt`, the reject generation equals the audited reject records byte for
 /// byte, record by record and in input order; the run exits with status 4, prints the
 /// generation's path, logs the audited job-log lines, leaves its input unchanged and shows no
@@ -1820,4 +2373,489 @@ async fn a_duplicate_transaction_id_abends_after_its_balances_are_written() -> T
     };
     assert_posted(transaction, &DailyTransactionRecord::decode(&first)?, 1);
     assert_both_postings_stand(&before, &after, Decimal::new(first_cents + second_cents, 2))
+}
+
+/// A category balance write, a category balance rewrite, a read of the input or a reject write
+/// that fails ends the run at that operation: its failure line, a status line and the abend, the
+/// effects before it standing and none after it. In a read-only session the update of a category
+/// balance the loads hold, and the insert of one they do not, fail with SQLSTATE 25006, each the
+/// first write of its run, so neither run changes a table; nor does a run whose input opens and
+/// then cannot be read. Under a 512-byte file-size limit the fixture run's first reject bytes
+/// cannot reach the file, after the postings of the records before.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_category_balance_or_reject_write_abends_at_that_write() -> TestResult {
+    let needles = Needles::load()?;
+    let template = first_daily_record()?;
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+    let before = Tables::read(&mut store).await?;
+    let scratch = Scratch::new("write-failures")?;
+    let read_only = session_url(&guard, READ_ONLY_SESSION);
+
+    // The rewrite of a loaded category balance, then the write of a new one, which its
+    // not-found line announces first (CBTRN02C-016).
+    for (name, type_cd, line, operation, creates) in [
+        (
+            "rewrite",
+            LOADED_TYPE,
+            REWRITE_TCATBALF,
+            REWRITE_TCATBALF_OP,
+            false,
+        ),
+        (
+            "write",
+            SCRATCH_TYPE,
+            WRITE_TCATBALF,
+            WRITE_TCATBALF_OP,
+            true,
+        ),
+    ] {
+        let record = scratch_record(&template, type_cd, SCRATCH_CENTS)?;
+        let input = scratch.write(&format!("{name}.txt"), &lines_of(&[&record]))?;
+        let var_dir = scratch.path().join(name);
+        let output = run_posttran_with(&read_only, &var_dir, &input, Launch::Direct).await?;
+        // audit: CBTRN02C-038
+        let status = assert_abended(&output, &var_dir, Some(line), &needles);
+        status_blocked(status.as_deref());
+        // audit: CBTRN02C-038
+        assert_event(
+            &output,
+            &[
+                ("operation", operation),
+                ("error", database_error(READ_ONLY_SQLSTATE).as_str()),
+            ],
+            &needles,
+        );
+        if creates {
+            let messages = messages(&output);
+            let announced = messages.iter().position(|message| {
+                message.starts_with(NOT_FOUND_PREFIX) && message.ends_with(NOT_FOUND_SUFFIX)
+            });
+            let failed = messages.iter().position(|message| message == line);
+            // audit: CBTRN02C-016
+            assert!(
+                announced
+                    .zip(failed)
+                    .is_some_and(|(announced, failed)| announced < failed),
+                "no `{NOT_FOUND_PREFIX}` line precedes `{line}`"
+            );
+            blocked(
+                "CBTRN02C-016",
+                "X-POSTTRAN-H2",
+                "the 17 key bytes of the not-found line",
+            );
+        }
+        // audit: CBTRN02C-038
+        assert!(
+            Tables::read(&mut store).await? == before,
+            "the run whose category balance {name} failed changed a table"
+        );
+    }
+
+    // A directory opens for reading, and its read then fails (`EISDIR`): the input is read
+    // whole at its open, before any other effect, so nothing has changed (CBTRN02C-032).
+    let directory = scratch.path().join("dalytran-directory");
+    fs::create_dir_all(&directory)?;
+    let var_dir = scratch.path().join("read");
+    let output = run_posttran(&guard, &var_dir, &directory).await?;
+    // audit: CBTRN02C-038
+    let status = assert_abended(&output, &var_dir, Some(READ_DALYTRAN), &needles);
+    status_blocked(status.as_deref());
+    assert_event(&output, &[("operation", READ_DALYTRAN_OP)], &needles);
+    // audit: CBTRN02C-038
+    assert!(
+        Tables::read(&mut store).await? == before,
+        "the run whose input read failed changed a table"
+    );
+
+    let rows = fixpost_rows()?;
+    let dalytran = fixture_path(DAILYTRAN);
+    let daily: Vec<DailyTransactionRecord> =
+        decode_fixture::<DailyTransactionRecord>(&fs::read(&dalytran)?)?
+            .into_iter()
+            .map(|framed| framed.record)
+            .collect();
+    let var_dir = scratch.path().join("rejects");
+    let output = run_posttran_with(
+        guard.database_url(),
+        &var_dir,
+        &dalytran,
+        Launch::FileSizeLimited,
+    )
+    .await?;
+    // audit: CBTRN02C-038
+    let status = assert_abended(&output, &var_dir, Some(WRITE_DALYREJS), &needles);
+    status_blocked(status.as_deref());
+    assert_event(&output, &[("operation", WRITE_DALYREJS_OP)], &needles);
+    // audit: CBTRN02C-038
+    assert_posted_prefix(&Tables::read(&mut store).await?.transactions, &rows, &daily)
+}
+
+/// An account update that fails other than by matching no row ends the job: an event naming the
+/// rewrite and carrying the SQLSTATE alone, then `ABENDING PROGRAM`, with no failure or status
+/// line of its own. The category balance written before it stands, and no transaction is
+/// written. The test holds the account's row lock, and the job's session gives up waiting for it
+/// after a second, with SQLSTATE 55P03.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_account_rewrite_abends_after_its_category_balance_is_written() -> TestResult {
+    let needles = Needles::load()?;
+    let record = scratch_record(&first_daily_record()?, LOADED_TYPE, SCRATCH_CENTS)?;
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+    let before = Tables::read(&mut store).await?;
+    let scratch = Scratch::new("account-rewrite")?;
+    let input = scratch.write("rewrite.txt", &lines_of(&[&record]))?;
+
+    let mut lock = store.begin().await?;
+    let locked = AccountRepository::lock_by_id(&mut lock, PicU::new(SCRATCH_ACCOUNT)?).await?;
+    assert!(locked.is_some(), "the scratch account is not loaded");
+    let output = run_posttran_with(
+        &session_url(&guard, LOCK_TIMEOUT_SESSION),
+        scratch.path(),
+        &input,
+        Launch::Direct,
+    )
+    .await;
+    lock.rollback().await?;
+    let output = output?;
+    // audit: CBTRN02C-039
+    assert_abended(&output, scratch.path(), None, &needles);
+    // audit: CBTRN02C-039
+    assert!(
+        messages(&output)
+            .iter()
+            .all(|message| !message.starts_with(STATUS_PREFIX)),
+        "a failed account rewrite showed a status line"
+    );
+    // audit: CBTRN02C-039
+    assert_event(
+        &output,
+        &[
+            ("operation", REWRITE_ACCTFILE_OP),
+            ("error", database_error(LOCK_TIMEOUT_SQLSTATE).as_str()),
+        ],
+        &needles,
+    );
+    let after = Tables::read(&mut store).await?;
+    // audit: CBTRN02C-039
+    assert!(
+        after.transactions.is_empty() && after.accounts == before.accounts,
+        "a failed account rewrite left a transaction or an account change"
+    );
+    // audit: CBTRN02C-015
+    assert_balance_moved(
+        &before.balances,
+        &after.balances,
+        LOADED_KEY,
+        Decimal::new(SCRATCH_CENTS, 2),
+    )?;
+    // audit: CBTRN02C-039
+    blocked(
+        "CBTRN02C-039",
+        "X-POSTTRAN-5",
+        "the COBOL outcome of an account rewrite that fails other than by INVALID KEY, which \
+         tests no status and goes on with the records an earlier read left",
+    );
+    Ok(())
+}
+
+/// One run of [`a_failed_table_read_abends_before_the_first_record`].
+struct ReadFailure {
+    /// The rule the run's outcome proves.
+    rule: &'static str,
+    /// The table whose whole-table read the relay fails.
+    table: &'static str,
+    /// The column only that read returns, at whose row description the relay cuts.
+    column: &'static str,
+    /// The failure line the path shows before its status line, or `None` for a path with no
+    /// line of its own.
+    line: Option<&'static str>,
+    /// The file operation the event of the failed read names, as a JSON string.
+    operation: &'static str,
+    /// Whether the read follows the open of the reject generation (CBTRN02C-031).
+    after_rejects_open: bool,
+}
+
+/// A read of `card_xref`, `accounts` or `tran_cat_balances` that fails ends the job at that read,
+/// before its first record. The job reads each table whole at its open, and for each in turn a
+/// [`Relay`] closes the job's connection at the row description only that table's read returns,
+/// so the read fails as a lost connection fails it, with an error that names no URL and no value.
+/// The category balance read shows `ERROR READING TRANSACTION BALANCE FILE` and a status line
+/// (CBTRN02C-038); the cross-reference and account reads show no line of their own
+/// (CBTRN02C-039). Each run then abends with exit status 12 and prints no path; the reject
+/// generation, created after the cross-reference read and before the other two, is removed
+/// (CBTRN02C-044); and no table changes, as no write precedes these reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_table_read_abends_before_the_first_record() -> TestResult {
+    let needles = Needles::load()?;
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let before = Tables::read(&mut store).await?;
+    let scratch = Scratch::new("read-failures")?;
+    let dalytran = fixture_path(DAILYTRAN);
+    let unavailable = unavailable_error();
+
+    // In the job's read order: the cross-reference before the reject generation is created, the
+    // accounts after it, then the category balances (CBTRN02C-031).
+    let cases = [
+        ReadFailure {
+            rule: "CBTRN02C-039",
+            table: "card_xref",
+            column: CARD_XREF_COLUMN,
+            line: None,
+            operation: READ_XREFFILE_OP,
+            after_rejects_open: false,
+        },
+        ReadFailure {
+            rule: "CBTRN02C-039",
+            table: "accounts",
+            column: ACCOUNTS_COLUMN,
+            line: None,
+            operation: READ_ACCTFILE_OP,
+            after_rejects_open: true,
+        },
+        ReadFailure {
+            rule: "CBTRN02C-038",
+            table: "tran_cat_balances",
+            column: TRAN_CAT_BALANCES_COLUMN,
+            line: Some(READ_TCATBALF),
+            operation: READ_TCATBALF_OP,
+            after_rejects_open: true,
+        },
+    ];
+    for ReadFailure {
+        rule,
+        table,
+        column,
+        line,
+        operation,
+        after_rejects_open,
+    } in cases
+    {
+        let var_dir = scratch.path().join(table);
+        let relay = Relay::start(guard.database_url(), column)?;
+        let output =
+            run_posttran_with(relay.database_url(), &var_dir, &dalytran, Launch::Direct).await?;
+        let cut = relay.cut_made();
+        drop(relay);
+        // audit: CBTRN02C-038
+        // audit: CBTRN02C-039
+        assert!(
+            cut,
+            "{rule}: the relay never met the row description of {table}"
+        );
+        // audit: CBTRN02C-038
+        // audit: CBTRN02C-039
+        let status = assert_abended(&output, &var_dir, line, &needles);
+        let log: Vec<String> = messages(&output)
+            .into_iter()
+            .filter(|message| is_job_log(message))
+            .collect();
+        // Nothing of the run follows the failed read: no record is read, so no not-found line,
+        // and neither the counts nor the end line appear.
+        // audit: CBTRN02C-038
+        // audit: CBTRN02C-039
+        // audit: CBTRN02C-043
+        assert_eq!(
+            log,
+            [START_LINE],
+            "{rule}: the job log of a run whose read of {table} failed"
+        );
+        // The reject directory is allocated with the generation, which then exists until the
+        // abend removes it; before its open the run has allocated neither.
+        let left = fs::read_dir(var_dir.join("dalyrejs"))
+            .ok()
+            .map(Iterator::count);
+        // audit: CBTRN02C-044
+        assert_eq!(
+            left,
+            after_rejects_open.then_some(0),
+            "{rule}: the entries left in the reject directory after a failed read of {table}"
+        );
+        // audit: CBTRN02C-038
+        // audit: CBTRN02C-039
+        assert_cause_before_abend(&output, operation, &unavailable, &needles);
+        if line.is_some() {
+            // audit: CBTRN02C-038
+            status_blocked(status.as_deref());
+        } else {
+            // audit: CBTRN02C-039
+            assert!(
+                messages(&output).iter().all(|message| {
+                    !message.starts_with(STATUS_PREFIX) && !message.starts_with(FAILURE_LINE_PREFIX)
+                }),
+                "{rule}: a failed read of {table} showed a failure or status line"
+            );
+            // audit: CBTRN02C-039
+            blocked(
+                rule,
+                "X-POSTTRAN-5",
+                &format!(
+                    "the COBOL outcome of a read of {table} that fails other than by \
+                     INVALID KEY, which tests no status and goes on with the records an earlier \
+                     read left"
+                ),
+            );
+        }
+        // audit: CBTRN02C-038
+        // audit: CBTRN02C-039
+        assert!(
+            Tables::read(&mut store).await? == before,
+            "{rule}: the run whose read of {table} failed changed a table"
+        );
+    }
+    Ok(())
+}
+
+/// A reject generation that cannot be written at its close ends the run with
+/// `ERROR CLOSING DAILY REJECTS FILE` and the status the program shows there, always `0000`,
+/// before the count lines, and no generation is kept. The three rejects, 1,293 bytes, fit the
+/// 8 KiB the job buffers, so no byte of them reaches the file before the close, and they exceed
+/// the 512-byte file-size limit the job runs under, so the close's write fails.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_reject_close_shows_the_cross_reference_status() -> TestResult {
+    let needles = Needles::load()?;
+    let reject = card_record(
+        &first_daily_record()?,
+        UNKNOWN_CARD,
+        LOADED_TYPE,
+        SCRATCH_CENTS,
+    )?;
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let before = Tables::read(&mut store).await?;
+    let scratch = Scratch::new("reject-close")?;
+    let input = scratch.write("close.txt", &lines_of(&[&reject, &reject, &reject]))?;
+    let output = run_posttran_with(
+        guard.database_url(),
+        scratch.path(),
+        &input,
+        Launch::FileSizeLimited,
+    )
+    .await?;
+    // audit: CBTRN02C-040
+    let status = assert_abended(&output, scratch.path(), Some(CLOSE_DALYREJS), &needles);
+    // audit: CBTRN02C-040
+    assert_eq!(
+        status.as_deref(),
+        Some(REJECT_CLOSE_STATUS),
+        "the status line"
+    );
+    assert_event(&output, &[("operation", CLOSE_DALYREJS_OP)], &needles);
+    let log: Vec<String> = messages(&output)
+        .into_iter()
+        .filter(|message| is_job_log(message))
+        .collect();
+    // audit: CBTRN02C-040
+    assert_eq!(
+        log,
+        [START_LINE],
+        "the job log of a run whose reject close failed"
+    );
+    assert!(
+        Tables::read(&mut store).await? == before,
+        "a run that only rejected changed a table"
+    );
+    Ok(())
+}
+
+/// An account update that matches no row changes no outcome (X-POSTTRAN-3): its record is not
+/// rejected or counted as rejected, no reject record is written for it and its transaction is
+/// still written, after its category balance. The test removes the record's account after the
+/// job has read it: it replaces `accounts` by every account but that one in a transaction of its
+/// own, and commits it once the job is past its reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_account_update_that_matches_no_row_changes_no_outcome() -> TestResult {
+    let needles = Needles::load()?;
+    let template = first_daily_record()?;
+    let reject = card_record(&template, UNKNOWN_CARD, LOADED_TYPE, SCRATCH_CENTS)?;
+    let posted = scratch_record(&template, LOADED_TYPE, SCRATCH_CENTS)?;
+    let mut records = vec![reject.as_slice(); UNKNOWN_CARD_RECORDS];
+    records.push(posted.as_slice());
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+    let before = Tables::read(&mut store).await?;
+    let remaining: Vec<AccountRecord> = before
+        .accounts
+        .iter()
+        .filter(|account| account.id.get() != SCRATCH_ACCOUNT)
+        .cloned()
+        .collect();
+    let scratch = Scratch::new("account-removed")?;
+    let input = scratch.write("removed.txt", &lines_of(&records))?;
+    let rejects = generation(scratch.path(), FIRST_GENERATION);
+
+    // The replacement holds `SHARE ROW EXCLUSIVE` on `accounts` until it ends. The job's read of
+    // the table does not wait for it and still finds the account, while the job's update of the
+    // account waits for the commit and then finds the row gone, whether it was issued before the
+    // commit or after it. The commit point is sound because the job reads `card_xref`,
+    // `accounts` and `tran_cat_balances` whole before its first record, and its reject
+    // generation receives bytes only when the 8 KiB it buffers first overflows, at the twentieth
+    // unknown-card reject: bytes in the generation show the reads done and the posted record,
+    // the last, not yet reached.
+    let mut removal = store.begin().await?;
+    AccountRepository::replace_all(&mut removal, &remaining).await?;
+    let (output, committed) = tokio::join!(
+        run_posttran(&guard, scratch.path(), &input),
+        commit_after_reads(removal, &rejects)
+    );
+    let output = output?;
+    committed?;
+    assert_eq!(
+        output.status.code(),
+        Some(REJECTS_EXIT_STATUS),
+        "{}",
+        needles.report(&output)
+    );
+    assert_eq!(written_paths(&output), [rejects.clone()]);
+    // audit: CBTRN02C-023
+    assert_job_log(&output, 0, REMOVED_ACCOUNT_COUNT_LINES);
+    // Each record is the `0100` reject of an unknown card, so the posted record is none of them
+    // and none carries the `0109` its failed account update moved (CBTRN02C-027).
+    let expected = expected_reject(&reject, INVALID_CARD_REASON, INVALID_CARD_DESC)?;
+    let bytes = fs::read(&rejects)?;
+    let written = fixed_records(&bytes, REJECT_LEN)?;
+    // audit: CBTRN02C-023
+    assert_eq!(
+        written.len(),
+        UNKNOWN_CARD_RECORDS,
+        "reject records written"
+    );
+    for (index, record) in written.iter().enumerate() {
+        let offset = first_difference(record, &expected);
+        assert!(
+            offset.is_none(),
+            "reject record {index} differs from the unknown-card reject at byte offset \
+             {offset:?}"
+        );
+    }
+    let after = Tables::read(&mut store).await?;
+    let [transaction] = after.transactions.as_slice() else {
+        panic!(
+            "{} transactions, not the posted scratch record alone",
+            after.transactions.len()
+        );
+    };
+    // audit: CBTRN02C-023
+    assert_posted(
+        transaction,
+        &DailyTransactionRecord::decode(&posted)?,
+        records.len(),
+    );
+    // audit: CBTRN02C-015
+    assert_balance_moved(
+        &before.balances,
+        &after.balances,
+        LOADED_KEY,
+        Decimal::new(SCRATCH_CENTS, 2),
+    )?;
+    // audit: CBTRN02C-023
+    assert!(
+        after.accounts == remaining,
+        "the accounts are not those the replacement left"
+    );
+    Ok(())
 }

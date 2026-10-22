@@ -1,10 +1,17 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COPAU00 } from "./COPAU00";
 
 /**
@@ -1705,4 +1712,78 @@ describe("BLOCKED X-COPAUS0C-H3: pages after the 20th, not a parity result", () 
     expect(sent).toHaveLength(45);
     expectListed([]);
   });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/authorizations`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COPAU00] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the key that sent the refused
+// request, the test presses no key and follows no link.
+describe("COPAU00 in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the summary of ENTER",
+      replies: [json(401, SIGNON_REQUIRED)],
+      drive: async () => {
+        enter(ACCOUNT);
+      },
+      count: 1,
+    },
+    {
+      title: "the F8 page after page 1",
+      replies: [json(200, PAGE_1), json(401, SIGNON_REQUIRED)],
+      drive: async (sent: ReturnType<typeof stubFetch>) => {
+        enter(ACCOUNT);
+        await answered(sent, 1);
+        press("F8=Forward");
+      },
+      count: 2,
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, count }) => {
+      const sent = stubFetch(...replies);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "View Authorizations" }),
+      ).toBeDefined();
+
+      await drive(sent);
+
+      expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "View Authorizations" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(sent).toHaveLength(count);
+      for (const request of sent) {
+        expect([request.method, request.path, request.authorization]).toEqual([
+          "GET",
+          summaryPath(ACCOUNT),
+          `Bearer ${TOKEN}`,
+        ]);
+      }
+      router.dispose();
+    },
+  );
 });

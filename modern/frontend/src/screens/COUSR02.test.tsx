@@ -1433,3 +1433,187 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
     router.dispose();
   });
 });
+
+// Endpoints 18 and 19 name the user by the path alone, and every request carries the stored
+// session's token.
+describe("COUSR02: endpoint 18 and 19 requests", () => {
+  /** A request as its method, path, query, `Authorization` header and JSON body. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    const text = await request.clone().text();
+    const body: unknown = text === "" ? undefined : JSON.parse(text);
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body,
+    };
+  }
+
+  it("the read and F5's update each send the user's path with the bearer token and no query, and the update's message shows", async () => {
+    const requests = stubApi();
+    renderScreen(FROM_LIST);
+    await selectedShown();
+
+    typeInto("firstName", "LARRY");
+    fireEvent.click(key("F5=Save"));
+    await waitFor(() => {
+      expect(shownMessage()).toEqual({ kind: "info", text: updated.message });
+    });
+    await settle();
+
+    expect(await Promise.all(requests.map(shapeOf))).toEqual([
+      {
+        method: "GET",
+        path: `${ENDPOINT}${SELECTED_ID}`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: undefined,
+      },
+      {
+        method: "PUT",
+        path: `${ENDPOINT}${SELECTED_ID}`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: { first_name: "LARRY", last_name: "THOMAS", user_type: "U" },
+      },
+    ]);
+  });
+});
+
+/**
+ * Renders the application's route table at `/users/update` with `state`, so the admin guard that
+ * only the table mounts stands in front of the screen. Its screens load lazily, so a wait for one
+ * to render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, {
+    initialEntries: [{ pathname: PATHS.COUSR02, state }],
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/** Replaces `fetch` with a stub that answers every request 401; returns them in order sent. */
+function stubRefusingAll(): Request[] {
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      requests.push(req);
+      return json(401, signonRequired);
+    }),
+  );
+  return requests;
+}
+
+/** Sign-on replaced the screen: its ENTER key shows at `/signon`, and no `Update User` title. */
+async function expectSignonShown(router: ReturnType<typeof createMemoryRouter>): Promise<void> {
+  expect(
+    await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+  ).toBeDefined();
+  expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+  expect(screen.queryByRole("heading", { level: 1, name: "Update User" })).toBeNull();
+}
+
+// COUSR02C-003: CU02 reached with no COMMAREA transfers to COSGN00C. The replacement's counterpart
+// is the admin guard in front of `/users/update`, which only the route table mounts: no session
+// on entry, or a session a 401 cleared (`api/client.ts`) while the screen is mounted, both go to
+// `/signon`; after the key that sent the refused request, the test presses no key and follows no
+// link. A `U` session is sent to the main menu instead, as no menu of its own reaches this route.
+describe("COUSR02 in the route table: the admin guard and a 401", () => {
+  // audit: COUSR02C-003
+  it("opened with no session, goes to sign-on before endpoint 18 gets a request", async () => {
+    sessionStorage.clear();
+    const requests = stubApi();
+    const router = renderRouteTable(FROM_LIST);
+
+    await expectSignonShown(router);
+    await settle();
+    expect(requests).toHaveLength(0);
+    expect(getSession()).toBeNull();
+    router.dispose();
+  });
+
+  // audit: COUSR02C-003
+  it("opened with a U session, goes to the main menu, and endpoints 18 and 19 get no request", async () => {
+    setSession("test-token", "USER0001", "U");
+    const requests = stubApi();
+    const router = renderRouteTable(FROM_LIST);
+
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+      },
+      { timeout: 5_000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "Update User" })).toBeNull();
+    // The main menu loads endpoint 2 on entry, which `stubApi` answers 500. Waiting until the menu
+    // shows that answer keeps the load's last render inside the test's waits.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    await waitFor(() => {
+      expect(shownMessage()).toEqual({
+        kind: "error",
+        text: "Unexpected request GET /api/v1/menus/main",
+      });
+    });
+    await settle();
+    expect(sent(requests).filter((request) => request.includes(ENDPOINT))).toEqual([]);
+    router.dispose();
+  });
+
+  // audit: COUSR02C-003
+  it.each([
+    {
+      title: "the fetch of ENTER (endpoint 18)",
+      state: { from: PATHS.COADM01 },
+      stub: stubRefusingAll,
+      drive: async () => {
+        typeInto("userId", TYPED_ID);
+        fireEvent.click(key("ENTER=Fetch"));
+      },
+      expected: [`GET ${ENDPOINT}${TYPED_ID}`],
+    },
+    {
+      title: "the update of F5 (endpoint 19)",
+      state: FROM_LIST,
+      stub: () => stubApi(() => json(401, signonRequired)),
+      drive: async () => {
+        await selectedShown();
+        typeInto("firstName", "LARRY");
+        fireEvent.click(key("F5=Save"));
+      },
+      expected: [`GET ${ENDPOINT}${SELECTED_ID}`, `PUT ${ENDPOINT}${SELECTED_ID}`],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ state, stub, drive, expected }) => {
+      const requests = stub();
+      const router = renderRouteTable(state);
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Update User" }, { timeout: 5_000 }),
+      ).toBeDefined();
+
+      await drive();
+
+      await expectSignonShown(router);
+      expect(getSession()).toBeNull();
+      expect(sent(requests)).toEqual(expected);
+      expect(requests.map((request) => request.headers.get("Authorization"))).toEqual(
+        expected.map(() => "Bearer test-token"),
+      );
+      router.dispose();
+    },
+  );
+});

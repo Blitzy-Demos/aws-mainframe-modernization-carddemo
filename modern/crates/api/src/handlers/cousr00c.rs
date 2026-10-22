@@ -4,7 +4,7 @@
 //! ENTER lists from the search field and F8 and F7 page forward and backward, ten rows by
 //! default. The `U` and `D` row selections, which transfer to COUSR02C and COUSR03C, and F3 only
 //! navigate and are the screen's, so they reach no endpoint. `POST` on the same path is
-//! `handlers::cousr01c::add`, registered with this handler in one `routes!`.
+//! `handlers::cousr01c::add`, registered with this handler on the same path item.
 //!
 //! - **Admin only.** The `AdminUser` extractor is the gate: 401 without a valid bearer token,
 //!   403 for a user type other than `A`, before the query is read (COUSR00C-001). The search
@@ -26,6 +26,9 @@ use crate::dto::cousr00c::{UserListQuery, UserListResponse};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`list`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ListOperation;
+
 /// List users (CU00 / COUSR00C)
 ///
 /// ENTER lists from `start_user_id`, or from the first user ID when it is absent or blank. F8
@@ -41,6 +44,7 @@ use crate::services;
 /// or range rule; 401 without a valid bearer token; 403 when the token's user type is not `A`;
 /// 422 when `page_size` lies outside 1 to 100; 500 when the users cannot be read.
 #[utoipa::path(
+    impl_for = ListOperation,
     get,
     path = "/api/v1/users",
     operation_id = "cousr00c_list",

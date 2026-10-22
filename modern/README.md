@@ -97,7 +97,7 @@ A job that writes files prints each path it wrote, one per line. Outputs stay on
 | `scripts/protected-diff.sh` | Fails on any change to the COBOL tree or to any other path outside `modern/` |
 | `node scripts/frontend-policy.mjs` | Fails on a frontend dependency missing from `frontend/approved-dependencies.json`, or a hand-written type that restates a generated API type |
 
-`dev-up.sh`, `check.sh`, `regen-api.sh`, `e2e.sh` and `protected-diff.sh` print their usage with `--help`. `frontend-policy.mjs` reads its first argument as the directory to check in place of `modern/`, so do not pass it `--help`.
+`dev-up.sh`, `check.sh`, `regen-api.sh`, `e2e.sh`, `protected-diff.sh` and `frontend-policy.mjs` print their usage with `--help`; `frontend-policy.mjs` also takes an optional root directory to check in place of `modern/`.
 
 ### Frontend
 

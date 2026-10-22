@@ -33,6 +33,9 @@ use crate::dto::cocrdlic::{CardListQuery, CardListResponse};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`list`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ListOperation;
+
 /// List cards (CCLI / COCRDLIC).
 ///
 /// One page of the card list in ascending card-number order. ENTER applies the account and card
@@ -51,6 +54,7 @@ use crate::services;
 /// - 500: a card read failed, answered with the program's file-error text, or the request failed
 ///   internally.
 #[utoipa::path(
+    impl_for = ListOperation,
     get,
     path = "/api/v1/cards",
     operation_id = "cocrdlic_list",

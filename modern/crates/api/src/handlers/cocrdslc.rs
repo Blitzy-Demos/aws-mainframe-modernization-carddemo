@@ -32,12 +32,18 @@ use crate::dto::cocrdslc::{CardLookupQuery, CardViewResponse};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`view`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ViewOperation;
+
 /// View a card (CCDL / COCRDSLC).
 ///
-/// ENTER on the card detail screen: the card is looked up by the account and either the typed
-/// `card_num` or the `card_ref` handle of a card list row, never both. The card number is
-/// returned in full only to an administrator token; any other token receives twelve asterisks
-/// followed by the last four digits. The response carries no card verification code.
+/// ENTER on the card detail screen: the card is selected by its key alone, either the typed
+/// `card_num` or the `card_ref` handle of a card list row, never both. `acct_id` is validated by
+/// COCRDSLC's account edit and returned as the displayed account; it is never compared with the
+/// card's stored account, so a card held by another account is shown under the account entered.
+/// The card number is returned in full only to an administrator token; any other token receives
+/// twelve asterisks followed by the last four digits. The response carries no card verification
+/// code.
 ///
 /// # Errors
 ///
@@ -46,6 +52,7 @@ use crate::services;
 /// without a valid bearer token; 404 when no card has the number or handle; 500 when the card
 /// read fails.
 #[utoipa::path(
+    impl_for = ViewOperation,
     get,
     path = "/api/v1/cards/view",
     operation_id = "cocrdslc_view",

@@ -2,13 +2,16 @@
 //! `DATABASE_URL`, through the embedded migrator in `runtime::migrate`.
 //!
 //! This binary is the only operator entrypoint for schema changes: the API, worker and batch
-//! binaries never migrate, and the `sqlx` command-line tool only prepares the query cache. A run
-//! against an already migrated database applies nothing and still succeeds. The exit status is
-//! non-zero when the configuration, the connection or a migration fails. A configuration error
-//! names its variable and never its value. A connection or migration error is logged only as
-//! the value-free summary that `runtime::db` or `runtime::migrate` builds: an error class with at
-//! most migration versions and a SQLSTATE, never the driver's or the server's text. Neither the
-//! connection URL nor any value it carries reaches the output.
+//! binaries never migrate, and the `sqlx` command-line tool only prepares the query cache. A
+//! successful run logs one INFO event, `migrations applied`, whose `applied` field counts the
+//! migrations this run applied and whose `latest_version` field names the latest version the
+//! database records. A run against an already migrated database applies nothing, logs `applied`
+//! 0, and still succeeds. The exit status is non-zero when the configuration, the connection or
+//! a migration fails. A configuration error names its variable and never its value. A connection
+//! or migration error is logged only as the value-free summary that `runtime::db` or
+//! `runtime::migrate` builds: an error class with at most migration versions and a SQLSTATE,
+//! never the driver's or the server's text. Neither the connection URL nor any value it carries
+//! reaches the output.
 
 use std::process::ExitCode;
 
@@ -44,12 +47,16 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let applied = runtime::migrate::apply(&pool).await;
+        let outcome = runtime::migrate::apply(&pool).await;
         // Closing also ends the session that holds the migration lock after a failure.
         pool.close().await;
-        match applied {
-            Ok(()) => {
-                tracing::info!("migrations applied");
+        match outcome {
+            Ok(applied) => {
+                tracing::info!(
+                    applied = applied.count(),
+                    latest_version = applied.latest(),
+                    "migrations applied"
+                );
                 ExitCode::SUCCESS
             }
             Err(err) => {

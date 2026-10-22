@@ -15,14 +15,17 @@
 //!
 //! 1. `--start-date` and `--end-date` become the DATEPARM window, two typed dates (CBTRN03C-001,
 //!    CBTRN03C-002; Typed Dates and Timestamps). The one window stands for both the SORT
-//!    constants and the DATEPARM record (X-TRANREPT-1).
+//!    constants and the DATEPARM record (X-TRANREPT-1). Once it is accepted the start line is
+//!    shown, before any table is read (CBTRN03C-006).
 //! 2. The inputs are opened in the program's order (CBTRN03C-007): the selection of
 //!    `transactions` (`TRANFILE`), the generation file (`REPTFILE`), then the reads of
 //!    `card_xref` (`CARDXREF`), `transaction_types` (`TRANTYPE`) and `transaction_categories`
 //!    (`TRANCATG`). Every read is read-only; the job writes no table (CBTRN03C-003). The
 //!    selection opens with the read of its first row, so a statement that fails ends the job
 //!    before the generation file exists. Its rows hold one pooled connection until the loop
-//!    ends, so the lookup tables are read on other connections of the pool.
+//!    ends, so the lookup tables are read on other connections of the pool. The DATEPARM record
+//!    is built in memory, so its read always succeeds and shows the `Reporting from` line
+//!    (CBTRN03C-008, CBTRN03C-009).
 //! 3. Each selected row is read when the loop reaches it, as `1000-TRANFILE-GET-NEXT` reads the
 //!    next record (CBTRN03C-010), and goes to `Tranrept::process` in the order the repository
 //!    returns it; the job neither filters nor sorts again. Rows of one card come in
@@ -38,18 +41,45 @@
 //!    and the missing account total of the last card are the domain's, reproduced as audited
 //!    and never corrected here (CBTRN03C-030, CBTRN03C-031, X-TRANREPT-7; Behaviour
 //!    constraint).
-//! 5. A normal end returns code 0 and the generation path, which `main` prints (CBTRN03C-034).
+//! 5. A normal end shows the end line once the generation is complete and returns code 0 and the
+//!    generation path, which `main` prints after it (CBTRN03C-032, CBTRN03C-034).
 //!
 //! # Abends
 //!
-//! A lookup's `INVALID KEY` (CBTRN03C-014, CBTRN03C-016, CBTRN03C-018), a card number that is not
-//! 16 digits (X-TRANREPT-H4), a failed query (CBTRN03C-007, CBTRN03C-010, CBTRN03C-040 to
-//! CBTRN03C-042, X-TRANREPT-10) or a failed write (CBTRN03C-033) ends the job with its
-//! [`JobError`]. The unfinished generation file is then removed, as `DISP=(NEW,CATLG,DELETE)`
-//! deletes it at abend, so no path is printed and the next run takes the same generation number
-//! (CBTRN03C-035). A row that cannot be fetched or decoded after the first one fails once the
-//! records of the rows before it are written, and ends the job the same way, with
-//! [`JobError::Persistence`] (CBTRN03C-010).
+//! Every failure path ends as `9999-ABEND-PROGRAM` does: its job-log lines, then
+//! `ABENDING PROGRAM`, whose event carries the abend code 999 the program passes to `CEE3ABD`,
+//! then the job's [`JobError`] (CBTRN03C-035). The unfinished generation file is then removed,
+//! as `DISP=(NEW,CATLG,DELETE)` deletes it at abend, so no path and no end line are shown and the
+//! next run takes the same generation number. No table is written, so nothing is rolled back
+//! (CBTRN03C-003).
+//!
+//! | Failure | Lines before `ABENDING PROGRAM` | Rule |
+//! |---|---|---|
+//! | the selection's statement or its first row cannot be read | `ERROR OPENING TRANFILE`, status | CBTRN03C-007 |
+//! | the generation cannot be allocated or created | `ERROR OPENING REPTFILE`, status | CBTRN03C-007 |
+//! | `card_xref` cannot be read | `ERROR OPENING CROSS REF FILE`, status | CBTRN03C-007 |
+//! | `transaction_types` cannot be read | `ERROR OPENING TRANSACTION TYPE FILE`, status | CBTRN03C-007 |
+//! | `transaction_categories` cannot be read | `ERROR OPENING TRANSACTION CATG FILE`, status | CBTRN03C-007 |
+//! | a later row of the selection cannot be fetched or decoded | `ERROR READING TRANSACTION FILE`, status | CBTRN03C-010 |
+//! | a report record cannot be written | `ERROR WRITING REPTFILE`, status | CBTRN03C-033 |
+//! | the generation cannot be flushed or synced | `ERROR CLOSING REPORT FILE`, status | CBTRN03C-034 |
+//! | a card, type or category key missing from its table | the domain's `INVALID ...` line and `FILE STATUS IS: NNNN0023` | CBTRN03C-014, CBTRN03C-016, CBTRN03C-018 |
+//! | a card number that is not 16 digits | none (X-TRANREPT-H4) | CBTRN03C-035 |
+//!
+//! - A failed database or file call first adds one event naming the file operation it replaces
+//!   and the error: an SQLSTATE, a constraint or a column, or a static step and an I/O error
+//!   kind, never a value or a path. A failed generation open also names the setting of the
+//!   directory, `reports under CARDDEMO_VAR_DIR`.
+//! - The status line is `FILE STATUS IS: NNNN` and four characters (CBTRN03C-036).
+//!   `HALTED(X-TRANREPT-H3)`: a `PostgreSQL` or file-system failure has no file status, so the
+//!   job shows `0030`, the permanent-error status, as a stand-in that is no parity result.
+//! - Those paths end with [`JobError::Abend`], whose reason is the failure line; the lookup
+//!   abends end with [`JobError::Report`]. Neither carries a return code, as `CEE3ABD` sets none,
+//!   so the exit status is 1, a value X-TRANREPT-4 leaves to the reviewer.
+//! - The lookup tables are read whole when they are opened, so a failed read of one is that
+//!   open's failure, before the first record. During the loop a lookup can only miss its key.
+//!   The COBOL's fall-through for a lookup read that fails otherwise (CBTRN03C-040 to
+//!   CBTRN03C-042, X-TRANREPT-10) is `HALTED(X-TRANREPT-H5)` and has no counterpart here.
 //!
 //! # Data versions (E23)
 //!
@@ -60,28 +90,98 @@
 //!
 //! # Job log and cardholder data
 //!
-//! The program's `DISPLAY` lines (CBTRN03C-006, CBTRN03C-008, CBTRN03C-012, CBTRN03C-014,
-//! CBTRN03C-029, CBTRN03C-034, CBTRN03C-035) are not written: standard output carries only the
-//! paths `main` prints from [`JobOutcome::written`] (AAP 0.3.4.3), and the job has no tracing of
-//! its own. Report records hold no card number (CBTRN03C-023); the job's errors are the fixed
-//! texts of [`JobError`] and its counts are plain numbers, so nothing the job emits carries a
-//! card number, an SSN or a password (CBTRN03C-039; Cardholder Data Redaction).
+//! Each `DISPLAY` the program performs is one tracing event whose message is the line's text
+//! exactly, in program order: `INFO` for the lines of a run and `ERROR` for the lines a failure
+//! path adds (see Abends). The events reach standard output as the JSON stream of
+//! `runtime::telemetry`, so the stdout lines that are not JSON stay the paths `main` prints from
+//! [`JobOutcome::written`] (AAP 0.3.4.3, 0.3.4.7). A run shows:
+//!
+//! 1. `START OF EXECUTION OF PROGRAM CBTRN03C`, before any table is read; a refused window shows
+//!    nothing (CBTRN03C-002, CBTRN03C-006).
+//! 2. `Reporting from <start> to <end>`, once the inputs are open (CBTRN03C-008).
+//! 3. For each row the window selects, its `TRAN-RECORD` line, before the row is reported; a row
+//!    outside the window shows none (CBTRN03C-011, CBTRN03C-012).
+//! 4. At end of file after a record, the `TRAN-AMT ` and `WS-PAGE-TOTAL` lines, before the
+//!    final totals are written (CBTRN03C-029).
+//! 5. `END OF EXECUTION OF PROGRAM CBTRN03C`, once the generation is complete, the last line of a
+//!    normal end (CBTRN03C-034).
+//!
+//! Two lines carry record data, both built by the domain: the `TRAN-RECORD` line, whose card
+//! number is redacted and whose six free-text fields show as `*` whatever they hold, and the
+//! `INVALID CARD NUMBER : ` line, whose card number is redacted (CBTRN03C-012, CBTRN03C-014;
+//! X-TRANREPT-3). The rest of the `TRAN-RECORD` line is the row's encoding, except that the job
+//! shows any 16 bytes of it that equal a `card_xref` card number or the row's own, such as a
+//! transaction ID that is one, in the redacted form too; the line keeps its 350 bytes. Every
+//! other line is a fixed literal, the window's dates or an amount, and a failure's event carries
+//! an SQLSTATE, a constraint or an I/O error kind only. Report records have no card field
+//! (CBTRN03C-023), and the generation is a local file, not egress. The job's errors are the
+//! fixed texts of [`JobError`] and its counts are plain numbers, so nothing the job emits carries
+//! a full card number, an SSN or a password (CBTRN03C-039; Cardholder Data Redaction).
 
-use domain::batch::cbtrn03c::{DateParm, DateParmError, Flow, ReportRecord, Tranrept};
+use std::collections::HashSet;
+
+use copybook::PicX;
+use domain::batch::cbtrn03c::{
+    ABEND_LINE, CLOSE_REPTFILE_ERROR, DateParm, DateParmError, END_LINE, FILE_STATUS_LABEL, Flow,
+    OPEN_CARDXREF_ERROR, OPEN_REPTFILE_ERROR, OPEN_TRANCATG_ERROR, OPEN_TRANFILE_ERROR,
+    OPEN_TRANTYPE_ERROR, READ_TRANFILE_ERROR, ReportError, ReportRecord, START_LINE, Tranrept,
+    WRITE_REPTFILE_ERROR, record_display, selects,
+};
 use domain::records::{
     CardXrefRecord, TransactionCategoryRecord, TransactionRecord, TransactionTypeRecord,
 };
+use domain::sensitive::CardNumber;
 use persistence::{
-    CardXrefRepository, TransactionCategoryRepository, TransactionRepository, TransactionRows,
-    TransactionTypeRepository,
+    CardXrefRepository, PersistenceError, TransactionCategoryRepository, TransactionRepository,
+    TransactionRows, TransactionTypeRepository,
 };
+use runtime::telemetry::JobCounter;
 
-use super::{JobContext, JobError, JobOutcome, OutputFile, count};
+use super::{JobContext, JobError, JobOutcome, OutputFile, REPORTS_DIR_SETTING, count};
 use crate::cli::TranreptArgs;
 
 /// The generation base of the report, `AWS.M2.CARDDEMO.TRANREPT(+1)` of `TRANREPT.jcl:80`
 /// (CBTRN03C-032).
 const REPORT_BASE: &str = "TRANREPT";
+
+/// `MOVE 999 TO ABCODE` before `CALL 'CEE3ABD'` (`CBTRN03C.cbl:629-630`; CBTRN03C-035): the
+/// abend code the `ABENDING PROGRAM` event carries, where X-TRANREPT-4 proposes to record it.
+const ABEND_CODE: i32 = 999;
+
+/// The four status characters of the status line after the failure of a database or file call:
+/// `00` and `30`, a permanent error. `HALTED(X-TRANREPT-H3)`: such a failure has no file status,
+/// so this is a stand-in, never a parity result (CBTRN03C-036).
+const STAND_IN_STATUS: &str = "0030";
+
+/// Bytes of a card number, `PIC X(16)` (PIC-024).
+const CARD_LEN: usize = 16;
+
+/// The leading bytes of a card number that its redacted form shows as `*`: all but the last four
+/// (PIC-024; Cardholder Data Redaction).
+const CARD_MASKED_LEN: usize = 12;
+
+/// The character the redacted form of a card number shows for each masked byte.
+const CARD_MASK: u8 = b'*';
+
+// The file operation each database or file call replaces, named in the event that reports its
+// failure.
+
+/// `0000-TRANFILE-OPEN` and the read of the selection's first row, done at once.
+const OPEN_TRANFILE_OP: &str = "OPEN TRANFILE";
+/// `0100-REPTFILE-OPEN`.
+const OPEN_REPTFILE_OP: &str = "OPEN REPTFILE";
+/// `0200-CARDXREF-OPEN` and every keyed read of `1500-A-LOOKUP-XREF`, done at once.
+const OPEN_CARDXREF_OP: &str = "OPEN CARDXREF";
+/// `0300-TRANTYPE-OPEN` and every keyed read of `1500-B-LOOKUP-TRANTYPE`, done at once.
+const OPEN_TRANTYPE_OP: &str = "OPEN TRANTYPE";
+/// `0400-TRANCATG-OPEN` and every keyed read of `1500-C-LOOKUP-TRANCATG`, done at once.
+const OPEN_TRANCATG_OP: &str = "OPEN TRANCATG";
+/// The `READ` of `1000-TRANFILE-GET-NEXT` after the first row.
+const READ_TRANFILE_OP: &str = "READ TRANFILE";
+/// The `WRITE` of `1111-WRITE-REPORT-REC`.
+const WRITE_REPTFILE_OP: &str = "WRITE REPTFILE";
+/// `9100-REPTFILE-CLOSE`.
+const CLOSE_REPTFILE_OP: &str = "CLOSE REPTFILE";
 
 /// Runs TRANREPT over the window of `args`: writes the next `TRANREPT` generation under
 /// `Config::reports_dir` and returns its path, return code 0, and the counts `records` (rows
@@ -89,37 +189,57 @@ const REPORT_BASE: &str = "TRANREPT";
 ///
 /// # Errors
 ///
-/// - [`JobError::Abend`] for a window `DateParm::new` refuses, before any table is read
-///   (CBTRN03C-002); a command line `clap` parsed never gives one.
-/// - [`JobError::Persistence`] when the selection or a lookup table cannot be read: the
-///   selection's statement or its first row before the generation file exists, a lookup table
-///   after it (CBTRN03C-007), and a later row of the selection once the records of the rows
-///   before it are written (CBTRN03C-010).
-/// - [`JobError::Report`] for the abends of `CBTRN03C`: a card, type or category key missing
-///   from its table, or a card number that is not 16 digits (CBTRN03C-014, CBTRN03C-016,
-///   CBTRN03C-018, CBTRN03C-035).
-/// - [`JobError::Io`] when the generation file cannot be allocated, created, written or synced
-///   (CBTRN03C-007, CBTRN03C-033, CBTRN03C-034).
-/// - [`JobError::GenerationLimit`] when generation 9999 of `TRANREPT` exists (CBTRN03C-007).
+/// - [`JobError::Abend`] for a window `DateParm::new` refuses, before any table is read and
+///   before the start line (CBTRN03C-002); a command line `clap` parsed never gives one.
+/// - [`JobError::Abend`] whose reason is the failure line, after the failure's event, that line,
+///   the status line and `ABENDING PROGRAM` (module documentation, Abends): when the selection's
+///   statement or its first row, the generation file or a lookup table cannot be read or created
+///   (CBTRN03C-007), a later row of the selection cannot be fetched or decoded once the records
+///   of the rows before it are written (CBTRN03C-010), a report record cannot be written
+///   (CBTRN03C-033), or the generation file cannot be flushed or synced (CBTRN03C-034).
+/// - [`JobError::Report`] for the lookup abends of `CBTRN03C`, after the domain's job-log lines
+///   and `ABENDING PROGRAM`: a card, type or category key missing from its table, or a card
+///   number that is not 16 digits (CBTRN03C-014, CBTRN03C-016, CBTRN03C-018, CBTRN03C-035).
 ///
-/// After any error the generation file is removed (CBTRN03C-035).
+/// After any error the generation file is removed and no end line is shown (CBTRN03C-035).
 pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<JobOutcome, JobError> {
     let parm = args.date_parm().map_err(window_error)?;
+    tracing::info!("{START_LINE}");
     // Each store is a handle on the shared pool, cloned for the `&mut self` repository calls.
     // The selection's rows borrow theirs, and hold one pooled connection, until the loop ends,
     // so the lookup tables are read through a second handle, on other connections.
     let mut selection = ctx.store.clone();
     let mut rows = selection
         .stream_processed_between(parm.start(), parm.end())
-        .await?;
+        .await
+        .map_err(|error| database_failure(OPEN_TRANFILE_OP, OPEN_TRANFILE_ERROR, &error))?;
     // `TRANFILE` opens with the selection's first row, before `REPTFILE`: a statement that fails
     // ends the job before any generation file exists (CBTRN03C-007).
-    let first = rows.next().await?;
-    let mut output = OutputFile::next_generation(&ctx.config.reports_dir(), REPORT_BASE).await?;
+    let first = rows
+        .next()
+        .await
+        .map_err(|error| database_failure(OPEN_TRANFILE_OP, OPEN_TRANFILE_ERROR, &error))?;
+    // The event names the setting of the directory, never its path: the job returns its abend,
+    // so `main` cannot name it in the error.
+    let mut output = OutputFile::next_generation(&ctx.config.reports_dir(), REPORT_BASE)
+        .await
+        .map_err(|error| {
+            let error = error.naming_output_dir(REPORTS_DIR_SETTING);
+            file_failure(OPEN_REPTFILE_OP, OPEN_REPTFILE_ERROR, &error)
+        })?;
     let mut store = ctx.store.clone();
-    let xrefs = CardXrefRepository::find_all(&mut store).await?;
-    let types = TransactionTypeRepository::find_all(&mut store).await?;
-    let categories = TransactionCategoryRepository::find_all(&mut store).await?;
+    let xrefs = CardXrefRepository::find_all(&mut store)
+        .await
+        .map_err(|error| database_failure(OPEN_CARDXREF_OP, OPEN_CARDXREF_ERROR, &error))?;
+    let types = TransactionTypeRepository::find_all(&mut store)
+        .await
+        .map_err(|error| database_failure(OPEN_TRANTYPE_OP, OPEN_TRANTYPE_ERROR, &error))?;
+    let categories = TransactionCategoryRepository::find_all(&mut store)
+        .await
+        .map_err(|error| database_failure(OPEN_TRANCATG_OP, OPEN_TRANCATG_ERROR, &error))?;
+    // `0550-DATEPARM-READ`: the record built from the window always exists, so the read ends
+    // with status `00` and shows the window (CBTRN03C-008, CBTRN03C-009).
+    tracing::info!("{}", parm.reporting_line());
     let (read, report_lines) = report(
         parm,
         first,
@@ -133,13 +253,17 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<Job
     // A loop left at `Flow::Stop` reads no further row: the read ends here and its connection
     // returns to the pool before the generation is finished.
     drop(rows);
-    let path = output.finish().await?;
+    let path = output
+        .finish()
+        .await
+        .map_err(|error| file_failure(CLOSE_REPTFILE_OP, CLOSE_REPTFILE_ERROR, &error))?;
+    tracing::info!("{END_LINE}");
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
         counts: vec![
-            ("records", count(read)),
-            ("report_lines", count(report_lines)),
+            (JobCounter::Records, count(read)),
+            (JobCounter::ReportLines, count(report_lines)),
         ],
     })
 }
@@ -153,11 +277,17 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<Job
 /// pass's records, is held (W011-F06). Returns the number of rows passed, the stopping one
 /// included, and the number of records written.
 ///
+/// A row the window selects shows its `TRAN-RECORD` line before it is reported, as the program
+/// displays it after the window test and before the lookups (CBTRN03C-012); a row outside the
+/// window shows none (CBTRN03C-011). At end of file the two lines of CBTRN03C-029 are shown
+/// before the final totals are written.
+///
 /// # Errors
 ///
-/// [`JobError::Report`] for the `ReportError` that abended the run (CBTRN03C-035),
-/// [`JobError::Persistence`] when the next row cannot be fetched or decoded (CBTRN03C-010), and
-/// [`JobError::Io`] when a record cannot be written (CBTRN03C-033).
+/// [`JobError::Report`] for the `ReportError` that abended the run, after its job-log lines and
+/// `ABENDING PROGRAM` (CBTRN03C-035), and [`JobError::Abend`] after the failure's lines when the
+/// next row cannot be fetched or decoded (CBTRN03C-010) or a record cannot be written
+/// (CBTRN03C-033).
 async fn report(
     parm: DateParm,
     first: Option<TransactionRecord>,
@@ -167,20 +297,34 @@ async fn report(
     categories: Vec<TransactionCategoryRecord>,
     output: &mut OutputFile,
 ) -> Result<(usize, usize), JobError> {
+    // The card numbers every `TRAN-RECORD` line redacts wherever they appear, taken from the
+    // cross-reference once, before the first line is shown.
+    let held: HashSet<CardNumber> = xrefs.iter().map(|xref| xref.card_num.clone()).collect();
     let mut run = Tranrept::new(parm, xrefs, types, categories);
     let mut read = 0;
     let mut written = 0;
     let mut next = first;
     while let Some(row) = next {
         read += 1;
-        let flow = run.process(&row)?;
+        if selects(&row, &parm) {
+            tracing::info!("{}", record_line(&row, &held));
+        }
+        let flow = run.process(&row).map_err(lookup_abend)?;
         written += write_records(output, run.take_records()).await?;
         if flow == Flow::Stop {
             break;
         }
-        next = rows.next().await?;
+        next = rows
+            .next()
+            .await
+            .map_err(|error| database_failure(READ_TRANFILE_OP, READ_TRANFILE_ERROR, &error))?;
     }
-    written += write_records(output, run.finish()?).await?;
+    if let Some(lines) = run.end_of_file_display() {
+        for line in lines {
+            tracing::info!("{line}");
+        }
+    }
+    written += write_records(output, run.finish().map_err(lookup_abend)?).await?;
     Ok((read, written))
 }
 
@@ -189,15 +333,111 @@ async fn report(
 ///
 /// # Errors
 ///
-/// [`JobError::Io`] when a record cannot be written (CBTRN03C-033).
+/// [`JobError::Abend`] with `ERROR WRITING REPTFILE`, after the failure's lines, when a record
+/// cannot be written (CBTRN03C-033).
 async fn write_records(
     output: &mut OutputFile,
     records: Vec<ReportRecord>,
 ) -> Result<usize, JobError> {
     for record in &records {
-        output.write_record(record).await?;
+        output
+            .write_record(record)
+            .await
+            .map_err(|error| file_failure(WRITE_REPTFILE_OP, WRITE_REPTFILE_ERROR, &error))?;
     }
     Ok(records.len())
+}
+
+/// The `TRAN-RECORD` job-log line of `row`: the domain's 350 bytes, its card number redacted and
+/// its free-text fields masked, and any other 16 bytes equal to a card number of `held` or to the
+/// row's own redacted too ([`redact_held_cards`]), one character per byte (CBTRN03C-012,
+/// CBTRN03C-039).
+fn record_line(row: &TransactionRecord, held: &HashSet<CardNumber>) -> String {
+    let mut line = record_display(row);
+    redact_held_cards(&mut line, held, &row.card_num);
+    line.into_iter().map(char::from).collect()
+}
+
+/// Shows in the redacted form, twelve `*` and the last four digits, every 16 bytes of `line` that
+/// equal `own` or a card number of `held`. The matches are all found on `line` as given before
+/// any byte is masked, so two that overlap leave no more than the last four digits of either.
+/// The line keeps its length.
+///
+/// Cardholder Data Redaction: CBTRN03C-012 shows bytes 1-22, 133-152 and 279-330 of the line as
+/// the row's encoding, but nothing keeps a card number out of them (a transaction ID can be one)
+/// and the rule allows no full card number in a job-log event. Only such 16 bytes depart from
+/// the row's encoding; every other byte is the domain's.
+fn redact_held_cards(line: &mut [u8], held: &HashSet<CardNumber>, own: &CardNumber) {
+    let starts: Vec<usize> = line
+        .windows(CARD_LEN)
+        .enumerate()
+        .filter(|(_, window)| {
+            <[u8; CARD_LEN]>::try_from(*window)
+                .map(|bytes| CardNumber::new(PicX::from_array(bytes)))
+                .is_ok_and(|card| card == *own || held.contains(&card))
+        })
+        .map(|(start, _)| start)
+        .collect();
+    for start in starts {
+        if let Some(masked) = line.get_mut(start..start + CARD_MASKED_LEN) {
+            masked.fill(CARD_MASK);
+        }
+    }
+}
+
+/// The failure of repository call `operation` on the path that displays `line`: the event
+/// carrying the error, whose text is an SQLSTATE, a constraint or a column only (Cardholder Data
+/// Redaction), then the path's lines and the abend.
+fn database_failure(
+    operation: &'static str,
+    line: &'static str,
+    error: &PersistenceError,
+) -> JobError {
+    tracing::error!(operation, error = %error, "CBTRN03C database call failed");
+    abend(line)
+}
+
+/// The failure of local-file call `operation` on the path that displays `line`: the event
+/// carrying the error, whose text is a static step and the I/O error kind, or the generation
+/// limit and the `TRANREPT` base, never the path; then the path's lines and the abend.
+fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -> JobError {
+    tracing::error!(operation, error = %error, "CBTRN03C file operation failed");
+    abend(line)
+}
+
+/// `9999-ABEND-PROGRAM` after the failure line `line`: `line`, the status line of
+/// `9910-DISPLAY-IO-STATUS` with the stand-in status (CBTRN03C-036, X-TRANREPT-H3), then
+/// `ABENDING PROGRAM` and the abend, with no return code (CBTRN03C-035, X-TRANREPT-4). The caller
+/// returns the error at once, which drops the unfinished generation and so removes it.
+fn abend(line: &'static str) -> JobError {
+    tracing::error!("{line}");
+    tracing::error!("{FILE_STATUS_LABEL}{STAND_IN_STATUS}");
+    show_abend();
+    JobError::Abend {
+        code: None,
+        reason: line,
+    }
+}
+
+/// The abend of a lookup that misses its key, or of a card number that is not 16 digits: the
+/// domain's `INVALID ...` and status lines, which show the card number redacted
+/// (CBTRN03C-014, CBTRN03C-016, CBTRN03C-018), none for `HALTED(X-TRANREPT-H4)`, then
+/// `ABENDING PROGRAM` and [`JobError::Report`], whose text names the failed lookup only
+/// (CBTRN03C-035).
+fn lookup_abend(error: ReportError) -> JobError {
+    if let Some(lines) = error.job_log_lines() {
+        for line in lines {
+            tracing::error!("{line}");
+        }
+    }
+    show_abend();
+    JobError::Report(error)
+}
+
+/// `DISPLAY 'ABENDING PROGRAM'`, the last job-log line of every failure path, carrying the
+/// abend code `CEE3ABD` is called with (CBTRN03C-035, X-TRANREPT-4).
+fn show_abend() {
+    tracing::error!(abend_code = ABEND_CODE, "{ABEND_LINE}");
 }
 
 /// The [`JobError`] of a window the domain refuses (CBTRN03C-002). `JobError` has no variant of
@@ -216,14 +456,15 @@ fn window_error(error: DateParmError) -> JobError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::error::Error;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use copybook::{PicTimestamp, PicU, PicX};
-    use domain::batch::cbtrn03c::{DateParm, DateParmError, REPORT_RECORD_LEN};
+    use copybook::{FixedRecord, PicTimestamp, PicU, PicX};
+    use domain::batch::cbtrn03c::{DateParm, DateParmError, REPORT_RECORD_LEN, record_display};
     use domain::money::{Decimal, Money};
     use domain::records::{
         CardXrefRecord, TransactionCategoryRecord, TransactionRecord, TransactionTypeRecord,
@@ -231,7 +472,7 @@ mod tests {
     use domain::sensitive::CardNumber;
     use persistence::{PersistenceError, TransactionRows};
 
-    use super::{JobError, OutputFile, REPORT_BASE, report, window_error};
+    use super::{OutputFile, REPORT_BASE, record_line, report, window_error};
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -450,9 +691,10 @@ mod tests {
         Ok(())
     }
 
-    /// A row that cannot be fetched after the first ends the run with the repository's error once
-    /// the first row's records are written; the row after the failure is never read, and the
-    /// generation is removed once the run drops it.
+    /// A row that cannot be fetched after the first ends the run on the abend path of
+    /// `1000-TRANFILE-GET-NEXT` once the first row's records are written, with no return code;
+    /// the row after the failure is never read, and the generation is removed once the run drops
+    /// it.
     // audit: CBTRN03C-010
     // audit: CBTRN03C-035
     #[tokio::test]
@@ -482,10 +724,8 @@ mod tests {
         .await
         .err()
         .ok_or("a failed fetch was reported")?;
-        assert!(
-            matches!(error, JobError::Persistence(PersistenceError::Unavailable)),
-            "{error}"
-        );
+        assert_eq!(error.to_string(), "ABEND: ERROR READING TRANSACTION FILE");
+        assert_eq!(error.exit_code(), None);
         assert!(
             rows.next().await?.is_none(),
             "a row after the failure was read"
@@ -519,5 +759,99 @@ mod tests {
             assert_eq!(job_error.to_string(), text);
             assert_eq!(job_error.exit_code(), None);
         }
+    }
+
+    /// Bytes 1-22 of the rows of [`held_card_numbers_are_redacted_anywhere_in_the_line`],
+    /// `TRAN-ID`, `TRAN-TYPE-CD` and `TRAN-CAT-CD`: the digits `0` to `9` in turn, so that each
+    /// 16 of them are a synthetic card number in no fixture file.
+    fn leading_digits() -> [u8; 22] {
+        let mut digits = [b'0'; 22];
+        for (digit, n) in digits.iter_mut().zip(0_u8..) {
+            *digit = b'0' + n % 10;
+        }
+        digits
+    }
+
+    /// A card number of a case: [`CARD`] for `None`, else the 16 of [`leading_digits`] from
+    /// offset `at`.
+    fn case_card(at: Option<usize>) -> Result<CardNumber, Box<dyn Error>> {
+        let bytes = match at {
+            None => CARD,
+            Some(start) => <[u8; 16]>::try_from(
+                leading_digits()
+                    .get(start..start + 16)
+                    .ok_or("a card number past byte 22")?,
+            )?,
+        };
+        Ok(CardNumber::new(PicX::from_array(bytes)))
+    }
+
+    /// One row of [`held_card_numbers_are_redacted_anywhere_in_the_line`], whose bytes 1-22 are
+    /// [`leading_digits`]: its own card number and the ones `card_xref` holds, as [`case_card`]
+    /// names them, and the 0-based bytes of the domain's line that show as `*` besides.
+    struct RedactionCase {
+        own: Option<usize>,
+        held: &'static [Option<usize>],
+        masked: Option<(usize, usize)>,
+    }
+
+    /// The `TRAN-RECORD` line is the domain's but that every 16 bytes equal to a card number the
+    /// run holds show twelve `*` and its last four digits: one that spans `TRAN-ID`, the type
+    /// and the category; the row's own, which `card_xref` lacks; two that overlap, neither then
+    /// showing more than its last four digits. A transaction ID that is no such number shows as
+    /// stored.
+    // audit: CBTRN03C-012
+    // audit: CBTRN03C-039
+    #[test]
+    fn held_card_numbers_are_redacted_anywhere_in_the_line() -> TestResult {
+        let cases = [
+            RedactionCase {
+                own: None,
+                held: &[None, Some(6)],
+                masked: Some((6, 18)),
+            },
+            RedactionCase {
+                own: Some(0),
+                held: &[],
+                masked: Some((0, 12)),
+            },
+            RedactionCase {
+                own: None,
+                held: &[None, Some(0), Some(6)],
+                masked: Some((0, 18)),
+            },
+            RedactionCase {
+                own: None,
+                held: &[None],
+                masked: None,
+            },
+        ];
+        for (case, number) in cases.iter().zip(1..) {
+            let mut bytes = purchase(1, INSIDE)?.encode();
+            bytes
+                .get_mut(..22)
+                .ok_or("a record shorter than 22 bytes")?
+                .copy_from_slice(&leading_digits());
+            let mut row = TransactionRecord::decode(&bytes)?;
+            row.card_num = case_card(case.own)?;
+            let held = case
+                .held
+                .iter()
+                .map(|&at| case_card(at))
+                .collect::<Result<HashSet<_>, _>>()?;
+            let mut expected = record_display(&row);
+            if let Some((start, end)) = case.masked {
+                expected
+                    .get_mut(start..end)
+                    .ok_or("a line shorter than its masked bytes")?
+                    .fill(b'*');
+            }
+            assert_eq!(
+                record_line(&row, &held).into_bytes(),
+                expected,
+                "case {number}"
+            );
+        }
+        Ok(())
     }
 }

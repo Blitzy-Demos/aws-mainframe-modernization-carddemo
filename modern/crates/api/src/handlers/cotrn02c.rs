@@ -13,7 +13,7 @@
 //!   response carries is the domain's `CardNumber`, which serialises redacted (Cardholder Data
 //!   Redaction, `E32`).
 //! - `GET` on the same path is `handlers::cotrn00c::list`; `api::app::router()` registers both
-//!   in one `routes!`.
+//!   on the same path item.
 
 use axum::Json;
 use axum::extract::State;
@@ -24,6 +24,9 @@ use crate::dto::ValidJson;
 use crate::dto::cotrn02c::{TranAddRequest, TranAddResult};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`add`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct AddOperation;
 
 /// Add a transaction (CT02 / COTRN02C)
 ///
@@ -47,6 +50,7 @@ use crate::services;
 // exist...`, COTRN02C-050), and its failure classes give 400, 404 and 500 only. No 403: the
 // endpoint serves every signed-on user type (COTRN02C-003).
 #[utoipa::path(
+    impl_for = AddOperation,
     post,
     path = "/api/v1/transactions",
     operation_id = "cotrn02c_add",
@@ -103,9 +107,8 @@ mod tests {
 
     use serde_json::{Value, json};
     use utoipa_axum::router::OpenApiRouter;
-    use utoipa_axum::routes;
 
-    use crate::app::AppState;
+    use crate::app::{AppState, operation};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -122,7 +125,7 @@ mod tests {
     #[test]
     fn declares_the_endpoint_13_operation() -> TestResult {
         let (_, doc) = OpenApiRouter::<AppState>::new()
-            .routes(routes!(super::add))
+            .routes(operation(super::AddOperation, super::add))
             .split_for_parts();
         let doc = serde_json::to_value(doc)?;
 

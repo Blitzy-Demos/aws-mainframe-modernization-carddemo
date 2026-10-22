@@ -303,7 +303,7 @@ Narrower commands:
 - **Protected paths:** `scripts/protected-diff.sh` fails on any change, staged or not, to a path outside `modern/`, untracked files included.
 - **Coverage on its own:** `cargo llvm-cov --workspace --locked --no-report`, then `cargo llvm-cov report --fail-under-lines 80 --ignore-filename-regex '/(tests|benches)/'`. The instrumented build takes several gigabytes under `target/llvm-cov-target`, and `scripts/check.sh` leaves it there too; remove that directory afterwards to reclaim the space.
 
-Every `scripts/*.sh` script accepts `-h` or `--help`, prints its usage and runs nothing else. `scripts/frontend-policy.mjs` reads its optional first argument as the directory to check in place of `modern/`, so do not pass it `--help`. [SIGNOFF.md](SIGNOFF.md) gives the command for each acceptance criterion.
+Every `scripts/*.sh` script accepts `-h` or `--help`, prints its usage and runs nothing else, and so does `scripts/frontend-policy.mjs`, which also takes an optional directory to check in place of `modern/`. [SIGNOFF.md](SIGNOFF.md) gives the command for each acceptance criterion.
 
 **After changing a query or a migration.** Bring the stack up, apply the migrations, then regenerate the offline query cache and commit `.sqlx/` together with the change:
 

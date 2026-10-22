@@ -21,6 +21,9 @@ use crate::dto::comen01c::MenuResponse;
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`main_menu`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct MainMenuOperation;
+
 /// Main menu (CM00 / COMEN01C).
 ///
 /// Returns the 11 options of `COMEN02Y` in table order with their admin-only and installed flags,
@@ -31,6 +34,7 @@ use crate::services;
 ///
 /// 401 with a `ScreenError` when the request carries no valid bearer token.
 #[utoipa::path(
+    impl_for = MainMenuOperation,
     get,
     path = "/api/v1/menus/main",
     operation_id = "comen01c_main_menu",

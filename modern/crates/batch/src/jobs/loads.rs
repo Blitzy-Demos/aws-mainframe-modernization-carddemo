@@ -90,6 +90,7 @@ use persistence::{
     DisclosureGroupRepository, PersistenceError, PgTx, TranCatBalanceRepository,
     TransactionCategoryRepository, TransactionTypeRepository,
 };
+use runtime::telemetry::JobCounter;
 
 use super::{JobContext, JobError, JobOutcome};
 
@@ -192,7 +193,7 @@ async fn load<R: Table + Send + 'static>(
     Ok(JobOutcome {
         written: Vec::new(),
         return_code: 0,
-        counts: vec![("records", written)],
+        counts: vec![(JobCounter::Records, written)],
     })
 }
 

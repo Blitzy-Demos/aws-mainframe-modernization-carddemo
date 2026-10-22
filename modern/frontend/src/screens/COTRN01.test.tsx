@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import type { components } from "@/api/schema";
-import { clearSession, setSession } from "@/auth/session";
+import { clearSession, getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
 import { COTRN01 } from "./COTRN01";
 
@@ -1079,6 +1079,104 @@ describe("COTRN01 transaction view screen", () => {
     expect(stub.path).toBe("/transactions");
     expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: "pf3", list: LIST });
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`, `${ENDPOINT}${TYPED_ID}`]);
+  });
+});
+
+// Endpoint 12 names the transaction by its path alone, and every request carries the stored
+// session's token.
+describe("COTRN01: endpoint 12 request", () => {
+  /** A request as its method, path, query, `Authorization` header and body text. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body: await request.clone().text(),
+    };
+  }
+
+  it("the read of a COTRN00 selection is one GET of its path with the bearer token, no query and no body", async () => {
+    const requests = stubApi();
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(SHOWN_SELECTED);
+    });
+    await settle();
+
+    expect(await Promise.all(requests.map(shapeOf))).toEqual([
+      {
+        method: "GET",
+        path: `${ENDPOINT}${SELECTED_ID}`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: "",
+      },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/transactions/view`, so the sign-on guard that only
+ * the table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRN01] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the
+// route replaces the still-mounted screen with sign-on at once: the test presses no key and
+// follows no link after ENTER.
+describe("COTRN01 in the route table: a 401 ends the session", () => {
+  it("ENTER answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(input, init);
+        requests.push(req);
+        return json(401, signonRequired);
+      }),
+    );
+    const router = renderRouteTable();
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 1, name: "View Transaction" },
+        { timeout: 5_000 },
+      ),
+    ).toBeDefined();
+
+    fetchTyped(TYPED_ID);
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "View Transaction" })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
+    expect(
+      requests.map((request) => [request.method, request.headers.get("Authorization")]),
+    ).toEqual([["GET", "Bearer test-token"]]);
+    router.dispose();
   });
 });
 

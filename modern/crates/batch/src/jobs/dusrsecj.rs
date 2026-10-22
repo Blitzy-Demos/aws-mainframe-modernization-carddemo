@@ -46,6 +46,7 @@ use std::path::Path;
 
 use domain::batch::loads::{HashedUser, decode_usrsec, hash_user};
 use persistence::UserRepository;
+use runtime::telemetry::JobCounter;
 
 use super::{JobContext, JobError, JobOutcome};
 
@@ -83,7 +84,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome
     Ok(JobOutcome {
         written: Vec::new(),
         return_code: 0,
-        counts: vec![("records", written)],
+        counts: vec![(JobCounter::Records, written)],
     })
 }
 

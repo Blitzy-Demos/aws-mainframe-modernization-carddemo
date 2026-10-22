@@ -22,6 +22,13 @@
 //!   writes.
 //! - A reports directory that cannot be created stands for the failed open of `REPTFILE`
 //!   (CBTRN03C-007), which ends the run on the abend path (CBTRN03C-035).
+//! - `carddemo-batch` is a binary, so no repository double reaches it, and the other failures
+//!   are provoked from outside the process. A [`Relay`] between the binary and the container
+//!   closes the connection of the selection after its first row, so the next fetch fails inside
+//!   the loop (CBTRN03C-010), or the connection of a lookup table at its row description
+//!   (CBTRN03C-040 to CBTRN03C-042). A file-size limit that `/bin/sh` sets before it runs the
+//!   binary makes a report write fail (CBTRN03C-033) or, set above the bytes the loop writes, the
+//!   last write of the close (CBTRN03C-034).
 //!
 //! # Blocked values
 //!
@@ -30,38 +37,61 @@
 //! as a set at the block's record positions, and the page totals other than records 21, 201 and
 //! 341, and the grand total, are checked for their record kind only. Positions, record kinds, the
 //! detail texts, the 49 account totals and the three fixed page totals are asserted byte for
-//! byte.
+//! byte. The same order decides the last amount, so the items of the two end-of-file lines are
+//! checked for their shape only (CBTRN03C-029).
+//!
+//! The four characters after `FILE STATUS IS: NNNN` on a database or file failure have no
+//! counterpart (X-TRANREPT-H3), and the lookup failures other than a missing key are halted as a
+//! whole (CBTRN03C-040 to CBTRN03C-042, X-TRANREPT-H5): both are reported `BLOCKED`, never
+//! compared. The replacement reads each lookup table whole when it opens it, so a failed read of
+//! one takes the open path of CBTRN03C-007; that outcome is printed with the `BLOCKED` report.
 //!
 //! # Job log
 //!
-//! `tranrept` emits no job-log line of CBTRN03C, as `crates/batch/src/jobs/tranrept.rs` states:
-//! its standard output is the path it wrote. The job-log rules (CBTRN03C-006, CBTRN03C-008,
-//! CBTRN03C-012, CBTRN03C-029 and the end line of CBTRN03C-034) are therefore not proved here.
-//! Nor are the failures a subprocess cannot provoke without a repository double or a failing
-//! device: a row that cannot be fetched (CBTRN03C-010), a failed write (CBTRN03C-033) and the
-//! lookup failures other than a missing key (CBTRN03C-040 to CBTRN03C-042).
+//! Each `DISPLAY` of CBTRN03C is one tracing event of the job's module,
+//! `carddemo_batch::jobs::tranrept`, whose message is the line, in program order
+//! (`crates/batch/src/jobs/tranrept.rs`). The runs whose job log is checked log at `info`, and
+//! [`job_log`] reads those messages from standard output. A run over POSTED shows the start line,
+//! the `Reporting from` line with the dates passed, one 350-byte `TRAN-RECORD` line per selected
+//! row in report order, the two end-of-file lines and the end line, with the path on the line
+//! after it (CBTRN03C-006, CBTRN03C-008 to CBTRN03C-010, CBTRN03C-012, CBTRN03C-029,
+//! CBTRN03C-032, CBTRN03C-034). A failure path ends with its line, the status line and
+//! `ABENDING PROGRAM`, and shows no end line (CBTRN03C-007, CBTRN03C-010, CBTRN03C-033 to
+//! CBTRN03C-036).
 //!
 //! # Cardholder data
 //!
 //! Report records hold no card number (CBTRN03C-023), but every failure message names record
-//! numbers, block numbers or byte offsets only, never record bytes. Standard error, which
-//! `carddemo-batch` keeps free of protected values, is the only process output a message shows.
+//! numbers, block numbers, byte offsets or line positions only, never record bytes, and no
+//! job-log line is printed: the `TRAN-RECORD` line holds a card number in its redacted form
+//! only (CBTRN03C-012). Standard error, which `carddemo-batch` keeps free of protected values,
+//! is the only process output a message shows. Every `tranrept` run, normal or failing, has its
+//! standard output and standard error searched whole for the 50 fixture card numbers, which none
+//! may hold (CBTRN03C-039), the run whose transaction IDs are card numbers included.
 
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::{self, BufReader, Read, Write};
+use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chrono::{Days, NaiveDate};
-use copybook::{PicTimestamp, PicX};
+use copybook::{FixedRecord, PicTimestamp, PicX};
 use domain::clock::{Clock, SystemClock};
+use domain::records::TransactionRecord;
+use domain::sensitive::CardNumber;
 use persistence::{
     Db2TransactionTypeRepository, PgStore, TransactionRepository, TransactionTypeRepository,
 };
-use test_support::fixtures::{fixture_dir, fixture_path, start_loaded_postgres};
+use test_support::fixtures::{
+    fixture_card_numbers, fixture_dir, fixture_path, start_loaded_postgres,
+};
 use test_support::postgres::PostgresGuard;
 
 type TestResult = Result<(), Box<dyn Error>>;
@@ -161,6 +191,81 @@ const DB2_SEED_PURCHASE: &str = "PURCHASE";
 const _: () = assert!(NAME_HEADER.len() == 91);
 const _: () = assert!(COLUMN_HEADER.len() == 112);
 const _: () = assert!(PURCHASE_COLUMNS.len() == 68 && CREDIT_COLUMNS.len() == 68);
+
+// The job-log lines of CBTRN03C, transcribed from `modern/audit/batch/TRANREPT.md`.
+
+/// The first line of every run the window lets through (CBTRN03C-006).
+const START_LINE: &str = "START OF EXECUTION OF PROGRAM CBTRN03C";
+/// The last line of a normal end, before the path (CBTRN03C-032, CBTRN03C-034).
+const END_LINE: &str = "END OF EXECUTION OF PROGRAM CBTRN03C";
+/// The DATEPARM line: `Reporting from ` (15 characters), the start date, ` to ` (4) and the end
+/// date (CBTRN03C-008).
+const REPORTING_FROM: &str = "Reporting from ";
+const REPORTING_TO: &str = " to ";
+/// The DATEPARM line of the default window (CBTRN03C-008, FIXRPT-901).
+const DEFAULT_REPORTING_LINE: &str = "Reporting from 2022-01-01 to 2022-07-06";
+/// Bytes of the `TRAN-RECORD` line, the 350-byte `CVTRA05Y` record (CBTRN03C-012).
+const TRAN_RECORD_LEN: usize = 350;
+/// The bytes of the `TRAN-RECORD` line shown as `*` whatever the row holds, as 0-based ranges:
+/// `TRAN-SOURCE` and `TRAN-DESC` (bytes 23-132), `TRAN-MERCHANT-NAME`, `TRAN-MERCHANT-CITY` and
+/// `TRAN-MERCHANT-ZIP` (153-262) and `FILLER` (331-350) (CBTRN03C-012).
+const MASKED_BYTES: [(usize, usize); 3] = [(22, 132), (152, 262), (330, 350)];
+/// `TRAN-CARD-NUM`, bytes 263-278 of the `TRAN-RECORD` line, as a 0-based range: twelve `*`,
+/// then the last four digits (CBTRN03C-012).
+const CARD_BYTES: (usize, usize) = (262, 278);
+const CARD_MASK_LEN: usize = 12;
+/// `TRAN-ID`, bytes 1-16 of the `TRAN-RECORD` line and columns 1-16 of a detail record
+/// (CBTRN03C-012, CBTRN03C-023).
+const TRAN_ID_LEN: usize = 16;
+/// The end-of-file lines: `TRAN-AMT ` (9 characters) and `WS-PAGE-TOTAL` (13), each followed by
+/// its item's 11 digits, the sign overpunched on the last (CBTRN03C-029).
+const TRAN_AMT_LABEL: &str = "TRAN-AMT ";
+const PAGE_TOTAL_ITEM_LABEL: &str = "WS-PAGE-TOTAL";
+const AMOUNT_ITEM_LEN: usize = 11;
+/// The failure lines of the paths the tests provoke (CBTRN03C-007, CBTRN03C-010, CBTRN03C-033,
+/// CBTRN03C-034).
+const OPEN_REPTFILE: &str = "ERROR OPENING REPTFILE";
+const OPEN_CARDXREF: &str = "ERROR OPENING CROSS REF FILE";
+const OPEN_TRANTYPE: &str = "ERROR OPENING TRANSACTION TYPE FILE";
+const OPEN_TRANCATG: &str = "ERROR OPENING TRANSACTION CATG FILE";
+const READ_TRANFILE: &str = "ERROR READING TRANSACTION FILE";
+const WRITE_REPTFILE: &str = "ERROR WRITING REPTFILE";
+const CLOSE_REPTFILE: &str = "ERROR CLOSING REPORT FILE";
+/// `9910-DISPLAY-IO-STATUS`: this 20-character label, then four status characters
+/// (CBTRN03C-036).
+const STATUS_LABEL: &str = "FILE STATUS IS: NNNN";
+const STATUS_LINE_LEN: usize = 24;
+/// The line of `9999-ABEND-PROGRAM`, the last of every failure path (CBTRN03C-035).
+const ABEND_LINE: &str = "ABENDING PROGRAM";
+
+const _: () = assert!(REPORTING_FROM.len() == 15 && REPORTING_TO.len() == 4);
+const _: () = assert!(TRAN_AMT_LABEL.len() == 9 && PAGE_TOTAL_ITEM_LABEL.len() == 13);
+const _: () = assert!(STATUS_LABEL.len() == 20);
+
+/// The target every job-log event carries in the JSON lines of `runtime::telemetry`: the job's
+/// module. The events of `main`, such as `job finished`, carry another.
+const JOB_LOG_TARGET: &str = r#""target":"carddemo_batch::jobs::tranrept""#;
+/// What precedes an event's message in the JSON lines of `runtime::telemetry`.
+const MESSAGE_KEY: &str = r#""message":""#;
+
+/// A column of each statement `tranrept` runs that no other of them returns, by which the
+/// [`Relay`] tells the statements apart in their row descriptions (migrations 0001 and 0002).
+const TRANSACTIONS_COLUMN: &str = "proc_ts";
+const CARD_XREF_COLUMN: &str = "cust_id";
+const TRANSACTION_TYPES_COLUMN: &str = "tran_type_desc";
+const TRANSACTION_CATEGORIES_COLUMN: &str = "tran_cat_type_desc";
+
+/// The setting the event of a failed report open names in place of the directory's path.
+const REPORTS_DIR_SETTING: &str = "reports under CARDDEMO_VAR_DIR";
+
+/// The file-size limit, in the 512-byte blocks of `ulimit -f` in `/bin/sh` (dash), below the
+/// first buffer the job writes: the binary buffers 8,192 bytes before a write reaches the file,
+/// so the POSTED report fails at its first write, inside the loop (CBTRN03C-033).
+const FIRST_WRITE_LIMIT: u32 = 1;
+/// A limit above the 7 buffers of 61 records the loop writes over POSTED (57,218 bytes) and
+/// below the report's 60,434 bytes (451 records of 134), so only the last write, when the file is
+/// closed, fails (CBTRN03C-034).
+const CLOSE_LIMIT: u32 = 114;
 
 /// The type of a POSTED detail, which fixes its columns 30-97.
 #[derive(Clone, Copy)]
@@ -865,32 +970,489 @@ impl Drop for Scratch {
     }
 }
 
-/// Runs `carddemo-batch` with `args` from `modern/`, the working directory of every binary,
-/// against `guard`'s database, with its output directories in `scratch` and the fixtures read in
-/// place. The rest of the environment is inherited. Span export is off and only error events are
-/// logged, so standard output carries the written paths.
+/// The events a run logs, its `RUST_LOG`.
+#[derive(Clone, Copy)]
+enum Log {
+    /// Error events only, so standard output carries the written paths and little else.
+    Errors,
+    /// Every `INFO` event, so the job log reaches standard output.
+    JobLog,
+}
+
+impl Log {
+    fn directive(self) -> &'static str {
+        match self {
+            Log::Errors => "error",
+            Log::JobLog => "info",
+        }
+    }
+}
+
+/// Runs `carddemo-batch` with `args` against `guard`'s database, as [`run_against`] does.
 async fn run_batch(
     guard: &PostgresGuard,
     scratch: &Scratch,
     args: &[&OsStr],
+    log: Log,
+) -> Result<Output, Box<dyn Error>> {
+    run_against(guard.database_url(), scratch, args, log).await
+}
+
+/// Runs `carddemo-batch` with `args` from `modern/`, the working directory of every binary,
+/// against the database `database_url` names, with its output directories in `scratch`, the
+/// fixtures read in place and `log` as `RUST_LOG`. The rest of the environment is inherited, so
+/// the coverage profile variables reach the binary. Span export is off, so every event is one
+/// JSON line and the other lines of standard output are the written paths.
+async fn run_against(
+    database_url: &str,
+    scratch: &Scratch,
+    args: &[&OsStr],
+    log: Log,
 ) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carddemo-batch"));
+    command.args(args);
+    configure(&mut command, database_url, scratch, log);
+    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+}
+
+/// Runs `carddemo-batch` with `args` against `guard`'s database, logging its job log, after
+/// `/bin/sh` has limited the size of every file it writes to `blocks` blocks of 512 bytes.
+///
+/// The shell ignores `SIGXFSZ` before it replaces itself with the binary, and an ignored signal
+/// stays ignored across `exec`, so a write past the limit fails with `EFBIG` instead of killing
+/// the process: the job meets it as a failed write. Standard output is a pipe, which the limit
+/// does not reach.
+async fn run_size_limited(
+    guard: &PostgresGuard,
+    scratch: &Scratch,
+    args: &[&OsStr],
+    blocks: u32,
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new("/bin/sh");
     command
-        .args(args)
+        .arg("-c")
+        .arg(format!(
+            "trap '' XFSZ; ulimit -f {blocks} && exec \"$0\" \"$@\""
+        ))
+        .arg(env!("CARGO_BIN_EXE_carddemo-batch"))
+        .args(args);
+    configure(&mut command, guard.database_url(), scratch, Log::JobLog);
+    // Under `cargo llvm-cov` the binary is instrumented and writes its profile when it exits.
+    // Under the limit that profile would be cut short and break the merged report, so this run
+    // writes it to `/dev/null`, a device the limit does not reach, and adds no coverage.
+    command.env("LLVM_PROFILE_FILE", "/dev/null");
+    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+}
+
+/// The environment of every run: `modern/` as working directory, the database `database_url`
+/// names, the output directories in `scratch`, the fixtures read in place, `log` as `RUST_LOG`,
+/// and span export off.
+fn configure(command: &mut Command, database_url: &str, scratch: &Scratch, log: Log) {
+    command
         .current_dir(test_support::modern_dir())
-        .env("DATABASE_URL", guard.database_url())
+        .env("DATABASE_URL", database_url)
         .env("CARDDEMO_VAR_DIR", scratch.var_dir())
         .env("CARDDEMO_STATEMENT_DIR", scratch.path().join("statements"))
         .env("CARDDEMO_INTRDR_DIR", scratch.path().join("jobs"))
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", log.directive())
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+}
+
+/// The job log of a run: the message of every event of the job's module on standard output, in
+/// order, which are the program's lines and, on a failure path, the event naming the failed call
+/// before them. The messages hold no quote or backslash, the `TRAN-RECORD` line included, whose
+/// free-text fields show as `*`, so each ends at the first quote after its key.
+fn job_log(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('{') && line.contains(JOB_LOG_TARGET))
+        .filter_map(|event| {
+            let (_, rest) = event.split_once(MESSAGE_KEY)?;
+            rest.split_once('"').map(|(message, _)| message.to_owned())
+        })
+        .collect()
+}
+
+/// Whether the line of standard output right after the job-log event `END OF EXECUTION OF
+/// PROGRAM CBTRN03C` is `path` (CBTRN03C-032).
+fn path_follows_end_line(output: &Output, path: &Path) -> bool {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    let end_message = format!("{MESSAGE_KEY}{END_LINE}\"");
+    lines
+        .iter()
+        .position(|line| line.contains(JOB_LOG_TARGET) && line.contains(&end_message))
+        .and_then(|end| lines.get(end + 1))
+        .is_some_and(|line| Path::new(line) == path)
+}
+
+/// The `tranrept` arguments of the window `start` to `end`.
+fn tranrept_args<'a>(start: &'a str, end: &'a str) -> [&'a OsStr; 5] {
+    [
+        OsStr::new("tranrept"),
+        OsStr::new("--start-date"),
+        OsStr::new(start),
+        OsStr::new("--end-date"),
+        OsStr::new(end),
+    ]
+}
+
+/// Checks the job log of a run that abended on `failure_line` after the start line: no end line,
+/// and its last three lines `failure_line`, a status line and `ABENDING PROGRAM`
+/// (CBTRN03C-035, CBTRN03C-036). `HALTED(X-TRANREPT-H3)`: the status line's four characters
+/// have no counterpart, so only its label and length are checked and the characters are reported
+/// `BLOCKED` for `rule`. Failures name line positions only.
+fn assert_abend_log(log: &[String], failure_line: &str, rule: &str) {
+    // audit: CBTRN03C-006
+    assert!(
+        log.first().is_some_and(|line| line == START_LINE),
+        "{rule}: the first job-log line is not the start line"
+    );
+    // audit: CBTRN03C-035
+    assert!(
+        !log.iter().any(|line| line == END_LINE),
+        "{rule}: an abended run showed the end line"
+    );
+    let tail = log.len().checked_sub(3).and_then(|start| log.get(start..));
+    let Some([failure, status, abend]) = tail else {
+        panic!("{rule}: the job log has {} lines, fewer than 3", log.len());
+    };
+    assert!(
+        failure == failure_line,
+        "{rule}: the third line from the end is not the failure line"
+    );
+    // audit: CBTRN03C-036
+    assert!(
+        status.len() == STATUS_LINE_LEN && status.starts_with(STATUS_LABEL),
+        "{rule}: the line after the failure line is not a status line"
+    );
+    assert!(
+        abend == ABEND_LINE,
+        "{rule}: the last job-log line is not ABENDING PROGRAM"
+    );
+    println!("BLOCKED {rule} (X-TRANREPT-H3): the four status characters of the failure");
+}
+
+/// The first line of a run's standard error, the job's one line. Only that line is compared after
+/// a failure the test provokes, since an instrumented binary, such as one under a file-size limit,
+/// may add lines of its own after it.
+fn first_stderr_line(output: &Output) -> String {
+    stderr(output).lines().next().unwrap_or_default().to_owned()
+}
+
+/// Where a [`Relay`] cuts the one connection whose row description names a column.
+#[derive(Clone, Copy)]
+enum Cut {
+    /// After the first data row that follows the description, which is forwarded: the
+    /// statement's first row reaches the binary, and its next fetch finds the connection closed.
+    AfterFirstRow(&'static str),
+    /// At the description itself, which is not forwarded: the statement fails before it answers.
+    AtDescription(&'static str),
+}
+
+impl Cut {
+    /// The column whose row description the cut waits for.
+    fn column(self) -> &'static str {
+        match self {
+            Cut::AfterFirstRow(column) | Cut::AtDescription(column) => column,
+        }
+    }
+}
+
+/// The type bytes of the backend messages the relay looks at (protocol 3.0): `RowDescription`
+/// and `DataRow`.
+const ROW_DESCRIPTION: u8 = b'T';
+const DATA_ROW: u8 = b'D';
+/// Bytes of a message's length field, which counts itself.
+const LENGTH_LEN: usize = 4;
+/// Bytes after each field name of a `RowDescription`: the table OID (4), the column number (2),
+/// the type OID (4), the type size (2), the type modifier (4) and the format code (2).
+const FIELD_TRAILER_LEN: usize = 18;
+/// How long the relay waits for the container to accept a connection.
+const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A TCP relay on `127.0.0.1` between `carddemo-batch` and the test's `PostgreSQL` container. It
+/// forwards every connection unchanged except the first whose row description names the column
+/// of its [`Cut`], which it closes where the cut says, as a lost connection ends.
+///
+/// The binary connects with `sslmode=disable`, so the container's side of every connection is a
+/// sequence of typed messages from its first byte: a type byte, a big-endian `u32` length that
+/// counts itself, then the body. The binary's side is copied as it is. Each connection is served
+/// by two threads; dropping the relay wakes its accept loop, shuts every socket down and joins
+/// every thread, so no relay outlives its test.
+struct Relay {
+    /// The port the relay listens on.
+    port: u16,
+    /// The `DATABASE_URL` that points the binary at the relay.
+    database_url: String,
+    /// What the relay's threads share.
+    state: Arc<RelayState>,
+    /// The accept loop.
+    accept: Option<JoinHandle<()>>,
+}
+
+/// What the threads of a [`Relay`] share.
+struct RelayState {
+    /// The container's `host:port`.
+    upstream: String,
+    /// Where to cut.
+    cut: Cut,
+    /// Set when the relay is dropped: the accept loop ends at its next connection.
+    stopping: AtomicBool,
+    /// Set once a connection has been chosen for the cut, so that no other one is cut.
+    cut_made: AtomicBool,
+    /// A handle on every socket, shut down when the relay is dropped.
+    sockets: Mutex<Vec<TcpStream>>,
+    /// The threads of every connection, joined when the relay is dropped.
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+/// `mutex` locked, even if a relay thread panicked while it held the lock: a list of sockets or
+/// threads stays valid whatever its holder did.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+impl Relay {
+    /// Starts a relay to the container that `database_url`, as `PostgresGuard::database_url`
+    /// gives it, names, cutting as `cut` says.
+    fn start(database_url: &str, cut: Cut) -> Result<Self, Box<dyn Error>> {
+        let (scheme, rest) = database_url
+            .split_once("://")
+            .ok_or("the database URL has no scheme")?;
+        let (credentials, rest) = rest
+            .split_once('@')
+            .ok_or("the database URL has no credentials")?;
+        let (upstream, database) = rest
+            .split_once('/')
+            .ok_or("the database URL names no database")?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let port = listener.local_addr()?.port();
+        let state = Arc::new(RelayState {
+            upstream: upstream.to_owned(),
+            cut,
+            stopping: AtomicBool::new(false),
+            cut_made: AtomicBool::new(false),
+            sockets: Mutex::new(Vec::new()),
+            threads: Mutex::new(Vec::new()),
+        });
+        let accepting = Arc::clone(&state);
+        let accept = thread::spawn(move || accept_connections(&accepting, &listener));
+        Ok(Self {
+            port,
+            database_url: format!(
+                "{scheme}://{credentials}@127.0.0.1:{port}/{database}?sslmode=disable"
+            ),
+            state,
+            accept: Some(accept),
+        })
+    }
+
+    /// The `DATABASE_URL` that points the binary at the relay.
+    fn database_url(&self) -> &str {
+        &self.database_url
+    }
+
+    /// Whether the relay has cut a connection.
+    fn cut_made(&self) -> bool {
+        self.state.cut_made.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        self.state.stopping.store(true, Ordering::SeqCst);
+        // A connection of the relay's own wakes the accept loop, which sees `stopping` and ends.
+        // Should none get through, the loop is left blocked rather than waited for.
+        let woken = TcpStream::connect(("127.0.0.1", self.port)).is_ok();
+        if let Some(accept) = self.accept.take().filter(|_| woken) {
+            // A thread that panicked has nothing left to clean up, and a drop must not panic.
+            let _ = accept.join();
+        }
+        for socket in lock(&self.state.sockets).drain(..) {
+            // A socket the other side has closed already is no failure.
+            let _ = socket.shutdown(Shutdown::Both);
+        }
+        let threads: Vec<JoinHandle<()>> = lock(&self.state.threads).drain(..).collect();
+        for relaying in threads {
+            let _ = relaying.join();
+        }
+    }
+}
+
+/// Serves every connection `listener` accepts until the relay stops.
+fn accept_connections(state: &Arc<RelayState>, listener: &TcpListener) {
+    for client in listener.incoming() {
+        if state.stopping.load(Ordering::SeqCst) {
+            break;
+        }
+        // A failed accept leaves the binary to connect again; the relay keeps listening.
+        if let Ok(client) = client {
+            serve(state, client);
+        }
+    }
+}
+
+/// Connects `client` to the container and starts the two threads that relay it. A connection
+/// the container does not accept is closed at once, which the binary meets as a refused one.
+fn serve(state: &Arc<RelayState>, client: TcpStream) {
+    let server = state
+        .upstream
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut addresses| addresses.next())
+        .and_then(|address| TcpStream::connect_timeout(&address, UPSTREAM_TIMEOUT).ok());
+    let Some(server) = server else {
+        let _ = client.shutdown(Shutdown::Both);
+        return;
+    };
+    let handles = (
+        client.try_clone(),
+        client.try_clone(),
+        server.try_clone(),
+        server.try_clone(),
+    );
+    let (Ok(mut client_reader), Ok(client_kept), Ok(mut server_writer), Ok(server_kept)) = handles
+    else {
+        let _ = client.shutdown(Shutdown::Both);
+        let _ = server.shutdown(Shutdown::Both);
+        return;
+    };
+    lock(&state.sockets).extend([client_kept, server_kept]);
+    let upward = thread::spawn(move || forward_client(&mut client_reader, &mut server_writer));
+    let relaying = Arc::clone(state);
+    let mut client_writer = client;
+    let downward = thread::spawn(move || forward_server(&relaying, server, &mut client_writer));
+    lock(&state.threads).extend([upward, downward]);
+}
+
+/// Copies what the binary sends to the container until either side ends, then ends the
+/// container's side for writing, so the container sees the binary's end.
+fn forward_client(client: &mut TcpStream, server: &mut TcpStream) {
+    // An error ends the copy as the end of the stream does; a relay thread has no one to tell.
+    let _ = io::copy(client, server);
+    let _ = server.shutdown(Shutdown::Write);
+}
+
+/// Forwards the container's messages to the binary one at a time until the container ends or
+/// the cut is made, then ends the binary's side for writing, so the binary reads the end of the
+/// stream after the last message forwarded. A cut also closes the container's side.
+fn forward_server(state: &RelayState, server: TcpStream, client: &mut TcpStream) {
+    let mut reader = BufReader::new(server);
+    // The connection was chosen for a cut after its next data row.
+    let mut armed = false;
+    let mut cut = false;
+    while let Ok(message) = read_message(&mut reader) {
+        let kind = message.first().copied();
+        if !armed && kind == Some(ROW_DESCRIPTION) && describes(&message, state.cut.column()) {
+            let chosen = state
+                .cut_made
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok();
+            match state.cut {
+                Cut::AtDescription(_) if chosen => {
+                    cut = true;
+                    break;
+                }
+                Cut::AtDescription(_) => {}
+                Cut::AfterFirstRow(_) => armed = chosen,
+            }
+        }
+        if client.write_all(&message).is_err() {
+            break;
+        }
+        if armed && kind == Some(DATA_ROW) {
+            cut = true;
+            break;
+        }
+    }
+    if cut {
+        let _ = reader.get_ref().shutdown(Shutdown::Both);
+    }
+    let _ = client.shutdown(Shutdown::Write);
+}
+
+/// The next backend message `reader` holds, whole: its type byte, its length and its body.
+///
+/// # Errors
+///
+/// The read's error, `UnexpectedEof` at the end of the stream included, or `InvalidData` for a
+/// length shorter than its own field.
+fn read_message(reader: &mut impl Read) -> io::Result<Vec<u8>> {
+    let mut header = [0; 1 + LENGTH_LEN];
+    reader.read_exact(&mut header)?;
+    let [_, length @ ..] = header;
+    let body_len = usize::try_from(u32::from_be_bytes(length))
+        .ok()
+        .and_then(|length| length.checked_sub(LENGTH_LEN))
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
+    let mut body = vec![0; body_len];
+    reader.read_exact(&mut body)?;
+    let mut message = header.to_vec();
+    message.append(&mut body);
+    Ok(message)
+}
+
+/// Whether the `RowDescription` `message` describes a field named `column`: after the header, a
+/// big-endian `i16` field count, then each field's NUL-terminated name and its trailer.
+fn describes(message: &[u8], column: &str) -> bool {
+    let Some((count, mut fields)) = message
+        .get(1 + LENGTH_LEN..)
+        .and_then(|body| body.split_first_chunk::<2>())
+    else {
+        return false;
+    };
+    for _ in 0..i16::from_be_bytes(*count) {
+        let Some(end) = fields.iter().position(|&byte| byte == 0) else {
+            return false;
+        };
+        let (name, rest) = fields.split_at(end);
+        if name == column.as_bytes() {
+            return true;
+        }
+        let Some(rest) = rest.get(1 + FIELD_TRAILER_LEN..) else {
+            return false;
+        };
+        fields = rest;
+    }
+    false
 }
 
 /// A run's standard error, which `carddemo-batch` keeps free of records and protected values.
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Checks that no line of a run's standard output or standard error, every tracing event
+/// included, holds one of the 50 fixture card numbers in full (CBTRN03C-039; Cardholder Data
+/// Redaction). The numbers are search needles only: a failure names the stream and its line
+/// numbers, never a line or a number.
+fn assert_no_fixture_card_number(output: &Output) -> TestResult {
+    let cards = fixture_card_numbers()?;
+    let streams = [
+        ("standard output", &output.stdout),
+        ("standard error", &output.stderr),
+    ];
+    for (stream, bytes) in streams {
+        let holding: Vec<usize> = bytes
+            .split(|&byte| byte == b'\n')
+            .zip(1_usize..)
+            .filter(|(line, _)| {
+                cards.iter().any(|card| {
+                    line.windows(card.len())
+                        .any(|window| window == card.as_bytes())
+                })
+            })
+            .map(|(_, number)| number)
+            .collect();
+        // audit: CBTRN03C-039
+        assert!(
+            holding.is_empty(),
+            "{stream} lines holding a full fixture card number: {holding:?}"
+        );
+    }
+    Ok(())
 }
 
 /// The paths a run printed: its standard-output lines that are not JSON tracing events.
@@ -952,7 +1514,7 @@ async fn post_fixture_transactions(guard: &PostgresGuard, scratch: &Scratch) -> 
         OsStr::new("--dalytran"),
         dalytran.as_os_str(),
     ];
-    let output = run_batch(guard, scratch, &args).await?;
+    let output = run_batch(guard, scratch, &args, Log::Errors).await?;
     // audit: FIXPOST-903
     assert_eq!(
         output.status.code(),
@@ -963,14 +1525,22 @@ async fn post_fixture_transactions(guard: &PostgresGuard, scratch: &Scratch) -> 
     Ok(())
 }
 
-/// Runs `tranrept` over `window`, or with its default dates when `None`, checks that it ended
-/// normally and printed the path of generation `generation` alone, and returns that file.
+/// What a `tranrept` run that ended normally left: its generation file and its job log.
+struct ReportRun {
+    report: Vec<u8>,
+    job_log: Vec<String>,
+}
+
+/// Runs `tranrept` over `window`, or with its default dates when `None`, logging its job log,
+/// checks that nothing it printed holds a fixture card number in full, that it ended normally
+/// and that it printed the path of generation `generation` alone, on the line after the end
+/// line, and returns that file and the job log.
 async fn run_report(
     guard: &PostgresGuard,
     scratch: &Scratch,
     window: Option<(&str, &str)>,
     generation: u16,
-) -> Result<Vec<u8>, Box<dyn Error>> {
+) -> Result<ReportRun, Box<dyn Error>> {
     let mut args = vec![OsStr::new("tranrept")];
     if let Some((start, end)) = window {
         args.extend([
@@ -980,7 +1550,10 @@ async fn run_report(
             OsStr::new(end),
         ]);
     }
-    let output = run_batch(guard, scratch, &args).await?;
+    let output = run_batch(guard, scratch, &args, Log::JobLog).await?;
+    // Checked first, as the exit-status message below quotes standard error.
+    // audit: CBTRN03C-039
+    assert_no_fixture_card_number(&output)?;
     // audit: CBTRN03C-034
     assert_eq!(
         output.status.code(),
@@ -995,7 +1568,14 @@ async fn run_report(
         [path.clone()],
         "paths tranrept printed"
     );
-    Ok(fs::read(path)?)
+    assert!(
+        path_follows_end_line(&output, &path),
+        "the path is not on the line after END OF EXECUTION OF PROGRAM CBTRN03C"
+    );
+    Ok(ReportRun {
+        report: fs::read(path)?,
+        job_log: job_log(&output),
+    })
 }
 
 /// Writes `records`, each a 53-byte COBTUPDT record followed by LF (COBTUPDT-002,
@@ -1046,6 +1626,36 @@ fn transaction_ids() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
                 .ok_or_else(|| format!("dailytran.txt:{number} is shorter than its ID").into())
         })
         .collect()
+}
+
+/// Each `dailytran.txt` line in file order, read in place, as the 350-byte transaction record it
+/// is byte for byte: `CVTRA06Y` and `CVTRA05Y` share one layout.
+fn daily_transactions() -> Result<Vec<TransactionRecord>, Box<dyn Error>> {
+    let bytes = fs::read(fixture_path("dailytran.txt"))?;
+    bytes
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| Ok(TransactionRecord::decode(line)?))
+        .collect()
+}
+
+/// The `TRAN-RECORD` line of `row`, whose transaction ID is a card number, transcribed from
+/// CBTRN03C-012: the row's 350 bytes with the six free-text fields as `*` and the card number as
+/// twelve `*` and its last four digits; by Cardholder Data Redaction (CBTRN03C-039), the
+/// transaction ID shows in that redacted form too.
+fn id_redacted_tran_record_line(row: &TransactionRecord) -> Result<String, Box<dyn Error>> {
+    let mut line = row.encode();
+    for &(start, end) in &MASKED_BYTES {
+        line.get_mut(start..end)
+            .ok_or("a transaction record shorter than 350 bytes")?
+            .fill(b'*');
+    }
+    for start in [0, CARD_BYTES.0] {
+        line.get_mut(start..start + CARD_MASK_LEN)
+            .ok_or("a transaction record shorter than 350 bytes")?
+            .fill(b'*');
+    }
+    Ok(String::from_utf8(line)?)
 }
 
 /// `text` padded on the right with spaces to a report record (CBTRN03C-032).
@@ -1269,6 +1879,120 @@ fn assert_posted_report(report: &[u8], start: &str, end: &str) -> TestResult {
     Ok(())
 }
 
+/// The sign-bearing last characters of a signed DISPLAY item: `{` and `A` to `I` for zero and
+/// positive values, `}` and `J` to `R` for negative ones (PIC-005, CBTRN03C-029).
+const OVERPUNCHED: &[u8; 20] = b"{ABCDEFGHI}JKLMNOPQR";
+
+/// Whether `line` is a `TRAN-RECORD` line in its redacted form: 350 bytes, the six free-text
+/// fields all `*` and the card number twelve `*` and four digits (CBTRN03C-012).
+fn is_tran_record_line(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    let masked = MASKED_BYTES.iter().all(|&(start, end)| {
+        bytes
+            .get(start..end)
+            .is_some_and(|field| field.iter().all(|&byte| byte == b'*'))
+    });
+    let card = bytes.get(CARD_BYTES.0..CARD_BYTES.1).is_some_and(|card| {
+        let (mask, last) = card.split_at(CARD_MASK_LEN.min(card.len()));
+        mask.iter().all(|&byte| byte == b'*')
+            && last.len() == 4
+            && last.iter().all(u8::is_ascii_digit)
+    });
+    bytes.len() == TRAN_RECORD_LEN && masked && card
+}
+
+/// Whether `line` is the end-of-file line `label` followed by a signed DISPLAY item: ten digits,
+/// then a digit with the sign overpunched (CBTRN03C-029).
+fn is_amount_line(line: &str, label: &str) -> bool {
+    line.strip_prefix(label).is_some_and(|item| {
+        let (digits, last) = item
+            .as_bytes()
+            .split_at(item.len().min(AMOUNT_ITEM_LEN - 1));
+        item.len() == AMOUNT_ITEM_LEN
+            && digits.iter().all(u8::is_ascii_digit)
+            && last.first().is_some_and(|sign| OVERPUNCHED.contains(sign))
+    })
+}
+
+/// Checks the job log of a normal run over POSTED against the `report` it wrote, its window line
+/// being `reporting_line`: the start line, the window line, one `TRAN-RECORD` line per detail in
+/// report order, the two end-of-file lines and the end line, and nothing else (CBTRN03C-006,
+/// CBTRN03C-008 to CBTRN03C-010, CBTRN03C-012, CBTRN03C-029, CBTRN03C-034). Failures name line
+/// positions only.
+fn assert_posted_job_log(log: &[String], reporting_line: &str, report: &[u8]) -> TestResult {
+    let records = fixed_records(report, RECORD_LEN)?;
+    let mut detail_numbers: Vec<usize> = BLOCKS
+        .iter()
+        .flat_map(|block| block.details)
+        .map(|detail| detail.record)
+        .collect();
+    detail_numbers.sort_unstable();
+    let reported_ids = detail_numbers
+        .iter()
+        .map(|&number| {
+            number
+                .checked_sub(1)
+                .and_then(|index| records.get(index))
+                .and_then(|record| record.get(..TRAN_ID_LEN))
+                .ok_or_else(|| format!("the report has no detail record {number}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // audit: CBTRN03C-006
+    assert!(
+        log.first().is_some_and(|line| line == START_LINE),
+        "the first job-log line is not the start line"
+    );
+    // The DATEPARM record always exists, so every run shows the window it read, and neither the
+    // read's end of file nor its error path is taken.
+    // audit: CBTRN03C-008
+    // audit: CBTRN03C-009
+    assert!(
+        log.get(1).is_some_and(|line| line == reporting_line),
+        "the second job-log line is not the window line"
+    );
+    let shown = log
+        .get(2..2 + POSTED_ROWS)
+        .ok_or("the job log ends before one TRAN-RECORD line per selected row")?;
+    let malformed: Vec<usize> = shown
+        .iter()
+        .zip(3_usize..)
+        .filter(|(line, _)| !is_tran_record_line(line))
+        .map(|(_, number)| number)
+        .collect();
+    // audit: CBTRN03C-012
+    assert!(
+        malformed.is_empty(),
+        "job-log lines that are not a redacted TRAN-RECORD line: {malformed:?}"
+    );
+    let shown_ids: Vec<&[u8]> = shown
+        .iter()
+        .filter_map(|line| line.as_bytes().get(..TRAN_ID_LEN))
+        .collect();
+    // Status `00`: each selected row is read in turn, in report order, and shown before it is
+    // reported; status `10` after the last one ends the loop with the end-of-file lines.
+    // audit: CBTRN03C-010
+    assert!(
+        shown_ids == reported_ids,
+        "the TRAN-RECORD lines do not show the reported transactions in report order"
+    );
+    let after = log.get(2 + POSTED_ROWS..).unwrap_or_default();
+    // BLOCKED(X-TRANREPT-H1): the last amount follows the order inside the last card block, so
+    // the two items are checked for their shape only; their values get no parity assertion.
+    // audit: CBTRN03C-029
+    assert!(
+        matches!(after, [amount, total, _]
+            if is_amount_line(amount, TRAN_AMT_LABEL)
+                && is_amount_line(total, PAGE_TOTAL_ITEM_LABEL)),
+        "the TRAN-AMT and WS-PAGE-TOTAL lines do not follow the TRAN-RECORD lines"
+    );
+    // audit: CBTRN03C-034
+    assert!(
+        after.last().is_some_and(|line| line == END_LINE),
+        "the last job-log line is not the end line"
+    );
+    Ok(())
+}
+
 /// Checks that every type `01` detail of the POSTED `report` shows the VSAM description in
 /// columns 33-47, and that no record holds a Db2 description of type `01`. Failures name record
 /// numbers only.
@@ -1325,8 +2049,8 @@ fn assert_vsam_descriptions(report: &[u8]) -> TestResult {
 }
 
 /// POSTED over a window around today: `tranrept` writes the report of FIXRPT-001 to FIXRPT-905
-/// with the passed dates in its name headers, leaves `transactions` as it was and adds no file
-/// but its generation.
+/// with the passed dates in its name headers, shows the job log of the run with those dates,
+/// leaves `transactions` as it was and adds no file but its generation.
 #[tokio::test(flavor = "multi_thread")]
 async fn report_over_posted_transactions_matches_audit() -> TestResult {
     let guard = start_loaded_postgres().await?;
@@ -1335,10 +2059,12 @@ async fn report_over_posted_transactions_matches_audit() -> TestResult {
     let mut store = PgStore::new(guard.pool().clone());
     let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
     let (start, end) = window_around_today()?;
-    let report = run_report(&guard, &scratch, Some((start.as_str(), end.as_str())), 1).await?;
+    let run = run_report(&guard, &scratch, Some((start.as_str(), end.as_str())), 1).await?;
     // audit: CBTRN03C-001
     // audit: CBTRN03C-004
-    assert_posted_report(&report, &start, &end)?;
+    assert_posted_report(&run.report, &start, &end)?;
+    let reporting_line = format!("{REPORTING_FROM}{start}{REPORTING_TO}{end}");
+    assert_posted_job_log(&run.job_log, &reporting_line, &run.report)?;
     // audit: CBTRN03C-003
     assert!(
         TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
@@ -1353,8 +2079,8 @@ async fn report_over_posted_transactions_matches_audit() -> TestResult {
 }
 
 /// The default window over POSTED as `fixtures.md` states it, the rows `posttran` wrote carrying
-/// the POSTED processing timestamp: the name headers show `2022-01-01` and `2022-07-06`, and the
-/// report is FIXRPT-001 to FIXRPT-905.
+/// the POSTED processing timestamp: the name headers and the job log's window line show
+/// `2022-01-01` and `2022-07-06`, and the report is FIXRPT-001 to FIXRPT-905.
 #[tokio::test(flavor = "multi_thread")]
 async fn default_window() -> TestResult {
     // The rows are posted in a database of their own and copied, with the POSTED stamp, into the
@@ -1367,7 +2093,9 @@ async fn default_window() -> TestResult {
         // BLOCKED(X-TRANREPT-H2): that empty selection has no single COBOL result, so the run's
         // outcome is reported, never asserted.
         // audit: CBTRN03C-037
-        let empty = run_batch(&source, &scratch, &[OsStr::new("tranrept")]).await?;
+        let empty = run_batch(&source, &scratch, &[OsStr::new("tranrept")], Log::Errors).await?;
+        // audit: CBTRN03C-039
+        assert_no_fixture_card_number(&empty)?;
         eprintln!(
             "CBTRN03C-037 BLOCKED (X-TRANREPT-H2): exit status {:?}, {} path(s) printed",
             empty.status.code(),
@@ -1386,15 +2114,77 @@ async fn default_window() -> TestResult {
         TransactionRepository::insert(&mut store, &row).await?;
     }
     let scratch = Scratch::new()?;
-    let report = run_report(&guard, &scratch, None, 1).await?;
+    let run = run_report(&guard, &scratch, None, 1).await?;
     // audit: CBTRN03C-001
     // audit: CBTRN03C-004
     // audit: FIXRPT-901
-    assert_posted_report(&report, DEFAULT_START, DEFAULT_END)
+    assert_posted_report(&run.report, DEFAULT_START, DEFAULT_END)?;
+    assert_posted_job_log(&run.job_log, DEFAULT_REPORTING_LINE, &run.report)
+}
+
+/// Transaction IDs that are card numbers: two `dailytran.txt` records of two cards that
+/// `card_xref` holds are stored processed on the POSTED date, the first with its own card number
+/// as its transaction ID and the second with a third fixture card's. A run over the default
+/// window ends normally, nothing it prints holds a fixture card number in full, any event
+/// included ([`run_report`]), and each row's `TRAN-RECORD` line shows its transaction ID as
+/// twelve `*` and the ID's last four digits and every other byte as CBTRN03C-012 gives it.
+/// Failures name no line and no number.
+#[tokio::test(flavor = "multi_thread")]
+async fn card_numbers_in_transaction_ids_are_redacted() -> TestResult {
+    let cards = fixture_card_numbers()?
+        .into_iter()
+        .map(|text| Ok((CardNumber::parse(&text)?, text)))
+        .collect::<Result<Vec<(CardNumber, String)>, Box<dyn Error>>>()?;
+    let card_of =
+        |row: &TransactionRecord| cards.iter().position(|(card, _)| *card == row.card_num);
+    let mut daily = daily_transactions()?.into_iter();
+    let (own_row, own_card) = daily
+        .find_map(|row| card_of(&row).map(|index| (row, index)))
+        .ok_or("no dailytran.txt record of a card in card_xref")?;
+    let (other_row, other_card) = daily
+        .find_map(|row| {
+            card_of(&row)
+                .filter(|&index| index != own_card)
+                .map(|index| (row, index))
+        })
+        .ok_or("no dailytran.txt record of a second card in card_xref")?;
+    let third_card = (0..cards.len())
+        .find(|&index| index != own_card && index != other_card)
+        .ok_or("fewer than three fixture cards")?;
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let stamp = PicTimestamp::decode(POSTED_PROC_TS)?;
+    let mut expected = Vec::new();
+    for (mut row, id_card) in [(own_row, own_card), (other_row, third_card)] {
+        let (_, id) = cards.get(id_card).ok_or("no such fixture card")?;
+        row.id = PicX::from_text(id)?;
+        row.proc_ts = stamp;
+        TransactionRepository::insert(&mut store, &row).await?;
+        expected.push(id_redacted_tran_record_line(&row)?);
+    }
+    let scratch = Scratch::new()?;
+    // audit: CBTRN03C-039
+    let run = run_report(&guard, &scratch, None, 1).await?;
+    let mut shown: Vec<&str> = run
+        .job_log
+        .iter()
+        .filter(|line| is_tran_record_line(line))
+        .map(String::as_str)
+        .collect();
+    shown.sort_unstable();
+    expected.sort_unstable();
+    // audit: CBTRN03C-012
+    // audit: CBTRN03C-039
+    assert!(
+        shown == expected,
+        "the TRAN-RECORD lines are not the two rows with their transaction IDs redacted"
+    );
+    Ok(())
 }
 
 /// A reports directory that cannot be created, because `reports` is a file, fails the open of
-/// `REPTFILE` and ends the run on the abend path: a non-zero exit status, no path printed, no
+/// `REPTFILE` and ends the run on the abend path: `ERROR OPENING REPTFILE`, the status line and
+/// `ABENDING PROGRAM` after the start line, a non-zero exit status, no path printed, no
 /// generation file, and `transactions` as it was.
 #[tokio::test(flavor = "multi_thread")]
 async fn uncreatable_reports_directory_abends_the_run() -> TestResult {
@@ -1405,14 +2195,9 @@ async fn uncreatable_reports_directory_abends_the_run() -> TestResult {
     let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
     fs::write(scratch.var_dir().join("reports"), b"")?;
     let (start, end) = window_around_today()?;
-    let args = [
-        OsStr::new("tranrept"),
-        OsStr::new("--start-date"),
-        OsStr::new(&start),
-        OsStr::new("--end-date"),
-        OsStr::new(&end),
-    ];
-    let output = run_batch(&guard, &scratch, &args).await?;
+    let output = run_batch(&guard, &scratch, &tranrept_args(&start, &end), Log::JobLog).await?;
+    // audit: CBTRN03C-039
+    assert_no_fixture_card_number(&output)?;
     // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
     // audit: CBTRN03C-007
     // audit: CBTRN03C-035
@@ -1420,6 +2205,22 @@ async fn uncreatable_reports_directory_abends_the_run() -> TestResult {
         output.status.code().is_some_and(|code| code != 0),
         "tranrept ended with {:?}",
         output.status.code()
+    );
+    // audit: CBTRN03C-007
+    assert_abend_log(&job_log(&output), OPEN_REPTFILE, "CBTRN03C-007");
+    // The event of the failed open names the setting of the directory, never its path.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let shown = scratch.var_dir().display().to_string();
+    assert!(
+        stdout.lines().any(|line| {
+            line.contains(r#""operation":"OPEN REPTFILE""#)
+                && line.contains(&format!("({REPORTS_DIR_SETTING})"))
+        }),
+        "no event of the failed open names the reports setting"
+    );
+    assert!(
+        !stdout.contains(&shown),
+        "standard output shows the var directory"
     );
     assert!(written_paths(&output).is_empty(), "tranrept printed a path");
     assert_eq!(
@@ -1445,7 +2246,7 @@ async fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
     post_fixture_transactions(&guard, &scratch).await?;
     let (start, end) = window_around_today()?;
     let window = Some((start.as_str(), end.as_str()));
-    let before = run_report(&guard, &scratch, window, 1).await?;
+    let before = run_report(&guard, &scratch, window, 1).await?.report;
     let code = PicX::<2>::from_text("01")?;
     let mut store = PgStore::new(guard.pool().clone());
     let vsam = TransactionTypeRepository::find_by_id(&mut store, &code)
@@ -1467,7 +2268,7 @@ async fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
         OsStr::new("--input"),
         input.as_os_str(),
     ];
-    let output = run_batch(&guard, &scratch, &args).await?;
+    let output = run_batch(&guard, &scratch, &args, Log::Errors).await?;
     // audit: COBTUPDT-027
     assert_eq!(
         output.status.code(),
@@ -1492,12 +2293,201 @@ async fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
         "mnttrdb2 changed the VSAM type 01"
     );
 
-    let after = run_report(&guard, &scratch, window, 2).await?;
+    let after = run_report(&guard, &scratch, window, 2).await?.report;
     assert_vsam_descriptions(&after)?;
     // audit: CBTRN03C-038
     assert!(
         after == before,
         "the report written after the update differs from the one before it"
     );
+    Ok(())
+}
+
+/// A connection lost inside the read loop: the [`Relay`] closes the connection of the selection
+/// after its first row, so the job reads, shows and reports that row and fails to fetch the next.
+/// The run ends on the abend path of `1000-TRANFILE-GET-NEXT`: `ERROR READING TRANSACTION FILE`,
+/// the status line and `ABENDING PROGRAM`, a non-zero exit status, no path printed, no generation
+/// file and `transactions` as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_selection_lost_after_its_first_row_abends_the_read() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let scratch = Scratch::new()?;
+    post_fixture_transactions(&guard, &scratch).await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
+    let (start, end) = window_around_today()?;
+    let relay = Relay::start(
+        guard.database_url(),
+        Cut::AfterFirstRow(TRANSACTIONS_COLUMN),
+    )?;
+    let args = tranrept_args(&start, &end);
+    let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
+    let cut = relay.cut_made();
+    drop(relay);
+    assert!(cut, "the relay never met the selection's row description");
+    // audit: CBTRN03C-039
+    assert_no_fixture_card_number(&output)?;
+    // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
+    // audit: CBTRN03C-035
+    assert!(
+        output.status.code().is_some_and(|code| code != 0),
+        "tranrept ended with {:?}",
+        output.status.code()
+    );
+    assert_eq!(
+        first_stderr_line(&output),
+        format!("carddemo-batch tranrept: ABEND: {READ_TRANFILE}"),
+        "standard error"
+    );
+    let log = job_log(&output);
+    // Status `00` for the first row, read when the selection opened and shown before it was
+    // reported; the fetch of the second fails.
+    // audit: CBTRN03C-010
+    assert_eq!(
+        log.iter().filter(|line| is_tran_record_line(line)).count(),
+        1,
+        "TRAN-RECORD lines before the failed fetch"
+    );
+    // audit: CBTRN03C-010
+    assert_abend_log(&log, READ_TRANFILE, "CBTRN03C-010");
+    // audit: CBTRN03C-035
+    assert!(written_paths(&output).is_empty(), "tranrept printed a path");
+    assert_eq!(
+        var_files(&scratch)?,
+        ["dalyrejs/DALYREJS.G0001"],
+        "files under CARDDEMO_VAR_DIR"
+    );
+    // audit: CBTRN03C-003
+    assert!(
+        TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
+        "tranrept changed `transactions`"
+    );
+    Ok(())
+}
+
+/// One run of [`report_writes_past_a_size_limit_abend_the_run`]: the file-size limit, the
+/// failure line the write it stops shows, and the rule that line proves.
+struct LimitCase {
+    blocks: u32,
+    failure_line: &'static str,
+    rule: &'static str,
+}
+
+/// A report file that cannot grow past a file-size limit: below the first buffer the job writes,
+/// a write inside the loop fails (CBTRN03C-033); above every buffer the loop writes, the last
+/// write, when the file is closed, fails (CBTRN03C-034). Each run ends on the abend path: its
+/// failure line, the status line and `ABENDING PROGRAM`, a non-zero exit status, no path printed
+/// and no generation file.
+#[tokio::test(flavor = "multi_thread")]
+async fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let posting = Scratch::new()?;
+    post_fixture_transactions(&guard, &posting).await?;
+    let (start, end) = window_around_today()?;
+    let cases = [
+        LimitCase {
+            blocks: FIRST_WRITE_LIMIT,
+            failure_line: WRITE_REPTFILE,
+            rule: "CBTRN03C-033",
+        },
+        LimitCase {
+            blocks: CLOSE_LIMIT,
+            failure_line: CLOSE_REPTFILE,
+            rule: "CBTRN03C-034",
+        },
+    ];
+    for case in cases {
+        let rule = case.rule;
+        let scratch = Scratch::new()?;
+        let args = tranrept_args(&start, &end);
+        let output = run_size_limited(&guard, &scratch, &args, case.blocks).await?;
+        // audit: CBTRN03C-039
+        assert_no_fixture_card_number(&output)?;
+        // audit: CBTRN03C-035
+        assert!(
+            output.status.code().is_some_and(|code| code != 0),
+            "{rule}: tranrept ended with {:?}",
+            output.status.code()
+        );
+        assert_eq!(
+            first_stderr_line(&output),
+            format!("carddemo-batch tranrept: ABEND: {}", case.failure_line),
+            "{rule}: standard error"
+        );
+        // audit: CBTRN03C-033
+        // audit: CBTRN03C-034
+        assert_abend_log(&job_log(&output), case.failure_line, rule);
+        // audit: CBTRN03C-035
+        assert!(
+            written_paths(&output).is_empty(),
+            "{rule}: tranrept printed a path"
+        );
+        assert!(
+            var_files(&scratch)?.is_empty(),
+            "{rule}: a file remains under CARDDEMO_VAR_DIR"
+        );
+    }
+    Ok(())
+}
+
+/// The lookup reads that fail other than by a missing key, `HALTED(X-TRANREPT-H5)`
+/// (CBTRN03C-040 to CBTRN03C-042): the COBOL falls through to `END-READ` and goes on with the
+/// last record read, a result no source fixes for a `PostgreSQL` failure. For each lookup table
+/// the [`Relay`] closes the table's connection at its row description, and the run's outcome is
+/// printed as the rule's `BLOCKED` report, never asserted. The replacement reads each table
+/// whole when it opens it, before the first record, so the failure takes the open path of
+/// CBTRN03C-007 (X-TRANREPT-10).
+#[tokio::test(flavor = "multi_thread")]
+async fn lookup_reads_that_fail_are_reported_blocked() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let posting = Scratch::new()?;
+    post_fixture_transactions(&guard, &posting).await?;
+    let (start, end) = window_around_today()?;
+    let cases = [
+        ("CBTRN03C-040", "card_xref", CARD_XREF_COLUMN, OPEN_CARDXREF),
+        (
+            "CBTRN03C-041",
+            "transaction_types",
+            TRANSACTION_TYPES_COLUMN,
+            OPEN_TRANTYPE,
+        ),
+        (
+            "CBTRN03C-042",
+            "transaction_categories",
+            TRANSACTION_CATEGORIES_COLUMN,
+            OPEN_TRANCATG,
+        ),
+    ];
+    for (rule, table, column, open_line) in cases {
+        let scratch = Scratch::new()?;
+        let relay = Relay::start(guard.database_url(), Cut::AtDescription(column))?;
+        let args = tranrept_args(&start, &end);
+        let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
+        let cut = relay.cut_made();
+        drop(relay);
+        // Only the relay's own working and the run's redaction, which no halt covers, are
+        // checked; the run's outcome is reported.
+        assert!(
+            cut,
+            "{rule}: the relay never met the row description of {table}"
+        );
+        // audit: CBTRN03C-039
+        assert_no_fixture_card_number(&output)?;
+        let log = job_log(&output);
+        // BLOCKED(X-TRANREPT-H5): no parity assertion.
+        // audit: CBTRN03C-040
+        // audit: CBTRN03C-041
+        // audit: CBTRN03C-042
+        println!(
+            "BLOCKED {rule} (X-TRANREPT-H5): a failed read of {table}, no parity asserted; \
+             observed: exit status {:?}, {} path(s) printed, {} file(s) under \
+             CARDDEMO_VAR_DIR, open line shown: {}, ABENDING PROGRAM last: {}",
+            output.status.code(),
+            written_paths(&output).len(),
+            var_files(&scratch).map_or(0, |files| files.len()),
+            log.iter().any(|line| line == open_line),
+            log.last().is_some_and(|line| line == ABEND_LINE)
+        );
+    }
     Ok(())
 }

@@ -14,11 +14,13 @@
 //!
 //! Each handler extracts, delegates and maps, in one expression: the verified identity and the
 //! request, one call of `services::copaus1c`, and the `From` conversions of `dto::copaus1c` and
-//! [`ScreenError`]. The two path segments reach the service as the raw text the client sent:
-//! `domain::online::copaus1c::edit` and the total `AuthKey::parse` decode them there, so a
-//! malformed account or key is answered with the program's own status and message (Total
-//! Parsers Over Untrusted Input). Whether a request is ENTER or F8 is the service's dispatch on
-//! `direction`, never a branch here. Handlers never reference the storage crate or SQL.
+//! [`ScreenError`]. The two path segments reach the service through [`RawPath`] as the raw text
+//! the client sent: `domain::online::copaus1c::edit` and the total `AuthKey::parse` decode them
+//! there, so a malformed account or key is answered with the program's own status and message
+//! (Total Parsers Over Untrusted Input). Only a segment that is not UTF-8 once percent-decoded
+//! is refused before the service, with the API's 400 `Invalid path parameters...`. Whether a
+//! request is ENTER or F8 is the service's dispatch on `direction`, never a branch here.
+//! Handlers never reference the storage crate or SQL.
 //!
 //! # Identity and redaction
 //!
@@ -29,14 +31,17 @@
 //! and nothing here logs or traces a value (Cardholder Data Redaction, E32).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
-use crate::dto::ValidQuery;
 use crate::dto::copaus1c::{AuthDetailQuery, AuthDetailResponse, FraudToggleResult};
+use crate::dto::{RawPath, ValidQuery};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`detail`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct DetailOperation;
 
 /// View an authorization (CPVD / COPAUS1C).
 ///
@@ -50,10 +55,12 @@ use crate::services;
 ///
 /// # Errors
 ///
-/// A `ScreenError` body: 400 when the account is not eleven digits, the key is blank or the
-/// query does not deserialise; 401 without a valid bearer token; 404 when no authorization of
-/// the account has the key; 500 when the summary, detail or next read fails, or the store fails.
+/// A `ScreenError` body: 400 when the account is not eleven digits, the key is blank, the query
+/// does not deserialise or a path segment is not UTF-8 once percent-decoded; 401 without a
+/// valid bearer token; 404 when no authorization of the account has the key; 500 when the
+/// summary, detail or next read fails, or the store fails.
 #[utoipa::path(
+    impl_for = DetailOperation,
     get,
     path = "/api/v1/authorizations/{acct_id}/{auth_key}",
     operation_id = "copaus1c_detail",
@@ -71,7 +78,8 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "Malformed account, blank key or invalid query",
+            description = "Malformed account, blank key or invalid query; or a path segment \
+                           that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
@@ -91,7 +99,7 @@ use crate::services;
 pub(crate) async fn detail(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path((acct_id, auth_key)): Path<(String, String)>,
+    RawPath((acct_id, auth_key)): RawPath<(String, String)>,
     ValidQuery(query): ValidQuery<AuthDetailQuery>,
 ) -> Result<Json<AuthDetailResponse>, ScreenError> {
     services::copaus1c::detail(&state, &user, &acct_id, &auth_key, query)
@@ -100,6 +108,9 @@ pub(crate) async fn detail(
         .map(Json)
         .map_err(ScreenError::from)
 }
+
+/// The `utoipa::Path` of [`toggle_fraud`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ToggleFraudOperation;
 
 /// Mark or unmark an authorization as fraud (CPVD / COPAUS1C, COPAUS2C).
 ///
@@ -112,11 +123,13 @@ pub(crate) async fn detail(
 ///
 /// # Errors
 ///
-/// A `ScreenError` body: 400 when the account is not eleven digits or the key is blank; 401
-/// without a valid bearer token; 404 when no authorization of the account has the key; 500 when
-/// a read fails, when COPAUS2C's insert or update or the replace of the detail fails and both
-/// writes are rolled back, or when the store fails. Nothing is written on any error.
+/// A `ScreenError` body: 400 when the account is not eleven digits, the key is blank or a path
+/// segment is not UTF-8 once percent-decoded; 401 without a valid bearer token; 404 when no
+/// authorization of the account has the key; 500 when a read fails, when COPAUS2C's insert or
+/// update or the replace of the detail fails and both writes are rolled back, or when the store
+/// fails. Nothing is written on any error.
 #[utoipa::path(
+    impl_for = ToggleFraudOperation,
     post,
     path = "/api/v1/authorizations/{acct_id}/{auth_key}/fraud",
     operation_id = "copaus1c_toggle_fraud",
@@ -131,7 +144,12 @@ pub(crate) async fn detail(
             description = "The fraud flag was flipped and committed",
             body = FraudToggleResult
         ),
-        (status = 400, description = "Malformed account or blank key", body = ScreenError),
+        (
+            status = 400,
+            description = "Malformed account or blank key; or a path segment that is not UTF-8 \
+                           once percent-decoded",
+            body = ScreenError
+        ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
         (
             status = 404,
@@ -149,7 +167,7 @@ pub(crate) async fn detail(
 pub(crate) async fn toggle_fraud(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path((acct_id, auth_key)): Path<(String, String)>,
+    RawPath((acct_id, auth_key)): RawPath<(String, String)>,
 ) -> Result<Json<FraudToggleResult>, ScreenError> {
     services::copaus1c::toggle_fraud(&state, &user, &acct_id, &auth_key)
         .await

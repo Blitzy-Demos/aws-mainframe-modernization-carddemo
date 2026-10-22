@@ -8,12 +8,14 @@
 //!   (`CARDDEMO_INTRDR_DIR`), the counterpart of CORPT00C's `JOBS` transient data queue.
 //!   [`check_intrdr_dir`] is the check `carddemo-api` runs on that directory before it connects,
 //!   through the one service that touches the filesystem (AAP 0.5.3).
-//! - [`router`] registers every handler through `utoipa_axum::routes!` and splits the result into
-//!   the axum router and the document, so each operation in the document is exactly one handler
-//!   and each handler is exactly one operation. [`openapi`] is that document alone. Building it
-//!   opens no connection and reads no environment, so `carddemo-openapi` and
-//!   `scripts/regen-api.sh` run offline, and one build always emits the same bytes: the document
-//!   is the frontend's only source of payload types (Generated API Types Only).
+//! - [`router`] registers every handler through `operation`, which builds what
+//!   `utoipa_axum::routes!` builds without the lint suppressions of that macro's expansion, and
+//!   splits the result into the axum router and the document, so each operation in the document
+//!   is exactly one handler and each handler is exactly one operation. [`openapi`] is that
+//!   document alone. Building it opens no connection and reads no environment, so
+//!   `carddemo-openapi` and `scripts/regen-api.sh` run offline, and one build always emits the
+//!   same bytes: the document is the frontend's only source of payload types (Generated API Types
+//!   Only).
 //! - [`app`] adds [`DOCUMENT_ROUTE`] after the split, so the document is served without being one
 //!   of its own operations, wraps every route in the request trace layer and binds the state.
 //!
@@ -25,8 +27,13 @@
 //! when no route matched; `runtime::telemetry::record_response` then adds the status and the
 //! latency. The URI, the query string, the headers and the body are never recorded, because path
 //! segments and query values carry account IDs and card numbers (Cardholder Data Redaction, AAP
-//! 0.3.4.7, 0.3.4.8). tower-http's default request and failure events are kept: neither names
-//! the URI.
+//! 0.3.4.7, 0.3.4.8).
+//!
+//! The response callback only records the status and the latency; it emits no event. Standard
+//! output gets one `INFO` line per request when the request's span closes, written by the
+//! subscriber of `runtime::telemetry`, carrying the method, the route template, the status and
+//! the latency, so the default `info` output records every request. tower-http's default request
+//! event (`DEBUG`) and failure event (`ERROR`, for a 5xx) are kept: neither names the URI.
 //!
 //! # What is deliberately absent
 //!
@@ -47,8 +54,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{FromRef, MatchedPath};
+use axum::handler::Handler;
 use axum::http::{Request, Response};
-use axum::routing::get;
+use axum::routing::{MethodRouter, get};
 use axum::{Json, Router};
 use domain::clock::Clock;
 use persistence::PgStore;
@@ -56,15 +64,22 @@ use runtime::config::{Config, EnvError};
 use runtime::telemetry::{UNMATCHED_ROUTE, record_response, request_span};
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
+use utoipa::__dev::{SchemaReferences, Tags};
 use utoipa::OpenApi as _;
+use utoipa::Path;
 use utoipa::openapi::OpenApi;
-use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
+use utoipa::openapi::path::Paths;
+use utoipa_axum::PathItemExt as _;
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouter};
 
 use crate::auth::jwt::JwtKeys;
-use crate::handlers;
+use crate::handlers::{
+    coactupc, coactvwc, coadm01c, cobil00c, cocrdlic, cocrdslc, cocrdupc, comen01c, copaus0c,
+    copaus1c, corpt00c, cosgn00c, cotrn00c, cotrn01c, cotrn02c, cotrtlic, cotrtupc, cousr00c,
+    cousr01c, cousr02c, cousr03c,
+};
 use crate::openapi::ApiDoc;
-use crate::services::corpt00c::{self, DECK_DIR_SETTING};
+use crate::services::corpt00c::{DECK_DIR_SETTING, check_deck_dir};
 
 /// Where [`app`] serves the `OpenAPI` document as JSON. It is added after the split, so it is not
 /// an operation of the document it serves.
@@ -168,7 +183,7 @@ impl std::error::Error for IntrdrDirError {}
 /// left to the submissions, each of which answers it with `Unable to Write TDQ (JOBS)...`
 /// (CORPT00C-037).
 pub fn check_intrdr_dir(config: &Config) -> Result<(), IntrdrDirError> {
-    corpt00c::check_deck_dir(&config.intrdr_dir).map_err(|kind| IntrdrDirError { kind })
+    check_deck_dir(&config.intrdr_dir).map_err(|kind| IntrdrDirError { kind })
 }
 
 /// Names every field but shows only the job-deck directory: the keys are secret, and neither the
@@ -195,61 +210,108 @@ impl FromRef<AppState> for JwtKeys {
 /// make: the base document of [`ApiDoc`] with one path item per route and every schema the
 /// handlers declare.
 ///
-/// `routes!` registers each handler under the path its `#[utoipa::path]` declares, and gives one
-/// method router to every path its handlers name, so the handlers of one path share one
-/// `routes!` call and no call mixes paths. That makes 22 calls for the 27 operations. No route is
-/// added outside `routes!` before the split, so the router serves exactly the document's
-/// operations. The static segments `/cards/view`, `/cards/edit` and
+/// Each handler is registered by one `operation` call under the path and methods its
+/// `#[utoipa::path]` declares, so 27 calls make the 27 operations. The handlers of one path are
+/// registered one after the other: `OpenApiRouter::routes` merges their operations into the
+/// path's one path item, and axum merges their method routers into the path's one method router,
+/// which makes 22 paths. No route is added outside `operation` before the split, so the router
+/// serves exactly the document's operations. The static segments `/cards/view`, `/cards/edit` and
 /// `/transaction-types/list-actions` take precedence over the `{param}` segment beside them.
 #[must_use = "the router serves nothing and the document is emitted nowhere until both are used"]
 pub fn router() -> (Router<AppState>, OpenApi) {
     OpenApiRouter::<AppState>::with_openapi(ApiDoc::openapi())
         // 1: CC00 / COSGN00C.
-        .routes(routes!(handlers::cosgn00c::signon))
+        .routes(operation(cosgn00c::SignonOperation, cosgn00c::signon))
         // 2: CM00 / COMEN01C.
-        .routes(routes!(handlers::comen01c::main_menu))
+        .routes(operation(comen01c::MainMenuOperation, comen01c::main_menu))
         // 3: CA00 / COADM01C.
-        .routes(routes!(handlers::coadm01c::admin_menu))
-        // 4: CAVW / COACTVWC.
-        .routes(routes!(handlers::coactvwc::view))
-        // 5 and 6: CAUP / COACTUPC, fetch and save.
-        .routes(routes!(handlers::coactupc::fetch, handlers::coactupc::save))
-        // 7: CCLI / COCRDLIC.
-        .routes(routes!(handlers::cocrdlic::list))
-        // 8: CCDL / COCRDSLC.
-        .routes(routes!(handlers::cocrdslc::view))
-        // 9 and 10: CCUP / COCRDUPC, fetch and save, on two paths.
-        .routes(routes!(handlers::cocrdupc::fetch))
-        .routes(routes!(handlers::cocrdupc::save))
-        // 11 and 13: CT00 / COTRN00C's list and CT02 / COTRN02C's add share a path.
-        .routes(routes!(handlers::cotrn00c::list, handlers::cotrn02c::add))
-        // 12: CT01 / COTRN01C.
-        .routes(routes!(handlers::cotrn01c::view))
-        // 14: CR00 / CORPT00C.
-        .routes(routes!(handlers::corpt00c::submit))
-        // 15: CB00 / COBIL00C.
-        .routes(routes!(handlers::cobil00c::pay))
-        // 16 and 17: CU00 / COUSR00C's list and CU01 / COUSR01C's add share a path.
-        .routes(routes!(handlers::cousr00c::list, handlers::cousr01c::add))
-        // 18 to 20: the user read COUSR02C and COUSR03C share, COUSR02C's update and COUSR03C's
-        // delete.
-        .routes(routes!(
-            handlers::cousr02c::fetch,
-            handlers::cousr02c::update,
-            handlers::cousr03c::delete
+        .routes(operation(
+            coadm01c::AdminMenuOperation,
+            coadm01c::admin_menu,
         ))
+        // 4: CAVW / COACTVWC.
+        .routes(operation(coactvwc::ViewOperation, coactvwc::view))
+        // 5 and 6: CAUP / COACTUPC, fetch and save, on one path.
+        .routes(operation(coactupc::FetchOperation, coactupc::fetch))
+        .routes(operation(coactupc::SaveOperation, coactupc::save))
+        // 7: CCLI / COCRDLIC.
+        .routes(operation(cocrdlic::ListOperation, cocrdlic::list))
+        // 8: CCDL / COCRDSLC.
+        .routes(operation(cocrdslc::ViewOperation, cocrdslc::view))
+        // 9 and 10: CCUP / COCRDUPC, fetch and save, on two paths.
+        .routes(operation(cocrdupc::FetchOperation, cocrdupc::fetch))
+        .routes(operation(cocrdupc::SaveOperation, cocrdupc::save))
+        // 11 and 13: CT00 / COTRN00C's list and CT02 / COTRN02C's add share a path.
+        .routes(operation(cotrn00c::ListOperation, cotrn00c::list))
+        .routes(operation(cotrn02c::AddOperation, cotrn02c::add))
+        // 12: CT01 / COTRN01C.
+        .routes(operation(cotrn01c::ViewOperation, cotrn01c::view))
+        // 14: CR00 / CORPT00C.
+        .routes(operation(corpt00c::SubmitOperation, corpt00c::submit))
+        // 15: CB00 / COBIL00C.
+        .routes(operation(cobil00c::PayOperation, cobil00c::pay))
+        // 16 and 17: CU00 / COUSR00C's list and CU01 / COUSR01C's add share a path.
+        .routes(operation(cousr00c::ListOperation, cousr00c::list))
+        .routes(operation(cousr01c::AddOperation, cousr01c::add))
+        // 18 to 20: the user read COUSR02C and COUSR03C share, COUSR02C's update and COUSR03C's
+        // delete, on one path.
+        .routes(operation(cousr02c::FetchOperation, cousr02c::fetch))
+        .routes(operation(cousr02c::UpdateOperation, cousr02c::update))
+        .routes(operation(cousr03c::DeleteOperation, cousr03c::delete))
         // 21: CPVS / COPAUS0C.
-        .routes(routes!(handlers::copaus0c::summary))
+        .routes(operation(copaus0c::SummaryOperation, copaus0c::summary))
         // 22 and 23: CPVD / COPAUS1C, the detail and the fraud toggle COPAUS2C performs.
-        .routes(routes!(handlers::copaus1c::detail))
-        .routes(routes!(handlers::copaus1c::toggle_fraud))
+        .routes(operation(copaus1c::DetailOperation, copaus1c::detail))
+        .routes(operation(
+            copaus1c::ToggleFraudOperation,
+            copaus1c::toggle_fraud,
+        ))
         // 24 and 25: CTLI / COTRTLIC, paging and the ENTER and F10 workflow.
-        .routes(routes!(handlers::cotrtlic::list))
-        .routes(routes!(handlers::cotrtlic::list_actions))
+        .routes(operation(cotrtlic::ListOperation, cotrtlic::list))
+        .routes(operation(
+            cotrtlic::ListActionsOperation,
+            cotrtlic::list_actions,
+        ))
         // 26 and 27: CTTU / COTRTUPC, fetch and the save and delete actions.
-        .routes(routes!(handlers::cotrtupc::fetch))
-        .routes(routes!(handlers::cotrtupc::action))
+        .routes(operation(cotrtupc::FetchOperation, cotrtupc::fetch))
+        .routes(operation(cotrtupc::ActionOperation, cotrtupc::action))
         .split_for_parts()
+}
+
+/// One operation of [`router`]: `handler`, served at the path and methods that its
+/// `#[utoipa::path(impl_for = O)]` declares, with the operation and every schema the operation
+/// references, ready for `OpenApiRouter::routes`. `O` is passed as a value only to name the
+/// operation's type at the call site, and `handler` is a handler function, which is `Copy`.
+///
+/// This builds what `utoipa_axum::routes!` builds for one handler, from the same metadata: the
+/// `utoipa::Path`, `utoipa::__dev::Tags` and `utoipa::__dev::SchemaReferences` implementations
+/// that `#[utoipa::path]` generates on `O` and that `routes!` reads, the declared tags appended
+/// to the operation's own as `routes!` appends them, and one `MethodRouter::on` per declared
+/// method. The macro itself is not used, because its expansion carries lint-suppression
+/// attributes and R15 admits none in generated source; a function needs none (escalation E46).
+pub(crate) fn operation<O, H, T>(_: O, handler: H) -> UtoipaMethodRouter<AppState>
+where
+    O: Path + SchemaReferences + Tags<'static>,
+    H: Handler<T, AppState> + Copy,
+    T: 'static,
+{
+    let mut schemas = Vec::new();
+    O::schemas(&mut schemas);
+    let mut documented = O::operation();
+    let tags = O::tags();
+    if !tags.is_empty() {
+        documented
+            .tags
+            .get_or_insert_with(Vec::new)
+            .extend(tags.into_iter().map(String::from));
+    }
+    let methods = O::methods();
+    let method_router = methods.iter().fold(MethodRouter::new(), |router, method| {
+        router.on(method.to_method_filter(), handler)
+    });
+    let mut paths = Paths::new();
+    paths.add_path_operation(O::path(), methods, documented);
+    (schemas, paths, method_router)
 }
 
 /// The `OpenAPI` document of the 27 operations, as `carddemo-openapi` prints it and
@@ -289,8 +351,10 @@ impl<B> MakeSpan<B> for RouteSpan {
     }
 }
 
-/// Records the status and the latency of a response on its request's span, and nothing else:
-/// no header and no body.
+/// Records the status and the latency of a response on its request's span, and nothing else: no
+/// header and no body. It emits no event: when the span closes, the subscriber of
+/// `runtime::telemetry` writes the request's one `INFO` line on standard output, carrying the
+/// method, the route template and these two fields.
 #[derive(Debug, Clone, Copy, Default)]
 struct ResponseFields;
 
@@ -496,91 +560,106 @@ mod tests {
         builder.body(Body::empty())
     }
 
-    #[tokio::test]
-    async fn the_state_comes_from_the_configuration_and_shows_no_secret() -> TestResult {
-        let (store, _guard) = closed_store().await?;
-
-        let unset = AppState::from_config(store.clone(), &Config::default(), clock()?);
-        assert_eq!(unset.err(), Some(EnvError::MissingJwtSecret));
-
-        let config = Config {
-            jwt_secret: SECRET.to_owned(),
-            jwt_ttl_seconds: 120,
-            intrdr_dir: PathBuf::from("var/test-jobs"),
-            ..Config::default()
-        };
-        let state = AppState::from_config(store, &config, clock()?)?;
-        assert_eq!(state.intrdr_dir, PathBuf::from("var/test-jobs"));
-        assert_eq!(JwtKeys::from_ref(&state).ttl_seconds(), 120);
-
-        let shown = format!("{state:?}");
-        assert_eq!(
-            shown,
-            r#"AppState { store: .., jwt: .., clock: .., intrdr_dir: "var/test-jobs" }"#
-        );
-        assert!(!shown.contains(SECRET));
-
-        // The extractors verify with the configured secret: a token of these keys is accepted,
-        // one of another secret is refused before the handler runs.
-        let token = user_token(&JwtKeys::new(SECRET, 60))?;
-        let (status, _) = send(&state, get("/api/v1/menus/main", Some(&token))?).await?;
-        assert_eq!(status, StatusCode::OK);
-        let foreign = user_token(&JwtKeys::new("another-secret", 60))?;
-        let (status, _) = send(&state, get("/api/v1/menus/main", Some(&foreign))?).await?;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        // A `U` token reaches no admin operation.
-        let (status, _) = send(&state, get("/api/v1/menus/admin", Some(&token))?).await?;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        Ok(())
+    /// Runs `test` to completion on a current-thread runtime with I/O and time enabled, the
+    /// runtime `#[tokio::test]` builds. It is built here because that attribute's expansion
+    /// carries lint-suppression attributes, which R15 admits nowhere (escalation E46). The test
+    /// runs on the calling thread, so a trace capture the test starts sees all of it.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
-    #[tokio::test]
-    async fn the_document_is_served_and_spans_carry_route_templates_only() -> TestResult {
-        let (store, _guard) = closed_store().await?;
-        let state = AppState::new(
-            store,
-            JwtKeys::new(SECRET, 3600),
-            clock()?,
-            PathBuf::from("var/jobs"),
-        );
+    #[test]
+    fn the_state_comes_from_the_configuration_and_shows_no_secret() -> TestResult {
+        block_on(async {
+            let (store, _guard) = closed_store().await?;
 
-        let traces = trace_capture::capture();
+            let unset = AppState::from_config(store.clone(), &Config::default(), clock()?);
+            assert_eq!(unset.err(), Some(EnvError::MissingJwtSecret));
 
-        let (status, bytes) = send(&state, get(DOCUMENT_ROUTE, None)?).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_slice::<Value>(&bytes)?,
-            serde_json::to_value(openapi())?
-        );
-        assert!(traces.contains(r#""route":"/api-docs/openapi.json""#));
+            let config = Config {
+                jwt_secret: SECRET.to_owned(),
+                jwt_ttl_seconds: 120,
+                intrdr_dir: PathBuf::from("var/test-jobs"),
+                ..Config::default()
+            };
+            let state = AppState::from_config(store, &config, clock()?)?;
+            assert_eq!(state.intrdr_dir, PathBuf::from("var/test-jobs"));
+            assert_eq!(JwtKeys::from_ref(&state).ttl_seconds(), 120);
 
-        // No token: the extractor answers 401 before the path or the store is read.
-        let (status, _) = send(&state, get("/api/v1/accounts/00000000050/view", None)?).await?;
-        assert_eq!(status, StatusCode::UNAUTHORIZED);
-        assert!(traces.contains(r#""route":"/api/v1/accounts/{acct_id}/view""#));
-        assert!(traces.contains(r#""method":"GET""#));
-        assert!(traces.contains(r#""status":401"#));
-        assert!(traces.contains(r#""latency_ms":"#));
-
-        let (status, _) = send(
-            &state,
-            get(
-                "/api/v1/no-such-route/0500024453765740?card=0500024453765740",
-                None,
-            )?,
-        )
-        .await?;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        assert!(traces.contains(r#""route":"<unmatched>""#));
-        assert!(traces.contains(r#""status":404"#));
-
-        let text = traces.text();
-        for withheld in ["00000000050", "0500024453765740", "no-such-route", "card="] {
-            assert!(
-                !text.contains(withheld),
-                "a span or event recorded {withheld}"
+            let shown = format!("{state:?}");
+            assert_eq!(
+                shown,
+                r#"AppState { store: .., jwt: .., clock: .., intrdr_dir: "var/test-jobs" }"#
             );
-        }
-        Ok(())
+            assert!(!shown.contains(SECRET));
+
+            // The extractors verify with the configured secret: a token of these keys is
+            // accepted, one of another secret is refused before the handler runs.
+            let token = user_token(&JwtKeys::new(SECRET, 60))?;
+            let (status, _) = send(&state, get("/api/v1/menus/main", Some(&token))?).await?;
+            assert_eq!(status, StatusCode::OK);
+            let foreign = user_token(&JwtKeys::new("another-secret", 60))?;
+            let (status, _) = send(&state, get("/api/v1/menus/main", Some(&foreign))?).await?;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            // A `U` token reaches no admin operation.
+            let (status, _) = send(&state, get("/api/v1/menus/admin", Some(&token))?).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn the_document_is_served_and_spans_carry_route_templates_only() -> TestResult {
+        block_on(async {
+            let (store, _guard) = closed_store().await?;
+            let state = AppState::new(
+                store,
+                JwtKeys::new(SECRET, 3600),
+                clock()?,
+                PathBuf::from("var/jobs"),
+            );
+
+            let traces = trace_capture::capture();
+
+            let (status, bytes) = send(&state, get(DOCUMENT_ROUTE, None)?).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(
+                serde_json::from_slice::<Value>(&bytes)?,
+                serde_json::to_value(openapi())?
+            );
+            assert!(traces.contains(r#""route":"/api-docs/openapi.json""#));
+
+            // No token: the extractor answers 401 before the path or the store is read.
+            let (status, _) = send(&state, get("/api/v1/accounts/00000000050/view", None)?).await?;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(traces.contains(r#""route":"/api/v1/accounts/{acct_id}/view""#));
+            assert!(traces.contains(r#""method":"GET""#));
+            assert!(traces.contains(r#""status":401"#));
+            assert!(traces.contains(r#""latency_ms":"#));
+
+            let (status, _) = send(
+                &state,
+                get(
+                    "/api/v1/no-such-route/0500024453765740?card=0500024453765740",
+                    None,
+                )?,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert!(traces.contains(r#""route":"<unmatched>""#));
+            assert!(traces.contains(r#""status":404"#));
+
+            let text = traces.text();
+            for withheld in ["00000000050", "0500024453765740", "no-such-route", "card="] {
+                assert!(
+                    !text.contains(withheld),
+                    "a span or event recorded {withheld}"
+                );
+            }
+            Ok(())
+        })
     }
 }

@@ -2,33 +2,47 @@
 //! `OpenTelemetry` span export to standard output, and the span shapes every service uses.
 //!
 //! [`init`] installs the global subscriber once per process: the [`dependency_filter`] that
-//! silences the AMQP client's own diagnostics, an `EnvFilter` read from `RUST_LOG` (unset means
-//! `info`), the JSON layer of [`json_layer`] over standard output and, when
-//! `CARDDEMO_OTEL_EXPORT=stdout`, a `tracing-opentelemetry` layer whose finished spans the
+//! silences the AMQP client's and its I/O reactor's own diagnostics, an `EnvFilter` read from
+//! `RUST_LOG` (unset means `info`), the JSON layer of [`json_layer`] over standard output, a
+//! second layer of that format that writes only the closing of each HTTP request span and,
+//! when `CARDDEMO_OTEL_EXPORT=stdout`, a `tracing-opentelemetry` layer whose finished spans the
 //! `opentelemetry-stdout` exporter prints. Output goes to standard output only: there is no
 //! collector, no network exporter and no cloud service.
 //!
 //! # Standard output format
 //!
-//! With span export off, every line of standard output is one JSON event. With
-//! `CARDDEMO_OTEL_EXPORT=stdout`, the `opentelemetry-stdout` exporter also writes each finished
-//! span as a multi-line, human-readable text block, interleaved with the JSON event lines; the
+//! With span export off, every line of standard output is one JSON object: an event, or the one
+//! `INFO` line of a closed HTTP request span. `tracing-subscriber`'s fmt layer writes that line in
+//! the same format when the span closes, so no event of this workspace's code produces it, and it
+//! is how the default `info` output records every request. Its `span` member holds the method,
+//! the route template, the status and the latency of [`request_span`], and its `fields` hold only
+//! `message` (`close`) and the fmt layer's `time.busy` and `time.idle` durations, never a URI, a
+//! header, a body or an identity. No other span's opening or closing is written.
+//!
+//! With `CARDDEMO_OTEL_EXPORT=stdout`, the `opentelemetry-stdout` exporter also writes each
+//! finished span as a multi-line, human-readable text block, interleaved with the JSON lines; the
 //! exporter has no JSON format. A consumer that parses standard output line by line as JSON
-//! therefore runs with export off. Exported spans and their events carry no source-location
-//! attributes, so no source or host path reaches standard output. The `Resource` block of the
-//! export names the emitting binary: its `service.name` is the file name stem of the running
-//! executable (`carddemo-mq`, `carddemo-batch`, `carddemo-migrate`, `carddemo-api`), never a
-//! directory of its path. No event or span of the [`SILENCED_TARGETS`] reaches standard output,
-//! at any `RUST_LOG`.
+//! therefore runs with export off. The `Resource` block of the export names the emitting binary:
+//! its `service.name` is the file name stem of the running executable (`carddemo-mq`,
+//! `carddemo-batch`, `carddemo-migrate`, `carddemo-api`), never a directory of its path.
+//!
+//! Exported spans and their events carry no source-location attributes, and a JSON event of this
+//! workspace's code or of a dependency's `tracing` instrumentation names no source file or line.
+//! A record a dependency writes through the `log` crate is the exception: the `tracing-log`
+//! bridge gives it `log.file` and `log.line` fields naming the dependency's source file under the
+//! host's cargo registry. No event or span of the [`SILENCED_TARGETS`] reaches standard output,
+//! at any `RUST_LOG`, and they include the reactor crates `polling` and `async_io`, which write
+//! such a record for every poll.
 //!
 //! # Redaction boundary
 //!
-//! [`request_span`], [`record_response`], [`message_span`], [`record_reply_message_id`] and
-//! [`job_span`] are the only span shapes the services create and fill in, and each carries only
-//! the fields its documentation lists.
-//! Everything a span or event records reaches standard output, so a caller never adds a field
-//! holding a request or message body, a URI, a query string, a header or a protected value (card
-//! number, CVV, SSN, password), and never interpolates one into an event message.
+//! [`request_span`], [`record_response`], [`message_span`], [`record_reply_message_id`],
+//! [`job_span`] and [`record_job_outcome`] are the only span shapes the services create and fill
+//! in, and each carries only the fields its documentation lists; a job span's outcome is its
+//! return code and its [`JobCounter`] counts, plain numbers. Everything a span or event records
+//! reaches standard output, so a caller never adds a field holding a request or message body, a
+//! URI, a query string, a header or a protected value (card number, CVV, SSN, password), and
+//! never interpolates one into an event message.
 //!
 //! Text a requester chooses, such as the AMQP `message_id`, `correlation_id` and `reply_to`
 //! properties, can itself be a card number, an SSN or a password, and a `CardDemo` password is
@@ -60,12 +74,15 @@
 //! The redaction boundary binds the code of this workspace, and a dependency's own events bypass
 //! it. The AMQP client `lapin` logs, at `TRACE`, every frame it reads or writes in `Debug` form,
 //! the bytes of each message body and the `PLAIN` authentication response that carries the
-//! broker password included, and at `ERROR` the close text the broker composes. [`init`]
-//! therefore installs [`dependency_filter`] as a global filter of its own, ahead of the
-//! `RUST_LOG` filter. An event or span is recorded only when both filters enable it, so no
-//! `RUST_LOG` directive (`trace`, `lapin=trace`, `lapin::channels=trace`, …) re-enables one of
-//! the [`SILENCED_TARGETS`], while `RUST_LOG` alone, `info` by default, governs every other target
-//! in every binary.
+//! broker password included, and at `ERROR` the close text the broker composes. The reactor
+//! crates `polling` and `async_io` under `lapin`'s executor log every poll at `TRACE` through the
+//! `log` crate, dozens of lines a second while idle, each naming its source file under the host's
+//! cargo registry, and log nothing above `TRACE` on Linux. [`init`] therefore installs
+//! [`dependency_filter`] as a global filter of its own, ahead of the `RUST_LOG` filter. An event
+//! or span is recorded only when both filters enable it, so no `RUST_LOG` directive (`trace`,
+//! `lapin=trace`, `lapin::channels=trace`, `polling=trace`, …) re-enables one of the
+//! [`SILENCED_TARGETS`], while `RUST_LOG` alone, `info` by default, governs every other target in
+//! every binary.
 //!
 //! # Alerts
 //!
@@ -91,13 +108,17 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::SpanExporter;
 use opentelemetry_sdk::trace::{Tracer, TracerProvider};
+use tracing::callsite::{Callsite as _, DefaultCallsite};
 use tracing::field::Empty;
-use tracing::{Span, Subscriber, info_span};
+use tracing::level_filters::STATIC_MAX_LEVEL;
+use tracing::{Metadata, Span, Subscriber, info_span};
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::filter::{Builder, EnvFilter, FromEnvError, LevelFilter, Targets};
-use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
+use tracing_subscriber::filter::{
+    Builder, EnvFilter, FromEnvError, LevelFilter, Targets, filter_fn,
+};
+use tracing_subscriber::fmt::format::{FmtSpan, Format, Json, JsonFields};
 use tracing_subscriber::fmt::{Layer as FmtLayer, MakeWriter};
-use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 
@@ -124,9 +145,13 @@ const TRACER_NAME: &str = "carddemo";
 /// constant for it is private to the SDK crate.
 const SERVICE_NAME_KEY: &str = "service.name";
 
+/// Name of the span [`request_span`] creates, the only span whose closing standard output records
+/// (see [`request_close_layer`]).
+const REQUEST_SPAN: &str = "http.request";
+
 /// The targets whose events and spans are never recorded, whatever `RUST_LOG` says: the AMQP
 /// client `lapin`, its protocol crates and `pinky_swear`, the promise crate behind every `lapin`
-/// operation.
+/// operation, and `polling` and `async_io`, the I/O reactor `lapin`'s executor runs on.
 ///
 /// Their diagnostics pass through no redaction of this workspace. At `TRACE`, `lapin` logs every
 /// frame in `Debug` form, which spells out the bytes of each message body (a CP00 request body
@@ -135,10 +160,23 @@ const SERVICE_NAME_KEY: &str = "service.name";
 /// composes. `amq_protocol_tcp` logs the broker address, and `pinky_swear` traces the promises of
 /// every broker operation.
 ///
+/// The reactor crates log every poll at `TRACE` through the `log` crate, dozens of lines a second
+/// while `carddemo-mq` is idle, and the `tracing-log` bridge gives each of those records
+/// `log.file` and `log.line` fields naming the crate's source file under the host's cargo
+/// registry. The versions this workspace builds log nothing above `TRACE` on Linux, so silencing
+/// them hides no failure.
+///
 /// A target matches by string prefix, as `tracing_subscriber::filter::Targets` compares them:
-/// `lapin` covers `lapin::channels` and every other module of the crate, and `amq_protocol`
-/// covers `amq_protocol_tcp`, `amq_protocol_uri` and `amq_protocol_types` as well.
-pub const SILENCED_TARGETS: [&str; 3] = ["lapin", "amq_protocol", "pinky_swear"];
+/// `lapin` covers `lapin::channels` and every other module of the crate, `amq_protocol` covers
+/// `amq_protocol_tcp`, `amq_protocol_uri` and `amq_protocol_types` as well, and `polling` and
+/// `async_io` cover `polling::epoll`, `async_io::reactor` and `async_io::driver`.
+pub const SILENCED_TARGETS: [&str; 5] = [
+    "lapin",
+    "amq_protocol",
+    "pinky_swear",
+    "polling",
+    "async_io",
+];
 
 /// The JSON format layer of the `CardDemo` tracing output, writing through `make_writer`.
 ///
@@ -167,8 +205,11 @@ where
 /// [`init`] installs it as a global layer ahead of the `RUST_LOG` filter. Every global filter of
 /// a subscriber must enable an event or span for any layer to record it, so the two filters
 /// combine as an AND: no `RUST_LOG` directive re-enables a silenced target, and `RUST_LOG` alone
-/// decides every other one. `test-support`'s trace capture installs it too, so that a capture
-/// records exactly what standard output can carry.
+/// decides every other one. A record a dependency writes through the `log` crate is checked
+/// against its own target, such as `polling::epoll`, before the `tracing-log` bridge dispatches
+/// it, so the filter drops a silenced crate's `log` records as well as its `tracing` events.
+/// `test-support`'s trace capture installs it too, so that a capture records exactly what
+/// standard output can carry.
 #[must_use]
 pub fn dependency_filter() -> Targets {
     Targets::new()
@@ -176,32 +217,79 @@ pub fn dependency_filter() -> Targets {
         .with_targets(SILENCED_TARGETS.map(|target| (target, LevelFilter::OFF)))
 }
 
+/// The layer that writes one `INFO` line in the [`json_layer`] format when a [`request_span`]
+/// closes, and nothing else.
+///
+/// It is [`json_layer`] over `make_writer` with `FmtSpan::CLOSE`, behind a per-layer filter that
+/// passes only the `http.request` span of this module. The layer therefore sees no event and no
+/// other span: it writes no event, no span opening and no closing of a message or job span. The
+/// line is `tracing-subscriber`'s own record of the close. Its `level` and `target` are the span's
+/// (`INFO`, `runtime::telemetry`), its `fields` hold only `message` (`close`) and the fmt layer's
+/// `time.busy` and `time.idle` durations, and its `span` member holds the span's recorded
+/// `latency_ms`, `method`, `route` and `status` and its `name`. Its `spans` member lists only the
+/// request spans entered where the span closes, and the api enters none there, so it is `[]`. The
+/// line adds no other field, so it never carries a URI, a query string, a header, a body or an
+/// identity:
+///
+/// ```text
+/// {"timestamp":"…","level":"INFO","fields":{"message":"close","time.busy":"…","time.idle":"…"},
+///  "target":"runtime::telemetry","span":{"latency_ms":12,"method":"GET",
+///  "route":"/api/v1/accounts/{acct_id}/view","status":401,"name":"http.request"},"spans":[]}
+/// ```
+///
+/// That is one line on standard output, wrapped here.
+///
+/// The per-layer filter decides for this layer alone, and only over what the global filters of
+/// [`json_subscriber`] enable: a `RUST_LOG` that disables `INFO` for `runtime::telemetry`, such
+/// as `warn`, disables the span, and the layer writes no line.
+fn request_close_layer<S, W>(make_writer: W) -> impl Layer<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    W: for<'w> MakeWriter<'w> + 'static,
+{
+    json_layer(make_writer)
+        .with_span_events(FmtSpan::CLOSE)
+        .with_filter(filter_fn(is_request_span))
+}
+
+/// Whether `metadata` is that of a [`request_span`]: a span named `http.request` whose target is
+/// this module. An event, a span of another name, and a span of that name made in another module
+/// are not.
+fn is_request_span(metadata: &Metadata<'_>) -> bool {
+    metadata.is_span() && metadata.name() == REQUEST_SPAN && metadata.target() == module_path!()
+}
+
 /// The subscriber [`init`] installs, short of its optional `OpenTelemetry` layer: the registry
-/// with [`dependency_filter`] and then `env_filter` as global filters, and the [`json_layer`]
-/// over `make_writer`.
+/// with [`dependency_filter`] and then `env_filter` as global filters, the [`json_layer`] over
+/// `make_writer`, which writes every event and no span opening or closing, and the
+/// [`request_close_layer`] over the same writer, which writes the one line of each closed
+/// [`request_span`].
 ///
 /// Both filters sit below every layer, so they decide for the `OpenTelemetry` layer that [`init`]
 /// adds on top as well. The unit tests build this same subscriber over an in-memory writer, so
-/// they check the filtering that [`init`] installs.
+/// they check the filtering and the output that [`init`] installs.
 fn json_subscriber<W>(
     env_filter: EnvFilter,
     make_writer: W,
 ) -> impl Subscriber + for<'span> LookupSpan<'span> + Send + Sync
 where
-    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+    W: for<'w> MakeWriter<'w> + Clone + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
         .with(dependency_filter())
         .with(env_filter)
-        .with(json_layer(make_writer))
+        .with(json_layer(make_writer.clone()))
+        .with(request_close_layer(make_writer))
 }
 
 /// Installs the process-wide tracing subscriber.
 ///
 /// The subscriber drops every event and span of the [`SILENCED_TARGETS`] through
 /// [`dependency_filter`], whatever `RUST_LOG` says, filters every other target with `RUST_LOG`
-/// (unset or empty means `info`), writes JSON lines to standard output through [`json_layer`]
-/// and, for [`OtelExport::Stdout`], also bridges spans into an `OpenTelemetry` tracer provider
+/// (unset or empty means `info`), writes JSON lines to standard output through [`json_layer`],
+/// one for each event and, through its request close layer, one `INFO` line for each closed
+/// [`request_span`] carrying its method, route template, status and latency, and, for
+/// [`OtelExport::Stdout`], also bridges spans into an `OpenTelemetry` tracer provider
 /// whose simple span processor prints each finished span to standard output. [`OtelExport::Off`]
 /// adds no `OpenTelemetry` layer. A binary calls it before it connects to a broker or a
 /// database, so the silenced targets are off from the first frame.
@@ -209,7 +297,7 @@ where
 /// With [`OtelExport::Stdout`], the `opentelemetry-stdout` exporter writes each finished span as a
 /// multi-line, human-readable text block between the JSON event lines, so standard output is no
 /// longer one JSON object per line. A consumer that parses standard output line by line as JSON
-/// runs with [`OtelExport::Off`], where every line is one JSON event. Exported spans and their
+/// runs with [`OtelExport::Off`], where every line is one JSON object. Exported spans and their
 /// events carry no source-location attributes.
 ///
 /// The resource of the exported spans, which the exporter prints in its `Resource` block, names
@@ -403,6 +491,12 @@ impl Error for InitError {
 /// which [`record_response`] fills in. Never add the URI, the query string, a header or the body:
 /// path parameters and query values can hold card numbers and other protected values.
 ///
+/// When the span closes, the subscriber of [`init`] writes its one `INFO` line on standard
+/// output: the span's four fields and its name, plus only the fmt layer's `time.busy` and
+/// `time.idle` durations. It is the only span whose closing is written, so a request that emits
+/// no event of its own still leaves its method, route template, status and latency on the `info`
+/// output.
+///
 /// `api::app` calls it from tower-http's `TraceLayer::make_span_with` with the request method
 /// string and the route template, so the api passes plain strings and this crate needs no HTTP
 /// type. The request future runs inside the span through `tracing::Instrument::instrument`, as
@@ -410,7 +504,7 @@ impl Error for InitError {
 #[must_use]
 pub fn request_span(method: &str, matched_path: &str) -> Span {
     info_span!(
-        "http.request",
+        REQUEST_SPAN,
         method,
         route = matched_path,
         status = Empty,
@@ -590,14 +684,176 @@ pub fn record_reply_message_id(span: &Span, message_id: &str) {
     span.record("reply_message_id", message_id);
 }
 
-/// The span of one batch job run, named `batch.job`, recording only the `job` (subcommand) name.
+/// The span of one batch job run, named `batch.job`.
+///
+/// It records the `job` (subcommand) name when it opens, and declares the job's outcome, which
+/// [`record_job_outcome`] fills in once the job has run: `return_code` and one field for each
+/// [`JobCounter`], named as [`JobCounter::field`] names it. A field nothing records stays empty,
+/// and an empty field is neither written to standard output nor exported.
 ///
 /// Never add the content of an input or output record or any protected value. Attach it to the
 /// job's future with `tracing::Instrument::instrument`; never hold `Span::enter` across an
 /// `.await`.
 #[must_use]
 pub fn job_span(job: &str) -> Span {
-    info_span!("batch.job", job)
+    // A span's fields are declared here, where it is created, and a later record of a name it
+    // does not declare is dropped: each counter's name is the literal `JobCounter::field` gives.
+    info_span!(
+        "batch.job",
+        job,
+        return_code = Empty,
+        records = Empty,
+        processed = Empty,
+        rejected = Empty,
+        failed = Empty,
+        transactions = Empty,
+        accounts = Empty,
+        statements = Empty,
+        text_records = Empty,
+        html_records = Empty,
+        report_lines = Empty,
+        summaries_read = Empty,
+        summaries_deleted = Empty,
+        details_read = Empty,
+        details_deleted = Empty,
+        checkpoints = Empty
+    )
+}
+
+/// A counter of a batch job's outcome, recorded on its [`job_span`] under the field name
+/// [`field`](Self::field) gives.
+///
+/// The set is closed because a span declares its fields where it is created: every variant has
+/// a field of its name on every job span, so a new counter needs a variant here and a field in
+/// [`job_span`]. Each counter is a plain number of records, lines, rows or commits, never
+/// record content (Cardholder Data Redaction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCounter {
+    /// `records`: the records a job read, decoded or loaded.
+    Records,
+    /// `processed`: the daily transactions `posttran` processed.
+    Processed,
+    /// `rejected`: the daily transactions `posttran` rejected.
+    Rejected,
+    /// `failed`: the `mnttrdb2` records that reached `9999-ABEND`.
+    Failed,
+    /// `transactions`: the SYSTRAN records `intcalc` wrote.
+    Transactions,
+    /// `accounts`: the accounts `intcalc` rewrote.
+    Accounts,
+    /// `statements`: the statements `creastmt` wrote.
+    Statements,
+    /// `text_records`: the `STATEMNT.PS` records `creastmt` wrote.
+    TextRecords,
+    /// `html_records`: the `STATEMNT.HTML` records `creastmt` wrote.
+    HtmlRecords,
+    /// `report_lines`: the report records `tranrept` wrote.
+    ReportLines,
+    /// `summaries_read`: the pending authorization summaries `cbpaup0j` read.
+    SummariesRead,
+    /// `summaries_deleted`: the pending authorization summaries `cbpaup0j` deleted.
+    SummariesDeleted,
+    /// `details_read`: the pending authorization details `cbpaup0j` read.
+    DetailsRead,
+    /// `details_deleted`: the pending authorization details `cbpaup0j` deleted.
+    DetailsDeleted,
+    /// `checkpoints`: the checkpoint commits `cbpaup0j` took.
+    Checkpoints,
+}
+
+impl JobCounter {
+    /// Every counter, in the order [`job_span`] declares their fields.
+    pub const ALL: [Self; 15] = [
+        Self::Records,
+        Self::Processed,
+        Self::Rejected,
+        Self::Failed,
+        Self::Transactions,
+        Self::Accounts,
+        Self::Statements,
+        Self::TextRecords,
+        Self::HtmlRecords,
+        Self::ReportLines,
+        Self::SummariesRead,
+        Self::SummariesDeleted,
+        Self::DetailsRead,
+        Self::DetailsDeleted,
+        Self::Checkpoints,
+    ];
+
+    /// The name of the counter's field on the [`job_span`], as the span's JSON object and its
+    /// exported attributes show it.
+    #[must_use]
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::Records => "records",
+            Self::Processed => "processed",
+            Self::Rejected => "rejected",
+            Self::Failed => "failed",
+            Self::Transactions => "transactions",
+            Self::Accounts => "accounts",
+            Self::Statements => "statements",
+            Self::TextRecords => "text_records",
+            Self::HtmlRecords => "html_records",
+            Self::ReportLines => "report_lines",
+            Self::SummariesRead => "summaries_read",
+            Self::SummariesDeleted => "summaries_deleted",
+            Self::DetailsRead => "details_read",
+            Self::DetailsDeleted => "details_deleted",
+            Self::Checkpoints => "checkpoints",
+        }
+    }
+}
+
+/// Records a job's outcome on its [`job_span`]: `return_code`, and each count of `counts` under
+/// its [`JobCounter::field`].
+///
+/// The values are plain numbers, never record content or a protected value (Cardholder Data
+/// Redaction). They are span fields, and not only fields of an event, because the
+/// `OpenTelemetry` SDK keeps the first 128 events of a span and drops the rest: the event that
+/// ends a job emitting more, as `posttran` does at `TRACE`, is not exported, while the exported
+/// `batch.job` span carries its attributes however many events the job emitted. On standard
+/// output, each event emitted inside the span after this call shows the outcome in its `span`
+/// and `spans` members.
+///
+/// Each value is recorded as an `i64`, a JSON number on standard output and an integer
+/// attribute of the exported span; `tracing-opentelemetry` would export a `u64` as its text. A
+/// count above `i64::MAX`, which no job reaches, keeps its exact value as a `u64`, which the
+/// exporter shows as text. A disabled span, and a name the span does not declare, record nothing.
+pub fn record_job_outcome(span: &Span, return_code: u8, counts: &[(JobCounter, u64)]) {
+    span.record("return_code", i64::from(return_code));
+    for &(counter, count) in counts {
+        // TRUNCATION: checked, so nothing is lost: a count above `i64::MAX` fails the conversion
+        // and is recorded as its exact `u64` value instead, and no job counts 2^63 records.
+        if let Ok(signed) = i64::try_from(count) {
+            span.record(counter.field(), signed);
+        } else {
+            span.record(counter.field(), count);
+        }
+    }
+}
+
+/// Whether an event of `callsite` is to be dispatched now, decided as `tracing`'s event macros
+/// decide it: the event's level is within the static and the current maximum level, the
+/// callsite's interest, which its first use registers, is not `never`, and the interest is
+/// `always` or the current dispatcher enables the event's metadata.
+///
+/// It serves code that writes an event's callsite out by hand, a `DefaultCallsite` static over a
+/// `tracing::metadata!` static, and dispatches the event with `tracing::Event::dispatch` only when
+/// this returns `true`. Such code exists because the expansion of `tracing::info!` and the other
+/// event macros carries a lint suppression, an `allow(unused_imports)` attribute, and no source of
+/// this workspace, hand-written or generated, holds one.
+#[must_use]
+pub fn event_enabled(callsite: &'static DefaultCallsite) -> bool {
+    let metadata = callsite.metadata();
+    let level = *metadata.level();
+    if level > STATIC_MAX_LEVEL || level > LevelFilter::current() {
+        return false;
+    }
+    let interest = callsite.interest();
+    !interest.is_never()
+        && (interest.is_always()
+            || tracing::dispatcher::get_default(|dispatch| dispatch.enabled(metadata)))
 }
 
 #[cfg(test)]
@@ -616,15 +872,20 @@ mod tests {
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
     use opentelemetry_sdk::trace::TracerProvider;
+    use tracing::callsite::{Callsite as _, DefaultCallsite};
+    use tracing::field::{Field, Value};
+    use tracing::metadata::Kind;
+    use tracing::{Event, Level, Metadata};
     use tracing_subscriber::filter::{EnvFilter, FromEnvError, LevelFilter};
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, IdKey, InitError, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS,
-        ScreenedText, UNMATCHED_ROUTE, env_filter, init, job_span, json_layer, json_subscriber,
-        message_span, otel_layer, record_reply_message_id, record_response, request_span,
-        service_name, service_resource, tracer_provider,
+        ALERT_TARGET, IdKey, InitError, JobCounter, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS,
+        ScreenedText, UNMATCHED_ROUTE, dependency_filter, env_filter, event_enabled, init,
+        is_request_span, job_span, json_layer, json_subscriber, message_span, otel_layer,
+        record_job_outcome, record_reply_message_id, record_response, request_span, service_name,
+        service_resource, tracer_provider,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
@@ -707,6 +968,82 @@ mod tests {
             assert!(output.contains(needle), "{needle} missing from {output}");
         }
     }
+
+    // Written out: `tracing::info!` and the other macros expand to an `allow(unused_imports)` lint.
+    /// The callsite of the `INFO` probe event, whose one field is its `message`.
+    static PROBE: DefaultCallsite = DefaultCallsite::new(&PROBE_METADATA);
+
+    /// The metadata of [`PROBE`].
+    static PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "probe",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["message"],
+        callsite: &PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of the `WARN` probe event, whose one field is its `message`.
+    static WARN_PROBE: DefaultCallsite = DefaultCallsite::new(&WARN_PROBE_METADATA);
+
+    /// The metadata of [`WARN_PROBE`].
+    static WARN_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "warn probe",
+        target: module_path!(),
+        level: Level::WARN,
+        fields: &["message"],
+        callsite: &WARN_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// Emits an event of the probe `callsite` in the current span, with `message` as its message,
+    /// when [`event_enabled`] says so, and returns whether it did.
+    fn emit(callsite: &'static DefaultCallsite, message: &str) -> bool {
+        if !event_enabled(callsite) {
+            return false;
+        }
+        let metadata = callsite.metadata();
+        let fields = metadata.fields();
+        let field = fields
+            .field("message")
+            .expect("every probe declares `message`");
+        let values: [(&Field, Option<&dyn Value>); 1] = [(&field, Some(&message))];
+        Event::dispatch(metadata, &fields.value_set(&values));
+        true
+    }
+
+    /// Emits the `INFO` probe event with `message` in the current span.
+    fn probe(message: &str) {
+        emit(&PROBE, message);
+    }
+
+    /// The callsite of a span of the request span's name and fields made in another module, this
+    /// test module.
+    static OTHER_MODULE_REQUEST: DefaultCallsite =
+        DefaultCallsite::new(&OTHER_MODULE_REQUEST_METADATA);
+
+    /// The metadata of [`OTHER_MODULE_REQUEST`].
+    static OTHER_MODULE_REQUEST_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "http.request",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["method", "route", "status", "latency_ms"],
+        callsite: &OTHER_MODULE_REQUEST,
+        kind: Kind::SPAN,
+    };
+
+    /// The callsite of an event of the request span's name and target.
+    static REQUEST_EVENT: DefaultCallsite = DefaultCallsite::new(&REQUEST_EVENT_METADATA);
+
+    /// The metadata of [`REQUEST_EVENT`].
+    static REQUEST_EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "http.request",
+        target: "runtime::telemetry",
+        level: Level::INFO,
+        fields: &["message"],
+        callsite: &REQUEST_EVENT,
+        kind: Kind::EVENT,
+    };
 
     /// In-memory span exporter standing in for `opentelemetry-stdout`: it keeps every span it is
     /// handed, as the stdout exporter would print it, and the last resource the provider hands
@@ -797,6 +1134,152 @@ mod tests {
             &output,
             &[r#""status":500"#, r#""latency_ms":18446744073709551615"#],
         );
+    }
+
+    #[test]
+    fn a_closed_request_span_writes_one_info_line_when_rust_log_enables_it() {
+        // `RUST_LOG` value, and whether it enables `INFO` for this module's spans.
+        let directives = [
+            ("info", true),
+            ("warn,runtime::telemetry=info", true),
+            ("warn", false),
+            ("info,runtime::telemetry=warn", false),
+        ];
+        // Method, route, status and latency in milliseconds of each request.
+        let requests = [
+            ("GET", "/api/v1/accounts/{acct_id}/view", 401, 12),
+            ("GET", "/api/v1/menus/main", 200, 1),
+            ("POST", UNMATCHED_ROUTE, 404, 0),
+        ];
+        for (directive, enabled) in directives {
+            for (method, route, status, latency) in requests {
+                let captured = Captured::default();
+                let subscriber = json_subscriber(EnvFilter::new(directive), captured.clone());
+                tracing::subscriber::with_default(subscriber, || {
+                    let span = request_span(method, route);
+                    record_response(&span, status, Duration::from_millis(latency));
+                    drop(span);
+                });
+                let output = captured.text();
+                let case = format!("{directive}: {method} {route}");
+
+                if !enabled {
+                    assert_eq!(output, "", "{case}");
+                    continue;
+                }
+                let lines: Vec<&str> = output.lines().collect();
+                let [line] = lines.as_slice() else {
+                    panic!("{case}: expected exactly one line, got {output}");
+                };
+                // The span's recorded fields, in the order the JSON format writes them, then its
+                // name.
+                let fields =
+                    format!(r#""latency_ms":{latency},"method":"{method}","route":"{route}""#);
+                let span = format!(r#"{{{fields},"status":{status},"name":"http.request"}}"#);
+                assert_contains_all(
+                    line,
+                    &[
+                        r#"{"timestamp":""#,
+                        r#""level":"INFO","fields":{"message":"close","time.busy":""#,
+                        r#"","time.idle":""#,
+                        r#""target":"runtime::telemetry""#,
+                        // No span is entered where the span closes.
+                        &format!(r#""span":{span},"spans":[]}}"#),
+                    ],
+                );
+                // The fields are the message and the two durations, and nothing else.
+                let Some((_, fields)) = line.split_once(r#""fields":{"#) else {
+                    panic!("{case}: no fields member in {line}");
+                };
+                let fields = fields.split_once('}').map_or(fields, |(object, _)| object);
+                assert_eq!(fields.matches("\":").count(), 3, "{case}: {fields}");
+                for withheld in ["uri", "?", "header", "body", "user"] {
+                    assert!(!line.contains(withheld), "{case}: {withheld} in {line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_other_span_writes_its_opening_or_closing() {
+        for directive in ["info", "trace"] {
+            let captured = Captured::default();
+            let subscriber = json_subscriber(EnvFilter::new(directive), captured.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                job_span("posttran").in_scope(|| probe("job probe"));
+                message_span("CARD.DEMO.REQUEST.DATE", None, None)
+                    .in_scope(|| probe("message probe"));
+            });
+            let output = captured.text();
+
+            // Only the two events: no line of either span's opening or closing.
+            let messages: Vec<&str> = output
+                .lines()
+                .filter_map(|line| line.split_once(r#""message":""#))
+                .map(|(_, rest)| rest.split_once('"').map_or(rest, |(message, _)| message))
+                .collect();
+            assert_eq!(
+                messages,
+                ["job probe", "message probe"],
+                "{directive}: {output}"
+            );
+            assert_contains_all(
+                &output,
+                &[
+                    r#""name":"batch.job""#,
+                    r#""name":"mq.message""#,
+                    r#""target":"runtime::telemetry::tests""#,
+                ],
+            );
+        }
+    }
+
+    /// The request close layer's filter passes the request span of this module alone: not a span
+    /// of that name made in another module, not this module's other spans, not an event.
+    #[test]
+    fn only_the_request_span_of_this_module_is_a_request_span() {
+        // A subscriber that enables every span, so that each span has its metadata.
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let request = request_span("GET", "/api/v1/menus/main");
+            let job = job_span("posttran");
+            let message = message_span("CARD.DEMO.REQUEST.DATE", None, None);
+            let cases = [
+                ("the request span", request.metadata(), true),
+                (
+                    "a span of its name and fields in another module",
+                    Some(&OTHER_MODULE_REQUEST_METADATA),
+                    false,
+                ),
+                ("the job span", job.metadata(), false),
+                ("the message span", message.metadata(), false),
+                (
+                    "an event of its name and target",
+                    Some(&REQUEST_EVENT_METADATA),
+                    false,
+                ),
+            ];
+            for (case, metadata, expected) in cases {
+                let Some(metadata) = metadata else {
+                    panic!("{case} is disabled under a subscriber that enables every span");
+                };
+                assert_eq!(is_request_span(metadata), expected, "{case}: {metadata:?}");
+            }
+            // The two written-out cases differ from the request span in target or kind alone.
+            let Some(expected) = request.metadata() else {
+                panic!("the request span is disabled under a subscriber that enables every span");
+            };
+            let other_module = &OTHER_MODULE_REQUEST_METADATA;
+            assert_eq!(
+                (other_module.name(), other_module.is_span()),
+                (expected.name(), true)
+            );
+            assert_ne!(other_module.target(), expected.target());
+            let event = &REQUEST_EVENT_METADATA;
+            assert_eq!(
+                (event.name(), event.target(), event.is_event()),
+                (expected.name(), expected.target(), true)
+            );
+        });
     }
 
     #[test]
@@ -994,6 +1477,11 @@ mod tests {
                 "lapin=trace,amq_protocol=trace,pinky_swear=trace,info",
                 false,
             ),
+            ("polling=trace,async_io=trace,info", false),
+            (
+                "polling::epoll=trace,async_io::reactor=trace,async_io::driver=trace,trace",
+                true,
+            ),
             ("info", false),
         ];
         for (directives, below_info) in cases {
@@ -1035,6 +1523,38 @@ mod tests {
                     below_info,
                     "{directives}: {probe} in {output}"
                 );
+            }
+        }
+    }
+
+    /// The dependency filter refuses every silenced target, and each module under one such as
+    /// the reactor's `polling::epoll`, at every level, and passes an application target at every
+    /// level, so only `RUST_LOG` decides the latter.
+    #[test]
+    fn the_dependency_filter_refuses_every_silenced_target_at_every_level() {
+        let filter = dependency_filter();
+        let levels = [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ];
+        let modules = [
+            "polling::epoll",
+            "async_io::reactor",
+            "async_io::driver",
+            "lapin::channels",
+            "amq_protocol_tcp",
+        ];
+        for target in SILENCED_TARGETS.into_iter().chain(modules) {
+            for level in levels {
+                assert!(!filter.would_enable(target, &level), "{target} at {level}");
+            }
+        }
+        for target in ["messaging::workers", ALERT_TARGET] {
+            for level in levels {
+                assert!(filter.would_enable(target, &level), "{target} at {level}");
             }
         }
     }
@@ -1395,5 +1915,167 @@ mod tests {
             Err(err @ InitError::NotUnicode) => assert!(err.source().is_none()),
             Err(other) => panic!("first install must succeed, got {other:?}"),
         }
+    }
+
+    /// The outcome the job span tests record: `posttran`'s counts over the fixtures, and a count
+    /// beyond `i64::MAX`.
+    const OUTCOME: [(JobCounter, u64); 3] = [
+        (JobCounter::Processed, 300),
+        (JobCounter::Rejected, 38),
+        (JobCounter::Records, u64::MAX),
+    ];
+
+    /// The counters [`OUTCOME`] leaves unrecorded.
+    fn unrecorded() -> impl Iterator<Item = JobCounter> {
+        JobCounter::ALL
+            .into_iter()
+            .filter(|counter| OUTCOME.iter().all(|(recorded, _)| recorded != counter))
+    }
+
+    #[test]
+    fn job_span_declares_the_return_code_and_every_counter_field() {
+        let fields = JobCounter::ALL.map(JobCounter::field);
+        let distinct: std::collections::BTreeSet<&str> = fields.into_iter().collect();
+        assert_eq!(distinct.len(), fields.len(), "{fields:?}");
+
+        // A subscriber that enables every span, so that the span has its metadata.
+        tracing::subscriber::with_default(tracing_subscriber::registry(), || {
+            let span = job_span("posttran");
+            for name in ["job", "return_code"].into_iter().chain(fields) {
+                assert!(span.field(name).is_some(), "batch.job lacks {name}");
+            }
+            let Some(metadata) = span.metadata() else {
+                panic!("the job span is disabled under a subscriber that enables every span");
+            };
+            let declared: Vec<&str> = metadata.fields().iter().map(|field| field.name()).collect();
+            let mut expected = vec!["job", "return_code"];
+            expected.extend(fields);
+            assert_eq!(declared, expected);
+        });
+    }
+
+    #[test]
+    fn a_recorded_job_outcome_is_in_the_span_of_later_events_as_numbers() {
+        let output = capture(|| {
+            let span = job_span("posttran");
+            record_job_outcome(&span, 4, &OUTCOME);
+            span.in_scope(|| probe("job finished"));
+        });
+        let Some((_, after)) = output.split_once(r#""span":{"#) else {
+            panic!("no span member in {output}");
+        };
+        let span = after.split_once('}').map_or(after, |(object, _)| object);
+        assert_contains_all(
+            span,
+            &[
+                r#""job":"posttran""#,
+                r#""return_code":4"#,
+                r#""processed":300"#,
+                r#""rejected":38"#,
+                r#""records":18446744073709551615"#,
+                r#""name":"batch.job""#,
+            ],
+        );
+        for counter in unrecorded() {
+            let member = format!(r#""{}":"#, counter.field());
+            assert!(!output.contains(&member), "{member} in {output}");
+        }
+    }
+
+    #[test]
+    fn the_exported_job_span_carries_its_outcome_however_many_events_are_dropped() {
+        let exported = Exported::default();
+        // The construction `init` uses, with the SDK's default span limits.
+        let provider = tracer_provider(exported.clone(), Resource::default());
+        let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = job_span("posttran");
+            span.in_scope(|| {
+                for _ in 0..200 {
+                    probe("probe");
+                }
+            });
+            record_job_outcome(&span, 4, &OUTCOME);
+            span.in_scope(|| probe("job finished"));
+        });
+
+        let spans = exported.spans();
+        let [span] = spans.as_slice() else {
+            panic!("expected exactly one exported span, got {}", spans.len());
+        };
+        assert_eq!(span.name, "batch.job");
+        // The SDK keeps the first 128 of the 201 events: the closing event is among those dropped.
+        assert_eq!(
+            (span.events.len(), span.events.dropped_count),
+            (128, 73),
+            "{:?}",
+            span.attributes
+        );
+        assert!(
+            span.events.iter().all(|event| event.name != "job finished"),
+            "{:?}",
+            span.attributes
+        );
+        let attribute = |key: &str| {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.clone())
+        };
+        let expected = [
+            ("job", opentelemetry::Value::from("posttran")),
+            ("return_code", opentelemetry::Value::I64(4)),
+            ("processed", opentelemetry::Value::I64(300)),
+            ("rejected", opentelemetry::Value::I64(38)),
+            ("records", opentelemetry::Value::from(u64::MAX.to_string())),
+        ];
+        for (key, value) in expected {
+            assert_eq!(attribute(key), Some(value), "{key}: {:?}", span.attributes);
+        }
+        for counter in unrecorded() {
+            assert_eq!(attribute(counter.field()), None, "{:?}", span.attributes);
+        }
+    }
+
+    /// A written-out event is dispatched exactly when the subscriber's filters enable its level
+    /// and target, and the line it writes is the one a macro-made event writes.
+    #[test]
+    fn event_enabled_follows_the_filters_of_the_current_subscriber() {
+        // `RUST_LOG` value, and whether it enables the `INFO` and the `WARN` probe.
+        let cases = [
+            ("trace", true, true),
+            ("info", true, true),
+            ("warn", false, true),
+            ("info,runtime::telemetry::tests=error", false, false),
+            ("off", false, false),
+        ];
+        for (directive, info, warn) in cases {
+            let captured = Captured::default();
+            let subscriber = json_subscriber(EnvFilter::new(directive), captured.clone());
+            let emitted = tracing::subscriber::with_default(subscriber, || {
+                (emit(&PROBE, "info probe"), emit(&WARN_PROBE, "warn probe"))
+            });
+            assert_eq!(emitted, (info, warn), "{directive}");
+
+            let output = captured.text();
+            let lines = [
+                (info, r#""level":"INFO","fields":{"message":"info probe"}"#),
+                (warn, r#""level":"WARN","fields":{"message":"warn probe"}"#),
+            ];
+            for (expected, needle) in lines {
+                assert_eq!(output.contains(needle), expected, "{directive}: {output}");
+            }
+            let count = usize::from(info) + usize::from(warn);
+            assert_eq!(output.lines().count(), count, "{directive}: {output}");
+            if count > 0 {
+                assert_contains_all(&output, &[r#""target":"runtime::telemetry::tests""#]);
+            }
+        }
+
+        // A subscriber that enables nothing.
+        tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+            assert!(!event_enabled(&PROBE));
+            assert!(!event_enabled(&WARN_PROBE));
+        });
     }
 }

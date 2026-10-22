@@ -51,6 +51,9 @@ use crate::dto::cotrtupc::{
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`fetch`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct FetchOperation;
+
 /// Fetch a transaction type (CTTU / COTRTUPC).
 ///
 /// ENTER on the fresh screen: `1000-PROCESS-INPUTS` stores and edits the code typed in
@@ -71,6 +74,7 @@ use crate::services;
 // The responses are exactly the statuses COTRTUPC's audit assigns: a code no row holds is a 200
 // that starts the add path, never a 404 (COTRTUPC-010).
 #[utoipa::path(
+    impl_for = FetchOperation,
     get,
     path = "/api/v1/transaction-types/{type_code}",
     operation_id = "cotrtupc_fetch",
@@ -124,6 +128,9 @@ pub(crate) async fn fetch(
         .map_err(ScreenError::from)
 }
 
+/// The `utoipa::Path` of [`action`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ActionOperation;
+
 /// Save or delete a transaction type (CTTU / COTRTUPC).
 ///
 /// `{type_code}` is the code the screen shows, and `aid` the key pressed:
@@ -156,6 +163,7 @@ pub(crate) async fn fetch(
 // No 404 and no 409: an update finding no row falls back to the insert (COTRTUPC-026), and the
 // changed-by-another-user text is never set (COTRTUPC-025).
 #[utoipa::path(
+    impl_for = ActionOperation,
     post,
     path = "/api/v1/transaction-types/{type_code}/actions",
     operation_id = "cotrtupc_action",

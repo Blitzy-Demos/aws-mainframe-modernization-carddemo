@@ -169,7 +169,7 @@ async fn connect(container: ContainerAsync<GenericImage>) -> Result<PostgresGuar
 /// container, whose removal also ends the server session the abandoned migration left open.
 async fn migrate(guard: PostgresGuard, bound: Duration) -> Result<PostgresGuard, HarnessError> {
     match time::timeout(bound, runtime::migrate::apply(&guard.pool)).await {
-        Ok(Ok(())) => Ok(guard),
+        Ok(Ok(_applied)) => Ok(guard),
         Ok(Err(err)) => Err(HarnessError::new("apply migrations", &err)),
         Err(_) => Err(HarnessError::new(
             "apply migrations",

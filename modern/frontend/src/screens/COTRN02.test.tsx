@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import type { components } from "@/api/schema";
-import { clearSession, setSession } from "@/auth/session";
+import { clearSession, getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
 import { COTRN02 } from "./COTRN02";
 
@@ -1351,6 +1351,131 @@ describe("COTRN02 Add Transaction screen", () => {
     await settle();
     expect(requests).toHaveLength(1);
   });
+});
+
+// Endpoint 13 takes the transaction in its JSON body alone, and every request carries the stored
+// session's token.
+describe("COTRN02: endpoint 13 request", () => {
+  /** Every request `fetch` received: method, path, query, `Authorization` header and JSON body. */
+  async function sentRequests() {
+    return Promise.all(
+      vi.mocked(fetch).mock.calls.map(async ([input, init]) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        const text = await request.clone().text();
+        const body: unknown = text === "" ? undefined : JSON.parse(text);
+        return {
+          method: request.method,
+          path: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          authorization: request.headers.get("Authorization"),
+          body,
+        };
+      }),
+    );
+  }
+
+  it("ENTER POSTs the typed fields with the bearer token and no query, and shows the prompt", async () => {
+    stubApi([json(200, promptByAccount)]);
+    renderScreen({ from: PATHS.COMEN01 });
+
+    await reachPrompt();
+
+    expect(await sentRequests()).toEqual([
+      {
+        method: "POST",
+        path: ENDPOINT,
+        query: {},
+        authorization: "Bearer test-token",
+        body: enterByAccount,
+      },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/transactions/add`, so the sign-on guard that only
+ * the table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRN02] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the ENTER that sent the refused
+// request, the test presses no key and follows no link.
+describe("COTRN02 in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the validation of ENTER",
+      replies: [json(401, signonRequired)],
+      drive: async () => {
+        typeInto(TYPED_BY_ACCOUNT);
+        pressEnter();
+      },
+      count: 1,
+    },
+    {
+      title: "the add of the confirmed ENTER",
+      replies: [json(200, promptByAccount), json(401, signonRequired)],
+      drive: async () => {
+        await reachPrompt();
+        await waitFor(() => {
+          expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("false");
+        });
+        typeInto({ confirm: "Y" });
+        pressEnter();
+      },
+      count: 2,
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, count }) => {
+      const sent = stubApi(replies);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole(
+          "heading",
+          { level: 1, name: "Add Transaction" },
+          { timeout: 5_000 },
+        ),
+      ).toBeDefined();
+
+      await drive();
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "Add Transaction" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(sent).toHaveLength(count);
+      for (const request of sent) {
+        expect([request.method, request.path, request.authorization]).toEqual([
+          "POST",
+          ENDPOINT,
+          "Bearer test-token",
+        ]);
+      }
+      router.dispose();
+    },
+  );
 });
 
 // The sign-on guard lives in the application's route tree, not in the screen, so this group

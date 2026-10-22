@@ -12,10 +12,10 @@
 //! to 100, 5 rows when absent, a value outside that range refused with 422 by [`ValidQuery`]
 //! before the service runs. The handler passes the validated query on untouched.
 //!
-//! The account travels as the raw path segment: the service's domain edit answers a blank or
-//! non-numeric value with the program's own message, and the domain, never this handler,
-//! converts the edited `PicU<11>` account into the signed `PicS<11>` summary key (COPAUS0C-005,
-//! COPAUS0C-006, COPAUS0C-027).
+//! The account travels as the raw path segment ([`RawPath`]): the service's domain edit answers
+//! a blank or non-numeric value with the program's own message, and the domain, never this
+//! handler, converts the edited `PicU<11>` account into the signed `PicS<11>` summary key
+//! (COPAUS0C-005, COPAUS0C-006, COPAUS0C-027).
 //!
 //! The handler extracts the identity, the path segment and the validated query, calls
 //! `services::copaus0c::summary` and maps its outcome into [`AuthSummaryResponse`] or a
@@ -24,14 +24,17 @@
 //! (n5). No response holds a card number, full or redacted (COPAUS0C-055).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
-use crate::dto::ValidQuery;
 use crate::dto::copaus0c::{AuthSummaryQuery, AuthSummaryResponse};
+use crate::dto::{RawPath, ValidQuery};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`summary`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct SummaryOperation;
 
 /// List pending authorizations for an account (CPVS / COPAUS0C)
 ///
@@ -44,11 +47,14 @@ use crate::services;
 ///
 /// # Errors
 ///
-/// A `ScreenError` with 400 for a blank or non-numeric account ID, a malformed query or a
-/// `page_key` that is not an authorization key; 401 without a valid bearer token; 404 when the
-/// account has no cross-reference, account or customer record; 422 for a `page_size` outside 1
-/// to 100; 500 when a read fails, with the program's system-error text.
+/// A `ScreenError` with 400 for a blank or non-numeric account ID, a malformed query, a
+/// `page_key` that is not an authorization key or, with the API's `Invalid path parameters...`
+/// and no field, an account segment that is not UTF-8 once percent-decoded; 401 without a valid
+/// bearer token; 404 when the account has no cross-reference, account or customer record; 422
+/// for a `page_size` outside 1 to 100; 500 when a read fails, with the program's system-error
+/// text.
 #[utoipa::path(
+    impl_for = SummaryOperation,
     get,
     path = "/api/v1/accounts/{acct_id}/authorizations",
     operation_id = "copaus0c_summary",
@@ -71,7 +77,8 @@ use crate::services;
         (
             status = 400,
             description = "A blank or non-numeric account ID, a malformed query or a `page_key` \
-                           that is not an authorization key",
+                           that is not an authorization key; or a path segment that is not \
+                           UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
@@ -96,7 +103,7 @@ use crate::services;
 pub(crate) async fn summary(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path(acct_id): Path<String>,
+    RawPath(acct_id): RawPath<String>,
     ValidQuery(query): ValidQuery<AuthSummaryQuery>,
 ) -> Result<Json<AuthSummaryResponse>, ScreenError> {
     services::copaus0c::summary(&state, &user, &acct_id, query)

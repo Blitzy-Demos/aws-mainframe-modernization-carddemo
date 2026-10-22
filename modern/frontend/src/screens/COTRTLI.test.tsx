@@ -1,10 +1,17 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COTRTLI } from "./COTRTLI";
 
 /**
@@ -1412,4 +1419,109 @@ describe("COTRTLI", () => {
     expect(await arrivedAt(target)).toEqual({ from: PATHS.COTRTLI });
     expect(seen).toHaveLength(1);
   });
+});
+
+// Endpoint 25 takes the filters, rows and state in its JSON body alone, and every request
+// carries the stored session's token.
+describe("COTRTLI: endpoint 24 and 25 requests", () => {
+  it("the first page and ENTER's list action each carry the bearer token, the action no query, and the prompt shows", async () => {
+    const seen = stubFetch([
+      [200, LOADED],
+      [200, DELETE_PROMPTED],
+    ]);
+    renderScreen();
+    await answered(seen, 1);
+
+    type(selectorAt(1), "D");
+    press("ENTER");
+    await answered(seen, 2);
+    expect(messageRow("info").textContent).toBe(CENTRED_DELETE_PROMPT);
+
+    expect(
+      seen.map(({ method, url, authorization }) => ({
+        route: `${method} ${url.pathname}`,
+        query: queryOf({ url }),
+        authorization,
+      })),
+    ).toEqual([
+      { route: `GET ${LIST_PATH}`, query: {}, authorization: "Bearer test-token" },
+      { route: `POST ${ACTIONS_PATH}`, query: {}, authorization: "Bearer test-token" },
+    ]);
+  });
+});
+
+/** The 401 of the `AdminUser` extractor for a missing, invalid or expired token. */
+const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/transaction-types`, so the admin guard that only the
+ * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRTLI] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the admin guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the request the screen sent, the
+// test presses no key and follows no link.
+describe("COTRTLI in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the list of the first entry (endpoint 24)",
+      replies: [[401, SIGNON_REQUIRED]] as const,
+      drive: async (seen: ReturnType<typeof stubFetch>) => {
+        await waitFor(() => {
+          expect(seen).toHaveLength(1);
+        });
+      },
+      calls: [`GET ${LIST_PATH}`],
+    },
+    {
+      title: "the list action of ENTER (endpoint 25)",
+      replies: [
+        [200, LOADED],
+        [401, SIGNON_REQUIRED],
+      ] as const,
+      drive: async (seen: ReturnType<typeof stubFetch>) => {
+        await answered(seen, 1);
+        type(selectorAt(1), "D");
+        press("ENTER");
+      },
+      calls: [`GET ${LIST_PATH}`, `POST ${ACTIONS_PATH}`],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, calls }) => {
+      const seen = stubFetch(replies);
+      const router = renderRouteTable();
+
+      await drive(seen);
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("table", { name: "Transaction types" })).toBeNull();
+      expect(
+        screen.queryByRole("heading", { level: 1, name: "Maintain Transaction Type" }),
+      ).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(seen.map((request) => `${request.method} ${request.url.pathname}`)).toEqual(calls);
+      expect(seen.every((request) => request.authorization === "Bearer test-token")).toBe(true);
+      router.dispose();
+    },
+  );
 });

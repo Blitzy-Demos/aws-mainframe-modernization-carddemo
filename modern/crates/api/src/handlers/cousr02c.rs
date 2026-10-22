@@ -31,6 +31,9 @@ use crate::dto::{ScreenResult, ValidJson, ValidPath};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`fetch`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct FetchOperation;
+
 /// Fetch a user (CU02 / COUSR02C and CU03 / COUSR03C)
 ///
 /// ENTER on the update screen and on the delete screen: the ID, names and type stored for the
@@ -46,6 +49,7 @@ use crate::services;
 /// - 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.
 /// - 500 `Unable to lookup User...` (`field` `first_name`) when the read fails.
 #[utoipa::path(
+    impl_for = FetchOperation,
     get,
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr02c_fetch",
@@ -78,6 +82,9 @@ pub(crate) async fn fetch(
         .map_err(ScreenError::from)
 }
 
+/// The `utoipa::Path` of [`update`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct UpdateOperation;
+
 /// Update a user (CU02 / COUSR02C)
 ///
 /// PF5 (`F5=Save`), and the save F3 (`F3=Save&Exit`) performs before the screen leaves: the
@@ -98,6 +105,7 @@ pub(crate) async fn fetch(
 /// - 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when
 ///   the read, the password check or the rewrite fails.
 #[utoipa::path(
+    impl_for = UpdateOperation,
     put,
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr02c_update",

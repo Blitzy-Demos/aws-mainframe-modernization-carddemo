@@ -18,9 +18,15 @@
 //! - `every_operation_answers_with_a_declared_status` starts one fixture-loaded `postgres:16`
 //!   container of `test_support`, serves `api::app::app` on a loopback port and calls the 27
 //!   operations once each over HTTP, after signing on as `ADMIN001` through endpoint 1.
+//! - `ctli_statuses_declare_the_page_the_screen_error_or_any_of_both` needs no Docker. It checks
+//!   the body schema of every status of endpoints 24 and 25, `anyOf` the page and `ScreenError`
+//!   at 400 and 500.
+//! - `ctli_error_bodies_satisfy_their_declared_schema` serves the API as the second test does
+//!   and checks four live 400 bodies of endpoints 24 and 25, two pages and two `ScreenError`s,
+//!   against the 400 schema their operation declares, with a structural JSON Schema check.
 //!
 //! This is a pattern-lane schema test, so it carries no audit tag, and it asserts a declared
-//! status, never a parity result. Every live input writes nothing: the reads only read, ENTER
+//! status or schema, never a parity result. Every live input writes nothing: the reads only read, ENTER
 //! validates without saving, endpoint 15's blank confirmation only shows the balance, and every
 //! other write names a record that does not exist or is refused by an edit, so no call depends
 //! on another's effects.
@@ -40,7 +46,7 @@ use domain::clock::{Clock, FixedClock};
 use domain::online::copaus0c::AuthKey;
 use persistence::PgStore;
 use reqwest::header::CONTENT_TYPE;
-use reqwest::{Client, Method, StatusCode};
+use reqwest::{Client, Method, RequestBuilder, StatusCode};
 use runtime::config::Config;
 use serde_json::{Map, Value, json};
 use test_support::fixtures::start_loaded_postgres;
@@ -511,6 +517,87 @@ fn document_lists_exactly_the_27_operations() -> TestResult {
     check_statuses(&doc)?;
     check_dates(&doc)?;
     check_committed(&doc)
+}
+
+/// A response status and the names of the schemas its JSON body may take.
+type StatusSchemas = (&'static str, &'static [&'static str]);
+
+/// The response schemas of endpoints 24 and 25, CTLI / COTRTLIC, status by status: method,
+/// path, and each status with the schemas its JSON body may take. One name is a reference to
+/// it; two are `anyOf` exactly those references, for the statuses COTRTLIC answers with the page
+/// or, for a request that gets no screen, with a `ScreenError`. The union is `anyOf` because a
+/// page with its message satisfies the `ScreenError` schema too, which `oneOf` forbids.
+const CTLI_RESPONSES: [(&str, &str, &[StatusSchemas]); 2] = [
+    (
+        "GET",
+        "/api/v1/transaction-types",
+        &[
+            ("200", &["TranTypeListResponse"]),
+            ("400", &["TranTypeListResponse", "ScreenError"]),
+            ("401", &["ScreenError"]),
+            ("403", &["ScreenError"]),
+            ("422", &["ScreenError"]),
+            ("500", &["TranTypeListResponse", "ScreenError"]),
+        ],
+    ),
+    (
+        "POST",
+        "/api/v1/transaction-types/list-actions",
+        &[
+            ("200", &["TranTypeListActionResult"]),
+            ("400", &["TranTypeListActionResult", "ScreenError"]),
+            ("401", &["ScreenError"]),
+            ("403", &["ScreenError"]),
+            ("404", &["TranTypeListActionResult"]),
+            ("422", &["ScreenError"]),
+            ("500", &["TranTypeListActionResult", "ScreenError"]),
+        ],
+    ),
+];
+
+#[test]
+fn ctli_statuses_declare_the_page_the_screen_error_or_any_of_both() -> TestResult {
+    let doc = document()?;
+    for (method, path, responses) in CTLI_RESPONSES {
+        let entry = operation(&doc, method, path)?;
+        let expected: BTreeSet<String> = responses
+            .iter()
+            .map(|&(status, _)| status.to_owned())
+            .collect();
+        assert_eq!(
+            declared_statuses(entry)?,
+            expected,
+            "{method} {path}: declared statuses"
+        );
+        for &(status, names) in responses {
+            let schema = entry
+                .pointer(&format!(
+                    "/responses/{status}/content/application~1json/schema"
+                ))
+                .ok_or_else(|| format!("{method} {path} {status} has no JSON body schema"))?;
+            let references: Vec<Value> = names
+                .iter()
+                .map(|name| json!({"$ref": format!("{SCHEMA_REF}{name}")}))
+                .collect();
+            let declared = match references.as_slice() {
+                [single] => single.clone(),
+                _ => json!({"anyOf": references}),
+            };
+            assert_eq!(schema, &declared, "{method} {path} {status}: body schema");
+        }
+    }
+    // The two-body schemas are declared inline, so the document names no schema for them.
+    let schemas = doc
+        .pointer("/components/schemas")
+        .and_then(Value::as_object)
+        .ok_or("the document has no components.schemas")?;
+    for name in ["TranTypeListErrorBody", "TranTypeListActionErrorBody"] {
+        assert!(
+            !schemas.contains_key(name),
+            "{name} is registered as a schema"
+        );
+    }
+    Ok(())
 }
 
 /// The emitter binary that `scripts/regen-api.sh` runs.
@@ -1004,8 +1091,299 @@ async fn exercise(base: String) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn every_operation_answers_with_a_declared_status() -> TestResult {
+/// The schema keywords [`satisfies`] does not judge: annotations, and the formats and value
+/// bounds that say nothing of a body's shape.
+const UNJUDGED_KEYWORDS: [&str; 11] = [
+    "description",
+    "example",
+    "examples",
+    "format",
+    "enum",
+    "minimum",
+    "maximum",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+];
+
+/// Whether `value` is of the JSON Schema type `name`.
+fn has_type(name: &str, value: &Value) -> Fallible<bool> {
+    Ok(match name {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        other => return Err(format!("no JSON Schema type is named {other}").into()),
+    })
+}
+
+/// How many members of the composition `rule`, the array of an `anyOf`, `oneOf` or `allOf`,
+/// `value` satisfies, and how many members it has.
+fn members_satisfied(
+    doc: &Value,
+    keyword: &str,
+    rule: &Value,
+    value: &Value,
+) -> Fallible<(usize, usize)> {
+    let members = rule
+        .as_array()
+        .ok_or_else(|| format!("{keyword} is not an array"))?;
+    let verdicts = members
+        .iter()
+        .map(|member| satisfies(doc, member, value))
+        .collect::<Fallible<Vec<bool>>>()?;
+    let satisfied = verdicts.iter().filter(|holds| **holds).count();
+    Ok((satisfied, members.len()))
+}
+
+/// Whether `value` satisfies `against`, a schema of the document `doc`, by the structure JSON
+/// Schema 2020-12 gives it: `$ref` resolved in `components.schemas`; `anyOf` at least one
+/// member, `oneOf` exactly one and `allOf` every one; `type` one name or an array of names,
+/// `null` included; `required` members present; and `properties` and `items` applied to the
+/// members and elements present. The keywords of [`UNJUDGED_KEYWORDS`] are not judged. Any other
+/// keyword is an error, so that no body passes on a keyword this check cannot judge.
+fn satisfies(doc: &Value, against: &Value, value: &Value) -> Fallible<bool> {
+    let keywords = against
+        .as_object()
+        .ok_or("a schema that is not an object")?;
+    for (keyword, rule) in keywords {
+        let holds = match keyword.as_str() {
+            "$ref" => {
+                let name = rule
+                    .as_str()
+                    .and_then(|target| target.strip_prefix(SCHEMA_REF))
+                    .ok_or("a $ref outside components.schemas")?;
+                satisfies(doc, schema(doc, name)?, value)?
+            }
+            "anyOf" => members_satisfied(doc, keyword, rule, value)?.0 > 0,
+            "oneOf" => members_satisfied(doc, keyword, rule, value)?.0 == 1,
+            "allOf" => {
+                let (satisfied, members) = members_satisfied(doc, keyword, rule, value)?;
+                satisfied == members
+            }
+            "type" => match rule {
+                Value::String(name) => has_type(name, value)?,
+                Value::Array(names) => {
+                    let mut any = false;
+                    for name in names {
+                        let name = name.as_str().ok_or("a type name that is not a string")?;
+                        any |= has_type(name, value)?;
+                    }
+                    any
+                }
+                _ => return Err("a type that is neither a name nor an array of names".into()),
+            },
+            "required" => {
+                let names = rule.as_array().ok_or("required is not an array")?;
+                let mut present = true;
+                for name in names {
+                    let name = name
+                        .as_str()
+                        .ok_or("a required name that is not a string")?;
+                    present &= value
+                        .as_object()
+                        .is_none_or(|object| object.contains_key(name));
+                }
+                present
+            }
+            "properties" => {
+                let properties = rule.as_object().ok_or("properties is not an object")?;
+                let mut all = true;
+                for (name, property) in properties {
+                    if let Some(member) = value.get(name) {
+                        all &= satisfies(doc, property, member)?;
+                    }
+                }
+                all
+            }
+            "items" => {
+                let mut all = true;
+                for element in value.as_array().into_iter().flatten() {
+                    all &= satisfies(doc, rule, element)?;
+                }
+                all
+            }
+            other if UNJUDGED_KEYWORDS.contains(&other) => true,
+            other => return Err(format!("the schema keyword {other} is outside this check").into()),
+        };
+        if !holds {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Endpoint 24, CTLI's screen load and F7/F8.
+const TYPE_LIST: u8 = 24;
+
+/// A CTLI request that COTRTLIC answers with 400, and which of the two bodies the operation's
+/// 400 schema allows it carries.
+struct CtliErrorCase {
+    /// What the request gets wrong, for the assertion messages.
+    label: &'static str,
+    /// Endpoint 24 or 25.
+    number: u8,
+    /// The operation's page schema, the member of its 400 `anyOf` other than `ScreenError`.
+    page: &'static str,
+    /// Whether the answer is the page rather than a `ScreenError`.
+    answers_page: bool,
+    /// The request, with everything but the token.
+    request: RequestBuilder,
+}
+
+/// The four CTLI requests that answer 400, sent to the API at `base`: the page of a type filter
+/// in error under an issued `page_key` and of an invalid action code, and the `ScreenError` of
+/// a `page_key` this API did not issue and of a body that is not JSON. Each body must satisfy
+/// the 400 schema its operation declares, and each page also satisfies `ScreenError`, the
+/// reason that schema is `anyOf` and not `oneOf`.
+async fn ctli_error_bodies(base: String) -> TestResult {
+    let mut live = Live {
+        client: Client::builder().no_proxy().build()?,
+        base,
+        doc: document()?,
+        token: None,
+        called: Vec::new(),
+    };
+    live.sign_on().await?;
+    let load = Call {
+        number: TYPE_LIST,
+        uri: "/api/v1/transaction-types".to_owned(),
+        body: None,
+    };
+    let loaded = live.call(&load).await?;
+    let page_key = loaded
+        .get("page_key")
+        .and_then(Value::as_str)
+        .ok_or("endpoint 24 returned no page_key")?;
+    let rows: Vec<Value> = (0..MAP_ROWS)
+        .map(|row| json!({"selection": if row == 0 { "X" } else { "" }, "description": ""}))
+        .collect();
+    let invalid_action = json!({
+        "aid": "ENTER",
+        "type_filter": "",
+        "desc_filter": "",
+        "rows": rows,
+        "state": member(&loaded, "state")?,
+    });
+    let token = live.token.clone().ok_or("sign-on kept no token")?;
+    let list = format!("{}/api/v1/transaction-types", live.base);
+    let list_actions = format!("{}/api/v1/transaction-types/list-actions", live.base);
+    let cases = [
+        CtliErrorCase {
+            label: "an issued page_key with a type filter in error",
+            number: TYPE_LIST,
+            page: "TranTypeListResponse",
+            answers_page: true,
+            request: live.client.get(&list).query(&[
+                ("page_key", page_key),
+                ("direction", "forward"),
+                ("type_filter", "??"),
+                ("desc_filter", ""),
+            ]),
+        },
+        CtliErrorCase {
+            label: "a page_key this API did not issue",
+            number: TYPE_LIST,
+            page: "TranTypeListResponse",
+            answers_page: false,
+            request: live
+                .client
+                .get(&list)
+                .query(&[("page_key", "zz"), ("direction", "forward")]),
+        },
+        CtliErrorCase {
+            label: "an invalid action code",
+            number: LIST_ACTIONS,
+            page: "TranTypeListActionResult",
+            answers_page: true,
+            request: live.client.post(&list_actions).json(&invalid_action),
+        },
+        CtliErrorCase {
+            label: "a body that is not JSON",
+            number: LIST_ACTIONS,
+            page: "TranTypeListActionResult",
+            answers_page: false,
+            request: live
+                .client
+                .post(&list_actions)
+                .header(CONTENT_TYPE, "application/json")
+                .body("{"),
+        },
+    ];
+    for case in cases {
+        check_ctli_error_case(&live.doc, &token, case).await?;
+    }
+    Ok(())
+}
+
+/// Sends `case` with `token` and checks its answer against `doc`: a JSON 400 whose body is the
+/// page or a bare `ScreenError` as `case` expects, satisfies the operation's declared 400
+/// schema, and satisfies `ScreenError` and, for a page, the page schema too.
+async fn check_ctli_error_case(doc: &Value, token: &str, case: CtliErrorCase) -> TestResult {
+    let &(method, path, _) = usize::from(case.number)
+        .checked_sub(1)
+        .and_then(|index| OPERATIONS.get(index))
+        .ok_or_else(|| format!("no endpoint {}", case.number))?;
+    let label = format!("endpoint {} ({method} {path}), {}", case.number, case.label);
+    let response = case.request.bearer_auth(token).send().await?;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+    let json_content = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    assert!(
+        json_content,
+        "{label}: the 400 response is not application/json"
+    );
+    let bytes = response.bytes().await?;
+    let body: Value =
+        serde_json::from_slice(&bytes).map_err(|_| format!("{label}: the 400 body is not JSON"))?;
+    assert_eq!(
+        is_screen_error(&body),
+        !case.answers_page,
+        "{label}: whether the 400 body is a bare ScreenError"
+    );
+
+    let declared = operation(doc, method, path)?
+        .pointer("/responses/400/content/application~1json/schema")
+        .ok_or_else(|| format!("{label}: 400 declares no JSON body schema"))?;
+    assert!(
+        satisfies(doc, declared, &body)?,
+        "{label}: the 400 body does not satisfy the schema its operation declares"
+    );
+    let as_page = satisfies(doc, schema(doc, case.page)?, &body)?;
+    let as_error = satisfies(doc, schema(doc, "ScreenError")?, &body)?;
+    assert_eq!(
+        (as_page, as_error),
+        (case.answers_page, true),
+        "{label}: whether the 400 body satisfies {} and ScreenError",
+        case.page
+    );
+    Ok(())
+}
+
+/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+/// without the lint attributes that macro's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
+/// Serves `api::app::app` on a loopback port over one fixture-loaded `postgres:16` container of
+/// `test_support`, runs `run` with the server's origin, then stops the server, so that its state
+/// and pool drop before the container goes.
+async fn served<Run, Running>(run: Run) -> TestResult
+where
+    Run: FnOnce(String) -> Running,
+    Running: Future<Output = TestResult>,
+{
     // Declared first, so it drops last: dropping the guard removes the container.
     let database = start_loaded_postgres().await?;
     let config = Config {
@@ -1019,7 +1397,7 @@ async fn every_operation_answers_with_a_declared_status() -> TestResult {
     let base = format!("http://{}", listener.local_addr()?);
     let server = tokio::spawn(axum::serve(listener, app(state)).into_future());
 
-    let outcome = exercise(base).await;
+    let outcome = run(base).await;
     server.abort();
     // Awaiting the aborted task drops the state and its pool before the container goes.
     let stopped = server.await;
@@ -1029,4 +1407,14 @@ async fn every_operation_answers_with_a_declared_status() -> TestResult {
         Err(join) => Err(join.into()),
         Ok(ended) => ended.map_err(Into::into),
     }
+}
+
+#[tokio::test]
+async fn every_operation_answers_with_a_declared_status() -> TestResult {
+    served(exercise).await
+}
+
+#[test]
+fn ctli_error_bodies_satisfy_their_declared_schema() -> TestResult {
+    block_on(served(ctli_error_bodies))
 }

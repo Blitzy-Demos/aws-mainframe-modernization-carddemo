@@ -1,10 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router";
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { PATHS, routes } from "@/routes";
 import { COCRDSL } from "./COCRDSL";
 
 /**
@@ -765,5 +765,71 @@ describe("COCRDSL", () => {
     expect(seen).toHaveLength(reads);
     // The identity the next screen works with is unchanged.
     expect(getSession()).toEqual({ token: TOKEN, userId: "USER0001", userType: "U" });
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/cards/view`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COCRDSL] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the
+// route replaces the still-mounted screen with sign-on at once: the test presses no key and
+// follows no link after ENTER.
+describe("COCRDSL in the route table: a 401 ends the session", () => {
+  beforeEach(() => {
+    setSession(TOKEN, "USER0001", "U");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("ENTER answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
+    const seen = stubFetch(() => json(401, signonRequired));
+    const router = renderRouteTable();
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 1, name: "View Credit Card Detail" },
+        { timeout: 5_000 },
+      ),
+    ).toBeDefined();
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.click(enterButton());
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(
+      screen.queryByRole("heading", { level: 1, name: "View Credit Card Detail" }),
+    ).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(sentQueries(seen)).toEqual([{ acct_id: ACCT_ID, card_num: TYPED_CARD }]);
+    expect(seen.map((request) => request.authorization)).toEqual([`Bearer ${TOKEN}`]);
+    router.dispose();
   });
 });

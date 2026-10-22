@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import type { components } from "@/api/schema";
-import { clearSession, setSession } from "@/auth/session";
+import { clearSession, getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
 import { COBIL00 } from "./COBIL00";
 
@@ -839,23 +839,85 @@ describe("COBIL00 bill payment screen", () => {
     expect(requests).toHaveLength(row.sent);
   });
 
-  // A failure of the replacement alone, which no audit row covers: the dev proxy answers an empty
-  // 502 while the API is down, so the message names the status, and no field takes the cursor.
-  it("shows a failure with no ScreenError body by its status, keeps fields, cursor", async () => {
+  // A failure of the replacement alone, which no audit row covers: a reply without a JSON object
+  // body, such as the dev proxy's empty 502 while the API is down, carries no message of the
+  // program's, so the row names the status, and no field takes the cursor. openapi-fetch hands
+  // over a 204's or a `Content-Length: 0` body as nothing and any other error body as its text or
+  // parsed JSON, so an empty body of no declared length, a chunked one, plain text and JSON `null`
+  // are no `ScreenError` either; a success without a body has no data.
+  it.each([
+    {
+      reply: "the dev proxy's empty 502",
+      response: () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
+      message: "HTTP 502 Bad Gateway",
+    },
+    {
+      reply: "an empty 500 of Content-Length 0",
+      response: () =>
+        new Response(null, {
+          status: 500,
+          statusText: "Internal Server Error",
+          headers: { "Content-Length": "0" },
+        }),
+      message: "HTTP 500 Internal Server Error",
+    },
+    {
+      reply: "an empty 502 without a reason phrase",
+      response: () => new Response(null, { status: 502, headers: { "Content-Length": "0" } }),
+      message: "HTTP 502",
+    },
+    {
+      reply: "an empty 500 without Content-Length",
+      response: () => new Response(null, { status: 500, statusText: "Internal Server Error" }),
+      message: "HTTP 500 Internal Server Error",
+    },
+    {
+      reply: "an empty, chunked 500",
+      response: () =>
+        new Response(null, {
+          status: 500,
+          statusText: "Internal Server Error",
+          headers: { "Content-Type": "text/plain", "Transfer-Encoding": "chunked" },
+        }),
+      message: "HTTP 500 Internal Server Error",
+    },
+    {
+      reply: "a plain-text 502",
+      response: () =>
+        new Response("Bad Gateway", {
+          status: 502,
+          statusText: "Bad Gateway",
+          headers: { "Content-Type": "text/plain" },
+        }),
+      message: "HTTP 502 Bad Gateway",
+    },
+    {
+      reply: "a 500 whose JSON body is null",
+      response: () => json(500, null),
+      message: "HTTP 500",
+    },
+    {
+      reply: "a 204",
+      response: () => new Response(null, { status: 204, statusText: "No Content" }),
+      message: "HTTP 204 No Content",
+    },
+    {
+      reply: "an empty 200",
+      response: () => new Response(null, { status: 200, statusText: "OK" }),
+      message: "HTTP 200 OK",
+    },
+  ])("shows $reply by its status, keeps fields, cursor", async ({ response, message }) => {
     stubApi();
     renderScreen({ from: PATHS.COMEN01 });
     await showBalance();
-    const requests = stubApi(
-      undefined,
-      () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
-    );
+    const requests = stubApi(undefined, response);
 
     const enter = screen.getByRole("button", { name: "ENTER=Continue" });
     await moveFocus(enter);
     fireEvent.click(enter);
 
     await waitFor(() => {
-      expect(errorText()).toBe("HTTP 502 Bad Gateway");
+      expect(errorText()).toBe(message);
     });
     expect(shown()).toEqual({ acct: ACCT, balance: BALANCE, confirm: "" });
     expect(document.activeElement).toBe(enter);
@@ -1051,4 +1113,114 @@ describe("COBIL00 bill payment screen", () => {
     await settle();
     expect(requests).toHaveLength(0);
   });
+});
+
+// Endpoint 15 takes the account and the confirmation in its JSON body alone, and every request
+// carries the stored session's token.
+describe("COBIL00: endpoint 15 request", () => {
+  /** A request as its method, path, query, `Authorization` header and JSON body. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    const body: unknown = await request.clone().json();
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body,
+    };
+  }
+
+  it("ENTER POSTs the two inputs with the bearer token and no query, and shows the balance", async () => {
+    const requests = stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+
+    await showBalance();
+
+    expect(await Promise.all(requests.map(shapeOf))).toEqual([
+      {
+        method: "POST",
+        path: ENDPOINT,
+        query: {},
+        authorization: "Bearer test-token",
+        body: { acct_id: ACCT, confirm: "" },
+      },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/bill-payment`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COBIL00] });
+  render(
+    <QueryClientProvider client={testQueryClient()}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the ENTER that sent the refused
+// request, the test presses no key and follows no link.
+describe("COBIL00 in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the balance of ENTER",
+      answer: () => json(401, signonRequired),
+      drive: async () => {
+        typeInputs(ACCT, "");
+        pressEnter();
+      },
+      sent: [{ acct_id: ACCT, confirm: "" }],
+    },
+    {
+      title: "the payment of ENTER with Y",
+      answer: (body: unknown) =>
+        member(body, "confirm") === "Y" ? json(401, signonRequired) : billPayment(body),
+      drive: async () => {
+        await showBalance();
+        typeInputs(ACCT, "Y");
+        pressEnter();
+      },
+      sent: [
+        { acct_id: ACCT, confirm: "" },
+        { acct_id: ACCT, confirm: "Y" },
+      ],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ answer, drive, sent }) => {
+      const requests = stubApi(undefined, answer);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Bill Payment" }, { timeout: 5_000 }),
+      ).toBeDefined();
+
+      await drive();
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "Bill Payment" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(paths(requests)).toEqual(sent.map(() => ENDPOINT));
+      expect(requests.map((request) => request.headers.get("Authorization"))).toEqual(
+        sent.map(() => "Bearer test-token"),
+      );
+      expect(await bodies(requests)).toEqual(sent);
+      router.dispose();
+    },
+  );
 });

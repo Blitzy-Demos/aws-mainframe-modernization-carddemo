@@ -1,6 +1,11 @@
-//! The API's error contract: every failure an endpoint answers with becomes a [`ScreenError`],
-//! the `{ message, field? }` body of every non-200 response, with the HTTP status the owning
-//! program's audit assigns (AAP 0.3.4.1, 0.5.6).
+//! The API's error contract: [`ScreenError`], the standard `{ message, field? }` failure body of
+//! the request layer, the token gate and the programs, with the HTTP status the owning program's
+//! audit assigns (AAP 0.3.4.1, 0.5.6). Two exceptions answer without it. Endpoints 24 and 25
+//! answer COTRTLIC's own errors (400 and 500, and 404 on endpoint 25) with the page,
+//! `dto::cotrtlic::TranTypeListResponse` or `TranTypeListActionResult`; their request-layer
+//! rejections, an unissued `page_key` or `state`, an unreachable database and a failed commit
+//! transaction keep the [`ScreenError`]. An unmatched path (404) and a method its route does not
+//! serve (405) get axum's empty body.
 //!
 //! # Where a status comes from
 //!
@@ -59,8 +64,9 @@ pub const UNABLE_TO_PROCESS: &str = "Unable to process request...";
 /// The request field every [`ScreenError::page_size`] names.
 const PAGE_SIZE_FIELD: &str = "page_size";
 
-/// The body of every error response: the message row of the screen and the request field the
-/// program puts the cursor on, with the HTTP status the response carries.
+/// The standard body of an error response: the message row of the screen and the request field
+/// the program puts the cursor on, with the HTTP status the response carries. Endpoints 24 and 25
+/// may answer a program error with their page instead.
 ///
 /// Serialised as `{"message": …, "field": …}`, `field` omitted when absent. The status travels
 /// as the response status only and is no part of the body or of the schema. A deserialised

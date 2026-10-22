@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COPAU01 } from "./COPAU01";
 
 /*
@@ -1373,4 +1380,151 @@ describe("COPAU01 authorization detail screen", () => {
     expect(shown()).toEqual(fields);
     expect(document.activeElement).toBe(field("Card #:"));
   });
+});
+
+// Endpoints 22 and 23 name the authorization by the path alone, and every request carries the
+// stored session's token.
+describe("COPAU01: endpoint 22 and 23 requests", () => {
+  /** A request as its method, path, query, `Authorization` header and body text. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body: await request.clone().text(),
+    };
+  }
+
+  it("the read and F5's fraud toggle each send the authorization's path with the bearer token, no query and no body, and the toggle shows", async () => {
+    const requests = await renderSelected();
+
+    fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
+    await waitFor(() => {
+      expect(errorText()).toBe(markedFraud.message);
+    });
+    await settle();
+
+    expect(shown()).toEqual({ ...SHOWN_SELECTED, AUTHFRD: "F-02/01/24" });
+    expect(await Promise.all(requests.map(shapeOf))).toEqual([
+      {
+        method: "GET",
+        path: `${ENDPOINT}${SELECTED_KEY}`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: "",
+      },
+      {
+        method: "POST",
+        path: `${ENDPOINT}${SELECTED_KEY}/fraud`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: "",
+      },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/authorizations/detail` with the route state of a
+ * COPAU00 selection, so the sign-on guard that only the table mounts stands in front of the
+ * screen. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, {
+    initialEntries: [{ pathname: PATHS.COPAU01, state: FROM_LIST }],
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/**
+ * Replaces `fetch`: every request of `method` is answered 401, and an entry read of
+ * {@link SELECTED_KEY} otherwise {@link selectedDetail}; any other request gets a 500. Returns
+ * every request in the order the screen sent it.
+ */
+function stubRefusing(method: "GET" | "POST"): Request[] {
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      requests.push(req);
+      const { pathname } = new URL(req.url);
+      if (req.method === method) {
+        return json(401, signonRequired);
+      }
+      if (req.method === "GET" && pathname === `${ENDPOINT}${SELECTED_KEY}`) {
+        return json(200, selectedDetail);
+      }
+      const unexpected: components["schemas"]["ScreenError"] = {
+        message: `Unexpected request ${req.method} ${pathname}`,
+      };
+      return json(500, unexpected);
+    }),
+  );
+  return requests;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the request the screen sent, the
+// test presses no key and follows no link.
+describe("COPAU01 in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the detail read of the entry (endpoint 22)",
+      refused: "GET" as const,
+      drive: async (requests: readonly Request[]) => {
+        await waitFor(() => {
+          expect(requests).toHaveLength(1);
+        });
+      },
+      expected: [`GET ${ENDPOINT}${SELECTED_KEY}`],
+    },
+    {
+      title: "the fraud toggle of F5 (endpoint 23)",
+      refused: "POST" as const,
+      drive: async () => {
+        await waitFor(() => {
+          expect(shown()).toEqual(SHOWN_SELECTED);
+        });
+        clickKey("F5=Mark/Remove Fraud");
+      },
+      expected: [`GET ${ENDPOINT}${SELECTED_KEY}`, `POST ${ENDPOINT}${SELECTED_KEY}/fraud`],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ refused, drive, expected }) => {
+      const requests = stubRefusing(refused);
+      const router = renderRouteTable();
+
+      await drive(requests);
+
+      expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(
+        screen.queryByRole("heading", { level: 1, name: "View Authorization Details" }),
+      ).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(calls(requests)).toEqual(expected);
+      expect(requests.map((request) => request.headers.get("Authorization"))).toEqual(
+        expected.map(() => "Bearer test-token"),
+      );
+      router.dispose();
+    },
+  );
 });

@@ -2,11 +2,11 @@
 //! `GET /api/v1/accounts/{acct_id}` (ENTER fetch), and endpoint 6, `PUT
 //! /api/v1/accounts/{acct_id}` (ENTER validate, F5 save). F3 and F12 send no request.
 //!
-//! Each handler extracts the verified identity, the raw path account number and, for endpoint
-//! 6, the validated body, calls one function of `crate::services::coactupc` and maps what it
-//! returns through the `From` conversions of `crate::dto::coactupc` and `crate::error`. Which
-//! key does what is the service's and the domain's decision, never the handler's: the handler
-//! reads no member of the request (Thin Request Handlers).
+//! Each handler extracts the verified identity, the raw path account number ([`RawPath`]) and,
+//! for endpoint 6, the validated body, calls one function of `crate::services::coactupc` and maps
+//! what it returns through the `From` conversions of `crate::dto::coactupc` and `crate::error`.
+//! Which key does what is the service's and the domain's decision, never the handler's: the
+//! handler reads no member of the request (Thin Request Handlers).
 //!
 //! The SSN leaves only redacted, through the DTO's serialisation; its parts enter only when the
 //! operator re-entered them and are never logged here (Cardholder Data Redaction). The date,
@@ -15,14 +15,17 @@
 //! exception of Typed Dates and Timestamps.
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
-use crate::dto::ValidJson;
 use crate::dto::coactupc::{AccountUpdateRequest, AccountUpdateResult, AccountUpdateView};
+use crate::dto::{RawPath, ValidJson};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`fetch`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct FetchOperation;
 
 /// Fetch an account for update (CAUP / COACTUPC).
 ///
@@ -36,8 +39,10 @@ use crate::services;
 ///
 /// A `ScreenError` with the program's message: 400 when the account number fails its edit, 401
 /// without a valid bearer token, 404 when the cross-reference, the account or the customer is not
-/// found, and 500 when a read fails.
+/// found, and 500 when a read fails. A segment that is not UTF-8 once percent-decoded is a 400
+/// with the API's `Invalid path parameters...` and no field, before the program's edit.
 #[utoipa::path(
+    impl_for = FetchOperation,
     get,
     path = "/api/v1/accounts/{acct_id}",
     operation_id = "coactupc_fetch",
@@ -57,7 +62,8 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "The account number failed the program's edit",
+            description = "The account number failed the program's edit; or a path segment \
+                           that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
@@ -73,7 +79,7 @@ use crate::services;
 pub(crate) async fn fetch(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path(acct_id): Path<String>,
+    RawPath(acct_id): RawPath<String>,
 ) -> Result<Json<AccountUpdateView>, ScreenError> {
     services::coactupc::fetch(&state, &user, &acct_id)
         .await
@@ -81,6 +87,9 @@ pub(crate) async fn fetch(
         .map(Json)
         .map_err(ScreenError::from)
 }
+
+/// The `utoipa::Path` of [`save`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct SaveOperation;
 
 /// Validate or save an account update (CAUP / COACTUPC).
 ///
@@ -96,8 +105,11 @@ pub(crate) async fn fetch(
 /// A `ScreenError` with the program's message: 400 when the body fails validation, nothing
 /// changed or an edit fails; 401 without a valid bearer token; 404 when the re-read finds no
 /// cross-reference, account or customer; 409 when the stored records changed after the fetch; 500
-/// when a read, a lock or a rewrite fails, or the store fails.
+/// when a read, a lock or a rewrite fails, or the store fails. A segment that is not UTF-8 once
+/// percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
+/// body is read.
 #[utoipa::path(
+    impl_for = SaveOperation,
     put,
     path = "/api/v1/accounts/{acct_id}",
     operation_id = "coactupc_save",
@@ -118,7 +130,8 @@ pub(crate) async fn fetch(
         ),
         (
             status = 400,
-            description = "The body failed validation, nothing changed, or an edit failed",
+            description = "The body failed validation, nothing changed, or an edit failed; or \
+                           a path segment that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (status = 401, description = "No valid bearer token", body = ScreenError),
@@ -143,7 +156,7 @@ pub(crate) async fn fetch(
 pub(crate) async fn save(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path(acct_id): Path<String>,
+    RawPath(acct_id): RawPath<String>,
     ValidJson(request): ValidJson<AccountUpdateRequest>,
 ) -> Result<Json<AccountUpdateResult>, ScreenError> {
     services::coactupc::save(&state, &user, &acct_id, request)

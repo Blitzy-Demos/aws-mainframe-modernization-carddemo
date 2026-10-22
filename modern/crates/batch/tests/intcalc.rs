@@ -1,21 +1,52 @@
 //! INTCALC (`CBACT04C`) through the real `carddemo-batch intcalc` binary: binding g3b for
 //! `modern/audit/batch/INTCALC.md` (AAP 0.3.3.2, 0.3.4.3, 0.9.1).
 //!
-//! Each test starts a `postgres:16` container of its own through `test_support`, migrated by the
-//! single schema executor and filled by the nine fixture loads (scenario `LOADED` of
-//! `modern/audit/fixtures.md`), and runs the binary as a subprocess from `modern/`, its outputs
-//! under a scratch directory of the test's own. `intcalc` rewrites balances, so no database sees
-//! two interest runs that both reach the account file.
+//! Each test but the failed connection's starts a `postgres:16` container of its own through
+//! `test_support`, migrated by the single schema executor and filled by the nine fixture loads
+//! (scenario `LOADED` of `modern/audit/fixtures.md`), and runs the binary as a subprocess from
+//! `modern/`, its outputs under a scratch directory of the test's own. `intcalc` rewrites
+//! balances, so no database sees two interest runs that both reach the account file.
 //!
 //! - `intcalc_default_parm_date_matches_audit`: scenario `INTEREST-RAW` with the JCL's PARM.
 //! - `intcalc_explicit_parm_date`: a refused PARM, then a PARM longer than 10 characters.
 //! - `intcalc_after_posttran_matches_audit`: scenario `INTEREST-POSTED`, `posttran` first.
 //! - `intcalc_refuses_a_held_account_claim`: another writer's claim on `accounts` (CBACT04C-039).
+//! - `intcalc_abends_on_a_failed_rewrite`: a session whose transactions are all read-only, so
+//!   the first rewrite fails (CBACT04C-032, CBACT04C-038).
+//! - `intcalc_abends_on_a_failed_read`: a database whose schema has not been applied, so the
+//!   first read fails (CBACT04C-033).
+//! - `intcalc_abends_when_the_generation_cannot_be_created`: a regular file where the `systran`
+//!   directory belongs (CBACT04C-034).
+//! - `intcalc_shows_a_failed_connection_as_the_first_open_failure`: a server that cannot be
+//!   reached, so the first open fails (CBACT04C-034, CBACT04C-038); it needs no container.
+//! - `intcalc_abends_on_a_failed_systran_write`: `INTEREST-POSTED` under a file-size limit that
+//!   a write of the generation exceeds (CBACT04C-031, CBACT04C-038).
+//! - `intcalc_abends_on_a_failed_systran_close`: `INTEREST-POSTED` cut to three category
+//!   balances, whose records exceed the limit only when the close writes them (CBACT04C-035).
+//! - `intcalc_reports_a_duplicated_cross_reference_blocked`: two cross-references for one
+//!   account, which has no single result (CBACT04C-008, X-INTCALC-H5).
 //!
 //! Every expected value is transcribed from the `CBACT04C-` rows of `INTCALC.md`, the `FIXINT-`
 //! rows of `fixtures.md` and the `ARITH-` rows of `arithmetic.md`. Nothing here computes
 //! interest: the test calls neither `domain::batch::cbact04c` nor `monthly_interest`, and money is
 //! compared as `Decimal` values parsed from the audit's decimal strings (R1).
+//!
+//! # Failures provoked from outside
+//!
+//! The job runs as a subprocess, so no repository double reaches it. Each failure row is
+//! provoked through what the process meets instead, with no SQL in this file:
+//!
+//! - a connection option that makes every transaction read-only, under which the claim and the
+//!   reads succeed and the first rewrite fails with SQLSTATE 25006;
+//! - the server's `postgres` database, whose schema has not been applied, where the first read
+//!   fails;
+//! - a regular file in place of the `systran` directory, so no generation can be created;
+//! - a database URL naming a loopback port where no server listens, so no connection is made;
+//! - a file-size limit of one shell block, under which a write that extends the generation past
+//!   it fails with `EFBIG`. The job buffers its writes as `std::io::BufWriter` does, 8 KiB, so
+//!   the 50 records of a scenario fail at a write and three records only at the close, which
+//!   writes and syncs them;
+//! - a second cross-reference for one account, inserted through `CardXrefRepository`.
 //!
 //! # Compared by format only, or not at all
 //!
@@ -26,10 +57,19 @@
 //! - Bytes 25 to 100 of `TRAN-DESC` (CBACT04C-019) and the record's `FILLER` (CBACT04C-023) are
 //!   `HALTED(H2)` through the candidates X-INTCALC-H1 and X-INTCALC-H2 (X-FIXTURES-H4): they are
 //!   reported `BLOCKED` and never compared (AAP 0.8.5).
-//! - The job log: CBACT04C-003 and X-INTCALC-4 give one tracing event per `DISPLAY` line, and
-//!   CBACT04C-038 an `ABENDING PROGRAM` event. The job emits none of them, as its module
-//!   documentation states, so no event text is asserted here; standard output is read for its
-//!   path lines only.
+//! - The job log: X-INTCALC-4 gives one tracing event per `DISPLAY` line. The job emits the lines
+//!   of its failure paths only, as its module documentation states, and the tests of
+//!   CBACT04C-031 to CBACT04C-035 assert them: the failure line, its status line and
+//!   `ABENDING PROGRAM` recording abend code 999, as the last lines of the job log
+//!   (CBACT04C-038). The lines of a run that ends normally
+//!   (CBACT04C-002, CBACT04C-003, CBACT04C-010, CBACT04C-030) stay unwritten, so a successful
+//!   run's standard output is read for its path lines only.
+//! - The four characters after `FILE STATUS IS: NNNN` on these failure paths are `HALTED(H4)`
+//!   through X-INTCALC-H3: the line's shape is checked and its characters are reported `BLOCKED`
+//!   (CBACT04C-037). The one parity status of a failure, `0023` for a rewrite or a lookup that
+//!   finds no record (CBACT04C-036), is met by no external seam; the job's unit tests assert it.
+//! - CBACT04C-008 has no single result (X-INTCALC-H5): its test reports what the run did as
+//!   `BLOCKED` and asserts nothing of it.
 //!
 //! # Cardholder data
 //!
@@ -46,17 +86,18 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use copybook::{FixedRecord, PicTimestamp, TsForm};
+use copybook::{FixedRecord, PicTimestamp, PicX, TsForm};
 use domain::money::Decimal;
 use domain::records::{
     AccountRecord, CardXrefRecord, DisclosureGroupRecord, TranCatBalanceRecord, TransactionRecord,
 };
+use domain::sensitive::CardNumber;
 use persistence::{
     AccountRepository, CardXrefRepository, Dataset, DisclosureGroupRepository, PgStore,
     TranCatBalanceRepository, TransactionRepository,
 };
 use test_support::fixtures::{fixture_dir, fixture_path, start_loaded_postgres};
-use test_support::postgres::PostgresGuard;
+use test_support::postgres::{PostgresGuard, start_postgres};
 
 type TestResult = Result<(), Box<dyn Error>>;
 
@@ -109,6 +150,115 @@ const USAGE_STATUS: i32 = 2;
 /// account file's open text of CBACT04C-034 and CBACT04C-039.
 const HELD_CLAIM_STDERR: &str =
     "carddemo-batch intcalc: ABEND: ERROR OPENING ACCOUNT MASTER FILE\n";
+
+/// The start of the standard-error line of an abended run, which the failure line of its path
+/// follows (`main.rs`, "Standard error"; CBACT04C-038).
+const ABEND_STDERR_PREFIX: &str = "carddemo-batch intcalc: ABEND: ";
+
+/// The start of the standard-error line of a run that cannot connect to `PostgreSQL`, which the
+/// value-free summary of the error follows (`main.rs`, "Standard error").
+const CONNECT_STDERR_PREFIX: &str = "carddemo-batch intcalc: cannot connect to the database: ";
+
+/// The message of the event `main` emits when it cannot connect, before any line of the job
+/// (`main.rs`, `execute`).
+const CONNECTION_FAILED: &str = "database connection failed";
+
+/// A loopback address and port where no server listens, so every connection is refused at once.
+const UNREACHABLE_SERVER: &str = "127.0.0.1:1";
+
+/// The password in the URL of the unreachable server, which no output of the run may show.
+const UNREACHABLE_PASSWORD: &str = "never-shown-034";
+
+/// `DISPLAY 'ABENDING PROGRAM'` of `9999-ABEND-PROGRAM`, the last line of every failure path
+/// (CBACT04C-038).
+const ABEND_LINE: &str = "ABENDING PROGRAM";
+
+/// The field of the `ABENDING PROGRAM` event that records the abend code `CEE3ABD` receives,
+/// `ABCODE PIC S9(9) BINARY` = 999, as the JSON formatter writes it (CBACT04C-038).
+const ABEND_CODE_FIELD: &str = r#""abend_code":999"#;
+
+/// The message of the event `main` emits once a job has failed, after the job's own lines
+/// (`main.rs`, `finish`).
+const JOB_FAILED: &str = "job failed";
+
+/// The literal of `9910-DISPLAY-IO-STATUS` that the four status characters follow
+/// (CBACT04C-036, CBACT04C-037).
+const STATUS_PREFIX: &str = "FILE STATUS IS: NNNN";
+
+/// The length of a status line: [`STATUS_PREFIX`] and four status characters (CBACT04C-036).
+const STATUS_LEN: usize = 24;
+
+/// The failure line of a SYSTRAN record that cannot be written (CBACT04C-031).
+const WRITE_TRANSACT_LINE: &str = "ERROR WRITING TRANSACTION RECORD";
+
+/// The failure line of an account rewrite that fails (CBACT04C-032).
+const REWRITE_ACCOUNT_LINE: &str = "ERROR RE-WRITING ACCOUNT FILE";
+
+/// The failure line of a failed read of the account file (CBACT04C-033).
+const READ_ACCOUNT_LINE: &str = "ERROR READING ACCOUNT FILE";
+
+/// The failure line of a SYSTRAN generation that cannot be created, the open of `TRANSACT-FILE`
+/// (CBACT04C-034).
+const OPEN_TRANSACT_LINE: &str = "ERROR OPENING TRANSACTION FILE";
+
+/// The failure line of the first open, of the category balance file, which a failed
+/// `PostgreSQL` connection shows (CBACT04C-034, X-INTCALC-7).
+const OPEN_TCATBAL_LINE: &str = "ERROR OPENING TRANSACTION CATEGORY BALANCE";
+
+/// The failure line of a SYSTRAN generation that cannot be closed (CBACT04C-035).
+const CLOSE_TRANSACT_LINE: &str = "ERROR CLOSING TRANSACTION FILE";
+
+/// `ACCOUNT NOT FOUND: `, 19 characters ending in a space, the start of the invalid-key line of
+/// an account or cross-reference lookup, which no failed query shows (CBACT04C-005,
+/// CBACT04C-007, CBACT04C-033).
+const ACCOUNT_NOT_FOUND_PREFIX: &str = "ACCOUNT NOT FOUND: ";
+
+/// The invalid-key line of a disclosure lookup, which no failed query shows (CBACT04C-010,
+/// CBACT04C-033).
+const DISCLOSURE_MISSING_LINE: &str = "DISCLOSURE GROUP RECORD MISSING";
+
+/// `END OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-030), which no abend shows (CBACT04C-035,
+/// CBACT04C-038).
+const END_LINE: &str = "END OF EXECUTION OF PROGRAM CBACT04C";
+
+/// The key before the message of a JSON tracing event (`runtime::telemetry`).
+const MESSAGE_KEY: &str = r#""message":""#;
+
+/// SQLSTATE `25006`, `read_only_sql_transaction`: what `PostgreSQL` answers a write in a
+/// read-only transaction.
+const READ_ONLY_SQLSTATE: &str = "SQLSTATE 25006";
+
+/// SQLSTATE `42P01`, `undefined_table`: what `PostgreSQL` answers a query on a table the
+/// database does not hold.
+const UNDEFINED_TABLE_SQLSTATE: &str = "SQLSTATE 42P01";
+
+/// The launcher of a run whose files may grow to one shell block only: `ulimit -f 1` sets the
+/// file-size limit to one block of `/bin/sh`'s `ulimit`, 512 bytes under dash and 1024 under
+/// bash, either of which holds one 351-byte SYSTRAN line and not three. `trap '' XFSZ` ignores
+/// `SIGXFSZ`, a disposition `exec` keeps, so a write past the limit fails with `EFBIG`, "file
+/// too large", instead of killing the job. `$0` is the binary and `$@` its arguments.
+const FILE_LIMIT_SCRIPT: &str = r#"trap '' XFSZ; ulimit -f 1 && exec "$0" "$@""#;
+
+/// The type of the category balances that earn interest in `INTEREST-POSTED`, `01` at the
+/// `DEFAULT` rate 15.00 (`discgrp.txt:18`; CBACT04C-010, FIXINT-902).
+const INTEREST_TYPE: &[u8; 2] = b"01";
+
+/// The category balances of the close-failure run: the type-`01` balances of accounts 1 to 3,
+/// whose three SYSTRAN lines, 1053 bytes, exceed the file-size limit and fit the job's 8 KiB
+/// write buffer, so they first reach the file at the close.
+const CLOSE_RUN_ACCOUNTS: [u64; 3] = [1, 2, 3];
+
+/// The setting the event of a failed `SYSTRAN` open names in place of the directory's path.
+const SYSTRAN_DIR_SETTING: &str = "systran under CARDDEMO_VAR_DIR";
+
+/// The bytes of the regular file put where the `systran` directory belongs.
+const NOT_A_DIRECTORY: &[u8] = b"a regular file, not the systran directory\n";
+
+/// The account given a second cross-reference (CBACT04C-008).
+const DUPLICATED_ACCOUNT: u64 = 1;
+
+/// The card number of the second cross-reference: printable ASCII and no fixture card number.
+const SCRATCH_CARD: [u8; 16] = *b"SCRATCH-CARD-008";
 
 /// `INTEREST-POSTED`: the 49 totals added to accounts `00000000001` to `00000000049`
 /// (FIXINT-903).
@@ -382,20 +532,64 @@ impl ExpectedRecord<'_> {
 
 /// Runs `carddemo-batch` with `args` against the database of `guard`, from `modern/`, with every
 /// output directory under `scratch`, and returns what the process wrote and its status.
-///
-/// The child inherits the test's environment, of which only the variables the run reads are set
-/// here: span export is off, so standard output holds JSON events and path lines only, and
-/// `RUST_LOG=error` keeps the events to errors (`main.rs`, "Standard output").
 async fn run_batch(
     guard: &PostgresGuard,
     scratch: &Scratch,
     args: &[&str],
 ) -> Result<Output, Box<dyn Error>> {
+    run_batch_on(guard.database_url(), scratch, args).await
+}
+
+/// Runs `carddemo-batch` with `args` as [`run_batch`] does, against the database
+/// `database_url` names.
+async fn run_batch_on(
+    database_url: &str,
+    scratch: &Scratch,
+    args: &[&str],
+) -> Result<Output, Box<dyn Error>> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carddemo-batch"));
+    command.args(args);
+    output_of(command, database_url, scratch).await
+}
+
+/// Runs `carddemo-batch` with `args` as [`run_batch`] does, through [`FILE_LIMIT_SCRIPT`], so
+/// that a write extending a file the job writes past one shell block fails.
+///
+/// `LLVM_PROFILE_FILE` is `/dev/null`: under `cargo llvm-cov` the instrumented binary would
+/// otherwise write its coverage profile under the same limit and leave a truncated `.profraw`
+/// that breaks the merged report, so this run's coverage is not counted. The profile runtime may
+/// then add `LLVM Profile Error` lines to standard error after the job's own line, which is why
+/// [`check_abended`] reads the first line only.
+async fn run_batch_with_file_limit(
+    guard: &PostgresGuard,
+    scratch: &Scratch,
+    args: &[&str],
+) -> Result<Output, Box<dyn Error>> {
+    let mut command = Command::new("/bin/sh");
     command
+        .arg("-c")
+        .arg(FILE_LIMIT_SCRIPT)
+        .arg(env!("CARGO_BIN_EXE_carddemo-batch"))
         .args(args)
+        .env("LLVM_PROFILE_FILE", "/dev/null");
+    output_of(command, guard.database_url(), scratch).await
+}
+
+/// Runs `command` from `modern/` against the database `database_url` names, with every output
+/// directory under `scratch`, and returns what the process wrote and its status.
+///
+/// The child inherits the test's environment, of which only the variables the run reads are set
+/// here: span export is off, so standard output holds JSON events and path lines only, and
+/// `RUST_LOG=error` keeps the events to errors (`main.rs`, "Standard output"), which every line
+/// of a failure path is (X-INTCALC-4).
+async fn output_of(
+    mut command: Command,
+    database_url: &str,
+    scratch: &Scratch,
+) -> Result<Output, Box<dyn Error>> {
+    command
         .current_dir(test_support::modern_dir())
-        .env("DATABASE_URL", guard.database_url())
+        .env("DATABASE_URL", database_url)
         .env("CARDDEMO_VAR_DIR", scratch.path())
         .env("CARDDEMO_STATEMENT_DIR", scratch.path().join("statements"))
         .env("CARDDEMO_INTRDR_DIR", scratch.path().join("jobs"))
@@ -462,6 +656,119 @@ fn first_generation(output: &Output, scratch: &Scratch) -> Result<PathBuf, Box<d
         "intcalc: the systran directory holds a file other than the first generation",
     )?;
     Ok(generation)
+}
+
+/// The message of the JSON tracing `event`: the text after its message key up to the next
+/// quote. The messages these tests look for hold no quote and no backslash.
+fn message_of(event: &str) -> Option<&str> {
+    let (_, rest) = event.split_once(MESSAGE_KEY)?;
+    rest.split_once('"').map(|(message, _)| message)
+}
+
+/// The JSON tracing events of a run's standard output that carry a message, in order: lines
+/// that begin with `{` (`main.rs`, "Standard output").
+fn events(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter(|line| line.starts_with('{') && message_of(line).is_some())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The message of each of `events`, in order.
+fn messages(events: &[String]) -> Vec<&str> {
+    events
+        .iter()
+        .filter_map(|event| message_of(event))
+        .collect()
+}
+
+/// Checks that `output` is a run that abended on the failure path that shows `line`
+/// (CBACT04C-038): exit status 1, as `9999-ABEND-PROGRAM` sets no return code; standard error
+/// beginning with the job's abend line, which names `line`; and the job log of
+/// [`check_abend_log`], followed only by the event `main` emits for a failed job. Returns the
+/// events before `line`, for the caller's checks of what preceded it.
+///
+/// No message quotes the run's output (Cardholder Data Redaction).
+fn check_abended(output: &Output, line: &str) -> Result<Vec<String>, Box<dyn Error>> {
+    ensure(
+        output.status.code() == Some(ABEND_STATUS),
+        &format!(
+            "{line}: exit status {:?}, expected {ABEND_STATUS}",
+            output.status.code()
+        ),
+    )?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure(
+        stderr.lines().next() == Some(format!("{ABEND_STDERR_PREFIX}{line}").as_str()),
+        &format!("{line}: the first standard-error line is not the job's abend line"),
+    )?;
+    check_abend_log(output, line, &[JOB_FAILED])
+}
+
+/// Checks the job log of `output`, a run that abended on the failure path that shows `line`
+/// (CBACT04C-038): it ends with `line`, a status line and `ABENDING PROGRAM`, which records
+/// abend code 999, followed only by the events whose messages are `after`, so no
+/// `END OF EXECUTION` line; and the run printed no path. Every one of those events is an `ERROR`
+/// event, the only level `RUST_LOG=error` passes (X-INTCALC-4). Returns the events before
+/// `line`, for the caller's checks of what preceded it.
+///
+/// No message quotes the run's output (Cardholder Data Redaction).
+fn check_abend_log(
+    output: &Output,
+    line: &str,
+    after: &[&str],
+) -> Result<Vec<String>, Box<dyn Error>> {
+    let mut events = events(&output.stdout);
+    let shown = messages(&events);
+    let abend = shown
+        .iter()
+        .rposition(|&message| message == ABEND_LINE)
+        .ok_or_else(|| format!("{line}: the run shows no `{ABEND_LINE}` line"))?;
+    let failure = abend
+        .checked_sub(2)
+        .ok_or_else(|| format!("{line}: fewer than two lines precede `{ABEND_LINE}`"))?;
+    ensure(
+        shown.get(failure) == Some(&line),
+        &format!("{line}: the line two before `{ABEND_LINE}` is not the failure line"),
+    )?;
+    ensure(
+        shown
+            .get(failure + 1)
+            .is_some_and(|status| status.starts_with(STATUS_PREFIX) && status.len() == STATUS_LEN),
+        &format!("{line}: the line after the failure line is no status line"),
+    )?;
+    ensure(
+        shown.get(abend + 1..) == Some(after),
+        &format!("{line}: the job log goes on after `{ABEND_LINE}`"),
+    )?;
+    ensure(
+        events
+            .get(abend)
+            .is_some_and(|event| event.contains(ABEND_CODE_FIELD)),
+        &format!("{line}: `{ABEND_LINE}` does not record abend code 999"),
+    )?;
+    ensure(
+        written_paths(&output.stdout).is_empty(),
+        &format!("{line}: the abended run printed a path"),
+    )?;
+    events.truncate(failure);
+    Ok(events)
+}
+
+/// CBACT04C-038: the abended run kept no SYSTRAN generation, so the `systran` directory holds no
+/// file, if the run got as far as creating it.
+fn check_no_generation(scratch: &Scratch, line: &str) -> TestResult {
+    ensure(
+        file_names(&scratch.systran_dir())?.is_empty(),
+        &format!("{line}: the abended run kept a SYSTRAN generation"),
+    )
+}
+
+/// Reports the four status characters after `FILE STATUS IS: NNNN` on the failure path that
+/// shows `line`, which are `HALTED(H4)` through X-INTCALC-H3 and never compared (CBACT04C-037).
+fn report_status_blocked(line: &str) {
+    println!("BLOCKED CBACT04C-037 (H4, X-INTCALC-H3): the status characters after `{line}`");
 }
 
 /// The `width`-byte records of `bytes`, each of which must be followed by LF (AAP 0.3.4.3;
@@ -735,11 +1042,7 @@ fn check_accounts(
         }
         let [bal, cr, db] = expected(row);
         failures.extend(balance_failures("after intcalc", n, new, [bal, cr, db])?);
-        let mut kept = new.clone();
-        kept.curr_bal = old.curr_bal;
-        kept.curr_cyc_credit = old.curr_cyc_credit;
-        kept.curr_cyc_debit = old.curr_cyc_debit;
-        if kept != *old {
+        if !only_balances_changed(old, new) {
             failures.push(format!(
                 "after intcalc: account {n}: a field beside the balance and cycle fields changed"
             ));
@@ -747,6 +1050,62 @@ fn check_accounts(
     }
     if failures.is_empty() {
         Ok(())
+    } else {
+        Err(failures.join("\n").into())
+    }
+}
+
+/// Whether `new` holds every field of `old` but `ACCT-CURR-BAL`, `ACCT-CURR-CYC-CREDIT` and
+/// `ACCT-CURR-CYC-DEBIT`, the three fields the rewrite of `1050-UPDATE-ACCOUNT` changes
+/// (CBACT04C-026).
+fn only_balances_changed(old: &AccountRecord, new: &AccountRecord) -> bool {
+    let mut kept = new.clone();
+    kept.curr_bal = old.curr_bal;
+    kept.curr_cyc_credit = old.curr_cyc_credit;
+    kept.curr_cyc_debit = old.curr_cyc_debit;
+    kept == *old
+}
+
+/// The number j of accounts a run over `INTEREST-POSTED` rewrote before it abended, checking
+/// every account in key order: accounts 1 to j hold the balance after the rewrite of their
+/// FIXINT row with both cycle fields zero, every later account, the last included, holds the
+/// values `posttran` left, and no other field changes. Each rewrite committed before the abend
+/// stands, and none follows it (CBACT04C-026, CBACT04C-027, CBACT04C-038). Every difference
+/// is reported at once, by account and field.
+fn posted_rewrites(
+    before: &[AccountRecord],
+    after: &[AccountRecord],
+) -> Result<usize, Box<dyn Error>> {
+    ensure(
+        before.len() == SYSTRAN_RECORDS && after.len() == SYSTRAN_RECORDS,
+        "accounts: the table does not hold the 50 fixture accounts",
+    )?;
+    let rows = fixint()?;
+    let mut rewritten = 0;
+    let mut failures = Vec::new();
+    for (index, ((old, new), row)) in before.iter().zip(after).zip(&rows).enumerate() {
+        let n = index + 1;
+        if new.id.get() != u64::try_from(n)? || old.id != new.id {
+            failures.push(format!("accounts: key order differs at account {n}"));
+            continue;
+        }
+        let holds_rewrite = match row.rewritten_bal {
+            Some(bal) => balance_failures("rewritten", n, new, [bal, ZERO, ZERO])?.is_empty(),
+            None => false,
+        };
+        if holds_rewrite && rewritten == index {
+            rewritten = n;
+        } else {
+            failures.extend(balance_failures("after the abend", n, new, row.posted)?);
+        }
+        if !only_balances_changed(old, new) {
+            failures.push(format!(
+                "after the abend: account {n}: a field beside the balance and cycle fields changed"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok(rewritten)
     } else {
         Err(failures.join("\n").into())
     }
@@ -1058,5 +1417,335 @@ async fn intcalc_refuses_a_held_account_claim() -> TestResult {
     let systran = first_generation(&output, &scratch)?;
     report_blocked_spans();
     check_systran(&systran, JCL_PARM, |_| ZERO)?;
+    Ok(())
+}
+
+/// Runs `posttran` over `dailytran.txt` against the database of `guard`, the start of
+/// `INTEREST-POSTED`, and checks the state it leaves (see [`check_posted_start`]). Its own
+/// results are FIXPOST's, asserted by `posttran_i9.rs`; its status 4 is only the precondition
+/// that it ran to its end.
+async fn post_daily_transactions(
+    guard: &PostgresGuard,
+    scratch: &Scratch,
+    store: &mut PgStore,
+) -> TestResult {
+    let posted = run_batch(guard, scratch, &["posttran"]).await?;
+    ensure(
+        posted.status.code() == Some(POSTTRAN_REJECTED),
+        &format!(
+            "posttran: exit status {:?}, expected {POSTTRAN_REJECTED}",
+            posted.status.code()
+        ),
+    )?;
+    let accounts = AccountRepository::find_all(store).await?;
+    let inputs = read_inputs(store).await?;
+    check_posted_start(&accounts, &inputs)
+}
+
+/// `1050-UPDATE-ACCOUNT` against a rewrite that fails: in a session whose every transaction is
+/// read-only, the claim and the reads succeed, the generation is created and the first rewrite,
+/// of account 1 at the break of account 2, fails with SQLSTATE 25006. The run abends with
+/// `ERROR RE-WRITING ACCOUNT FILE` after the event carrying that SQLSTATE, removes the generation
+/// it created and changes no table.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_abends_on_a_failed_rewrite() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let scratch = Scratch::new("rewrite")?;
+    let accounts_before = AccountRepository::find_all(&mut store).await?;
+    let inputs_before = read_inputs(&mut store).await?;
+    let read_only = format!(
+        "{}?options[default_transaction_read_only]=on",
+        guard.database_url()
+    );
+
+    let output = run_batch_on(&read_only, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-032
+    // audit: CBACT04C-038
+    let before = check_abended(&output, REWRITE_ACCOUNT_LINE)?;
+    // audit: CBACT04C-032
+    ensure(
+        before
+            .last()
+            .is_some_and(|event| event.contains(READ_ONLY_SQLSTATE)),
+        "the event before the rewrite's failure line does not carry SQLSTATE 25006",
+    )?;
+    // audit: CBACT04C-038
+    check_no_generation(&scratch, REWRITE_ACCOUNT_LINE)?;
+    ensure(
+        AccountRepository::find_all(&mut store).await? == accounts_before,
+        "a run whose first rewrite failed changed an account",
+    )?;
+    // audit: CBACT04C-029
+    check_inputs_kept(&mut store, &inputs_before).await?;
+    // audit: CBACT04C-037
+    report_status_blocked(REWRITE_ACCOUNT_LINE);
+    Ok(())
+}
+
+/// `1100-GET-ACCT-DATA` against a read that fails: the server's `postgres` database has no
+/// schema applied, so the claim succeeds and the first read, of `accounts`, fails with SQLSTATE
+/// 42P01. The run abends with `ERROR READING ACCOUNT FILE` after the event carrying that
+/// SQLSTATE, with no invalid-key line before it, as no key was looked up, and creates no
+/// generation.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_abends_on_a_failed_read() -> TestResult {
+    let guard = start_postgres().await?;
+    let scratch = Scratch::new("read")?;
+    let (server, _) = guard
+        .database_url()
+        .rsplit_once('/')
+        .ok_or("the database URL names no database")?;
+    let unmigrated = format!("{server}/postgres");
+
+    let output = run_batch_on(&unmigrated, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-033
+    let before = check_abended(&output, READ_ACCOUNT_LINE)?;
+    // audit: CBACT04C-033
+    ensure(
+        before
+            .last()
+            .is_some_and(|event| event.contains(UNDEFINED_TABLE_SQLSTATE)),
+        "the event before the read's failure line does not carry SQLSTATE 42P01",
+    )?;
+    // audit: CBACT04C-033
+    ensure(
+        !messages(&before).iter().any(|message| {
+            message.starts_with(ACCOUNT_NOT_FOUND_PREFIX) || *message == DISCLOSURE_MISSING_LINE
+        }),
+        "an invalid-key line precedes the read's failure line",
+    )?;
+    // audit: CBACT04C-038
+    check_no_generation(&scratch, READ_ACCOUNT_LINE)?;
+    // audit: CBACT04C-037
+    report_status_blocked(READ_ACCOUNT_LINE);
+    Ok(())
+}
+
+/// `0400-TRANFILE-OPEN` against a generation that cannot be created: a regular file stands
+/// where the `systran` directory belongs. The run abends with `ERROR OPENING TRANSACTION FILE`
+/// before it reads a category balance, so it rewrites no account, and leaves the file as it was.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_abends_when_the_generation_cannot_be_created() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let scratch = Scratch::new("open")?;
+    fs::write(scratch.systran_dir(), NOT_A_DIRECTORY)?;
+    let accounts_before = AccountRepository::find_all(&mut store).await?;
+    let inputs_before = read_inputs(&mut store).await?;
+
+    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-034
+    // audit: CBACT04C-038
+    let before = check_abended(&output, OPEN_TRANSACT_LINE)?;
+    // The event before the failure line names the setting of the directory, never its path.
+    let shown = scratch.systran_dir().display().to_string();
+    ensure(
+        before.last().is_some_and(|event| {
+            event.contains(&format!("({SYSTRAN_DIR_SETTING})")) && !event.contains(&shown)
+        }),
+        "the event before the open's failure line does not name the systran setting alone",
+    )?;
+    // audit: CBACT04C-034
+    ensure(
+        fs::read(scratch.systran_dir())? == NOT_A_DIRECTORY,
+        "the file in place of the systran directory changed",
+    )?;
+    // audit: CBACT04C-034
+    ensure(
+        AccountRepository::find_all(&mut store).await? == accounts_before,
+        "a run that could not create its generation changed an account",
+    )?;
+    // audit: CBACT04C-029
+    check_inputs_kept(&mut store, &inputs_before).await?;
+    // audit: CBACT04C-037
+    report_status_blocked(OPEN_TRANSACT_LINE);
+    Ok(())
+}
+
+/// `0000-TCATBALF-OPEN` against a server that cannot be reached: the one `PostgreSQL`
+/// connection stands for the four input opens, so after `main`'s connection event the job log
+/// is the first open's failure, and the run exits 1 with `main`'s connection error before it
+/// reads a table or creates a generation (X-INTCALC-7). No container is started, and no output
+/// shows the URL or its password.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestResult {
+    let scratch = Scratch::new("connect")?;
+    let unreachable =
+        format!("postgres://carddemo:{UNREACHABLE_PASSWORD}@{UNREACHABLE_SERVER}/carddemo");
+
+    let output = run_batch_on(&unreachable, &scratch, &["intcalc"]).await?;
+    // `main`'s status for a failed connection, the same as an abend's (`main.rs`, "Exit status").
+    // audit: CBACT04C-038
+    ensure(
+        output.status.code() == Some(ABEND_STATUS),
+        &format!(
+            "a failed connection: exit status {:?}, expected {ABEND_STATUS}",
+            output.status.code()
+        ),
+    )?;
+    // audit: CBACT04C-034
+    ensure(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .is_some_and(|first| first.starts_with(CONNECT_STDERR_PREFIX)),
+        "a failed connection: the first standard-error line is not main's connection error",
+    )?;
+    // audit: CBACT04C-034
+    // audit: CBACT04C-038
+    let before = check_abend_log(&output, OPEN_TCATBAL_LINE, &[])?;
+    // audit: CBACT04C-034
+    ensure(
+        messages(&before) == [CONNECTION_FAILED],
+        "a failed connection: the job log before the first open's failure line is not main's \
+         connection event alone",
+    )?;
+    // audit: CBACT04C-038
+    check_no_generation(&scratch, OPEN_TCATBAL_LINE)?;
+    for (stream, bytes) in [
+        ("standard output", &output.stdout),
+        ("standard error", &output.stderr),
+    ] {
+        let text = String::from_utf8_lossy(bytes);
+        ensure(
+            !text.contains(UNREACHABLE_PASSWORD) && !text.contains(&unreachable),
+            &format!("a failed connection: {stream} shows the database URL or its password"),
+        )?;
+    }
+    // audit: CBACT04C-037
+    report_status_blocked(OPEN_TCATBAL_LINE);
+    Ok(())
+}
+
+/// `1300-B-WRITE-TX` against a write that fails: `INTEREST-POSTED` under a file-size limit of one
+/// shell block. One SYSTRAN line fits it, so the write that fails is made for record 2 or a later
+/// one, after the rewrite of account 1 at the break of account 2. The run abends with
+/// `ERROR WRITING TRANSACTION RECORD`, removes the generation, and the rewrites committed before
+/// the failure stand: accounts 1 to j, for some j of at least 1, hold their FIXINT rewrite, and
+/// every later account, the last included, what `posttran` left.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_abends_on_a_failed_systran_write() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let scratch = Scratch::new("write")?;
+    post_daily_transactions(&guard, &scratch, &mut store).await?;
+    let accounts_before = AccountRepository::find_all(&mut store).await?;
+    let inputs_before = read_inputs(&mut store).await?;
+
+    let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-031
+    // audit: CBACT04C-038
+    check_abended(&output, WRITE_TRANSACT_LINE)?;
+    // audit: CBACT04C-031
+    // audit: CBACT04C-038
+    check_no_generation(&scratch, WRITE_TRANSACT_LINE)?;
+    // audit: CBACT04C-038
+    let rewritten = posted_rewrites(
+        &accounts_before,
+        &AccountRepository::find_all(&mut store).await?,
+    )?;
+    // audit: CBACT04C-038
+    ensure(
+        rewritten >= 1,
+        "the rewrite of account 1, made before the failed write, does not stand",
+    )?;
+    // audit: CBACT04C-029
+    check_inputs_kept(&mut store, &inputs_before).await?;
+    // audit: CBACT04C-037
+    report_status_blocked(WRITE_TRANSACT_LINE);
+    Ok(())
+}
+
+/// `9400-TRANFILE-CLOSE` against a close that fails: `INTEREST-POSTED` with only the type-`01`
+/// category balances of accounts 1 to 3, under the file-size limit. Their three SYSTRAN lines
+/// exceed it but stay in the job's write buffer until the close writes and syncs them, which
+/// fails. The run abends with `ERROR CLOSING TRANSACTION FILE` and no `END OF EXECUTION` line,
+/// removes the generation, and the rewrites of accounts 1 and 2 at the breaks before the close
+/// stand, while account 3, the last in key order, is never rewritten (E08) and accounts 4 to 50,
+/// which no category balance names, are never read.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_abends_on_a_failed_systran_close() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let scratch = Scratch::new("close")?;
+    post_daily_transactions(&guard, &scratch, &mut store).await?;
+    let kept: Vec<TranCatBalanceRecord> = TranCatBalanceRepository::find_all(&mut store)
+        .await?
+        .into_iter()
+        .filter(|balance| balance.type_cd.as_bytes() == INTEREST_TYPE)
+        .take(CLOSE_RUN_ACCOUNTS.len())
+        .collect();
+    ensure(
+        kept.iter()
+            .map(|balance| balance.acct_id.get())
+            .eq(CLOSE_RUN_ACCOUNTS),
+        "POSTED: the first type-01 category balances are not those of accounts 1 to 3",
+    )?;
+    let mut tx = store.begin().await?;
+    TranCatBalanceRepository::replace_all(&mut tx, &kept).await?;
+    tx.commit().await?;
+    let accounts_before = AccountRepository::find_all(&mut store).await?;
+    let inputs_before = read_inputs(&mut store).await?;
+
+    let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-035
+    // audit: CBACT04C-038
+    check_abended(&output, CLOSE_TRANSACT_LINE)?;
+    // audit: CBACT04C-035
+    ensure(
+        !messages(&events(&output.stdout)).contains(&END_LINE),
+        "a run whose close failed shows the END OF EXECUTION line",
+    )?;
+    // audit: CBACT04C-035
+    // audit: CBACT04C-038
+    check_no_generation(&scratch, CLOSE_TRANSACT_LINE)?;
+    // audit: CBACT04C-027
+    // audit: CBACT04C-028
+    // audit: CBACT04C-038
+    let rewritten = posted_rewrites(
+        &accounts_before,
+        &AccountRepository::find_all(&mut store).await?,
+    )?;
+    // audit: CBACT04C-027
+    // audit: CBACT04C-038
+    ensure(
+        rewritten == 2,
+        &format!(
+            "{rewritten} accounts rewritten before the failed close, expected accounts 1 and 2"
+        ),
+    )?;
+    // audit: CBACT04C-029
+    check_inputs_kept(&mut store, &inputs_before).await?;
+    // audit: CBACT04C-037
+    report_status_blocked(CLOSE_TRANSACT_LINE);
+    Ok(())
+}
+
+/// `1110-GET-XREF-DATA` for an account with two cross-references: the fixture's own and a
+/// second with a scratch card and the same account and customer. No source fixes how the
+/// program reads such an account (X-INTCALC-H5), so what the run did is reported `BLOCKED`,
+/// its exit status and the number of paths it printed, and no value of it is asserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn intcalc_reports_a_duplicated_cross_reference_blocked() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let scratch = Scratch::new("duplicate")?;
+    let mut second = CardXrefRepository::find_all(&mut store)
+        .await?
+        .into_iter()
+        .find(|xref| xref.acct_id.get() == DUPLICATED_ACCOUNT)
+        .ok_or("card_xref holds no cross-reference of account 1")?;
+    second.card_num = CardNumber::new(PicX::from_array(SCRATCH_CARD));
+    CardXrefRepository::insert(&mut store, &second).await?;
+
+    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+    // audit: CBACT04C-008
+    println!(
+        "BLOCKED CBACT04C-008 (X-INTCALC-H5): an account with two cross-references; the run \
+         exited with status {:?} and printed {} path(s), neither compared",
+        output.status.code(),
+        written_paths(&output.stdout).len()
+    );
     Ok(())
 }

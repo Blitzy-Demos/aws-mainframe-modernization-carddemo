@@ -1,10 +1,19 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { Link, MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  createMemoryRouter,
+  Link,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
-import { getSession, setSession } from "@/auth/session";
-import { PATHS, PROGRAM_ROUTES } from "@/routes";
+import { SESSION_KEY, getSession, setSession } from "@/auth/session";
+import { PATHS, PROGRAM_ROUTES, routes } from "@/routes";
 import { COMEN01 } from "./COMEN01";
 
 /**
@@ -719,5 +728,251 @@ describe("BLOCKED X-COMEN01C-1: options past the table and non-digits, not a par
     renderMenu();
     await loaded();
     await expectStay(typed, INVALID_OPTION, shown);
+  });
+});
+
+/** A stored value that is no session, and what is wrong with it. */
+const UNUSABLE_STORED_VALUES = [
+  { stored: "not json", why: "is not JSON" },
+  { stored: '{"token":', why: "is truncated JSON" },
+  { stored: "null", why: "is JSON null" },
+  { stored: '"text"', why: "is a JSON string" },
+  { stored: "[]", why: "is a JSON array" },
+  { stored: '{"userId":"USER0001","userType":"U"}', why: "lacks the token" },
+  { stored: '{"token":"test-token","userType":"U"}', why: "lacks the user ID" },
+  { stored: '{"token":"test-token","userId":"USER0001"}', why: "lacks the user type" },
+  { stored: '{"token":"","userId":"USER0001","userType":"U"}', why: "has an empty token" },
+  { stored: '{"token":"test-token","userId":"","userType":"U"}', why: "has an empty user ID" },
+  {
+    stored: '{"token":"test-token","userId":"USER0001","userType":""}',
+    why: "has an empty user type",
+  },
+  { stored: '{"token":7,"userId":"USER0001","userType":"U"}', why: "has a numeric token" },
+];
+
+/** The error a browser raises when it blocks storage. */
+function storageBlocked(): DOMException {
+  return new DOMException("storage blocked", "SecurityError");
+}
+
+// The sign-on guard in front of `/menu` reads the stored session afresh at every render. Absent,
+// unreadable, corrupt or wrongly shaped data, and a `sessionStorage` that is missing or refuses
+// access, are no session: the visit goes to sign-on before the menu requests endpoint 2.
+describe("COMEN01 in the route table: no usable session", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Renders the application's route table at `/menu`; returns the router, for its location. */
+  function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COMEN01] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    return router;
+  }
+
+  it.each([
+    {
+      why: "nothing is stored",
+      install: () => {
+        sessionStorage.removeItem(SESSION_KEY);
+      },
+    },
+    ...UNUSABLE_STORED_VALUES.map(({ stored, why }) => ({
+      why: `the stored value ${why}`,
+      install: () => {
+        sessionStorage.setItem(SESSION_KEY, stored);
+      },
+    })),
+    {
+      why: "reading storage throws",
+      install: () => {
+        vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+          throw storageBlocked();
+        });
+      },
+    },
+    {
+      why: "sessionStorage does not exist",
+      install: () => {
+        vi.stubGlobal("sessionStorage", undefined);
+      },
+    },
+    {
+      why: "reaching sessionStorage throws",
+      install: () => {
+        // Stubbed first, so `vi.unstubAllGlobals` restores the original property afterwards.
+        vi.stubGlobal("sessionStorage", undefined);
+        Object.defineProperty(globalThis, "sessionStorage", {
+          configurable: true,
+          get(): Storage {
+            throw storageBlocked();
+          },
+        });
+      },
+    },
+  ])("sends /menu to /signon with no request when $why", async ({ install }) => {
+    serve(MENU);
+    install();
+    const router = renderRouteTable();
+
+    expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Main Menu" })).toBeNull();
+    expect(requests).toHaveLength(0);
+    router.dispose();
+  });
+
+  it("reads the session afresh: one removed from storage directly is gone at the next navigation", async () => {
+    serve(MENU);
+    const router = renderRouteTable();
+    await loaded();
+    expect(menuRequests()).toHaveLength(1);
+
+    sessionStorage.removeItem(SESSION_KEY);
+    await act(async () => {
+      await router.navigate(PATHS.COACTVW);
+    });
+
+    expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(requests).toHaveLength(1);
+    router.dispose();
+  });
+});
+
+/**
+ * The answer `fetch` gives a request the server accepted and never completes: it settles only when
+ * the request's signal aborts, at once for a signal already aborted when `fetch` receives it, and
+ * then rejects with the abort reason, as `fetch` does.
+ */
+function unansweredUntilAborted(request: Request): Promise<Response> {
+  return new Promise((_answer, fail) => {
+    const abandon = (): void => {
+      fail(request.signal.reason);
+    };
+    if (request.signal.aborted) {
+      abandon();
+    } else {
+      request.signal.addEventListener("abort", abandon, { once: true });
+    }
+  });
+}
+
+/** The `name` of `signal`'s abort reason; `undefined` for a reason that is no `DOMException`. */
+function reasonName(signal: AbortSignal): string | undefined {
+  const reason: unknown = signal.reason;
+  return reason instanceof DOMException ? reason.name : undefined;
+}
+
+/**
+ * Spies on `setTimeout` and `clearTimeout`, both passing through. Returns a function that tells,
+ * for every request-deadline timer armed since (the `setTimeout` calls of `REQUEST_DEADLINE_MS`),
+ * in arming order, whether it has been cleared.
+ */
+function watchDeadlines(): () => boolean[] {
+  const armed = vi.spyOn(globalThis, "setTimeout");
+  const cleared = vi.spyOn(globalThis, "clearTimeout");
+  return () =>
+    armed.mock.calls.flatMap((call, index) => {
+      if (call[1] !== REQUEST_DEADLINE_MS) {
+        return [];
+      }
+      const timer: unknown = armed.mock.results[index].value;
+      return [cleared.mock.calls.some(([id]) => id === timer)];
+    });
+}
+
+// The menu load is the one request that also carries a signal of TanStack Query's, which aborts it
+// when the query is cancelled. `api/client.ts` composes that signal with the shared request
+// deadline: a cancelled load aborts the request handed to `fetch` with the cancellation's own
+// reason, never the deadline's `TimeoutError`, and its deadline timer is cleared at once rather
+// than left to fire. The cancelled load leaves no message behind.
+describe("COMEN01 request deadline: a cancelled load", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("F3 while endpoint 2 loads cancels the load at once, not at the deadline, and the menu entered again shows no error", async () => {
+    stubFetch(() => {
+      const sent = menuRequests();
+      return sent.length === 1 ? unansweredUntilAborted(sent[0]) : json(200, MENU);
+    });
+    const deadlines = watchDeadlines();
+    renderMenu();
+    await waitFor(() => {
+      expect(menuRequests()).toHaveLength(1);
+    });
+    const [load] = menuRequests();
+    expect(load.signal.aborted).toBe(false);
+    expect(deadlines()).toEqual([false]);
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    // Leaving the screen unmounts its query, and TanStack Query cancels it: the request is aborted
+    // before the click returns, so no timer, the deadline's included, has had a turn to run.
+    expect(load.signal.aborted).toBe(true);
+    expect(reasonName(load.signal)).not.toBe("TimeoutError");
+    expect(reasonName(load.signal)).toBe("AbortError");
+    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+    await waitFor(() => {
+      expect(deadlines()).toEqual([true]);
+    });
+
+    // Back on the menu, a fresh load fills the table; the cancellation shows nowhere.
+    fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
+    await loaded();
+    expect(errorRow().textContent).toBe("");
+    expect(menuRequests()).toHaveLength(2);
+    expect(menuRequests()[1].signal.aborted).toBe(false);
+    await waitFor(() => {
+      expect(deadlines()).toEqual([true, true]);
+    });
+    expect(reasonName(load.signal)).toBe("AbortError");
+  });
+
+  it("StrictMode's double mount cancels the first load before fetch receives it, clears its deadline and shows the second load's table", async () => {
+    // `main.tsx` renders the application in `StrictMode`, so the development build mounts the menu,
+    // unmounts it and mounts it again in one commit. The first load's signal is aborted before
+    // openapi-fetch hands its request to the client's `fetch`, which then aborts the request at
+    // once with the cancellation's reason; `fetch` rejects such a request without sending it.
+    const abortedAtHandOff: boolean[] = [];
+    stubFetch(() => {
+      const sent = menuRequests();
+      const request = sent[sent.length - 1];
+      abortedAtHandOff.push(request.signal.aborted);
+      return request.signal.aborted ? unansweredUntilAborted(request) : json(200, MENU);
+    });
+    const deadlines = watchDeadlines();
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[PATHS.COMEN01]}>
+          <Routes>
+            <Route path={PATHS.COMEN01} element={<COMEN01 />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+      { reactStrictMode: true },
+    );
+
+    await loaded();
+    expect(abortedAtHandOff).toEqual([true, false]);
+    const [cancelled, served] = menuRequests();
+    expect(reasonName(cancelled.signal)).not.toBe("TimeoutError");
+    expect(reasonName(cancelled.signal)).toBe("AbortError");
+    expect(served.signal.aborted).toBe(false);
+    expect(errorRow().textContent).toBe("");
+    await waitFor(() => {
+      expect(deadlines()).toEqual([true, true]);
+    });
+    expect(client.isFetching()).toBe(0);
   });
 });

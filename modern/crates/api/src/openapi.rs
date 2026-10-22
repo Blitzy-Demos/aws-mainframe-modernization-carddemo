@@ -1,8 +1,8 @@
 //! The base `OpenAPI` document: what the 27 operations do not contribute themselves.
 //!
 //! `api::app::router()` starts from `OpenApiRouter::with_openapi(ApiDoc::openapi())`, and every
-//! `routes!(…)` it registers then adds one path item and the request-body and response schemas
-//! its handler declares. This module adds only the rest:
+//! handler it registers then adds its operation to a path item, with the request-body and
+//! response schemas the handler declares. This module adds only the rest:
 //!
 //! - **`info`**: title, version and a one-line description, all fixed at compile time, so the
 //!   emitted `modern/openapi/openapi.json` is the same bytes on every run and needs no
@@ -19,7 +19,7 @@
 //!   query parameter would resolve to nothing. Registering a type also registers every schema it
 //!   references (`TranListEntryKey`, for one), each under its own `ToSchema` name.
 //!
-//! The document lists no paths, so the operations are exactly those `routes!` adds, and no
+//! The document lists no paths, so the operations are exactly those `router()` adds, and no
 //! `servers`, so it points at no hosted service (Local-Only Runtime).
 //!
 //! # Built by the derive

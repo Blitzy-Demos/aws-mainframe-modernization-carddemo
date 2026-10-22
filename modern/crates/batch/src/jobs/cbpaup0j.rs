@@ -95,6 +95,7 @@ use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
 use persistence::{
     PendingAuthDetailRepository, PendingAuthSummaryRepository, PersistenceError, PgTx,
 };
+use runtime::telemetry::JobCounter;
 
 use super::{JobContext, JobError, JobOutcome};
 use crate::cli::Cbpaup0jArgs;
@@ -418,11 +419,11 @@ fn finished(purge: Purge) -> JobOutcome {
         written: Vec::new(),
         return_code: report.return_code(),
         counts: vec![
-            ("summaries_read", report.summaries_read()),
-            ("summaries_deleted", report.summaries_deleted()),
-            ("details_read", report.details_read()),
-            ("details_deleted", report.details_deleted()),
-            ("checkpoints", report.checkpoints()),
+            (JobCounter::SummariesRead, report.summaries_read()),
+            (JobCounter::SummariesDeleted, report.summaries_deleted()),
+            (JobCounter::DetailsRead, report.details_read()),
+            (JobCounter::DetailsDeleted, report.details_deleted()),
+            (JobCounter::Checkpoints, report.checkpoints()),
         ],
     }
 }
@@ -525,6 +526,7 @@ mod tests {
     use domain::sensitive::CardNumber;
     use persistence::{PendingAuthDetailRepository, PendingAuthSummaryRepository, PgStore, PgTx};
     use runtime::config::Config;
+    use runtime::telemetry::JobCounter;
     use tokio::time;
 
     use super::{
@@ -688,11 +690,11 @@ mod tests {
         assert_eq!(
             outcome.counts,
             [
-                ("summaries_read", 2),
-                ("summaries_deleted", 1),
-                ("details_read", 2),
-                ("details_deleted", 0),
-                ("checkpoints", 1),
+                (JobCounter::SummariesRead, 2),
+                (JobCounter::SummariesDeleted, 1),
+                (JobCounter::DetailsRead, 2),
+                (JobCounter::DetailsDeleted, 0),
+                (JobCounter::Checkpoints, 1),
             ]
         );
         let mut reader = store.clone();

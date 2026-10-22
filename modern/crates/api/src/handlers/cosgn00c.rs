@@ -31,6 +31,9 @@ use crate::dto::cosgn00c::{SignonRequest, SignonResponse};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`signon`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct SignonOperation;
+
 /// Sign on (CC00 / COSGN00C)
 ///
 /// ENTER on the sign-on screen: validates the user ID and the password, upper-cases both as the
@@ -46,6 +49,7 @@ use crate::services;
 /// - 401: no user has the user ID, or the password does not match the stored one.
 /// - 500: the user could not be read or verified, or the token could not be issued.
 #[utoipa::path(
+    impl_for = SignonOperation,
     post,
     path = "/api/v1/signon",
     operation_id = "cosgn00c_signon",
@@ -94,20 +98,19 @@ mod tests {
 
     use serde_json::{Map, Value, json};
     use utoipa_axum::router::OpenApiRouter;
-    use utoipa_axum::routes;
 
-    use crate::app::AppState;
+    use crate::app::{AppState, operation};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
     /// The operation's path item, under its JSON-pointer form.
     const PATH_ITEM: &str = "/paths/~1api~1v1~1signon";
 
-    /// The document `routes!` builds from this handler alone, as `api::app::router()` registers
-    /// it.
+    /// The document `crate::app::operation` builds from this handler alone, as
+    /// `api::app::router()` registers it.
     fn document() -> Result<Value, serde_json::Error> {
         let (_, doc) = OpenApiRouter::<AppState>::new()
-            .routes(routes!(super::signon))
+            .routes(operation(super::SignonOperation, super::signon))
             .split_for_parts();
         serde_json::to_value(doc)
     }

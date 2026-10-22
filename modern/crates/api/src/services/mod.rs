@@ -67,9 +67,17 @@
 //!   (AAP 0.5.1). An `AdminUser` argument is the admin gate, already passed. Endpoint 8's
 //!   disclosure of a full card number depends on `user.user_type` alone (AAP 0.3.4.8).
 //!   `cosgn00c::signon` takes no user, because endpoint 1 issues the token.
-//! - **Path parameters as `&str`.** A raw path segment goes through the program's total domain
-//!   edit before any read, so a malformed key is answered with the program's own message, never
-//!   an extractor rejection.
+//! - **Path parameters as `&str`.** The request layer judges a path segment first. A segment
+//!   that is not UTF-8 once percent-decoded is refused with 400 everywhere. The validated path
+//!   DTOs also enforce the transport and map bounds, answering a segment outside them with 400
+//!   `crate::dto::FIELD_LENGTH_MESSAGE` naming its field: `crate::dto::ValidPath<UserIdPath>`
+//!   (endpoints 18 to 20) the map `LENGTH` and printable `PIC X(8)` text of `USRIDIN`, and
+//!   `crate::dto::cotrtupc::TypeCodePath` (endpoints 26 and 27) the two characters of
+//!   `TRTYPCDI`. Every other segment goes through `crate::dto::RawPath`, which refuses only the
+//!   undecodable one, with `crate::dto::INVALID_PATH`. The text accepted then reaches the service
+//!   as `&str`, unparsed and untrimmed, and a total edit answers a malformed key, a blank one
+//!   included, with the program's own message before any read: the program's domain edit, or,
+//!   for the card handle of endpoint 10, a parse whose failure is COCRDUPC's lock failure.
 //! - **Bounded reads.** The page size is the one `crate::dto::resolve_page_size` gives: the
 //!   validated `page_size` of the request (1 to 100), or the program's screen size when it is
 //!   absent. Every browse binds a repository row limit derived from it, the page plus the

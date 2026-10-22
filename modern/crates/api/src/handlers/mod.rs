@@ -8,9 +8,10 @@
 //! Every handler has the same three steps and nothing else:
 //!
 //! 1. **Extract** the validated request (a `crate::dto::ValidJson` body, a `crate::dto::ValidQuery`
-//!    query or a raw path segment) and the verified identity, `SignedOnUser` or `AdminUser`. Who
-//!    acts, and with which user type, comes only from the verified JWT claims, never from a
-//!    header, a query string or a body field (AAP 0.5.1).
+//!    query, a validated path, `crate::dto::ValidPath` or `crate::dto::cotrtupc::TypeCodePath`,
+//!    or a raw path segment through `crate::dto::RawPath`) and the verified identity,
+//!    `SignedOnUser` or `AdminUser`. Who acts, and with which user type, comes only from the
+//!    verified JWT claims, never from a header, a query string or a body field (AAP 0.5.1).
 //! 2. **Delegate** to exactly one `crate::services::<program>` function. The service loads through
 //!    the repository traits, applies the `domain::online::<program>` rules, persists and returns
 //!    the outcome.
@@ -72,11 +73,12 @@
 //!   defaulting to the program's screen size. The request extractor answers a value outside that
 //!   range with 422 and a `ScreenError`, the only use of 422. The menus (2, 3) are fixed option
 //!   tables, single resources rather than collections.
-//! - **One path per handler.** This module re-exports nothing, so each handler and the path type
-//!   its `#[utoipa::path]` generates have exactly one name for `routes!` to resolve, and the
-//!   emitted document, the frontend's only type source, is built from these operations alone
-//!   (Generated API Types Only). Each operation ID is the module name and the handler name joined
-//!   by an underscore, for example `cotrtupc_action`.
+//! - **One path per handler.** This module re-exports nothing, so each handler and the operation
+//!   type its `#[utoipa::path(impl_for = …)]` implements `utoipa::Path` on have exactly one name
+//!   for `crate::app::router` to register, and the emitted document, the frontend's only type
+//!   source, is built from these operations alone (Generated API Types Only). Each operation ID
+//!   is the module name and the handler name joined by an underscore, for example
+//!   `cotrtupc_action`.
 //! - **Redaction.** Handlers return only the DTOs of `crate::dto`, whose card number and SSN
 //!   fields carry the redacted forms. Endpoint 8 is the one operation that can return a full card
 //!   number, and its service decides that from the verified user type alone (Cardholder Data

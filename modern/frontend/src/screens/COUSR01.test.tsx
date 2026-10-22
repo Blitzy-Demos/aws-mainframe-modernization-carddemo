@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import type { components } from "@/api/schema";
-import { clearSession, SESSION_KEY, setSession } from "@/auth/session";
+import { clearSession, getSession, SESSION_KEY, setSession } from "@/auth/session";
 import { INVALID_KEY } from "@/lib/header";
 import { PATHS, routes } from "@/routes";
 import { COUSR01 } from "./COUSR01";
@@ -794,6 +794,71 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       expectNoNavigation();
     },
   );
+});
+
+/** The 401 of the `AdminUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/users/add`, so the admin guard that only the table
+ * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
+ * allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COUSR01] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The 401 clears the stored session (`api/client.ts`), and the admin guard in front of the route
+// replaces the still-mounted screen with sign-on at once: the test presses no key and follows no
+// link after ENTER.
+describe("COUSR01 in the route table: a 401 ends the session", () => {
+  beforeEach(() => {
+    setSession("test-token", "ADMIN001", "A");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("an add answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
+    const { fetchStub, sent } = stubFetch({ status: 401, body: signonRequired });
+    const router = renderRouteTable();
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Add User" }, { timeout: 5_000 }),
+    ).toBeDefined();
+
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Add User" })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(sent).toEqual([
+      {
+        authorization: "Bearer test-token",
+        url: `${globalThis.location.origin}${USERS_PATH}`,
+        body: typed,
+      },
+    ]);
+    router.dispose();
+  });
 });
 
 // COUSR01C entered with no COMMAREA (`EIBCALEN = 0`) transfers to COSGN00C. The replacement is

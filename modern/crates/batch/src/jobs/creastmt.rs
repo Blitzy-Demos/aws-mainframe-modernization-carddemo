@@ -95,6 +95,7 @@ use persistence::{
     AccountRepository, CardXrefRepository, CustomerRepository, PersistenceError,
     TransactionRepository,
 };
+use runtime::telemetry::JobCounter;
 
 use super::{DirectoryLock, FileIdentity, JobContext, JobError, JobOutcome, OutputFile, count};
 
@@ -534,9 +535,9 @@ impl StatementFiles {
             written: vec![text_path, html_path, pdf_path],
             return_code: 0,
             counts: vec![
-                ("statements", count(statements)),
-                ("text_records", count(text_records)),
-                ("html_records", count(html_records)),
+                (JobCounter::Statements, count(statements)),
+                (JobCounter::TextRecords, count(text_records)),
+                (JobCounter::HtmlRecords, count(html_records)),
             ],
         })
     }
@@ -665,6 +666,7 @@ mod tests {
     use persistence::{
         AccountCustomerChain, AccountRepository, ChainLink, CustomerRepository, PersistenceError,
     };
+    use runtime::telemetry::JobCounter;
     use test_support::trace_capture;
     use tracing::instrument::WithSubscriber as _;
 
@@ -922,7 +924,11 @@ mod tests {
         assert_eq!(outcome.return_code, 0);
         assert_eq!(
             outcome.counts,
-            [("statements", 2), ("text_records", 3), ("html_records", 2)]
+            [
+                (JobCounter::Statements, 2),
+                (JobCounter::TextRecords, 3),
+                (JobCounter::HtmlRecords, 2)
+            ]
         );
         let text = [b'A', b'B', b'C'].map(|byte| [byte; STMT_RECORD_LEN]);
         assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&text));
@@ -953,7 +959,11 @@ mod tests {
         assert!(fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"));
         assert_eq!(
             outcome.counts,
-            [("statements", 0), ("text_records", 0), ("html_records", 0)]
+            [
+                (JobCounter::Statements, 0),
+                (JobCounter::TextRecords, 0),
+                (JobCounter::HtmlRecords, 0)
+            ]
         );
         Ok(())
     }

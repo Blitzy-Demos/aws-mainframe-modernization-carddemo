@@ -78,6 +78,7 @@ use std::path::Path;
 
 use domain::batch::cobtupdt::{Maintenance, MaintenanceAction, SqlOutcome, decode_input};
 use persistence::{Db2TransactionTypeRepository, PersistenceError, PgTx};
+use runtime::telemetry::JobCounter;
 
 use super::{JobContext, JobError, JobOutcome};
 
@@ -169,8 +170,8 @@ pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome
         written: Vec::new(),
         return_code: maintenance.return_code(),
         counts: vec![
-            ("records", super::count(records.len())),
-            ("failed", super::count(failed)),
+            (JobCounter::Records, super::count(records.len())),
+            (JobCounter::Failed, super::count(failed)),
         ],
     })
 }

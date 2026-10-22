@@ -38,6 +38,14 @@
 //!   lines as the lines that do not begin with `{`, with span export off (the default; the
 //!   `CARDDEMO_OTEL_EXPORT=stdout` exporter writes multi-line text blocks), or runs with
 //!   `RUST_LOG=off`, which leaves only the path lines.
+//! - The outcome of a job that ran to its end is the event `job finished`, with the fields
+//!   `job`, `return_code` and `written` (the number of path lines): `INFO` for return code 0
+//!   and `WARN` for any other, so a run whose records were rejected or failed raises a warning.
+//!   A failed job's event is `job failed`, at `ERROR`. Before either event, the job span
+//!   `batch.job` records `return_code`, when the run has one, and the job's counters, such as
+//!   `processed` and `rejected` for `posttran`, as JSON numbers: the event line shows them in
+//!   its `span` member, and the exported span carries them as attributes, however many of the
+//!   span's events the exporter drops.
 //!
 //! # Standard error
 //!
@@ -48,8 +56,9 @@
 //! record, a card number, an SSN, a password or the connection URL (Cardholder Data Redaction).
 //! A job's error on its output directory, such as `allocating generation (reports under
 //! CARDDEMO_VAR_DIR): not a directory`, names the setting of that directory instead of its path.
-//! `posttran` ends such a failure with its audited abend, `ERROR OPENING DALY REJECTS FILE`, and
-//! names the setting in the event that precedes the abend's lines.
+//! `posttran`, `intcalc` and `tranrept` end such a failure with their audited abend,
+//! `ERROR OPENING DALY REJECTS FILE`, `ERROR OPENING TRANSACTION FILE` or
+//! `ERROR OPENING REPTFILE`, and name the setting in the event that precedes the abend's lines.
 //!
 //! Input checks that need no database run before the pool is opened, so a refusal comes at once
 //! and without a connection attempt:
@@ -80,6 +89,10 @@
 //!   error that carries no return code.
 //! - 2 for a usage error, reported by `clap` before anything else runs, so `--help` and
 //!   `--version` need neither the environment nor a database.
+//!
+//! The job span records a return code, the job's own or its error's, as `return_code`, and a
+//! non-zero one makes the `job finished` event of a job that ran to its end a `WARN` (see
+//! Standard output).
 
 mod cli;
 mod jobs;
@@ -96,7 +109,10 @@ use domain::batch::loads::LoadJob;
 use domain::clock::SystemClock;
 use persistence::PgStore;
 use runtime::config::Config;
-use tracing::Instrument;
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{Field, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Instrument, Level, Metadata, Span};
 
 use crate::cli::{
     Cli, DusrsecjArgs, IntcalcArgs, Job, LoadArgs, Mnttrdb2Args, PosttranArgs, TranreptArgs,
@@ -273,7 +289,9 @@ fn has_line_break(path: &Path) -> bool {
         .any(|&byte| byte == b'\r' || byte == b'\n')
 }
 
-/// Opens the pool, runs `selected` and reports its result, inside the job span.
+/// Opens the pool, runs `selected` and reports its result, inside the job span. A pool that
+/// cannot be opened is reported as a connection failure, after which `intcalc` also shows its
+/// first open's failure (CBACT04C-034).
 async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -> ExitCode {
     let pool = match runtime::db::connect(config).await {
         Ok(pool) => pool,
@@ -282,6 +300,11 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
             // quote the connection URL.
             let error = runtime::db::ErrorSummary::from(&error);
             tracing::error!(job, error = %error, "database connection failed");
+            // CBACT04C-034: the connection stands for INTCALC's input opens, so its failure is
+            // the first open's, shown with that open's abend lines. Every other job shows none.
+            if matches!(selected, CheckedJob::Intcalc(_)) {
+                jobs::intcalc::show_failed_connection();
+            }
             return fail(
                 job,
                 &format_args!("cannot connect to the database: {error}"),
@@ -352,30 +375,105 @@ async fn run_load(
     jobs::loads::run(ctx, job, &input).await
 }
 
-/// Reports the job's result: the written paths on standard output and the outcome as a tracing
-/// event, or the error on standard error and as a tracing event, and returns the exit code.
+/// Reports the job's result: the written paths on standard output and the outcome on the job
+/// span and as a tracing event, or the error on standard error and as a tracing event, and
+/// returns the exit code.
+///
+/// The return code, and for a job that ran to its end its counters, are recorded on the current
+/// span, the job span, before the event, as numbers. The outcome event `job finished` is `INFO`
+/// for return code 0 and `WARN` for any other, so a run whose records were rejected or failed
+/// raises a warning.
 fn finish(job: &'static str, result: Result<JobOutcome, JobError>) -> ExitCode {
+    let span = Span::current();
     match result {
         Ok(outcome) => {
             if print_paths(&outcome.written).is_err() {
                 tracing::error!(job, "cannot write to standard output");
                 return fail(job, &"cannot write to standard output");
             }
-            tracing::info!(
-                job,
-                return_code = outcome.return_code,
-                counts = ?outcome.counts,
-                written = outcome.written.len(),
-                "job finished"
-            );
+            runtime::telemetry::record_job_outcome(&span, outcome.return_code, &outcome.counts);
+            job_finished(job, outcome.return_code, outcome.written.len());
             ExitCode::from(outcome.return_code)
         }
         Err(error) => {
+            let code = error.exit_code();
+            if let Some(return_code) = code {
+                runtime::telemetry::record_job_outcome(&span, return_code, &[]);
+            }
             tracing::error!(job, error = %error, "job failed");
             report(job, &error);
-            error.exit_code().map_or(ExitCode::FAILURE, ExitCode::from)
+            code.map_or(ExitCode::FAILURE, ExitCode::from)
         }
     }
+}
+
+/// The message of the outcome event of a job that ran to its end, and the name of its callsites.
+const JOB_FINISHED: &str = "job finished";
+
+/// The fields of the [`JOB_FINISHED`] event, in the order [`job_finished`] gives their values.
+const JOB_FINISHED_FIELDS: &[&str] = &["message", "job", "return_code", "written"];
+
+// Written out: `tracing::info!`/`warn!` expand to an `allow(unused_imports)` lint suppression.
+/// The `INFO` callsite of the [`JOB_FINISHED`] event, for return code 0.
+static JOB_FINISHED_INFO: DefaultCallsite = DefaultCallsite::new(&JOB_FINISHED_INFO_METADATA);
+
+/// The metadata of [`JOB_FINISHED_INFO`].
+static JOB_FINISHED_INFO_METADATA: Metadata<'static> = tracing::metadata! {
+    name: JOB_FINISHED,
+    target: module_path!(),
+    level: Level::INFO,
+    fields: JOB_FINISHED_FIELDS,
+    callsite: &JOB_FINISHED_INFO,
+    kind: Kind::EVENT,
+};
+
+/// The `WARN` callsite of the [`JOB_FINISHED`] event, for any other return code.
+static JOB_FINISHED_WARN: DefaultCallsite = DefaultCallsite::new(&JOB_FINISHED_WARN_METADATA);
+
+/// The metadata of [`JOB_FINISHED_WARN`].
+static JOB_FINISHED_WARN_METADATA: Metadata<'static> = tracing::metadata! {
+    name: JOB_FINISHED,
+    target: module_path!(),
+    level: Level::WARN,
+    fields: JOB_FINISHED_FIELDS,
+    callsite: &JOB_FINISHED_WARN,
+    kind: Kind::EVENT,
+};
+
+/// Emits the [`JOB_FINISHED`] event of a job that ran to its end, in the current span, with the
+/// fields `job`, `return_code` and `written`: `INFO` for return code 0 and `WARN` for any other.
+///
+/// It decides through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s event
+/// macros do, so the event is the line a macro would write: target `carddemo_batch` and fields
+/// `{"message":"job finished","job":…,"return_code":…,"written":…}`.
+fn job_finished(job: &str, return_code: u8, written: usize) {
+    // An event's level is fixed at its callsite, so each level has its own callsite.
+    let callsite = if return_code == 0 {
+        &JOB_FINISHED_INFO
+    } else {
+        &JOB_FINISHED_WARN
+    };
+    if !runtime::telemetry::event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    let fields = metadata.fields();
+    // Both callsites declare every name of `JOB_FINISHED_FIELDS`, so each lookup finds its field.
+    let (Some(message_field), Some(job_field), Some(return_code_field), Some(written_field)) = (
+        fields.field("message"),
+        fields.field("job"),
+        fields.field("return_code"),
+        fields.field("written"),
+    ) else {
+        return;
+    };
+    let values: [(&Field, Option<&dyn Value>); 4] = [
+        (&message_field, Some(&JOB_FINISHED)),
+        (&job_field, Some(&job)),
+        (&return_code_field, Some(&return_code)),
+        (&written_field, Some(&written)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 /// Writes each path on its own line of standard output, then flushes it.
@@ -418,6 +516,8 @@ mod tests {
     use clap::Parser;
     use domain::batch::cbpaup0c::{DEFAULT_SYSIN, PurgeParams};
     use runtime::config::Config;
+    use runtime::telemetry::{JobCounter, job_span};
+    use test_support::trace_capture;
 
     use super::{
         CheckedJob, PROGRAM, STATEMENT_DIR_LINE_BREAK, VAR_DIR_LINE_BREAK, check, check_output_dir,
@@ -666,7 +766,7 @@ mod tests {
         JobOutcome {
             written: Vec::new(),
             return_code,
-            counts: vec![("records", 0)],
+            counts: vec![(JobCounter::Records, 0)],
         }
     }
 
@@ -732,5 +832,101 @@ mod tests {
             finish("dusrsecj", Err(JobError::Password)),
             ExitCode::FAILURE
         );
+    }
+
+    /// The object of member `name` in the JSON event `line`, such as `"span"` for the current
+    /// span's fields and name, without its braces. Neither member holds a nested object.
+    fn member<'a>(line: &'a str, name: &str) -> Option<&'a str> {
+        let (_, after) = line.split_once(&format!(r#""{name}":{{"#))?;
+        after.split_once('}').map(|(object, _)| object)
+    }
+
+    /// The one captured event of `capture` whose message is `message`.
+    fn sole_event(capture: &trace_capture::TraceCapture, message: &str) -> String {
+        let needle = format!(r#""message":"{message}""#);
+        let events: Vec<String> = capture
+            .lines()
+            .into_iter()
+            .filter(|line| line.contains(&needle))
+            .collect();
+        let [event] = events.as_slice() else {
+            panic!("expected one {message:?} event, got {events:?}");
+        };
+        event.clone()
+    }
+
+    fn assert_members(object: &str, expected: &[&str]) {
+        for needle in expected {
+            assert!(object.contains(needle), "{needle} missing from {object}");
+        }
+    }
+
+    /// The outcome event of a job that ran to its end is a `WARN` for a non-zero return code
+    /// and an `INFO` for 0, and either way the job span holds the return code and every counter
+    /// as a number; no counter is left as a `Debug` string.
+    #[test]
+    fn the_job_finished_event_warns_on_a_non_zero_return_code_and_the_span_holds_the_outcome() {
+        for (return_code, level) in [(4, "WARN"), (0, "INFO")] {
+            let capture = trace_capture::capture();
+            let outcome = JobOutcome {
+                written: Vec::new(),
+                return_code,
+                counts: vec![(JobCounter::Processed, 300), (JobCounter::Rejected, 38)],
+            };
+            let code = job_span("posttran").in_scope(|| finish("posttran", Ok(outcome)));
+            assert_eq!(code, ExitCode::from(return_code));
+
+            let event = sole_event(&capture, "job finished");
+            let return_code_member = format!(r#""return_code":{return_code}"#);
+            assert!(event.contains(&format!(r#""level":"{level}""#)), "{event}");
+            let Some(fields) = member(&event, "fields") else {
+                panic!("no fields member in {event}");
+            };
+            assert_members(
+                fields,
+                &[r#""job":"posttran""#, &return_code_member, r#""written":0"#],
+            );
+            let Some(span) = member(&event, "span") else {
+                panic!("no span member in {event}");
+            };
+            assert_members(
+                span,
+                &[
+                    r#""name":"batch.job""#,
+                    r#""job":"posttran""#,
+                    &return_code_member,
+                    r#""processed":300"#,
+                    r#""rejected":38"#,
+                ],
+            );
+            assert!(!capture.contains(r#""counts":"#), "{}", capture.text());
+        }
+    }
+
+    /// A failed job records the return code its error carries on the job span before its
+    /// `ERROR` event, and an error without one records none.
+    #[test]
+    fn a_failed_job_records_its_error_return_code_on_the_job_span() {
+        for code in [Some(16), None] {
+            let capture = trace_capture::capture();
+            let error = JobError::Abend {
+                code,
+                reason: "CBPAUP0C ABENDING ...",
+            };
+            let exit = job_span("cbpaup0j").in_scope(|| finish("cbpaup0j", Err(error)));
+            assert_eq!(exit, code.map_or(ExitCode::FAILURE, ExitCode::from));
+
+            let event = sole_event(&capture, "job failed");
+            assert!(event.contains(r#""level":"ERROR""#), "{event}");
+            let Some(span) = member(&event, "span") else {
+                panic!("no span member in {event}");
+            };
+            assert_members(span, &[r#""name":"batch.job""#, r#""job":"cbpaup0j""#]);
+            match code {
+                Some(code) => assert_members(span, &[&format!(r#""return_code":{code}"#)]),
+                None => assert!(!span.contains("return_code"), "{span}"),
+            }
+            assert!(!capture.contains("job finished"), "{}", capture.text());
+        }
     }
 }

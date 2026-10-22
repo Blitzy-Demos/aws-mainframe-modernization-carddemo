@@ -21,8 +21,9 @@ import { COADM01_LENGTHS, coadm01Schema, type Coadm01Values } from "@/schemas/CO
  * route `/admin`, served by endpoint 3 (`GET /api/v1/menus/admin`).
  *
  * The screen holds no authority. The API's admin gate answers 401 or 403 before any menu is
- * built, and that `ScreenError` shows in the message row (COADM01C-001); the route guard in front
- * of `/admin` only hides the screen from a session that is not of user type `A`.
+ * built, and that `ScreenError` shows in the message row (COADM01C-001). A 401 also clears the
+ * session, so the route guard in front of `/admin` then replaces the screen with sign-on; the
+ * guard only hides the screen from a session that is absent or not of user type `A`.
  */
 
 /** `OPTN001` to `OPTN012`: the map's option lines, `POS=(6,20)` to `(17,20)`, `LENGTH=40`. */

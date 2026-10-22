@@ -10,7 +10,7 @@
 //! ENTER, F7, F8 and the transfer key of a first entry are served here. The `S` selection to
 //! COTRN01 and F3 to the main menu are client-side and send no request. `POST` on the same path
 //! is COTRN02C's add, `handlers::cotrn02c::add`, which `app::router` registers beside this
-//! handler in one `routes!`.
+//! handler on the same path item.
 
 use axum::Json;
 use axum::extract::State;
@@ -21,6 +21,9 @@ use crate::dto::ValidQuery;
 use crate::dto::cotrn00c::{TranListQuery, TranListResponse};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`list`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ListOperation;
 
 /// List transactions (CT00 / COTRN00C).
 ///
@@ -42,6 +45,7 @@ use crate::services;
 /// - 500 `Unable to lookup transaction...` when the page cannot be read, and 500 for a store
 ///   failure without an audited message.
 #[utoipa::path(
+    impl_for = ListOperation,
     get,
     path = "/api/v1/transactions",
     operation_id = "cotrn00c_list",

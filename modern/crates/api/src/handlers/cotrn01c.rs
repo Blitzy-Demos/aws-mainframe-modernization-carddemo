@@ -2,10 +2,10 @@
 //! `GET /api/v1/transactions/{tran_id}` (transaction `CT01`, map `COTRN1A`; AAP 0.3.4.1).
 //!
 //! [`view`] serves ENTER, the program's only key that reads: it extracts the signed-on user and
-//! the raw `tran_id` path segment, calls `services::cotrn01c::view` and maps the answer through
-//! `TranViewResponse::from` or `ScreenError::from` (Thin Request Handlers). F4 (clear), F5 (to
-//! the transaction list) and PF3 (back) are served by the screen alone and reach no endpoint
-//! (COTRN01C-004 to COTRN01C-006).
+//! the raw `tran_id` path segment ([`RawPath`]), calls `services::cotrn01c::view` and maps the
+//! answer through `TranViewResponse::from` or `ScreenError::from` (Thin Request Handlers). F4
+//! (clear), F5 (to the transaction list) and PF3 (back) are served by the screen alone and reach
+//! no endpoint (COTRN01C-004 to COTRN01C-006).
 //!
 //! The path segment stays a `String`, never parsed here: the domain's total edit, not an
 //! extractor, answers a blank Tran ID with the program's own message (COTRN01C-009). The card
@@ -14,13 +14,17 @@
 //! response (COTRN01C-023, COTRN01C-024, Typed Dates and Timestamps).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
+use crate::dto::RawPath;
 use crate::dto::cotrn01c::TranViewResponse;
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`view`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ViewOperation;
 
 /// View a transaction (CT01 / COTRN01C).
 ///
@@ -35,8 +39,11 @@ use crate::services;
 /// A `ScreenError` naming field `tran_id`: 400 `Tran ID can NOT be empty...` when the Tran ID
 /// is blank, 404 `Transaction ID NOT found...` when no transaction has the key, and 500
 /// `Unable to lookup Transaction...` when the read fails. A request without a valid bearer
-/// token is refused with 401 before anything is read.
+/// token is refused with 401 before anything is read. A segment that is not UTF-8 once
+/// percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
+/// program's edit.
 #[utoipa::path(
+    impl_for = ViewOperation,
     get,
     path = "/api/v1/transactions/{tran_id}",
     operation_id = "cotrn01c_view",
@@ -58,7 +65,7 @@ use crate::services;
         (
             status = 400,
             description = "`Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is \
-                read (COTRN01C-009)",
+                read (COTRN01C-009); or a path segment that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (
@@ -83,7 +90,7 @@ use crate::services;
 pub(crate) async fn view(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path(tran_id): Path<String>,
+    RawPath(tran_id): RawPath<String>,
 ) -> Result<Json<TranViewResponse>, ScreenError> {
     services::cotrn01c::view(&state, &user, &tran_id)
         .await

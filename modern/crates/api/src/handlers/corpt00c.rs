@@ -29,6 +29,9 @@ use crate::dto::corpt00c::{ReportRequest, ReportResult};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`submit`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct SubmitOperation;
+
 /// Submit the transaction report (CR00 / CORPT00C)
 ///
 /// ENTER on the report screen: the Monthly or Yearly report of the current date, or a Custom report
@@ -50,6 +53,7 @@ use crate::services;
 /// - 500: `Unable to Write TDQ (JOBS)...` when the job deck cannot be written, or
 ///   `Unable to process request...` for an internal failure.
 #[utoipa::path(
+    impl_for = SubmitOperation,
     post,
     path = "/api/v1/reports/transactions",
     operation_id = "corpt00c_submit",

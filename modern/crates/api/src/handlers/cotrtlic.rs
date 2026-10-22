@@ -30,27 +30,36 @@
 //!
 //! COTRTLIC re-sends the whole screen with every message (`COTRTLIC.cbl:699-720`), so an input
 //! error, a row another user deleted and a Db2 failure still answer with the page and the
-//! state. The one exception is a database the service cannot reach, the failed
-//! `9998-PRIMING-QUERY`, which sends no screen: 500 with a [`ScreenError`] carrying
-//! `Db2 access failure. ` in the Db2 format (COTRTLIC-053).
+//! state. A request that gets no screen is answered with a [`ScreenError`] instead: 400 for a
+//! query or body the extractor rejects and for a `page_key` or `state` no screen could hold;
+//! 500 for a database the service cannot reach, the failed `9998-PRIMING-QUERY`, carrying
+//! `Db2 access failure. ` in the Db2 format (COTRTLIC-053), and, on endpoint 25, for an F10
+//! commit whose transaction cannot be opened, committed or rolled back or whose re-read of the
+//! target row fails.
 //!
 //! `TranTypeListResponse` and `TranTypeListActionResult` carry the audited status and answer
 //! with it through their own `IntoResponse`, so each handler returns the DTO itself and never
-//! wraps it in `Json`, which would answer 200 for every outcome. One status can declare only one
-//! JSON body, so the documented 400 and 500 bodies are the page, the program's own answer, and
-//! their descriptions name the [`ScreenError`] answered instead: to a request rejected before
-//! the program runs, and to an unreachable database.
+//! wraps it in `Json`, which would answer 200 for every outcome. 400 and 500 therefore carry
+//! either the page or a [`ScreenError`], and each operation declares both statuses as `anyOf`
+//! the two schemas, inline through the schema-only `TranTypeListErrorBody` and
+//! `TranTypeListActionErrorBody`; `anyOf` rather than `oneOf`, because a page with its message
+//! also satisfies the [`ScreenError`] schema. 200, and endpoint 25's 404, carry the page alone;
+//! 401, 403 and 422 carry the [`ScreenError`] alone.
 
 use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::AdminUser;
 use crate::dto::cotrtlic::{
-    TranTypeListActionRequest, TranTypeListActionResult, TranTypeListQuery, TranTypeListResponse,
+    TranTypeListActionErrorBody, TranTypeListActionRequest, TranTypeListActionResult,
+    TranTypeListErrorBody, TranTypeListQuery, TranTypeListResponse,
 };
 use crate::dto::{ValidJson, ValidQuery};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`list`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ListOperation;
 
 /// List transaction types (CTLI / COTRTLIC).
 ///
@@ -73,6 +82,7 @@ use crate::services;
 /// message when the count or the page read fails, or with a `ScreenError` carrying
 /// `Db2 access failure. ` when the database cannot be reached (COTRTLIC-053).
 #[utoipa::path(
+    impl_for = ListOperation,
     get,
     path = "/api/v1/transaction-types",
     operation_id = "cotrtlic_list",
@@ -86,10 +96,10 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "The page with a filter in error and its message; a query the request \
-                rules reject, or a `page_key` this API did not issue, is answered with a \
-                `ScreenError` instead",
-            body = TranTypeListResponse
+            description = "Either body: the page with a filter in error and its message, or a \
+                `ScreenError` for a query the request rules reject or a `page_key` this API did \
+                not issue",
+            body = inline(TranTypeListErrorBody)
         ),
         (
             status = 401,
@@ -108,10 +118,10 @@ use crate::services;
         ),
         (
             status = 500,
-            description = "The count or the page read failed: the rows read before the failure \
-                and the program's Db2 message; a database that cannot be reached \
-                (`Db2 access failure. `) is answered with a `ScreenError` instead",
-            body = TranTypeListResponse
+            description = "Either body: the page, with the rows read before the failure and the \
+                program's Db2 message, when the count or the page read failed, or a \
+                `ScreenError` carrying `Db2 access failure. ` when the database cannot be reached",
+            body = inline(TranTypeListErrorBody)
         ),
     ),
     security(("bearer_auth" = []))
@@ -127,6 +137,9 @@ pub(crate) async fn list(
         .map(TranTypeListResponse::from)
         .map_err(ScreenError::from)
 }
+
+/// The `utoipa::Path` of [`list_actions`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ListActionsOperation;
 
 /// Validate or confirm list actions (CTLI / COTRTLIC).
 ///
@@ -152,10 +165,12 @@ pub(crate) async fn list(
 /// page when the row to commit was deleted by another user; 422 for a `page_size` outside 1 to
 /// 100; 500 with the page and its Db2 message when a Db2 statement fails, with a `ScreenError`
 /// carrying `Db2 access failure. ` when the database cannot be reached (COTRTLIC-053), or with a
-/// `ScreenError` when the commit's transaction cannot be opened, committed or rolled back.
+/// `ScreenError` when the commit's transaction cannot be opened, committed or rolled back or its
+/// re-read of the target row fails.
 // The static `list-actions` segment coexists with endpoint 26's `{type_code}` parameter: axum's
 // matcher prefers the static segment, so this POST never reaches COTRTUPC.
 #[utoipa::path(
+    impl_for = ListActionsOperation,
     post,
     path = "/api/v1/transaction-types/list-actions",
     operation_id = "cotrtlic_list_actions",
@@ -169,10 +184,10 @@ pub(crate) async fn list(
         ),
         (
             status = 400,
-            description = "The page with the per-row errors and the message of an input error \
-                or of a delete the type's categories restrict; a body the request rules reject, \
-                or a `state` no screen could hold, is answered with a `ScreenError` instead",
-            body = TranTypeListActionResult
+            description = "Either body: the page with the per-row errors and the message of an \
+                input error or of a delete the type's categories restrict, or a `ScreenError` for \
+                a body the request rules reject or a `state` no screen could hold",
+            body = inline(TranTypeListActionErrorBody)
         ),
         (
             status = 401,
@@ -197,11 +212,12 @@ pub(crate) async fn list(
         ),
         (
             status = 500,
-            description = "The page and the program's Db2 message of a failed statement; a \
-                database that cannot be reached (`Db2 access failure. `) and a commit \
-                transaction that cannot be opened, committed or rolled back are answered with a \
-                `ScreenError` instead",
-            body = TranTypeListActionResult
+            description = "Either body: the page and the program's Db2 message of a failed \
+                statement, or a `ScreenError` carrying `Db2 access failure. ` when the database \
+                cannot be reached, or `Unable to process request...` when the commit's \
+                transaction cannot be opened, committed or rolled back or its re-read of the \
+                target row fails",
+            body = inline(TranTypeListActionErrorBody)
         ),
     ),
     security(("bearer_auth" = []))

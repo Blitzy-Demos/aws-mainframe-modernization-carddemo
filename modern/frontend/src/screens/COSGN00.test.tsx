@@ -1,11 +1,26 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { SESSION_KEY, getSession, setSession } from "@/auth/session";
+import {
+  SESSION_KEY,
+  type StoredSession,
+  getSession,
+  getSessionSnapshot,
+  getToken,
+  setSession,
+  subscribeSession,
+} from "@/auth/session";
 import { INVALID_KEY, THANK_YOU } from "@/lib/header";
-import { PATHS } from "@/routes";
+import { PATHS, routes } from "@/routes";
 import { COSGN00 } from "./COSGN00";
 
 /*
@@ -159,6 +174,13 @@ function cellsStartingAt(container: HTMLElement, row: number, col: number): (str
 function typeCredentials(userId: string, password: string): void {
   fireEvent.change(userIdInput(), { target: { value: userId } });
   fireEvent.change(passwordInput(), { target: { value: password } });
+}
+
+/** Types the credentials, presses ENTER and waits for the main menu `userSignon` routes to. */
+async function signOnAsUser(): Promise<void> {
+  typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+  fireEvent.click(screen.getByRole("button", { name: "ENTER=Sign-on" }));
+  expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
 }
 
 afterEach(() => {
@@ -385,4 +407,417 @@ describe("COSGN00 sign-on screen", () => {
     expect(screen.queryAllByRole("textbox")).toHaveLength(0);
     expect(screen.queryByText("CC00")).toBeNull();
   });
+});
+
+// The session sign-on keeps in `sessionStorage`: one key holding exactly the token, user ID and
+// user type; a later sign-on replaces it, a refused write leaves none, and entry and F3 remove
+// only it. No storage failure stops the screen.
+describe("COSGN00 session storage", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Every request `fetch` received: method, path, query, `Authorization` header and JSON body. */
+  async function sentRequests() {
+    return Promise.all(
+      vi.mocked(fetch).mock.calls.map(async ([input, init]) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        const text = await request.clone().text();
+        const body: unknown = text === "" ? undefined : JSON.parse(text);
+        return {
+          method: request.method,
+          path: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          authorization: request.headers.get("Authorization"),
+          body,
+        };
+      }),
+    );
+  }
+
+  it("ENTER stores exactly the token, user ID and user type as JSON under carddemo.session, after one POST with no bearer token and no query", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+
+    await signOnAsUser();
+
+    expect(SESSION_KEY).toBe("carddemo.session");
+    expect(sessionStorage).toHaveLength(1);
+    expect(JSON.parse(sessionStorage.getItem(SESSION_KEY) ?? "null")).toStrictEqual({
+      token: "test-token",
+      userId: "USER0001",
+      userType: "U",
+    });
+    const typed: components["schemas"]["SignonRequest"] = {
+      user_id: TYPED_USER_ID,
+      password: TYPED_PASSWORD,
+    };
+    expect(await sentRequests()).toEqual([
+      { method: "POST", path: "/api/v1/signon", query: {}, authorization: null, body: typed },
+    ]);
+  });
+
+  it("a later sign-on replaces the session an earlier one stored", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+    // Stored after entry, which itself ends any session.
+    setSession("test-token-earlier", "ADMIN001", "A");
+
+    await signOnAsUser();
+
+    expect(getSession()).toEqual({ token: "test-token", userId: "USER0001", userType: "U" });
+    expect(sessionStorage).toHaveLength(1);
+  });
+
+  it("a refused write leaves no session, earlier or new, and sign-on still completes", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+    setSession("test-token-earlier", "ADMIN001", "A");
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("quota exceeded", "QuotaExceededError");
+    });
+
+    await signOnAsUser();
+
+    expect(getSession()).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+  });
+
+  it("first entry and F3 each end the session and leave every other key in place", () => {
+    stubFetch();
+    sessionStorage.setItem("unrelated", "kept");
+    setSession("test-token", "USER0001", "U");
+
+    renderScreen();
+    expect(getSession()).toBeNull();
+    expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(sessionStorage.getItem("unrelated")).toBe("kept");
+
+    setSession("test-token", "USER0001", "U");
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+    expect(getSession()).toBeNull();
+    expect(sessionStorage.getItem("unrelated")).toBe("kept");
+    expect(sessionStorage).toHaveLength(1);
+  });
+
+  it("entry and F3 still show their screens when removing the session throws", () => {
+    stubFetch();
+    const stored = { token: "test-token", userId: "USER0001", userType: "U" };
+    setSession(stored.token, stored.userId, stored.userType);
+    vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => {
+      throw new DOMException("storage blocked", "SecurityError");
+    });
+
+    renderScreen();
+    expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+    // Storage refused both removals, so the session it holds is unchanged.
+    expect(getSession()).toEqual(stored);
+  });
+});
+
+// Sign-on is the one screen no guard stands in front of in the route table. A failed sign-on is a
+// 401 too, and the session the client clears on it is the one entry already removed: the screen
+// stays at `/signon` with the audited message and the input as typed, and nothing navigates.
+describe("COSGN00 in the route table: a failed sign-on stays on sign-on", () => {
+  it("a sign-on answered 401 keeps the screen, its message and the typed input, with no navigation", async () => {
+    const failure: components["schemas"]["ScreenError"] = {
+      message: "Wrong Password. Try again ...",
+      field: "password",
+    };
+    const { sent } = stubFetch({ status: 401, body: failure });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COSGN00] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    const enter = await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 });
+    const entry = router.state.location;
+
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+    fireEvent.click(enter);
+
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(failure.message);
+    });
+    expect(router.state.location).toBe(entry);
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.getByRole("button", { name: "ENTER=Sign-on" })).toBe(enter);
+    expect(userIdInput().value).toBe(TYPED_USER_ID);
+    expect(passwordInput().value).toBe(TYPED_PASSWORD);
+    expect(getSession()).toBeNull();
+    const typed: components["schemas"]["SignonRequest"] = {
+      user_id: TYPED_USER_ID,
+      password: TYPED_PASSWORD,
+    };
+    expect(sent).toEqual([{ authorization: null, body: typed }]);
+    router.dispose();
+  });
+});
+
+// `setSession` and `clearSession` never throw, even when a listener of `subscribeSession` does,
+// and a listener that throws stops none after it. The throwing listener here is subscribed before
+// the route table mounts, so on every change it runs, and throws, before the sign-on guard's own
+// listener. The sign-on is an admin's: the admin menu has no redirect of its own on a refused
+// token, so only the guard's listener can replace it with sign-on after a 401.
+describe("COSGN00 in the route table: a session listener that throws", () => {
+  it("sign-on still stores the session and reaches the server's next route, a 401 there still sends the guard to sign-on, and F3 still ends the session", async () => {
+    const seen: (StoredSession | null)[] = [];
+    const failing = vi.fn((): void => {
+      seen.push(getSession());
+      throw new Error("session listener failure");
+    });
+    onTestFinished(subscribeSession(failing));
+
+    const refused: components["schemas"]["ScreenError"] = {
+      message: "The sign-on token is missing, invalid or expired",
+    };
+    let refuse = (): void => undefined;
+    const refusal = new Promise<void>((resolve) => {
+      refuse = resolve;
+    });
+    const sent: { method: string; path: string; authorization: string | null }[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(input, init);
+        const path = new URL(req.url).pathname;
+        sent.push({ method: req.method, path, authorization: req.headers.get("Authorization") });
+        if (req.method === "POST" && path === "/api/v1/signon") {
+          return json(200, adminSignon);
+        }
+        if (req.method === "GET" && path === "/api/v1/menus/admin") {
+          await refusal;
+          return json(401, refused);
+        }
+        const unexpected: components["schemas"]["ScreenError"] = {
+          message: `Unexpected request ${req.method} ${path}`,
+        };
+        return json(500, unexpected);
+      }),
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COSGN00] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    const enter = await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 });
+    // Entry ended the session: the listener was told, threw, and the screen rendered regardless.
+    expect(seen).toEqual([null]);
+
+    typeCredentials("admin001", TYPED_PASSWORD);
+    fireEvent.click(enter);
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Admin Menu" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+    expect(router.state.location.pathname).toBe(adminSignon.next_route);
+    const stored: StoredSession = { token: "test-token", userId: "ADMIN001", userType: "A" };
+    expect(getSession()).toEqual(stored);
+    expect(seen).toEqual([null, stored]);
+    await waitFor(() => {
+      expect(sent).toHaveLength(2);
+    });
+    expect(sent).toEqual([
+      { method: "POST", path: "/api/v1/signon", authorization: null },
+      { method: "GET", path: "/api/v1/menus/admin", authorization: "Bearer test-token" },
+    ]);
+
+    // The admin menu's load is refused: the client clears the session, the throwing listener is
+    // told first, and the guard's listener after it still replaces the screen with sign-on, whose
+    // entry ends the session once more.
+    refuse();
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(errorRow().textContent).toBe("");
+    expect(seen).toEqual([null, stored, null, null]);
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+    expect(getSession()).toBeNull();
+    expect(seen).toEqual([null, stored, null, null, null]);
+    expect(failing.mock.results.map((result) => result.type)).toEqual(Array(5).fill("throw"));
+    expect(sent).toHaveLength(2);
+    router.dispose();
+  });
+});
+
+// `subscribeSession` and `getSessionSnapshot` are the store `RequireSignon` reads through
+// `useSyncExternalStore`. The screen makes the session changes: every entry and F3 end the session
+// (`clearSession`) and a successful sign-on stores it (`setSession`); only a session left by an
+// earlier sign-on is seeded directly. That a listener reads the session the change made, and that
+// a throwing listener stops neither the listener after it nor the screen, is proven by "COSGN00 in
+// the route table: a session listener that throws".
+describe("COSGN00 session changes: subscribeSession and getSessionSnapshot", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  /** Registers `listener` for the current test only, and returns its remover. */
+  function subscribe(listener: () => void): () => void {
+    const unsubscribe = subscribeSession(listener);
+    onTestFinished(unsubscribe);
+    return unsubscribe;
+  }
+
+  /** The error a browser throws when it blocks storage. */
+  function storageBlocked(): DOMException {
+    return new DOMException("storage blocked", "SecurityError");
+  }
+
+  /** Presses F3 and checks that the session-end text replaced the screen. */
+  function pressF3(): void {
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+  }
+
+  // Each change calls every listener once, a function subscribed twice is held and called once,
+  // and an unsubscribed listener hears no later change while the others still do.
+  it("notifies every listener once per entry and per sign-on, holds a function subscribed twice once, and stops calling one that unsubscribed", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    const first = vi.fn();
+    const second = vi.fn();
+    const unsubscribeFirst = subscribe(first);
+    subscribe(second);
+    // The same function registered again is held once, so it is still called once per change.
+    subscribe(second);
+
+    // Entry ends the session (one clearSession), then the sign-on stores it (one setSession).
+    const { unmount } = renderScreen();
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    await signOnAsUser();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(2);
+
+    // Unsubscribed, `first` hears neither the next entry nor the next sign-on; `second` hears both.
+    unsubscribeFirst();
+    unmount();
+    renderScreen();
+    expect(second).toHaveBeenCalledTimes(3);
+    await signOnAsUser();
+    expect(first).toHaveBeenCalledTimes(2);
+    expect(second).toHaveBeenCalledTimes(4);
+  });
+
+  // The snapshot is the stored text itself, so repeated reads with no change between them are
+  // identical, as `useSyncExternalStore` requires, and a different session gives a different one.
+  it("getSessionSnapshot returns the identical stored text until the session changes, and null once entry ends it", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    expect(getSessionSnapshot()).toBeNull();
+    expect(getSessionSnapshot()).toBe(getSessionSnapshot());
+
+    const { unmount } = renderScreen();
+    // Stored after entry, which itself ends any session.
+    setSession("test-token-earlier", "ADMIN001", "A");
+    const earlier = getSessionSnapshot();
+    expect(earlier).not.toBeNull();
+    expect(earlier).toBe(sessionStorage.getItem(SESSION_KEY));
+    expect(getSessionSnapshot()).toBe(earlier);
+
+    await signOnAsUser();
+    const signedOn = getSessionSnapshot();
+    expect(signedOn).not.toBeNull();
+    expect(signedOn).not.toBe(earlier);
+    expect(signedOn).toBe(sessionStorage.getItem(SESSION_KEY));
+    expect(getSessionSnapshot()).toBe(signedOn);
+
+    unmount();
+    renderScreen();
+    expect(getSessionSnapshot()).toBeNull();
+  });
+
+  // A refused read is the same snapshot as no session, and never reaches the caller.
+  it("getSessionSnapshot returns null, without throwing, when reading storage throws", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+    await signOnAsUser();
+    expect(getSessionSnapshot()).not.toBeNull();
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw storageBlocked();
+    });
+
+    expect(() => getSessionSnapshot()).not.toThrow();
+    expect(getSessionSnapshot()).toBeNull();
+  });
+
+  // A storage operation that throws still announces the change, once, and the screen still
+  // finishes the key that made it.
+  it.each([
+    { method: "setItem", change: "setSession at sign-on", press: signOnAsUser },
+    { method: "removeItem", change: "setSession at sign-on", press: signOnAsUser },
+    { method: "removeItem", change: "clearSession at F3", press: pressF3 },
+  ] as const)(
+    "still notifies once when $method throws during $change",
+    async ({ method, press }) => {
+      stubFetch({ status: 200, body: userSignon });
+      renderScreen();
+      const listener = vi.fn();
+      subscribe(listener);
+      vi.spyOn(Storage.prototype, method).mockImplementation(() => {
+        throw storageBlocked();
+      });
+
+      await press();
+
+      expect(listener).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  // With no storage to reach, entry and sign-on still complete, nothing is held, and both changes
+  // are still announced.
+  it.each([
+    {
+      why: "sessionStorage does not exist",
+      install: () => {
+        vi.stubGlobal("sessionStorage", undefined);
+      },
+    },
+    {
+      why: "reaching sessionStorage throws",
+      install: () => {
+        // Stubbed first, so `vi.unstubAllGlobals` restores the original property afterwards.
+        vi.stubGlobal("sessionStorage", undefined);
+        Object.defineProperty(globalThis, "sessionStorage", {
+          configurable: true,
+          get(): Storage {
+            throw storageBlocked();
+          },
+        });
+      },
+    },
+  ])(
+    "entry and sign-on complete, hold no session and still notify both changes when $why",
+    async ({ install }) => {
+      stubFetch({ status: 200, body: userSignon });
+      const listener = vi.fn();
+      subscribe(listener);
+      install();
+
+      renderScreen();
+      await signOnAsUser();
+
+      expect(getSession()).toBeNull();
+      expect(getToken()).toBeNull();
+      expect(getSessionSnapshot()).toBeNull();
+      expect(listener).toHaveBeenCalledTimes(2);
+    },
+  );
 });

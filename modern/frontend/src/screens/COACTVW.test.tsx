@@ -1,10 +1,10 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes } from "react-router";
+import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COACTVW } from "./COACTVW";
 
 /*
@@ -1046,4 +1046,146 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
       ["GET", `/api/v1/accounts/${ACCOUNT}/view`],
     ]);
   });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/accounts/view`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COACTVW] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the
+// route replaces the still-mounted screen with sign-on at once: the test presses no key and
+// follows no link after ENTER.
+describe("COACTVW in the route table: a 401 ends the session", () => {
+  beforeEach(() => {
+    setSession("test-token", "USER0001", "U");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("ENTER answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
+    const requests = stubFetch(() => json(401, signonRequired));
+    const router = renderRouteTable();
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
+    ).toBeDefined();
+
+    typeAccount(ACCOUNT);
+    pressEnterButton();
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "View Account" })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(requests).toEqual([
+      {
+        method: "GET",
+        path: `/api/v1/accounts/${ACCOUNT}/view`,
+        authorization: "Bearer test-token",
+      },
+    ]);
+    router.dispose();
+  });
+});
+
+// Endpoint 4 answers a failed edit 400, a missing record 404 and a failed read 500, each with a
+// `ScreenError`. The screen shows that body's message as it came, and only a 401 ends the session.
+describe("COACTVW: a ScreenError reply keeps the session", () => {
+  beforeEach(() => {
+    setSession("test-token", "USER0001", "U");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  /** Every request `fetch` received: method, path, query, `Authorization` header and body text. */
+  async function sentRequests() {
+    return Promise.all(
+      vi.mocked(fetch).mock.calls.map(async ([input, init]) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        return {
+          method: request.method,
+          path: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          authorization: request.headers.get("Authorization"),
+          body: await request.clone().text(),
+        };
+      }),
+    );
+  }
+
+  it.each<{ status: number; typed: string; body: components["schemas"]["ScreenError"] }>([
+    {
+      status: 400,
+      typed: "00000000000",
+      body: { message: "Account Filter must  be a non-zero 11 digit number", field: "acct_id" },
+    },
+    {
+      status: 404,
+      typed: ACCOUNT,
+      body: {
+        message: `Account:${ACCOUNT} not found in Cross ref file.  Resp:000000000  Reas:0000`,
+        field: "acct_id",
+      },
+    },
+    {
+      status: 500,
+      typed: ACCOUNT,
+      body: {
+        message: "File Error: READ     on CXACAIX   returned RESP 0000000013,RESP2 0000000000",
+        field: "acct_id",
+      },
+    },
+  ])(
+    "a $status shows its message unchanged, keeps the session, after one GET with the bearer token and no query or body",
+    async ({ status, typed, body }) => {
+      stubFetch(() => json(status, body));
+      renderScreen();
+
+      typeAccount(typed);
+      pressEnterButton();
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe(body.message);
+      });
+
+      expect(getSession()).toEqual({ token: "test-token", userId: "USER0001", userType: "U" });
+      expect(outputValues()).toEqual(NO_BLOCK);
+      expect(await sentRequests()).toEqual([
+        {
+          method: "GET",
+          path: `/api/v1/accounts/${typed}/view`,
+          query: {},
+          authorization: "Bearer test-token",
+          body: "",
+        },
+      ]);
+    },
+  );
 });

@@ -3,8 +3,8 @@
 //!
 //! ENTER is the only key the endpoint serves. F3 returns to the admin menu and F4 clears the
 //! screen without a request, so both belong to the screen (COUSR01C-007, COUSR01C-008). `GET` on
-//! the same path is `handlers::cousr00c::list`, and `api::app` registers the two in one
-//! `routes!`.
+//! the same path is `handlers::cousr00c::list`, and `api::app` registers the two on the same
+//! path item.
 //!
 //! The handler extracts the [`AdminUser`] gate and the validated [`UserAddRequest`], hands both
 //! to `services::cousr01c::add`, and maps its answer: the success message into a
@@ -33,6 +33,9 @@ use crate::dto::{ScreenResult, ValidJson};
 use crate::error::ScreenError;
 use crate::services;
 
+/// The `utoipa::Path` of [`add`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct AddOperation;
+
 /// Add a user (CU01 / COUSR01C).
 ///
 /// ENTER on `COUSR1A`: the five fields are edited in the program's order and, when none is
@@ -54,6 +57,7 @@ use crate::services;
 // and the duplicate is input the operator must change (COUSR01C-023), so the document declares
 // no 409. Success stays 200, not 201: the program answers the add with its message row.
 #[utoipa::path(
+    impl_for = AddOperation,
     post,
     path = "/api/v1/users",
     operation_id = "cousr01c_add",

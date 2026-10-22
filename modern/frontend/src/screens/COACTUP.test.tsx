@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COACTUP } from "./COACTUP";
 
 /*
@@ -1122,5 +1130,263 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     expectEmptyScreen(ACCOUNT);
     expect(document.activeElement).toBe(input("Account Number :"));
     expect(sent).toHaveLength(2);
+  });
+});
+
+// Endpoint 6 answers a record another user changed since the fetch with a 409 `ScreenError`. The
+// screen shows that body's message as it came, and only a 401 ends the session.
+describe("COACTUP: a 409 on F5 keeps the session", { timeout: TEST_TIMEOUT_MS }, () => {
+  /** Every request `fetch` received: method, path, query, `Authorization` header and JSON body. */
+  async function sentRequests() {
+    return Promise.all(
+      vi.mocked(fetch).mock.calls.map(async ([input, init]) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        const text = await request.clone().text();
+        const body: unknown = text === "" ? undefined : JSON.parse(text);
+        return {
+          method: request.method,
+          path: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          authorization: request.headers.get("Authorization"),
+          body,
+        };
+      }),
+    );
+  }
+
+  it("shows the 409 body's message unchanged and keeps the session, every request carrying the bearer token and no query", async () => {
+    stubApi(get(200, VIEW), put(200, VALIDATED), put(409, RECORD_CHANGED));
+    renderScreen();
+    await fetchAccount();
+    typeInto("First Name", "Grace");
+    await validate();
+    fireEvent.click(screen.getByRole("button", { name: "F5=Save" }));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(RECORD_CHANGED.message);
+    });
+    await settled();
+
+    expect(getSession()).toEqual({ token: "test-token", userId: "USER0001", userType: "U" });
+    const fields = { ...FETCHED_FIELDS, first_name: "Grace" };
+    expect(await sentRequests()).toEqual([
+      {
+        method: "GET",
+        path: ACCOUNT_PATH,
+        query: {},
+        authorization: "Bearer test-token",
+        body: undefined,
+      },
+      {
+        method: "PUT",
+        path: ACCOUNT_PATH,
+        query: {},
+        authorization: "Bearer test-token",
+        body: { aid: "ENTER", fields, snapshot: VIEW.snapshot },
+      },
+      {
+        method: "PUT",
+        path: ACCOUNT_PATH,
+        query: {},
+        authorization: "Bearer test-token",
+        body: { aid: "PF5", fields, snapshot: { ...VIEW.snapshot, state: "N" } },
+      },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/accounts/update`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COACTUP] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the key that sent the refused
+// request, the test presses no key and follows no link.
+describe("COACTUP in the route table: a 401 ends the session", { timeout: TEST_TIMEOUT_MS }, () => {
+  it.each([
+    {
+      title: "the fetch of ENTER (endpoint 5)",
+      replies: [get(401, SIGNON_REQUIRED)],
+      drive: async () => {
+        typeInto("Account Number :", ACCOUNT);
+        fireEvent.click(key("ENTER=Process"));
+      },
+      methods: ["GET"],
+    },
+    {
+      title: "the validation of ENTER (endpoint 6)",
+      replies: [get(200, VIEW), put(401, SIGNON_REQUIRED)],
+      drive: async () => {
+        await fetchAccount();
+        typeInto("First Name", "Grace");
+        fireEvent.click(key("ENTER=Process"));
+      },
+      methods: ["GET", "PUT"],
+    },
+    {
+      title: "the save of F5 (endpoint 6)",
+      replies: [get(200, VIEW), put(200, VALIDATED), put(401, SIGNON_REQUIRED)],
+      drive: async () => {
+        await fetchAccount();
+        typeInto("First Name", "Grace");
+        await validate();
+        fireEvent.click(screen.getByRole("button", { name: "F5=Save" }));
+      },
+      methods: ["GET", "PUT", "PUT"],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, methods }) => {
+      stubApi(...replies);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Update Account" }),
+      ).toBeDefined();
+
+      await drive();
+
+      expect(await screen.findByRole("button", { name: "ENTER=Sign-on" })).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "Update Account" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(sent.map((request) => request.method)).toEqual(methods);
+      expect(sent.every((request) => request.path === ACCOUNT_PATH)).toBe(true);
+      expect(sent.every((request) => request.authorization === "Bearer test-token")).toBe(true);
+      router.dispose();
+    },
+  );
+});
+
+/** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */
+const TIMED_OUT = "No answer from the server within 30 seconds";
+
+/** The `aid` an endpoint 6 request body carries; `undefined` for a request without one. */
+function aidOf(body: unknown): unknown {
+  return typeof body === "object" && body !== null && "aid" in body ? body.aid : undefined;
+}
+
+/**
+ * Replaces `fetch` as `stubApi` does, except that the save (`aid` PF5) gets no answer: like a
+ * request the server accepted and never completed, it settles only when its signal aborts, and
+ * then rejects with the abort reason, as `fetch` does. Resolves with that signal once the save
+ * was sent.
+ */
+function stubUnansweredSave(
+  ...replies: { method: "GET" | "PUT"; path: string; status: number; body: unknown }[]
+): Promise<AbortSignal> {
+  const pending = [...replies];
+  return new Promise((saveSent) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(input, init);
+        const path = decodeURIComponent(new URL(req.url).pathname);
+        const body: unknown = req.method === "GET" ? undefined : await req.clone().json();
+        const authorization = req.headers.get("Authorization");
+        sent.push({ method: req.method, path, authorization, body });
+        if (req.method === "PUT" && aidOf(body) === "PF5") {
+          saveSent(req.signal);
+          return new Promise<Response>((_answer, fail) => {
+            const abandon = (): void => {
+              fail(req.signal.reason);
+            };
+            if (req.signal.aborted) {
+              abandon();
+            } else {
+              req.signal.addEventListener("abort", abandon, { once: true });
+            }
+          });
+        }
+        const next = pending.at(0);
+        if (next === undefined || next.method !== req.method || next.path !== path) {
+          return reply(500, { message: `Unexpected ${req.method} ${path}` });
+        }
+        pending.shift();
+        return reply(next.status, next.body);
+      }),
+    );
+  });
+}
+
+// Every request shares one deadline (`api/client.ts`). A save the server never answers fails at
+// the deadline like any other failure: its message in the error row, the keys unlocked, and the
+// write not sent again, since it may have committed.
+describe("COACTUP request deadline", { timeout: TEST_TIMEOUT_MS }, () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("fails an unanswered F5 save at the deadline, sends it once and serves the next ENTER", async () => {
+    const saveSent = stubUnansweredSave(get(200, VIEW), put(200, VALIDATED), put(200, VALIDATED));
+    renderScreen();
+    await fetchAccount();
+    typeInto("First Name", "Grace");
+    await validate();
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    fireEvent.click(screen.getByRole("button", { name: "F5=Save" }));
+    const signal = await act(() => saveSent);
+    expect(signal.aborted).toBe(false);
+    await act(() => vi.advanceTimersByTimeAsync(REQUEST_DEADLINE_MS));
+    vi.useRealTimers();
+
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(TIMED_OUT);
+    });
+    await settled();
+    expect(signal.aborted).toBe(true);
+    const reason: unknown = signal.reason;
+    expect(reason instanceof DOMException ? [reason.name, reason.message] : reason).toEqual([
+      "TimeoutError",
+      TIMED_OUT,
+    ]);
+    expect(sent.map((request) => [request.method, aidOf(request.body)])).toEqual([
+      ["GET", undefined],
+      ["PUT", "ENTER"],
+      ["PUT", "PF5"],
+    ]);
+    expect(messageRow("info").textContent).toBe(VALIDATED.message);
+    expect(input("First Name").value).toBe("Grace");
+
+    const armed = vi.spyOn(globalThis, "setTimeout");
+    const cleared = vi.spyOn(globalThis, "clearTimeout");
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe("");
+    });
+    await settled();
+    expect(sent.map((request) => [request.method, aidOf(request.body)])).toEqual([
+      ["GET", undefined],
+      ["PUT", "ENTER"],
+      ["PUT", "PF5"],
+      ["PUT", "ENTER"],
+    ]);
+    expect(messageRow("info").textContent).toBe(VALIDATED.message);
+    expect(key("F5=Save").hasAttribute("hidden")).toBe(false);
+    const deadlines = armed.mock.calls.flatMap((call, index) =>
+      call[1] === REQUEST_DEADLINE_MS ? [armed.mock.results[index].value] : [],
+    );
+    expect(deadlines).toHaveLength(1);
+    expect(cleared).toHaveBeenCalledWith(deadlines[0]);
   });
 });

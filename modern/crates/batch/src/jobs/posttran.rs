@@ -74,7 +74,8 @@
 //!
 //! | Operation | Line shown first | Status shown | Rules |
 //! |---|---|---|---|
-//! | `--dalytran` cannot be read | `ERROR OPENING DALYTRAN` | stand-in `0030` | CBTRN02C-031 |
+//! | `--dalytran` cannot be opened for reading | `ERROR OPENING DALYTRAN` | stand-in `0030` | CBTRN02C-031 |
+//! | `--dalytran` opens but cannot be read, as a directory | `ERROR READING DALYTRAN FILE` | stand-in `0030` | CBTRN02C-038 |
 //! | a line codec A refuses, or a body that is not 350 bytes | none; an event names the file, the line and the failing rule | none | CBTRN02C-032, CBTRN02C-045 |
 //! | another run holds the claim on `transactions` | `ERROR OPENING TRANSACTION FILE` | `9243`, not claimed as parity | CBTRN02C-046 |
 //! | the run's session cannot be opened, the claim on `transactions` fails, or `transactions` cannot be read | `ERROR OPENING TRANSACTION FILE` | stand-in `0030` | CBTRN02C-031 |
@@ -150,6 +151,8 @@
 //! - R4: every statement is a call of `persistence` on the run's session: a repository call, a
 //!   writer claim of `PgSession::claim_writer`, or the session's close.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use copybook::FixedRecord;
@@ -160,10 +163,10 @@ use persistence::{
     AccountRepository, CardXrefRepository, Dataset, PersistenceError, PgSession, PgStore,
     TranCatBalanceRepository, TransactionRepository,
 };
+use runtime::telemetry::JobCounter;
 
 use super::{
-    DALYREJS_DIR_SETTING, JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking,
-    read_input,
+    DALYREJS_DIR_SETTING, JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking, io,
 };
 
 /// The generation base of the reject file, `AWS.M2.CARDDEMO.DALYREJS(+1)` (`POSTTRAN.jcl:38`;
@@ -187,6 +190,9 @@ const ABEND_LINE: &str = "ABENDING PROGRAM";
 
 /// The failed open of the input (`CBTRN02C.cbl:247`; CBTRN02C-031).
 const OPEN_DALYTRAN: &str = "ERROR OPENING DALYTRAN";
+
+/// A failed read of the input once it is open (`CBTRN02C.cbl:363`; CBTRN02C-038).
+const READ_DALYTRAN: &str = "ERROR READING DALYTRAN FILE";
 
 /// The failed open of the transaction file (`CBTRN02C.cbl:265`; CBTRN02C-030, CBTRN02C-031,
 /// CBTRN02C-046).
@@ -241,8 +247,10 @@ const ACCOUNT_REWRITE_FAILED: &str = "an account could not be rewritten";
 // The file operation each database or file call replaces, named in the event that reports its
 // failure.
 
-/// `0000-DALYTRAN-OPEN` and the reads of `1000-DALYTRAN-GET-NEXT`, done at once.
+/// `0000-DALYTRAN-OPEN`.
 const OPEN_DALYTRAN_OP: &str = "OPEN DALYTRAN";
+/// The reads of `1000-DALYTRAN-GET-NEXT`, done at once.
+const READ_DALYTRAN_OP: &str = "READ DALYTRAN";
 /// `0100-TRANFILE-OPEN`.
 const OPEN_TRANFILE_OP: &str = "OPEN TRANFILE";
 /// The keyed reads of `1500-A-LOOKUP-XREF`, done at once.
@@ -467,8 +475,8 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
         written: vec![path],
         return_code: summary.return_code(),
         counts: vec![
-            ("processed", summary.processed()),
-            ("rejected", summary.rejected()),
+            (JobCounter::Processed, summary.processed()),
+            (JobCounter::Rejected, summary.rejected()),
         ],
     })
 }
@@ -479,9 +487,11 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] when the file cannot be read (`ERROR OPENING DALYTRAN`, CBTRN02C-031), when
-/// codec A refuses a line (CBTRN02C-032), or when a line's body is not the 350-byte record, which
-/// is never padded into one (CBTRN02C-045). Nothing else has happened then.
+/// [`JobError::Abend`] when the file cannot be opened for reading (`ERROR OPENING DALYTRAN`,
+/// CBTRN02C-031), when it opens but cannot be read (`ERROR READING DALYTRAN FILE`,
+/// CBTRN02C-038), when codec A refuses a line (CBTRN02C-032), or when a line's body is not the
+/// 350-byte record, which is never padded into one (CBTRN02C-045). Nothing else has happened
+/// then.
 ///
 /// The read and the decoding block, so they run as one step on the blocking pool, awaited at
 /// once; the step only returns what failed, and the events of the failure are emitted here,
@@ -489,14 +499,17 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
 async fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobError> {
     let path = path.to_path_buf();
     let decoded = blocking(READING_INPUT, move || {
-        let bytes = read_input(&path).map_err(DalytranFailure::Unreadable)?;
+        let bytes = read_dalytran(&path)?;
         decode_fixture::<DailyTransactionRecord>(&bytes).map_err(DalytranFailure::Refused)
     })
     .await;
     let lines = match decoded {
         Ok(Ok(lines)) => lines,
-        Ok(Err(DalytranFailure::Unreadable(error))) | Err(error) => {
+        Ok(Err(DalytranFailure::Unopenable(error))) | Err(error) => {
             return Err(file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error));
+        }
+        Ok(Err(DalytranFailure::Unreadable(error))) => {
+            return Err(file_failure(READ_DALYTRAN_OP, READ_DALYTRAN, &error));
         }
         Ok(Err(DalytranFailure::Refused(error))) => return Err(refused(&error)),
     };
@@ -510,10 +523,32 @@ async fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobEr
     Ok(records)
 }
 
+/// `0000-DALYTRAN-OPEN`, the file opened for reading, then every `READ` of
+/// `1000-DALYTRAN-GET-NEXT` at once, the file read in place to its end (CBTRN02C-033). Runs
+/// inside the blocking step of [`open_dalytran`].
+///
+/// # Errors
+///
+/// [`DalytranFailure::Unopenable`] when the file cannot be opened for reading (CBTRN02C-031),
+/// and [`DalytranFailure::Unreadable`] when it opens but cannot be read, as a directory
+/// (CBTRN02C-038), each a [`JobError::Io`] with context `reading input` and the error's kind.
+fn read_dalytran(path: &Path) -> Result<Vec<u8>, DalytranFailure> {
+    let mut file = File::open(path)
+        .map_err(io(READING_INPUT))
+        .map_err(DalytranFailure::Unopenable)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(io(READING_INPUT))
+        .map_err(DalytranFailure::Unreadable)?;
+    Ok(bytes)
+}
+
 /// Why the blocking step of [`open_dalytran`] produced no lines, returned unreported so that
 /// its events are emitted on the job's task.
 enum DalytranFailure {
-    /// The file could not be read: the failed open (CBTRN02C-031).
+    /// The file could not be opened for reading: the failed open (CBTRN02C-031).
+    Unopenable(JobError),
+    /// The file opened but could not be read: the failed read (CBTRN02C-038).
     Unreadable(JobError),
     /// Codec A refused a line (CBTRN02C-032).
     Refused(LoadError),

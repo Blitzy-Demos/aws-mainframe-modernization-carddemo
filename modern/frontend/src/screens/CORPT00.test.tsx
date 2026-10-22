@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import type { components } from "@/api/schema";
-import { clearSession, setSession } from "@/auth/session";
+import { clearSession, getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
 import { CORPT00 } from "./CORPT00";
 
@@ -1107,6 +1107,60 @@ describe("CORPT00 transaction reports screen", () => {
     expect(within(stub).getByTestId("stub-state").textContent).toBe("null");
     await settle();
     expect(requests).toHaveLength(0);
+  });
+});
+
+/**
+ * Renders the application's route table at `/reports`, so the sign-on guard that only the table
+ * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
+ * allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.CORPT00] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the
+// route replaces the still-mounted screen with sign-on at once: the test presses no key and
+// follows no link after ENTER.
+describe("CORPT00 in the route table: a 401 ends the session", () => {
+  it("a submission answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
+    const requests = stubApi({ status: 401, body: signonRequired });
+    const router = renderRouteTable();
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 1, name: "Transaction Reports" },
+        { timeout: 5_000 },
+      ),
+    ).toBeDefined();
+
+    fill(monthlyRequest);
+    await pressEnter();
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Transaction Reports" })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(
+      requests.map((request) => [
+        request.method,
+        new URL(request.url).pathname,
+        request.headers.get("Authorization"),
+      ]),
+    ).toEqual([["POST", ENDPOINT, "Bearer test-token"]]);
+    expect(await bodies(requests)).toEqual([monthlyRequest]);
+    router.dispose();
   });
 });
 

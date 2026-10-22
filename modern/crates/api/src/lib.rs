@@ -17,8 +17,13 @@
 //!   [`auth::extract::SignedOnUser`] and [`auth::extract::AdminUser`].
 //! - [`dto`]: the request and response contracts, one module per program, with the validating
 //!   extractors and the `page_size` rule of Bounded Pagination.
-//! - [`error`]: [`error::ScreenError`], the `{ message, field? }` body of every non-200 response,
-//!   and the status each failure answers with.
+//! - [`error`]: [`error::ScreenError`], the standard `{ message, field? }` failure body of the
+//!   request layer, the token gate and the programs, and the status each failure answers with.
+//!   Two exceptions answer without it. Endpoints 24 and 25 answer COTRTLIC's own errors (400 and
+//!   500, and 404 on endpoint 25) with the page, `dto::cotrtlic::TranTypeListResponse` or
+//!   `TranTypeListActionResult`; their request-layer rejections, an unissued `page_key` or
+//!   `state`, an unreachable database and a failed commit transaction keep the `ScreenError`.
+//!   An unmatched path (404) and a method its route does not serve (405) get axum's empty body.
 //! - [`openapi`]: [`openapi::ApiDoc`], the base document every operation is added to.
 //! - `handlers` and `services`, crate-private: one module per program each, reached only through
 //!   [`app::router`].

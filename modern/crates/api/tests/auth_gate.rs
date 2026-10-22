@@ -7,6 +7,10 @@
 //! - **n5:** each of the 26 bearer operations (every endpoint except 1) refuses a request without
 //!   a valid token with 401; each `[A]` operation refuses a `U` token with 403 and serves an `A`
 //!   token; each other operation serves both.
+//! - **Path rejections after the gate:** on the eight operations whose path segments reach their
+//!   program's edit as raw text (4, 5, 6, 10, 12, 21, 22 and 23), a segment that is not UTF-8
+//!   once percent-decoded is a 401 without a valid token and, with one, the JSON `ScreenError`
+//!   400 `api::dto::INVALID_PATH` that echoes nothing (AAP 0.3.4.1).
 //!
 //! The acting identity comes only from the verified token (AAP 0.5.1, 0.3.4.6): valid tokens come
 //! only from endpoint 1, and a spoofed header or query value does not change the gate's answer.
@@ -26,6 +30,7 @@ use std::sync::Arc;
 use api::app::{AppState, app};
 use api::auth::extract::{ADMIN_REQUIRED, SIGNON_REQUIRED};
 use api::auth::jwt::{JwtError, JwtKeys};
+use api::dto::INVALID_PATH;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, header};
@@ -842,4 +847,165 @@ async fn signon_ignores_a_bearer_header(api: &Router) -> TestResult {
     assert_eq!(status, 200, "a bearer header stopped the sign-on");
     assert_eq!(member(&response, "user_type"), Some("U"));
     Ok(())
+}
+
+/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+/// without the lint attributes that macro's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
+/// The eight operations whose path segments reach their program's edit as raw text, each with
+/// a segment that is not UTF-8 once percent-decoded (`%FF`); endpoints 22 and 23 once in each of
+/// their two segments. The bodies of 6 and 10 would fail their own extractor, so only a path
+/// rejection that comes first answers [`INVALID_PATH`].
+fn undecodable_path_operations() -> Vec<Operation> {
+    let gate = Gate::SignedOn;
+    let body = json!({ "aid": "ENTER" });
+    let detail = "/authorizations/{acct_id}/{auth_key}";
+    let fraud = "/authorizations/{acct_id}/{auth_key}/fraud";
+    vec![
+        Operation::new(
+            gate,
+            4,
+            Method::GET,
+            "/accounts/{acct_id}/view",
+            "/api/v1/accounts/%FF/view",
+        ),
+        Operation::new(
+            gate,
+            5,
+            Method::GET,
+            "/accounts/{acct_id}",
+            "/api/v1/accounts/%FF",
+        ),
+        Operation::new(
+            gate,
+            6,
+            Method::PUT,
+            "/accounts/{acct_id}",
+            "/api/v1/accounts/%FF",
+        )
+        .with_body(body.clone()),
+        Operation::new(
+            gate,
+            10,
+            Method::PUT,
+            "/cards/{card_ref}",
+            "/api/v1/cards/%FF",
+        )
+        .with_body(body),
+        Operation::new(
+            gate,
+            12,
+            Method::GET,
+            "/transactions/{tran_id}",
+            "/api/v1/transactions/%FF",
+        ),
+        Operation::new(
+            gate,
+            21,
+            Method::GET,
+            "/accounts/{acct_id}/authorizations",
+            "/api/v1/accounts/%FF/authorizations",
+        ),
+        Operation::new(
+            gate,
+            22,
+            Method::GET,
+            detail,
+            "/api/v1/authorizations/%FF/0778000000000001",
+        ),
+        Operation::new(
+            gate,
+            22,
+            Method::GET,
+            detail,
+            "/api/v1/authorizations/00000000001/%FF",
+        ),
+        Operation::new(
+            gate,
+            23,
+            Method::POST,
+            fraud,
+            "/api/v1/authorizations/%FF/0778000000000001/fraud",
+        ),
+        Operation::new(
+            gate,
+            23,
+            Method::POST,
+            fraud,
+            "/api/v1/authorizations/00000000001/%FF/fraud",
+        ),
+    ]
+}
+
+/// Sends `operation` with `authorization` and returns the status, the `Content-Type` and the
+/// body as text, so that a body that is not JSON is reported rather than failing the parse.
+async fn send_untyped(
+    api: &Router,
+    operation: &Operation,
+    authorization: &str,
+) -> TestResult<(u16, String, String)> {
+    let builder = Request::builder()
+        .method(operation.method.clone())
+        .uri(&operation.uri)
+        .header(header::AUTHORIZATION, authorization);
+    let request = match &operation.body {
+        Some(json) => builder
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(json)?))?,
+        None => builder.body(Body::empty())?,
+    };
+    let response = api.clone().oneshot(request).await?;
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .unwrap_or_default();
+    let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+    Ok((
+        status,
+        content_type,
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
+}
+
+/// A path segment that is not UTF-8 once percent-decoded is judged after the token: without a
+/// valid token it is the gate's 401, and with one it is the JSON `ScreenError` of every other
+/// input rejection, 400 [`INVALID_PATH`] with no field, before any program edit or read.
+#[test]
+fn undecodable_path_segments_are_a_json_400_after_the_gate() -> TestResult {
+    block_on(async {
+        let pg = start_loaded_postgres().await?;
+        let api = api(&pg)?;
+        let user = bearer(&signon_token(&api, "USER0001").await?);
+        for operation in undecodable_path_operations() {
+            let case = format!("{operation} at {}", operation.uri);
+            let (status, response) = operation.send(&api, None).await?;
+            assert_eq!(status, 401, "{case} without a token");
+            assert_eq!(
+                member(&response, "message"),
+                Some(SIGNON_REQUIRED),
+                "{case}"
+            );
+
+            let (status, content_type, body) = send_untyped(&api, &operation, &user).await?;
+            assert_eq!(
+                (status, content_type.as_str()),
+                (400, "application/json"),
+                "{case}: {body}"
+            );
+            assert_eq!(
+                serde_json::from_str::<Value>(&body)?,
+                json!({ "message": INVALID_PATH }),
+                "{case}"
+            );
+        }
+        Ok(())
+    })
 }

@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COCRDUP } from "./COCRDUP";
 
 /*
@@ -1394,4 +1401,148 @@ describe("COCRDUP messages", () => {
     await expectFocus(LABELS.name);
     expect(infoText()).toBe(INFO_SHOWN);
   });
+});
+
+// Every endpoint 10 request carries the stored session's token, and none a query: the path's
+// `card_ref` alone names the card.
+describe("COCRDUP: endpoint 10 requests", () => {
+  it("ENTER and F5 each PUT the card's path with the bearer token and no query, and the save shows", async () => {
+    const calls = stubApi({
+      [CARDS_EDIT]: [{ status: 200, body: view }],
+      [CARD_PUT]: [
+        { status: 200, body: validated },
+        { status: 200, body: committed },
+      ],
+    });
+    await showFromList();
+    await validate();
+    await save(INFO_DONE);
+
+    expect(
+      calls.map(({ route, query, authorization }) => ({
+        route,
+        query: Object.fromEntries(query),
+        authorization,
+      })),
+    ).toEqual([
+      {
+        route: CARDS_EDIT,
+        query: { acct_id: ACCT_ID, card_ref: String(CARD_REF) },
+        authorization: "Bearer test-token",
+      },
+      { route: CARD_PUT, query: {}, authorization: "Bearer test-token" },
+      { route: CARD_PUT, query: {}, authorization: "Bearer test-token" },
+    ]);
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/cards/update`, so the sign-on guard that only the
+ * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
+ * render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COCRDUP] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/** Searches by the typed keys with ENTER and waits for endpoint 9's card (state `S`). */
+async function searchShown(): Promise<void> {
+  typeSearchKeys(ACCT_ID, TYPED_CARD);
+  fireEvent.click(key("ENTER=Process"));
+  await waitFor(() => {
+    expect(field(LABELS.card).value).toBe(MASKED_CARD);
+  });
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the key that sent the refused
+// request, the test presses no key and follows no link.
+describe("COCRDUP in the route table: a 401 ends the session", () => {
+  it.each<{
+    title: string;
+    replies: Parameters<typeof stubApi>[0];
+    drive: () => Promise<void>;
+    sent: string[];
+  }>([
+    {
+      title: "the fetch of ENTER (endpoint 9)",
+      replies: { [CARDS_EDIT]: [{ status: 401, body: signonRequired }] },
+      drive: async () => {
+        typeSearchKeys(ACCT_ID, TYPED_CARD);
+        fireEvent.click(key("ENTER=Process"));
+      },
+      sent: [CARDS_EDIT],
+    },
+    {
+      title: "the validation of ENTER (endpoint 10)",
+      replies: {
+        [CARDS_EDIT]: [{ status: 200, body: view }],
+        [CARD_PUT]: [{ status: 401, body: signonRequired }],
+      },
+      drive: async () => {
+        await searchShown();
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+        fireEvent.click(key("ENTER=Process"));
+      },
+      sent: [CARDS_EDIT, CARD_PUT],
+    },
+    {
+      title: "the save of F5 (endpoint 10)",
+      replies: {
+        [CARDS_EDIT]: [{ status: 200, body: view }],
+        [CARD_PUT]: [
+          { status: 200, body: validated },
+          { status: 401, body: signonRequired },
+        ],
+      },
+      drive: async () => {
+        await searchShown();
+        await validate();
+        fireEvent.click(key("F5=Save"));
+      },
+      sent: [CARDS_EDIT, CARD_PUT, CARD_PUT],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, sent }) => {
+      const calls = stubApi(replies);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole(
+          "heading",
+          { level: 1, name: "Update Credit Card Details" },
+          { timeout: 5_000 },
+        ),
+      ).toBeDefined();
+
+      await drive();
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(
+        screen.queryByRole("heading", { level: 1, name: "Update Credit Card Details" }),
+      ).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(calls.map((call) => call.route)).toEqual(sent);
+      expect(calls.every((call) => call.authorization === "Bearer test-token")).toBe(true);
+      router.dispose();
+    },
+  );
 });

@@ -7,8 +7,8 @@
 //! (COACTVWC-004).
 //!
 //! [`view`] is a thin handler (Thin Request Handlers): it extracts the signed-on user and the
-//! raw `acct_id` path text, calls `services::coactvwc::view`, and maps the outcome through
-//! `AccountViewResponse::from` and `ScreenError::from`. The path text goes to the service
+//! raw `acct_id` path text ([`RawPath`]), calls `services::coactvwc::view`, and maps the outcome
+//! through `AccountViewResponse::from` and `ScreenError::from`. The path text goes to the service
 //! unparsed and untrimmed, so the program's own edit answers a malformed account number with
 //! its own message (COACTVWC-029 to COACTVWC-032).
 //!
@@ -17,13 +17,17 @@
 //! it (COACTVWC-017, E32).
 
 use axum::Json;
-use axum::extract::{Path, State};
+use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
+use crate::dto::RawPath;
 use crate::dto::coactvwc::AccountViewResponse;
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`view`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct ViewOperation;
 
 /// View an account (CAVW / COACTVWC).
 ///
@@ -37,8 +41,10 @@ use crate::services;
 /// A `ScreenError` with the program's message and the field `acct_id`: 400 when the account
 /// number is missing, not numeric or all zeros; 404 when the cross-reference, the account or
 /// the customer record is not found; 500 when one of those reads fails. 401 when the request
-/// carries no valid bearer token.
+/// carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a 400
+/// with the API's `Invalid path parameters...` and no field, before the program's edit.
 #[utoipa::path(
+    impl_for = ViewOperation,
     get,
     path = "/api/v1/accounts/{acct_id}/view",
     operation_id = "coactvwc_view",
@@ -58,7 +64,8 @@ use crate::services;
         ),
         (
             status = 400,
-            description = "The account number is missing, not numeric or all zeros",
+            description = "The account number is missing, not numeric or all zeros; or a path \
+                           segment that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (
@@ -82,7 +89,7 @@ use crate::services;
 pub(crate) async fn view(
     State(state): State<AppState>,
     user: SignedOnUser,
-    Path(acct_id): Path<String>,
+    RawPath(acct_id): RawPath<String>,
 ) -> Result<Json<AccountViewResponse>, ScreenError> {
     services::coactvwc::view(&state, &user, &acct_id)
         .await

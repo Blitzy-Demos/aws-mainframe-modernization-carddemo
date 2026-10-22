@@ -11,7 +11,7 @@ import {
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
+import { getSession, setSession } from "@/auth/session";
 import { PATHS, PROGRAM_ROUTES, routes } from "@/routes";
 import { COADM01 } from "./COADM01";
 
@@ -129,7 +129,8 @@ function reply(status: number, body: unknown): Response {
 
 /**
  * Replaces the global `fetch`: `GET` endpoint 3 answers `status` with `body`, and any other request
- * answers 500, which no test expects.
+ * answers 500. No test expects another request, except the main menu's load after the admin guard
+ * sends a non-admin there.
  */
 function stubMenu(
   status: number,
@@ -707,6 +708,199 @@ describe("BLOCKED X-COADM01C-H1: /admin opened with no session, not a parity res
     expect(router.state.location.pathname).toBe(PATHS.COSGN00);
     expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
     expect(requests).toHaveLength(0);
+    router.dispose();
+  });
+});
+
+// Endpoint 3 answers a token whose user type is not `A` with a 403 `ScreenError`. The screen
+// shows that body's message as it came, and only a 401 ends the session.
+describe("COADM01: a 403 keeps the session", () => {
+  beforeEach(() => {
+    requests = [];
+    setSession("test-token", "ADMIN001", "A");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  /** A request as its method, path, query, `Authorization` header and body text. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body: await request.clone().text(),
+    };
+  }
+
+  it("shows the 403 body's message unchanged and keeps the session, after one GET with the bearer token, no query and no body", async () => {
+    stubMenu(403, forbidden);
+    renderAdminMenu();
+
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(forbidden.message);
+    });
+
+    expect(getSession()).toEqual({ token: "test-token", userId: "ADMIN001", userType: "A" });
+    expect(await Promise.all(requests.map(shapeOf))).toEqual([
+      { method: "GET", path: MENU_PATH, query: {}, authorization: "Bearer test-token", body: "" },
+    ]);
+  });
+});
+
+/**
+ * The main menu's error row once `stubMenu` has answered its endpoint 2 load with a 500. The admin
+ * guard sends every non-admin there.
+ */
+const MAIN_MENU_ANSWER = `Unexpected request GET ${globalThis.location.origin}/api/v1/menus/main`;
+
+// The admin guard in front of `/admin` lets user type `A` through, and that type only: `U`, a
+// lower-case `a` and any other type go to the main menu before endpoint 3 is requested.
+describe("COADM01 in the route table: the admin guard", () => {
+  beforeEach(() => {
+    requests = [];
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  // `shown` is a text the menu shows only once its load on entry is answered.
+  it.each([
+    {
+      userId: "ADMIN001",
+      userType: "A",
+      path: PATHS.COADM01,
+      heading: "Admin Menu",
+      loads: 1,
+      shown: "01. User List (Security)",
+    },
+    {
+      userId: "USER0001",
+      userType: "U",
+      path: PATHS.COMEN01,
+      heading: "Main Menu",
+      loads: 0,
+      shown: MAIN_MENU_ANSWER,
+    },
+    {
+      userId: "USER0001",
+      userType: "a",
+      path: PATHS.COMEN01,
+      heading: "Main Menu",
+      loads: 0,
+      shown: MAIN_MENU_ANSWER,
+    },
+    {
+      userId: "USER0001",
+      userType: "X",
+      path: PATHS.COMEN01,
+      heading: "Main Menu",
+      loads: 0,
+      shown: MAIN_MENU_ANSWER,
+    },
+  ])(
+    "user type $userType opening /admin is shown $heading at $path",
+    async ({ userId, userType, path, heading, loads, shown }) => {
+      setSession("test-token", userId, userType);
+      stubMenu(200, served);
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, { initialEntries: [PATHS.COADM01] });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      expect(await screen.findByRole("heading", { level: 1, name: heading })).toBeDefined();
+      expect(router.state.location.pathname).toBe(path);
+      await waitFor(() => {
+        expect(
+          requests.filter((request) => new URL(request.url).pathname === MENU_PATH),
+        ).toHaveLength(loads);
+      });
+      // Waiting for `shown` keeps the menu load's last render inside the test's waits.
+      expect(await screen.findByText(shown)).toBeDefined();
+      router.dispose();
+    },
+  );
+});
+
+/** The 401 of the `AdminUser` extractor for a missing, invalid or expired token. */
+const signonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/admin`, so the admin guard that only the table
+ * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
+ * allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COADM01] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// The menu load of a stored `A` session, refused by the API. A 401 clears the session
+// (`api/client.ts`), and the admin guard then replaces the still-mounted menu with sign-on at
+// once, with no key or navigation of the test. A 403 is the gate's refusal (COADM01C-001): it
+// clears nothing, so the guard keeps the menu, which shows the gate's message.
+describe("COADM01 in the route table: a 401 ends the session, a 403 keeps it", () => {
+  beforeEach(() => {
+    requests = [];
+    setSession("test-token", "ADMIN001", "A");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("the menu load answered 401 replaces the menu with sign-on and clears the session, with no retry", async () => {
+    stubMenu(401, signonRequired);
+    const router = renderRouteTable();
+
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
+    expect(getSession()).toBeNull();
+    await expectMenuRequests(1);
+    expect(requests[0].headers.get("Authorization")).toBe("Bearer test-token");
+    router.dispose();
+  });
+
+  it("the menu load answered 403 keeps the menu with the gate's message and the stored session", async () => {
+    stubMenu(403, forbidden);
+    const router = renderRouteTable();
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Admin Menu" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(forbidden.message);
+    });
+    expect(router.state.location.pathname).toBe(PATHS.COADM01);
+    expect(screen.queryByRole("button", { name: "ENTER=Sign-on" })).toBeNull();
+    expect(getSession()).toEqual({ token: "test-token", userId: "ADMIN001", userType: "A" });
+    await expectMenuRequests(1);
     router.dispose();
   });
 });

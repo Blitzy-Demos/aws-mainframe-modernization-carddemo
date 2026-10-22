@@ -32,10 +32,11 @@
 //! rejected value or a key value, so callers log a migration error only through
 //! [`ErrorSummary`].
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use sqlx::PgPool;
-use sqlx::migrate::{MigrateError, Migrator};
+use sqlx::migrate::{Migrate, MigrateError, Migrator};
 
 use crate::db;
 
@@ -43,18 +44,24 @@ use crate::db;
 /// path against this package's root, `crates/runtime`.
 static MIGRATOR: Migrator = sqlx::migrate!("../persistence/migrations");
 
-/// Applies every pending migration, in version order, to the database behind `pool`.
+/// Applies every pending migration, in version order, to the database behind `pool`, and returns
+/// the [`Applied`] account of the run: the versions it applied and the latest version recorded.
 ///
 /// sqlx records each applied migration in its bookkeeping table `_sqlx_migrations`. A migration
 /// already recorded there is skipped, so a second run against a migrated database changes
-/// nothing. Each pending migration runs in one transaction with its bookkeeping row, so a file
-/// that fails leaves none of its statements applied.
+/// nothing and returns no versions. Each pending migration runs in one transaction with its
+/// bookkeeping row, so a file that fails leaves none of its statements applied.
 ///
-/// The run holds a `PostgreSQL` advisory lock keyed on the database name, so concurrent runs
-/// against one database wait for each other; test containers each have their own database and
-/// never wait. The lock is session-level and sqlx releases it only on success: after an error it
-/// stays held by the pooled connection until that connection closes. Both callers end on an
-/// error, which closes it.
+/// The run takes one connection from `pool` and, on it, the migrator's `PostgreSQL` advisory lock
+/// keyed on the database name. It holds the lock from before it reads the bookkeeping table,
+/// creating the table if it is missing, until after it reads the table again once the migrator
+/// has finished, so concurrent runs against one database wait for each other and each reports
+/// only the versions it applied itself. Test containers each have their own database and never
+/// wait. The migrator takes and releases the same lock again inside the run, which leaves the
+/// outer hold in place, because a `PostgreSQL` session must release an advisory lock as many
+/// times as it took it. The lock is session-level and is released only on success: after an
+/// error it stays held by the pooled connection until that connection closes. Both callers end on
+/// an error, which closes it.
 ///
 /// # Errors
 ///
@@ -64,8 +71,65 @@ static MIGRATOR: Migrator = sqlx::migrate!("../persistence/migrations");
 /// - a checksum mismatch: an applied migration whose embedded file has changed since it ran
 ///   ([`MigrateError::VersionMismatch`]);
 /// - an applied migration missing from the embedded set ([`MigrateError::VersionMissing`]).
-pub async fn apply(pool: &PgPool) -> Result<(), MigrateError> {
-    MIGRATOR.run(pool).await
+pub async fn apply(pool: &PgPool) -> Result<Applied, MigrateError> {
+    let mut conn = pool.acquire().await?;
+    conn.lock().await?;
+    conn.ensure_migrations_table().await?;
+    let before = conn.list_applied_migrations().await?;
+    MIGRATOR.run(&mut *conn).await?;
+    let after = conn.list_applied_migrations().await?;
+    conn.unlock().await?;
+    Ok(Applied::between(
+        before.iter().map(|migration| migration.version),
+        after.iter().map(|migration| migration.version),
+    ))
+}
+
+/// What one successful run of [`apply`] did: the migrations it applied and the latest version the
+/// database records afterwards. It holds versions only, never migration text or checksums.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Applied {
+    /// The versions this run applied, ascending.
+    versions: Vec<i64>,
+    /// The highest version recorded in `_sqlx_migrations` after the run.
+    latest: Option<i64>,
+}
+
+impl Applied {
+    /// The account of a run from the versions `_sqlx_migrations` recorded before it and after it:
+    /// every version recorded after and not before, ascending and once each, and the highest
+    /// version recorded after. Neither list needs to be ordered.
+    fn between(
+        before: impl IntoIterator<Item = i64>,
+        after: impl IntoIterator<Item = i64>,
+    ) -> Self {
+        let before: BTreeSet<i64> = before.into_iter().collect();
+        let after: BTreeSet<i64> = after.into_iter().collect();
+        Self {
+            versions: after.difference(&before).copied().collect(),
+            latest: after.last().copied(),
+        }
+    }
+
+    /// The versions this run applied, ascending; empty when every embedded migration was already
+    /// recorded.
+    #[must_use]
+    pub fn versions(&self) -> &[i64] {
+        &self.versions
+    }
+
+    /// How many migrations this run applied: 0 against an up-to-date database.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.versions.len()
+    }
+
+    /// The highest version recorded in `_sqlx_migrations` after the run, whichever run applied
+    /// it; `None` only when the database records no migration at all.
+    #[must_use]
+    pub fn latest(&self) -> Option<i64> {
+        self.latest
+    }
 }
 
 /// A value-free account of a [`MigrateError`], the only form in which a caller logs one.
@@ -148,10 +212,41 @@ mod tests {
 
     use sqlx::migrate::MigrateError;
 
-    use super::ErrorSummary;
+    use super::{Applied, ErrorSummary};
 
     /// Stand-in for a value that the driver's or the server's text quotes.
     const SECRET: &str = "s3cr3t-migration-value-8K";
+
+    #[test]
+    fn a_run_reports_only_the_versions_it_added_and_the_latest_recorded() {
+        /// Recorded before, recorded after, applied by the run, latest recorded.
+        type Case = (&'static [i64], &'static [i64], &'static [i64], Option<i64>);
+        let cases: [Case; 6] = [
+            // A fresh database: all six.
+            (&[], &[1, 2, 3, 4, 5, 6], &[1, 2, 3, 4, 5, 6], Some(6)),
+            // A rerun, or the run that waited on the lock while another applied everything.
+            (&[1, 2, 3, 4, 5, 6], &[1, 2, 3, 4, 5, 6], &[], Some(6)),
+            // A database at an earlier release.
+            (&[1, 2, 3], &[1, 2, 3, 4, 5, 6], &[4, 5, 6], Some(6)),
+            // Unordered lists still give ascending versions, each once.
+            (&[2, 1], &[6, 1, 3, 2, 3], &[3, 6], Some(6)),
+            // Versions need not be consecutive.
+            (
+                &[20_250_101],
+                &[20_250_101, 20_260_301],
+                &[20_260_301],
+                Some(20_260_301),
+            ),
+            // No migration recorded either side.
+            (&[], &[], &[], None),
+        ];
+        for (before, after, versions, latest) in cases {
+            let applied = Applied::between(before.iter().copied(), after.iter().copied());
+            assert_eq!(applied.versions(), versions, "{before:?} -> {after:?}");
+            assert_eq!(applied.count(), versions.len(), "{before:?} -> {after:?}");
+            assert_eq!(applied.latest(), latest, "{before:?} -> {after:?}");
+        }
+    }
 
     #[test]
     fn summaries_keep_the_class_and_versions_and_drop_every_value() {

@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COTRTUP } from "./COTRTUP";
 
 /*
@@ -1693,4 +1700,129 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     await settle();
     expect(calls).toHaveLength(1);
   });
+});
+
+// Endpoints 26 and 27 name the transaction type by the path alone, and every request carries the
+// stored session's token.
+describe("COTRTUP: endpoint 26 and 27 requests", () => {
+  /** Every request `fetch` received: method, path, query, `Authorization` header and JSON body. */
+  async function sentRequests() {
+    return Promise.all(
+      vi.mocked(fetch).mock.calls.map(async ([input, init]) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        const text = await request.clone().text();
+        const body: unknown = text === "" ? undefined : JSON.parse(text);
+        return {
+          method: request.method,
+          path: url.pathname,
+          query: Object.fromEntries(url.searchParams),
+          authorization: request.headers.get("Authorization"),
+          body,
+        };
+      }),
+    );
+  }
+
+  it("the fetch and ENTER's action each send the type's path with the bearer token and no query, and the validation shows", async () => {
+    stubApi({
+      [FETCH]: [reply(200, found)],
+      [ACTIONS]: [reply(200, validated)],
+    });
+
+    await validateEdit();
+
+    expect(await sentRequests()).toEqual([
+      {
+        method: "GET",
+        path: `/api/v1/transaction-types/${CODE}`,
+        query: {},
+        authorization: BEARER,
+        body: undefined,
+      },
+      {
+        method: "POST",
+        path: `/api/v1/transaction-types/${CODE}/actions`,
+        query: {},
+        authorization: BEARER,
+        body: { aid: "ENTER", description: EDITED },
+      },
+    ]);
+  });
+});
+
+/**
+ * Renders the application's route table at `/transaction-types/maintain`, so the admin guard that
+ * only the table mounts stands in front of the screen. Its screens load lazily, so a wait for one
+ * to render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COTRTUP] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the admin guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the ENTER that sent the refused
+// request, the test presses no key and follows no link.
+describe("COTRTUP in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the fetch of ENTER (endpoint 26)",
+      replies: { [FETCH]: [reply(401, signonRequired)] },
+      drive: async () => {
+        fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+        press("ENTER=Process");
+      },
+      calls: [FETCH],
+    },
+    {
+      title: "the validation action of ENTER (endpoint 27)",
+      replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(401, signonRequired)] },
+      drive: async () => {
+        fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+        press("ENTER=Process");
+        await waitFor(() => {
+          expect(field(LABELS.description).value).toBe(STORED);
+        });
+        fireEvent.change(field(LABELS.description), { target: { value: EDITED } });
+        press("ENTER=Process");
+      },
+      calls: [FETCH, ACTIONS],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, calls: expected }) => {
+      const calls = stubApi(replies);
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole(
+          "heading",
+          { level: 1, name: "Maintain Transaction Type" },
+          { timeout: 5_000 },
+        ),
+      ).toBeDefined();
+
+      await drive();
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(
+        screen.queryByRole("heading", { level: 1, name: "Maintain Transaction Type" }),
+      ).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(calls.map((call) => call.route)).toEqual(expected);
+      expect(calls.every((call) => call.authorization === BEARER)).toBe(true);
+      router.dispose();
+    },
+  );
 });

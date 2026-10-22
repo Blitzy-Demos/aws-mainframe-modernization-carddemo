@@ -103,6 +103,7 @@ use domain::batch::loads::LoadError;
 use domain::clock::Clock;
 use persistence::{PersistenceError, PgStore};
 use runtime::config::Config;
+use runtime::telemetry::JobCounter;
 
 use crate::pdf::RenderError;
 
@@ -129,9 +130,9 @@ pub(crate) struct JobOutcome {
     /// the code the job's audit gives, such as 4 when `posttran` rejected a record or `mnttrdb2`
     /// met an SQL error.
     pub(crate) return_code: u8,
-    /// Named counters for the job's tracing event, such as `("records", 50)`. Plain counts,
-    /// never record content.
-    pub(crate) counts: Vec<(&'static str, u64)>,
+    /// The job's counters, such as `(JobCounter::Records, 50)`, which `main` records on the job
+    /// span, each under its field name (`records`). Plain counts, never record content.
+    pub(crate) counts: Vec<(JobCounter, u64)>,
 }
 
 /// Why a job ended without its outcome.
@@ -181,9 +182,10 @@ pub(crate) enum JobError {
         error: LoadError,
     },
     /// Generation 9999, `runtime::gdg::MAX_GENERATION`, of the `(+1)` output `base` already
-    /// exists, so no further generation is named and none is overwritten (`posttran`,
-    /// `intcalc`, `tranrept`). Its text names the step, the limit and the base only, never the
-    /// directory.
+    /// exists, so no further generation is named and none is overwritten
+    /// ([`OutputFile::next_generation`]). `posttran`, `intcalc` and `tranrept` each report it as
+    /// the cause of the abend of their failed output open, so none of them returns it. Its text
+    /// names the step, the limit and the base only, never the directory.
     GenerationLimit {
         /// The generation base, such as `SYSTRAN`.
         base: &'static str,
@@ -412,13 +414,15 @@ impl fmt::Display for InputPath {
     }
 }
 
-/// The whole content of the input file at `path`, read in place (`posttran`, `mnttrdb2`). The
-/// COBOL programs open their input first, so an unreadable input fails the job before it
-/// writes anything. Their failure events name the file by its DD, never by its path; the
-/// loads read through [`read_named_input`] instead.
+/// The whole content of the input file at `path`, read in place (`mnttrdb2`). The COBOL program
+/// opens its input first, so an unreadable input fails the job before it writes anything. Its
+/// failure events name the file by its DD, never by its path; the loads read through
+/// [`read_named_input`] instead, and `posttran` opens and then reads its input itself, because
+/// `CBTRN02C` shows a failed open and a failed read on different paths (CBTRN02C-031,
+/// CBTRN02C-038).
 ///
-/// The read blocks its thread, so each job calls this inside the one [`blocking`] step that
-/// also decodes the bytes, with [`READING_INPUT`] as the step's context.
+/// The read blocks its thread, so the job calls this inside the one [`blocking`] step that also
+/// decodes the bytes, with [`READING_INPUT`] as the step's context.
 ///
 /// # Errors
 ///
@@ -544,8 +548,8 @@ const OUTPUT_DIRECTORY_STEPS: [&str; 4] = [
 ];
 
 // The settings [`JobError::naming_output_dir`] takes, one per job that writes files: `main`
-// names them in the error a job returns, and `posttran` in the event of its `DALYREJS` open,
-// whose failure it reports itself before its abend.
+// names them in the error a job returns, and `posttran`, `intcalc` and `tranrept` in the event
+// of their generation open, whose failure each reports itself before its abend.
 
 /// The setting of `posttran`'s `DALYREJS` generations: `dalyrejs` under `CARDDEMO_VAR_DIR`.
 pub(crate) const DALYREJS_DIR_SETTING: &str = "dalyrejs under CARDDEMO_VAR_DIR";

@@ -1,10 +1,18 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  createMemoryRouter,
+  MemoryRouter,
+  Route,
+  RouterProvider,
+  Routes,
+  useLocation,
+} from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
-import { setSession } from "@/auth/session";
-import { PATHS } from "@/routes";
+import { getSession, setSession } from "@/auth/session";
+import { PATHS, routes } from "@/routes";
 import { COCRDLI } from "./COCRDLI";
 
 /**
@@ -1110,5 +1118,185 @@ describe("COCRDLI", () => {
     );
     expect(rows.map((row) => row.textContent === "")).toEqual(holdsCard.map((holds) => !holds));
     expect(accountFilter()).toHaveProperty("value", "00000000050");
+  });
+});
+
+/** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
+const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/cards`, so the sign-on guard that only the table
+ * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
+ * allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, { initialEntries: [PATHS.COCRDLI] });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+// A 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the route
+// replaces the still-mounted screen with sign-on at once: after the list request the screen sent,
+// the test presses no key and follows no link.
+describe("COCRDLI in the route table: a 401 ends the session", () => {
+  it.each([
+    {
+      title: "the list of the first entry",
+      replies: [[401, SIGNON_REQUIRED]] as const,
+      drive: async (seen: ReturnType<typeof stubFetch>) => {
+        await waitFor(() => {
+          expect(seen).toHaveLength(1);
+        });
+      },
+      count: 1,
+    },
+    {
+      title: "the F8 page after page 1",
+      replies: [
+        [200, FIRST_PAGE],
+        [401, SIGNON_REQUIRED],
+      ] as const,
+      drive: async () => {
+        await firstPageShown();
+        press("F8=Forward");
+      },
+      count: 2,
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ replies, drive, count }) => {
+      const seen = stubReplies(...replies);
+      const router = renderRouteTable();
+
+      await drive(seen);
+
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "List Credit Cards" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(listQueries(seen)).toHaveLength(count);
+      expect(seen.every((request) => request.authorization === "Bearer test-token")).toBe(true);
+      router.dispose();
+    },
+  );
+});
+
+/** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */
+const TIMED_OUT = "No answer from the server within 30 seconds";
+
+/**
+ * Replaces `fetch` as `stubFetch` does and answers the list requests in order from `replies`,
+ * except list request number `unanswered` (from 1): like a request the server accepted and never
+ * completed, it settles only when its signal aborts, and then rejects with the abort reason, as
+ * `fetch` does. `held` resolves with that signal once the request was sent.
+ */
+function stubUnansweredRead(
+  unanswered: number,
+  ...replies: readonly (readonly [number, unknown])[]
+): { seen: ReturnType<typeof stubFetch>; held: Promise<AbortSignal> } {
+  const seen: ReturnType<typeof stubFetch> = [];
+  const pending = [...replies];
+  const held = new Promise<AbortSignal>((sent) => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = input instanceof Request ? input : new Request(input, init);
+        const url = new URL(request.url);
+        seen.push({
+          method: request.method,
+          url,
+          authorization: request.headers.get("Authorization"),
+        });
+        if (request.method !== "GET" || url.pathname !== "/api/v1/cards") {
+          return json(500, UNEXPECTED);
+        }
+        if (seen.length === unanswered) {
+          sent(request.signal);
+          return new Promise<Response>((_answer, fail) => {
+            const abandon = (): void => {
+              fail(request.signal.reason);
+            };
+            if (request.signal.aborted) {
+              abandon();
+            } else {
+              request.signal.addEventListener("abort", abandon, { once: true });
+            }
+          });
+        }
+        const reply = pending.shift();
+        return reply === undefined ? json(500, UNEXPECTED) : json(reply[0], reply[1]);
+      }),
+    );
+  });
+  return { seen, held };
+}
+
+// Every request shares one deadline (`api/client.ts`). A page read the server never answers fails
+// at the deadline like any other failure: its message in the error row, the page kept, the keys
+// unlocked, and the read not sent again until a key asks for it.
+describe("COCRDLI request deadline", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("fails an unanswered F8 read at the deadline, sends it once and serves the next F8", async () => {
+    const { seen, held } = stubUnansweredRead(2, [200, FIRST_PAGE], [200, SECOND_PAGE]);
+    renderScreen();
+    await firstPageShown();
+    await answered(seen, 1);
+
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    press("F8=Forward");
+    const signal = await act(() => held);
+    expect(signal.aborted).toBe(false);
+    await act(() => vi.advanceTimersByTimeAsync(REQUEST_DEADLINE_MS));
+    vi.useRealTimers();
+
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(TIMED_OUT);
+    });
+    await answered(seen, 2);
+    expect(signal.aborted).toBe(true);
+    const reason: unknown = signal.reason;
+    expect(reason instanceof DOMException ? [reason.name, reason.message] : reason).toEqual([
+      "TimeoutError",
+      TIMED_OUT,
+    ]);
+    expect(listQueries(seen)).toEqual([{}, { ...FIRST_PAGE_ECHO, direction: "forward" }]);
+    expect(listedRows()).toEqual(cellsOf(FIRST_PAGE));
+    expect(pageNo()).toHaveProperty("value", "1");
+
+    const armed = vi.spyOn(globalThis, "setTimeout");
+    const cleared = vi.spyOn(globalThis, "clearTimeout");
+    press("F8=Forward");
+    await waitFor(() => {
+      expect(pageNo()).toHaveProperty("value", "2");
+    });
+    await answered(seen, 3);
+    expect(listQueries(seen)).toEqual([
+      {},
+      { ...FIRST_PAGE_ECHO, direction: "forward" },
+      { ...FIRST_PAGE_ECHO, direction: "forward" },
+    ]);
+    expect(listedRows()).toEqual(cellsOf(SECOND_PAGE));
+    expect(messageRow("error").textContent).toBe("");
+    const deadlines = armed.mock.calls.flatMap((call, index) =>
+      call[1] === REQUEST_DEADLINE_MS ? [armed.mock.results[index].value] : [],
+    );
+    expect(deadlines).toHaveLength(1);
+    expect(cleared).toHaveBeenCalledWith(deadlines[0]);
   });
 });

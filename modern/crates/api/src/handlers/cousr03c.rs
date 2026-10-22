@@ -5,7 +5,7 @@
 //! (COUSR03C-016 to COUSR03C-023). ENTER's fetch is endpoint 18, the user read COUSR03C shares
 //! with COUSR02C, served by `handlers::cousr02c::fetch` on the same path; F3, F4 and F12 send no
 //! request and belong to the screen (COUSR03C-006 to COUSR03C-008). `api::app::router()`
-//! registers this handler in the one `routes!` of `/api/v1/users/{user_id}`, beside the
+//! registers this handler on the one path item of `/api/v1/users/{user_id}`, beside the
 //! `GET` and `PUT` of `handlers::cousr02c`.
 //!
 //! The handler extracts the admin gate and the path ID, a `UserIdPath` revalidated against the
@@ -23,6 +23,9 @@ use crate::dto::cousr02c::UserIdPath;
 use crate::dto::{ScreenResult, ValidPath};
 use crate::error::ScreenError;
 use crate::services;
+
+/// The `utoipa::Path` of [`delete`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct DeleteOperation;
 
 /// Delete a user (CU03 / COUSR03C)
 ///
@@ -54,6 +57,7 @@ use crate::services;
 ///   COUSR03C-022); 500 with the API's fixed text when the store transaction cannot begin,
 ///   commit or roll back.
 #[utoipa::path(
+    impl_for = DeleteOperation,
     delete,
     path = "/api/v1/users/{user_id}",
     operation_id = "cousr03c_delete",

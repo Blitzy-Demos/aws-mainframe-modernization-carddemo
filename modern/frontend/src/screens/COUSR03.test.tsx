@@ -1208,6 +1208,199 @@ describe("COUSR03 user delete screen", () => {
   });
 });
 
+// Endpoints 18 and 20 name the user by the path alone, and every request carries the stored
+// session's token.
+describe("COUSR03: endpoint 18 and 20 requests", () => {
+  /** A request as its method, path, query, `Authorization` header and body text. */
+  async function shapeOf(request: Request) {
+    const url = new URL(request.url);
+    return {
+      method: request.method,
+      path: url.pathname,
+      query: Object.fromEntries(url.searchParams),
+      authorization: request.headers.get("Authorization"),
+      body: await request.clone().text(),
+    };
+  }
+
+  it("the read and F5's delete each send the user's path with the bearer token, no query and no body, and the delete's message shows", async () => {
+    const requests = await renderSelected();
+
+    fireEvent.click(key("F5=Delete"));
+    await waitFor(() => {
+      expect(messageRow()).toEqual(infoRow(deletedSelected.message));
+    });
+    await settle();
+
+    expect(await Promise.all(requests.map(shapeOf))).toEqual(
+      ["GET", "DELETE"].map((method) => ({
+        method,
+        path: `${ENDPOINT}${SELECTED_ID}`,
+        query: {},
+        authorization: "Bearer test-token",
+        body: "",
+      })),
+    );
+  });
+});
+
+/** The 401 of the `AdminUser` extractor for a missing, invalid or expired token. */
+const adminSignonRequired: components["schemas"]["ScreenError"] = {
+  message: "Sign-on required. Please sign on ...",
+  field: null,
+};
+
+/**
+ * Renders the application's route table at `/users/delete` with `state`, so the admin guard that
+ * only the table mounts stands in front of the screen. Its screens load lazily, so a wait for one
+ * to render allows 5 s. Returns the router, whose location the test reads.
+ */
+function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(routes, {
+    initialEntries: [{ pathname: PATHS.COUSR03, state }],
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/**
+ * Replaces `fetch` with {@link REPLIES}, except that every request of `method` is answered 401.
+ * Returns every request in the order the screen sent it.
+ */
+function stubRefusing(method: "GET" | "DELETE"): Request[] {
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      requests.push(req);
+      if (req.method === method) {
+        return json(401, adminSignonRequired);
+      }
+      const { pathname } = new URL(req.url);
+      const userId = decodeURIComponent(pathname.slice(ENDPOINT.length));
+      const reply = pathname.startsWith(ENDPOINT)
+        ? REPLIES.get(`${req.method} ${userId}`)
+        : undefined;
+      if (reply !== undefined) {
+        return json(reply.status, reply.body);
+      }
+      const unexpected: components["schemas"]["ScreenError"] = {
+        message: `Unexpected request ${req.method} ${pathname}`,
+      };
+      return json(500, unexpected);
+    }),
+  );
+  return requests;
+}
+
+/** Sign-on replaced the screen: its ENTER key shows at `/signon`, and no `Delete User` title. */
+async function expectSignonShown(router: ReturnType<typeof createMemoryRouter>): Promise<void> {
+  expect(
+    await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+  ).toBeDefined();
+  expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+  expect(screen.queryByRole("heading", { level: 1, name: "Delete User" })).toBeNull();
+}
+
+// COUSR03C-003: CU03 reached with no COMMAREA transfers to COSGN00C. The replacement's counterpart
+// is the admin guard in front of `/users/delete`, which only the route table mounts: no session
+// on entry, or a session a 401 cleared (`api/client.ts`) while the screen is mounted, both go to
+// `/signon`; after the key that sent the refused request, the test presses no key and follows no
+// link. A `U` session is sent to the main menu instead, as no menu of its own reaches this route.
+describe("COUSR03 in the route table: the admin guard and a 401", () => {
+  // audit: COUSR03C-003
+  it("opened with no session, goes to sign-on before endpoint 18 gets a request", async () => {
+    sessionStorage.clear();
+    const { requests } = stubApi();
+    const router = renderRouteTable(FROM_LIST);
+
+    await expectSignonShown(router);
+    await settle();
+    expect(requests).toHaveLength(0);
+    expect(getSession()).toBeNull();
+    router.dispose();
+  });
+
+  // audit: COUSR03C-003
+  it("opened with a U session, goes to the main menu, and endpoints 18 and 20 get no request", async () => {
+    setSession("test-token", "USER0001", "U");
+    const { requests } = stubApi();
+    const router = renderRouteTable(FROM_LIST);
+
+    await waitFor(
+      () => {
+        expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+      },
+      { timeout: 5_000 },
+    );
+    expect(screen.queryByRole("heading", { level: 1, name: "Delete User" })).toBeNull();
+    // The main menu loads endpoint 2 on entry, which `stubApi` answers 500. Waiting until the menu
+    // shows that answer keeps the load's last render inside the test's waits.
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    await waitFor(() => {
+      expect(messageRow()).toEqual(errorRow("Unexpected request GET /api/v1/menus/main"));
+    });
+    await settle();
+    expect(sent(requests).filter((request) => request.includes(ENDPOINT))).toEqual([]);
+    router.dispose();
+  });
+
+  // audit: COUSR03C-003
+  it.each([
+    {
+      title: "the fetch of ENTER (endpoint 18)",
+      state: { from: PATHS.COADM01 },
+      refused: "GET" as const,
+      drive: async () => {
+        typeUserId(TYPED_ID);
+        fireEvent.click(key("ENTER=Fetch"));
+      },
+      expected: [`GET ${ENDPOINT}${TYPED_ID}`],
+    },
+    {
+      title: "the delete of F5 (endpoint 20)",
+      state: FROM_LIST,
+      refused: "DELETE" as const,
+      drive: async () => {
+        await waitFor(() => {
+          expect(shown()).toEqual(SHOWN_SELECTED);
+        });
+        fireEvent.click(key("F5=Delete"));
+      },
+      expected: [`GET ${ENDPOINT}${SELECTED_ID}`, `DELETE ${ENDPOINT}${SELECTED_ID}`],
+    },
+  ])(
+    "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
+    async ({ state, refused, drive, expected }) => {
+      const requests = stubRefusing(refused);
+      const router = renderRouteTable(state);
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Delete User" }, { timeout: 5_000 }),
+      ).toBeDefined();
+
+      await drive();
+
+      await expectSignonShown(router);
+      expect(getSession()).toBeNull();
+      expect(sent(requests)).toEqual(expected);
+      expect(requests.map((request) => request.headers.get("Authorization"))).toEqual(
+        expected.map(() => "Bearer test-token"),
+      );
+      router.dispose();
+    },
+  );
+});
+
 // COUSR03C entered with no COMMAREA (`EIBCALEN = 0`) transfers to COSGN00C. The replacement is
 // the route guard that only the application's route table mounts in front of `/users/delete`, so
 // this group renders that table rather than the screen alone, with nobody signed on. The file's

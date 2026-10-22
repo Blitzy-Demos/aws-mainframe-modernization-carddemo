@@ -41,6 +41,13 @@
 //! [`TranTypeListResponse`] and [`TranTypeListActionResult`] therefore carry the audited status
 //! of their outcome and answer with it through `IntoResponse`, outside the body: return the
 //! value itself, not `Json(value)`, which would answer 200 whatever the outcome.
+//!
+//! A request that gets no screen, such as one the extractor rejects or one that finds the
+//! database unreachable, is answered with a [`ScreenError`] at 400 or 500 instead, so those two
+//! statuses carry either body. [`TranTypeListErrorBody`] and [`TranTypeListActionErrorBody`]
+//! are the document's schemas of them, `anyOf` the page and [`ScreenError`], and nothing
+//! constructs either. The union is `anyOf`, not `oneOf`, because a page with its message also
+//! satisfies [`ScreenError`]'s schema, which requires only a string `message`.
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -49,10 +56,13 @@ use domain::copybook::PicX;
 use domain::online::cotrtlic as rules;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
-use utoipa::{IntoParams, ToSchema};
+use utoipa::openapi::RefOr;
+use utoipa::openapi::schema::{AnyOfBuilder, Ref, Schema};
+use utoipa::{IntoParams, PartialSchema, ToSchema};
 use validator::{Validate, ValidationError};
 
 use super::{PageDirection, text};
+use crate::error::ScreenError;
 
 /// The request field of a row error on a selection, `TRTSELn`.
 const SELECTION_FIELD: &str = "selection";
@@ -820,6 +830,75 @@ impl IntoResponse for TranTypeListActionResult {
         let status = self.status;
         (status, Json(self)).into_response()
     }
+}
+
+// The two types below exist for the `OpenAPI` document only, and nothing constructs them: a
+// handler answers with the page or the `ScreenError` itself. COTRTLIC answers 400 and 500 with
+// either body, so each operation declares those two statuses' body inline as one of these
+// types, whose schema is `anyOf` the page and `ScreenError`, and the document names no schema
+// of its own for them. Each response's own description states when it carries which body.
+//
+// The union is `anyOf`, at least one member, and not `oneOf`, exactly one: `ScreenError`
+// requires only a string `message` and leaves every other member open, and a page carries a
+// string `message` too, so a page with its message satisfies both members, which `oneOf` would
+// reject. utoipa derives `oneOf` for every untagged enum, so both schemas are written by hand,
+// with no description beside the two references.
+
+/// The body of endpoint 24's 400 and 500: the page of a filter in error or of a failed Db2
+/// read, or the [`ScreenError`] of a query the extractor rejects, of a `page_key` this API did
+/// not issue and of an unreachable database (COTRTLIC-053). Its schema is `anyOf`
+/// [`TranTypeListResponse`] and [`ScreenError`], each by reference.
+#[derive(Debug)]
+pub struct TranTypeListErrorBody;
+
+impl PartialSchema for TranTypeListErrorBody {
+    fn schema() -> RefOr<Schema> {
+        page_or_screen_error::<TranTypeListResponse>()
+    }
+}
+
+impl ToSchema for TranTypeListErrorBody {
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        register_page_and_screen_error::<TranTypeListResponse>(schemas);
+    }
+}
+
+/// The body of endpoint 25's 400 and 500: the page of an input error, of a delete the type's
+/// categories restrict or of a failed Db2 statement, or the [`ScreenError`] of a body the
+/// extractor rejects, of a `state` no screen could hold, of an unreachable database
+/// (COTRTLIC-053) and of an F10 commit whose transaction cannot be opened, committed or rolled
+/// back or whose re-read of the target row fails. Its schema is `anyOf`
+/// [`TranTypeListActionResult`] and [`ScreenError`], each by reference.
+#[derive(Debug)]
+pub struct TranTypeListActionErrorBody;
+
+impl PartialSchema for TranTypeListActionErrorBody {
+    fn schema() -> RefOr<Schema> {
+        page_or_screen_error::<TranTypeListActionResult>()
+    }
+}
+
+impl ToSchema for TranTypeListActionErrorBody {
+    fn schemas(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+        register_page_and_screen_error::<TranTypeListActionResult>(schemas);
+    }
+}
+
+/// `anyOf` a reference to the page schema `Page` and a reference to [`ScreenError`].
+fn page_or_screen_error<Page: ToSchema>() -> RefOr<Schema> {
+    AnyOfBuilder::new()
+        .item(Ref::from_schema_name(Page::name()))
+        .item(Ref::from_schema_name(ScreenError::name()))
+        .into()
+}
+
+/// Registers the two schemas [`page_or_screen_error`] refers to, and every schema either one
+/// refers to, as utoipa's derive registers the members of a type.
+fn register_page_and_screen_error<Page: ToSchema>(schemas: &mut Vec<(String, RefOr<Schema>)>) {
+    schemas.push((Page::name().into_owned(), Page::schema()));
+    Page::schemas(schemas);
+    schemas.push((ScreenError::name().into_owned(), ScreenError::schema()));
+    ScreenError::schemas(schemas);
 }
 
 /// The seven positions an outcome shows.

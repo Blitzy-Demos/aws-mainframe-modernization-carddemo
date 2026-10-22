@@ -23,7 +23,8 @@ export interface paths {
          *
          *     A `ScreenError` with the program's message: 400 when the account number fails its edit, 401
          *     without a valid bearer token, 404 when the cross-reference, the account or the customer is not
-         *     found, and 500 when a read fails.
+         *     found, and 500 when a read fails. A segment that is not UTF-8 once percent-decoded is a 400
+         *     with the API's `Invalid path parameters...` and no field, before the program's edit.
          */
         get: operations["coactupc_fetch"];
         /**
@@ -40,7 +41,9 @@ export interface paths {
          *     A `ScreenError` with the program's message: 400 when the body fails validation, nothing
          *     changed or an edit fails; 401 without a valid bearer token; 404 when the re-read finds no
          *     cross-reference, account or customer; 409 when the stored records changed after the fetch; 500
-         *     when a read, a lock or a rewrite fails, or the store fails.
+         *     when a read, a lock or a rewrite fails, or the store fails. A segment that is not UTF-8 once
+         *     percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
+         *     body is read.
          */
         put: operations["coactupc_save"];
         post?: never;
@@ -68,10 +71,12 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` with 400 for a blank or non-numeric account ID, a malformed query or a
-         *     `page_key` that is not an authorization key; 401 without a valid bearer token; 404 when the
-         *     account has no cross-reference, account or customer record; 422 for a `page_size` outside 1
-         *     to 100; 500 when a read fails, with the program's system-error text.
+         *     A `ScreenError` with 400 for a blank or non-numeric account ID, a malformed query, a
+         *     `page_key` that is not an authorization key or, with the API's `Invalid path parameters...`
+         *     and no field, an account segment that is not UTF-8 once percent-decoded; 401 without a valid
+         *     bearer token; 404 when the account has no cross-reference, account or customer record; 422
+         *     for a `page_size` outside 1 to 100; 500 when a read fails, with the program's system-error
+         *     text.
          */
         get: operations["copaus0c_summary"];
         put?: never;
@@ -101,7 +106,8 @@ export interface paths {
          *     A `ScreenError` with the program's message and the field `acct_id`: 400 when the account
          *     number is missing, not numeric or all zeros; 404 when the cross-reference, the account or
          *     the customer record is not found; 500 when one of those reads fails. 401 when the request
-         *     carries no valid bearer token.
+         *     carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a 400
+         *     with the API's `Invalid path parameters...` and no field, before the program's edit.
          */
         get: operations["coactvwc_view"];
         put?: never;
@@ -131,9 +137,10 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` body: 400 when the account is not eleven digits, the key is blank or the
-         *     query does not deserialise; 401 without a valid bearer token; 404 when no authorization of
-         *     the account has the key; 500 when the summary, detail or next read fails, or the store fails.
+         *     A `ScreenError` body: 400 when the account is not eleven digits, the key is blank, the query
+         *     does not deserialise or a path segment is not UTF-8 once percent-decoded; 401 without a
+         *     valid bearer token; 404 when no authorization of the account has the key; 500 when the
+         *     summary, detail or next read fails, or the store fails.
          */
         get: operations["copaus1c_detail"];
         put?: never;
@@ -164,10 +171,11 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` body: 400 when the account is not eleven digits or the key is blank; 401
-         *     without a valid bearer token; 404 when no authorization of the account has the key; 500 when
-         *     a read fails, when COPAUS2C's insert or update or the replace of the detail fails and both
-         *     writes are rolled back, or when the store fails. Nothing is written on any error.
+         *     A `ScreenError` body: 400 when the account is not eleven digits, the key is blank or a path
+         *     segment is not UTF-8 once percent-decoded; 401 without a valid bearer token; 404 when no
+         *     authorization of the account has the key; 500 when a read fails, when COPAUS2C's insert or
+         *     update or the replace of the detail fails and both writes are rolled back, or when the store
+         *     fails. Nothing is written on any error.
          */
         post: operations["copaus1c_toggle_fraud"];
         delete?: never;
@@ -282,10 +290,13 @@ export interface paths {
         };
         /**
          * View a card (CCDL / COCRDSLC).
-         * @description ENTER on the card detail screen: the card is looked up by the account and either the typed
-         *     `card_num` or the `card_ref` handle of a card list row, never both. The card number is
-         *     returned in full only to an administrator token; any other token receives twelve asterisks
-         *     followed by the last four digits. The response carries no card verification code.
+         * @description ENTER on the card detail screen: the card is selected by its key alone, either the typed
+         *     `card_num` or the `card_ref` handle of a card list row, never both. `acct_id` is validated by
+         *     COCRDSLC's account edit and returned as the displayed account; it is never compared with the
+         *     card's stored account, so a card held by another account is shown under the account entered.
+         *     The card number is returned in full only to an administrator token; any other token receives
+         *     twelve asterisks followed by the last four digits. The response carries no card verification
+         *     code.
          *
          *     # Errors
          *
@@ -325,7 +336,9 @@ export interface paths {
          *     A `ScreenError` carrying the program's message: 400 when nothing changed, a field fails its
          *     edit or the body does not fit its screen fields; 401 without a valid bearer token; 409 when
          *     the card changed after it was fetched; 500 when the card cannot be locked for update, a
-         *     `card_ref` that names no card included, or when its rewrite fails.
+         *     `card_ref` that names no card included, or when its rewrite fails. A segment that is not
+         *     UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...` and no
+         *     field, before the body is read.
          */
         put: operations["cocrdupc_save"];
         post?: never;
@@ -527,7 +540,8 @@ export interface paths {
          *     page when the row to commit was deleted by another user; 422 for a `page_size` outside 1 to
          *     100; 500 with the page and its Db2 message when a Db2 statement fails, with a `ScreenError`
          *     carrying `Db2 access failure. ` when the database cannot be reached (COTRTLIC-053), or with a
-         *     `ScreenError` when the commit's transaction cannot be opened, committed or rolled back.
+         *     `ScreenError` when the commit's transaction cannot be opened, committed or rolled back or its
+         *     re-read of the target row fails.
          */
         post: operations["cotrtlic_list_actions"];
         delete?: never;
@@ -691,7 +705,9 @@ export interface paths {
          *     A `ScreenError` naming field `tran_id`: 400 `Tran ID can NOT be empty...` when the Tran ID
          *     is blank, 404 `Transaction ID NOT found...` when no transaction has the key, and 500
          *     `Unable to lookup Transaction...` when the read fails. A request without a valid bearer
-         *     token is refused with 401 before anything is read.
+         *     token is refused with 401 before anything is read. A segment that is not UTF-8 once
+         *     percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
+         *     program's edit.
          */
         get: operations["cotrn01c_view"];
         put?: never;
@@ -2547,8 +2563,9 @@ export interface components {
             message: string;
         };
         /**
-         * @description The body of every error response: the message row of the screen and the request field the
-         *     program puts the cursor on, with the HTTP status the response carries.
+         * @description The standard body of an error response: the message row of the screen and the request field
+         *     the program puts the cursor on, with the HTTP status the response carries. Endpoints 24 and 25
+         *     may answer a program error with their page instead.
          *
          *     Serialised as `{"message": …, "field": …}`, `field` omitted when absent. The status travels
          *     as the response status only and is no part of the body or of the schema. A deserialised
@@ -3741,7 +3758,7 @@ export interface operations {
                     "application/json": components["schemas"]["AccountUpdateView"];
                 };
             };
-            /** @description The account number failed the program's edit */
+            /** @description The account number failed the program's edit; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3804,7 +3821,7 @@ export interface operations {
                     "application/json": components["schemas"]["AccountUpdateResult"];
                 };
             };
-            /** @description The body failed validation, nothing changed, or an edit failed */
+            /** @description The body failed validation, nothing changed, or an edit failed; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3889,7 +3906,7 @@ export interface operations {
                     "application/json": components["schemas"]["AuthSummaryResponse"];
                 };
             };
-            /** @description A blank or non-numeric account ID, a malformed query or a `page_key` that is not an authorization key */
+            /** @description A blank or non-numeric account ID, a malformed query or a `page_key` that is not an authorization key; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -3957,7 +3974,7 @@ export interface operations {
                     "application/json": components["schemas"]["AccountViewResponse"];
                 };
             };
-            /** @description The account number is missing, not numeric or all zeros */
+            /** @description The account number is missing, not numeric or all zeros; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4021,7 +4038,7 @@ export interface operations {
                     "application/json": components["schemas"]["AuthDetailResponse"];
                 };
             };
-            /** @description Malformed account, blank key or invalid query */
+            /** @description Malformed account, blank key or invalid query; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4082,7 +4099,7 @@ export interface operations {
                     "application/json": components["schemas"]["FraudToggleResult"];
                 };
             };
-            /** @description Malformed account or blank key */
+            /** @description Malformed account or blank key; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4468,7 +4485,7 @@ export interface operations {
                     "application/json": components["schemas"]["CardUpdateResult"];
                 };
             };
-            /** @description Nothing changed, a field failed its edit, or the body does not fit */
+            /** @description Nothing changed, a field failed its edit, or the body does not fit; or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -4714,13 +4731,13 @@ export interface operations {
                     "application/json": components["schemas"]["TranTypeListResponse"];
                 };
             };
-            /** @description The page with a filter in error and its message; a query the request rules reject, or a `page_key` this API did not issue, is answered with a `ScreenError` instead */
+            /** @description Either body: the page with a filter in error and its message, or a `ScreenError` for a query the request rules reject or a `page_key` this API did not issue */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TranTypeListResponse"];
+                    "application/json": components["schemas"]["TranTypeListResponse"] | components["schemas"]["ScreenError"];
                 };
             };
             /** @description No bearer token, or one that is invalid or expired */
@@ -4750,13 +4767,13 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
-            /** @description The count or the page read failed: the rows read before the failure and the program's Db2 message; a database that cannot be reached (`Db2 access failure. `) is answered with a `ScreenError` instead */
+            /** @description Either body: the page, with the rows read before the failure and the program's Db2 message, when the count or the page read failed, or a `ScreenError` carrying `Db2 access failure. ` when the database cannot be reached */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TranTypeListResponse"];
+                    "application/json": components["schemas"]["TranTypeListResponse"] | components["schemas"]["ScreenError"];
                 };
             };
         };
@@ -4783,13 +4800,13 @@ export interface operations {
                     "application/json": components["schemas"]["TranTypeListActionResult"];
                 };
             };
-            /** @description The page with the per-row errors and the message of an input error or of a delete the type's categories restrict; a body the request rules reject, or a `state` no screen could hold, is answered with a `ScreenError` instead */
+            /** @description Either body: the page with the per-row errors and the message of an input error or of a delete the type's categories restrict, or a `ScreenError` for a body the request rules reject or a `state` no screen could hold */
             400: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TranTypeListActionResult"];
+                    "application/json": components["schemas"]["TranTypeListActionResult"] | components["schemas"]["ScreenError"];
                 };
             };
             /** @description No bearer token, or one that is invalid or expired */
@@ -4828,13 +4845,13 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
-            /** @description The page and the program's Db2 message of a failed statement; a database that cannot be reached (`Db2 access failure. `) and a commit transaction that cannot be opened, committed or rolled back are answered with a `ScreenError` instead */
+            /** @description Either body: the page and the program's Db2 message of a failed statement, or a `ScreenError` carrying `Db2 access failure. ` when the database cannot be reached, or `Unable to process request...` when the commit's transaction cannot be opened, committed or rolled back or its re-read of the target row fails */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TranTypeListActionResult"];
+                    "application/json": components["schemas"]["TranTypeListActionResult"] | components["schemas"]["ScreenError"];
                 };
             };
         };
@@ -5133,7 +5150,7 @@ export interface operations {
                     "application/json": components["schemas"]["TranViewResponse"];
                 };
             };
-            /** @description `Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009) */
+            /** @description `Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009); or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;

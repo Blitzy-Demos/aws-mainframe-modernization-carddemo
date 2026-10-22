@@ -1,7 +1,7 @@
 //! The request and response contracts of the 27 REST operations (AAP 0.3.4.1), and what all of
 //! them share: the [`ScreenResult`] and [`PageDirection`] schemas, the `page_size` rule of
-//! Bounded Pagination, and the validating extractors [`ValidJson`], [`ValidQuery`] and
-//! [`ValidPath`].
+//! Bounded Pagination, the validating extractors [`ValidJson`], [`ValidQuery`] and
+//! [`ValidPath`], and the raw path extractor [`RawPath`].
 //!
 //! # Folder contract
 //!
@@ -24,16 +24,18 @@
 //!
 //! # Extractors
 //!
-//! A handler takes a body as [`ValidJson<T>`], a query string as [`ValidQuery<T>`] and path
-//! parameters that carry a map field as [`ValidPath<T>`]. utoipa cannot see through any of
-//! them, so a handler taking `ValidJson<T>` declares `request_body = T` and one taking
-//! `ValidQuery<T>` or `ValidPath<T>` declares `params(T)` in its `#[utoipa::path]`.
+//! A handler takes a body as [`ValidJson<T>`], a query string as [`ValidQuery<T>`], path
+//! parameters that carry a map field as [`ValidPath<T>`] and path parameters whose raw text the
+//! program's own edit checks as [`RawPath<T>`], which checks no rule. utoipa cannot see through
+//! any of them, so a handler taking `ValidJson<T>` declares `request_body = T`, one taking
+//! `ValidQuery<T>` or `ValidPath<T>` declares `params(T)`, and one taking `RawPath<T>` declares
+//! each segment inline in the `params` of its `#[utoipa::path]`.
 //!
 //! Every rejection is a [`ScreenError`]:
 //!
 //! - A body, query string or path that does not deserialise into `T`: 400 with
 //!   [`INVALID_BODY`], [`INVALID_QUERY`] or [`INVALID_PATH`] and no field. That covers malformed
-//!   JSON, a missing JSON content type, a
+//!   JSON, a missing JSON content type, a path segment whose percent-encoding is not UTF-8, a
 //!   value of the wrong type (text where an integer belongs, for instance) and an unknown enum
 //!   value. An attention key whose program answers unserved keys itself (`cotrtupc`,
 //!   `cotrn02c`) reads every other key name as a hidden variant instead, so that the program's
@@ -340,6 +342,37 @@ where
     }
 }
 
+/// Path parameters deserialised into `T` and passed on unchecked, for a path segment that
+/// carries a key the program's own edit checks: the account number of endpoints 4 to 6 and 21,
+/// the card handle of endpoint 10, the transaction ID of endpoint 12, and the account and
+/// authorization key of endpoints 22 and 23.
+///
+/// No rule is checked and nothing is parsed, trimmed or normalised here, so the text reaches the
+/// service as the client sent it, once percent-decoded, and the program's total domain edit
+/// answers a malformed key with its own message. utoipa cannot see through it, so a handler that
+/// takes it declares each segment inline, as `("acct_id" = String, Path, ..)`, in the `params`
+/// of its `#[utoipa::path]`. The rejection is a [`ScreenError`]: 400 with [`INVALID_PATH`] and
+/// no field when the path does not deserialise into `T`, such as a segment whose percent-encoding
+/// is not UTF-8.
+#[derive(Debug, Clone)]
+pub struct RawPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for RawPath<T>
+where
+    T: DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = ScreenError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // The rejection's own text quotes the offending segment, so it is dropped unread.
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(|_| ScreenError::input(INVALID_PATH, None))
+    }
+}
+
 /// The [`ScreenError`] of a failed `validate()`.
 ///
 /// A top-level `page_size` error decides it: 422 with [`PAGE_SIZE_MESSAGE`], whatever else
@@ -477,21 +510,25 @@ pub(crate) fn digits<const N: u32>(field: PicU<N>) -> String {
 mod tests {
     use std::error::Error as StdError;
 
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use axum::extract::{FromRequest, FromRequestParts, Request};
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
+    use axum::routing::get;
+    use axum::{Json, Router};
     use domain::copybook::{PicU, PicX};
     use domain::online::{cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
     use serde::Deserialize;
+    use serde_json::{Value, json};
+    use tower::ServiceExt as _;
     use utoipa::ToSchema;
     use validator::{Validate, ValidationError};
 
     use super::{
         FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE, INVALID_BODY,
-        INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD, PAGE_SIZE_MESSAGE,
-        PIC_X_CODE, PageDirection, ScreenResult, ValidJson, ValidQuery, digits, full_text, numeric,
-        pic_x, resolve_page_size, text, validation_error,
+        INVALID_PATH, INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD,
+        PAGE_SIZE_MESSAGE, PIC_X_CODE, PageDirection, RawPath, ScreenResult, ValidJson, ValidQuery,
+        digits, full_text, numeric, pic_x, resolve_page_size, text, validation_error,
     };
     use crate::error::ScreenError;
 
@@ -571,6 +608,39 @@ mod tests {
         Ok(ValidQuery::<QueryProbe>::from_request_parts(&mut head, &())
             .await
             .map(|ValidQuery(value)| value))
+    }
+
+    /// The status and JSON body `uri` answers on a router with one [`RawPath`] route of a single
+    /// segment and one of two, each echoing the text it extracted.
+    async fn through_raw_path(uri: &str) -> Result<(StatusCode, Value), Box<dyn StdError>> {
+        let router = Router::new()
+            .route(
+                "/probe/{key}",
+                get(|RawPath(key): RawPath<String>| async move { Json(json!({ "key": key })) }),
+            )
+            .route(
+                "/probe/{acct_id}/{auth_key}",
+                get(
+                    |RawPath((acct_id, auth_key)): RawPath<(String, String)>| async move {
+                        Json(json!({ "acct_id": acct_id, "auth_key": auth_key }))
+                    },
+                ),
+            );
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
     #[test]
@@ -965,6 +1035,46 @@ mod tests {
             assert!(!error.message().contains("4111"));
         }
         Ok(())
+    }
+
+    #[test]
+    fn raw_path_segments_pass_as_decoded_or_are_a_400_that_echoes_nothing() -> TestResult {
+        let rejected = || (StatusCode::BAD_REQUEST, json!({ "message": INVALID_PATH }));
+        let cases = [
+            // Decodable text passes untrimmed and unparsed, for the program's own edit to judge.
+            (
+                "/probe/00000000001".to_owned(),
+                (StatusCode::OK, json!({ "key": "00000000001" })),
+            ),
+            (
+                "/probe/%20%201A%20".to_owned(),
+                (StatusCode::OK, json!({ "key": "  1A " })),
+            ),
+            (
+                "/probe/%C3%A9x".to_owned(),
+                (StatusCode::OK, json!({ "key": "éx" })),
+            ),
+            (
+                "/probe/00000000001/0778000000000001".to_owned(),
+                (
+                    StatusCode::OK,
+                    json!({ "acct_id": "00000000001", "auth_key": "0778000000000001" }),
+                ),
+            ),
+            // A segment that is not UTF-8 once decoded, in either position, is refused without
+            // its text.
+            ("/probe/%FF".to_owned(), rejected()),
+            (format!("/probe/{CARD}%FF"), rejected()),
+            ("/probe/%FF/0778000000000001".to_owned(), rejected()),
+            (format!("/probe/00000000001/{CARD}%FE"), rejected()),
+        ];
+        // A failure names the case by its index: two of the URIs hold a card number.
+        block_on(async {
+            for (case, (uri, expected)) in cases.into_iter().enumerate() {
+                assert_eq!(through_raw_path(&uri).await?, expected, "case {case}");
+            }
+            Ok(())
+        })
     }
 
     #[test]

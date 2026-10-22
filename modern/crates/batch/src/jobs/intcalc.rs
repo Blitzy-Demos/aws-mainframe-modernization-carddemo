@@ -50,8 +50,9 @@
 //! rewrite, runs on the session that holds it, a connection that is never replaced. A session
 //! the server ends, through `pg_terminate_backend`, `idle_session_timeout` or a lost network,
 //! takes the claim with it, and the run's next statement fails on it, a read or a rewrite: the
-//! run ends there with [`JobError::Persistence`] and rewrites nothing after its claim is gone,
-//! so a second run that claims the file then is the only writer. The claim is held to the run's
+//! run ends there with the abend of that read or rewrite (CBACT04C-032, CBACT04C-033) and
+//! rewrites nothing after its claim is gone, so a second run that claims the file then is the
+//! only writer. The claim is held to the run's
 //! end and given up by closing the session on success; on every error the session drops with
 //! the run, which closes it and ends the lock on the server. A close that fails is reported in a
 //! warning event and changes nothing else: every rewrite is done, and the session's connection
@@ -69,20 +70,43 @@
 //!
 //! # Abends
 //!
-//! - [`JobError::Intcalc`]: an account, cross-reference or `DEFAULT` disclosure lookup the
-//!   domain refuses (CBACT04C-005, CBACT04C-007, CBACT04C-008, CBACT04C-011).
-//! - [`JobError::Abend`] with `ERROR OPENING ACCOUNT MASTER FILE`: another run holds the claim on
-//!   `accounts` (CBACT04C-039).
-//! - [`JobError::Abend`] with `ERROR RE-WRITING ACCOUNT FILE`: a rewrite that finds no row
-//!   (CBACT04C-032).
-//! - [`JobError::Persistence`]: the session that cannot be opened, the claim, a read or a
-//!   rewrite that fails as a statement (CBACT04C-032, CBACT04C-033), every statement after the
-//!   session is lost (CBACT04C-039), and any query against a database whose schema has not been
-//!   applied.
-//! - [`JobError::Io`]: the generation cannot be allocated, created, written or synced
-//!   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
-//! - [`JobError::GenerationLimit`]: generation 9999 of `SYSTRAN` exists, so no generation is
-//!   allocated and none is overwritten (CBACT04C-034).
+//! Every failure path ends in `9999-ABEND-PROGRAM`, its `DISPLAY` lines emitted in program order
+//! as `ERROR` events whose message is the line (X-INTCALC-4): first, when the failure has an
+//! underlying error, one event naming the file operation the call replaces and carrying the
+//! error, an SQLSTATE, a constraint or column name, or a static step and an I/O error kind; then
+//! the path's failure line; the status line of `9910-DISPLAY-IO-STATUS` (`file_status_line`);
+//! and `ABENDING PROGRAM`, whose field `abend_code` records the abend code 999 `CEE3ABD` receives
+//! (CBACT04C-038). The job then returns [`JobError::Abend`] with the failure line as its reason:
+//!
+//! - `ERROR OPENING TRANSACTION CATEGORY BALANCE`: the one `PostgreSQL` connection that stands
+//!   for the input opens fails (CBACT04C-034, X-INTCALC-7): the run's session cannot be opened,
+//!   or `main` cannot connect at all and the job never starts. In that case `main` emits its
+//!   connection event, then these lines through `show_failed_connection`, and reports its own
+//!   connection error, exit status 1, in place of the [`JobError::Abend`].
+//! - `ERROR OPENING ACCOUNT MASTER FILE`: another run holds the claim on `accounts`, status `93`
+//!   (CBACT04C-039), or the claim fails as a database call.
+//! - `ERROR READING ACCOUNT FILE`, `ERROR READING XREF FILE`, `ERROR READING DISCLOSURE GROUP
+//!   FILE` or `ERROR READING TRANSACTION CATEGORY FILE`: the read of `accounts`, `card_xref`,
+//!   `disclosure_groups` or `tran_cat_balances` fails (CBACT04C-033), as every read does once the
+//!   session is lost (CBACT04C-039) and against a database whose schema has not been applied.
+//! - `ERROR OPENING TRANSACTION FILE`: the generation cannot be allocated or created, generation
+//!   9999 of `SYSTRAN` existing included, which is left as it is (CBACT04C-034). The event names
+//!   the setting of the directory, `systran under CARDDEMO_VAR_DIR`, never its path.
+//! - `ERROR RE-WRITING ACCOUNT FILE`: a rewrite finds no row, status `23`, or fails as a
+//!   statement (CBACT04C-032).
+//! - `ERROR WRITING TRANSACTION RECORD`: a SYSTRAN record cannot be written (CBACT04C-031).
+//! - `ERROR CLOSING TRANSACTION FILE`: the generation cannot be flushed or synced; no
+//!   `END OF EXECUTION OF PROGRAM CBACT04C` line follows (CBACT04C-035).
+//!
+//! Status `23` of a rewrite that finds no row is the COBOL's own, `FILE STATUS IS: NNNN0023`
+//! (CBACT04C-036). Every other path shows `93` for the held claim and `30`, a permanent error,
+//! as the stand-in for the rest: both are `HALTED(H4)` and no parity result, since no VSAM status
+//! maps to a `PostgreSQL` or file-system failure (CBACT04C-037, X-INTCALC-H3).
+//!
+//! A lookup the domain refuses, of an account, a cross-reference or a `DEFAULT` disclosure
+//! record (CBACT04C-005, CBACT04C-007, CBACT04C-008, CBACT04C-011), emits the lines of
+//! `IntcalcError::sysout_lines` the same way, `ABENDING PROGRAM` with its `abend_code` last, and
+//! ends with [`JobError::Intcalc`].
 //!
 //! `9999-ABEND-PROGRAM` sets no return code (CBACT04C-038), so no abend carries one. After any
 //! error the unfinished generation file is removed by the guard of `OutputFile`, as
@@ -104,19 +128,24 @@
 //!
 //! # Job log and cardholder data
 //!
-//! The program's `DISPLAY` lines, the record shown for every category balance read included
-//! (CBACT04C-003), are not written: standard output carries only the path `main` prints from
-//! [`JobOutcome::written`] (AAP 0.3.4.3), and the job emits no tracing of its own, as `tranrept`
-//! does not, but for the warning of a session close that failed, which names the close and the
-//! error only. Each SYSTRAN record carries the full `XREF-CARD-NUM` (CBACT04C-021) in the local
-//! generation file only, which is batch output and not egress; the job's errors are the fixed
-//! texts of [`JobError`] and its counts are plain numbers, so nothing it emits carries a card
-//! number (Cardholder Data Redaction).
+//! The job emits the `DISPLAY` lines of its failure paths, with their cause events, as "Abends"
+//! lists them, and the warning of a session close that failed, which names the close and the
+//! error only. The lines of a run that ends normally stay unwritten (X-INTCALC-4):
+//! `START OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-002), the record shown for every category
+//! balance read (CBACT04C-003), the pair `DISCLOSURE GROUP RECORD MISSING` and
+//! `TRY WITH DEFAULT GROUP CODE` of every `DEFAULT` fallback, which the domain does not report
+//! for a lookup that succeeds (CBACT04C-010), and `END OF EXECUTION OF PROGRAM CBACT04C`
+//! (CBACT04C-030). Standard output otherwise carries only the path `main` prints from
+//! [`JobOutcome::written`] (AAP 0.3.4.3). Each SYSTRAN record carries the full `XREF-CARD-NUM`
+//! (CBACT04C-021) in the local generation file only, which is batch output and not egress. The
+//! lines emitted show account IDs at most, the cause events never a path or a value, the job's
+//! errors are the fixed texts of [`JobError`] and its counts are plain numbers, so nothing it
+//! emits carries a card number (Cardholder Data Redaction).
 //!
 //! # Rules
 //!
 //! - Single Schema Executor: no schema work here; against a database whose schema has not been
-//!   applied the job fails at its first read with [`JobError::Persistence`].
+//!   applied the job abends at its first read, `ERROR READING ACCOUNT FILE` (CBACT04C-033).
 //! - R4: every statement is a call of `persistence` on the run's session: a repository call, the
 //!   writer claim of `PgSession::claim_writer`, or the session's close.
 //! - Local-Only Runtime: the job writes `PostgreSQL` and the directory `Config::systran_dir`
@@ -126,15 +155,21 @@
 //!   (CBACT04C-022).
 
 use copybook::FixedRecord;
-use domain::batch::cbact04c::{Intcalc, IntcalcEffect, OPEN_ACCOUNT_ERROR, REWRITE_ACCOUNT_ERROR};
+use domain::batch::cbact04c::{
+    ABEND_CODE, ABEND_LINE, CLOSE_TRANSACT_ERROR, Intcalc, IntcalcEffect, IntcalcError,
+    OPEN_ACCOUNT_ERROR, OPEN_TCATBAL_ERROR, OPEN_TRANSACT_ERROR, READ_ACCOUNT_ERROR,
+    READ_DISCGRP_ERROR, READ_TCATBAL_ERROR, READ_XREF_ERROR, REWRITE_ACCOUNT_ERROR,
+    WRITE_TRANSACT_ERROR, file_status_line,
+};
 use domain::clock::Clock;
 use domain::records::{AccountRecord, TranCatBalanceRecord};
 use persistence::{
-    AccountRepository, CardXrefRepository, Dataset, DisclosureGroupRepository, PgSession, PgStore,
-    TranCatBalanceRepository,
+    AccountRepository, CardXrefRepository, Dataset, DisclosureGroupRepository, PersistenceError,
+    PgSession, PgStore, TranCatBalanceRepository,
 };
+use runtime::telemetry::JobCounter;
 
-use super::{JobContext, JobError, JobOutcome, OutputFile, count};
+use super::{JobContext, JobError, JobOutcome, OutputFile, SYSTRAN_DIR_SETTING, count};
 use crate::cli::IntcalcArgs;
 
 /// The generation base of the SYSTRAN file, `AWS.M2.CARDDEMO.SYSTRAN(+1)` of the `TRANSACT` DD
@@ -145,6 +180,59 @@ const SYSTRAN_BASE: &str = "SYSTRAN";
 /// stands for, named in the warning of a close that failed.
 const CLOSE_ACCTFILE_OP: &str = "CLOSE ACCTFILE";
 
+// The file operation each database or file call replaces, named in the event that reports its
+// failure.
+
+/// `0000-TCATBALF-OPEN`, the first of the four input opens the run's one session stands for
+/// (X-INTCALC-7).
+const OPEN_TCATBALF_OP: &str = "OPEN TCATBALF";
+/// `0300-ACCTFILE-OPEN`, which the writer claim on `accounts` stands for (CBACT04C-039).
+const OPEN_ACCTFILE_OP: &str = "OPEN ACCTFILE";
+/// The keyed reads of `1100-GET-ACCT-DATA`, done at once.
+const READ_ACCTFILE_OP: &str = "READ ACCTFILE";
+/// The keyed reads of `1110-GET-XREF-DATA`, done at once.
+const READ_XREFFILE_OP: &str = "READ XREFFILE";
+/// The keyed reads of `1200-GET-INTEREST-RATE` and `1200-A-GET-DEFAULT-INT-RATE`, done at once.
+const READ_DISCGRP_OP: &str = "READ DISCGRP";
+/// The reads of `1000-TCATBALF-GET-NEXT`, done at once.
+const READ_TCATBALF_OP: &str = "READ TCATBALF";
+/// `0400-TRANFILE-OPEN`, the creation of the SYSTRAN generation.
+const OPEN_TRANFILE_OP: &str = "OPEN TRANFILE";
+/// The `REWRITE` of `1050-UPDATE-ACCOUNT`.
+const REWRITE_ACCTFILE_OP: &str = "REWRITE ACCTFILE";
+/// The `WRITE` of `1300-B-WRITE-TX`.
+const WRITE_TRANFILE_OP: &str = "WRITE TRANFILE";
+/// `9400-TRANFILE-CLOSE`, the flush and sync of the SYSTRAN generation.
+const CLOSE_TRANFILE_OP: &str = "CLOSE TRANFILE";
+
+/// The file status `9910-DISPLAY-IO-STATUS` shows after a failure line, as `file_status_line`
+/// renders it (CBACT04C-036, CBACT04C-037).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Status {
+    /// `23`, record not found: the status of a `REWRITE` that finds no record, shown as
+    /// `FILE STATUS IS: NNNN0023` (CBACT04C-032, CBACT04C-036).
+    NotFound,
+    /// `93`, resource not available: VSAM's refusal of a second writer's `OPEN I-O`
+    /// (CBACT04C-039). `HALTED(H4)`: the status VSAM returns there is not claimed as parity
+    /// (CBACT04C-037).
+    ResourceUnavailable,
+    /// `30`, a permanent error: the stand-in for every other database or file-system failure.
+    /// `HALTED(H4)`: no VSAM status maps to such a failure, so it is not claimed as parity
+    /// (CBACT04C-037, X-INTCALC-H3).
+    Permanent,
+}
+
+impl Status {
+    /// The two status characters `9910-DISPLAY-IO-STATUS` receives.
+    const fn code(self) -> [u8; 2] {
+        match self {
+            Self::NotFound => *b"23",
+            Self::ResourceUnavailable => *b"93",
+            Self::Permanent => *b"30",
+        }
+    }
+}
+
 /// Runs INTCALC with the PARM of `args`: rewrites every account in key order but the last,
 /// writes the next `SYSTRAN` generation under `Config::systran_dir` and returns its path,
 /// return code 0, and the counts `records` (category balances read), `transactions` (SYSTRAN
@@ -152,19 +240,26 @@ const CLOSE_ACCTFILE_OP: &str = "CLOSE ACCTFILE";
 ///
 /// # Errors
 ///
-/// - [`JobError::Abend`] with `ERROR OPENING ACCOUNT MASTER FILE` when another run holds the
-///   claim on `accounts`, before any table is read or file created (CBACT04C-039).
-/// - [`JobError::Persistence`] when the run's session cannot be opened, the claim fails, a
-///   table cannot be read or a rewrite fails as a statement, as every statement does once the
-///   session is lost (CBACT04C-032, CBACT04C-033, CBACT04C-039).
-/// - [`JobError::Intcalc`] for the lookup abends of `CBACT04C` (CBACT04C-005, CBACT04C-007,
-///   CBACT04C-008, CBACT04C-011), after the account rewrite that preceded the failed lookup is
-///   persisted.
-/// - [`JobError::Abend`] with `ERROR RE-WRITING ACCOUNT FILE` when a rewrite finds no row
-///   (CBACT04C-032).
-/// - [`JobError::Io`] when the generation file cannot be allocated, created, written or synced
-///   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
-/// - [`JobError::GenerationLimit`] when generation 9999 of `SYSTRAN` exists (CBACT04C-034).
+/// [`JobError::Abend`] with the failure line of the path, after its job-log lines (see
+/// "Abends"):
+///
+/// - `ERROR OPENING TRANSACTION CATEGORY BALANCE` when the run's session cannot be opened, and
+///   `ERROR OPENING ACCOUNT MASTER FILE` when another run holds the claim on `accounts` or the
+///   claim fails, before any table is read or file created (CBACT04C-034, CBACT04C-039).
+/// - `ERROR READING ACCOUNT FILE`, `ERROR READING XREF FILE`,
+///   `ERROR READING DISCLOSURE GROUP FILE` or `ERROR READING TRANSACTION CATEGORY FILE` when
+///   that table cannot be read, as every statement fails once the session is lost
+///   (CBACT04C-033, CBACT04C-039).
+/// - `ERROR OPENING TRANSACTION FILE` when the generation cannot be allocated or created, or
+///   generation 9999 of `SYSTRAN` exists (CBACT04C-034).
+/// - `ERROR RE-WRITING ACCOUNT FILE` when a rewrite finds no row or fails (CBACT04C-032).
+/// - `ERROR WRITING TRANSACTION RECORD` when a SYSTRAN record cannot be written, and
+///   `ERROR CLOSING TRANSACTION FILE` when the generation cannot be flushed or synced
+///   (CBACT04C-031, CBACT04C-035).
+///
+/// [`JobError::Intcalc`] for the lookup abends of `CBACT04C` (CBACT04C-005, CBACT04C-007,
+/// CBACT04C-008, CBACT04C-011), after the account rewrite that preceded the failed lookup is
+/// persisted and the lookup's lines are emitted.
 ///
 /// Every rewrite committed before an error stands, the generation file is removed and the run's
 /// session is dropped, which gives up its claim on `accounts` (CBACT04C-038).
@@ -175,12 +270,27 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
     // commits on its own, as each VSAM rewrite stands once made (CBACT04C-026), so the job opens
     // no transaction.
     let mut session = open_acctfile(ctx.store).await?;
-    let accounts = AccountRepository::find_all(&mut session).await?;
-    let xrefs = CardXrefRepository::find_all(&mut session).await?;
-    let groups = DisclosureGroupRepository::find_all(&mut session).await?;
+    let accounts = AccountRepository::find_all(&mut session)
+        .await
+        .map_err(|error| shown_failure(READ_ACCTFILE_OP, READ_ACCOUNT_ERROR, &error))?;
+    let xrefs = CardXrefRepository::find_all(&mut session)
+        .await
+        .map_err(|error| shown_failure(READ_XREFFILE_OP, READ_XREF_ERROR, &error))?;
+    let groups = DisclosureGroupRepository::find_all(&mut session)
+        .await
+        .map_err(|error| shown_failure(READ_DISCGRP_OP, READ_DISCGRP_ERROR, &error))?;
     let mut intcalc = Intcalc::new(args.parm_date.clone(), accounts, xrefs, groups);
-    let mut systran = OutputFile::next_generation(&ctx.config.systran_dir(), SYSTRAN_BASE).await?;
-    let balances = TranCatBalanceRepository::find_all(&mut session).await?;
+    // The event names the setting of the directory, never its path: the job returns its abend,
+    // so `main` cannot name it in the error.
+    let mut systran = OutputFile::next_generation(&ctx.config.systran_dir(), SYSTRAN_BASE)
+        .await
+        .map_err(|error| {
+            let error = error.naming_output_dir(SYSTRAN_DIR_SETTING);
+            file_failure(OPEN_TRANFILE_OP, OPEN_TRANSACT_ERROR, &error)
+        })?;
+    let balances = TranCatBalanceRepository::find_all(&mut session)
+        .await
+        .map_err(|error| shown_failure(READ_TCATBALF_OP, READ_TCATBAL_ERROR, &error))?;
     let rewritten = post_interest(
         &mut intcalc,
         &balances,
@@ -192,38 +302,46 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
     // E08: the summary's unapplied last account and total are discarded, never rewritten;
     // only its counters are reported (CBACT04C-027).
     let summary = intcalc.finish();
-    let path = systran.finish().await?;
+    // `9400-TRANFILE-CLOSE`: a failure removes the generation and ends the run before the
+    // `END OF EXECUTION` line (CBACT04C-035).
+    let path = systran
+        .finish()
+        .await
+        .map_err(|error| file_failure(CLOSE_TRANFILE_OP, CLOSE_TRANSACT_ERROR, &error))?;
     close_acctfile(session).await;
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
         counts: vec![
-            ("records", summary.records_read()),
-            ("transactions", summary.transactions_written()),
-            ("accounts", count(rewritten)),
+            (JobCounter::Records, summary.records_read()),
+            (JobCounter::Transactions, summary.transactions_written()),
+            (JobCounter::Accounts, count(rewritten)),
         ],
     })
 }
 
 /// `0300-ACCTFILE-OPEN`, the `OPEN I-O` of the account cluster, which admits one writer: opens
-/// the run's session and claims `accounts` on it (`CBACT04C.cbl:289-305`; CBACT04C-039).
-/// Returns the session, on which the run then issues every statement.
+/// the run's session, the one connection that stands for the input opens before it, and claims
+/// `accounts` on it (`CBACT04C.cbl:234-305`; CBACT04C-034, CBACT04C-039). Returns the session,
+/// on which the run then issues every statement.
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] with the open's `ERROR OPENING ACCOUNT MASTER FILE` and no return code
-/// when another run holds the claim (CBACT04C-034, CBACT04C-038), and
-/// [`JobError::Persistence`] when the session cannot be opened or the claim fails as a
-/// statement. The session, when it was opened, is dropped as the error returns.
+/// [`JobError::Abend`] with no return code (CBACT04C-038): with the first open's
+/// `ERROR OPENING TRANSACTION CATEGORY BALANCE` and the stand-in status when the session cannot
+/// be opened (CBACT04C-034, X-INTCALC-7); with the account file's
+/// `ERROR OPENING ACCOUNT MASTER FILE` and status `93` when another run holds the claim, and
+/// with that line and the stand-in status when the claim fails as a statement (CBACT04C-039).
+/// The session, when it was opened, is dropped as the error returns.
 async fn open_acctfile(store: &PgStore) -> Result<PgSession, JobError> {
-    let mut session = store.session().await?;
-    if session.claim_writer(Dataset::Accounts).await? {
-        Ok(session)
-    } else {
-        Err(JobError::Abend {
-            code: None,
-            reason: OPEN_ACCOUNT_ERROR,
-        })
+    let mut session = store
+        .session()
+        .await
+        .map_err(|error| shown_failure(OPEN_TCATBALF_OP, OPEN_TCATBAL_ERROR, &error))?;
+    match session.claim_writer(Dataset::Accounts).await {
+        Ok(true) => Ok(session),
+        Ok(false) => Err(abend(OPEN_ACCOUNT_ERROR, Status::ResourceUnavailable)),
+        Err(error) => Err(shown_failure(OPEN_ACCTFILE_OP, OPEN_ACCOUNT_ERROR, &error)),
     }
 }
 
@@ -251,8 +369,11 @@ async fn close_acctfile(session: PgSession) {
 ///
 /// # Errors
 ///
-/// The first failure, as [`run`] reports it. A lookup abend carrying the previous account's
-/// update has that update rewritten first (CBACT04C-005, CBACT04C-038).
+/// The first failure, as [`run`] reports it: [`JobError::Abend`] with
+/// `ERROR RE-WRITING ACCOUNT FILE` or `ERROR WRITING TRANSACTION RECORD` (CBACT04C-031,
+/// CBACT04C-032), or [`JobError::Intcalc`] for a lookup abend, after its lines. A lookup abend
+/// carrying the previous account's update has that update rewritten first (CBACT04C-005,
+/// CBACT04C-038).
 async fn post_interest<A: AccountRepository>(
     intcalc: &mut Intcalc,
     balances: &[TranCatBalanceRecord],
@@ -268,7 +389,7 @@ async fn post_interest<A: AccountRepository>(
                 if let Some(account) = error.rewritten_before_abend() {
                     rewrite(accounts, account).await?;
                 }
-                return Err(JobError::Intcalc(error));
+                return Err(lookup_abend(error));
             }
         };
         for effect in effects {
@@ -278,7 +399,12 @@ async fn post_interest<A: AccountRepository>(
                     rewritten += 1;
                 }
                 IntcalcEffect::SystemTransaction(record) => {
-                    systran.write_record(&record.encode()).await?;
+                    systran
+                        .write_record(&record.encode())
+                        .await
+                        .map_err(|error| {
+                            file_failure(WRITE_TRANFILE_OP, WRITE_TRANSACT_ERROR, &error)
+                        })?;
                 }
             }
         }
@@ -291,21 +417,105 @@ async fn post_interest<A: AccountRepository>(
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] with the program's `ERROR RE-WRITING ACCOUNT FILE` when no row has the
-/// account's key, the status `23` of a `REWRITE` that finds no record, and
-/// [`JobError::Persistence`] when the statement fails (CBACT04C-032).
+/// [`JobError::Abend`] with the program's `ERROR RE-WRITING ACCOUNT FILE` (CBACT04C-032): with
+/// `FILE STATUS IS: NNNN0023` when no row has the account's key, the status `23` of a `REWRITE`
+/// that finds no record (CBACT04C-036), and after the event carrying the error, with the
+/// stand-in status, when the statement fails (CBACT04C-037).
 async fn rewrite<A: AccountRepository>(
     accounts: &mut A,
     account: &AccountRecord,
 ) -> Result<(), JobError> {
-    if AccountRepository::update(accounts, account).await? {
-        Ok(())
-    } else {
-        Err(JobError::Abend {
-            code: None,
-            reason: REWRITE_ACCOUNT_ERROR,
-        })
+    match AccountRepository::update(accounts, account).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(abend(REWRITE_ACCOUNT_ERROR, Status::NotFound)),
+        Err(error) => Err(shown_failure(
+            REWRITE_ACCTFILE_OP,
+            REWRITE_ACCOUNT_ERROR,
+            &error,
+        )),
     }
+}
+
+/// The failure of repository call `operation` on the path that displays `line`, with the
+/// stand-in status: the event carrying the error, then the path's lines and the abend.
+fn shown_failure(
+    operation: &'static str,
+    line: &'static str,
+    error: &PersistenceError,
+) -> JobError {
+    report(operation, error);
+    abend(line, Status::Permanent)
+}
+
+/// The failure of local-file call `operation` on the path that displays `line`, with the
+/// stand-in status: the event carrying the error, then the path's lines and the abend.
+fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -> JobError {
+    report_file(operation, error);
+    abend(line, Status::Permanent)
+}
+
+/// Reports why a repository call failed, for the operator: the file operation it replaces and
+/// the error's text, which names an SQLSTATE, a constraint or a column only (Cardholder Data
+/// Redaction).
+fn report(operation: &'static str, error: &PersistenceError) {
+    tracing::error!(operation, error = %error, "CBACT04C database call failed");
+}
+
+/// Reports why a local-file call failed: the file operation and the error's text, a static step
+/// and the I/O error kind, or the generation limit and the `SYSTRAN` base, never the path.
+fn report_file(operation: &'static str, error: &JobError) {
+    tracing::error!(operation, error = %error, "CBACT04C file operation failed");
+}
+
+/// `9999-ABEND-PROGRAM` after the failure line `line` and the status line of `status`, as
+/// [`show_abend`] emits them. The abend carries no return code, and the caller returns it at
+/// once, which drops the unfinished generation and so removes it.
+fn abend(line: &'static str, status: Status) -> JobError {
+    show_abend(line, status);
+    JobError::Abend {
+        code: None,
+        reason: line,
+    }
+}
+
+/// The job log of the first open's failure when `main` cannot connect to `PostgreSQL`, the
+/// connection that stands for the four input opens: `ERROR OPENING TRANSACTION CATEGORY BALANCE`,
+/// the stand-in status line and `ABENDING PROGRAM`, as for a session that cannot be opened
+/// (CBACT04C-034, CBACT04C-038, X-INTCALC-7). No other line precedes them, as the normal-run
+/// lines stay unwritten (X-INTCALC-4), and `main` reports the connection error itself.
+pub(crate) fn show_failed_connection() {
+    show_abend(OPEN_TCATBAL_ERROR, Status::Permanent);
+}
+
+/// The `DISPLAY` lines of a failure path: the failure line `line` and the status line of
+/// `status`, each an `ERROR` event whose message is the line (X-INTCALC-4; CBACT04C-036,
+/// CBACT04C-037), then `ABENDING PROGRAM` (CBACT04C-038).
+fn show_abend(line: &'static str, status: Status) {
+    tracing::error!("{line}");
+    tracing::error!("{}", file_status_line(status.code()));
+    abending_program();
+}
+
+/// `DISPLAY 'ABENDING PROGRAM'` and the `CALL 'CEE3ABD'` that follows it: one `ERROR` event
+/// whose field `abend_code` records `ABCODE`, 999 (`CBACT04C.cbl:628-632`; CBACT04C-038,
+/// X-INTCALC-3).
+fn abending_program() {
+    tracing::error!(abend_code = ABEND_CODE, "{ABEND_LINE}");
+}
+
+/// A lookup abend the domain returns: each line `CBACT04C` displays for it, in order and as
+/// `ERROR` events, `ABENDING PROGRAM` with its abend code among them (CBACT04C-005,
+/// CBACT04C-007, CBACT04C-008, CBACT04C-011, CBACT04C-038), then the error. The lines show an
+/// account ID at most, never a card number.
+fn lookup_abend(error: IntcalcError) -> JobError {
+    for line in error.sysout_lines() {
+        if line == ABEND_LINE {
+            abending_program();
+        } else {
+            tracing::error!("{line}");
+        }
+    }
+    JobError::Intcalc(error)
 }
 
 #[cfg(test)]
@@ -337,6 +547,7 @@ mod tests {
     use runtime::config::Config;
     use test_support::fixtures::{fixture_path, start_loaded_postgres};
     use test_support::postgres::PostgresGuard;
+    use test_support::trace_capture::{self, TraceCapture};
 
     use super::{OPEN_ACCOUNT_ERROR, post_interest, run};
     use crate::cli::IntcalcArgs;
@@ -733,27 +944,53 @@ mod tests {
     enum Ends {
         /// `ERROR RE-WRITING ACCOUNT FILE`: the rewrite found no row.
         RewriteNotFound,
-        /// The rewrite failed as a statement.
+        /// `ERROR RE-WRITING ACCOUNT FILE`: the rewrite failed as a statement.
         StoreFailure,
         /// The account lookup at a break found no record.
         AccountNotFound,
     }
 
     /// One abending run: the accounts the table holds, whether every update fails, the accounts
-    /// of the two category balances, the expected end and the rewrites that stand.
+    /// of the two category balances, the expected end, the rewrites that stand and the messages
+    /// of the events the run emits, in order.
     struct Case {
         held: &'static [u64],
         failing: bool,
         keys: [u64; 2],
         ends: Ends,
         kept: &'static [u64],
+        log: &'static [&'static str],
+    }
+
+    /// The job log of a rewrite that finds no row: the failure line, status `23` and the abend
+    /// (CBACT04C-032, CBACT04C-036, CBACT04C-038).
+    const REWRITE_NOT_FOUND_LOG: &[&str] = &[
+        "ERROR RE-WRITING ACCOUNT FILE",
+        "FILE STATUS IS: NNNN0023",
+        "ABENDING PROGRAM",
+    ];
+
+    /// The messages of the JSON events `capture` holds, in order.
+    fn messages(capture: &TraceCapture) -> Vec<String> {
+        capture
+            .lines()
+            .iter()
+            .filter_map(|line| {
+                let (_, rest) = line.split_once(r#""message":""#)?;
+                let (message, _) = rest.split_once('"')?;
+                Some(message.to_owned())
+            })
+            .collect()
     }
 
     /// Each abend ends the loop with its error, keeps the rewrites committed before it, the one
     /// made at the failing break included, and leaves no generation file once the output is
-    /// dropped. A rewrite that precedes a failed lookup and fails itself is the abend.
+    /// dropped. A rewrite that precedes a failed lookup and fails itself is the abend. Its job
+    /// log is the path's lines, after the event carrying the error when the rewrite failed as a
+    /// statement, ending with `ABENDING PROGRAM`, which records abend code 999.
     // audit: CBACT04C-005
     // audit: CBACT04C-032
+    // audit: CBACT04C-036
     // audit: CBACT04C-038
     #[tokio::test]
     async fn abends_keep_the_rewrites_made_before_them() -> TestResult {
@@ -764,6 +1001,7 @@ mod tests {
                 keys: [1, 2],
                 ends: Ends::RewriteNotFound,
                 kept: &[],
+                log: REWRITE_NOT_FOUND_LOG,
             },
             Case {
                 held: &[1, 2],
@@ -771,6 +1009,12 @@ mod tests {
                 keys: [1, 2],
                 ends: Ends::StoreFailure,
                 kept: &[],
+                log: &[
+                    "CBACT04C database call failed",
+                    "ERROR RE-WRITING ACCOUNT FILE",
+                    "FILE STATUS IS: NNNN0030",
+                    "ABENDING PROGRAM",
+                ],
             },
             Case {
                 held: &[1, 2],
@@ -778,6 +1022,12 @@ mod tests {
                 keys: [1, 3],
                 ends: Ends::AccountNotFound,
                 kept: &[1],
+                log: &[
+                    "ACCOUNT NOT FOUND: 00000000003",
+                    "ERROR READING ACCOUNT FILE",
+                    "FILE STATUS IS: NNNN0023",
+                    "ABENDING PROGRAM",
+                ],
             },
             Case {
                 held: &[2],
@@ -785,6 +1035,7 @@ mod tests {
                 keys: [1, 3],
                 ends: Ends::RewriteNotFound,
                 kept: &[],
+                log: REWRITE_NOT_FOUND_LOG,
             },
         ];
         for Case {
@@ -793,6 +1044,7 @@ mod tests {
             keys,
             ends,
             kept,
+            log,
         } in cases
         {
             let scratch = Scratch::new()?;
@@ -807,24 +1059,32 @@ mod tests {
                 .into_iter()
                 .map(|id| balance(id, 120_000))
                 .collect::<Result<Vec<_>, _>>()?;
+            let capture = trace_capture::capture();
             let error = post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran)
                 .await
                 .err()
                 .ok_or("the run abends")?;
             let matched = match ends {
-                Ends::RewriteNotFound => matches!(
+                Ends::RewriteNotFound | Ends::StoreFailure => matches!(
                     &error,
                     JobError::Abend { code: None, reason } if *reason == REWRITE_ACCOUNT_ERROR
                 ),
-                Ends::StoreFailure => {
-                    matches!(&error, JobError::Persistence(PersistenceError::Unavailable))
-                }
                 Ends::AccountNotFound => matches!(
                     &error,
                     JobError::Intcalc(IntcalcError::AccountNotFound { .. })
                 ),
             };
             assert!(matched, "{ends:?} ended with {error}");
+            assert_eq!(messages(&capture), log, "{ends:?}");
+            assert!(
+                capture.lines().iter().any(|line| {
+                    line.contains(r#""message":"ABENDING PROGRAM""#)
+                        && line.contains(r#""abend_code":999"#)
+                        && line.contains(r#""level":"ERROR""#)
+                }),
+                "{ends:?}: no ERROR event `ABENDING PROGRAM` records abend code 999"
+            );
+            drop(capture);
             let kept = kept
                 .iter()
                 .map(|&id| PicU::new(id))
