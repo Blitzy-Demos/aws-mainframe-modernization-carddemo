@@ -1,0 +1,484 @@
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useForm, type FieldErrors } from "react-hook-form";
+import { useLocation, useNavigate } from "react-router";
+import { useCotrn00cList } from "@/api/hooks";
+import type { components } from "@/api/schema";
+import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
+import { ScreenShell } from "@/components/screen/ScreenShell";
+import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+// `CCDA-MSG-INVALID-KEY` comes from the shared header module, the one copy every screen shows.
+import { INVALID_KEY } from "@/lib/header";
+import { KEY_ROWS, keyRowItems, type PfKeyHandlers } from "@/lib/pfkeys";
+import { PATHS, SCREENS } from "@/routes";
+import { COTRN00_LENGTHS, cotrn00Schema, type Cotrn00Values } from "@/schemas/COTRN00";
+
+/**
+ * `COTRN00C`'s message for a selection code other than `S` (`app/cbl/COTRN00C.cbl:196-203`;
+ * COTRN00C-010).
+ */
+const INVALID_SELECTION = "Invalid selection. Valid value is S";
+
+/**
+ * The program's message for a failed page read (`app/cbl/COTRN00C.cbl:612-618`; COTRN00C-027),
+ * shown when a failure carries no message of its own.
+ */
+const LOOKUP_FAILED = "Unable to lookup transaction...";
+
+/** Line 21, `POS=(21,12) LENGTH=50`, NEUTRAL BRT (COTRN00-087). */
+const INSTRUCTION = "Type 'S' to View Transaction details from the list";
+
+/** The row-24 labels in map order (COTRN00-089, COTRN00-096 to COTRN00-099). */
+const KEY_ITEMS = keyRowItems(KEY_ROWS.COTRN00);
+
+/**
+ * The list's column captions (line 8) and rules (line 9), each its map `INITIAL` with its
+ * padding (COTRN00-017 to COTRN00-026).
+ */
+const COLUMNS = [
+  { caption: "Sel", rule: "---" },
+  { caption: " Transaction ID ", rule: "----------------" },
+  { caption: "  Date  ", rule: "--------" },
+  { caption: "     Description          ", rule: "--------------------------" },
+  { caption: "   Amount   ", rule: "------------" },
+] as const;
+
+/*
+ * BLITZY [LAYOUT]: list cells use `py-0.5` instead of the cell's `p-2` vertical padding, so each
+ * list line is one map line tall, the height of the screen grid's other lines (an input plus the
+ * line gap), and the ten lines keep the terminal's 24-line rhythm.
+ */
+const LINE = "py-0.5";
+
+/**
+ * BLUE list values, shown byte for byte with their trailing spaces (COTRN00C-028 to
+ * COTRN00C-032), one map line tall.
+ */
+const VALUE = "whitespace-pre py-0.5 text-muted-foreground";
+
+/** `SPACES` or `LOW-VALUES`, the COBOL test for an empty selector or transaction ID. */
+const BLANK = /^[ \u0000]*$/;
+
+/**
+ * The paging state of `CDEMO-CT00-INFO` a menu entry starts from: no keys, page 0, next-page
+ * flag `N` (COTRN00C-002). Every later state is the one the last response returned.
+ */
+const BLANK_PAGING: Pick<
+  components["schemas"]["TranListResponse"],
+  "first_key" | "last_key" | "page_no" | "has_next_page"
+> = { first_key: null, last_key: null, page_no: 0, has_next_page: false };
+
+/** The ten list lines before any page is read: all blank. */
+const BLANK_ROWS: components["schemas"]["TranListResponse"]["rows"] = Array.from(
+  { length: COTRN00_LENGTHS.rows },
+  () => null,
+);
+
+/** The transfer keys endpoint 11 accepts on the request that brings the screen up. */
+const ENTRY_KEYS: readonly components["schemas"]["TranListEntryKey"][] = ["enter", "pf3", "pf5"];
+
+/**
+ * The key a request is sent for: the entry request, ENTER, F7 or F8. It decides the paging state
+ * kept after a failure and whether a page read clears the search field.
+ */
+type ListKey = "entry" | "enter" | "pf7" | "pf8";
+
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === "object" && value !== null;
+}
+
+function isBlank(text: string): boolean {
+  return BLANK.test(text);
+}
+
+/** A paging key as the state may hold it: text, or nothing when the key is blank. */
+function isPagingKey(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+/**
+ * The transfer that brought the screen up (COTRN00C-003, COTRN00C-004).
+ *
+ * COTRN01 returns here by F3, when the list transferred to it, and by F5, with route state
+ * `{ from: PATHS.COTRN01, entry_key: "pf3" | "pf5", list? }`; `list` is the paging state this
+ * screen handed over, passed back unchanged when there was one (COTRN00C-002). An `entry_key`
+ * endpoint 11 accepts names the key. Otherwise the origin decides: `from` `/transactions/view`
+ * reads as COTRN01's F5, and the menu and every other origin enter as ENTER, which the API also
+ * reads F3 as. F5 matters because the program's skip read then drops the lowest transaction
+ * (X-COTRN00C-2).
+ */
+function entryKeyOf(state: unknown): components["schemas"]["TranListEntryKey"] {
+  if (!isRecord(state)) {
+    return "enter";
+  }
+  const named = ENTRY_KEYS.find((key) => key === state.entry_key);
+  if (named !== undefined) {
+    return named;
+  }
+  return state.from === PATHS.COTRN01 ? "pf5" : "enter";
+}
+
+/**
+ * The paging state a transfer hands back in route state under `list`, as COTRN01C returns the
+ * COMMAREA it received (COTRN00C-002); the blank state when there is none or it is malformed.
+ * The state grants nothing: endpoint 11 re-reads every page.
+ */
+function pagingOf(state: unknown): typeof BLANK_PAGING {
+  const list = isRecord(state) ? state.list : undefined;
+  if (!isRecord(list)) {
+    return BLANK_PAGING;
+  }
+  const { first_key, last_key, page_no, has_next_page } = list;
+  if (
+    isPagingKey(first_key) &&
+    isPagingKey(last_key) &&
+    typeof page_no === "number" &&
+    Number.isInteger(page_no) &&
+    page_no >= 0 &&
+    typeof has_next_page === "boolean"
+  ) {
+    return { first_key: first_key ?? null, last_key: last_key ?? null, page_no, has_next_page };
+  }
+  return BLANK_PAGING;
+}
+
+/** The state as endpoint 11 takes it back: every field echoed, a blank key left out. */
+function echo(paging: typeof BLANK_PAGING) {
+  return {
+    first_key: paging.first_key ?? undefined,
+    last_key: paging.last_key ?? undefined,
+    page_no: paging.page_no,
+    has_next_page: paging.has_next_page,
+  };
+}
+
+/**
+ * The state after a 400 or a 500, whose `ScreenError` carries none: the echoed state with page
+ * number 0 after ENTER or the entry request, which reset it before the read, and the next-page
+ * flag `Y` after F7, which sets it before the read (COTRN00C-013, COTRN00C-027).
+ */
+function afterFailure(paging: typeof BLANK_PAGING, key: ListKey): typeof BLANK_PAGING {
+  return {
+    ...paging,
+    page_no: key === "entry" || key === "enter" ? 0 : paging.page_no,
+    has_next_page: key === "pf7" ? true : paging.has_next_page,
+  };
+}
+
+/** `PAGENUM`: the `PIC 9(08)` page number moved to `X(8)`, eight digits (COTRN00C-036). */
+function pageNumberText(pageNo: number): string {
+  return String(pageNo).padStart(8, "0");
+}
+
+/** The failure's message: the `ScreenError` text, or the network or status error's own. */
+function failureText(reason: unknown): string {
+  return isRecord(reason) && typeof reason.message === "string" ? reason.message : LOOKUP_FAILED;
+}
+
+/** The first message the form schema reports, in field order. */
+function firstFormError(errors: FieldErrors<Cotrn00Values>): string | undefined {
+  const selectors = Array.from(
+    { length: COTRN00_LENGTHS.rows },
+    (_, index) => errors.selections?.[index]?.message,
+  );
+  return (
+    errors.startTranId?.message ??
+    errors.selections?.message ??
+    errors.selections?.root?.message ??
+    selectors.find((text) => text !== undefined)
+  );
+}
+
+/**
+ * List Transactions, map `COTRN0A` of transaction CT00 (COTRN00C), at `/transactions`: ten
+ * transactions to a page from endpoint 11 (`modern/audit/screens.md` COTRN00-001 to COTRN00-099;
+ * `modern/audit/online/COTRN00C.md`).
+ *
+ * - Entry reads the first page with a blank search, as the program's first entry runs ENTER
+ *   (COTRN00C-003, COTRN00C-004).
+ * - ENTER: the first non-blank selector in row order decides (COTRN00C-007). `S` or `s` on a row
+ *   that holds a transaction opens it at `/transactions/view` with no request (COTRN00C-008); any
+ *   other code on such a row sends the search with `Invalid selection. Valid value is S` pending,
+ *   which a message of the response or of a `ScreenError` replaces (COTRN00C-010, COTRN00C-035);
+ *   a code on a blank row is ignored (COTRN00C-009). Otherwise ENTER searches from the typed ID.
+ * - F7 and F8 page backward and forward from the echoed paging state (COTRN00C-015 to
+ *   COTRN00C-026); F3 returns to the main menu (COTRN00C-005); any other F-key shows the
+ *   invalid-key message (COTRN00C-006).
+ * - The rows, `PAGENUM` and the search field change only when a page was read, the search field
+ *   clearing after a forward page (COTRN00C-036, COTRN00C-037). Selectors are never cleared
+ *   (COTRN00C-038), and the cursor returns to the search field after every answer.
+ *
+ * The page size is never sent, so the server's ten rows, the map's, decide each page.
+ */
+export function COTRN00(): ReactNode {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const list = useCotrn00cList();
+  const formId = useId();
+  const pageId = useId();
+  const form = useForm<Cotrn00Values>({
+    resolver: zodResolver(cotrn00Schema),
+    defaultValues: {
+      startTranId: "",
+      selections: Array.from({ length: COTRN00_LENGTHS.rows }, () => ""),
+    },
+  });
+  const [rows, setRows] = useState(BLANK_ROWS);
+  const [pageLabel, setPageLabel] = useState("");
+  const [paging, setPaging] = useState(() => pagingOf(location.state));
+  const [message, setMessage] = useState<string>();
+  const [busy, setBusy] = useState(false);
+  // One request at a time, as the terminal keyboard locks until the program answers.
+  const inFlight = useRef(false);
+  // The entry request runs once, also when StrictMode runs the mount effect twice.
+  const entered = useRef(false);
+
+  /**
+   * Sends endpoint 11 for `key` with the current paging state echoed, then shows the answer.
+   * The promise of `mutateAsync` carries the answer, so it lands even when the mutation
+   * observer is detached, as StrictMode's simulated unmount does to the entry request.
+   */
+  function send(
+    key: ListKey,
+    query: NonNullable<Parameters<typeof list.mutateAsync>[0]["query"]>,
+    selectionMessage?: string,
+  ): void {
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    const sent = paging;
+    void list
+      .mutateAsync({ query: { ...query, ...echo(sent) } })
+      .then(
+        (page) => {
+          setPaging({
+            first_key: page.first_key ?? null,
+            last_key: page.last_key ?? null,
+            page_no: page.page_no,
+            has_next_page: page.has_next_page,
+          });
+          if (!page.rows_kept) {
+            setRows(page.rows);
+            setPageLabel(pageNumberText(page.page_no));
+            if (key !== "pf7") {
+              form.setValue("startTranId", "");
+            }
+          }
+          setMessage(page.message ?? selectionMessage);
+        },
+        (reason: unknown) => {
+          setPaging(afterFailure(sent, key));
+          setMessage(failureText(reason));
+        },
+      )
+      .finally(() => {
+        inFlight.current = false;
+        setBusy(false);
+        form.setFocus("startTranId");
+      });
+  }
+
+  useEffect(() => {
+    if (entered.current) {
+      return;
+    }
+    entered.current = true;
+    send("entry", { entry_key: entryKeyOf(location.state) });
+    // Runs on mount only: later requests come from the keys.
+  }, []);
+
+  function onEnter(values: Cotrn00Values): void {
+    const selected = values.selections.findIndex((code) => !isBlank(code));
+    let selectionMessage: string | undefined;
+    if (selected >= 0) {
+      const code = values.selections[selected];
+      const tranId = rows[selected]?.tran_id ?? "";
+      if (!isBlank(tranId)) {
+        if (code === "S" || code === "s") {
+          navigate(PATHS.COTRN01, {
+            state: { from: PATHS.COTRN00, tran_id: tranId, list: paging },
+          });
+          return;
+        }
+        selectionMessage = INVALID_SELECTION;
+      }
+    }
+    send(
+      "enter",
+      { start_tran_id: values.startTranId === "" ? undefined : values.startTranId },
+      selectionMessage,
+    );
+  }
+
+  function onInvalid(errors: FieldErrors<Cotrn00Values>): void {
+    setMessage(firstFormError(errors));
+  }
+
+  const handlers: PfKeyHandlers = {
+    F3: () => {
+      navigate(PATHS.COMEN01);
+    },
+    F7: () => {
+      send("pf7", { direction: "backward" });
+    },
+    F8: () => {
+      send("pf8", { direction: "forward" });
+    },
+  };
+  // ENTER has no action of its own, so its button and the Enter key submit the form.
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: handlers[item.key] }));
+
+  return (
+    <ScreenShell
+      transaction={SCREENS.COTRN00.transaction}
+      program={SCREENS.COTRN00.program}
+      title="List Transactions"
+      formId={formId}
+      message={{ kind: "error", text: message }}
+      keys={keys}
+      keyOptions={{
+        foldShifted: KEY_ROWS.COTRN00.foldShifted,
+        onInvalidKey: () => {
+          setMessage(INVALID_KEY);
+          form.setFocus("startTranId");
+        },
+      }}
+    >
+      <Form {...form}>
+        <form
+          id={formId}
+          noValidate
+          aria-busy={busy}
+          onSubmit={form.handleSubmit(onEnter, onInvalid)}
+        >
+          {/*
+           * Auto-height lines: with the grid's equal lines, the ten-row table on line 8 would
+           * make every one of the 24 lines as tall as the table.
+           */}
+          <FieldGrid className="grid-rows-none">
+            <GridCell row={4} col={65} span={5}>
+              <Label htmlFor={pageId} className="h-9 whitespace-pre font-semibold text-foreground">
+                Page:
+              </Label>
+            </GridCell>
+            <GridCell row={4} col={71} span={8}>
+              {/*
+               * ASKIP output: the cursor skips it, as on the terminal.
+               * BLITZY [LAYOUT]: `px-2` instead of the input's `px-3`, so the eight digits fit the
+               * eight-column cell on screens down to about 1000px wide.
+               */}
+              <Input
+                id={pageId}
+                readOnly
+                tabIndex={-1}
+                value={pageLabel}
+                className="px-2 text-muted-foreground"
+              />
+            </GridCell>
+            <FormField
+              control={form.control}
+              name="startTranId"
+              render={({ field }) => (
+                // `contents` makes the label and input cells items of the screen grid.
+                <FormItem className="contents">
+                  <GridCell row={6} col={5} span={15}>
+                    <FormLabel className="h-9 whitespace-pre text-foreground">
+                      Search Tran ID:
+                    </FormLabel>
+                  </GridCell>
+                  <GridCell row={6} col={21} span={16}>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        maxLength={COTRN00_LENGTHS.startTranId}
+                        autoComplete="off"
+                        autoFocus
+                      />
+                    </FormControl>
+                  </GridCell>
+                </FormItem>
+              )}
+            />
+            <GridCell row={8} col={2} span={77}>
+              {/*
+               * BLITZY [A11Y]: the selectors keep the input's default `h-9` (36px) square, below
+               * the 44px touch-target guidance, and its focus ring (`ring-ring/50`) is about 1.5:1
+               * against the card, below 3:1. Both are the system's defaults; flagged for designer
+               * review.
+               */}
+              <Table aria-label="Transactions">
+                <TableHeader>
+                  <TableRow>
+                    {COLUMNS.map((column) => (
+                      <TableHead key={column.caption} scope="col" className="whitespace-pre">
+                        {column.caption}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                  {/* Line 9's rules are decoration under the captions. */}
+                  <TableRow aria-hidden="true">
+                    {COLUMNS.map((column) => (
+                      <TableHead key={column.caption} className="whitespace-pre">
+                        {column.rule}
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {Array.from({ length: COTRN00_LENGTHS.rows }, (_, index) => {
+                    const row = rows[index] ?? null;
+                    return (
+                      <TableRow key={index}>
+                        <TableCell className={LINE}>
+                          <FormField
+                            control={form.control}
+                            name={`selections.${index}`}
+                            render={({ field }) => (
+                              <FormItem>
+                                <FormLabel className="sr-only">
+                                  {`Select row ${index + 1}`}
+                                </FormLabel>
+                                <FormControl>
+                                  <Input
+                                    {...field}
+                                    maxLength={COTRN00_LENGTHS.selection}
+                                    autoComplete="off"
+                                    className="w-9 text-center"
+                                  />
+                                </FormControl>
+                              </FormItem>
+                            )}
+                          />
+                        </TableCell>
+                        <TableCell className={VALUE}>{row?.tran_id ?? ""}</TableCell>
+                        <TableCell className={VALUE}>{row?.display_date ?? ""}</TableCell>
+                        <TableCell className={VALUE}>{row?.description ?? ""}</TableCell>
+                        <TableCell className={VALUE}>{row?.amount ?? ""}</TableCell>
+                      </TableRow>
+                    );
+                  })}
+                </TableBody>
+              </Table>
+            </GridCell>
+            <GridCell row={21} col={12} span={50}>
+              <p className="whitespace-pre font-semibold text-foreground">{INSTRUCTION}</p>
+            </GridCell>
+          </FieldGrid>
+        </form>
+      </Form>
+    </ScreenShell>
+  );
+}

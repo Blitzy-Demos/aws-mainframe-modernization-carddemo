@@ -14,10 +14,11 @@
 @custom-variant dark (&:is(.dark *));
 
 /*
- * FieldGrid computes these classes from each BMS field's POS and LENGTH, so the
- * source scanner cannot find them (24 x 80 terminal grid).
+ * FieldGrid computes these classes from each BMS field's POS and LENGTH, and from
+ * the map lines a list table spans, so the source scanner cannot find them
+ * (24 x 80 terminal grid).
  */
-@source inline("col-start-{1..80} col-span-{1..80} row-start-{1..24}");
+@source inline("col-start-{1..80} col-span-{1..80} row-start-{1..24} row-span-{1..24}");
 
 :root {
   --radius: 0.625rem;

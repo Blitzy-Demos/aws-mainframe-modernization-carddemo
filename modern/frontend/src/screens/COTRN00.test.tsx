@@ -1,0 +1,1078 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { components } from "@/api/schema";
+import { setSession } from "@/auth/session";
+import { INVALID_KEY, TITLE01, TITLE02 } from "@/lib/header";
+import { PATHS } from "@/routes";
+import { COTRN00 } from "./COTRN00";
+// The shared render-test contract imports only the screen under test; COTRN00C-002's round trip
+// is proved through the real COTRN01, whose hand-back of the paging state is half of the rule.
+import { COTRN01 } from "./COTRN01";
+
+/**
+ * Render test of map `COTRN0A` (transaction CT00, program COTRN00C) at `/transactions`, run in
+ * jsdom with the global `fetch` stubbed, so no request leaves the test (Local-Only Runtime).
+ * Endpoint 11, `GET /api/v1/transactions`, is the only operation the screen calls; any other
+ * request is answered 500 and recorded, and every test asserts how many requests were sent.
+ *
+ * The transaction IDs are fake, and `TranListResponse` has no card-number field, so no fixture
+ * carries cardholder data (Cardholder Data Redaction).
+ */
+
+const TOKEN = "test-token";
+const LIST_PATH = "/api/v1/transactions";
+
+/** The program's messages, as `modern/audit/online/COTRN00C.md` words them. */
+const INVALID_SELECTION = "Invalid selection. Valid value is S";
+const NOT_NUMERIC = "Tran ID must be Numeric ...";
+const BOTTOM_REACHED = "You have reached the bottom of the page...";
+const ALREADY_BOTTOM = "You are already at the bottom of the page...";
+const ALREADY_TOP = "You are already at the top of the page...";
+const LOOKUP_FAILED = "Unable to lookup transaction...";
+
+/** Transaction ID `n` as the 16 characters of `TRAN-ID PIC X(16)`. */
+function tranId(n: number): string {
+  return String(n).padStart(16, "0");
+}
+
+/** `TRAN-AMT` edited by `PIC +99999999.99`: twelve characters each, shown as received. */
+const AMOUNTS = [
+  "+00000050.47",
+  "-00000091.90",
+  "+00000006.78",
+  "+00001234.56",
+  "-00000000.01",
+  "+00000100.00",
+  "+99999999.99",
+  "-00000450.00",
+  "+00000012.34",
+  "+00000000.00",
+] as const;
+
+/**
+ * Page 1 of a first entry: ten transactions of 2022-06-10, a following page and no message
+ * (COTRN00C-014, COTRN00C-016). Half of them are stamped at midnight and half at the last
+ * microsecond of the day, and the eight-character `MM/DD/YY` display date is the same for all.
+ */
+const FIRST_PAGE: components["schemas"]["TranListResponse"] = {
+  rows: AMOUNTS.map((amount, index) => ({
+    tran_id: tranId(index + 1),
+    orig_ts: index % 2 === 0 ? "2022-06-10T00:00:00" : "2022-06-10T23:59:59.999999",
+    display_date: "06/10/22",
+    description: `Purchase ${index + 1}`.padEnd(26, " "),
+    amount,
+  })),
+  first_key: tranId(1),
+  last_key: tranId(10),
+  page_no: 1,
+  has_next_page: true,
+  message: null,
+  rows_kept: false,
+};
+
+/** Page 2, the last one: transactions 11 to 20 and the end-of-file message (COTRN00C-017). */
+const SECOND_PAGE: components["schemas"]["TranListResponse"] = {
+  rows: [...AMOUNTS].reverse().map((amount, index) => ({
+    tran_id: tranId(index + 11),
+    orig_ts: "2022-06-11T12:00:00",
+    display_date: "06/11/22",
+    description: `Refund ${index + 11}`.padEnd(26, " "),
+    amount,
+  })),
+  first_key: tranId(11),
+  last_key: tranId(20),
+  page_no: 2,
+  has_next_page: false,
+  message: BOTTOM_REACHED,
+  rows_kept: false,
+};
+
+/**
+ * A first page of three transactions, rows 4 to 10 blank; the last key keeps the blank state's
+ * value, as only row 10 sets it (COTRN00C-018).
+ */
+const SHORT_PAGE: components["schemas"]["TranListResponse"] = {
+  rows: [...FIRST_PAGE.rows.slice(0, 3), ...Array.from({ length: 7 }, () => null)],
+  first_key: tranId(1),
+  last_key: null,
+  page_no: 1,
+  has_next_page: false,
+  message: BOTTOM_REACHED,
+  rows_kept: false,
+};
+
+/** F8 on the last page: nothing read, the screen keeps what it shows (COTRN00C-021). */
+const BOTTOM_KEPT: components["schemas"]["TranListResponse"] = {
+  rows: [],
+  first_key: tranId(11),
+  last_key: tranId(20),
+  page_no: 2,
+  has_next_page: false,
+  message: ALREADY_BOTTOM,
+  rows_kept: true,
+};
+
+/** F7 on page 1: nothing read, the screen keeps what it shows (COTRN00C-022). */
+const TOP_KEPT: components["schemas"]["TranListResponse"] = {
+  rows: [],
+  first_key: tranId(1),
+  last_key: tranId(10),
+  page_no: 1,
+  has_next_page: true,
+  message: ALREADY_TOP,
+  rows_kept: true,
+};
+
+/** The 400 of a search value that is neither blank nor 16 digits (COTRN00C-013). */
+const NOT_NUMERIC_ERROR: components["schemas"]["ScreenError"] = {
+  message: NOT_NUMERIC,
+  field: "start_tran_id",
+};
+
+/** The 500 of a page read that failed (COTRN00C-027). */
+const LOOKUP_ERROR: components["schemas"]["ScreenError"] = { message: LOOKUP_FAILED };
+
+/**
+ * Endpoint 12's view of transaction 3, which COTRN01 reads on a selection of row 3 of
+ * {@link FIRST_PAGE}; its card number is redacted, as the endpoint returns it.
+ */
+const VIEWED: components["schemas"]["TranViewResponse"] = {
+  tran_id: tranId(3),
+  card_num: "************5740",
+  type_cd: "01",
+  cat_cd: "0001",
+  source: "POS TERM  ",
+  description: "Purchase 3".padEnd(60, " "),
+  amount: AMOUNTS[2],
+  orig_ts: "2022-06-10T00:00:00",
+  proc_ts: null,
+  merchant_id: "800000000",
+  merchant_name: "Abshire-Lowe".padEnd(30, " "),
+  merchant_city: "North Enoshaven".padEnd(25, " "),
+  merchant_zip: "72112     ",
+  message: null,
+};
+
+/** A reply with a JSON body, as the API sends every page and every `ScreenError`. */
+function json(status: number, body: unknown): () => Response {
+  return () =>
+    new Response(JSON.stringify(body), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+}
+
+/**
+ * Replaces the global `fetch`. Each `GET /api/v1/transactions` (endpoint 11), and each
+ * `GET /api/v1/transactions/{tran_id}` (endpoint 12, which only COTRN01 sends, in the round trip
+ * of COTRN00C-002), takes the next of `replies`; any other request, and any past the last reply,
+ * is answered 500. Returns every request's method, path, full URL, query parameters and
+ * `Authorization` header, in order.
+ */
+function stubFetch(...replies: (() => Response)[]) {
+  const sent: {
+    method: string;
+    path: string;
+    url: string;
+    query: Record<string, string>;
+    authorization: string | null;
+  }[] = [];
+  const pending = [...replies];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(req.url);
+      sent.push({
+        method: req.method,
+        path: url.pathname,
+        url: req.url,
+        query: Object.fromEntries(url.searchParams),
+        authorization: req.headers.get("Authorization"),
+      });
+      const reply =
+        req.method === "GET" &&
+        (url.pathname === LIST_PATH || url.pathname.startsWith(`${LIST_PATH}/`))
+          ? pending.shift()
+          : undefined;
+      if (reply !== undefined) {
+        return reply();
+      }
+      const unexpected: components["schemas"]["ScreenError"] = {
+        message: `Unexpected request ${req.method} ${url.pathname}`,
+      };
+      return json(500, unexpected)();
+    }),
+  );
+  return sent;
+}
+
+/** A navigation target: its name, and the route state the transfer handed over, as JSON. */
+function TransferStub({ name }: { name: string }) {
+  const location = useLocation();
+  return (
+    <section aria-label={name}>
+      <h1>{name}</h1>
+      <output>{JSON.stringify(location.state ?? null)}</output>
+    </section>
+  );
+}
+
+/**
+ * Renders the screen at `/transactions` with `state`, beside stubs at its transfer targets, or
+ * with `view` instead of the stub at `/transactions/view`.
+ */
+function renderList(state?: unknown, view = <TransferStub name="View Transaction" />) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[{ pathname: PATHS.COTRN00, state }]}>
+        <Routes>
+          <Route path={PATHS.COTRN00} element={<COTRN00 />} />
+          <Route path={PATHS.COTRN01} element={view} />
+          <Route path={PATHS.COMEN01} element={<TransferStub name="Main Menu" />} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+/** The route state the transfer stub `name` shows, parsed back from its JSON. */
+function transferState(name: string): unknown {
+  const stub = screen.getByRole("region", { name });
+  return JSON.parse(within(stub).getByRole("status").textContent ?? "null");
+}
+
+/** Waits until `count` requests were sent and the screen shows the answer to the last one. */
+async function answered(sent: readonly unknown[], count: number): Promise<void> {
+  await waitFor(() => {
+    expect(sent).toHaveLength(count);
+    expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("false");
+  });
+}
+
+/** The value of an `<input>`. */
+function valueOf(element: HTMLElement): string {
+  if (!(element instanceof HTMLInputElement)) {
+    throw new TypeError(`${element.tagName} is not an input`);
+  }
+  return element.value;
+}
+
+function searchField(): HTMLElement {
+  return screen.getByLabelText("Search Tran ID:");
+}
+
+function pageField(): HTMLElement {
+  return screen.getByLabelText("Page:");
+}
+
+/** The selector of list row `row`, 1 to 10. */
+function selector(row: number): HTMLElement {
+  return screen.getByLabelText(`Select row ${row}`);
+}
+
+/** Types `value` into `field`, as one change event. */
+function typeInto(field: HTMLElement, value: string): void {
+  fireEvent.change(field, { target: { value } });
+}
+
+/** Clicks the row-24 key button labelled `label`. */
+function press(label: string): void {
+  fireEvent.click(screen.getByRole("button", { name: label }));
+}
+
+/** The table's two row groups: the caption and rule lines, then the ten list lines. */
+function rowGroups(): HTMLElement[] {
+  return within(screen.getByRole("table", { name: "Transactions" })).getAllByRole("rowgroup");
+}
+
+/** The ten list lines (screen lines 10 to 19). */
+function listLines(): HTMLElement[] {
+  const [, body] = rowGroups();
+  return within(body).getAllByRole("row");
+}
+
+/** The transaction ID, date, description and amount a list line shows, verbatim. */
+function lineValues(line: HTMLElement): (string | null)[] {
+  return within(line)
+    .getAllByRole("cell")
+    .slice(1)
+    .map((cell) => cell.textContent);
+}
+
+/** Asserts that the ten list lines show the rows of `page` exactly, blank rows empty. */
+function expectListed(page: components["schemas"]["TranListResponse"]): void {
+  const lines = listLines();
+  expect(lines).toHaveLength(10);
+  lines.forEach((line, index) => {
+    const row = page.rows[index] ?? null;
+    expect(lineValues(line)).toEqual(
+      row === null
+        ? ["", "", "", ""]
+        : [row.tran_id, row.display_date, row.description, row.amount],
+    );
+  });
+}
+
+/** The `ERRMSG` row (row 23), the screen's only message row. */
+function errorRow(): HTMLElement {
+  const rows = screen
+    .getAllByRole("alert")
+    .filter((alert) => alert.getAttribute("data-message-kind") === "error");
+  expect(rows).toHaveLength(1);
+  return rows[0];
+}
+
+/** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
+function headerField(name: string): string | null | undefined {
+  return document.querySelector(`[data-field="${name}"]`)?.textContent;
+}
+
+beforeEach(() => {
+  setSession(TOKEN, "USER0001", "U");
+});
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  sessionStorage.clear();
+});
+
+describe("COTRN00 List Transactions", () => {
+  it("renders the map: header rows, title, Page and Search Tran ID fields, list captions, instruction and the four key labels", async () => {
+    // audit: COTRN00-011
+    // audit: COTRN00-012
+    // audit: COTRN00-013
+    // audit: COTRN00-014
+    // audit: COTRN00-017
+    // audit: COTRN00-018
+    // audit: COTRN00-019
+    // audit: COTRN00-020
+    // audit: COTRN00-021
+    // audit: COTRN00-022
+    // audit: COTRN00-023
+    // audit: COTRN00-024
+    // audit: COTRN00-025
+    // audit: COTRN00-026
+    // audit: COTRN00-087
+    // audit: COTRN00-089
+    // audit: COTRN00-090
+    // audit: COTRN00-091
+    // audit: COTRN00-092
+    // audit: COTRN00-093
+    // audit: COTRN00-094
+    // audit: COTRN00-095
+    // audit: COTRN00C-039
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await answered(sent, 1);
+
+    expect(sent[0].authorization).toBe(`Bearer ${TOKEN}`);
+
+    expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("List Transactions");
+    expect(headerField("TRNNAME")).toBe("CT00");
+    expect(headerField("PGMNAME")).toBe("COTRN00C");
+    expect(headerField("TITLE01")).toBe(TITLE01);
+    expect(headerField("TITLE02")).toBe(TITLE02);
+    // Time-dependent fields are compared by format only.
+    expect(headerField("CURDATE")).toMatch(/^\d{2}\/\d{2}\/\d{2}$/);
+    expect(headerField("CURTIME")).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+
+    // PAGENUM, POS=(4,71) LENGTH=8: ASKIP output the cursor skips, showing endpoint 11's page.
+    expect(pageField().hasAttribute("readonly")).toBe(true);
+    expect(pageField().getAttribute("tabindex")).toBe("-1");
+    expect(pageField().parentElement?.className).toBe("row-start-4 col-start-71 col-span-8");
+    expect(valueOf(pageField())).toBe("00000001");
+    // TRNIDIN, POS=(6,21) LENGTH=16.
+    expect(searchField().getAttribute("maxlength")).toBe("16");
+    expect(searchField().parentElement?.className).toBe("row-start-6 col-start-21 col-span-16");
+
+    const [head] = rowGroups();
+    const [captions, rules] = within(head).getAllByRole("row", { hidden: true });
+    expect(
+      within(captions)
+        .getAllByRole("columnheader")
+        .map((cell) => cell.textContent),
+    ).toEqual([
+      "Sel",
+      " Transaction ID ",
+      "  Date  ",
+      "     Description          ",
+      "   Amount   ",
+    ]);
+    expect(rules.getAttribute("aria-hidden")).toBe("true");
+    expect(
+      within(rules)
+        .getAllByRole("columnheader", { hidden: true })
+        .map((cell) => cell.textContent),
+    ).toEqual(["---", "-".repeat(16), "-".repeat(8), "-".repeat(26), "-".repeat(12)]);
+
+    expect(
+      screen.getByText("Type 'S' to View Transaction details from the list").textContent,
+    ).toBe("Type 'S' to View Transaction details from the list");
+
+    const keys = within(screen.getByRole("group", { name: "Function keys" })).getAllByRole(
+      "button",
+    );
+    expect(keys.map((key) => key.textContent)).toEqual([
+      "ENTER=Continue",
+      "F3=Back",
+      "F7=Backward",
+      "F8=Forward",
+    ]);
+    const [enter, ...others] = keys;
+    expect(enter.getAttribute("type")).toBe("submit");
+    expect(enter.getAttribute("data-variant")).toBe("default");
+    // The ENTER button is the form's submit button, so the Enter key in a field submits it too.
+    expect(enter.getAttribute("form")).toBe(document.querySelector("form")?.id);
+    for (const key of others) {
+      expect(key.getAttribute("type")).toBe("button");
+      expect(key.getAttribute("data-variant")).toBe("outline");
+      expect(key.getAttribute("data-size")).toBe("sm");
+    }
+  });
+
+  it("reads page 1 on entry from the menu and shows its rows verbatim, with empty one-character selectors", async () => {
+    // audit: COTRN00-029
+    // audit: COTRN00-030
+    // audit: COTRN00-031
+    // audit: COTRN00-032
+    // audit: COTRN00-035
+    // audit: COTRN00-036
+    // audit: COTRN00-037
+    // audit: COTRN00-038
+    // audit: COTRN00-041
+    // audit: COTRN00-042
+    // audit: COTRN00-043
+    // audit: COTRN00-044
+    // audit: COTRN00-047
+    // audit: COTRN00-048
+    // audit: COTRN00-049
+    // audit: COTRN00-050
+    // audit: COTRN00-053
+    // audit: COTRN00-054
+    // audit: COTRN00-055
+    // audit: COTRN00-056
+    // audit: COTRN00-059
+    // audit: COTRN00-060
+    // audit: COTRN00-061
+    // audit: COTRN00-062
+    // audit: COTRN00-065
+    // audit: COTRN00-066
+    // audit: COTRN00-067
+    // audit: COTRN00-068
+    // audit: COTRN00-071
+    // audit: COTRN00-072
+    // audit: COTRN00-073
+    // audit: COTRN00-074
+    // audit: COTRN00-077
+    // audit: COTRN00-078
+    // audit: COTRN00-079
+    // audit: COTRN00-080
+    // audit: COTRN00-083
+    // audit: COTRN00-084
+    // audit: COTRN00-085
+    // audit: COTRN00-086
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await answered(sent, 1);
+
+    // A menu entry starts from the blank state: no keys, page 0, next-page flag N (COTRN00C-002).
+    expect(sent[0].method).toBe("GET");
+    expect(sent[0].path).toBe(LIST_PATH);
+    expect(sent[0].query).toEqual({ entry_key: "enter", page_no: "0", has_next_page: "false" });
+
+    const lines = listLines();
+    expect(lines).toHaveLength(10);
+    lines.forEach((line, index) => {
+      // The date is the server's eight-character MM/DD/YY, the same for midnight and for the
+      // day's last microsecond; the amount and the 26-character description are as received.
+      expect(lineValues(line)).toEqual([
+        tranId(index + 1),
+        "06/10/22",
+        `Purchase ${index + 1}`.padEnd(26, " "),
+        AMOUNTS[index],
+      ]);
+    });
+    expectListed(FIRST_PAGE);
+    expect(valueOf(pageField())).toBe("00000001");
+
+    for (let row = 1; row <= 10; row += 1) {
+      expect(selector(row).getAttribute("maxlength")).toBe("1");
+      expect(valueOf(selector(row))).toBe("");
+    }
+    expect(valueOf(searchField())).toBe("");
+    expect(document.activeElement).toBe(searchField());
+    expect(errorRow().textContent).toBe("");
+  });
+
+  it.each(Array.from({ length: 10 }, (_, index) => index + 1))(
+    "S in row %i's selector opens that row's transaction at /transactions/view with no request",
+    async (row) => {
+      // audit: COTRN00-027
+      // audit: COTRN00-033
+      // audit: COTRN00-039
+      // audit: COTRN00-045
+      // audit: COTRN00-051
+      // audit: COTRN00-057
+      // audit: COTRN00-063
+      // audit: COTRN00-069
+      // audit: COTRN00-075
+      // audit: COTRN00-081
+      // audit: COTRN00-096
+      // audit: COTRN00C-008
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList();
+      await answered(sent, 1);
+
+      expect(selector(row).getAttribute("maxlength")).toBe("1");
+      typeInto(selector(row), "S");
+      press("ENTER=Continue");
+
+      await screen.findByRole("region", { name: "View Transaction" });
+      expect(transferState("View Transaction")).toEqual({
+        from: PATHS.COTRN00,
+        tran_id: tranId(row),
+        list: { first_key: tranId(1), last_key: tranId(10), page_no: 1, has_next_page: true },
+      });
+      // The selector is never sent: the selection only navigates.
+      expect(sent).toHaveLength(1);
+    },
+  );
+
+  it.each(["S", "s"])(
+    "the first selector decides: %s in row 3 opens row 3's transaction despite later codes and a non-numeric search value",
+    async (code) => {
+      // audit: COTRN00C-007
+      // audit: COTRN00C-008
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList();
+      await answered(sent, 1);
+
+      typeInto(searchField(), "ABC");
+      typeInto(selector(3), code);
+      typeInto(selector(5), "X");
+      typeInto(selector(9), "S");
+      press("ENTER=Continue");
+
+      await screen.findByRole("region", { name: "View Transaction" });
+      expect(transferState("View Transaction")).toEqual({
+        from: PATHS.COTRN00,
+        tran_id: tranId(3),
+        list: { first_key: tranId(1), last_key: tranId(10), page_no: 1, has_next_page: true },
+      });
+      expect(sent).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    {
+      answer: "a page without a message",
+      search: "",
+      reply: json(200, FIRST_PAGE),
+      shown: INVALID_SELECTION,
+    },
+    {
+      answer: "a page with the end-of-file message",
+      search: "",
+      reply: json(200, SHORT_PAGE),
+      shown: BOTTOM_REACHED,
+    },
+    {
+      answer: "a 400 ScreenError",
+      search: "ABC",
+      reply: json(400, NOT_NUMERIC_ERROR),
+      shown: NOT_NUMERIC,
+    },
+  ])(
+    "an invalid code in the first selector sends ENTER and shows `$shown` after $answer, with no transfer",
+    async ({ search, reply, shown }) => {
+      // audit: COTRN00C-007
+      // audit: COTRN00C-010
+      const sent = stubFetch(json(200, FIRST_PAGE), reply);
+      renderList();
+      await answered(sent, 1);
+
+      // Row 1's `X` comes first, so row 4's `S` is ignored. The invalid code does not stop the
+      // ENTER: the search is sent, and a message of its answer replaces the selection message.
+      typeInto(searchField(), search);
+      typeInto(selector(1), "X");
+      typeInto(selector(4), "S");
+      press("ENTER=Continue");
+      await answered(sent, 2);
+
+      expect(sent[1].query).toEqual({
+        ...(search === "" ? {} : { start_tran_id: search }),
+        first_key: tranId(1),
+        last_key: tranId(10),
+        page_no: "1",
+        has_next_page: "true",
+      });
+      expect(errorRow().textContent).toBe(shown);
+      expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
+      expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("List Transactions");
+      expect(valueOf(selector(1))).toBe("X");
+      expect(valueOf(selector(4))).toBe("S");
+      expect(document.activeElement).toBe(searchField());
+    },
+  );
+
+  it("ignores a code on a blank row: ENTER searches and shows no selection message", async () => {
+    // audit: COTRN00C-009
+    const reread: components["schemas"]["TranListResponse"] = { ...SHORT_PAGE, message: null };
+    const sent = stubFetch(json(200, SHORT_PAGE), json(200, reread));
+    renderList();
+    await answered(sent, 1);
+    expectListed(SHORT_PAGE);
+
+    typeInto(selector(7), "S");
+    press("ENTER=Continue");
+    await answered(sent, 2);
+
+    // The blank last key is left out of the echoed state.
+    expect(sent[1].query).toEqual({ first_key: tranId(1), page_no: "1", has_next_page: "false" });
+    expect(errorRow().textContent).toBe("");
+    expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
+    expectListed(SHORT_PAGE);
+  });
+
+  it("ENTER with no selection reads the page from the typed ID, echoing the state, and clears the search field", async () => {
+    // audit: COTRN00-096
+    // audit: COTRN00C-037
+    const searched: components["schemas"]["TranListResponse"] = { ...SECOND_PAGE, page_no: 1 };
+    const sent = stubFetch(json(200, FIRST_PAGE), json(200, searched));
+    renderList();
+    await answered(sent, 1);
+
+    typeInto(searchField(), tranId(11));
+    press("ENTER=Continue");
+    await answered(sent, 2);
+
+    expect(sent[1].query).toEqual({
+      start_tran_id: tranId(11),
+      first_key: tranId(1),
+      last_key: tranId(10),
+      page_no: "1",
+      has_next_page: "true",
+    });
+    expectListed(searched);
+    expect(valueOf(pageField())).toBe("00000001");
+    expect(errorRow().textContent).toBe(BOTTOM_REACHED);
+    expect(valueOf(searchField())).toBe("");
+    expect(document.activeElement).toBe(searchField());
+  });
+
+  it("F8 and F7 page forward and backward with the keys echoed, keep the selectors, and never send page_size", async () => {
+    // audit: COTRN00-098
+    // audit: COTRN00-099
+    // audit: COTRN00C-036
+    // audit: COTRN00C-037
+    // audit: COTRN00C-038
+    const sent = stubFetch(
+      json(200, FIRST_PAGE),
+      json(200, SECOND_PAGE),
+      json(200, BOTTOM_KEPT),
+      json(200, FIRST_PAGE),
+      json(200, TOP_KEPT),
+    );
+    renderList();
+    await answered(sent, 1);
+    typeInto(selector(4), "X");
+
+    // F8 from the keyboard; the button pressed while the request runs sends nothing more, as the
+    // terminal keyboard locks until the program answers.
+    typeInto(searchField(), tranId(5));
+    fireEvent.keyDown(searchField(), { key: "F8" });
+    press("F8=Forward");
+    await answered(sent, 2);
+    expect(sent[1].query).toEqual({
+      direction: "forward",
+      first_key: tranId(1),
+      last_key: tranId(10),
+      page_no: "1",
+      has_next_page: "true",
+    });
+    expectListed(SECOND_PAGE);
+    expect(valueOf(pageField())).toBe("00000002");
+    expect(errorRow().textContent).toBe(BOTTOM_REACHED);
+    // A forward page clears the search field; the selectors stay as typed.
+    expect(valueOf(searchField())).toBe("");
+    expect(valueOf(selector(4))).toBe("X");
+    expect(document.activeElement).toBe(searchField());
+
+    // F8 at the bottom reads nothing: rows, page number and search value stay as shown.
+    typeInto(searchField(), "123");
+    press("F8=Forward");
+    await answered(sent, 3);
+    expect(sent[2].query).toEqual({
+      direction: "forward",
+      first_key: tranId(11),
+      last_key: tranId(20),
+      page_no: "2",
+      has_next_page: "false",
+    });
+    expectListed(SECOND_PAGE);
+    expect(valueOf(pageField())).toBe("00000002");
+    expect(errorRow().textContent).toBe(ALREADY_BOTTOM);
+    expect(valueOf(searchField())).toBe("123");
+
+    // A backward page leaves the search field as typed.
+    press("F7=Backward");
+    await answered(sent, 4);
+    expect(sent[3].query).toEqual({
+      direction: "backward",
+      first_key: tranId(11),
+      last_key: tranId(20),
+      page_no: "2",
+      has_next_page: "false",
+    });
+    expectListed(FIRST_PAGE);
+    expect(valueOf(pageField())).toBe("00000001");
+    expect(errorRow().textContent).toBe("");
+    expect(valueOf(searchField())).toBe("123");
+    expect(valueOf(selector(4))).toBe("X");
+    expect(document.activeElement).toBe(searchField());
+
+    // F7 at the top, from the keyboard: nothing read.
+    fireEvent.keyDown(searchField(), { key: "F7" });
+    await answered(sent, 5);
+    expect(sent[4].query).toEqual({
+      direction: "backward",
+      first_key: tranId(1),
+      last_key: tranId(10),
+      page_no: "1",
+      has_next_page: "true",
+    });
+    expectListed(FIRST_PAGE);
+    expect(valueOf(pageField())).toBe("00000001");
+    expect(errorRow().textContent).toBe(ALREADY_TOP);
+    expect(valueOf(searchField())).toBe("123");
+    expect(valueOf(selector(4))).toBe("X");
+
+    // Bounded Pagination: the screen never sends a page size.
+    for (const request of sent) {
+      expect(request.url).not.toContain("page_size");
+    }
+  });
+
+  it("shows a 400 ScreenError in the error row, keeps the rows, page number and search value, and echoes page 0 next", async () => {
+    // audit: COTRN00-088
+    // audit: COTRN00C-036
+    // audit: COTRN00C-037
+    const afterReject: components["schemas"]["TranListResponse"] = { ...SECOND_PAGE, page_no: 1 };
+    const sent = stubFetch(
+      json(200, FIRST_PAGE),
+      json(400, NOT_NUMERIC_ERROR),
+      json(200, afterReject),
+    );
+    renderList();
+    await answered(sent, 1);
+    const message = errorRow();
+    expect(message.getAttribute("aria-live")).toBe("polite");
+    expect(message.textContent).toBe("");
+
+    typeInto(searchField(), "12345");
+    press("ENTER=Continue");
+    await answered(sent, 2);
+    expect(sent[1].query).toEqual({
+      start_tran_id: "12345",
+      first_key: tranId(1),
+      last_key: tranId(10),
+      page_no: "1",
+      has_next_page: "true",
+    });
+    expect(errorRow().textContent).toBe(NOT_NUMERIC);
+    expectListed(FIRST_PAGE);
+    expect(valueOf(pageField())).toBe("00000001");
+    expect(valueOf(searchField())).toBe("12345");
+    expect(document.activeElement).toBe(searchField());
+
+    // The rejected search reset the state's page number to 0, while the screen kept 00000001.
+    press("F8=Forward");
+    await answered(sent, 3);
+    expect(sent[2].query).toEqual({
+      direction: "forward",
+      first_key: tranId(1),
+      last_key: tranId(10),
+      page_no: "0",
+      has_next_page: "true",
+    });
+    expectListed(afterReject);
+    expect(valueOf(pageField())).toBe("00000001");
+    expect(errorRow().textContent).toBe(BOTTOM_REACHED);
+  });
+
+  it.each([
+    { failure: "a 500 ScreenError", reply: json(500, LOOKUP_ERROR), shown: LOOKUP_FAILED },
+    {
+      failure: "a 502 without a body",
+      reply: () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
+      shown: "HTTP 502 Bad Gateway",
+    },
+  ])(
+    "F7 answered by $failure shows `$shown`, keeps the page and search value, and echoes next-page flag Y next",
+    async ({ reply, shown }) => {
+      // audit: COTRN00C-037
+      const sent = stubFetch(
+        json(200, FIRST_PAGE),
+        json(200, SECOND_PAGE),
+        reply,
+        json(200, BOTTOM_KEPT),
+      );
+      renderList();
+      await answered(sent, 1);
+      press("F8=Forward");
+      await answered(sent, 2);
+
+      typeInto(searchField(), "777");
+      press("F7=Backward");
+      await answered(sent, 3);
+      expect(errorRow().textContent).toBe(shown);
+      expectListed(SECOND_PAGE);
+      expect(valueOf(pageField())).toBe("00000002");
+      expect(valueOf(searchField())).toBe("777");
+      expect(document.activeElement).toBe(searchField());
+
+      // F7 sets the next-page flag before its read, so the failed read leaves it Y.
+      press("F8=Forward");
+      await answered(sent, 4);
+      expect(sent[3].query).toEqual({
+        direction: "forward",
+        first_key: tranId(11),
+        last_key: tranId(20),
+        page_no: "2",
+        has_next_page: "true",
+      });
+      expect(errorRow().textContent).toBe(ALREADY_BOTTOM);
+    },
+  );
+
+  it.each([
+    {
+      trigger: "the F3=Back button",
+      origin: "the menu",
+      state: undefined,
+      act: () => {
+        press("F3=Back");
+      },
+    },
+    {
+      trigger: "the F3 key",
+      origin: "the menu",
+      state: undefined,
+      act: () => {
+        fireEvent.keyDown(searchField(), { key: "F3" });
+      },
+    },
+    {
+      trigger: "the F3=Back button",
+      origin: "COTRN01",
+      state: { from: PATHS.COTRN01, entry_key: "pf5" },
+      act: () => {
+        press("F3=Back");
+      },
+    },
+  ])(
+    "$trigger after entry from $origin returns to the main menu with no request",
+    async ({ state, act }) => {
+      // audit: COTRN00-097
+      // audit: COTRN00C-005
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList(state);
+      await answered(sent, 1);
+
+      act();
+
+      await screen.findByRole("region", { name: "Main Menu" });
+      expect(transferState("Main Menu")).toBeNull();
+      expect(sent).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    { key: "F2", init: { key: "F2" } },
+    { key: "Shift+F8", init: { key: "F8", shiftKey: true } },
+  ])(
+    "$key shows the invalid-key message with no request and keeps the screen and the state",
+    async ({ init }) => {
+      // audit: COTRN00C-006
+      const sent = stubFetch(json(200, FIRST_PAGE), json(200, SECOND_PAGE));
+      renderList();
+      await answered(sent, 1);
+      typeInto(searchField(), "ABC");
+      typeInto(selector(2), "X");
+
+      fireEvent.keyDown(searchField(), init);
+
+      expect(errorRow().textContent).toBe(INVALID_KEY);
+      expect(sent).toHaveLength(1);
+      expectListed(FIRST_PAGE);
+      expect(valueOf(pageField())).toBe("00000001");
+      expect(valueOf(searchField())).toBe("ABC");
+      expect(valueOf(selector(2))).toBe("X");
+      expect(document.activeElement).toBe(searchField());
+
+      // The next key echoes the state page 1 left.
+      press("F8=Forward");
+      await answered(sent, 2);
+      expect(sent[1].query).toEqual({
+        direction: "forward",
+        first_key: tranId(1),
+        last_key: tranId(10),
+        page_no: "1",
+        has_next_page: "true",
+      });
+    },
+  );
+
+  // How each route state is read on entry. COTRN00C-002 is tagged on the round trip below, which
+  // runs the real COTRN01, so the `list` it reads here is the one COTRN01 handed back.
+  it.each([
+    {
+      entry: "no route state",
+      state: undefined,
+      query: { entry_key: "enter", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "the menu",
+      state: { from: PATHS.COMEN01 },
+      query: { entry_key: "enter", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "an unknown entry key",
+      state: { entry_key: "pf9" },
+      query: { entry_key: "enter", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "COTRN01's F3",
+      state: { from: PATHS.COTRN01, entry_key: "pf3" },
+      query: { entry_key: "pf3", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "COTRN01 without an entry key",
+      state: { from: PATHS.COTRN01 },
+      query: { entry_key: "pf5", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "COTRN01's F5 with the list state",
+      state: {
+        from: PATHS.COTRN01,
+        entry_key: "pf5",
+        list: { first_key: tranId(11), last_key: tranId(20), page_no: 2, has_next_page: true },
+      },
+      query: {
+        entry_key: "pf5",
+        first_key: tranId(11),
+        last_key: tranId(20),
+        page_no: "2",
+        has_next_page: "true",
+      },
+    },
+    {
+      entry: "a list state with blank keys",
+      state: {
+        entry_key: "pf5",
+        list: { first_key: null, page_no: 0, has_next_page: false },
+      },
+      query: { entry_key: "pf5", page_no: "0", has_next_page: "false" },
+    },
+    {
+      entry: "a malformed list state",
+      state: {
+        entry_key: "pf5",
+        list: { first_key: 11, last_key: tranId(20), page_no: 1.5, has_next_page: "Y" },
+      },
+      query: { entry_key: "pf5", page_no: "0", has_next_page: "false" },
+    },
+  ])(
+    "entry from $entry sends its entry key and echoes the state it carries",
+    async ({ state, query }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList(state);
+      await answered(sent, 1);
+
+      expect(sent[0].query).toEqual(query);
+      expectListed(FIRST_PAGE);
+      expect(valueOf(pageField())).toBe("00000001");
+    },
+  );
+
+  it.each([
+    { key: "F3=Back", entryKey: "pf3" },
+    { key: "F5=Browse Tran.", entryKey: "pf5" },
+  ])(
+    "keeps its paging state across the round trip to /transactions/view and back by COTRN01's $key",
+    async ({ key, entryKey }) => {
+      // audit: COTRN00C-002
+      const sent = stubFetch(json(200, FIRST_PAGE), json(200, VIEWED), json(200, SECOND_PAGE));
+      renderList(undefined, <COTRN01 />);
+      await answered(sent, 1);
+
+      // Page 1 leaves keys 1 and 10, page 1 and the next-page flag Y: each differs from the
+      // blank state a menu entry starts from.
+      typeInto(selector(3), "S");
+      press("ENTER=Continue");
+      // COTRN01 reads the selected transaction on entry.
+      await waitFor(() => {
+        expect(valueOf(screen.getByLabelText("Transaction ID:"))).toBe(tranId(3));
+      });
+      await answered(sent, 2);
+
+      press(key);
+
+      await answered(sent, 3);
+      expect(sent.map(({ path }) => path)).toEqual([
+        LIST_PATH,
+        `${LIST_PATH}/${tranId(3)}`,
+        LIST_PATH,
+      ]);
+      // Back on the list, the entry request echoes the state the list held when it left.
+      expect(sent[2].query).toEqual({
+        entry_key: entryKey,
+        first_key: tranId(1),
+        last_key: tranId(10),
+        page_no: "1",
+        has_next_page: "true",
+      });
+      expectListed(SECOND_PAGE);
+      expect(valueOf(pageField())).toBe("00000002");
+    },
+  );
+
+  // The map lengths stop typing beyond them; a longer value set programmatically is refused
+  // by the form schema before any request.
+  it.each([
+    {
+      field: "the search field",
+      target: searchField,
+      value: "0".repeat(17),
+      shown: "String must contain at most 16 character(s)",
+    },
+    {
+      field: "row 2's selector",
+      target: () => selector(2),
+      value: "SS",
+      shown: "String must contain at most 1 character(s)",
+    },
+  ])(
+    "ENTER with more characters in $field than the map allows sends nothing",
+    async ({ target, value, shown }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList();
+      await answered(sent, 1);
+
+      typeInto(target(), value);
+      press("ENTER=Continue");
+
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(shown);
+      });
+      expect(sent).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
+    },
+  );
+});

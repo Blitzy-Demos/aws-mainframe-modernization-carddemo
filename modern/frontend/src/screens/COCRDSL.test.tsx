@@ -1,0 +1,725 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter, Route, Routes } from "react-router";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { components } from "@/api/schema";
+import { getSession, setSession } from "@/auth/session";
+import { TITLE01, TITLE02 } from "@/lib/header";
+import { PATHS } from "@/routes";
+import { COCRDSL } from "./COCRDSL";
+
+/**
+ * Render test of COCRDSL (`/cards/view`, CCDL / COCRDSLC, map `CCRDSLA`) in jsdom. The global
+ * `fetch` is a stub that answers endpoint 8 in process, so no request leaves the test.
+ *
+ * Every card number a response carries is redacted, as endpoint 8 returns it to a `U` token. The
+ * two typed card numbers are synthetic request input, built from parts, that fail the card-number
+ * check digit.
+ */
+
+const TOKEN = "test-token";
+const ACCT_ID = "00000000050";
+const TYPED_CARD = "12345678".repeat(2);
+const OTHER_TYPED_CARD = "87654321".repeat(2);
+
+/** The info row before any request and after every error (COCRDSLC-025). */
+const PROMPT = "Please enter Account and Card Number";
+
+/** Route state of a COCRDLI `S` selection: the caller and the row's account and card handle. */
+const FROM_LIST = { from: PATHS.COCRDLI, acct_id: ACCT_ID, card_ref: 1 };
+
+/** The labels of the inputs as Testing Library reads them, runs of spaces collapsed. */
+const ACCOUNT = "Account Number :";
+const CARD = "Card Number :";
+const NAME = "Name on card :";
+const STATUS = "Card Active Y/N :";
+const MONTH = "Expiry Date :";
+const YEAR = "Expiry year";
+
+const LIST_STUB = "COCRDLI stub";
+const MENU_STUB = "COMEN01 stub";
+
+const view: components["schemas"]["CardViewResponse"] = {
+  acct_id: ACCT_ID,
+  card_num: "************5740",
+  card_ref: 1,
+  embossed_name: "TEST CARDHOLDER",
+  expiration_date: "2025-03-31",
+  info_message: "   Displaying requested details",
+  message: null,
+  status: "Y",
+};
+
+const undatedView: components["schemas"]["CardViewResponse"] = {
+  ...view,
+  expiration_date: null,
+};
+
+const typedView: components["schemas"]["CardViewResponse"] = {
+  ...view,
+  card_num: "************5678",
+  card_ref: 2,
+};
+
+const notFound: components["schemas"]["ScreenError"] = {
+  message: "Did not find cards for this search condition",
+  field: "acct_id",
+};
+
+const noInput: components["schemas"]["ScreenError"] = {
+  message: "No input received",
+  field: "acct_id",
+};
+
+const cardNotProvided: components["schemas"]["ScreenError"] = {
+  message: "Card number not provided",
+  field: "card_num",
+};
+
+/** Replies with a JSON body, as the API sends every success and every `ScreenError`. */
+function json(status: number, body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+/** The reply of a test that expects no request to endpoint 8. */
+function unexpected(): Response {
+  return json(500, { message: "No request was expected" });
+}
+
+/**
+ * Replaces the global `fetch` with a stub that records every request and answers endpoint 8 with
+ * `answer`. Any other request gets a 500.
+ */
+function stubFetch(answer: (query: URLSearchParams) => Response | Promise<Response>) {
+  const seen: {
+    method: string;
+    path: string;
+    query: URLSearchParams;
+    authorization: string | null;
+  }[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      const url = new URL(req.url);
+      seen.push({
+        method: req.method,
+        path: url.pathname,
+        query: url.searchParams,
+        authorization: req.headers.get("Authorization"),
+      });
+      if (req.method === "GET" && url.pathname === "/api/v1/cards/view") {
+        return answer(url.searchParams);
+      }
+      return json(500, { message: `Unexpected request ${req.method} ${url.pathname}` });
+    }),
+  );
+  return seen;
+}
+
+/** The query of every request, each checked to be endpoint 8. */
+function sentQueries(seen: ReturnType<typeof stubFetch>): Record<string, string>[] {
+  return seen.map((request) => {
+    expect(`${request.method} ${request.path}`).toBe("GET /api/v1/cards/view");
+    return Object.fromEntries(request.query);
+  });
+}
+
+/** Renders the screen at its route with `state`, and a text stub at each F3 target. */
+function renderScreen(state?: unknown) {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter initialEntries={[{ pathname: PATHS.COCRDSL, state }]}>
+        <Routes>
+          <Route path={PATHS.COCRDSL} element={<COCRDSL />} />
+          <Route path={PATHS.COCRDLI} element={<p>{LIST_STUB}</p>} />
+          <Route path={PATHS.COMEN01} element={<p>{MENU_STUB}</p>} />
+        </Routes>
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+}
+
+/** An input or output of the screen by its label. */
+function field(label: string): HTMLInputElement {
+  return screen.getByLabelText<HTMLInputElement>(label);
+}
+
+/** The name, status, expiry month and expiry year the screen shows. */
+function cardDetails(): string[] {
+  return [NAME, STATUS, MONTH, YEAR].map((label) => field(label).value);
+}
+
+/** Sets the text of the input labelled `label`, as typing would. */
+function typeInto(label: string, value: string): void {
+  fireEvent.change(field(label), { target: { value } });
+}
+
+/** The screen's form, which ENTER submits. */
+function form(): HTMLFormElement {
+  const element = document.querySelector("form");
+  if (element === null) {
+    throw new Error("The screen renders no form");
+  }
+  return element;
+}
+
+/** The `ENTER=Search Cards` key, the submit button of the form. */
+function enterButton(): HTMLElement {
+  return screen.getByRole("button", { name: "ENTER=Search Cards" });
+}
+
+/** The one message row of `kind`. */
+function messageRow(kind: "error" | "info"): HTMLElement {
+  const rows = screen.getAllByRole("alert").filter((row) => row.dataset.messageKind === kind);
+  expect(rows).toHaveLength(1);
+  return rows[0];
+}
+
+/** The text of the header value field `name`, padding kept. */
+function headerValue(name: string): string | null | undefined {
+  return document.querySelector(`span[data-field="${name}"]`)?.textContent;
+}
+
+/** Waits until `count` requests were sent and the last one has been answered. */
+async function requestsSettled(seen: ReturnType<typeof stubFetch>, count: number): Promise<void> {
+  await waitFor(() => {
+    expect(seen).toHaveLength(count);
+  });
+  await waitFor(() => {
+    expect(form().getAttribute("aria-busy")).toBe("false");
+  });
+}
+
+describe("COCRDSL", () => {
+  beforeEach(() => {
+    setSession(TOKEN, "USER0001", "U");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  it("shows the screen title, the two inputs and the key row of the map", () => {
+    stubFetch(unexpected);
+    renderScreen();
+
+    // audit: COCRDSL-011
+    const title = screen.getByRole("heading", { level: 1 });
+    expect(title.textContent).toBe("View Credit Card Detail");
+    expect(title.dataset.slot).toBe("card-title");
+
+    // The lengths are `both` rows, whose client half the schema test proves.
+    expect(field(ACCOUNT).maxLength).toBe(11);
+    expect(field(ACCOUNT).parentElement?.className).toBe("row-start-7 col-start-45 col-span-11");
+    expect(field(CARD).maxLength).toBe(16);
+    expect(field(CARD).parentElement?.className).toBe("row-start-8 col-start-45 col-span-16");
+
+    // audit: COCRDSL-031
+    const keys = within(screen.getByRole("group", { name: "Function keys" })).getAllByRole(
+      "button",
+    );
+    expect(keys.map((key) => key.textContent)).toEqual(["ENTER=Search Cards", "F3=Exit"]);
+    expect(keys.map((key) => key.dataset.slot)).toEqual(["button", "button"]);
+  });
+
+  it.each([
+    // audit: COCRDSL-012
+    {
+      id: "COCRDSL-012",
+      label: ACCOUNT,
+      text: "Account Number    :",
+      cell: "row-start-7 col-start-23 col-span-19",
+      slot: "form-label",
+    },
+    // audit: COCRDSL-015
+    {
+      id: "COCRDSL-015",
+      label: CARD,
+      text: "Card Number       :",
+      cell: "row-start-8 col-start-23 col-span-19",
+      slot: "form-label",
+    },
+    // audit: COCRDSL-018
+    {
+      id: "COCRDSL-018",
+      label: NAME,
+      text: "Name on card      :",
+      cell: "row-start-11 col-start-4 col-span-20",
+      slot: "label",
+    },
+    // audit: COCRDSL-021
+    {
+      id: "COCRDSL-021",
+      label: STATUS,
+      text: "Card Active Y/N   : ",
+      cell: "row-start-13 col-start-4 col-span-20",
+      slot: "label",
+    },
+    // audit: COCRDSL-024
+    {
+      id: "COCRDSL-024",
+      label: MONTH,
+      text: "Expiry Date       : ",
+      cell: "row-start-15 col-start-4 col-span-20",
+      slot: "label",
+    },
+    // audit: COCRDSL-026
+    {
+      id: "COCRDSL-026",
+      label: YEAR,
+      text: "/",
+      cell: "row-start-15 col-start-28 col-span-1",
+      slot: "label",
+    },
+  ])("$id labels its field with the map literal at its POS", ({ label, text, cell, slot }) => {
+    stubFetch(unexpected);
+    renderScreen();
+
+    const labels = Array.from(field(label).labels ?? []);
+    expect(labels.map((element) => element.textContent)).toEqual([text]);
+    expect(labels[0].dataset.slot).toBe(slot);
+    expect(labels[0].parentElement?.className).toBe(cell);
+  });
+
+  it.each([
+    // audit: COCRDSL-019
+    {
+      id: "COCRDSL-019",
+      label: NAME,
+      cell: "row-start-11 col-start-25 col-span-50",
+      size: 50,
+      value: "TEST CARDHOLDER",
+    },
+    // audit: COCRDSL-022
+    {
+      id: "COCRDSL-022",
+      label: STATUS,
+      cell: "row-start-13 col-start-25 col-span-1",
+      size: 1,
+      value: "Y",
+    },
+    // audit: COCRDSL-025
+    {
+      id: "COCRDSL-025",
+      label: MONTH,
+      cell: "row-start-15 col-start-25 col-span-2",
+      size: 2,
+      value: "03",
+    },
+    // audit: COCRDSL-027
+    {
+      id: "COCRDSL-027",
+      label: YEAR,
+      cell: "row-start-15 col-start-30 col-span-4",
+      size: 4,
+      value: "2025",
+    },
+  ])(
+    "$id shows its endpoint 8 value in a read-only output of the map LENGTH",
+    async ({ label, cell, size, value }) => {
+      const seen = stubFetch(() => json(200, view));
+      renderScreen(FROM_LIST);
+
+      const output = field(label);
+      expect(output.dataset.slot).toBe("input");
+      expect(output.readOnly).toBe(true);
+      expect(output.size).toBe(size);
+      expect(output.parentElement?.className).toBe(cell);
+      await requestsSettled(seen, 1);
+      expect(output.value).toBe(value);
+    },
+  );
+
+  it("leaves no element at the zero-length stoppers that end the fields", () => {
+    stubFetch(unexpected);
+    renderScreen();
+
+    // audit: COCRDSL-014
+    expect(document.querySelector(".row-start-7.col-start-57")).toBeNull();
+    // audit: COCRDSL-017
+    expect(document.querySelector(".row-start-8.col-start-62")).toBeNull();
+    // audit: COCRDSL-020
+    expect(document.querySelector(".row-start-11.col-start-76")).toBeNull();
+    // audit: COCRDSL-023
+    expect(document.querySelector(".row-start-13.col-start-27")).toBeNull();
+    // audit: COCRDSL-028
+    expect(document.querySelector(".row-start-15.col-start-35")).toBeNull();
+  });
+
+  it("shows the header rows of every send", () => {
+    stubFetch(unexpected);
+    renderScreen();
+
+    /*
+     * The header labels and value fields render as plain text rather than the `Label` and
+     * read-only `Input` their rows name, so only the values the program moves are tagged.
+     */
+    expect(screen.getByText("Tran:").parentElement?.className).toBe(
+      "row-start-1 col-start-1 col-span-5",
+    );
+    expect(screen.getByText("Date:").parentElement?.className).toBe(
+      "row-start-1 col-start-65 col-span-5",
+    );
+    expect(screen.getByText("Prog:").parentElement?.className).toBe(
+      "row-start-2 col-start-1 col-span-5",
+    );
+    expect(screen.getByText("Time:").parentElement?.className).toBe(
+      "row-start-2 col-start-65 col-span-5",
+    );
+    // audit: COCRDSL-032
+    expect(headerValue("TRNNAME")).toBe("CCDL");
+    // audit: COCRDSL-033
+    expect(headerValue("TITLE01")).toBe(TITLE01);
+    // audit: COCRDSL-034
+    expect(headerValue("CURDATE")).toMatch(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/);
+    // audit: COCRDSL-035
+    expect(headerValue("PGMNAME")).toBe("COCRDSLC");
+    // audit: COCRDSL-036
+    expect(headerValue("TITLE02")).toBe(TITLE02);
+    // audit: COCRDSL-037
+    expect(headerValue("CURTIME")).toMatch(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/);
+  });
+
+  it.each([
+    { title: "without route state", state: undefined },
+    { title: "from the main menu", state: { from: PATHS.COMEN01 } },
+    {
+      title: "when the account exceeds 11 characters",
+      state: { ...FROM_LIST, acct_id: "0".repeat(12) },
+    },
+    { title: "when the account is not text", state: { ...FROM_LIST, acct_id: 50 } },
+    { title: "when the card_ref is not a number", state: { ...FROM_LIST, card_ref: "1" } },
+    { title: "when the card_ref is not an integer", state: { ...FROM_LIST, card_ref: 1.5 } },
+  ])("opens empty and sends nothing $title", ({ state }) => {
+    // audit: COCRDSLC-001
+    // audit: COCRDSLC-025
+    const seen = stubFetch(unexpected);
+    renderScreen(state);
+
+    expect(seen).toEqual([]);
+    expect(field(ACCOUNT).value).toBe("");
+    expect(field(ACCOUNT).readOnly).toBe(false);
+    expect(field(CARD).value).toBe("");
+    expect(field(CARD).readOnly).toBe(false);
+    expect(document.activeElement).toBe(field(ACCOUNT));
+    expect(cardDetails()).toEqual(["", "", "", ""]);
+    expect(messageRow("error").textContent).toBe("");
+    const info = messageRow("info");
+    expect(info.textContent).toBe(PROMPT);
+    expect(info.className).not.toContain("text-destructive");
+  });
+
+  it.each([
+    { title: "with an expiry date", response: view, month: "03", year: "2025" },
+    { title: "without an expiry date", response: undatedView, month: "", year: "" },
+  ])(
+    "reads the card a card-list selection names at once, $title",
+    async ({ response, month, year }) => {
+      // audit: COCRDSLC-002
+      // audit: COCRDSLC-024
+      const seen = stubFetch(() => json(200, response));
+      renderScreen(FROM_LIST);
+
+      expect(field(ACCOUNT).value).toBe(ACCT_ID);
+      await requestsSettled(seen, 1);
+      expect(sentQueries(seen)).toEqual([{ acct_id: ACCT_ID, card_ref: "1" }]);
+      expect(seen[0].authorization).toBe(`Bearer ${TOKEN}`);
+
+      expect(field(ACCOUNT).value).toBe(ACCT_ID);
+      expect(field(CARD).value).toBe("************5740");
+      expect(field(NAME).value).toBe("TEST CARDHOLDER");
+      expect(field(STATUS).value).toBe("Y");
+      expect(field(MONTH).value).toBe(month);
+      expect(field(YEAR).value).toBe(year);
+      expect(screen.queryByDisplayValue("31")).toBeNull();
+      for (const label of [ACCOUNT, CARD]) {
+        expect(field(label).readOnly).toBe(true);
+        expect(field(label).className).not.toContain("text-destructive");
+      }
+      expect(messageRow("info").textContent).toBe("   Displaying requested details");
+      expect(messageRow("error").textContent).toBe("");
+    },
+  );
+
+  it("looks up a typed card number, then reads the shown card again by its card_ref", async () => {
+    // audit: COCRDSL-038
+    // audit: COCRDSLC-026
+    const seen = stubFetch(() => json(200, typedView));
+    renderScreen();
+
+    const enter = enterButton();
+    expect(enter.getAttribute("type")).toBe("submit");
+    expect(enter.dataset.variant).toBe("default");
+    expect(enter.getAttribute("form")).toBe(form().id);
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.click(enter);
+    await requestsSettled(seen, 1);
+    expect(field(CARD).value).toBe("************5678");
+    expect(messageRow("info").textContent).toBe("   Displaying requested details");
+
+    // Unchanged, the card input names the card shown: its redacted number is never sent.
+    fireEvent.click(enter);
+    await requestsSettled(seen, 2);
+
+    // Changed, the card input is sent as typed.
+    typeInto(CARD, OTHER_TYPED_CARD);
+    fireEvent.click(enter);
+    await requestsSettled(seen, 3);
+
+    expect(sentQueries(seen)).toEqual([
+      { acct_id: ACCT_ID, card_num: TYPED_CARD },
+      { acct_id: ACCT_ID, card_ref: "2" },
+      { acct_id: ACCT_ID, card_num: OTHER_TYPED_CARD },
+    ]);
+    expect(seen.some((request) => request.query.get("card_num")?.includes("*"))).toBe(false);
+  });
+
+  it("shows a not-found ScreenError in the error row and marks both inputs", async () => {
+    // audit: COCRDSL-030
+    // audit: COCRDSLC-025
+    const seen = stubFetch((query) =>
+      query.has("card_num") ? json(404, notFound) : json(400, cardNotProvided),
+    );
+    renderScreen();
+
+    const error = messageRow("error");
+    expect(error.textContent).toBe("");
+    expect(error.dataset.slot).toBe("alert");
+    expect(error.getAttribute("aria-live")).toBe("polite");
+    expect(error.className).toContain("text-destructive");
+    // The info row (map line 20), the error row (line 23) and the key row (line 24), in order.
+    expect(Array.from(document.querySelectorAll('[role="alert"], [role="group"]'))).toEqual([
+      messageRow("info"),
+      error,
+      screen.getByRole("group", { name: "Function keys" }),
+    ]);
+
+    // A card edit error first, which puts the cursor in the card input.
+    typeInto(ACCOUNT, ACCT_ID);
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 1);
+    expect(document.activeElement).toBe(field(CARD));
+
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 2);
+
+    expect(sentQueries(seen)).toEqual([
+      { acct_id: ACCT_ID },
+      { acct_id: ACCT_ID, card_num: TYPED_CARD },
+    ]);
+    expect(messageRow("error").textContent).toBe(notFound.message);
+    expect(messageRow("info").textContent).toBe(PROMPT);
+    expect(field(ACCOUNT).value).toBe(ACCT_ID);
+    expect(field(CARD).value).toBe(TYPED_CARD);
+    expect(field(ACCOUNT).className).toContain("text-destructive");
+    expect(field(CARD).className).toContain("text-destructive");
+    expect(document.activeElement).toBe(field(ACCOUNT));
+    expect(cardDetails()).toEqual(["", "", "", ""]);
+  });
+
+  /*
+   * COCRDSLC-027 stays untagged: the screen also marks the card input after a 500, where the
+   * program marks only the account input, and its empty-in-red case is halted.
+   */
+  it("shows * in red in an input sent blank and never sends the marker", async () => {
+    const seen = stubFetch((query) => json(400, query.has("acct_id") ? cardNotProvided : noInput));
+    renderScreen();
+
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 1);
+    expect(messageRow("error").textContent).toBe(noInput.message);
+    expect(messageRow("info").textContent).toBe(PROMPT);
+    for (const label of [ACCOUNT, CARD]) {
+      expect(field(label).value).toBe("*");
+      expect(field(label).className).toContain("text-destructive");
+    }
+    expect(document.activeElement).toBe(field(ACCOUNT));
+
+    // `*` alone reads as not supplied, so ENTER again sends neither input.
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 2);
+
+    typeInto(ACCOUNT, ACCT_ID);
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 3);
+
+    expect(sentQueries(seen)).toEqual([{}, {}, { acct_id: ACCT_ID }]);
+    expect(messageRow("error").textContent).toBe(cardNotProvided.message);
+    expect(field(ACCOUNT).value).toBe(ACCT_ID);
+    expect(field(ACCOUNT).className).not.toContain("text-destructive");
+    expect(field(CARD).value).toBe("*");
+    expect(field(CARD).className).toContain("text-destructive");
+    expect(document.activeElement).toBe(field(CARD));
+  });
+
+  it("shows a failure without a ScreenError body and leaves the inputs as sent", async () => {
+    const seen = stubFetch(() => new Response(null, { status: 502, statusText: "Bad Gateway" }));
+    renderScreen();
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 1);
+
+    expect(messageRow("error").textContent).toBe("HTTP 502 Bad Gateway");
+    expect(messageRow("info").textContent).toBe(PROMPT);
+    expect(field(ACCOUNT).value).toBe(ACCT_ID);
+    expect(field(CARD).value).toBe(TYPED_CARD);
+    for (const label of [ACCOUNT, CARD]) {
+      expect(field(label).className).not.toContain("text-destructive");
+    }
+  });
+
+  it.each([
+    {
+      title: "an account",
+      label: ACCOUNT,
+      value: "0".repeat(12),
+      message: "String must contain at most 11 character(s)",
+    },
+    {
+      title: "a card number",
+      label: CARD,
+      value: "0".repeat(17),
+      message: "String must contain at most 16 character(s)",
+    },
+  ])(
+    "rejects $title longer than its map LENGTH without a request",
+    async ({ label, value, message }) => {
+      const seen = stubFetch(unexpected);
+      renderScreen();
+
+      typeInto(label, value);
+      fireEvent.click(enterButton());
+
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe(message);
+      });
+      expect(seen).toEqual([]);
+    },
+  );
+
+  it("sends one request at a time", async () => {
+    let release = (): void => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const seen = stubFetch(async () => {
+      await held;
+      return json(200, typedView);
+    });
+    renderScreen();
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.click(enterButton());
+    await waitFor(() => {
+      expect(form().getAttribute("aria-busy")).toBe("true");
+    });
+    fireEvent.click(enterButton());
+    release();
+    await requestsSettled(seen, 1);
+
+    expect(field(CARD).value).toBe("************5678");
+    expect(seen).toHaveLength(1);
+  });
+
+  it("serves every key but F3 as ENTER, and Shift+F3 as F3", async () => {
+    // audit: COCRDSLC-003
+    // audit: COCRDSLC-004
+    // audit: COCRDSL-038
+    const seen = stubFetch(() => json(200, typedView));
+    renderScreen();
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    fireEvent.keyDown(window, { key: "Enter" });
+    await requestsSettled(seen, 1);
+    fireEvent.keyDown(window, { key: "F5" });
+    await requestsSettled(seen, 2);
+    // Shift+F7 is PF19, which the program folds onto PF7.
+    fireEvent.keyDown(window, { key: "F7", shiftKey: true });
+    await requestsSettled(seen, 3);
+
+    expect(sentQueries(seen)).toEqual([
+      { acct_id: ACCT_ID, card_num: TYPED_CARD },
+      { acct_id: ACCT_ID, card_ref: "2" },
+      { acct_id: ACCT_ID, card_ref: "2" },
+    ]);
+
+    // Shift+F3 is PF15, which exits as F3 does.
+    fireEvent.keyDown(window, { key: "F3", shiftKey: true });
+    expect(await screen.findByText(MENU_STUB)).toBeTruthy();
+    expect(seen).toHaveLength(3);
+  });
+
+  it.each([
+    {
+      title: "to the card list that selected the card",
+      state: FROM_LIST,
+      press: "click",
+      stub: LIST_STUB,
+      reads: 1,
+    },
+    {
+      title: "to the card list on the F3 key",
+      state: FROM_LIST,
+      press: "key",
+      stub: LIST_STUB,
+      reads: 1,
+    },
+    {
+      title: "to the main menu that opened it",
+      state: { from: PATHS.COMEN01 },
+      press: "click",
+      stub: MENU_STUB,
+      reads: 0,
+    },
+    {
+      title: "to the main menu without a caller",
+      state: undefined,
+      press: "click",
+      stub: MENU_STUB,
+      reads: 0,
+    },
+    {
+      title: "to the main menu from a path no screen has",
+      state: { from: "/not-a-screen" },
+      press: "click",
+      stub: MENU_STUB,
+      reads: 0,
+    },
+  ])("F3 returns $title without a request", async ({ state, press, stub, reads }) => {
+    // audit: COCRDSLC-004
+    // audit: COCRDSL-039
+    const seen = stubFetch(() => json(200, view));
+    renderScreen(state);
+    await requestsSettled(seen, reads);
+
+    const exit = screen.getByRole("button", { name: "F3=Exit" });
+    expect(exit.getAttribute("type")).toBe("button");
+    expect(exit.dataset.variant).toBe("outline");
+    expect(exit.dataset.size).toBe("sm");
+    if (press === "key") {
+      fireEvent.keyDown(window, { key: "F3" });
+    } else {
+      fireEvent.click(exit);
+    }
+
+    expect(await screen.findByText(stub)).toBeTruthy();
+    expect(seen).toHaveLength(reads);
+    // The identity the next screen works with is unchanged.
+    expect(getSession()).toEqual({ token: TOKEN, userId: "USER0001", userType: "U" });
+  });
+});

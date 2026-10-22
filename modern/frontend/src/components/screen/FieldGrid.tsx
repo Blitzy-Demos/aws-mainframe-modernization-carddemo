@@ -27,6 +27,12 @@ export type GridCellProps = {
   col: number;
   /** The field's `LENGTH`: how many columns the cell spans. */
   span: number;
+  /**
+   * How many map lines the cell spans from `row`; one when omitted. A list `Table` spans the
+   * lines of its captions and rows, so its height is shared by those lines instead of making
+   * every line of the grid as tall as the whole table.
+   */
+  rowSpan?: number;
   /** The field's content, rendered exactly as given. */
   children: ReactNode;
 };
@@ -62,16 +68,21 @@ export function FieldGrid({ children, className }: FieldGridProps): ReactNode {
  * stays empty, the 80-byte `ERRMSG` of COCRDSL and COCRDUP (X-SCREENS-7) fits on its line, and
  * no cell needs an 81st column.
  *
- * Positions outside the screen are held at its edge, and the span is cut so the cell ends by
- * column 80; a zero-length field still spans one column. The computed class names are generated
- * through the `@source inline` list of `src/index.css`.
+ * Positions outside the screen are held at its edge, and the spans are cut so the cell ends by
+ * column 80 and line 24; a zero-length field still spans one column. A cell of one line carries no
+ * row-span class. The computed class names are generated through the `@source inline` list of
+ * `src/index.css`.
  *
  * Children are not formatted, trimmed or rewritten: screens pass card numbers and SSNs already
  * redacted, and the cell shows them as received.
  */
-export function GridCell({ row, col, span, children }: GridCellProps): ReactNode {
+export function GridCell({ row, col, span, rowSpan = 1, children }: GridCellProps): ReactNode {
   const r = clamp(row, 1, SCREEN_ROWS);
   const c = clamp(col, 1, SCREEN_COLUMNS);
   const s = clamp(span, 1, SCREEN_COLUMNS + 1 - c);
-  return <div className={`row-start-${r} col-start-${c} col-span-${s}`}>{children}</div>;
+  const rs = clamp(rowSpan, 1, SCREEN_ROWS + 1 - r);
+  const lines = rs > 1 ? ` row-span-${rs}` : "";
+  return (
+    <div className={`row-start-${r}${lines} col-start-${c} col-span-${s}`}>{children}</div>
+  );
 }
