@@ -100,6 +100,7 @@ const REPORT_BASE: &str = "TRANREPT";
 ///   CBTRN03C-018, CBTRN03C-035).
 /// - [`JobError::Io`] when the generation file cannot be allocated, created, written or synced
 ///   (CBTRN03C-007, CBTRN03C-033, CBTRN03C-034).
+/// - [`JobError::GenerationLimit`] when generation 9999 of `TRANREPT` exists (CBTRN03C-007).
 ///
 /// After any error the generation file is removed (CBTRN03C-035).
 pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<JobOutcome, JobError> {

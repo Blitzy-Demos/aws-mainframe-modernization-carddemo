@@ -56,8 +56,16 @@
 //! The `Display` and `Debug` of [`JobError`] are the text `main` writes to standard error and to
 //! the job's tracing event. They hold no record bytes and no card number, CVV, SSN, password or
 //! hash (Cardholder Data Redaction): an I/O failure carries a static context and the
-//! `std::io::ErrorKind`, never a path built from data, and a wrapped domain or persistence error
-//! is shown through its own `Display` only where that text carries none of them.
+//! `std::io::ErrorKind`, never a path, a reached generation limit names the static base only,
+//! and a wrapped domain or persistence error is shown through its own `Display` only where that
+//! text carries none of them.
+//!
+//! The one path an error shows is the input file of a load (`loads`, `dusrsecj`), as the job got
+//! it: the `--input` the operator gave, or its default, the fixture in `CARDDEMO_FIXTURE_DIR` or
+//! the `DUSRSECJ` deck, never canonicalised (an [`InputPath`]). It is operator configuration,
+//! not data built from records, and the operator needs it to tell which file failed (LOADS-016,
+//! LOADS-017, LOADS-019). Its control characters are escaped, so the report stays one line; no
+//! byte of the file is shown.
 
 pub(crate) mod cbpaup0j;
 pub(crate) mod creastmt;
@@ -131,17 +139,40 @@ pub(crate) struct JobOutcome {
 /// write the same text, and neither ever formats a record, a key value or the `Debug` of a
 /// wrapped error.
 pub(crate) enum JobError {
-    /// A local file could not be read or written. `context` is a static description of the
-    /// step, such as `reading input`; the path is never shown.
+    /// A local file other than the input of a load could not be read or written: an output, or
+    /// the input of `posttran` or `mnttrdb2`. `context` is a static description of the step,
+    /// such as `reading input`; the path is never shown.
     Io {
         /// The step that failed.
         context: &'static str,
         /// What the operating system reported.
         kind: ErrorKind,
     },
+    /// The input file of a load could not be read (`loads`, `dusrsecj`; LOADS-019). Its text
+    /// names the path as the job got it and what the operating system reported.
+    UnreadableInput {
+        /// The file the load tried to read.
+        input: InputPath,
+        /// What the operating system reported.
+        kind: ErrorKind,
+    },
     /// Codec A or the in-stream extraction refused a fixture or the `DUSRSECJ` deck (`loads`,
-    /// `dusrsecj`). Its text names a line, a field, an offset and a width only.
-    Load(LoadError),
+    /// `dusrsecj`). Its text names the input file, then a line, a field, an offset and a width
+    /// only, never a byte of the line (LOADS-016, LOADS-017).
+    Load {
+        /// The file the load read.
+        input: InputPath,
+        /// What codec A or the extraction refused.
+        error: LoadError,
+    },
+    /// Generation 9999, `runtime::gdg::MAX_GENERATION`, of the `(+1)` output `base` already
+    /// exists, so no further generation is named and none is overwritten (`posttran`,
+    /// `intcalc`, `tranrept`). Its text names the step, the limit and the base only, never the
+    /// directory.
+    GenerationLimit {
+        /// The generation base, such as `SYSTRAN`.
+        base: &'static str,
+    },
     /// A repository call failed. Its text names an SQLSTATE, a constraint or a column only.
     Persistence(PersistenceError),
     /// `STATEMNT.PDF` could not be rendered (`creastmt`). Its text names a record number at
@@ -194,8 +225,14 @@ impl fmt::Display for JobError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io { context, kind } => write!(f, "{context}: {kind}"),
+            Self::UnreadableInput { input, kind } => write!(f, "{READING_INPUT} {input}: {kind}"),
+            Self::GenerationLimit { base } => write!(
+                f,
+                "{ALLOCATING_GENERATION}: generation limit {limit} reached for {base}",
+                limit = runtime::gdg::MAX_GENERATION
+            ),
             // Verified texts: line numbers, field names, offsets, widths and failure classes.
-            Self::Load(error) => fmt::Display::fmt(error, f),
+            Self::Load { input, error } => write!(f, "{input}: {error}"),
             Self::Input(error) => fmt::Display::fmt(error, f),
             // Verified texts: SQLSTATE, constraint and column names only.
             Self::Persistence(error) => fmt::Display::fmt(error, f),
@@ -260,12 +297,6 @@ fn report_text(error: ReportError) -> &'static str {
     }
 }
 
-impl From<LoadError> for JobError {
-    fn from(error: LoadError) -> Self {
-        Self::Load(error)
-    }
-}
-
 impl From<PersistenceError> for JobError {
     fn from(error: PersistenceError) -> Self {
         Self::Persistence(error)
@@ -308,9 +339,41 @@ impl From<InputError> for JobError {
     }
 }
 
-/// The whole content of the input file at `path`, read in place (`loads`, `dusrsecj`,
-/// `posttran`, `mnttrdb2`). The COBOL programs open their input first, so an unreadable input
-/// fails the job before it writes anything.
+/// The input file of a load (`loads`, `dusrsecj`) as the job got it: the `--input` path as
+/// given, or its default, the fixture path `LoadArgs::input_path` resolves from
+/// `CARDDEMO_FIXTURE_DIR` or the `DUSRSECJ` deck; never canonicalised, so the text an error
+/// shows is the path the operator can act on (LOADS-010, LOADS-019).
+///
+/// `Display` writes the path as `Path::display` does, with each control character replaced by
+/// its `char::escape_default` form, so a CR or LF in a path cannot split the one-line report
+/// `main` writes; every other character is written as it is.
+pub(crate) struct InputPath(PathBuf);
+
+impl InputPath {
+    /// The input `path`, kept as it is.
+    pub(crate) fn new(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+impl fmt::Display for InputPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The same text as `Path::display`: invalid UTF-8 becomes U+FFFD.
+        for character in self.0.to_string_lossy().chars() {
+            if character.is_control() {
+                fmt::Display::fmt(&character.escape_default(), f)?;
+            } else {
+                fmt::Write::write_char(f, character)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The whole content of the input file at `path`, read in place (`posttran`, `mnttrdb2`). The
+/// COBOL programs open their input first, so an unreadable input fails the job before it
+/// writes anything. Their failure events name the file by its DD, never by its path; the
+/// loads read through [`read_named_input`] instead.
 ///
 /// The read blocks its thread, so each job calls this inside the one [`blocking`] step that
 /// also decodes the bytes, with [`READING_INPUT`] as the step's context.
@@ -320,6 +383,31 @@ impl From<InputError> for JobError {
 /// [`JobError::Io`] with context `reading input` when the file cannot be read.
 fn read_input(path: &Path) -> Result<Vec<u8>, JobError> {
     fs::read(path).map_err(io(READING_INPUT))
+}
+
+/// The whole content of the input file of a load at `input` (`loads`, `dusrsecj`), read in
+/// place, as [`read_input`] reads it, inside the job's one [`blocking`] step. The table is not
+/// touched before this read succeeds (LOADS-011, LOADS-019).
+///
+/// # Errors
+///
+/// [`JobError::UnreadableInput`] naming `input` and the error's kind when the file cannot be
+/// read, as when it does not exist or is a directory (LOADS-019).
+fn read_named_input(input: &Path) -> Result<Vec<u8>, JobError> {
+    fs::read(input).map_err(|error| JobError::UnreadableInput {
+        input: InputPath::new(input),
+        kind: error.kind(),
+    })
+}
+
+/// The conversion of what codec A or the in-stream extraction refused in the load input at
+/// `input` into [`JobError::Load`], which names the file as well as the line and the rule
+/// (LOADS-016, LOADS-017).
+fn load_refused(input: &Path) -> impl FnOnce(LoadError) -> JobError + '_ {
+    move |error| JobError::Load {
+        input: InputPath::new(input),
+        error,
+    }
 }
 
 /// Runs `work` on the runtime's blocking pool and waits for its result, so that a step that
@@ -361,6 +449,20 @@ fn io(context: &'static str) -> impl FnOnce(std::io::Error) -> JobError {
     move |error| JobError::Io {
         context,
         kind: error.kind(),
+    }
+}
+
+/// The conversion of a failure of `runtime::gdg::next_generation` for base `base`:
+/// [`JobError::GenerationLimit`] when generation 9999 of the base exists, which the error kind
+/// alone cannot tell, and otherwise [`JobError::Io`] with context `allocating generation`,
+/// keeping only the kind, as [`io()`] does.
+fn generation_failure(base: &'static str) -> impl FnOnce(std::io::Error) -> JobError {
+    move |error| {
+        if runtime::gdg::is_limit_reached(&error) {
+            JobError::GenerationLimit { base }
+        } else {
+            io(ALLOCATING_GENERATION)(error)
+        }
     }
 }
 
@@ -647,17 +749,17 @@ impl OutputFile {
     ///
     /// # Errors
     ///
-    /// [`JobError::Io`] with context `allocating generation` when the directory cannot be
-    /// created or read or the generation limit is reached, and with context
-    /// `creating output file` when the file cannot be created, as when another run took the
-    /// same generation first.
-    pub(crate) async fn next_generation(dir: &Path, name: &str) -> Result<Self, JobError> {
+    /// - [`JobError::GenerationLimit`] when generation 9999 of `name` already exists, which is
+    ///   left as it is.
+    /// - [`JobError::Io`] with context `allocating generation` when the directory cannot be
+    ///   created or read, or `name` is no valid base, and with context `creating output file`
+    ///   when the file cannot be created, as when another run took the same generation first.
+    pub(crate) async fn next_generation(dir: &Path, name: &'static str) -> Result<Self, JobError> {
         let dir = dir.to_path_buf();
-        let name = name.to_owned();
         blocking(ALLOCATING_GENERATION, move || {
             create_output_dir(&dir).map_err(io(ALLOCATING_GENERATION))?;
             let path =
-                runtime::gdg::next_generation(&dir, &name).map_err(io(ALLOCATING_GENERATION))?;
+                runtime::gdg::next_generation(&dir, name).map_err(generation_failure(name))?;
             Self::create(path)
         })
         .await?
@@ -1376,7 +1478,7 @@ mod tests {
 
     use super::{
         Attempt, DirectoryLock, Failure, Held, JobError, LOCK_NAME, LOCK_RETRY, OutputFile,
-        blocking, read_input, remove_outputs,
+        blocking, read_input, read_named_input, remove_outputs,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1416,11 +1518,11 @@ mod tests {
     static SCRATCH_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
     /// A directory of its own under the system temporary directory, removed with its content
-    /// when dropped.
-    struct Scratch(PathBuf);
+    /// when dropped. The load tests of `loads` and `dusrsecj` write their inputs into one.
+    pub(super) struct Scratch(PathBuf);
 
     impl Scratch {
-        fn new() -> Result<Self, Box<dyn Error>> {
+        pub(super) fn new() -> Result<Self, Box<dyn Error>> {
             let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
             let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
@@ -1431,7 +1533,7 @@ mod tests {
             Ok(Self(dir))
         }
 
-        fn path(&self) -> &Path {
+        pub(super) fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -1560,6 +1662,38 @@ mod tests {
         assert_eq!(first, dir.join("DALYREJS.G0001"));
         assert_eq!(second, dir.join("DALYREJS.G0002"));
         assert!(first.exists() && second.exists());
+        Ok(())
+    }
+
+    /// No generation is named past generation 9999, whose file is left as it was: the error
+    /// names the limit and the base, never the directory. Any other failure of the generation
+    /// naming, such as a refused base name, stays an I/O error that keeps the kind only.
+    #[tokio::test]
+    async fn a_reached_generation_limit_is_named_and_overwrites_nothing() -> TestResult {
+        let cases = [
+            (
+                "SYSTRAN",
+                "allocating generation: generation limit 9999 reached for SYSTRAN",
+            ),
+            (
+                "SYSTRAN/G",
+                "allocating generation: invalid input parameter",
+            ),
+        ];
+        for (base, text) in cases {
+            let scratch = Scratch::new()?;
+            let last = scratch.path().join("SYSTRAN.G9999");
+            fs::write(&last, b"sentinel\n")?;
+            let error = OutputFile::next_generation(scratch.path(), base)
+                .await
+                .err()
+                .ok_or("a generation was allocated")?;
+            let limit = matches!(error, JobError::GenerationLimit { base: "SYSTRAN" });
+            assert_eq!(limit, base == "SYSTRAN", "{error}");
+            assert_eq!(error.to_string(), text);
+            assert_eq!(fs::read(&last)?, b"sentinel\n");
+            assert_eq!(names(scratch.path())?, ["SYSTRAN.G9999"]);
+        }
         Ok(())
     }
 
@@ -1957,11 +2091,53 @@ mod tests {
         Ok(())
     }
 
+    /// The input of a load that cannot be read is named as the job got it, never canonicalised,
+    /// with the error's kind: a file under a missing directory, a directory, and a path whose
+    /// control characters are shown escaped, so the report stays one line.
+    // audit: LOADS-019
+    #[test]
+    fn an_unreadable_load_input_names_its_path_and_kind() -> TestResult {
+        let scratch = Scratch::new()?;
+        let dir = scratch.path().display().to_string();
+        let cases = [
+            (
+                scratch.path().join("missing/../acctdata.txt"),
+                ErrorKind::NotFound,
+                format!("{dir}/missing/../acctdata.txt"),
+            ),
+            (
+                scratch.path().to_path_buf(),
+                ErrorKind::IsADirectory,
+                dir.clone(),
+            ),
+            (
+                scratch.path().join("acct\ndata\r\t\u{1b}\u{e9}.txt"),
+                ErrorKind::NotFound,
+                format!("{dir}/acct\\ndata\\r\\t\\u{{1b}}\u{e9}.txt"),
+            ),
+        ];
+        for (path, kind, shown) in cases {
+            let error = read_named_input(&path)
+                .err()
+                .ok_or("an unreadable input was read")?;
+            assert!(
+                matches!(&error, JobError::UnreadableInput { kind: found, .. } if *found == kind),
+                "{error}"
+            );
+            let text = error.to_string();
+            assert_eq!(text, format!("reading input {shown}: {kind}"));
+            assert_eq!(format!("{error:?}"), text);
+            assert!(!text.contains(['\n', '\r']), "{text}");
+            assert_eq!(error.exit_code(), None, "{text}");
+        }
+        Ok(())
+    }
+
     /// Each error's text, which `Debug` repeats, its exit code, and the record values it must
     /// not show.
     #[test]
     fn error_texts_and_exit_codes() -> TestResult {
-        let cases: [(JobError, &str, Option<u8>, &[&str]); 6] = [
+        let cases: [(JobError, &str, Option<u8>, &[&str]); 7] = [
             (
                 JobError::Abend {
                     code: Some(16),
@@ -1981,6 +2157,12 @@ mod tests {
                 &[],
             ),
             (JobError::Password, "password hashing failed", None, &[]),
+            (
+                JobError::GenerationLimit { base: "DALYREJS" },
+                "allocating generation: generation limit 9999 reached for DALYREJS",
+                None,
+                &[],
+            ),
             (
                 JobError::Report(ReportError::XrefNotFound {
                     redacted_card: *b"************5740",

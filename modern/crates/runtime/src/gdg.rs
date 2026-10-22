@@ -23,12 +23,44 @@
 //! the `CardDemo` replacement asks for pruning. Every path is on the local filesystem; no object
 //! storage is involved.
 
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Highest generation number the four-digit `Gnnnn` suffix can hold.
-const MAX_GENERATION: u16 = 9999;
+/// Highest generation number the four-digit `Gnnnn` suffix can hold. Once this generation of a
+/// base exists, [`next_generation`] names no other, and its error is the one
+/// [`is_limit_reached`] recognises.
+pub const MAX_GENERATION: u16 = 9999;
+
+/// The cause carried by the error [`next_generation`] returns when generation
+/// [`MAX_GENERATION`] of `base` already exists, so that [`is_limit_reached`] tells it from
+/// every other error of kind [`io::ErrorKind::Other`].
+#[derive(Debug)]
+struct LimitReached {
+    /// The base name the caller passed.
+    base: String,
+}
+
+impl fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "generation limit {MAX_GENERATION} reached for {}",
+            self.base
+        )
+    }
+}
+
+impl std::error::Error for LimitReached {}
+
+/// Whether `error` is the error [`next_generation`] returns when generation
+/// [`MAX_GENERATION`] of the base already exists, rather than an error of the name or the
+/// directory. Another error of kind [`io::ErrorKind::Other`], whatever its text, is not.
+#[must_use]
+pub fn is_limit_reached(error: &io::Error) -> bool {
+    matches!(error.get_ref(), Some(cause) if cause.is::<LimitReached>())
+}
 
 /// Returns the path of generation `(+1)` of base `name` in `dir`, `<dir>/<name>.G<nnnn>`, with
 /// `nnnn` one above the highest existing generation, or `0001` when `dir` holds none.
@@ -49,8 +81,10 @@ const MAX_GENERATION: u16 = 9999;
 ///   `dir` is left untouched in that case.
 /// - Any error from creating `dir`, reading it, or reading one of its entries, for example when
 ///   `dir` names an existing regular file.
-/// - An error of kind [`io::ErrorKind::Other`] when generation 9999 of `name` already exists. The
-///   number never wraps back to `G0001`, which would overwrite the oldest generation.
+/// - An error of kind [`io::ErrorKind::Other`] when generation 9999 ([`MAX_GENERATION`]) of
+///   `name` already exists, for which [`is_limit_reached`] is true and whose text is
+///   `generation limit 9999 reached for <name>`. The number never wraps back to `G0001`, which
+///   would overwrite the oldest generation.
 pub fn next_generation(dir: &Path, name: &str) -> io::Result<PathBuf> {
     if name.is_empty() || name.contains(['/', '\\', '\0']) {
         return Err(io::Error::new(
@@ -77,9 +111,9 @@ pub fn next_generation(dir: &Path, name: &str) -> io::Result<PathBuf> {
             .checked_add(1)
             .filter(|next| *next <= MAX_GENERATION)
             .ok_or_else(|| {
-                io::Error::other(format!(
-                    "generation limit {MAX_GENERATION} reached for {name}"
-                ))
+                io::Error::other(LimitReached {
+                    base: name.to_owned(),
+                })
             })?,
     };
 
@@ -98,9 +132,9 @@ fn parse_generation(file_name: &str, prefix: &str) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_generation;
+    use super::{is_limit_reached, next_generation};
     use std::fs;
-    use std::io::ErrorKind;
+    use std::io::{self, ErrorKind};
     use std::path::{Path, PathBuf};
 
     /// A directory private to one test of this process, absent at creation and removed on drop,
@@ -243,6 +277,42 @@ mod tests {
         let error = next_generation(scratch.path(), "SYSTRAN").expect_err("limit reached");
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("9999"));
+    }
+
+    /// Only the limit error is recognised as the limit: not the refused name, not a regular
+    /// file in place of the directory, and not another error of kind `Other` with the same text.
+    #[test]
+    fn only_the_generation_limit_is_recognised_as_reached() {
+        let scratch = ScratchDir::new("limit-recognised");
+        scratch.create_file("SYSTRAN.G9999");
+        scratch.create_file("not-a-directory");
+        let cases = [
+            (
+                next_generation(scratch.path(), "SYSTRAN").expect_err("limit reached"),
+                true,
+            ),
+            (
+                next_generation(scratch.path(), "a/b").expect_err("invalid name"),
+                false,
+            ),
+            (
+                next_generation(&scratch.path().join("not-a-directory"), "SYSTRAN")
+                    .expect_err("a file in place of the directory"),
+                false,
+            ),
+            (
+                io::Error::other("generation limit 9999 reached for SYSTRAN"),
+                false,
+            ),
+        ];
+        for (error, reached) in cases {
+            assert_eq!(is_limit_reached(&error), reached, "{error}");
+        }
+        let limit = next_generation(scratch.path(), "SYSTRAN").expect_err("limit reached");
+        assert_eq!(
+            limit.to_string(),
+            "generation limit 9999 reached for SYSTRAN"
+        );
     }
 
     #[test]

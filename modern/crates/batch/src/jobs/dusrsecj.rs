@@ -20,7 +20,8 @@
 //!
 //! An unreadable deck (LOADS-019), a deck codec A or the in-stream extraction refuses
 //! (LOADS-013, LOADS-016), a key out of sequence (LOADS-017) and a failed hash all end the job
-//! before the transaction opens. A failed delete, insert or commit drops the uncommitted
+//! before the transaction opens. The first three name the deck's path as the job got it, never
+//! a byte of the deck. A failed delete, insert or commit drops the uncommitted
 //! transaction, which rolls it back (LOADS-018). Either way `users` keeps its previous rows.
 //!
 //! # Passwords (E25)
@@ -61,10 +62,10 @@ use super::{JobContext, JobError, JobOutcome};
 ///
 /// # Errors
 ///
-/// - [`JobError::Io`] when the deck cannot be read (LOADS-019).
-/// - [`JobError::Load`] when the deck has no `//SYSUT1   DD *` statement or no closing `/*`
-///   line, an in-stream card codec A rejects, or a `SEC-USR-ID` out of sequence (LOADS-013,
-///   LOADS-016, LOADS-017).
+/// - [`JobError::UnreadableInput`] naming `input` when the deck cannot be read (LOADS-019).
+/// - [`JobError::Load`] naming `input` when the deck has no `//SYSUT1   DD *` statement or no
+///   closing `/*` line, an in-stream card codec A rejects, or a `SEC-USR-ID` out of sequence
+///   (LOADS-013, LOADS-016, LOADS-017).
 /// - [`JobError::Password`] when argon2id cannot hash a password (LOADS-033).
 /// - [`JobError::Persistence`] when the transaction cannot be opened, the delete or an insert
 ///   fails, or the commit is refused; nothing is committed then (LOADS-018, LOADS-021).
@@ -72,15 +73,7 @@ use super::{JobContext, JobError, JobOutcome};
 /// Every failure leaves the previous contents of `users`.
 pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
     let input = input.to_path_buf();
-    let users = super::blocking(super::READING_INPUT, move || {
-        let deck = super::read_input(&input)?;
-        // LineFraming describes the deck line and is never stored: only the record goes on.
-        decode_usrsec(&deck)?
-            .into_iter()
-            .map(|framed| hash_user(framed.record).map_err(|_| JobError::Password))
-            .collect::<Result<Vec<HashedUser>, JobError>>()
-    })
-    .await??;
+    let users = super::blocking(super::READING_INPUT, move || read_users(&input)).await??;
 
     // Dropping `tx` on an early return rolls the replacement back (LOADS-018).
     let mut tx = ctx.store.begin().await?;
@@ -92,4 +85,80 @@ pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome
         return_code: 0,
         counts: vec![("records", written)],
     })
+}
+
+/// The in-stream users of the deck at `input` in deck order, each with the argon2id hash of its
+/// password: the deck read in place, its records extracted and decoded, then hashed, the
+/// blocking step of [`run`] (LOADS-011 to LOADS-013, LOADS-033).
+///
+/// # Errors
+///
+/// - [`JobError::UnreadableInput`] naming `input` when the deck cannot be read (LOADS-019).
+/// - [`JobError::Load`] naming `input` when the extraction or codec A refuses the deck, or a
+///   `SEC-USR-ID` is out of sequence (LOADS-013, LOADS-016, LOADS-017).
+/// - [`JobError::Password`] when argon2id cannot hash a password (LOADS-033).
+fn read_users(input: &Path) -> Result<Vec<HashedUser>, JobError> {
+    let deck = super::read_named_input(input)?;
+    // LineFraming describes the deck line and is never stored: only the record goes on.
+    decode_usrsec(&deck)
+        .map_err(super::load_refused(input))?
+        .into_iter()
+        .map(|framed| hash_user(framed.record).map_err(|_| JobError::Password))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::error::Error;
+    use std::fs;
+
+    use super::read_users;
+    use crate::jobs::JobError;
+    use crate::jobs::tests::Scratch;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    /// A deck the in-stream extraction refuses fails the job's read, before any password is
+    /// hashed, with an error naming the deck's path and then the refusal, never a byte of a
+    /// card: no `//SYSUT1   DD *` statement, no closing `/*` after it (named by the statement's
+    /// line), and a `SEC-USR-ID` out of sequence (named by both lines).
+    // audit: LOADS-013
+    // audit: LOADS-016
+    // audit: LOADS-017
+    #[test]
+    fn a_refused_deck_is_named_with_its_path() -> TestResult {
+        let header = "//DUSRSECJ JOB\n//STEP01  EXEC PGM=IEBGENER\n";
+        let admin = "ADMIN001MARGARET            GOLD                PASSWORDA\n";
+        let user = "USER0001LAWRENCE            THOMAS              PASSWORDU\n";
+        let cases = [
+            (
+                format!("{header}{admin}/*\n"),
+                "no '//SYSUT1   DD *' statement opens the in-stream records",
+            ),
+            (
+                format!("{header}//SYSUT1   DD *\n{admin}"),
+                "line 3: the in-stream records this statement opens are not closed by a line \
+                 beginning '/*'",
+            ),
+            (
+                format!("{header}//SYSUT1   DD *\n{user}{admin}/*\n"),
+                "line 5: record key is not above the key on line 4: \
+                 a duplicate or out-of-sequence key",
+            ),
+        ];
+        let scratch = Scratch::new()?;
+        let path = scratch.path().join("DUSRSECJ.jcl");
+        let shown = path.display().to_string();
+        for (deck, refusal) in cases {
+            fs::write(&path, deck)?;
+            let error = read_users(&path).err().ok_or("a refused deck was loaded")?;
+            assert!(matches!(error, JobError::Load { .. }), "{error}");
+            let text = error.to_string();
+            assert_eq!(text, format!("{shown}: {refusal}"));
+            for value in ["ADMIN001", "USER0001", "PASSWORD", "MARGARET"] {
+                assert!(!text.contains(value), "{text} shows {value}");
+            }
+        }
+        Ok(())
+    }
 }

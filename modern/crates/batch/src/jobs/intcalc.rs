@@ -50,6 +50,8 @@
 //!   CBACT04C-033), and any query against a database whose schema has not been applied.
 //! - [`JobError::Io`]: the generation cannot be allocated, created, written or synced
 //!   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
+//! - [`JobError::GenerationLimit`]: generation 9999 of `SYSTRAN` exists, so no generation is
+//!   allocated and none is overwritten (CBACT04C-034).
 //!
 //! `9999-ABEND-PROGRAM` sets no return code (CBACT04C-038), so no abend carries one. After any
 //! error the unfinished generation file is removed by the guard of `OutputFile`, as
@@ -121,6 +123,7 @@ const SYSTRAN_BASE: &str = "SYSTRAN";
 ///   (CBACT04C-032).
 /// - [`JobError::Io`] when the generation file cannot be allocated, created, written or synced
 ///   (CBACT04C-031, CBACT04C-034, CBACT04C-035).
+/// - [`JobError::GenerationLimit`] when generation 9999 of `SYSTRAN` exists (CBACT04C-034).
 ///
 /// Every rewrite committed before an error stands, and the generation file is removed
 /// (CBACT04C-038).

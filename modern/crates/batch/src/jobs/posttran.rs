@@ -592,7 +592,7 @@ fn report(operation: &'static str, error: &PersistenceError) {
 }
 
 /// Reports why a local-file call failed: the file operation and the error's text, a static step
-/// and the I/O error kind, never the path.
+/// and the I/O error kind, or the generation limit and the `DALYREJS` base, never the path.
 fn report_file(operation: &'static str, error: &JobError) {
     tracing::error!(operation, error = %error, "CBTRN02C file operation failed");
 }
