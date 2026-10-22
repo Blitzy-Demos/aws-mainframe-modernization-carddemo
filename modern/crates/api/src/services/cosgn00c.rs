@@ -10,7 +10,7 @@
 //! |---|---|---|---|
 //! | Edit | `EVALUATE TRUE` on `USERIDI` and `PASSWDI`, then `FUNCTION UPPER-CASE` of both | `cosgn00c::edit` | COSGN00C-003, COSGN00C-007 to COSGN00C-010 |
 //! | Read | `EXEC CICS READ DATASET('USRSEC  ') RIDFLD(WS-USER-ID) KEYLENGTH(8)` | `UserRepository::find_by_id` on the upper-cased, space-padded user ID | COSGN00C-013, COSGN00C-019, COSGN00C-020 |
-//! | Decide | `EVALUATE WS-RESP-CD` and `SEC-USR-PWD = WS-USER-PWD` | `cosgn00c::decide`, on Tokio's blocking pool | COSGN00C-013, COSGN00C-018 to COSGN00C-020 |
+//! | Decide | `EVALUATE WS-RESP-CD` and `SEC-USR-PWD = WS-USER-PWD` | `cosgn00c::decide`, on Tokio's blocking pool within the API's password-work budget | COSGN00C-013, COSGN00C-018 to COSGN00C-020 |
 //! | Transfer | COMMAREA identity, then `XCTL` to COADM01C or COMEN01C | the token of `JwtKeys::issue` and `SignedOn::next_route` | COSGN00C-014 to COSGN00C-016 |
 //!
 //! A blank-field failure returns before the read, as `IF NOT ERR-FLG-ON` skips
@@ -35,8 +35,13 @@
 //! The password is verified inside `cosgn00c::decide`, never here. argon2id is deliberately
 //! CPU- and memory-hard, so the decision takes the owned key and read to Tokio's blocking pool
 //! and the request awaits it there: concurrent sign-ons for known users never hold a runtime
-//! worker that unrelated requests need. A decision task that does not complete is
-//! `ServiceError::Internal`; the token is issued only after a decision that signs on.
+//! worker that unrelated requests need. The whole decision, an unknown user's included, runs
+//! within the `AppState::password_work` budget, so a burst of sign-ons, which anyone can send,
+//! runs a bounded number of verifications at once and queues a bounded number more
+//! (`crate::app::PasswordWork`). A decision the budget refuses at once because every place is
+//! taken, or whose task does not complete, is `ServiceError::Internal`; no verification is
+//! skipped and no ordinary answer changes. The token is issued only after a decision that signs
+//! on.
 //!
 //! # Identity
 //!
@@ -57,7 +62,7 @@ use domain::online::cosgn00c::{
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
 
-use crate::app::AppState;
+use crate::app::{AppState, PasswordWork, PasswordWorkError};
 use crate::auth::jwt::JwtKeys;
 use crate::dto::cosgn00c::SignonRequest;
 use crate::error::ServiceError;
@@ -74,8 +79,8 @@ use crate::error::ServiceError;
 /// - `ServiceError::Rule` with the program's `SignonFailure`: a rejected or blank input (400),
 ///   a wrong password or an unknown user (401), and a failed read or an unverifiable stored hash
 ///   (500, `Unable to verify the User ...`).
-/// - `ServiceError::Internal` when the verification task does not complete or the token cannot
-///   be issued; it carries no detail.
+/// - `ServiceError::Internal` when the password-work budget refuses the decision, the
+///   verification task does not complete or the token cannot be issued; it carries no detail.
 pub(crate) async fn signon(
     state: &AppState,
     input: SignonRequest,
@@ -90,7 +95,7 @@ pub(crate) async fn signon(
         // bound value, so the event names neither the user ID nor the row.
         tracing::error!(error = %error, "sign-on user read failed");
     }
-    let signed_on = decided(key, read)
+    let signed_on = decided(&state.password_work, key, read)
         .await?
         .into_result()
         .map_err(ServiceError::Rule)?;
@@ -98,27 +103,27 @@ pub(crate) async fn signon(
     Ok((token, signed_on))
 }
 
-/// `cosgn00c::decide` over the read's `UserLookup`, run on Tokio's blocking pool: argon2id is
-/// deliberately CPU- and memory-hard, so verifying a known user's password inline would stall
-/// the runtime worker and every request it serves (COSGN00C-013, COSGN00C-018 to
-/// COSGN00C-020).
+/// `cosgn00c::decide` over the read's `UserLookup`, run on Tokio's blocking pool within `work`:
+/// argon2id is deliberately CPU- and memory-hard, so verifying a known user's password inline
+/// would stall the runtime worker and every request it serves, and verifying any number at once
+/// would exhaust the host (COSGN00C-013, COSGN00C-018 to COSGN00C-020).
 ///
 /// # Errors
 ///
-/// `ServiceError::Internal` when the verification task does not complete. The `JoinError` is
-/// reported only as whether the task panicked, never by its text, which can carry the panic's
-/// payload.
+/// `ServiceError::Internal` when the budget refuses the decision, which `work` has already
+/// logged, or the verification task does not complete. The task is reported only as whether it
+/// panicked, never by its payload.
 async fn decided(
+    work: &PasswordWork,
     key: SignonKey,
     read: Result<Option<UserEntry>, PersistenceError>,
 ) -> Result<SignonOutcome, ServiceError<SignonFailure>> {
-    tokio::task::spawn_blocking(move || cosgn00c::decide(&key, lookup(&read)))
+    work.run(move || cosgn00c::decide(&key, lookup(&read)))
         .await
         .map_err(|error| {
-            tracing::error!(
-                panicked = error.is_panic(),
-                "sign-on verification task did not complete"
-            );
+            if let PasswordWorkError::Interrupted { panicked } = error {
+                tracing::error!(panicked, "sign-on verification task did not complete");
+            }
             ServiceError::Internal
         })
 }
@@ -169,12 +174,22 @@ mod tests {
     use test_support::trace_capture;
 
     use super::signon;
-    use crate::app::AppState;
+    use crate::app::worker_hold::WorkerHold;
+    use crate::app::{AppState, PasswordWork};
     use crate::auth::jwt::JwtKeys;
     use crate::dto::cosgn00c::SignonRequest;
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A local-only signing secret for these tests.
     const SECRET: &str = "services-cosgn00c-test-secret";
@@ -326,6 +341,51 @@ mod tests {
             assert!(!traces.contains(value), "the trace holds {value}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn a_full_password_budget_answers_internal_until_a_place_frees() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store).await?;
+            let state = app_state(store, 3600).with_password_work(PasswordWork::new(1, 0));
+            let hold = WorkerHold::start(&state.password_work).await?;
+            let traces = trace_capture::capture();
+
+            // The whole decision runs within the budget, so a refusal answers alike for a right
+            // password, a wrong one and an unknown user, and tells nothing about the user ID.
+            for (user_id, typed) in [
+                ("ADMIN001", TYPED_PASSWORD),
+                ("ADMIN001", "WRONGPW1"),
+                ("NOBODY01", TYPED_PASSWORD),
+            ] {
+                let outcome = signon(&state, request(user_id, typed)).await;
+                assert_eq!(outcome, Err(ServiceError::Internal), "{user_id} {typed}");
+            }
+            assert!(traces.contains("password work budget saturated"));
+            for value in [
+                "ADMIN001",
+                "NOBODY01",
+                TYPED_PASSWORD,
+                "WRONGPW1",
+                "$argon2id$",
+            ] {
+                assert!(!traces.contains(value), "the trace holds {value}");
+            }
+
+            // Once the place frees, sign-on answers as it always does.
+            assert!(hold.release().await?);
+            let (_, signed_on) = signon(&state, request("ADMIN001", TYPED_PASSWORD))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(signed_on.next_route.path(), "/admin");
+            assert_eq!(
+                signon(&state, request("ADMIN001", "WRONGPW1")).await,
+                Err(ServiceError::Rule(SignonFailure::WrongPassword))
+            );
+            Ok(())
+        })
     }
 
     /// Verification leaves the runtime serving: on this test's single runtime thread, a

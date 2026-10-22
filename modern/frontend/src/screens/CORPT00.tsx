@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useId, useMemo, useState, type ReactNode } from "react";
+import { useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCorpt00cSubmit } from "@/api/hooks";
@@ -258,6 +258,8 @@ function focusTarget(field: string | null | undefined): Corpt00Field {
  * - F3 goes back to the main menu, as CORPT00C transfers to COMEN01C (CORPT00C-004).
  * - Any other function key shows `Invalid key pressed. Please see below...` and focuses
  *   `MONTHLY`, keeping the inputs (CORPT00C-005).
+ * - From the moment ENTER is taken until its reply arrives the keyboard is locked: ENTER is
+ *   disabled, the inputs are read-only and the key row is busy. F3 stays available.
  */
 export function CORPT00(): ReactNode {
   const navigate = useNavigate();
@@ -274,6 +276,13 @@ export function CORPT00(): ReactNode {
   });
   const { reset, setError, setFocus } = form;
 
+  // One request per ENTER: a second ENTER while the first is in flight would write a second job
+  // deck for the same screen. `inFlight` is taken when ENTER is accepted, before the form's
+  // asynchronous validation, and freed when validation refuses the values or the reply settles;
+  // `pending` shows the same lock on the keys and inputs.
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
+
   const keys = useMemo<PfKeyBarEntry[]>(
     () =>
       keyRowItems(KEY_ROWS.CORPT00).map((item) =>
@@ -284,9 +293,9 @@ export function CORPT00(): ReactNode {
                 void navigate(PATHS.COMEN01);
               },
             }
-          : item,
+          : { ...item, disabled: pending },
       ),
-    [navigate],
+    [navigate, pending],
   );
 
   const keyOptions = useMemo<PfKeyOptions>(
@@ -300,12 +309,24 @@ export function CORPT00(): ReactNode {
     [setFocus],
   );
 
-  function onValid(values: Corpt00Values): void {
-    // One request per ENTER: a second ENTER while the first is in flight would write a second
-    // job deck for the same screen.
-    if (submit.isPending) {
+  /** Frees the keyboard once validation has refused the values or the reply has settled. */
+  function release(): void {
+    inFlight.current = false;
+    setPending(false);
+  }
+
+  /** Takes ENTER and locks the keyboard, or refuses the submit while a request holds it. */
+  function onSubmit(event: FormEvent<HTMLFormElement>): void {
+    if (inFlight.current) {
+      event.preventDefault();
       return;
     }
+    inFlight.current = true;
+    setPending(true);
+    void form.handleSubmit(onValid, onInvalid)(event);
+  }
+
+  function onValid(values: Corpt00Values): void {
     submit.mutate(
       {
         body: {
@@ -339,12 +360,14 @@ export function CORPT00(): ReactNode {
           }
           setFocus(focusTarget(error.field));
         },
+        onSettled: release,
       },
     );
   }
 
   /** Shows the first schema message in map order; react-hook-form focuses that field. */
   function onInvalid(errors: FieldErrors<Corpt00Values>): void {
+    release();
     const text = INPUTS.map((input) => errors[input.name]?.message).find(
       (issue) => issue !== undefined,
     );
@@ -360,15 +383,10 @@ export function CORPT00(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
     >
       <Form {...form}>
-        <form
-          id={formId}
-          noValidate
-          onSubmit={(event) => {
-            void form.handleSubmit(onValid, onInvalid)(event);
-          }}
-        >
+        <form id={formId} noValidate aria-busy={pending} onSubmit={onSubmit}>
           <FieldGrid>
             {INPUTS.map((input) => (
               <FormField
@@ -395,6 +413,7 @@ export function CORPT00(): ReactNode {
                           autoFocus={input.name === "monthly"}
                           autoComplete="off"
                           aria-label={input.accessibleName}
+                          readOnly={pending}
                         />
                       </FormControl>
                     </GridCell>

@@ -171,6 +171,10 @@ type FocusRequest = { readonly name: FieldName };
  * where the program puts the cursor. The password input is masked and never pre-filled; the
  * screen sends the password only in the request body, never shows, logs or stores it, and empties
  * it with the other fields after a successful add (Cardholder Data Redaction).
+ *
+ * While an add is in flight the keyboard is locked, as the 3270's was until the program answered:
+ * ENTER, F4 and F12 are disabled, every other key but F3 is refused and the inputs are read-only.
+ * F3 sends nothing, so it still leaves.
  */
 export function COUSR01(): ReactNode {
   const formId = useId();
@@ -186,6 +190,8 @@ export function COUSR01(): ReactNode {
   // Set while an add is in flight, so a second ENTER cannot send the same user twice before the
   // first response arrives, as the 3270 keyboard stayed locked until the program answered.
   const sending = useRef(false);
+  // `sending` as rendered: the disabled keys, the read-only inputs and `aria-busy`.
+  const [pending, setPending] = useState(false);
 
   // Focus moves after the render that follows the outcome. `reset` drops the inputs' focus
   // references until the fields render again, so focusing in the same tick would miss.
@@ -204,6 +210,9 @@ export function COUSR01(): ReactNode {
   }, [navigate]);
 
   const clear = useCallback(() => {
+    if (sending.current) {
+      return;
+    }
     reset(EMPTY);
     setMessage(undefined);
     focusField(HOME_FIELD);
@@ -211,6 +220,9 @@ export function COUSR01(): ReactNode {
 
   // The previous outcome's field error goes with its message (COUSR01C-005).
   const invalidKey = useCallback(() => {
+    if (sending.current) {
+      return;
+    }
     clearErrors();
     setMessage({ kind: "error", text: INVALID_KEY });
     focusField(HOME_FIELD);
@@ -218,8 +230,13 @@ export function COUSR01(): ReactNode {
 
   const keys = useMemo<PfKeyBarEntry[]>(() => {
     const actions: PfKeyHandlers = { F3: back, F4: clear, F12: invalidKey };
-    return KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
-  }, [back, clear, invalidKey]);
+    // The keys `submit`, `clear` and `invalidKey` refuse while an add is in flight: all but F3.
+    return KEY_ITEMS.map((item) => ({
+      ...item,
+      onPress: actions[item.key],
+      disabled: pending && item.key !== "F3",
+    }));
+  }, [back, clear, invalidKey, pending]);
 
   const keyOptions = useMemo<PfKeyOptions>(() => ({ onInvalidKey: invalidKey }), [invalidKey]);
 
@@ -228,6 +245,7 @@ export function COUSR01(): ReactNode {
       return;
     }
     sending.current = true;
+    setPending(true);
     add.mutate(
       {
         body: {
@@ -257,6 +275,7 @@ export function COUSR01(): ReactNode {
         },
         onSettled: () => {
           sending.current = false;
+          setPending(false);
         },
       },
     );
@@ -273,6 +292,11 @@ export function COUSR01(): ReactNode {
   }
 
   function submit(event: FormEvent<HTMLFormElement>): void {
+    if (sending.current) {
+      // Refused while an add is in flight: the message stays and the browser submits nothing.
+      event.preventDefault();
+      return;
+    }
     setMessage(undefined);
     void handleSubmit(addUser, showSchemaError)(event);
   }
@@ -286,9 +310,10 @@ export function COUSR01(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} noValidate onSubmit={submit}>
+        <form id={formId} noValidate aria-busy={pending} onSubmit={submit}>
           <FieldGrid>
             {MAP_FIELDS.map(({ name, row, col, label, hint, dark }) => {
               const layout = inputLayout(name);
@@ -315,6 +340,7 @@ export function COUSR01(): ReactNode {
                            */}
                           <Input
                             {...field}
+                            readOnly={pending}
                             className={layout.className}
                             type={dark === true ? "password" : "text"}
                             maxLength={COUSR01_LENGTHS[name]}

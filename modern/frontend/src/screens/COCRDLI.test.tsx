@@ -284,6 +284,22 @@ function pageNo(): HTMLElement {
   return screen.getByLabelText("Page ", EXACT);
 }
 
+/**
+ * The header field `name` of rows 1 and 2 (`data-field`): the one `Input` of that name in the
+ * `CardHeader` title rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerInput(name: string): HTMLInputElement {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [field] = fields;
+  if (!(field instanceof HTMLInputElement)) {
+    throw new Error(`the header has no input ${name}`);
+  }
+  return field;
+}
+
 /** The selection code input of list row `row`, 1 to 7. */
 function selector(row: number): HTMLElement {
   return screen.getByRole("textbox", { name: `Select row ${row}` });
@@ -338,6 +354,63 @@ function typeCodes(codes: readonly string[]): void {
   }
 }
 
+/** The screen's form, which ENTER submits. */
+function listForm(): HTMLFormElement {
+  const form = document.querySelector("form");
+  if (form === null) {
+    throw new Error("The screen renders no form");
+  }
+  return form;
+}
+
+/** The key row, `PfKeyBar`'s group. */
+function keyRow(): HTMLElement {
+  return screen.getByRole("group", { name: "Function keys" });
+}
+
+/** Whether each key-row button is disabled, by its label. */
+function disabledKeys(): Record<string, boolean> {
+  return Object.fromEntries(
+    within(keyRow())
+      .getAllByRole("button")
+      .map((button) => [button.textContent ?? "", button.hasAttribute("disabled")]),
+  );
+}
+
+/** Whether each input the operator types in is read-only: both filters, then each row's code. */
+function readOnlyInputs(): boolean[] {
+  return [
+    accountFilter(),
+    cardFilter(),
+    ...screen.queryAllByRole("textbox", { name: /^Select row / }),
+  ].map((input) => input.hasAttribute("readonly"));
+}
+
+/**
+ * Answers every list request with `FIRST_PAGE`, the first `after` at once and the next ones only
+ * once `open` is called.
+ */
+function holdAfter(after: number) {
+  const gate: { open?: () => void } = {};
+  const held = new Promise<void>((resolve) => {
+    gate.open = resolve;
+  });
+  let served = 0;
+  const requests = stubFetch(async () => {
+    served += 1;
+    if (served > after) {
+      await held;
+    }
+    return json(200, FIRST_PAGE);
+  });
+  return {
+    requests,
+    open: () => {
+      gate.open?.();
+    },
+  };
+}
+
 beforeEach(() => {
   setSession("test-token", "USER0001", "U");
 });
@@ -387,8 +460,7 @@ describe("COCRDLI", () => {
     renderScreen();
 
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("List Credit Cards");
-    const header = (field: string) =>
-      document.querySelector(`[data-field="${field}"]`)?.textContent;
+    const header = (field: string): string => headerInput(field).value;
     expect(header("TRNNAME")).toBe("CCLI");
     expect(header("PGMNAME")).toBe("COCRDLIC");
     expect(header("TITLE01")).toBe("      AWS Mainframe Modernization       ");
@@ -456,6 +528,95 @@ describe("COCRDLI", () => {
     expect(listQueries(requests)).toEqual([{}]);
     expect(requests.at(0)?.authorization).toBe("Bearer test-token");
   });
+
+  it.each([
+    // audit: COCRDLI-002
+    {
+      id: "COCRDLI-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CCLI",
+    },
+    // audit: COCRDLI-003
+    {
+      id: "COCRDLI-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COCRDLI-005
+    {
+      id: "COCRDLI-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COCRDLI-007
+    {
+      id: "COCRDLI-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COCRDLIC",
+    },
+    // audit: COCRDLI-008
+    {
+      id: "COCRDLI-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // audit: COCRDLI-010
+    {
+      id: "COCRDLI-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    async ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const requests = stubReplies([200, FIRST_PAGE]);
+      renderScreen();
+      await firstPageShown();
+
+      const value = headerInput(name);
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(value);
+      // The fresh start's one list read, with no filter and no paging state.
+      expect(listQueries(requests)).toEqual([{}]);
+    },
+  );
 
   it("places the fields on their map lines and renders no stopper or dark field", async () => {
     // audit: COCRDLI-013
@@ -741,6 +902,117 @@ describe("COCRDLI", () => {
       { ...FIRST_PAGE_ECHO, direction: "forward" },
       { ...SECOND_PAGE_ECHO, direction: "backward" },
     ]);
+  });
+
+  it.each([
+    { title: "the entry read", before: 0, inputs: 2, send: undefined },
+    { title: "a click on ENTER", before: 1, inputs: 9, send: () => press("ENTER") },
+    {
+      title: "the key F8",
+      before: 1,
+      inputs: 9,
+      send: () => fireEvent.keyDown(window, { key: "F8" }),
+    },
+  ])("locks every key but F3 and the inputs during $title, then frees them", async ({
+    before,
+    inputs,
+    send,
+  }) => {
+    const { requests, open } = holdAfter(before);
+    renderScreen();
+    if (send !== undefined) {
+      await firstPageShown();
+      send();
+    }
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    expect(disabledKeys()).toEqual({
+      ENTER: true,
+      "F3=Exit": false,
+      "F7=Backward": true,
+      "F8=Forward": true,
+    });
+    expect(listForm().getAttribute("aria-busy")).toBe("true");
+    expect(readOnlyInputs()).toEqual(Array.from({ length: inputs }, () => true));
+    // Neither the buttons nor the keys send a second request, and no key counts as invalid.
+    press("ENTER");
+    press("F7=Backward");
+    press("F8=Forward");
+    for (const key of ["Enter", "F7", "F8", "F5"]) {
+      fireEvent.keyDown(window, { key });
+    }
+    fireEvent.keyDown(window, { key: "F8", shiftKey: true });
+    fireEvent.submit(listForm());
+    expect(messageRow("error").textContent).toBe("");
+
+    open();
+    await answered(requests, before + 1);
+    expect(keyRow().getAttribute("aria-busy")).toBe("false");
+    expect(disabledKeys()).toEqual({
+      ENTER: false,
+      "F3=Exit": false,
+      "F7=Backward": false,
+      "F8=Forward": false,
+    });
+    expect(readOnlyInputs()).toEqual(Array.from({ length: 9 }, () => false));
+
+    // The next key reads again.
+    press("ENTER");
+    await answered(requests, before + 2);
+    expect(listQueries(requests)).toHaveLength(before + 2);
+  });
+
+  it.each([
+    {
+      title: "ENTER clicked twice",
+      keys: () => {
+        press("ENTER");
+        press("ENTER");
+      },
+    },
+    {
+      title: "the keys Enter and F8",
+      keys: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+        fireEvent.keyDown(window, { key: "F8" });
+      },
+    },
+    {
+      title: "F7 clicked and the form submitted",
+      keys: () => {
+        press("F7=Backward");
+        fireEvent.submit(listForm());
+      },
+    },
+  ])("sends one read for $title before the screen shows the lock", async ({ keys }) => {
+    const requests = stubReplies([200, FIRST_PAGE]);
+    renderScreen();
+    await firstPageShown();
+
+    // One act: the screen renders only after both keys, so the second meets the enabled keys.
+    act(() => {
+      keys();
+    });
+
+    await answered(requests, 2);
+    expect(listQueries(requests)).toHaveLength(2);
+  });
+
+  it("exits on F3 while a read is in flight", async () => {
+    // audit: COCRDLIC-004
+    const { requests, open } = holdAfter(0);
+    renderScreen();
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    press("F3=Exit");
+
+    expect(await arrivedAt("COMEN01")).toBeNull();
+    open();
+    expect(listQueries(requests)).toEqual([{}]);
   });
 
   it("keeps a selection code at its row across F8, then opens the card now there", async () => {

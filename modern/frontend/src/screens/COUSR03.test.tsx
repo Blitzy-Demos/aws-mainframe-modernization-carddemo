@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -333,9 +333,20 @@ function marks(): {
 /** No control marked. */
 const UNMARKED = { userId: null, firstName: null, lastName: null, userType: null };
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const inputs = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(inputs).toHaveLength(1);
+  const [input] = inputs;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return input.value;
 }
 
 /**
@@ -344,13 +355,13 @@ function headerField(container: HTMLElement, name: string): string | null {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -381,9 +392,13 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.dataset.slot).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
@@ -391,9 +406,8 @@ function expectHeaderValues(
     expect(element.parentElement?.className).toBe(
       `row-start-${row} col-start-${col} col-span-${length}`,
     );
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -431,6 +445,26 @@ function key(label: string): HTMLElement {
 /** A keydown of `name` at the focused element, as the browser sends it; it bubbles to `window`. */
 function pressKey(name: string, shiftKey = false): void {
   fireEvent.keyDown(document.activeElement ?? document.body, { key: name, shiftKey });
+}
+
+/**
+ * Checks the keyboard lock as rendered. While `busy`, ENTER, F4 and F5 are disabled, the key row
+ * and the form are `aria-busy` and the user ID is read-only; F3 and F12 stay enabled either way.
+ */
+function expectLocked(busy: boolean): void {
+  const labels = ["ENTER=Fetch", "F3=Back", "F4=Clear", "F5=Delete", "F12"];
+  expect(labels.map((label) => [label, key(label).hasAttribute("disabled")])).toEqual([
+    ["ENTER=Fetch", busy],
+    ["F3=Back", false],
+    ["F4=Clear", busy],
+    ["F5=Delete", busy],
+    ["F12", false],
+  ]);
+  const group = screen.getByRole("group", { name: "Function keys" });
+  expect(group.getAttribute("aria-busy")).toBe(String(busy));
+  expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe(String(busy));
+  expect(userIdInput().readOnly).toBe(busy);
+  expect(userIdInput().disabled).toBe(false);
 }
 
 /**
@@ -624,7 +658,7 @@ describe("COUSR03 user delete screen", () => {
   // audit: COUSR03-007
   // audit: COUSR03-008
   // audit: COUSR03-010
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
@@ -925,22 +959,27 @@ describe("COUSR03 user delete screen", () => {
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
-  // The screen's keyboard lock: while a request is outstanding ENTER, F4 and F5 do nothing, as the
-  // 3270 keyboard stays locked until the program answers.
-  it("ignores ENTER, F4 and F5 while the fetch or the delete is outstanding", async () => {
+  // The screen's keyboard lock: while a request is outstanding ENTER, F4 and F5 are disabled and
+  // do nothing and the user ID is read-only, as the 3270 keyboard stays locked until the program
+  // answers; F3 and F12 stay enabled.
+  it("locks ENTER, F4, F5 and the user ID while the fetch or the delete is outstanding", async () => {
     const { requests, release } = stubApi(true);
     renderScreen(FROM_LIST);
     const form = userIdInput().closest("form");
     await waitFor(() => {
       expect(form?.getAttribute("aria-busy")).toBe("true");
     });
+    expectLocked(true);
 
     fireEvent.click(key("F5=Delete"));
     fireEvent.click(key("F4=Clear"));
     fireEvent.click(key("ENTER=Fetch"));
+    pressKey("F7");
     await settle();
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(userIdInput().value).toBe(SELECTED_ID);
+    // An unserved key while the keyboard is locked shows no invalid-key message.
+    expect(messageRow()).toEqual(EMPTY_ROW);
 
     release();
     await waitFor(() => {
@@ -949,11 +988,13 @@ describe("COUSR03 user delete screen", () => {
     await waitFor(() => {
       expect(form?.getAttribute("aria-busy")).toBe("false");
     });
+    expectLocked(false);
 
     fireEvent.click(key("F5=Delete"));
     await waitFor(() => {
       expect(form?.getAttribute("aria-busy")).toBe("true");
     });
+    expectLocked(true);
     pressKey("F5");
     fireEvent.click(key("F4=Clear"));
     fireEvent.click(key("ENTER=Fetch"));
@@ -970,8 +1011,80 @@ describe("COUSR03 user delete screen", () => {
       expect(messageRow()).toEqual(infoRow(deletedSelected.message));
     });
     expect(shown()).toEqual(BLANK);
+    await waitFor(() => {
+      expect(form?.getAttribute("aria-busy")).toBe("false");
+    });
+    expectLocked(false);
     await settle();
     expect(requests).toHaveLength(2);
+  });
+
+  // The lock is taken by the key itself, before the edits run: keys pressed in one burst, before
+  // React renders the disabled keys, send one request, and the answer unlocks the next one.
+  it.each([
+    {
+      title: "three clicks on ENTER=Fetch",
+      presses: ["ENTER=Fetch", "ENTER=Fetch", "ENTER=Fetch"],
+    },
+    { title: "three Enter keys", presses: ["Enter", "Enter", "Enter"] },
+    { title: "three clicks on F5=Delete", presses: ["F5=Delete", "F5=Delete", "F5=Delete"] },
+    { title: "three F5 keys", presses: ["F5", "F5", "F5"] },
+    {
+      title: "clicks on ENTER=Fetch, F5=Delete and F4=Clear",
+      presses: ["ENTER=Fetch", "F5=Delete", "F4=Clear"],
+    },
+    { title: "the F5, Enter and F4 keys", presses: ["F5", "Enter", "F4"] },
+  ])("$title in one burst send one request until it is answered", async ({ presses }) => {
+    const { requests, release } = stubApi(true);
+    renderScreen({ from: PATHS.COADM01 });
+    const [first] = presses;
+    const method = first === "F5" || first === "F5=Delete" ? "DELETE" : "GET";
+    // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
+    const burst = (): void => {
+      act(() => {
+        for (const press of presses) {
+          if (press.includes("=")) {
+            fireEvent.click(key(press));
+          } else {
+            fireEvent.keyDown(window, { key: press });
+          }
+        }
+      });
+    };
+
+    typeUserId(SELECTED_ID);
+    burst();
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expectLocked(true);
+    await settle();
+    expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
+    expect(userIdInput().value).toBe(SELECTED_ID);
+
+    release();
+    await waitFor(() => {
+      expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
+    });
+    expectLocked(false);
+
+    // A later key is served again, and locks the keyboard again until its own answer.
+    typeUserId(SELECTED_ID);
+    burst();
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expectLocked(true);
+    release();
+    await waitFor(() => {
+      expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
+    });
+    expectLocked(false);
+    await settle();
+    expect(sent(requests)).toEqual([
+      `${method} ${ENDPOINT}${SELECTED_ID}`,
+      `${method} ${ENDPOINT}${SELECTED_ID}`,
+    ]);
   });
 
   // audit: COUSR03-035

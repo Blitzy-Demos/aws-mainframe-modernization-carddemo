@@ -96,12 +96,21 @@ function enterOutcome(menu: components["schemas"]["MenuResponse"], option: strin
  *   replaces the message of the one before (COADM01C-004).
  * - F3 goes to sign-on, which starts with no session (COADM01C-020).
  * - Any other F-key shows the invalid-key message (COADM01C-021).
+ *
+ * While endpoint 3 loads or reloads, the keyboard is locked as the terminal's is until the program
+ * answers: ENTER is disabled and decides nothing, so it never matches an entry against a cached
+ * table the reload is replacing; the key row and the form are busy, the option input is read-only
+ * and an unserved F-key shows nothing. F3 stays available.
  */
 export function COADM01(): ReactNode {
   const formId = useId();
   const navigate = useNavigate();
   const menuQuery = useCoadm01cAdminMenu();
   const menu = menuQuery.data;
+  // Whether endpoint 3 is loading or reloading. Read here, during render, so the screen renders
+  // again when the fetch ends: TanStack Query re-renders only for the result fields a render reads.
+  // ENTER's guard and its `disabled` flag both follow it.
+  const pending = menuQuery.isFetching;
   const [keyMessage, setKeyMessage] = useState<ShellMessage>();
   const form = useForm<Coadm01Values>({
     resolver: zodResolver(coadm01Schema),
@@ -120,9 +129,9 @@ export function COADM01(): ReactNode {
                 void navigate(PATHS.COSGN00);
               },
             }
-          : item,
+          : { ...item, disabled: pending },
       ),
-    [navigate],
+    [navigate, pending],
   );
 
   /** The menu sent again with `message`, the cursor back on the option input (`IC`). */
@@ -133,9 +142,12 @@ export function COADM01(): ReactNode {
 
   /** ENTER with an entry the schema accepts: empty, or one or two digits. */
   function onEnter(values: Coadm01Values): void {
+    if (pending) {
+      return;
+    }
     if (menu === undefined) {
-      // No table to match against while the menu loads or after it failed: the load's own
-      // outcome, the gate's message included, is what the row shows.
+      // No table to match against after the load failed: the load's own outcome, the gate's
+      // message included, is what the row shows.
       setKeyMessage(undefined);
       return;
     }
@@ -156,6 +168,9 @@ export function COADM01(): ReactNode {
    * the program's invalid-option text is shown rather than the schema's own issue text.
    */
   function onRefusedEntry(): void {
+    if (pending) {
+      return;
+    }
     if (menu === undefined) {
       setKeyMessage(undefined);
       return;
@@ -185,9 +200,14 @@ export function COADM01(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={{ onInvalidKey }}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} onSubmit={form.handleSubmit(onEnter, onRefusedEntry)}>
+        <form
+          id={formId}
+          aria-busy={pending}
+          onSubmit={form.handleSubmit(onEnter, onRefusedEntry)}
+        >
           <FieldGrid>
             {/*
              * The option table holds the twelve OPTNnnn fields of lines 6 to 17, so it spans those
@@ -237,6 +257,7 @@ export function COADM01(): ReactNode {
                        */}
                       <Input
                         {...field}
+                        readOnly={pending}
                         data-field="OPTION"
                         maxLength={COADM01_LENGTHS.option}
                         size={COADM01_LENGTHS.option}

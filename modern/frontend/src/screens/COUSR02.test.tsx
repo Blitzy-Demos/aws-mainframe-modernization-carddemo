@@ -146,6 +146,15 @@ const SHOWN_SELECTED = {
   userType: "U",
 };
 
+/** The inputs showing {@link typedView} after ENTER fetched {@link TYPED_ID}. */
+const SHOWN_TYPED = {
+  userId: TYPED_ID,
+  firstName: "MARGARET",
+  lastName: "GOLD",
+  password: "",
+  userType: "A",
+};
+
 /** A JSON response, as the API sends every success and every `ScreenError`. */
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -343,9 +352,20 @@ function marks(): Record<keyof typeof INPUT_LABELS, string | null> {
 /** No input marked. */
 const UNMARKED = { userId: null, firstName: null, lastName: null, password: null, userType: null };
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const found = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(found).toHaveLength(1);
+  const [box] = found;
+  if (!(box instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return box.value;
 }
 
 /**
@@ -354,13 +374,13 @@ function headerField(container: HTMLElement, name: string): string | null {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -391,9 +411,13 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.dataset.slot).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
@@ -401,9 +425,8 @@ function expectHeaderValues(
     expect(element.parentElement?.className).toBe(
       `row-start-${row} col-start-${col} col-span-${length}`,
     );
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -483,6 +506,47 @@ async function selectedShown(): Promise<void> {
 async function settle(): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, 20);
+  });
+}
+
+/** The row-24 labels in map order (COUSR02-029). */
+const KEY_LABELS = ["ENTER=Fetch", "F3=Save&Exit", "F4=Clear", "F5=Save", "F12=Cancel"];
+
+/** The five inputs in map order, by form name. */
+const INPUT_NAMES = ["userId", "firstName", "lastName", "password", "userType"] as const;
+
+/**
+ * The keyboard lock the screen shows: the disabled row-24 buttons, the read-only inputs, and the
+ * `aria-busy` of the key row and of the form.
+ */
+function lockShown(): { disabled: string[]; readOnly: string[]; busy: (string | null)[] } {
+  return {
+    disabled: KEY_LABELS.filter((label) => key(label).hasAttribute("disabled")),
+    readOnly: INPUT_NAMES.filter((name) => input(name).readOnly),
+    busy: [
+      screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),
+      input("userId").form?.getAttribute("aria-busy") ?? null,
+    ],
+  };
+}
+
+/** An idle screen: every key acts, every input is editable, nothing is busy. */
+const UNLOCKED = { disabled: [], readOnly: [], busy: ["false", "false"] };
+
+/** A fetch or a save in flight: every key but F12 refused, the inputs read-only, busy. */
+const REQUEST_LOCK = {
+  disabled: ["ENTER=Fetch", "F3=Save&Exit", "F4=Clear", "F5=Save"],
+  readOnly: [...INPUT_NAMES],
+  busy: ["true", "true"],
+};
+
+/** Once F3 has started: every key refused, F12 included, until the screen has left. */
+const LEAVING_LOCK = { ...REQUEST_LOCK, disabled: KEY_LABELS };
+
+/** Waits until the screen shows `lock`. */
+async function lockReaches(lock: ReturnType<typeof lockShown>): Promise<void> {
+  await waitFor(() => {
+    expect(lockShown()).toEqual(lock);
   });
 }
 
@@ -629,9 +693,10 @@ describe("COUSR02 user update screen", () => {
   // audit: COUSR02-033
   // audit: COUSR02-034
   // audit: COUSR02-035
-  // The header labels and value fields render as plain text rather than the `Label` and
-  // read-only `Input` of COUSR02-001 to COUSR02-010. This test proves the values the program
-  // moves; the next test proves the placement and read-only state of the six value fields.
+  // The header values of COUSR02-001 to COUSR02-010 are the read-only `Input`s `ScreenShell`
+  // renders in the `CardHeader` title rows, skipped by Tab; NAV proves the label rows. This test
+  // proves the values the program moves; the next test proves the six value fields' placement,
+  // read-only state and width.
   it("fills header rows 1 and 2 at every send: CU02, COUSR02C, titles, date, time", async () => {
     // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
@@ -664,7 +729,7 @@ describe("COUSR02 user update screen", () => {
   // audit: COUSR02-007
   // audit: COUSR02-008
   // audit: COUSR02-010
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
@@ -1103,13 +1168,18 @@ describe("COUSR02 user update screen", () => {
       ]);
     });
 
-    // While the save runs, every key is ignored: no second save, no clear, no cancel, no message.
+    // While the save runs, every key is disabled, F12 included, and the inputs are read-only.
+    await lockReaches(LEAVING_LOCK);
+    // Every key is ignored: no second save, no clear, no cancel, no fetch, no message.
     fireEvent.click(key("F3=Save&Exit"));
     fireEvent.click(key("F5=Save"));
     fireEvent.click(key("F4=Clear"));
     fireEvent.click(key("F12=Cancel"));
     fireEvent.click(key("ENTER=Fetch"));
-    pressKey("F7");
+    for (const name of ["F3", "F5", "F4", "F12", "F7"]) {
+      pressKey(name);
+    }
+    fireEvent.keyDown(document.body, { key: "Enter" });
     await settle();
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
     expect(shownInputs()).toEqual({ ...SHOWN_SELECTED, firstName: "LARRY" });
@@ -1168,7 +1238,7 @@ describe("COUSR02 user update screen", () => {
 
   // audit: COUSR02C-007
   // audit: COUSR02C-017
-  it("F4 while a fetch is in flight keeps the screen empty when its answer arrives", async () => {
+  it("F4 while a fetch is in flight is refused, and the fetch's answer fills the screen", async () => {
     const get = gate();
     const requests = stubApi(() => json(200, updated), {
       method: "GET",
@@ -1188,16 +1258,245 @@ describe("COUSR02 user update screen", () => {
     });
     // The program clears the four inputs before its read.
     expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+    await lockReaches(REQUEST_LOCK);
 
+    // The keyboard is locked until the program answers: F4 neither clears nor cancels the read.
+    fireEvent.click(key("F4=Clear"));
+    pressKey("F4");
+    await settle();
+    expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+    expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+
+    get.open();
+    await waitFor(() => {
+      expect(shownInputs()).toEqual(SHOWN_TYPED);
+    });
+    expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+    await lockReaches(UNLOCKED);
+
+    // Answered, F4 clears again.
     fireEvent.click(key("F4=Clear"));
     await waitFor(() => {
       expect(shownInputs()).toEqual(BLANK_INPUTS);
     });
-    get.open();
-    await settle();
-    expect(shownInputs()).toEqual(BLANK_INPUTS);
     expect(shownMessage()).toEqual({ kind: "error", text: "" });
     expect(requests).toHaveLength(2);
+  });
+
+  // audit: COUSR02C-013
+  // audit: COUSR02C-033
+  it.each([
+    {
+      title: "ENTER=Fetch clicks",
+      method: "GET",
+      press: () => {
+        fireEvent.click(key("ENTER=Fetch"));
+      },
+    },
+    {
+      title: "Enter keydowns outside the form",
+      method: "GET",
+      press: () => {
+        fireEvent.keyDown(document.body, { key: "Enter" });
+      },
+    },
+    {
+      title: "submissions of the form by the Enter key in an input",
+      method: "GET",
+      press: () => {
+        const form = input("userId").form;
+        if (form !== null) {
+          fireEvent.submit(form);
+        }
+      },
+    },
+    {
+      title: "F5=Save clicks",
+      method: "PUT",
+      press: () => {
+        fireEvent.click(key("F5=Save"));
+      },
+    },
+    {
+      title: "F5 keydowns",
+      method: "PUT",
+      press: () => {
+        pressKey("F5");
+      },
+    },
+  ] as const)(
+    "repeated $title before the answer send one request, and a later one is sent again",
+    async (row) => {
+      const answer = gate();
+      const target = row.method === "GET" ? TYPED_ID : SELECTED_ID;
+      const requests = stubApi(() => json(200, updated), {
+        method: row.method,
+        userId: target,
+        until: answer.until,
+      });
+      renderScreen(FROM_LIST);
+      await selectedShown();
+      await lockReaches(UNLOCKED);
+      if (row.method === "GET") {
+        typeInto("userId", TYPED_ID);
+      } else {
+        typeInto("firstName", "LARRY");
+      }
+      const one = [`GET ${ENDPOINT}${SELECTED_ID}`, `${row.method} ${ENDPOINT}${target}`];
+
+      row.press();
+      await waitFor(() => {
+        expect(sent(requests)).toEqual(one);
+      });
+      // While the answer is held back: every key but F12 is disabled and the inputs read-only.
+      await lockReaches(REQUEST_LOCK);
+      row.press();
+      row.press();
+      // No other request either, and an unserved key shows nothing.
+      fireEvent.click(key("ENTER=Fetch"));
+      fireEvent.click(key("F5=Save"));
+      fireEvent.click(key("F3=Save&Exit"));
+      for (const name of ["F3", "F5", "F7"]) {
+        pressKey(name);
+      }
+      await settle();
+      expect(sent(requests)).toEqual(one);
+      expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+      expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
+
+      answer.open();
+      await waitFor(() => {
+        expect(shownMessage()).toEqual({
+          kind: "info",
+          text: row.method === "GET" ? UPDATE_PROMPT : updated.message,
+        });
+      });
+      await lockReaches(UNLOCKED);
+      expect(shownInputs()).toEqual(
+        row.method === "GET" ? SHOWN_TYPED : { ...SHOWN_SELECTED, firstName: "LARRY" },
+      );
+
+      // Settled, the same key sends its request again.
+      row.press();
+      await waitFor(() => {
+        expect(sent(requests)).toEqual([...one, `${row.method} ${ENDPOINT}${target}`]);
+      });
+      await lockReaches(UNLOCKED);
+    },
+  );
+
+  // audit: COUSR02C-006
+  it("F3 while a save is in flight is refused: no second save, and a later F3 saves once", async () => {
+    const put = gate();
+    const requests = stubApi(() => json(200, updated), {
+      method: "PUT",
+      userId: SELECTED_ID,
+      until: put.until,
+    });
+    renderScreen(FROM_LIST);
+    await selectedShown();
+
+    // Save A: F5 with the first name LARRY, its answer held back.
+    typeInto("firstName", "LARRY");
+    fireEvent.click(key("F5=Save"));
+    await waitFor(() => {
+      expect(sent(requests)).toEqual([
+        `GET ${ENDPOINT}${SELECTED_ID}`,
+        `PUT ${ENDPOINT}${SELECTED_ID}`,
+      ]);
+    });
+    await lockReaches(REQUEST_LOCK);
+    fireEvent.click(key("F3=Save&Exit"));
+    pressKey("F3");
+    await settle();
+    expect(requests).toHaveLength(2);
+
+    // Save A's answer is shown and the screen stays: the refused F3 was not queued.
+    put.open();
+    await waitFor(() => {
+      expect(shownMessage()).toEqual({ kind: "info", text: updated.message });
+    });
+    await lockReaches(UNLOCKED);
+    expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
+
+    // Value B, then F3: exactly one save of B, then the return to the user list.
+    typeInto("firstName", "LAURENCE");
+    fireEvent.click(key("F3=Save&Exit"));
+    const stub = await reachedStub();
+    expect(stub.path).toBe("/users");
+    await settle();
+    expect(sent(requests)).toEqual([
+      `GET ${ENDPOINT}${SELECTED_ID}`,
+      `PUT ${ENDPOINT}${SELECTED_ID}`,
+      `PUT ${ENDPOINT}${SELECTED_ID}`,
+    ]);
+    expect(await bodyOf(requests[1])).toStrictEqual({
+      first_name: "LARRY",
+      last_name: "THOMAS",
+      user_type: "U",
+    });
+    expect(await bodyOf(requests[2])).toStrictEqual({
+      first_name: "LAURENCE",
+      last_name: "THOMAS",
+      user_type: "U",
+    });
+  });
+
+  // audit: COUSR02C-008
+  it.each([
+    { title: "a fetch", method: "GET", userId: TYPED_ID },
+    { title: "a save", method: "PUT", userId: SELECTED_ID },
+  ] as const)("F12 while $title is in flight still goes to /admin", async (row) => {
+    const answer = gate();
+    const requests = stubApi(() => json(200, updated), {
+      method: row.method,
+      userId: row.userId,
+      until: answer.until,
+    });
+    renderScreen(FROM_LIST);
+    await selectedShown();
+
+    if (row.method === "GET") {
+      typeInto("userId", TYPED_ID);
+      fireEvent.click(key("ENTER=Fetch"));
+    } else {
+      fireEvent.click(key("F5=Save"));
+    }
+    await lockReaches(REQUEST_LOCK);
+    fireEvent.click(key("F12=Cancel"));
+
+    const stub = await reachedStub();
+    expect(stub.path).toBe("/admin");
+    expect(stub.state).toEqual({ from: "/users/update" });
+    answer.open();
+    await settle();
+    expect(sent(requests)).toEqual([
+      `GET ${ENDPOINT}${SELECTED_ID}`,
+      `${row.method} ${ENDPOINT}${row.userId}`,
+    ]);
+  });
+
+  // audit: COUSR02C-013
+  it("a fetch's answer fills nothing once the user ID shown is no longer the one it was sent for", async () => {
+    const get = gate();
+    const requests = stubApi(() => json(200, updated), {
+      method: "GET",
+      userId: SELECTED_ID,
+      until: get.until,
+    });
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
+    });
+    await lockReaches(REQUEST_LOCK);
+
+    // The input is read-only to the keyboard; a script can still replace its value.
+    typeInto("userId", TYPED_ID);
+    get.open();
+    await lockReaches(UNLOCKED);
+    expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+    expect(shownMessage()).toEqual({ kind: "error", text: "" });
+    expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
   // audit: COUSR02-040

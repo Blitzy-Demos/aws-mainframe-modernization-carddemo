@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -24,13 +24,13 @@ import { COPAU00 } from "./COPAU00";
  *
  * Expectations come from the `client` rows of `modern/audit/online/COPAUS0C.md` and
  * `modern/audit/screens.md`. Rows `COPAU00-001` to `COPAU00-010` place the header labels in a
- * `Label` and the header values in a read-only `Input`; the shared `ScreenShell` renders both as
- * plain text in the `CardHeader` title rows. The six value rows (`COPAU00-002`, `-003`, `-005`,
- * `-007`, `-008`, `-010`) are proved by that text's read-only state, `POS`, width and placement,
- * and their content rows (`COPAU00-105` to `COPAU00-110`) by the values it shows. The rows
- * blocked by halts `X-COPAUS0C-H3` and `X-COPAUS0C-H4` are tested in
- * their own `BLOCKED` groups, which assert only the replacement's path the rows state, never a
- * COBOL result.
+ * `Label` and the header values in the read-only `Input`s the shared `ScreenShell` renders in the
+ * `CardHeader` title rows, skipped by Tab. NAV proves the label rows. {@link expectHeaderValues}
+ * proves the six value rows (`COPAU00-002`, `-003`, `-005`, `-007`, `-008`, `-010`): their
+ * placement, read-only state and width; their content rows (`COPAU00-105` to `COPAU00-110`) are
+ * proved by the values those inputs hold. The rows blocked by halts `X-COPAUS0C-H3` and
+ * `X-COPAUS0C-H4` are tested in their own `BLOCKED` groups, which assert only the replacement's
+ * path the rows state, never a COBOL result.
  */
 
 /*
@@ -388,6 +388,28 @@ function press(label: string): void {
   fireEvent.click(screen.getByRole("button", { name: label }));
 }
 
+/**
+ * Checks the keyboard lock as rendered, before any page or after a page of five rows. While
+ * `busy`, ENTER, F3, F7 and F8 are disabled, the key row and the form are `aria-busy`, and the
+ * account field and the five selectors are read-only; none of the fields is ever disabled.
+ */
+function expectLocked(busy: boolean): void {
+  const labels = ["ENTER=Continue", "F3=Back", "F7=Backward", "F8=Forward"];
+  expect(
+    labels.map((label) => [
+      label,
+      screen.getByRole("button", { name: label }).hasAttribute("disabled"),
+    ]),
+  ).toEqual(labels.map((label) => [label, busy]));
+  const group = screen.getByRole("group", { name: "Function keys" });
+  expect(group.getAttribute("aria-busy")).toBe(String(busy));
+  expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe(String(busy));
+  for (const field of [accountField(), ...[1, 2, 3, 4, 5].map(selector)]) {
+    expect(field).toHaveProperty("readOnly", busy);
+    expect(field).toHaveProperty("disabled", false);
+  }
+}
+
 /** Types `account` into the account field and presses ENTER. */
 function enter(account: string): void {
   typeInto(accountField(), account);
@@ -437,9 +459,20 @@ function marks(): (string | null)[] {
 /** No input marked. */
 const UNMARKED = [null, null, null, null, null, null];
 
-/** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
-function headerField(name: string): string | null | undefined {
-  return document.querySelector(`[data-field="${name}"]`)?.textContent;
+/**
+ * The value of the header field `name` (`TRNNAME`, `CURDATE`, …): the one read-only `Input` of
+ * that name in the `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerField(name: string): string {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [field] = fields;
+  if (!(field instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return field.value;
 }
 
 /**
@@ -448,13 +481,13 @@ function headerField(name: string): string | null | undefined {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -485,17 +518,20 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.getAttribute("data-slot")).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
     // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
     expect(element.parentElement?.className).toBe(cell(row, col, length));
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -815,7 +851,7 @@ describe("COPAU00 View Authorizations", () => {
     }
   });
 
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // audit: COPAU00-002
     // audit: COPAU00-003
     // audit: COPAU00-005
@@ -1550,7 +1586,7 @@ describe("COPAU00 View Authorizations", () => {
     expect(marks()).toEqual(UNMARKED);
   });
 
-  it("locks the keyboard while a read is outstanding: ENTER, F3, F7, F8 and an invalid key do nothing until it answers", async () => {
+  it("locks the keyboard while a read is outstanding: ENTER, F3, F7 and F8 are disabled, the fields read-only and an invalid key does nothing until it answers", async () => {
     const gate = { release: () => {} };
     const held = new Promise<void>((resolve) => {
       gate.release = () => resolve();
@@ -1558,17 +1594,20 @@ describe("COPAU00 View Authorizations", () => {
     const sent = stubFetch(async () => {
       await held;
       return json(200, PAGE_1)();
-    });
+    }, json(200, PAGE_2));
     renderScreen();
+    expectLocked(false);
     enter(ACCOUNT);
     await waitFor(() => expect(sent).toHaveLength(1));
-    expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("true");
+    expectLocked(true);
 
     press("ENTER=Continue");
     press("F3=Back");
     press("F7=Backward");
     press("F8=Forward");
     fireEvent.keyDown(accountField(), { key: "F2" });
+    fireEvent.keyDown(accountField(), { key: "F3" });
+    fireEvent.keyDown(accountField(), { key: "F8" });
     await idle();
     expect(sent).toHaveLength(1);
     expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
@@ -1576,8 +1615,83 @@ describe("COPAU00 View Authorizations", () => {
 
     gate.release();
     await answered(sent, 1);
+    expectLocked(false);
     expectListed(PAGE_1.rows);
     expect(shownBlock()).toEqual(expectedBlock(BLOCK));
+
+    // The answer unlocks the keyboard: the next key is served.
+    press("F8=Forward");
+    await answered(sent, 2);
+    expect(sent[1].query).toEqual({ page_key: authKey(5), direction: "forward" });
+  });
+
+  // The lock is taken by the key itself, before the edits run: keys pressed in one burst, before
+  // React renders the disabled keys, send one read, and the answer unlocks the next key.
+  it.each([
+    {
+      title: "three clicks on ENTER=Continue",
+      presses: ["ENTER=Continue", "ENTER=Continue", "ENTER=Continue"],
+      query: {},
+    },
+    { title: "three Enter keys", presses: ["Enter", "Enter", "Enter"], query: {} },
+    {
+      title: "three clicks on F8=Forward",
+      presses: ["F8=Forward", "F8=Forward", "F8=Forward"],
+      query: { page_key: authKey(5), direction: "forward" },
+    },
+    {
+      title: "three F8 keys",
+      presses: ["F8", "F8", "F8"],
+      query: { page_key: authKey(5), direction: "forward" },
+    },
+    {
+      title: "clicks on F8=Forward, ENTER=Continue, F7=Backward and F3=Back",
+      presses: ["F8=Forward", "ENTER=Continue", "F7=Backward", "F3=Back"],
+      query: { page_key: authKey(5), direction: "forward" },
+    },
+    { title: "the Enter, F8, F7 and F3 keys", presses: ["Enter", "F8", "F7", "F3"], query: {} },
+  ])("$title in one burst send one read until it is answered", async ({ presses, query }) => {
+    const gate = { release: () => {} };
+    const held = new Promise<void>((resolve) => {
+      gate.release = () => resolve();
+    });
+    const sent = stubFetch(
+      json(200, PAGE_1),
+      async () => {
+        await held;
+        return json(200, PAGE_2)();
+      },
+      json(200, PAGE_1),
+    );
+    renderScreen();
+    enter(ACCOUNT);
+    await answered(sent, 1);
+
+    // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
+    act(() => {
+      for (const label of presses) {
+        if (label.includes("=")) {
+          press(label);
+        } else {
+          fireEvent.keyDown(window, { key: label });
+        }
+      }
+    });
+    await waitFor(() => expect(sent).toHaveLength(2));
+    expectLocked(true);
+    await idle();
+    expect(sent).toHaveLength(2);
+    expect(sent[1].path).toBe(summaryPath(ACCOUNT));
+    expect(sent[1].query).toEqual(query);
+    expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
+
+    gate.release();
+    await answered(sent, 2);
+    expectLocked(false);
+
+    press("ENTER=Continue");
+    await answered(sent, 3);
+    expect(sent[2].query).toEqual({});
   });
 });
 

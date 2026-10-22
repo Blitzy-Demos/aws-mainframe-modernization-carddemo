@@ -43,7 +43,7 @@ use sqlx::PgExecutor;
 
 use crate::error::{DecodeKind, PersistenceError};
 use crate::rows::{TransactionRow, pic_x_to_string};
-use crate::{PgSession, PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx, ProbePoint, probed};
 
 /// Column `tran_id`, `TRAN-ID PIC X(16)` (CVTRA05Y-001): the key every keyed statement binds
 /// and the column a failed allocation names.
@@ -359,7 +359,8 @@ impl TransactionRepository for PgStore {
         &mut self,
         record: &TransactionRecord,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-        insert_row(self.pool(), record)
+        let verdict = self.verdict(ProbePoint::TransactionInsert, &[record]);
+        probed(verdict, insert_row(self.pool(), record))
     }
 
     fn page_after(
@@ -423,7 +424,8 @@ impl TransactionRepository for PgTx<'_> {
         &mut self,
         record: &TransactionRecord,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-        insert_row(self.conn(), record)
+        let verdict = self.verdict(ProbePoint::TransactionInsert, &[record]);
+        probed(verdict, insert_row(self.conn(), record))
     }
 
     fn page_after(
@@ -465,6 +467,7 @@ impl TransactionRepository for PgTx<'_> {
     }
 }
 
+// A session is never probed (see "Probes" in the crate documentation).
 impl TransactionRepository for PgSession {
     fn find_by_id(
         &mut self,

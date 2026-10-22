@@ -23,10 +23,12 @@ import { COACTUP } from "./COACTUP";
  * dark keys, the message rows, the keys that send no request (F3, F12, the restart after a
  * finished save) and the requests ENTER and F5 build. `online/CSUTLDTC.md` has no `client` row.
  *
- * Not tagged here: COACTUP-001 to COACTUP-010 describe the header literals and values as `Label`
- * and read-only `Input` elements, while `ScreenShell` renders them as plain text; their content
- * rows (COACTUP-129 to COACTUP-134) and the absence of the unnamed (1,1) field (COACTUP-124) are
- * proved instead.
+ * Not tagged here: the header literals COACTUP-001, COACTUP-004, COACTUP-006 and COACTUP-009,
+ * which NAV tags. They and the header values COACTUP-002 to COACTUP-010 are described as `Label`
+ * and read-only `Input` elements, as `ScreenShell` renders them; the value rows are tagged here on
+ * each value's read-only `Input`, width, map `POS`, `LENGTH`, label and content, as are their
+ * content rows (COACTUP-129 to COACTUP-134) and the absence of the unnamed (1,1) field
+ * (COACTUP-124).
  *
  * Every value is synthetic. Responses carry only the redacted SSN `***-**-1234`; the SSN the
  * operator re-enters exists only as request input (Cardholder Data Redaction, E32).
@@ -277,13 +279,34 @@ function put(status: number, body: unknown) {
   return { method: "PUT", path: ACCOUNT_PATH, status, body } as const;
 }
 
+/** A gate a stubbed answer waits on, and the call that lets the answer go. */
+function gate(): { until: Promise<void>; open: () => void } {
+  const opener: { open?: () => void } = {};
+  const until = new Promise<void>((resolve) => {
+    opener.open = resolve;
+  });
+  return {
+    until,
+    open: () => {
+      opener.open?.();
+    },
+  };
+}
+
 /**
  * Replaces `fetch` with a stub that records every request and answers them in order from
  * `replies`, each only when the request has its method and decoded path; any other request gets a
- * 500. No request leaves the process (Local-Only Runtime).
+ * 500. A reply with `until` is held until that gate opens. No request leaves the process
+ * (Local-Only Runtime).
  */
 function stubApi(
-  ...replies: { method: "GET" | "PUT"; path: string; status: number; body: unknown }[]
+  ...replies: {
+    method: "GET" | "PUT";
+    path: string;
+    status: number;
+    body: unknown;
+    until?: Promise<void>;
+  }[]
 ): void {
   const pending = [...replies];
   vi.stubGlobal(
@@ -299,6 +322,7 @@ function stubApi(
         return reply(500, { message: `Unexpected ${req.method} ${path}` });
       }
       pending.shift();
+      await next.until;
       return reply(next.status, next.body);
     }),
   );
@@ -335,6 +359,22 @@ function input(name: string): HTMLInputElement {
   const element = screen.getByLabelText(name);
   if (!(element instanceof HTMLInputElement)) {
     throw new Error(`${name} labels no input`);
+  }
+  return element;
+}
+
+/**
+ * The header field `name` of rows 1 and 2 (`data-field`): the one `Input` of that name in the
+ * `CardHeader` title rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerInput(name: string): HTMLInputElement {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [element] = fields;
+  if (!(element instanceof HTMLInputElement)) {
+    throw new Error(`the header has no input ${name}`);
   }
   return element;
 }
@@ -421,6 +461,28 @@ async function settled(): Promise<void> {
   });
 }
 
+/**
+ * The keyboard locked while a request is awaited, or open again: every key but F3 disabled, the
+ * hidden ones included, the key row and the form busy, and, while locked, every field read-only.
+ * F3 sends no request and is available either way.
+ */
+function expectLocked(locked: boolean): void {
+  const keyRow = screen.getByRole("group", { name: "Function keys" });
+  const labels = within(keyRow)
+    .getAllByRole("button", { hidden: true })
+    .map((button) => ({ label: button.textContent, disabled: button.hasAttribute("disabled") }));
+  expect(labels).toEqual(
+    labels.map(({ label }) => ({ label, disabled: locked && label !== "F3=Exit" })),
+  );
+  expect([keyRow.getAttribute("aria-busy"), mapForm().getAttribute("aria-busy")]).toEqual([
+    String(locked),
+    String(locked),
+  ]);
+  if (locked) {
+    expect(enterableIds()).toEqual([]);
+  }
+}
+
 /** Types the account number, presses ENTER=Process and waits for the fetched details. */
 async function fetchAccount(): Promise<void> {
   typeInto("Account Number :", ACCOUNT);
@@ -493,8 +555,7 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     stubApi();
     renderScreen();
 
-    const header = (field: string): string | null | undefined =>
-      document.querySelector(`[data-field="${field}"]`)?.textContent;
+    const header = (field: string): string => headerInput(field).value;
     const title01 = `${" ".repeat(6)}AWS Mainframe Modernization${" ".repeat(7)}`;
     const title02 = `${" ".repeat(14)}CardDemo${" ".repeat(18)}`;
     expect([title01.length, title02.length]).toEqual([40, 40]);
@@ -556,6 +617,93 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
 
     expect(sent).toEqual([]);
   });
+
+  it.each([
+    // audit: COACTUP-002
+    {
+      id: "COACTUP-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CAUP",
+    },
+    // audit: COACTUP-003
+    {
+      id: "COACTUP-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COACTUP-005
+    {
+      id: "COACTUP-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COACTUP-007
+    {
+      id: "COACTUP-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COACTUPC",
+    },
+    // audit: COACTUP-008
+    {
+      id: "COACTUP-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // audit: COACTUP-010
+    {
+      id: "COACTUP-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      stubApi();
+      renderScreen();
+
+      const value = headerInput(name);
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(value);
+      expect(sent).toEqual([]);
+    },
+  );
 
   it.each([
     // audit: COACTUP-012
@@ -1130,6 +1278,160 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     expectEmptyScreen(ACCOUNT);
     expect(document.activeElement).toBe(input("Account Number :"));
     expect(sent).toHaveLength(2);
+  });
+
+  it("locks the keyboard while ENTER's fetch is awaited: keys repeated before the answer send nothing, and the next ENTER is sent", async () => {
+    const fetched = gate();
+    stubApi({ ...get(200, VIEW), until: fetched.until }, put(200, VALIDATED));
+    renderScreen();
+    typeInto("Account Number :", ACCOUNT);
+    expectLocked(false);
+
+    // Presses in one task, before the screen renders the lock: the button twice, the Enter key,
+    // and F12 and F7, which COACTUPC processes as ENTER before a fetch. The lock taken by the
+    // first refuses the others.
+    act(() => {
+      key("ENTER=Process").click();
+      key("ENTER=Process").click();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F7" }));
+    });
+    await waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
+    expectLocked(true);
+    expect([key("F5=Save").hasAttribute("hidden"), key("F12=Cancel").hasAttribute("hidden")]).toEqual(
+      [true, true],
+    );
+
+    // The same presses on the locked screen, and a submission of its form, send nothing.
+    fireEvent.click(key("ENTER=Process"));
+    fireEvent.keyDown(window, { key: "Enter" });
+    fireEvent.keyDown(window, { key: "F12" });
+    fireEvent.submit(mapForm());
+    expectLocked(true);
+
+    fetched.open();
+    await waitFor(() => {
+      expect(input("Opened :").value).toBe("2014");
+    });
+    await settled();
+    expectLocked(false);
+    expectDetailsEnterable();
+    expect(document.activeElement).toBe(input("Active Y/N:"));
+
+    await validate();
+    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT"]);
+  });
+
+  it("locks the keyboard while ENTER's validation and F5's save are awaited, F5=Save and F12=Cancel staying shown but disabled, and opens it with each answer", async () => {
+    const validated = gate();
+    const saved = gate();
+    stubApi(
+      get(200, VIEW),
+      { ...put(200, VALIDATED), until: validated.until },
+      { ...put(200, COMMITTED), until: saved.until },
+    );
+    renderScreen();
+    await fetchAccount();
+    typeInto("First Name", "Grace");
+
+    // ENTER twice, F5, which is ENTER outside state N, and F12, which in state S would discard
+    // the edit: all in one task, so only the lock taken by the first refuses the others.
+    act(() => {
+      key("ENTER=Process").click();
+      key("ENTER=Process").click();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+    });
+    await waitFor(() => {
+      expect(sent).toHaveLength(2);
+    });
+    expectLocked(true);
+    expect(input("First Name").value).toBe("Grace");
+
+    validated.open();
+    expect(await screen.findByRole("button", { name: "F5=Save" })).toBe(key("F5=Save"));
+    await settled();
+    expectLocked(false);
+
+    // F5 twice by its button and once by its key, F12 and the Enter key, in one task.
+    act(() => {
+      key("F5=Save").click();
+      key("F5=Save").click();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+    });
+    await waitFor(() => {
+      expect(sent).toHaveLength(3);
+    });
+    expectLocked(true);
+    expect([key("F5=Save").hasAttribute("hidden"), key("F12=Cancel").hasAttribute("hidden")]).toEqual(
+      [false, false],
+    );
+    expect(messageRow("info").textContent).toBe("Changes validated.Press F5 to save");
+
+    saved.open();
+    await waitFor(() => {
+      expect(messageRow("info").textContent).toBe("Changes committed to database");
+    });
+    await settled();
+    expectLocked(false);
+    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT", "PUT"]);
+    expect(sent.slice(1).map((request) => request.body)).toMatchObject([
+      { aid: "ENTER", fields: { first_name: "Grace" } },
+      { aid: "PF5", fields: { first_name: "Grace" } },
+    ]);
+  });
+
+  it("opens the lock when the schema refuses a length, so the corrected ENTER is sent", async () => {
+    stubApi(get(200, VIEW), put(200, VALIDATED));
+    renderScreen();
+    await fetchAccount();
+    typeInto("First Name", "G".repeat(26));
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe("String must contain at most 25 character(s)");
+    });
+
+    expect(sent).toHaveLength(1);
+    expectLocked(false);
+    expectDetailsEnterable();
+    typeInto("First Name", "Grace");
+    await validate();
+    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT"]);
+  });
+
+  it.each([
+    {
+      title: "the F3=Exit button",
+      press: () => {
+        fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      },
+    },
+    {
+      title: "the F3 key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "F3" });
+      },
+    },
+  ])("$title stays available while the fetch is awaited and opens the main menu", async (exit) => {
+    const fetched = gate();
+    stubApi({ ...get(200, VIEW), until: fetched.until });
+    renderScreen();
+    typeInto("Account Number :", ACCOUNT);
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
+    expectLocked(true);
+
+    exit.press();
+    expect(await screen.findByText("Arrived at COMEN01 from /accounts/update")).toBeTruthy();
+    fetched.open();
+    expect(sent).toHaveLength(1);
   });
 });
 

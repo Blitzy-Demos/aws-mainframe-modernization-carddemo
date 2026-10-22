@@ -1,8 +1,17 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
-import { useCocrdslcView } from "@/api/hooks";
+import { errorStatus, useCocrdslcView } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
@@ -98,10 +107,21 @@ function callerPath(state: unknown): string | undefined {
 }
 
 /**
- * The card a COCRDLI `S` selection names: the row's `acct_id` and `card_ref` (COCRDSLC-002). Route
- * state is not typed, so anything else, a missing member included, is no selection.
+ * The card a COCRDLI `S` selection names: the row's `acct_id` and `card_ref` (COCRDSLC-002), taken
+ * only when `caller` is the card list, as COCRDSLC reads on entry only `WHEN CDEMO-PGM-ENTER AND
+ * CDEMO-FROM-PROGRAM EQUAL LIT-CCLISTPGM` (`app/cbl/COCRDSLC.cbl:339-341`). The main menu
+ * forwards the route state it received, where an earlier screen may have left an account and a
+ * card, so from the menu, from any other caller or from none the screen opens empty
+ * (COCRDSLC-001). Route state is not typed, so anything else, a missing member included, is no
+ * selection.
  */
-function listSelection(state: unknown): { acctId: string; cardRef: number } | undefined {
+function listSelection(
+  state: unknown,
+  caller: string | undefined,
+): { acctId: string; cardRef: number } | undefined {
+  if (caller !== PATHS.COCRDLI) {
+    return undefined;
+  }
   const acctId = stateMember(state, "acct_id");
   const cardRef = stateMember(state, "card_ref");
   if (
@@ -175,35 +195,48 @@ type Display = {
  * CCDL / COCRDSLC, map `CCRDSLA`: one credit card's detail, read through endpoint 8
  * (`GET /api/v1/cards/view`).
  *
- * - From the main menu (option 04) the screen opens empty with the account input focused and
- *   sends nothing (COCRDSLC-001).
- * - From a COCRDLI `S` selection, whose route state carries the row's `acct_id` and `card_ref`,
- *   the screen reads that card at once, and both inputs stay read-only for the visit, as the
- *   program protects them while the card list is its caller (COCRDSLC-002).
+ * - From the main menu (option 04), or with no caller, the screen opens empty with the account
+ *   input focused and sends nothing, whatever account or card the route state still carries
+ *   (COCRDSLC-001).
+ * - From a COCRDLI `S` selection, whose route state names the card list as `from` and carries
+ *   the row's `acct_id` and `card_ref`, the screen reads that card at once, and both inputs stay
+ *   read-only for the visit, as the program protects them while the card list is its caller
+ *   (COCRDSLC-002).
  * - ENTER, and every other key except F3, searches (COCRDSLC-003, COCRDSL-038). The request
  *   carries the account and exactly one of `card_num` (the typed card number) or `card_ref` (the
  *   handle of the card shown, while the card input still shows its number, COCRDSLC-026).
  * - F3 returns to the screen that transferred here, else to the main menu (COCRDSLC-004).
+ * - While a request is out every key but F3 is refused, as the terminal keyboard locks until the
+ *   program answers: `ENTER=Search Cards` is disabled, the key row and the form are busy and both
+ *   inputs are read-only.
  *
  * The card number is shown exactly as the endpoint returns it: all 16 digits only when the
  * server disclosed them to an administrator token, else twelve `*` and the last four digits
- * (COCRDSLC-022, COCRDSLC-023). The screen never decides disclosure, never unmasks, and keeps no
- * card number anywhere but the input showing it.
+ * (COCRDSLC-022, COCRDSLC-023). The screen never decides disclosure and never unmasks. The
+ * returned number, an administrator's full number included, lives only in memory: the card
+ * input's form value, the `knownCard` ref that lets ENTER re-read the unchanged card by its
+ * `card_ref` (COCRDSLC-026), and the shown response in `display.view` and TanStack's in-memory
+ * mutation state. It is never logged, written to storage or route state, or sent back: while the
+ * card input still shows it, ENTER sends `card_ref` instead.
  */
 export function COCRDSL(): ReactNode {
   const navigate = useNavigate();
   const location = useLocation();
   const routeState: unknown = location.state;
   // Route state is fixed for the visit, as the COMMAREA the caller passed is.
-  const [entry] = useState(() => ({
-    caller: callerPath(routeState),
-    selection: listSelection(routeState),
-  }));
+  const [entry] = useState(() => {
+    const caller = callerPath(routeState);
+    return { caller, selection: listSelection(routeState, caller) };
+  });
   const fromList = entry.selection !== undefined;
 
   const formId = useId();
   const outputId = useId();
-  const { mutate, isPending } = useCocrdslcView();
+  const { mutateAsync } = useCocrdslcView();
+  // `inFlight` is the lock the key handlers read at once; `pending` renders it while a request
+  // is out.
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
   const form = useForm<CocrdslValues>({
     resolver: zodResolver(cocrdslSchema),
     defaultValues: { acctId: entry.selection?.acctId ?? "", cardNum: "" },
@@ -225,13 +258,24 @@ export function COCRDSL(): ReactNode {
     entry.selection === undefined ? null : { ref: entry.selection.cardRef, shown: "" },
   );
 
-  /** Sends one endpoint 8 request and shows its outcome as `1000-SEND-MAP` would. */
+  /** Opens the key lock: the answer has arrived, or the key that took it sends nothing. */
+  const unlockKeys = useCallback(() => {
+    inFlight.current = false;
+    setPending(false);
+  }, []);
+
+  /**
+   * Sends one endpoint 8 request and shows its outcome as `1000-SEND-MAP` would. The keys stay
+   * locked until the request settles, whatever its outcome, after the outcome is shown.
+   */
   const search = useCallback(
     (query: NonNullable<paths["/api/v1/cards/view"]["get"]["parameters"]["query"]>) => {
+      inFlight.current = true;
+      setPending(true);
       const acct = sentAs(query.acct_id, COCRDSL_LENGTHS.acctId);
       const card =
         query.card_ref === undefined ? sentAs(query.card_num, COCRDSL_LENGTHS.cardNum) : "ref";
-      mutate(
+      void mutateAsync(
         { query },
         {
           onSuccess: (view) => {
@@ -270,24 +314,23 @@ export function COCRDSL(): ReactNode {
             if (cardText !== undefined) {
               form.setValue("cardNum", cardText);
             }
-            // The account error names `acct_id` after edits that passed only when the card read
-            // failed. COCRDSLC marks both inputs on not-found (404) and only the account on a
-            // file error (500); the hook hands over the `ScreenError` body without its status,
-            // so both inputs are marked for either read failure.
-            const readFailed = field === "acct_id" && acct === "valid";
+            // After edits that passed, the card read failed and the error names `acct_id` either
+            // way: COCRDSLC marks both inputs on not-found (404) and only the account on a file
+            // error (500), so the status the hook recorded, not the body, tells the two apart.
+            const notFound = errorStatus(error) === 404;
             setDisplay({
               view: null,
               message: error.message,
               info: PROMPT,
               acctMarked: acct !== "valid" || field === "acct_id",
-              cardMarked: card === "blank" || card === "invalid" || readFailed,
+              cardMarked: card === "blank" || card === "invalid" || notFound,
             });
             form.setFocus(field === "card_num" ? "cardNum" : "acctId");
           },
         },
-      );
+      ).then(unlockKeys, unlockKeys);
     },
-    [mutate, form],
+    [mutateAsync, form, unlockKeys],
   );
 
   /**
@@ -296,12 +339,10 @@ export function COCRDSL(): ReactNode {
    * number the card edit would reject (COCRDSLC-026). Any other text goes as `card_num`, as
    * typed, an edited redacted number included: the card edit then answers it as the program
    * answers any changed input, rather than the screen silently re-reading the earlier card.
-   * One request at a time, as the terminal keyboard locks until the reply.
+   * Reached only through `submit`, which holds the key lock: one request at a time, as the
+   * terminal keyboard locks until the reply.
    */
   const onValid = (values: CocrdslValues): void => {
-    if (isPending) {
-      return;
-    }
     const acctId = queryText(values.acctId);
     const known = knownCard.current;
     if (known !== null && values.cardNum === known.shown) {
@@ -311,21 +352,48 @@ export function COCRDSL(): ReactNode {
     }
   };
 
-  /** A map `LENGTH` the zod schema rejects: its message in the error row, nothing sent. */
+  /**
+   * A map `LENGTH` the zod schema rejects: its message in the error row, nothing sent, so the
+   * key lock opens again.
+   */
   const onInvalid = (errors: FieldErrors<CocrdslValues>): void => {
+    unlockKeys();
     const first = errors.acctId ?? errors.cardNum;
     setDisplay((shown) => ({ ...shown, message: first?.message }));
   };
 
-  const submit = form.handleSubmit(onValid, onInvalid);
+  /**
+   * ENTER, by the button, the key, an Enter in a field or a key processed as ENTER. The lock is
+   * taken here, before the schema's asynchronous check, so a key that arrives during the check
+   * or while the request is out sends nothing and never reaches the browser's own form
+   * submission. A check that fails unexpectedly opens it again, as nothing was sent.
+   */
+  const submit = (event?: FormEvent<HTMLFormElement>): void => {
+    event?.preventDefault();
+    if (inFlight.current) {
+      return;
+    }
+    inFlight.current = true;
+    setPending(true);
+    void form
+      .handleSubmit(onValid, onInvalid)()
+      .catch((error: unknown) => {
+        unlockKeys();
+        throw error;
+      });
+  };
 
   const exit = useCallback(() => {
     void navigate(entry.caller ?? PATHS.COMEN01);
   }, [navigate, entry.caller]);
 
+  // While a request is out only F3 stays enabled.
   const keys = useMemo<PfKeyBarEntry[]>(
-    () => KEY_ITEMS.map((item) => (item.key === "F3" ? { ...item, onPress: exit } : item)),
-    [exit],
+    () =>
+      KEY_ITEMS.map((item) =>
+        item.key === "F3" ? { ...item, onPress: exit } : { ...item, disabled: pending },
+      ),
+    [exit, pending],
   );
 
   // COCRDSLC-002: entered from the card list, the program reads the card before its first send.
@@ -355,12 +423,13 @@ export function COCRDSL(): ReactNode {
         foldShifted: KEY_ROWS.COCRDSL.foldShifted,
         // COCRDSLC-003: any key other than ENTER and F3 is processed as ENTER.
         onInvalidKey: () => {
-          void submit();
+          submit();
         },
       }}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} noValidate aria-busy={isPending} onSubmit={submit}>
+        <form id={formId} noValidate aria-busy={pending} onSubmit={submit}>
           {/*
            * Rows keep their map numbers. Lines that hold no field (the header and title lines
            * 1-6, which ScreenShell draws above, and the blank lines 9, 10, 12 and 14) take no
@@ -384,7 +453,7 @@ export function COCRDSL(): ReactNode {
                         maxLength={COCRDSL_LENGTHS.acctId}
                         size={COCRDSL_LENGTHS.acctId}
                         autoFocus
-                        readOnly={fromList}
+                        readOnly={fromList || pending}
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.acctMarked || fieldState.invalid}
@@ -410,7 +479,7 @@ export function COCRDSL(): ReactNode {
                         data-field="CARDSID"
                         maxLength={COCRDSL_LENGTHS.cardNum}
                         size={COCRDSL_LENGTHS.cardNum}
-                        readOnly={fromList}
+                        readOnly={fromList || pending}
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.cardMarked || fieldState.invalid}

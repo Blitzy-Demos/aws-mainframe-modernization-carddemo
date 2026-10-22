@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -26,10 +26,11 @@ import { COADM01 } from "./COADM01";
  * counts the requests: one per entry to `/admin`.
  *
  * Rows `COADM01-001` to `COADM01-010` place the header labels in a `Label` and the header values in
- * a read-only `Input`; the shared `ScreenShell` renders both as plain text, so those rows are not
- * tagged here. Their content rows (`COADM01-029` to `COADM01-034`) are. `COADM01C-002` is blocked
- * by halt candidate `X-COADM01C-H1`: its group is reported BLOCKED and asserts only the
- * replacement's path the row states, never a COBOL result.
+ * a read-only `Input`, as the shared `ScreenShell` renders them. The label rows are tagged in NAV.
+ * The value rows are tagged here, on each value's read-only `Input`, its width, its map `POS` and
+ * `LENGTH`, its label and its content, as are their content rows (`COADM01-029` to `COADM01-034`).
+ * `COADM01C-002` is blocked by halt candidate `X-COADM01C-H1`: its group is reported BLOCKED and
+ * asserts only the replacement's path the row states, never a COBOL result.
  */
 
 const MENU_PATH = "/api/v1/menus/admin";
@@ -130,18 +131,22 @@ function reply(status: number, body: unknown): Response {
 /**
  * Replaces the global `fetch`: `GET` endpoint 3 answers `status` with `body`, and any other request
  * answers 500. No test expects another request, except the main menu's load after the admin guard
- * sends a non-admin there.
+ * sends a non-admin there. The request at position `n` of the test (from 0) is answered only once
+ * `holds[n]`, when there is one, settles.
  */
 function stubMenu(
   status: number,
   body: components["schemas"]["MenuResponse"] | components["schemas"]["ScreenError"],
+  holds: readonly Promise<void>[] = [],
 ): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = input instanceof Request ? input : new Request(input, init);
+      const position = requests.length;
       requests.push(request);
       if (request.method === "GET" && new URL(request.url).pathname === MENU_PATH) {
+        await holds.at(position);
         return reply(status, body);
       }
       const unexpected: components["schemas"]["ScreenError"] = {
@@ -219,6 +224,22 @@ function field(name: string): HTMLElement {
   return element;
 }
 
+/**
+ * The header field `name` of rows 1 and 2 (`data-field`): the one `Input` of that name in the
+ * `CardHeader` title rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerInput(name: string): HTMLInputElement {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [element] = fields;
+  if (!(element instanceof HTMLInputElement)) {
+    throw new TypeError(`the header has no input ${name}`);
+  }
+  return element;
+}
+
 /** The message row of `kind`, or `undefined` when the row shows the other kind. */
 function messageRow(kind: "error" | "info"): HTMLElement | undefined {
   return screen.getAllByRole("alert").find((row) => row.dataset.messageKind === kind);
@@ -253,6 +274,56 @@ async function transferTarget(): Promise<string | null> {
 function expectNoTransfer(): void {
   expect(screen.getByRole("heading", { level: 1, name: "Admin Menu" })).toBeDefined();
   expect(screen.queryByTestId("target")).toBeNull();
+}
+
+/** A promise the test settles by calling `release`, to hold a reply back. */
+function deferred(): { readonly done: Promise<void>; readonly release: () => void } {
+  let release = (): void => undefined;
+  const done = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { done, release: () => release() };
+}
+
+/** The `ENTER=Continue` button (COADM01-035). */
+function enterButton(): HTMLElement {
+  return screen.getByRole("button", { name: "ENTER=Continue" });
+}
+
+/** The menu's `<form>`, which holds the option input. */
+function menuForm(): HTMLFormElement {
+  const form = optionInput().form;
+  if (form === null) {
+    throw new TypeError("the option field is not in a form");
+  }
+  return form;
+}
+
+/**
+ * Whether the screen shows the locked keyboard of a load in progress: ENTER disabled, the key row
+ * and the form busy, the option input read-only; or, with `busy` false, all of them free. F3 is
+ * free either way.
+ */
+function expectBusy(busy: boolean): void {
+  expect(enterButton()).toHaveProperty("disabled", busy);
+  expect(screen.getByRole("button", { name: "F3=Exit" })).toHaveProperty("disabled", false);
+  expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+    String(busy),
+  );
+  expect(menuForm().getAttribute("aria-busy")).toBe(String(busy));
+  expect(optionInput().readOnly).toBe(busy);
+}
+
+/**
+ * Gives a refused key the time its submit handler would take to decide and render. The wait runs
+ * inside `act`, as the form's own state updates after an ENTER do.
+ */
+async function lingers(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
 }
 
 describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
@@ -372,13 +443,13 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     await loaded();
 
     const expectHeader = () => {
-      expect(field("TRNNAME").textContent).toBe("CA00");
-      expect(field("PGMNAME").textContent).toBe("COADM01C");
-      expect(field("TITLE01").textContent).toBe("      AWS Mainframe Modernization       ");
-      expect(field("TITLE02").textContent).toBe("              CardDemo                  ");
+      expect(headerInput("TRNNAME").value).toBe("CA00");
+      expect(headerInput("PGMNAME").value).toBe("COADM01C");
+      expect(headerInput("TITLE01").value).toBe("      AWS Mainframe Modernization       ");
+      expect(headerInput("TITLE02").value).toBe("              CardDemo                  ");
       // The date and time are the current instant, so only their formats are compared.
-      expect(field("CURDATE").textContent).toMatch(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/);
-      expect(field("CURTIME").textContent).toMatch(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/);
+      expect(headerInput("CURDATE").value).toMatch(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/);
+      expect(headerInput("CURTIME").value).toMatch(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/);
     };
     expectHeader();
 
@@ -401,6 +472,94 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     expectHeader();
     await expectMenuRequests(1);
   });
+
+  it.each([
+    // audit: COADM01-002
+    {
+      id: "COADM01-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CA00",
+    },
+    // audit: COADM01-003
+    {
+      id: "COADM01-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COADM01-005
+    {
+      id: "COADM01-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/),
+    },
+    // audit: COADM01-007
+    {
+      id: "COADM01-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COADM01C",
+    },
+    // audit: COADM01-008
+    {
+      id: "COADM01-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // audit: COADM01-010
+    {
+      id: "COADM01-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    async ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      stubMenu(200, menu);
+      renderAdminMenu();
+      await loaded();
+
+      const value = headerInput(name);
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(value);
+      await expectMenuRequests(1);
+    },
+  );
 
   // audit: COADM01C-015
   // audit: COADM01C-017
@@ -556,6 +715,93 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
     expect(PATHS.COSGN00).toBe("/signon");
     await expectMenuRequests(1);
+  });
+
+  // audit: COADM01C-020
+  // audit: COADM01-036
+  it("F3 still goes to sign-on while endpoint 3 loads, and an unserved key is refused", async () => {
+    const load = deferred();
+    stubMenu(200, served, [load.done]);
+    renderAdminMenu();
+    expectBusy(true);
+
+    // The locked keyboard takes the unserved key without the invalid-key text.
+    fireEvent.keyDown(optionInput(), { key: "F5" });
+    await lingers();
+    expect(messageRow("error")?.textContent).toBe("");
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
+    load.release();
+    await expectMenuRequests(1);
+  });
+
+  // audit: COADM01-035
+  it.each([
+    {
+      how: "a click on ENTER=Continue",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      how: "the Enter key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+      },
+    },
+    {
+      how: "a submit of the form",
+      press: () => {
+        fireEvent.submit(menuForm());
+      },
+    },
+  ])("$how decides nothing while endpoint 3 loads or reloads", async ({ press }) => {
+    const load = deferred();
+    const reload = deferred();
+    stubMenu(200, served, [load.done, reload.done]);
+    renderAdminMenu();
+
+    // First entry: the load is out. The input is read-only, so the entry is set, not typed.
+    expectBusy(true);
+    fireEvent.change(optionInput(), { target: { value: "1" } });
+    press();
+    press();
+    await lingers();
+    expectNoTransfer();
+    expect(messageRow("error")?.textContent).toBe("");
+    load.release();
+    await loaded();
+    expectBusy(false);
+
+    enter("01");
+    expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+    fireEvent.click(screen.getByRole("button", { name: "Return to admin menu" }));
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+
+    // A return to /admin: the cached table shows while the reload is out, and neither an entry
+    // it would refuse nor one the schema refuses is matched against it.
+    await loaded();
+    expectBusy(true);
+    for (const entry of ["99", "-"]) {
+      fireEvent.change(optionInput(), { target: { value: entry } });
+      press();
+      press();
+      await lingers();
+      expectNoTransfer();
+      expect(messageRow("error")?.textContent).toBe("");
+    }
+
+    reload.release();
+    await waitFor(() => {
+      expectBusy(false);
+    });
+    fireEvent.change(optionInput(), { target: { value: "5" } });
+    press();
+    expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
+    await expectMenuRequests(2);
   });
 
   // audit: COADM01C-021

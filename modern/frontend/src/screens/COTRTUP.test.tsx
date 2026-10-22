@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -241,12 +241,15 @@ function json(status: number, body: unknown): Response {
 
 /**
  * Replaces `fetch`. Each request is routed on `<METHOD> <path>` and answered with the next reply
- * listed for that route; any other request, and one past the end of its list, gets a 500. Every
- * request is recorded with its JSON body and `Authorization` header. A route listed without
- * replies (as a table row that omits another row's route leaves it) answers like an unlisted one.
+ * listed for that route, a status and body or a response the test holds back (`heldReply`); any
+ * other request, and one past the end of its list, gets a 500. Every request is recorded with its
+ * JSON body and `Authorization` header. A route listed without replies (as a table row that omits
+ * another row's route leaves it) answers like an unlisted one.
  */
 function stubApi(replies: {
-  readonly [route: string]: readonly { status: number; body: unknown }[] | undefined;
+  readonly [route: string]:
+    | readonly ({ status: number; body: unknown } | Promise<Response>)[]
+    | undefined;
 }) {
   const queues = new Map(
     Object.entries(replies).map(([route, list]) => [route, [...(list ?? [])]]),
@@ -267,10 +270,30 @@ function stubApi(replies: {
         };
         return json(500, unexpected);
       }
+      if (next instanceof Promise) {
+        return next;
+      }
       return json(next.status, next.body);
     }),
   );
   return calls;
+}
+
+/** A reply held back until the test passes it to `release`. */
+function heldReply(): {
+  readonly reply: Promise<Response>;
+  readonly release: (response: Response) => void;
+} {
+  let resolveReply: (response: Response) => void = () => undefined;
+  const reply = new Promise<Response>((resolve) => {
+    resolveReply = resolve;
+  });
+  return {
+    reply,
+    release: (response) => {
+      resolveReply(response);
+    },
+  };
 }
 
 /** The screen a navigation reached, by its path, with the route state it was handed. */
@@ -457,9 +480,20 @@ function infoText(): string | null {
   return messageRow("info").textContent;
 }
 
-/** The text of a header value field (`ScreenShell`), by its BMS name. */
-function headerValue(name: string): string | null {
-  return document.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of a header value field (`ScreenShell`), by its BMS name: the one read-only `Input`
+ * of that `data-field` in the `CardHeader`, failing when there is not exactly one.
+ */
+function headerValue(name: string): string {
+  const inputs = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(inputs).toHaveLength(1);
+  const [input] = inputs;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return input.value;
 }
 
 /**
@@ -468,13 +502,13 @@ function headerValue(name: string): string | null {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -505,17 +539,20 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.getAttribute("data-slot")).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
     // The field box: the grid cell at POS, LENGTH columns wide, holding exactly LENGTH characters.
     expect(cellOf(element)).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -742,7 +779,8 @@ describe("COTRTUP rendering", () => {
     expect(
       cellOf(screen.getByText(LABELS.description, { ...exactText, selector: "label" })),
     ).toBe("row-start-14 col-start-4 col-span-19");
-    expect(screen.getAllByRole("textbox")).toHaveLength(2);
+    // The body's text boxes; the header's read-only values are counted by none.
+    expect(within(screenForm()).getAllByRole("textbox")).toHaveLength(2);
     expect(field(LABELS.code).maxLength).toBe(2);
     expect(field(LABELS.description).maxLength).toBe(50);
     expect(cellOf(field(LABELS.code))).toBe("row-start-12 col-start-26 col-span-2");
@@ -789,7 +827,7 @@ describe("COTRTUP rendering", () => {
   // audit: COTRTUP-007
   // audit: COTRTUP-008
   // audit: COTRTUP-010
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -1145,21 +1183,183 @@ describe("COTRTUP fetch, endpoint 26", () => {
     },
   );
 
-  it("keys pressed while a request is pending are not served", async () => {
-    const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    await open();
+});
+
+describe("COTRTUP while a request is out", () => {
+  /** After a completed save or delete, the next key starts over; then ENTER fetches `CODE`. */
+  function startOverAndFetch(): void {
+    press("ENTER=Process");
     fireEvent.change(field(LABELS.code), { target: { value: CODE } });
     press("ENTER=Process");
-    press("ENTER=Process");
-    press("F3=Exit");
-    await waitFor(() => {
-      expect(field(LABELS.description).value).toBe(STORED);
-    });
-    await settle();
+  }
 
-    expect(calls.map((call) => call.route)).toEqual([FETCH]);
-    expect(screen.queryByText(/^Stub at/)).toBeNull();
-  });
+  /** Every row-24 button, hidden ones included, and every key on the keyboard that has a role. */
+  function pressEveryKey(): void {
+    for (const label of ALL_KEYS) {
+      fireEvent.click(key(label));
+    }
+    for (const name of ["Enter", "F2", "F3", "F4", "F5", "F12"]) {
+      pressKey(name);
+    }
+  }
+
+  it.each([
+    {
+      title: "ENTER fetching a code (endpoint 26)",
+      replies: (held: Promise<Response>) => ({
+        [FETCH]: [held],
+        [ACTIONS]: [reply(200, validated)],
+      }),
+      arrange: async () => {
+        await open();
+        fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+      },
+      start: () => {
+        press("ENTER=Process");
+      },
+      route: FETCH,
+      answer: reply(200, found),
+      info: INFO.search,
+      before: { code: true, description: false },
+      after: { code: false, description: true },
+      later: () => {
+        press("ENTER=Process");
+      },
+      laterRoute: ACTIONS,
+    },
+    {
+      title: "Enter fetching again after a code no row holds (endpoint 26)",
+      replies: (held: Promise<Response>) => ({
+        [FETCH_NEW]: [reply(200, notFound)],
+        [FETCH]: [held],
+        [ACTIONS]: [reply(200, validated)],
+      }),
+      arrange: async () => {
+        await showNotFound();
+        fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+      },
+      start: () => {
+        pressKey("Enter");
+      },
+      route: FETCH,
+      answer: reply(200, found),
+      info: INFO.search,
+      before: { code: true, description: false },
+      after: { code: false, description: true },
+      later: () => {
+        press("ENTER=Process");
+      },
+      laterRoute: ACTIONS,
+    },
+    {
+      title: "ENTER validating an edit (endpoint 27)",
+      replies: (held: Promise<Response>) => ({
+        [FETCH]: [reply(200, found)],
+        [ACTIONS]: [held, reply(200, saved)],
+      }),
+      arrange: async () => {
+        await showFound();
+        fireEvent.change(field(LABELS.description), { target: { value: EDITED } });
+      },
+      start: () => {
+        press("ENTER=Process");
+      },
+      route: ACTIONS,
+      answer: reply(200, validated),
+      info: INFO.validated,
+      before: { code: false, description: true },
+      after: { code: false, description: false },
+      later: () => {
+        press("F5=Save");
+      },
+      laterRoute: ACTIONS,
+    },
+    {
+      title: "F5 saving validated changes (endpoint 27)",
+      replies: (held: Promise<Response>) => ({
+        [FETCH]: [reply(200, found), reply(200, found)],
+        [ACTIONS]: [reply(200, validated), held],
+      }),
+      arrange: validateEdit,
+      start: () => {
+        pressKey("F5");
+      },
+      route: ACTIONS,
+      answer: reply(200, saved),
+      info: INFO.committed,
+      before: { code: false, description: false },
+      after: { code: false, description: false },
+      later: startOverAndFetch,
+      laterRoute: FETCH,
+    },
+    {
+      title: "the second F4 deleting the type (endpoint 27)",
+      replies: (held: Promise<Response>) => ({
+        [FETCH]: [reply(200, found), reply(200, found)],
+        [ACTIONS]: [held],
+      }),
+      arrange: confirmDelete,
+      start: () => {
+        press("F4=Delete");
+      },
+      route: ACTIONS,
+      answer: reply(200, deleted),
+      info: INFO.deleted,
+      before: { code: false, description: false },
+      after: { code: false, description: false },
+      later: startOverAndFetch,
+      laterRoute: FETCH,
+    },
+  ])(
+    "while $title is out, every key is disabled and refused, the key row and form are busy and both inputs read-only",
+    async ({ replies, arrange, start, route, answer, info, before, after, later, laterRoute }) => {
+      const held = heldReply();
+      const calls = stubApi(replies(held.reply));
+      await arrange();
+      const sentBefore = calls.length;
+      const shownBefore = shownKeys();
+      expectEditable(before);
+
+      // The key twice and every other key in one batch, before the screen re-renders: only the
+      // lock the first key took refuses the rest.
+      act(() => {
+        start();
+        start();
+        pressEveryKey();
+      });
+      await waitFor(() => {
+        expect(calls).toHaveLength(sentBefore + 1);
+      });
+      expect(calls[sentBefore]?.route).toBe(route);
+
+      expect(functionKeys().getAttribute("aria-busy")).toBe("true");
+      expect(screenForm().getAttribute("aria-busy")).toBe("true");
+      expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => true));
+      expect(shownKeys()).toEqual(shownBefore);
+      expectEditable({ code: false, description: false });
+
+      pressEveryKey();
+      await settle();
+      expect(calls).toHaveLength(sentBefore + 1);
+      expect(screen.queryByText(/^Stub at/)).toBeNull();
+
+      held.release(json(answer.status, answer.body));
+      await waitFor(() => {
+        expect(screenForm().getAttribute("aria-busy")).toBe("false");
+      });
+      expect(infoText()).toBe(info);
+      expect(functionKeys().getAttribute("aria-busy")).toBe("false");
+      expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => false));
+      expectEditable(after);
+
+      // The keyboard is open again: the next request is sent.
+      later();
+      await waitFor(() => {
+        expect(calls).toHaveLength(sentBefore + 2);
+      });
+      expect(calls[sentBefore + 1]?.route).toBe(laterRoute);
+    },
+  );
 });
 
 describe("COTRTUP save, endpoint 27", () => {

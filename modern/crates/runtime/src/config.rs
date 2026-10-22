@@ -76,6 +76,12 @@ const DEFAULT_MQ_POLL_MS: u64 = 250;
 const MAX_MQ_POLL_MS: u64 = 5_000;
 const DEFAULT_API_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_JWT_TTL_SECONDS: u64 = 3600;
+/// The longest `CARDDEMO_JWT_TTL_SECONDS` accepted: `i64::MAX` seconds,
+/// `9223372036854775807`. A token's `exp` is its `iat` plus the lifetime in `u64`
+/// (`api::auth::jwt`), so this bound leaves room for every issue time below 2^63 seconds since
+/// the epoch: every accepted lifetime issues a token, and a longer one is refused here at
+/// startup rather than failing every sign-on.
+const MAX_JWT_TTL_SECONDS: u64 = i64::MAX.unsigned_abs();
 const DEFAULT_VAR_DIR: &str = "./var";
 const DEFAULT_FIXTURE_DIR: &str = "../app/data/ASCII";
 
@@ -88,9 +94,13 @@ const REPORTS_SUBDIR: &str = "reports";
 
 const OTEL_EXPORT_STDOUT: &str = "stdout";
 
-const EXPECTED_POSITIVE_INTEGER: &str = "a positive integer of decimal digits";
-/// [`EXPECTED_POSITIVE_INTEGER`] bounded by [`MAX_MQ_POLL_MS`].
+/// What a rejected `CARDDEMO_MQ_POLL_MS` reports: a positive integer bounded by
+/// [`MAX_MQ_POLL_MS`].
 const EXPECTED_MQ_POLL_MS: &str = "a positive integer of decimal digits, at most 5000";
+/// What a rejected `CARDDEMO_JWT_TTL_SECONDS` reports: a positive integer bounded by
+/// [`MAX_JWT_TTL_SECONDS`].
+const EXPECTED_JWT_TTL_SECONDS: &str =
+    "a positive integer of decimal digits, at most 9223372036854775807";
 const EXPECTED_OTEL_EXPORT: &str = "unset, empty or stdout";
 
 /// Text the `Debug` output of [`Config`] shows in place of a credential.
@@ -138,7 +148,8 @@ pub struct Config {
     /// HS256 signing secret of the API (`CARDDEMO_JWT_SECRET`). No default: empty when unset,
     /// and the API refuses to start then (see [`Config::require_jwt_secret`]).
     pub jwt_secret: String,
-    /// Token lifetime in seconds (`CARDDEMO_JWT_TTL_SECONDS`, default `3600`, never zero).
+    /// Token lifetime in seconds (`CARDDEMO_JWT_TTL_SECONDS`, default `3600`, from `1` to
+    /// `9223372036854775807`, which is `i64::MAX`).
     pub jwt_ttl_seconds: u64,
     /// Root of the local output directories (`CARDDEMO_VAR_DIR`, default `./var`).
     pub var_dir: PathBuf,
@@ -247,8 +258,10 @@ impl Config {
     ///
     /// [`EnvError::Invalid`], naming the variable, when:
     /// - `CARDDEMO_MQ_POLL_MS` or `CARDDEMO_JWT_TTL_SECONDS` holds anything but ASCII decimal
-    ///   digits (a sign included), is zero, or exceeds the 64-bit unsigned range;
+    ///   digits (a sign included), or is zero;
     /// - `CARDDEMO_MQ_POLL_MS` exceeds `5000`, the COBOL's five-second wait;
+    /// - `CARDDEMO_JWT_TTL_SECONDS` exceeds `9223372036854775807` (`i64::MAX`), beyond which
+    ///   a token's expiry could overflow;
     /// - `CARDDEMO_OTEL_EXPORT` is anything other than exactly `stdout`.
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, EnvError> {
         let get = |var: &str| lookup(var).filter(|value| !value.is_empty());
@@ -280,8 +293,8 @@ impl Config {
                 CARDDEMO_JWT_TTL_SECONDS,
                 get(CARDDEMO_JWT_TTL_SECONDS).as_deref(),
                 DEFAULT_JWT_TTL_SECONDS,
-                u64::MAX,
-                EXPECTED_POSITIVE_INTEGER,
+                MAX_JWT_TTL_SECONDS,
+                EXPECTED_JWT_TTL_SECONDS,
             )?,
             var_dir,
             statement_dir,
@@ -620,13 +633,14 @@ mod tests {
             },
             Case {
                 var: CARDDEMO_JWT_TTL_SECONDS,
-                expected: "a positive integer of decimal digits",
-                out_of_range: &[],
+                expected: "a positive integer of decimal digits, at most 9223372036854775807",
+                // `i64::MAX + 1` and `u64::MAX`.
+                out_of_range: &["9223372036854775808", "18446744073709551615"],
                 accepted: &[
                     ("1", 1),
                     ("250", 250),
                     ("007", 7),
-                    ("18446744073709551615", u64::MAX),
+                    ("9223372036854775807", 9_223_372_036_854_775_807),
                 ],
             },
         ];

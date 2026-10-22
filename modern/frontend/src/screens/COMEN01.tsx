@@ -143,10 +143,12 @@ function transferState(received: unknown): Record<string, unknown> {
  *   session is gone (the API refused the token, and the client cleared the session) sends the
  *   user to sign-on, where the route guard would send a user with no session (COMEN01C-003).
  * - ENTER: `enterOutcome`, decided from the loaded response; while it loads, or reloads, ENTER
- *   decides nothing. The server's texts win over the schema's messages, so none of zod's is shown.
- * - F3: back to sign-on with no request (COMEN01C-006). The session is not cleared here: the
- *   sign-on screen's first entry clears it.
- * - Any other F-key: the invalid-key text, the input left as typed (COMEN01C-007).
+ *   decides nothing and is disabled, the key row and the form are busy and the option input is
+ *   read-only. The server's texts win over the schema's messages, so none of zod's is shown.
+ * - F3: back to sign-on with no request (COMEN01C-006), at any time, a load in progress included.
+ *   The session is not cleared here: the sign-on screen's first entry clears it.
+ * - Any other F-key: the invalid-key text, the input left as typed (COMEN01C-007); while endpoint
+ *   2 loads or reloads, the busy key row takes it with no message.
  *
  * Every key clears the message of the previous one first (COMEN01C-001). Whenever the menu is
  * shown again with a message, the cursor returns to the option input, the map's `IC` field.
@@ -167,6 +169,7 @@ export function COMEN01(): ReactNode {
   // render, so the screen renders again when the fetch ends: TanStack Query re-renders only for
   // the result fields a render reads, and a reload on a return to `/menu` brings identical data,
   // so a flag read only in the handler would keep the value of the render that started the reload.
+  // The same flag disables ENTER, so the button and the key refuse what the handler would ignore.
   const busy = menu.isFetching;
 
   useEffect(() => {
@@ -201,9 +204,9 @@ export function COMEN01(): ReactNode {
                 void navigate(PATHS.COSGN00);
               },
             }
-          : item,
+          : { ...item, disabled: busy },
       ),
-    [navigate],
+    [navigate, busy],
   );
 
   const keyOptions = useMemo<PfKeyOptions>(
@@ -232,11 +235,13 @@ export function COMEN01(): ReactNode {
       message={{ kind: "error", text: message ?? menu.error?.message ?? "" }}
       keys={keys}
       keyOptions={keyOptions}
+      busy={busy}
     >
       <Form {...form}>
         <form
           id={formId}
           noValidate
+          aria-busy={busy}
           onSubmit={form.handleSubmit(
             (values) => {
               enter(values.option, true);
@@ -295,6 +300,7 @@ export function COMEN01(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={OPTION_LENGTH}
                         size={OPTION_LENGTH}
                         inputMode="numeric"

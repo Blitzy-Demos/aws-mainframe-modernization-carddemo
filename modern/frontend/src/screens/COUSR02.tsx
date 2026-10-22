@@ -148,6 +148,13 @@ function firstErrorMessage(errors: FieldErrors<Cousr02Values>): string | undefin
 }
 
 /**
+ * The request the screen waits for, from the key that starts it to its settlement: the action
+ * that sent it and the user ID input it was sent for. The object itself is the token a response
+ * is checked against, so a response touches the screen only while its own request is awaited.
+ */
+type Operation = { readonly kind: "fetch" | "save" | "saveAndExit"; readonly userId: string };
+
+/**
  * CU02, the user update screen.
  *
  * - ENTER fetches the user by the typed ID (COUSR02C-010 to COUSR02C-017). The four other inputs
@@ -157,6 +164,11 @@ function firstErrorMessage(errors: FieldErrors<Cousr02Values>): string | undefin
  * - F5 saves through endpoint 19 and shows its message; every input keeps what was typed
  *   (COUSR02C-033). F3 saves the same way, then leaves whatever the outcome (COUSR02C-006).
  * - F4 empties the screen (COUSR02C-007); F12 returns to the admin menu (COUSR02C-008).
+ *
+ * One request at a time, as the 3270 keyboard stays locked while the program runs: from ENTER,
+ * F5 or F3 until its response, ENTER, F3, F4 and F5 are disabled, every other key but F12 is
+ * refused and the inputs are read-only. F12 sends nothing, so it still leaves; once F3 has
+ * started, it is refused too, because the screen is leaving.
  *
  * The target user ID and type are data for the API; the caller acts only as the verified token,
  * which the API's admin gate checks (AAP 0.5.1). No password is logged, stored or shown.
@@ -176,6 +188,12 @@ export function COUSR02(): ReactNode {
   // Set once F3 has started: the screen is leaving, as the XCTL follows the save, so no later key
   // acts on it. The 3270 keyboard stays locked while the program runs.
   const leaving = useRef(false);
+  // The request in flight: set before its edit runs, so a key pressed before the next render is
+  // refused too, and cleared when its response has been applied. Endpoints 18 and 19 are separate
+  // hooks, so this one token is what keeps a read and a save, or two saves, from overlapping.
+  const inFlight = useRef<Operation | null>(null);
+  // The kind of `inFlight` as rendered: the disabled keys, the read-only inputs and `aria-busy`.
+  const [pending, setPending] = useState<Operation["kind"] | null>(null);
   // StrictMode runs mount effects twice in development; the entry fetch must be sent once.
   const entered = useRef(false);
 
@@ -208,8 +226,42 @@ export function COUSR02(): ReactNode {
     void navigate(path, { state: { from: PATHS.COUSR02 } });
   }
 
-  /** ENTER, `PROCESS-ENTER-KEY`: the user ID edit, then endpoint 18. */
+  /**
+   * Starts the request `kind` for the user ID `userId` holds now, before its edit runs. Returns
+   * its token, or `null` when the key is refused: a request is in flight or the screen is leaving.
+   */
+  function begin(kind: Operation["kind"], userId: string): Operation | null {
+    if (leaving.current || inFlight.current !== null) {
+      return null;
+    }
+    const operation: Operation = { kind, userId };
+    inFlight.current = operation;
+    setPending(kind);
+    return operation;
+  }
+
+  /** Ends `operation` once its edit has failed or its response has been applied. */
+  function end(operation: Operation): void {
+    if (inFlight.current === operation) {
+      inFlight.current = null;
+      setPending(null);
+    }
+  }
+
+  /** Whether a response of `operation` may change the screen: it is awaited, for the shown key. */
+  function awaited(operation: Operation): boolean {
+    return inFlight.current === operation && form.getValues("userId") === operation.userId;
+  }
+
+  /**
+   * ENTER, `PROCESS-ENTER-KEY`: the user ID edit, then endpoint 18. Refused while a request is in
+   * flight; its response fills the screen only for the user ID it was sent for.
+   */
   function fetchByUserId(userId: string): void {
+    const operation = begin("fetch", userId);
+    if (operation === null) {
+      return;
+    }
     form.clearErrors();
     const parsed = cousr02KeySchema.safeParse({ userId });
     if (!parsed.success) {
@@ -217,15 +269,19 @@ export function COUSR02(): ReactNode {
       const text = parsed.error.issues.at(0)?.message;
       setMessage({ kind: "error", text });
       form.setError("userId", { type: "custom", message: text }, { shouldFocus: true });
+      end(operation);
       return;
     }
     for (const name of ["firstName", "lastName", "password", "userType"] as const) {
       form.setValue(name, "");
     }
-    fetchUser.mutate(
-      { path: { user_id: parsed.data.userId } },
-      {
-        onSuccess: (view) => {
+    void fetchUser
+      .mutateAsync({ path: { user_id: parsed.data.userId } })
+      .then(
+        (view) => {
+          if (!awaited(operation)) {
+            return;
+          }
           // COUSR02C-013 and COUSR02C-014: the user ID keeps its value and the cursor.
           form.setValue("firstName", view.first_name);
           form.setValue("lastName", view.last_name);
@@ -233,11 +289,15 @@ export function COUSR02(): ReactNode {
           setMessage({ kind: "info", text: view.update_prompt });
           form.setFocus("userId");
         },
-        onError: (error) => {
-          showError(error, "error", "userId");
+        (error: components["schemas"]["ScreenError"]) => {
+          if (awaited(operation)) {
+            showError(error, "error", "userId");
+          }
         },
-      },
-    );
+      )
+      .finally(() => {
+        end(operation);
+      });
   }
 
   /** The message and cursor of an endpoint 19 failure (COUSR02C-033). */
@@ -246,35 +306,51 @@ export function COUSR02(): ReactNode {
     showError(error, neutral ? "info" : "error", "firstName");
   }
 
-  /** F5, `UPDATE-USER-INFO`: the user ID edit, then endpoint 19. */
+  /**
+   * F5, `UPDATE-USER-INFO`: the user ID edit, then endpoint 19. Refused while a request is in
+   * flight, so two saves never race; the request stays awaited until its response is shown.
+   */
   function save(): void {
-    if (leaving.current) {
+    const operation = begin("save", form.getValues("userId"));
+    if (operation === null) {
       return;
     }
-    void form.handleSubmit(
-      (values) => {
-        updateUser.mutate(updateVars(values), {
-          onSuccess: (result) => {
-            setMessage({ kind: "info", text: result.message });
-            form.setFocus("firstName");
-          },
-          onError: showUpdateError,
-        });
-      },
-      (errors) => {
-        // The resolver has already put the cursor on the first input in error.
-        setMessage({ kind: "error", text: firstErrorMessage(errors) });
-      },
-    )();
+    void form
+      .handleSubmit(
+        async (values) => {
+          await updateUser.mutateAsync(updateVars(values)).then(
+            (result) => {
+              if (awaited(operation)) {
+                setMessage({ kind: "info", text: result.message });
+                form.setFocus("firstName");
+              }
+            },
+            (error: components["schemas"]["ScreenError"]) => {
+              if (awaited(operation)) {
+                showUpdateError(error);
+              }
+            },
+          );
+        },
+        (errors) => {
+          // The resolver has already put the cursor on the first input in error.
+          setMessage({ kind: "error", text: firstErrorMessage(errors) });
+        },
+      )()
+      .finally(() => {
+        end(operation);
+      });
   }
 
   /**
    * F3, `UPDATE-USER-INFO` then `RETURN-TO-PREV-SCREEN`: saves exactly as F5 and leaves once the
    * save has settled, whatever its outcome, without showing its message (COUSR02C-006). A blank
-   * user ID fails the edit, so nothing is sent before leaving.
+   * user ID fails the edit, so nothing is sent before leaving. Refused while a fetch or a save is
+   * in flight, so it never sends a second save; its own request is never ended, because the
+   * screen it would unlock is gone.
    */
   function saveAndExit(): void {
-    if (leaving.current) {
+    if (begin("saveAndExit", form.getValues("userId")) === null) {
       return;
     }
     leaving.current = true;
@@ -289,12 +365,15 @@ export function COUSR02(): ReactNode {
     )();
   }
 
-  /** F4, `CLEAR-CURRENT-SCREEN`: every input and the message emptied, the cursor on the user ID. */
+  /**
+   * F4, `CLEAR-CURRENT-SCREEN`: every input and the message emptied, the cursor on the user ID.
+   * Refused while a request is in flight, whose response is the next thing the screen shows.
+   */
   function clear(): void {
-    if (leaving.current) {
+    if (leaving.current || inFlight.current !== null) {
       return;
     }
-    // A response still in flight would refill the screen after it was cleared.
+    // Only settled requests remain, so this drops their results and cancels nothing.
     fetchUser.reset();
     updateUser.reset();
     // `keepFieldsRef` keeps the inputs registered, so `setFocus` still finds the user ID input.
@@ -312,11 +391,12 @@ export function COUSR02(): ReactNode {
   }
 
   /**
-   * An F-key the program does not serve, its `WHEN OTHER` (COUSR02C-009). The input an earlier
-   * error marked is no longer the subject of the message row, so its mark goes.
+   * An F-key the program does not serve, its `WHEN OTHER` (COUSR02C-009). Refused while a request
+   * is in flight, as the key row's `busy` refuses it. The input an earlier error marked is no
+   * longer the subject of the message row, so its mark goes.
    */
   function invalidKey(): void {
-    if (leaving.current) {
+    if (leaving.current || inFlight.current !== null) {
       return;
     }
     form.clearErrors();
@@ -343,7 +423,14 @@ export function COUSR02(): ReactNode {
     F5: save,
     F12: cancel,
   };
-  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
+  const busy = pending !== null;
+  // The keys `begin`, `clear` and `cancel` refuse: every key while F3's save-and-exit runs, every
+  // key but F12 while a fetch or a save does.
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: actions[item.key],
+    disabled: item.key === "F12" ? pending === "saveAndExit" : busy,
+  }));
 
   return (
     <ScreenShell
@@ -354,11 +441,13 @@ export function COUSR02(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={{ foldShifted: KEY_ROWS.COUSR02.foldShifted, onInvalidKey: invalidKey }}
+      busy={busy}
     >
       <Form {...form}>
         <form
           id={formId}
           noValidate
+          aria-busy={busy}
           onSubmit={(event) => {
             event.preventDefault();
             if (!leaving.current) {
@@ -380,6 +469,7 @@ export function COUSR02(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={COUSR02_LENGTHS.userId}
                         autoComplete="off"
                         spellCheck={false}
@@ -415,6 +505,7 @@ export function COUSR02(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={COUSR02_LENGTHS.firstName}
                         autoComplete="off"
                         spellCheck={false}
@@ -439,6 +530,7 @@ export function COUSR02(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={COUSR02_LENGTHS.lastName}
                         autoComplete="off"
                         spellCheck={false}
@@ -463,6 +555,7 @@ export function COUSR02(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         type="password"
                         maxLength={COUSR02_LENGTHS.password}
                         autoComplete="off"
@@ -490,6 +583,7 @@ export function COUSR02(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={COUSR02_LENGTHS.userType}
                         autoComplete="off"
                         spellCheck={false}

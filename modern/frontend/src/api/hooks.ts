@@ -20,18 +20,24 @@ import type { components, paths } from "./schema";
  *
  * Nothing here logs, stores or copies a request or response. Data lives only in TanStack's
  * in-memory cache under the hook's own key, so the full card number that endpoint 8 discloses to
- * an admin reaches no other key or sink (Cardholder Data Redaction). Identity travels only as the
+ * an admin reaches no other key or sink (Cardholder Data Redaction); the one other store,
+ * `failureStatus`, holds only the HTTP status of a thrown failure. Identity travels only as the
  * bearer token `client.ts` adds; no hook sends the signed-on user's ID or type.
  */
 
 declare module "@tanstack/react-query" {
   /**
    * Every query and mutation error is typed as the API's `ScreenError` body, which the message
-   * row shows. The three failures without such a body, the browser's network `TypeError`, the
-   * `TimeoutError` `DOMException` of the request deadline in `client.ts` and the status `Error`
-   * of `settle`, carry a string `message` too. The page that endpoints 24 and 25 may throw on an
-   * error status can lack a string `message`, so COTRTLI reads it only through its
-   * `isListPage` and `isActionResult` guards.
+   * row shows. That is the body the generated error responses of every operation declare except
+   * two of COTRTLIC's, which may answer some error statuses with their page instead:
+   * `cotrtlic_list` (endpoint 24) a `TranTypeListResponse` on 400 and 500, and
+   * `cotrtlic_list_actions` (endpoint 25) a `TranTypeListActionResult` on 400 and 500 and always
+   * on 404; their 401, 403 and 422 are `ScreenError`s. Such a page can lack a string `message`,
+   * so a consumer of those two hooks narrows the thrown body before it reads it as a
+   * `ScreenError`, as COTRTLI's `isListPage` and `isActionResult` guards do. The three failures
+   * without a body, the browser's network `TypeError`, the `TimeoutError` `DOMException` of the
+   * request deadline in `client.ts` and the status `Error` of `settle`, carry a string `message`
+   * too. `errorStatus` gives the HTTP status of every failure `settle` threw.
    */
   interface Register {
     defaultError: components["schemas"]["ScreenError"];
@@ -39,28 +45,51 @@ declare module "@tanstack/react-query" {
 }
 
 /**
+ * The HTTP status of each failure `settle` threw, keyed by the thrown value itself: the error
+ * body, or the status `Error`. Kept beside the value rather than on it, so the generated body
+ * reaches the screen unchanged, with no key its schema does not declare; weakly held, so an
+ * entry lives no longer than the error it describes.
+ */
+const failureStatus = new WeakMap<object, number>();
+
+/**
  * Resolves an openapi-fetch call to its success body, or throws its failure.
  *
- * A failure whose body is a JSON object throws that object unchanged: the error body the API
- * declares for its status. That is a `ScreenError` with the program's message or, for endpoints
- * 24 and 25, the page their 400 or 500 (and endpoint 25's 404) may carry instead, which COTRTLI
- * tells apart with its `isListPage` and `isActionResult` guards. Any other failure has no object
- * to throw: openapi-fetch hands over an empty or non-JSON error body as its text, as for the dev
- * proxy's empty, chunked 500 while the API is down, and a declared-empty one as `undefined`. Such
- * a failure, and a success without a body, reject with an `Error` naming the HTTP status, so the
- * screen always reads a string `message` and never reads `undefined` as data.
+ * A failure whose body is a JSON object throws that object unchanged: the body the operation's
+ * generated error response declares for the status, the `ScreenError` with the program's message
+ * or, for endpoints 24 and 25, the COTRTLIC page `Register` names, which COTRTLI tells apart with
+ * its `isListPage` and `isActionResult` guards; the dev proxy's 502 while the API cannot be
+ * reached is such an object too, whose `message` names CARDDEMO_API_BIND. Any other failure has
+ * no object to throw: openapi-fetch hands over an empty or non-JSON error body as its text, and a
+ * declared-empty one as `undefined`. Such a failure, and a success without a body, reject with an
+ * `Error` naming the HTTP status, so the screen always reads a string `message` and never reads
+ * `undefined` as data. Either way the response's status is recorded for `errorStatus`.
  */
 async function settle<Data>(
   pending: Promise<{ data?: Data; error?: unknown; response: Response }>,
 ): Promise<Data> {
   const { data, error, response } = await pending;
   if (typeof error === "object" && error !== null) {
+    failureStatus.set(error, response.status);
     throw error;
   }
   if (data === undefined) {
-    throw new Error(`HTTP ${response.status} ${response.statusText}`.trimEnd());
+    const failure = new Error(`HTTP ${response.status} ${response.statusText}`.trimEnd());
+    failureStatus.set(failure, response.status);
+    throw failure;
   }
   return data;
+}
+
+/**
+ * The HTTP status of the response a hook's error came from, for a screen whose program reacts to
+ * the outcome class and not only to the message: COCRDSLC marks both inputs on a not-found read
+ * (404) but only the account on a file error (500). `undefined` for anything `settle` did not
+ * throw, such as the browser's network `TypeError` or the request deadline's `TimeoutError`, when
+ * no response arrived.
+ */
+export function errorStatus(error: unknown): number | undefined {
+  return typeof error === "object" && error !== null ? failureStatus.get(error) : undefined;
 }
 
 /** Endpoint 1, CC00 / COSGN00C: ENTER signs on and returns the token and the next route. */

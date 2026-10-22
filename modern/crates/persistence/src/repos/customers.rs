@@ -40,7 +40,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::PersistenceError;
 use crate::rows::{CustomerRow, pic_u_to_i64};
-use crate::{PgStore, PgTx};
+use crate::{PgStore, PgTx, ProbePoint, probed};
 
 /// The statements on `customers`, implemented by [`PgStore`] and [`PgTx`]; test doubles in
 /// other crates implement the same trait.
@@ -357,7 +357,8 @@ impl CustomerRepository for PgStore {
         &mut self,
         id: PicU<9>,
     ) -> impl Future<Output = Result<Option<CustomerRecord>, PersistenceError>> + Send {
-        select_by_id(self.pool(), id)
+        let verdict = self.verdict(ProbePoint::CustomerRead, &[&id]);
+        probed(verdict, select_by_id(self.pool(), id))
     }
 
     fn lock_by_id(
@@ -412,7 +413,8 @@ impl CustomerRepository for PgTx<'_> {
         &mut self,
         id: PicU<9>,
     ) -> impl Future<Output = Result<Option<CustomerRecord>, PersistenceError>> + Send {
-        select_by_id(self.conn(), id)
+        let verdict = self.verdict(ProbePoint::CustomerRead, &[&id]);
+        probed(verdict, select_by_id(self.conn(), id))
     }
 
     fn lock_by_id(

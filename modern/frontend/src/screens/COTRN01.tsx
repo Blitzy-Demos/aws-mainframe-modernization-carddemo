@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
@@ -275,6 +283,9 @@ function formFieldOf(field: string | null | undefined): keyof Cotrn01Values | un
  * - F3 returns to the screen that transferred here, else to the main menu (COTRN01C-004); F4 clears
  *   the screen (COTRN01C-005); F5 goes to the transaction list (COTRN01C-006); any other F-key
  *   shows the invalid-key message, keeps the Tran ID and blanks the details (COTRN01C-007).
+ * - While a read is outstanding the keyboard is locked, as the terminal's stays until the program
+ *   answers: ENTER and F4 are refused, an unserved F-key shows nothing and the Tran ID input is
+ *   read-only, so only one read is ever in flight. F3 and F5 still leave.
  *
  * The origin and the list's paging state stay in the route state for as long as the screen is
  * shown, so F3 returns there after any number of fetches (COTRN01C-008), and F3 or F5 back to the
@@ -294,33 +305,61 @@ export function COTRN01(): ReactNode {
     defaultValues: { tranId: selectedTranId ?? "" },
   });
   const view = useCotrn01cView();
-  const { mutate, reset: resetView } = view;
+  const { mutateAsync, reset: resetView } = view;
   const [keyMessage, setKeyMessage] = useState<string | undefined>(undefined);
+  const [busy, setBusy] = useState(false);
+  // One read at a time, as the terminal keyboard locks until the program answers. The ref is set
+  // before the form's validation starts, so a key pressed before the next render is refused too.
+  const inFlight = useRef(false);
 
+  /** Locks the keyboard for one read; `false` when a read already holds it. */
+  const lock = useCallback((): boolean => {
+    if (inFlight.current) {
+      return false;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    return true;
+  }, []);
+
+  /** Releases the keyboard: the read settled, or validation refused ENTER before any request. */
+  const unlock = useCallback((): void => {
+    inFlight.current = false;
+    setBusy(false);
+  }, []);
+
+  /**
+   * Reads `tranId` under the lock its caller holds. The read's own promise releases the lock and
+   * returns the cursor, so they follow the answer even when `resetView` has detached the view from
+   * it; a failure shows through `view.error` and marks the input it names.
+   */
   const fetchTransaction = useCallback(
     (tranId: string): void => {
       setKeyMessage(undefined);
       // A new read replaces the last answer, so an input the last one rejected is unmarked, and
       // a read that succeeds leaves it unmarked.
       form.clearErrors("tranId");
-      mutate(
+      void mutateAsync(
         { path: { tran_id: tranId } },
         {
+          // Runs only while the view still follows this read, the read whose error the message
+          // row shows: the input the server names is marked invalid with that message, so its
+          // field message carries the server's text.
           onError: (error) => {
-            // The input the server names is marked invalid with the message the message row
-            // shows, so its field message carries the server's text.
             const name = formFieldOf(error.field);
             if (name !== undefined) {
               form.setError(name, { type: "server", message: error.message });
             }
           },
-          onSettled: () => {
-            form.setFocus("tranId");
-          },
         },
-      );
+      )
+        .catch(() => undefined)
+        .finally(() => {
+          unlock();
+          form.setFocus("tranId");
+        });
     },
-    [mutate, form],
+    [mutateAsync, unlock, form],
   );
 
   // One entry per transfer: the location key changes with every navigation to this route, and
@@ -334,20 +373,30 @@ export function COTRN01(): ReactNode {
     form.reset({ tranId: selectedTranId ?? "" }, { keepFieldsRef: true });
     resetView();
     setKeyMessage(undefined);
-    if (selectedTranId !== undefined) {
+    if (selectedTranId !== undefined && lock()) {
       fetchTransaction(selectedTranId);
     }
-  }, [location.key, selectedTranId, form, resetView, fetchTransaction]);
+  }, [location.key, selectedTranId, form, resetView, lock, fetchTransaction]);
 
-  const onSubmit = form.handleSubmit(
+  const validate = form.handleSubmit(
     (values) => {
       fetchTransaction(values.tranId);
     },
     () => {
+      unlock();
       resetView();
       setKeyMessage(undefined);
     },
   );
+
+  /** ENTER: refused while a read is outstanding, else validated under the lock, then read. */
+  function onSubmit(event: FormEvent<HTMLFormElement>): void {
+    if (!lock()) {
+      event.preventDefault();
+      return;
+    }
+    void validate(event);
+  }
 
   function back(): void {
     const target = transfer.from ?? PATHS.COMEN01;
@@ -355,6 +404,9 @@ export function COTRN01(): ReactNode {
   }
 
   function clearScreen(): void {
+    if (inFlight.current) {
+      return;
+    }
     // `keepFieldsRef` keeps the input registered; a plain reset empties the registry until the
     // next render, and `setFocus` below would then find no field to focus.
     form.reset({ tranId: "" }, { keepFieldsRef: true });
@@ -368,13 +420,21 @@ export function COTRN01(): ReactNode {
   }
 
   function showInvalidKey(): void {
+    if (inFlight.current) {
+      return;
+    }
     form.clearErrors();
     resetView();
     setKeyMessage(INVALID_KEY);
   }
 
   const actions: PfKeyHandlers = { F3: back, F4: clearScreen, F5: browse };
-  const keys = KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
+  // While a read is outstanding ENTER and F4 are refused; F3 and F5 only navigate, so they leave.
+  const keys = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: actions[item.key],
+    disabled: busy && (item.key === "ENTER" || item.key === "F4"),
+  }));
 
   // The server's message wins: a validation message only shows while no response has replaced it.
   const message =
@@ -394,16 +454,10 @@ export function COTRN01(): ReactNode {
       message={{ text: message, kind: "error" }}
       keys={keys}
       keyOptions={{ foldShifted: KEY_ROWS.COTRN01.foldShifted, onInvalidKey: showInvalidKey }}
+      busy={busy}
     >
       <Form {...form}>
-        <form
-          id={formId}
-          noValidate
-          aria-busy={view.isPending}
-          onSubmit={(event) => {
-            void onSubmit(event);
-          }}
-        >
+        <form id={formId} noValidate aria-busy={busy} onSubmit={onSubmit}>
           <FieldGrid className={BODY_ROWS}>
             <FormField
               control={form.control}
@@ -433,6 +487,7 @@ export function COTRN01(): ReactNode {
                           field.onChange(event);
                         }}
                         data-field="TRNIDIN"
+                        readOnly={busy}
                         maxLength={TRAN_ID_INPUT.span}
                         size={TRAN_ID_INPUT.span}
                         autoFocus

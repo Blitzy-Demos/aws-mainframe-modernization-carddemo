@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useForm, type FieldErrors, type FieldPath } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCocrdlicList } from "@/api/hooks";
@@ -206,7 +206,11 @@ function errorLine(text: string | null | undefined): ShellMessage | undefined {
  * - F3 opens the main menu and sends nothing (COCRDLIC-004). Every other F-key is ENTER, and
  *   Shift+F1 to F12 (PF13 to PF24) act as F1 to F12 (COCRDLIC-003).
  * - While a request is in flight the keys that read are ignored, as the 3270 keyboard locks
- *   until the program answers; F3 still exits.
+ *   until the program answers; F3 still exits. The lock is taken when ENTER, F7 or F8 is
+ *   accepted, before the filter edits, and opens when the edits fail, when a selection opens
+ *   another screen, or when the answer arrives. While the request is out, ENTER, `F7=Backward`
+ *   and `F8=Forward` are disabled, the key row and the form are busy and every input is
+ *   read-only.
  *
  * Card numbers are shown exactly as the server redacts them, and only `card_ref` travels to the
  * next screen (Cardholder Data Redaction, E32). The page size is never sent, so the server's
@@ -229,12 +233,19 @@ export function COCRDLI(): ReactNode {
   const [selectorsProtected, setSelectorsProtected] = useState(false);
   // A new object per request, so the same field takes the cursor again after every answer.
   const [cursor, setCursor] = useState<{ readonly name: FieldPath<CocrdliValues> }>();
+  // `inFlight` is the lock the key handlers read at once; `pending` renders it while a list
+  // request is out.
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
 
   // Every arrival is the fresh start with no key. COCRDLIC would evaluate the key that left the
   // caller (F7 after COCRDUPC's post-save exit shows `NO PREVIOUS PAGES TO DISPLAY`,
-  // COCRDLIC-002), but no route state carries that key here.
+  // COCRDLIC-002), but no route state carries that key here. The lock keeps React's development
+  // double effect from reading twice.
   useEffect(() => {
-    read({}, FRESH_START);
+    if (lockKeys()) {
+      read({}, FRESH_START);
+    }
   }, []);
 
   useEffect(() => {
@@ -243,22 +254,43 @@ export function COCRDLI(): ReactNode {
     }
   }, [cursor, form]);
 
-  /** Sends one list request and shows its answer. */
+  /** Takes the lock of the reading keys; false when a key already holds it. */
+  function lockKeys(): boolean {
+    if (inFlight.current) {
+      return false;
+    }
+    inFlight.current = true;
+    setPending(true);
+    return true;
+  }
+
+  /** Opens the lock: the answer has arrived, or the key that took it sends nothing. */
+  function unlockKeys(): void {
+    inFlight.current = false;
+    setPending(false);
+  }
+
+  /**
+   * Sends one list request and shows its answer. The lock opens once the request settles,
+   * whatever its outcome, after the answer is shown.
+   */
   function read(
     query: NonNullable<paths["/api/v1/cards"]["get"]["parameters"]["query"]>,
     sent: SentInputs,
   ): void {
-    cards.mutate(
-      { query },
-      {
-        onSuccess: (response) => {
-          showPage(response, sent);
+    void cards
+      .mutateAsync(
+        { query },
+        {
+          onSuccess: (response) => {
+            showPage(response, sent);
+          },
+          onError: (error) => {
+            showFailure(error, sent);
+          },
         },
-        onError: (error) => {
-          showFailure(error, sent);
-        },
-      },
-    );
+      )
+      .then(unlockKeys, unlockKeys);
   }
 
   /**
@@ -335,6 +367,7 @@ export function COCRDLI(): ReactNode {
       const card = cardAt(page, edit.selected);
       if (card !== undefined) {
         const target = values.selections.at(edit.selected) === "S" ? PATHS.COCRDSL : PATHS.COCRDUP;
+        unlockKeys();
         void navigate(target, {
           state: { from: PATHS.COCRDLI, acct_id: card.acct_id, card_ref: card.card_ref },
         });
@@ -359,19 +392,29 @@ export function COCRDLI(): ReactNode {
     );
   }
 
-  /** ENTER, F7 or F8: the edits, then a transfer or a read. */
+  /**
+   * ENTER, F7 or F8: the edits, then a transfer or a read. The lock is taken here, before the
+   * asynchronous edits, so a key that arrives during them or while the request is out is
+   * refused. Edits that fail, or fail unexpectedly, open it again, as nothing was sent.
+   */
   function press(key: ListKey): void {
-    if (cards.isPending) {
+    if (!lockKeys()) {
       return;
     }
-    void form.handleSubmit(
-      (values) => {
-        proceed(values, key);
-      },
-      (errors) => {
-        showFilterErrors(errors);
-      },
-    )();
+    void form
+      .handleSubmit(
+        (values) => {
+          proceed(values, key);
+        },
+        (errors) => {
+          unlockKeys();
+          showFilterErrors(errors);
+        },
+      )()
+      .catch((error: unknown) => {
+        unlockKeys();
+        throw error;
+      });
   }
 
   const actions: PfKeyHandlers = {
@@ -385,9 +428,14 @@ export function COCRDLI(): ReactNode {
       press("F8");
     },
   };
+  // While a read is out only F3 stays enabled.
   const keys: PfKeyBarEntry[] = [
-    ENTER_KEY,
-    ...KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] })),
+    { ...ENTER_KEY, disabled: pending },
+    ...KEY_ITEMS.map((item) => ({
+      ...item,
+      onPress: actions[item.key],
+      disabled: pending && item.key !== "F3",
+    })),
   ];
   // Every F-key the row does not serve is processed as ENTER (COCRDLIC-003).
   const keyOptions: PfKeyOptions = {
@@ -407,12 +455,13 @@ export function COCRDLI(): ReactNode {
       info={info}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
     >
       <Form {...form}>
         <form
           id={formId}
           noValidate
-          aria-busy={cards.isPending}
+          aria-busy={pending}
           onSubmit={(event) => {
             event.preventDefault();
             press("ENTER");
@@ -449,6 +498,7 @@ export function COCRDLI(): ReactNode {
                       <Input
                         {...field}
                         maxLength={COCRDLI_LENGTHS.acctId}
+                        readOnly={pending}
                         autoFocus
                         autoComplete="off"
                         className={MARKED}
@@ -473,6 +523,7 @@ export function COCRDLI(): ReactNode {
                       <Input
                         {...field}
                         maxLength={COCRDLI_LENGTHS.cardNum}
+                        readOnly={pending}
                         autoComplete="off"
                         className={MARKED}
                       />
@@ -533,7 +584,7 @@ export function COCRDLI(): ReactNode {
                                     <Input
                                       {...field}
                                       maxLength={COCRDLI_LENGTHS.selection}
-                                      readOnly={selectorsProtected}
+                                      readOnly={selectorsProtected || pending}
                                       autoComplete="off"
                                       aria-label={`Select row ${position + 1}`}
                                       aria-invalid={marks.at(position) ?? false}

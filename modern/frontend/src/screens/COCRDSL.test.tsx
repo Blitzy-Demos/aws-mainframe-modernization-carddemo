@@ -1,7 +1,8 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { errorStatus } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -85,6 +86,24 @@ const cardNotProvided: components["schemas"]["ScreenError"] = {
   field: "card_num",
 };
 
+/**
+ * The 500 of a failed card read (COCRDSLC-016): `WS-FILE-ERROR-MESSAGE` in its 75 bytes, the RESP
+ * and RESP2 fields left blank, as their values are halted (COCRDSLC-017).
+ */
+const fileError: components["schemas"]["ScreenError"] = {
+  message: [
+    "File Error: ",
+    "READ".padEnd(8),
+    " on ",
+    "CARDDAT".padEnd(9),
+    " returned RESP ",
+    " ".repeat(10),
+    ",RESP2 ",
+    " ".repeat(10),
+  ].join(""),
+  field: "acct_id",
+};
+
 /** Replies with a JSON body, as the API sends every success and every `ScreenError`. */
 function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
@@ -137,12 +156,15 @@ function sentQueries(seen: ReturnType<typeof stubFetch>): Record<string, string>
   });
 }
 
-/** Renders the screen at its route with `state`, and a text stub at each F3 target. */
-function renderScreen(state?: unknown) {
+/**
+ * Renders the screen at its route with `state`, and a text stub at each F3 target. Returns the
+ * screen's `QueryClient`, whose mutation cache holds what each ENTER's read threw.
+ */
+function renderScreen(state?: unknown): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COCRDSL, state }]}>
         <Routes>
@@ -153,6 +175,14 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
+}
+
+/** What the last ENTER's read threw, as `useCocrdslcView` handed it to the screen. */
+function lastFailure(
+  client: QueryClient,
+): components["schemas"]["ScreenError"] | null | undefined {
+  return client.getMutationCache().getAll().at(-1)?.state.error;
 }
 
 /** An input or output of the screen by its label. */
@@ -191,9 +221,25 @@ function messageRow(kind: "error" | "info"): HTMLElement {
   return rows[0];
 }
 
-/** The text of the header value field `name`, padding kept. */
-function headerValue(name: string): string | null | undefined {
-  return document.querySelector(`span[data-field="${name}"]`)?.textContent;
+/**
+ * The header field `name` of rows 1 and 2 (`data-field`): the one `Input` of that name in the
+ * `CardHeader` title rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerInput(name: string): HTMLInputElement {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [input] = fields;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return input;
+}
+
+/** The value of the header field `name`, padding kept. */
+function headerValue(name: string): string {
+  return headerInput(name).value;
 }
 
 /** Waits until `count` requests were sent and the last one has been answered. */
@@ -204,6 +250,38 @@ async function requestsSettled(seen: ReturnType<typeof stubFetch>, count: number
   await waitFor(() => {
     expect(form().getAttribute("aria-busy")).toBe("false");
   });
+}
+
+/** The key row, `PfKeyBar`'s group. */
+function keyRow(): HTMLElement {
+  return screen.getByRole("group", { name: "Function keys" });
+}
+
+/** Whether each key-row button is disabled, by its label. */
+function disabledKeys(): Record<string, boolean> {
+  return Object.fromEntries(
+    within(keyRow())
+      .getAllByRole("button")
+      .map((button) => [button.textContent ?? "", button.hasAttribute("disabled")]),
+  );
+}
+
+/** Answers every endpoint 8 request with `reply`, but only once `open` has been called. */
+function heldReplies(reply: components["schemas"]["CardViewResponse"]) {
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const seen = stubFetch(async () => {
+    await held;
+    return json(200, reply);
+  });
+  return {
+    seen,
+    open: () => {
+      release();
+    },
+  };
 }
 
 describe("COCRDSL", () => {
@@ -368,8 +446,9 @@ describe("COCRDSL", () => {
     renderScreen();
 
     /*
-     * The header labels and value fields render as plain text rather than the `Label` and
-     * read-only `Input` their rows name, so only the values the program moves are tagged.
+     * The header labels render as `Label`s and the value fields as read-only `Input`s. NAV tags
+     * the label rows, and the next case the value rows; this one tags the content the program
+     * moves into each value.
      */
     expect(screen.getByText("Tran:").parentElement?.className).toBe(
       "row-start-1 col-start-1 col-span-5",
@@ -400,8 +479,104 @@ describe("COCRDSL", () => {
   });
 
   it.each([
+    // audit: COCRDSL-002
+    {
+      id: "COCRDSL-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CCDL",
+    },
+    // audit: COCRDSL-003
+    {
+      id: "COCRDSL-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE01,
+    },
+    // audit: COCRDSL-005
+    {
+      id: "COCRDSL-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^[0-9]{2}\/[0-9]{2}\/[0-9]{2}$/),
+    },
+    // audit: COCRDSL-007
+    {
+      id: "COCRDSL-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COCRDSLC",
+    },
+    // audit: COCRDSL-008
+    {
+      id: "COCRDSL-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE02,
+    },
+    // audit: COCRDSL-010
+    {
+      id: "COCRDSL-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^[0-9]{2}:[0-9]{2}:[0-9]{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const seen = stubFetch(unexpected);
+      renderScreen();
+
+      const value = headerInput(name);
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(value);
+      expect(seen).toEqual([]);
+    },
+  );
+
+  it.each([
     { title: "without route state", state: undefined },
     { title: "from the main menu", state: { from: PATHS.COMEN01 } },
+    // The menu forwards the route state it received, card-list handles included.
+    {
+      title: "from the main menu with an account and card a card-list visit left",
+      state: { ...FROM_LIST, from: PATHS.COMEN01 },
+    },
+    {
+      title: "with an account and card but no caller",
+      state: { acct_id: ACCT_ID, card_ref: 1 },
+    },
     {
       title: "when the account exceeds 11 characters",
       state: { ...FROM_LIST, acct_id: "0".repeat(12) },
@@ -531,10 +706,11 @@ describe("COCRDSL", () => {
   it("shows a not-found ScreenError in the error row and marks both inputs", async () => {
     // audit: COCRDSL-030
     // audit: COCRDSLC-025
+    // audit: COCRDSLC-027
     const seen = stubFetch((query) =>
       query.has("card_num") ? json(404, notFound) : json(400, cardNotProvided),
     );
-    renderScreen();
+    const client = renderScreen();
 
     const error = messageRow("error");
     expect(error.textContent).toBe("");
@@ -570,13 +746,49 @@ describe("COCRDSL", () => {
     expect(field(CARD).className).toContain("text-destructive");
     expect(document.activeElement).toBe(field(ACCOUNT));
     expect(cardDetails()).toEqual(["", "", "", ""]);
+    // The body reaches the screen as the API sent it, and its status travels beside it.
+    const failure = lastFailure(client);
+    expect(failure).toEqual(notFound);
+    expect(Reflect.ownKeys(failure ?? {})).toEqual(Object.keys(notFound));
+    expect(errorStatus(failure)).toBe(404);
+  });
+
+  it("marks only the account input after a file error", async () => {
+    // audit: COCRDSLC-027
+    const seen = stubFetch(() => json(500, fileError));
+    const client = renderScreen();
+
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+    // The cursor starts in the card input, so the response is what moves it.
+    act(() => {
+      field(CARD).focus();
+    });
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 1);
+
+    expect(sentQueries(seen)).toEqual([{ acct_id: ACCT_ID, card_num: TYPED_CARD }]);
+    expect(fileError.message).toHaveLength(75);
+    expect(messageRow("error").textContent).toBe(fileError.message);
+    expect(messageRow("info").textContent).toBe(PROMPT);
+    expect(field(ACCOUNT).value).toBe(ACCT_ID);
+    expect(field(ACCOUNT).className).toContain("text-destructive");
+    expect(field(CARD).value).toBe(TYPED_CARD);
+    expect(field(CARD).className).not.toContain("text-destructive");
+    expect(document.activeElement).toBe(field(ACCOUNT));
+    expect(cardDetails()).toEqual(["", "", "", ""]);
+    const failure = lastFailure(client);
+    expect(failure).toEqual(fileError);
+    expect(Reflect.ownKeys(failure ?? {})).toEqual(Object.keys(fileError));
+    expect(errorStatus(failure)).toBe(500);
   });
 
   /*
-   * COCRDSLC-027 stays untagged: the screen also marks the card input after a 500, where the
-   * program marks only the account input, and its empty-in-red case is halted.
+   * COCRDSLC-027 shows an input sent neither blank nor valid empty and in red; that case is
+   * HALTED(X-COCRDSLC-H1), so no case here asserts it.
    */
   it("shows * in red in an input sent blank and never sends the marker", async () => {
+    // audit: COCRDSLC-027
     const seen = stubFetch((query) => json(400, query.has("acct_id") ? cardNotProvided : noInput));
     renderScreen();
 
@@ -607,23 +819,43 @@ describe("COCRDSL", () => {
     expect(document.activeElement).toBe(field(CARD));
   });
 
-  it("shows a failure without a ScreenError body and leaves the inputs as sent", async () => {
-    const seen = stubFetch(() => new Response(null, { status: 502, statusText: "Bad Gateway" }));
-    renderScreen();
+  it.each([
+    {
+      failure: "an empty 502",
+      answer: (): Response => new Response(null, { status: 502, statusText: "Bad Gateway" }),
+      message: "HTTP 502 Bad Gateway",
+      status: 502,
+    },
+    {
+      failure: "a request that got no response",
+      answer: (): Response => {
+        throw new TypeError("Failed to fetch");
+      },
+      message: "Failed to fetch",
+      status: undefined,
+    },
+  ])(
+    "shows $failure without a ScreenError body and leaves the inputs as sent",
+    async ({ answer, message, status }) => {
+      const seen = stubFetch(answer);
+      const client = renderScreen();
 
-    typeInto(ACCOUNT, ACCT_ID);
-    typeInto(CARD, TYPED_CARD);
-    fireEvent.click(enterButton());
-    await requestsSettled(seen, 1);
+      typeInto(ACCOUNT, ACCT_ID);
+      typeInto(CARD, TYPED_CARD);
+      fireEvent.click(enterButton());
+      await requestsSettled(seen, 1);
 
-    expect(messageRow("error").textContent).toBe("HTTP 502 Bad Gateway");
-    expect(messageRow("info").textContent).toBe(PROMPT);
-    expect(field(ACCOUNT).value).toBe(ACCT_ID);
-    expect(field(CARD).value).toBe(TYPED_CARD);
-    for (const label of [ACCOUNT, CARD]) {
-      expect(field(label).className).not.toContain("text-destructive");
-    }
-  });
+      expect(messageRow("error").textContent).toBe(message);
+      expect(messageRow("info").textContent).toBe(PROMPT);
+      expect(field(ACCOUNT).value).toBe(ACCT_ID);
+      expect(field(CARD).value).toBe(TYPED_CARD);
+      for (const label of [ACCOUNT, CARD]) {
+        expect(field(label).className).not.toContain("text-destructive");
+      }
+      // `settle` records the status of a reply it turned into an `Error`; no reply, no status.
+      expect(errorStatus(lastFailure(client))).toBe(status);
+    },
+  );
 
   it.each([
     {
@@ -676,6 +908,122 @@ describe("COCRDSL", () => {
     await requestsSettled(seen, 1);
 
     expect(field(CARD).value).toBe("************5678");
+    expect(seen).toHaveLength(1);
+  });
+
+  it.each([
+    {
+      title: "the entry read from the card list",
+      state: FROM_LIST,
+      reply: view,
+      send: undefined,
+      editable: false,
+    },
+    {
+      title: "a click on ENTER",
+      state: undefined,
+      reply: typedView,
+      send: () => fireEvent.click(enterButton()),
+      editable: true,
+    },
+    {
+      title: "the key F5, processed as ENTER",
+      state: undefined,
+      reply: typedView,
+      send: () => fireEvent.keyDown(window, { key: "F5" }),
+      editable: true,
+    },
+  ])("locks every key but F3 and the inputs during $title, then frees them", async ({
+    state,
+    reply,
+    send,
+    editable,
+  }) => {
+    const { seen, open } = heldReplies(reply);
+    renderScreen(state);
+    if (send !== undefined) {
+      typeInto(ACCOUNT, ACCT_ID);
+      typeInto(CARD, TYPED_CARD);
+      send();
+    }
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    expect(disabledKeys()).toEqual({ "ENTER=Search Cards": true, "F3=Exit": false });
+    expect(form().getAttribute("aria-busy")).toBe("true");
+    expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([true, true]);
+    // Neither the button nor the keys send a second request, and no key counts as invalid.
+    fireEvent.click(enterButton());
+    for (const key of ["Enter", "F5"]) {
+      fireEvent.keyDown(window, { key });
+    }
+    fireEvent.keyDown(window, { key: "F7", shiftKey: true });
+    fireEvent.submit(form());
+    expect(messageRow("error").textContent).toBe("");
+
+    open();
+    await requestsSettled(seen, 1);
+    expect(keyRow().getAttribute("aria-busy")).toBe("false");
+    expect(disabledKeys()).toEqual({ "ENTER=Search Cards": false, "F3=Exit": false });
+    // Entered from the list, both inputs stay protected for the visit (COCRDSLC-002).
+    expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([!editable, !editable]);
+
+    // The next ENTER reads again.
+    fireEvent.click(enterButton());
+    await requestsSettled(seen, 2);
+    expect(sentQueries(seen)).toHaveLength(2);
+  });
+
+  it.each([
+    {
+      title: "ENTER clicked twice",
+      keys: () => {
+        fireEvent.click(enterButton());
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      title: "the keys Enter and F5",
+      keys: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+        fireEvent.keyDown(window, { key: "F5" });
+      },
+    },
+    {
+      title: "ENTER clicked and the form submitted",
+      keys: () => {
+        fireEvent.click(enterButton());
+        fireEvent.submit(form());
+      },
+    },
+  ])("sends one request for $title before the screen shows the lock", async ({ keys }) => {
+    const seen = stubFetch(() => json(200, typedView));
+    renderScreen();
+    typeInto(ACCOUNT, ACCT_ID);
+    typeInto(CARD, TYPED_CARD);
+
+    // One act: the screen renders only after both keys, so the second meets the enabled keys.
+    act(() => {
+      keys();
+    });
+
+    await requestsSettled(seen, 1);
+    expect(sentQueries(seen)).toEqual([{ acct_id: ACCT_ID, card_num: TYPED_CARD }]);
+  });
+
+  it("F3 returns to the card list while the entry read is out", async () => {
+    // audit: COCRDSLC-004
+    const { seen, open } = heldReplies(view);
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+
+    expect(await screen.findByText(LIST_STUB)).toBeTruthy();
+    open();
     expect(seen).toHaveLength(1);
   });
 

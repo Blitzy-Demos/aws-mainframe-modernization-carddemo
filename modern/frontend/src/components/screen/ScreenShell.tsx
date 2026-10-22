@@ -1,19 +1,22 @@
 import { useId, type ReactNode } from "react";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { TITLE01, TITLE02, formatHeaderDate, formatHeaderTime } from "@/lib/header";
 import { GridCell } from "./FieldGrid";
 import { MessageLine, type MessageKind } from "./MessageLine";
 import { PfKeyBar, type PfKeyBarProps } from "./PfKeyBar";
 
 /**
- * Which placement of header rows 1 and 2 a map declares.
+ * Which placement of the header rows a map declares.
  *
- * - `standard`: the 20 maps other than COSGN00, for example `app/bms/COMEN01.bms:29-74`: labels
- *   `Tran:`, `Prog:` at column 1 and `Date:`, `Time:` at column 65, five wide; `TRNNAME` and
- *   `PGMNAME` at column 7; `CURTIME` eight wide.
- * - `signon`: COSGN00 only, `app/bms/COSGN00.bms:29-74`: labels `Tran :`, `Prog :` at column 1 and
- *   `Date :`, `Time :` at column 64, six wide; `TRNNAME` and `PGMNAME` at column 8; `CURTIME`
- *   nine wide (`INITIAL='Ahh:mm:ss'`). Its row 3 (`AppID`/`SysID`) is not part of the shell.
+ * - `standard`: the 20 maps other than COSGN00, for example `app/bms/COMEN01.bms:29-74`: rows 1
+ *   and 2, labels `Tran:`, `Prog:` at column 1 and `Date:`, `Time:` at column 65, five wide;
+ *   `TRNNAME` and `PGMNAME` at column 7; `CURTIME` eight wide.
+ * - `signon`: COSGN00 only, `app/bms/COSGN00.bms:29-93`: rows 1 and 2, labels `Tran :`, `Prog :`
+ *   at column 1 and `Date :`, `Time :` at column 64, six wide; `TRNNAME` and `PGMNAME` at column
+ *   8; `CURTIME` nine wide (`INITIAL='Ahh:mm:ss'`). Then row 3: `AppID:` at column 1 and `SysID:`
+ *   at column 64, six wide, labelling `APPLID` at column 8 and `SYSID` at column 71, eight wide.
  */
 export type HeaderLayout = "standard" | "signon";
 
@@ -50,29 +53,45 @@ export type ScreenShellProps = {
   keys: PfKeyBarProps["keys"];
   /** Settings of the keyboard binding, forwarded to `PfKeyBar` as `options`. */
   keyOptions?: PfKeyBarProps["options"];
+  /** Whether the screen waits for a response; forwarded to `PfKeyBar` as `busy`. */
+  busy?: boolean;
   /**
    * The instant `CURDATE` and `CURTIME` show; the current time at each render when omitted, as
    * every program refreshes them on each send. Tests pass a fixed instant.
    */
   now?: Date;
-  /** Placement of header rows 1 and 2; `standard` unless the map is COSGN00. */
+  /** Placement of the header rows; `standard` unless the map is COSGN00. */
   headerLayout?: HeaderLayout;
   /** The screen body: the screen's `<form>` with its `FieldGrid`. */
   children: ReactNode;
 };
 
-/** The six header fields the programs fill in their header paragraph, by their BMS names. */
-type HeaderField = "TRNNAME" | "TITLE01" | "CURDATE" | "PGMNAME" | "TITLE02" | "CURTIME";
+/**
+ * The header fields the programs fill in their header paragraph, by their BMS names: the six of
+ * rows 1 and 2, and the `APPLID` and `SYSID` of COSGN00's row 3.
+ */
+type HeaderField =
+  | "TRNNAME"
+  | "TITLE01"
+  | "CURDATE"
+  | "PGMNAME"
+  | "TITLE02"
+  | "CURTIME"
+  | "APPLID"
+  | "SYSID";
 
-/** One header-row `DFHMDF` macro: a literal label, or a value field filled at render. */
+/**
+ * One header-row `DFHMDF` macro: a literal label and the value field it labels, or a value field
+ * filled at render. A value the map labels with no literal, a title, carries its accessible name.
+ */
 type HeaderCell = {
   readonly row: number;
   readonly col: number;
   readonly span: number;
   readonly className: string;
 } & (
-  | { readonly label: string; readonly field?: never }
-  | { readonly field: HeaderField; readonly label?: never }
+  | { readonly label: string; readonly labels: HeaderField; readonly field?: never }
+  | { readonly field: HeaderField; readonly name?: string; readonly label?: never }
 );
 
 /*
@@ -80,44 +99,57 @@ type HeaderCell = {
  * expressed as emphasis on the foreground. The value fields are BLUE on the map, snapped by role
  * to the foreground token of value fields.
  *
- * `whitespace-pre` keeps the padding that centres `TITLE01` and `TITLE02` in their 40 columns
- * (`app/cpy/COTTL01Y.cpy:18-22`). A grid column is wider than a character, so the 40 characters
- * fill only part of their cell; the title text is centred in the cell, which keeps it centred on
- * the screen as the padded field is on the terminal, instead of drifting left of the screen title.
+ * Each value is a read-only `Input` as wide as its `LENGTH` (`size`, so `w-auto` replaces the
+ * input's full width) at its `POS` column: a grid column is narrower than a character at some
+ * widths and wider at others, so a box filling its cell would cut a value or stretch past it.
+ * `h-full` centres each label on its line beside the boxes; `whitespace-pre` keeps its spacing.
+ *
+ * `TITLE01` and `TITLE02` keep the padding that centres them in their 40 characters
+ * (`app/cpy/COTTL01Y.cpy:18-22`). Their 40-character box is centred in its 40-column cell
+ * (`block mx-auto`), which keeps the titles centred on the screen as the padded fields are on the
+ * terminal, instead of drifting left of the screen title.
  */
-const LABEL = "whitespace-pre text-muted-foreground";
-const VALUE = "whitespace-pre text-foreground";
-const TITLE = "block whitespace-pre text-center font-semibold text-foreground";
+const LABEL = "h-full whitespace-pre text-muted-foreground";
+const VALUE = "w-auto text-foreground";
+const TITLE = "mx-auto block w-auto font-semibold text-foreground";
+
+/** The accessible names of the two titles, which no map literal labels. */
+const TITLE01_NAME = "Title row 1";
+const TITLE02_NAME = "Title row 2";
 
 /**
- * Header rows 1 and 2 of each layout, in macro order, as `POS` row, `POS` column and `LENGTH`
- * (`modern/audit/screens.md` rows `<MAP>-001` to `<MAP>-010`). Columns are the map's own, as
- * `GridCell` takes them.
+ * The header rows of each layout, in macro order, as `POS` row, `POS` column and `LENGTH`
+ * (`modern/audit/screens.md` rows `<MAP>-001` to `<MAP>-010`, and `COSGN00-011` to
+ * `COSGN00-014`). Columns are the map's own, as `GridCell` takes them.
  */
 const HEADER_CELLS: Readonly<Record<HeaderLayout, readonly HeaderCell[]>> = {
   standard: [
-    { row: 1, col: 1, span: 5, label: "Tran:", className: LABEL },
+    { row: 1, col: 1, span: 5, label: "Tran:", labels: "TRNNAME", className: LABEL },
     { row: 1, col: 7, span: 4, field: "TRNNAME", className: VALUE },
-    { row: 1, col: 21, span: 40, field: "TITLE01", className: TITLE },
-    { row: 1, col: 65, span: 5, label: "Date:", className: LABEL },
+    { row: 1, col: 21, span: 40, field: "TITLE01", name: TITLE01_NAME, className: TITLE },
+    { row: 1, col: 65, span: 5, label: "Date:", labels: "CURDATE", className: LABEL },
     { row: 1, col: 71, span: 8, field: "CURDATE", className: VALUE },
-    { row: 2, col: 1, span: 5, label: "Prog:", className: LABEL },
+    { row: 2, col: 1, span: 5, label: "Prog:", labels: "PGMNAME", className: LABEL },
     { row: 2, col: 7, span: 8, field: "PGMNAME", className: VALUE },
-    { row: 2, col: 21, span: 40, field: "TITLE02", className: TITLE },
-    { row: 2, col: 65, span: 5, label: "Time:", className: LABEL },
+    { row: 2, col: 21, span: 40, field: "TITLE02", name: TITLE02_NAME, className: TITLE },
+    { row: 2, col: 65, span: 5, label: "Time:", labels: "CURTIME", className: LABEL },
     { row: 2, col: 71, span: 8, field: "CURTIME", className: VALUE },
   ],
   signon: [
-    { row: 1, col: 1, span: 6, label: "Tran :", className: LABEL },
+    { row: 1, col: 1, span: 6, label: "Tran :", labels: "TRNNAME", className: LABEL },
     { row: 1, col: 8, span: 4, field: "TRNNAME", className: VALUE },
-    { row: 1, col: 21, span: 40, field: "TITLE01", className: TITLE },
-    { row: 1, col: 64, span: 6, label: "Date :", className: LABEL },
+    { row: 1, col: 21, span: 40, field: "TITLE01", name: TITLE01_NAME, className: TITLE },
+    { row: 1, col: 64, span: 6, label: "Date :", labels: "CURDATE", className: LABEL },
     { row: 1, col: 71, span: 8, field: "CURDATE", className: VALUE },
-    { row: 2, col: 1, span: 6, label: "Prog :", className: LABEL },
+    { row: 2, col: 1, span: 6, label: "Prog :", labels: "PGMNAME", className: LABEL },
     { row: 2, col: 8, span: 8, field: "PGMNAME", className: VALUE },
-    { row: 2, col: 21, span: 40, field: "TITLE02", className: TITLE },
-    { row: 2, col: 64, span: 6, label: "Time :", className: LABEL },
+    { row: 2, col: 21, span: 40, field: "TITLE02", name: TITLE02_NAME, className: TITLE },
+    { row: 2, col: 64, span: 6, label: "Time :", labels: "CURTIME", className: LABEL },
     { row: 2, col: 71, span: 9, field: "CURTIME", className: VALUE },
+    { row: 3, col: 1, span: 6, label: "AppID:", labels: "APPLID", className: LABEL },
+    { row: 3, col: 8, span: 8, field: "APPLID", className: VALUE },
+    { row: 3, col: 64, span: 6, label: "SysID:", labels: "SYSID", className: LABEL },
+    { row: 3, col: 71, span: 8, field: "SYSID", className: VALUE },
   ],
 };
 
@@ -125,15 +157,21 @@ const HEADER_CELLS: Readonly<Record<HeaderLayout, readonly HeaderCell[]>> = {
  * The frame of every screen, one BMS map laid out in a shadcn/ui `Card` (AAP 0.3.5, 0.4.2):
  *
  * - `CardHeader`: header rows 1 and 2 on the 80-column grid of `FieldGrid` (the transaction,
- *   the titles of `COTTL01Y`, the date, the program, the time), then the screen title;
+ *   the titles of `COTTL01Y`, the date, the program, the time), with COSGN00's row 3 (the
+ *   application and system IDs), then the screen title;
  * - `CardContent`: the screen body;
  * - `CardFooter`: the `INFOMSG` row when the map has one, the `ERRMSG` row and the row-24 keys.
  *
  * The header grid has the body grid's columns and gaps inside the same padding, so the header
- * fields stand over the body columns of the same number. The header rows are plain text: they
- * belong to the frame's title rows, not to the map's input or output fields.
+ * fields stand over the body columns of the same number. Each header value is an output field of
+ * the map, so it is a read-only `Input` keeping the field's box and width; each header literal is
+ * the `Label` of the value after it, bound by `htmlFor`, and the titles, which no literal labels,
+ * are named by `aria-label`. The header fields are `ASKIP` or `PROT`, which the 3270 cursor skips,
+ * so each value is out of the tab order (`tabIndex={-1}`) and Tab moves past the header rows to
+ * the body. No CICS region assigns `APPLID` and `SYSID`, so they stay empty (X-SCREENS-1).
  *
- * `PfKeyBar` is the screen's only keyboard binding, so screens never call `usePfKeys`. Every text
+ * `PfKeyBar` is the screen's only keyboard binding, so screens never call `usePfKeys`; a screen
+ * locks its keys through the keys' `disabled` and `busy`, which `PfKeyBar` receives. Every text
  * passed in is shown verbatim and never logged: card numbers and SSNs arrive already redacted.
  *
  * The frame is the page's `main` landmark. The skip link, shown only on keyboard focus, moves past
@@ -150,11 +188,13 @@ export function ScreenShell({
   info,
   keys,
   keyOptions,
+  busy,
   now,
   headerLayout = "standard",
   children,
 }: ScreenShellProps): ReactNode {
   const bodyId = useId();
+  const headerId = useId();
   const at = now ?? new Date();
   const values: Readonly<Record<HeaderField, string>> = {
     TRNNAME: transaction,
@@ -163,6 +203,8 @@ export function ScreenShell({
     PGMNAME: program,
     TITLE02,
     CURTIME: formatHeaderTime(at),
+    APPLID: "",
+    SYSID: "",
   };
 
   return (
@@ -187,9 +229,22 @@ export function ScreenShell({
                 col={cell.col}
                 span={cell.span}
               >
-                <span className={cell.className} data-field={cell.field}>
-                  {cell.field === undefined ? cell.label : values[cell.field]}
-                </span>
+                {cell.field === undefined ? (
+                  <Label htmlFor={`${headerId}-${cell.labels}`} className={cell.className}>
+                    {cell.label}
+                  </Label>
+                ) : (
+                  <Input
+                    id={`${headerId}-${cell.field}`}
+                    data-field={cell.field}
+                    aria-label={cell.name}
+                    readOnly
+                    tabIndex={-1}
+                    value={values[cell.field]}
+                    size={cell.span}
+                    className={cell.className}
+                  />
+                )}
               </GridCell>
             ))}
           </div>
@@ -214,7 +269,7 @@ export function ScreenShell({
         <CardFooter className="flex-col items-stretch gap-2">
           {info !== undefined && <MessageLine kind="info" text={info} />}
           <MessageLine kind={message?.kind ?? "error"} text={message?.text} />
-          <PfKeyBar keys={keys} formId={formId} options={keyOptions} />
+          <PfKeyBar keys={keys} formId={formId} options={keyOptions} busy={busy} />
         </CardFooter>
       </Card>
     </main>

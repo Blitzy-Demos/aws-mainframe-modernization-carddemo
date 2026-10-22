@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useId, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldErrors, type FieldPath } from "react-hook-form";
 import { useNavigate } from "react-router";
@@ -26,7 +34,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { KEY_ROWS, keyRowItems, type PfKeyHandlers } from "@/lib/pfkeys";
+import { KEY_ROWS, keyRowItems, type PfKey, type PfKeyHandlers } from "@/lib/pfkeys";
 import { PATHS, SCREENS } from "@/routes";
 import { COTRTLI_LENGTHS, cotrtliSchema, type CotrtliValues } from "@/schemas/COTRTLI";
 
@@ -56,6 +64,12 @@ const LINE_LABEL = "h-full";
 
 /** The 50 dashes under the description caption, `POS=(11,25)` (COTRTLI-025). */
 const DESCRIPTION_DASHES = "-".repeat(COTRTLI_LENGTHS.description);
+
+/**
+ * The labelled keys that send a request, refused with ENTER while one is outstanding; F2 and F3
+ * only navigate (COTRTLIC-015, COTRTLIC-016), so they stay available.
+ */
+const REQUEST_KEYS: ReadonlySet<PfKey> = new Set<PfKey>(["F7", "F8", "F10"]);
 
 /** The form before the first response: both filters and all seven rows blank. */
 function blankValues(): CotrtliValues {
@@ -221,6 +235,12 @@ function firstMessage(errors: FieldErrors<CotrtliValues>): string | undefined {
  * - F7 and F8: endpoint 24 with the filters on the screen and the last response's `page_key`.
  * - F2 and F3: navigation only (COTRTLIC-015, COTRTLIC-016).
  *
+ * While a request is out the keyboard is locked, as the 3270's is until the program answers. The
+ * lock is taken when a key is accepted, before the form's asynchronous check, and opens when the
+ * check refuses the input or the reply settles. Meanwhile ENTER, F7, F8 and F10 are disabled and
+ * refused, the key row and the form are busy and every input is read-only; F2 and F3 still
+ * navigate.
+ *
  * The state is the server's: it carries no authority, and the server re-reads and re-validates
  * every commit. The error line shows the server's message; the zod schema enforces only the map
  * lengths.
@@ -229,8 +249,8 @@ export function COTRTLI(): ReactNode {
   const navigate = useNavigate();
   const formId = useId();
   const pageNoId = useId();
-  const { mutate: readPage, isPending: reading } = useCotrtlicList();
-  const { mutate: sendActions, isPending: sending } = useCotrtlicListActions();
+  const { mutate: readPage } = useCotrtlicList();
+  const { mutate: sendActions } = useCotrtlicListActions();
   const form = useForm<CotrtliValues>({
     resolver: zodResolver(cotrtliSchema),
     defaultValues: blankValues(),
@@ -244,7 +264,26 @@ export function COTRTLI(): ReactNode {
   // screen keeps it from the request it sent.
   const [filtersLocked, setFiltersLocked] = useState(false);
   const [cursor, setCursor] = useState<{ readonly name: FieldPath<CotrtliValues> } | null>(null);
-  const busy = reading || sending;
+  // `inFlight` is the lock the key handlers read at once, so a second key pressed before the next
+  // render is refused too; `busy` renders it while a request is out.
+  const inFlight = useRef(false);
+  const [busy, setBusy] = useState(false);
+
+  /** Locks the keyboard for a request; `false`, refusing the key, while one is outstanding. */
+  const lock = useCallback((): boolean => {
+    if (inFlight.current) {
+      return false;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    return true;
+  }, []);
+
+  /** Opens the keyboard again: the reply settled, or the form's check sent nothing. */
+  const unlock = useCallback(() => {
+    inFlight.current = false;
+    setBusy(false);
+  }, []);
 
   /** Shows a page, its row and filter errors, its messages and its cursor. */
   const show = useCallback(
@@ -290,7 +329,10 @@ export function COTRTLI(): ReactNode {
     [setError],
   );
 
-  /** Endpoint 24 without paging: the first entry, page 1 under no filter (COTRTLIC-002). */
+  /**
+   * Endpoint 24 without paging: the first entry, page 1 under no filter (COTRTLIC-002). Its caller
+   * has locked the keyboard; the reply opens it.
+   */
   const load = useCallback(() => {
     readPage(
       { query: {} },
@@ -306,18 +348,20 @@ export function COTRTLI(): ReactNode {
             showFailure(error);
           }
         },
+        onSettled: unlock,
       },
     );
-  }, [readPage, show, showFailure]);
+  }, [readPage, show, showFailure, unlock]);
 
   // One first entry per mount, also under StrictMode's repeated effects.
   const entered = useRef(false);
   useEffect(() => {
     if (!entered.current) {
       entered.current = true;
+      lock();
       load();
     }
-  }, [load]);
+  }, [load, lock]);
 
   useEffect(() => {
     if (cursor !== null) {
@@ -327,7 +371,7 @@ export function COTRTLI(): ReactNode {
 
   /** F7 (`backward`) and F8 (`forward`): endpoint 24 under the filters on the screen. */
   function movePage(direction: components["schemas"]["PageDirection"]): void {
-    if (busy) {
+    if (!lock()) {
       return;
     }
     if (page === null) {
@@ -357,15 +401,16 @@ export function COTRTLI(): ReactNode {
             showFailure(error);
           }
         },
+        onSettled: unlock,
       },
     );
   }
 
-  /** ENTER and F10: endpoint 25 with the screen's input and the last `state`, unchanged. */
+  /**
+   * ENTER and F10: endpoint 25 with the screen's input and the last `state`, unchanged. Reached
+   * once the form's check passed, with the keyboard locked by `lockedSubmit`; the reply opens it.
+   */
   function sendKey(aid: components["schemas"]["CotrtlicAid"], values: CotrtliValues): void {
-    if (busy) {
-      return;
-    }
     if (page === null) {
       load();
       return;
@@ -397,12 +442,17 @@ export function COTRTLI(): ReactNode {
             showFailure(error);
           }
         },
+        onSettled: unlock,
       },
     );
   }
 
-  /** The client-side length check failed: its message stands until the server answers. */
+  /**
+   * The client-side length check failed: its message stands until the server answers, and the
+   * keyboard opens again, as nothing was sent.
+   */
   function showInvalid(errors: FieldErrors<CotrtliValues>): void {
+    unlock();
     setMessage(firstMessage(errors));
   }
 
@@ -412,6 +462,24 @@ export function COTRTLI(): ReactNode {
   const submitSave = handleSubmit((values) => {
     sendKey("PF10", values);
   }, showInvalid);
+
+  /**
+   * ENTER or F10 by its button, its key or an Enter in a field: `submit` (one of the two above)
+   * once the keyboard is locked. The lock is taken before the form's check, which settles later,
+   * so a key that arrives during the check or while the request is out sends nothing and never
+   * reaches the browser's own form submission. A check that fails unexpectedly sent nothing, so it
+   * opens the lock again and still reports its error.
+   */
+  function lockedSubmit(submit: typeof submitEnter, event?: FormEvent<HTMLFormElement>): void {
+    if (!lock()) {
+      event?.preventDefault();
+      return;
+    }
+    void submit(event).catch((error: unknown) => {
+      unlock();
+      throw error;
+    });
+  }
 
   const handlers: PfKeyHandlers = {
     // COTRTLIC-016: to CTTU to add a type; the list state is discarded. `from` lets CTTU's F3
@@ -432,7 +500,7 @@ export function COTRTLI(): ReactNode {
       movePage("forward");
     },
     F10: () => {
-      void submitSave();
+      lockedSubmit(submitSave);
     },
   };
 
@@ -440,8 +508,12 @@ export function COTRTLI(): ReactNode {
   // after the bare key, first in the row (COTRTLI-093, X-SCREENS-10): every PF action exists as a
   // button (AAP 0.4.4), and a hidden one could not be clicked.
   const keys: PfKeyBarEntry[] = [
-    { key: "ENTER", label: "ENTER", dark: false },
-    ...keyRowItems(KEY_ROWS.COTRTLI).map((item) => ({ ...item, onPress: handlers[item.key] })),
+    { key: "ENTER", label: "ENTER", dark: false, disabled: busy },
+    ...keyRowItems(KEY_ROWS.COTRTLI).map((item) => ({
+      ...item,
+      onPress: handlers[item.key],
+      disabled: busy && REQUEST_KEYS.has(item.key),
+    })),
   ];
 
   const positions = screenRows(page);
@@ -459,9 +531,10 @@ export function COTRTLI(): ReactNode {
         foldShifted: KEY_ROWS.COTRTLI.foldShifted,
         // COTRTLIC-014: COTRTLIC treats every key it does not serve as ENTER.
         onInvalidKey: () => {
-          void submitEnter();
+          lockedSubmit(submitEnter);
         },
       }}
+      busy={busy}
     >
       <Form {...form}>
         <form
@@ -469,7 +542,7 @@ export function COTRTLI(): ReactNode {
           noValidate
           aria-busy={busy}
           onSubmit={(event) => {
-            void submitEnter(event);
+            lockedSubmit(submitEnter, event);
           }}
         >
           <FieldGrid>
@@ -505,7 +578,7 @@ export function COTRTLI(): ReactNode {
                         size={COTRTLI_LENGTHS.typeFilter}
                         autoFocus
                         autoComplete="off"
-                        readOnly={filtersLocked}
+                        readOnly={filtersLocked || busy}
                         tabIndex={filtersLocked ? -1 : undefined}
                         className={cn(
                           NARROW_FIELD,
@@ -535,7 +608,7 @@ export function COTRTLI(): ReactNode {
                         maxLength={COTRTLI_LENGTHS.descFilter}
                         size={COTRTLI_LENGTHS.descFilter}
                         autoComplete="off"
-                        readOnly={filtersLocked}
+                        readOnly={filtersLocked || busy}
                         tabIndex={filtersLocked ? -1 : undefined}
                         className={cn(
                           "aria-invalid:text-destructive",
@@ -592,7 +665,7 @@ export function COTRTLI(): ReactNode {
                                     maxLength={COTRTLI_LENGTHS.selection}
                                     size={COTRTLI_LENGTHS.selection}
                                     autoComplete="off"
-                                    readOnly={!selectorOpen}
+                                    readOnly={!selectorOpen || busy}
                                     tabIndex={selectorOpen ? undefined : -1}
                                     className="aria-invalid:text-destructive"
                                   />
@@ -616,7 +689,7 @@ export function COTRTLI(): ReactNode {
                                     maxLength={COTRTLI_LENGTHS.description}
                                     size={COTRTLI_LENGTHS.description}
                                     autoComplete="off"
-                                    readOnly={!descriptionOpen}
+                                    readOnly={!descriptionOpen || busy}
                                     tabIndex={descriptionOpen ? undefined : -1}
                                     className="aria-invalid:text-destructive"
                                   />

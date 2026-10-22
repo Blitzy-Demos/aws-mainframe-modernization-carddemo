@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useForm, useFormContext, type Control, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn02cAdd } from "@/api/hooks";
@@ -299,6 +299,8 @@ function promptValues(
 interface MapFieldProps {
   readonly input: MapInput;
   readonly control: Control<Cotrn02Values>;
+  /** Whether the input takes no typing, as while a request is outstanding. */
+  readonly readOnly: boolean;
 }
 
 /**
@@ -308,7 +310,7 @@ interface MapFieldProps {
  * field's `FormMessage`, which repeats the text of the error that marks the input invalid, is for
  * assistive technology only; being absolutely positioned, it takes no cell of the grid.
  */
-function MapField({ input, control }: MapFieldProps): ReactNode {
+function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
   const length = COTRN02_LENGTHS[input.name];
   const { label, hint } = input;
   const { clearErrors, getFieldState } = useFormContext<Cotrn02Values>();
@@ -325,6 +327,7 @@ function MapField({ input, control }: MapFieldProps): ReactNode {
             <FormControl>
               <Input
                 {...field}
+                readOnly={readOnly}
                 onChange={(event) => {
                   // A change is the user's correction, so the input's mark goes with it; where the
                   // form re-validates on change (after a submit), the resolver judges the new
@@ -370,8 +373,9 @@ function MapField({ input, control }: MapFieldProps): ReactNode {
  * A 200 shows the response's fields and message; a `ScreenError` keeps every field shown and
  * displays its message (`COTRN02C-060`). The cursor goes to the field the response names. Every
  * message is red but the success message, which is green (`COTRN02C-058`). While a request is
- * outstanding the keys do nothing, as the terminal keyboard stays locked until the program
- * answers; F3 still leaves.
+ * outstanding the keyboard is locked, as the terminal's stays until the program answers: ENTER,
+ * F4 and F5 are refused, an unserved F-key shows nothing and the inputs are read-only; F3 still
+ * leaves.
  */
 export function COTRN02(): ReactNode {
   const formId = useId();
@@ -385,8 +389,10 @@ export function COTRN02(): ReactNode {
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
   // The redacted card number the program last filled in; never sent back (`requestBody`).
   const filledCard = useRef<string | undefined>(undefined);
-  // Set from the send until the answer, so a second key press cannot slip in before re-render.
+  // Set from the key until the answer, or until validation refuses the key, so a second key press
+  // cannot slip in before re-render; `busy` is its rendered copy.
   const pending = useRef(false);
+  const [busy, setBusy] = useState(false);
   // The input the program's cursor goes to. Focus is applied after the render that follows, because
   // `form.reset` drops the field references until the inputs render again.
   const [cursor, setCursor] = useState<{ readonly name: FieldName } | undefined>(undefined);
@@ -438,47 +444,74 @@ export function COTRN02(): ReactNode {
     focus(inputOfMember(result.field) ?? "acctId");
   }
 
-  function send(aid: components["schemas"]["Cotrn02cAid"], values: Cotrn02Values): void {
+  /** Locks the keyboard for one key; `false` while another key holds it. */
+  function lock(): boolean {
     if (pending.current) {
-      return;
+      return false;
     }
     pending.current = true;
-    add.mutate(
-      { body: requestBody(aid, values, filledCard.current) },
-      {
-        onSuccess: (result) => {
-          showResult(result, values);
+    setBusy(true);
+    return true;
+  }
+
+  /** Releases the keyboard: the answer arrived, or validation refused the key with no request. */
+  function unlock(): void {
+    pending.current = false;
+    setBusy(false);
+  }
+
+  /**
+   * Sends the screen with `aid` under the lock its caller holds. The request's own promise releases
+   * the lock, so the release never depends on the mutation's observer staying attached.
+   */
+  function send(aid: components["schemas"]["Cotrn02cAid"], values: Cotrn02Values): void {
+    void add
+      .mutateAsync(
+        { body: requestBody(aid, values, filledCard.current) },
+        {
+          onSuccess: (result) => {
+            showResult(result, values);
+          },
+          onError: (error) => {
+            showRejection(error);
+          },
         },
-        onError: (error) => {
-          showRejection(error);
-        },
-        onSettled: () => {
-          pending.current = false;
-        },
-      },
-    );
+      )
+      .catch(() => undefined)
+      .finally(unlock);
   }
 
   /** The first map-length error in map order, shown in the message row; no request is sent. */
   function showInvalid(errors: FieldErrors<Cotrn02Values>): void {
+    unlock();
     const first = INPUTS.find((input) => errors[input.name]?.message !== undefined);
     if (first !== undefined) {
       showError(errors[first.name]?.message ?? "", first.name);
     }
   }
 
-  const submit = form.handleSubmit((values) => {
+  const validate = form.handleSubmit((values) => {
     send("ENTER", values);
   }, showInvalid);
 
+  /** ENTER: refused while a request is outstanding, else validated and sent under the lock. */
+  function submit(event: FormEvent<HTMLFormElement>): void {
+    if (!lock()) {
+      event.preventDefault();
+      return;
+    }
+    void validate(event);
+  }
+
   function copyLast(): void {
-    if (pending.current) {
+    if (!lock()) {
       return;
     }
     const values = form.getValues();
     const keys = cotrn02KeySchema.safeParse({ acctId: values.acctId, cardNum: values.cardNum });
     form.clearErrors();
     if (!keys.success) {
+      unlock();
       // Each key the schema rejects is marked invalid, as ENTER's resolver marks every field it
       // rejects; the first one's message is shown and takes the cursor.
       for (const issue of keys.error.issues) {
@@ -513,7 +546,12 @@ export function COTRN02(): ReactNode {
   }
 
   const actions: PfKeyHandlers = { F3: back, F4: clear, F5: copyLast };
-  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
+  // While a request is outstanding ENTER, F4 and F5 are refused; F3 still leaves.
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: actions[item.key],
+    disabled: busy && (item.key === "ENTER" || item.key === "F4" || item.key === "F5"),
+  }));
   const keyOptions: PfKeyOptions = {
     foldShifted: KEY_ROWS.COTRN02.foldShifted,
     onInvalidKey: invalidKey,
@@ -528,29 +566,23 @@ export function COTRN02(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={keyOptions}
+      busy={busy}
     >
       <Form {...form}>
-        <form
-          id={formId}
-          noValidate
-          aria-busy={add.isPending}
-          onSubmit={(event) => {
-            void submit(event);
-          }}
-        >
+        <form id={formId} noValidate aria-busy={busy} onSubmit={submit}>
           <FieldGrid>
-            <MapField input={ACCOUNT_INPUT} control={form.control} />
+            <MapField input={ACCOUNT_INPUT} control={form.control} readOnly={busy} />
             <GridCell row={OR_TEXT.row} col={OR_TEXT.col} span={OR_TEXT.span}>
               <span className={STATIC}>{OR_TEXT.text}</span>
             </GridCell>
-            <MapField input={CARD_INPUT} control={form.control} />
+            <MapField input={CARD_INPUT} control={form.control} readOnly={busy} />
             <GridCell row={RULE_TEXT.row} col={RULE_TEXT.col} span={RULE_TEXT.span}>
               <span aria-hidden="true" className={STATIC}>
                 {RULE_TEXT.text}
               </span>
             </GridCell>
             {DATA_INPUTS.map((input) => (
-              <MapField key={input.name} input={input} control={form.control} />
+              <MapField key={input.name} input={input} control={form.control} readOnly={busy} />
             ))}
           </FieldGrid>
         </form>

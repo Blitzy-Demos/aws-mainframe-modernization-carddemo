@@ -8,10 +8,10 @@
 //! database records. A run against an already migrated database applies nothing, logs `applied`
 //! 0, and still succeeds. The exit status is non-zero when the configuration, the connection or
 //! a migration fails. A configuration error names its variable and never its value. A connection
-//! or migration error is logged only as the value-free summary that `runtime::db` or
-//! `runtime::migrate` builds: an error class with at most migration versions and a SQLSTATE,
-//! never the driver's or the server's text. Neither the connection URL nor any value it carries
-//! reaches the output.
+//! error names `DATABASE_URL`. A connection or migration error is logged only as the value-free
+//! summary that `runtime::db` or `runtime::migrate` builds: an error class with at most migration
+//! versions and a SQLSTATE, never the driver's or the server's text. Neither the connection URL
+//! nor any value it carries reaches the output.
 
 use std::process::ExitCode;
 
@@ -43,7 +43,7 @@ async fn main() -> ExitCode {
             Ok(pool) => pool,
             Err(err) => {
                 let error = runtime::db::ErrorSummary::from(&err);
-                tracing::error!(%error, "database connection failed");
+                tracing::error!(%error, "database connection failed (DATABASE_URL)");
                 return ExitCode::FAILURE;
             }
         };

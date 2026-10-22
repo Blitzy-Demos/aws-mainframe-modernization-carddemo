@@ -1,5 +1,13 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useCallback, useId, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCobil00cPay } from "@/api/hooks";
@@ -134,6 +142,9 @@ function resultMessage(result: components["schemas"]["BillPaymentResult"]): Shel
  *   the cursor to it; the account, balance and confirmation keep what they showed.
  * - F3 goes back (COBIL00C-004); F4 empties the screen and the message row (COBIL00C-005); any
  *   other function key shows the invalid-key message (COBIL00C-006). None sends a request.
+ * - From the moment ENTER is taken until its reply arrives the keyboard is locked: ENTER and F4
+ *   are disabled, the account and confirmation are read-only and the key row is busy. F3 stays
+ *   available.
  */
 export function COBIL00(): ReactNode {
   const formId = useId();
@@ -153,20 +164,23 @@ export function COBIL00(): ReactNode {
   const [balance, setBalance] = useState("");
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
 
-  // The terminal keyboard stays locked until the program's reply arrives, so ENTER and F4 do
-  // nothing while a request is in flight: a second ENTER cannot pay twice, and no reply lands on
-  // a screen cleared after it was sent.
-  const pending = pay.isPending;
+  // The terminal keyboard stays locked until the program's reply arrives, so ENTER and F4 are
+  // refused while a request is in flight: a second ENTER cannot pay twice, and no reply lands on
+  // a screen cleared after it was sent. `inFlight` is taken when ENTER is accepted, before the
+  // form's asynchronous validation, and freed when validation refuses the values or the reply
+  // settles; `pending` shows the same lock on the keys and inputs.
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
 
   const clear = useCallback(() => {
-    if (pending) {
+    if (inFlight.current) {
       return;
     }
     reset(EMPTY_VALUES, CLEAR_OPTIONS);
     setBalance("");
     setMessage(undefined);
     setFocus("acctId");
-  }, [pending, reset, setFocus]);
+  }, [reset, setFocus]);
 
   const back = useCallback(() => {
     // COBIL00C names itself the from-program before its XCTL (`RETURN-TO-PREV-SCREEN`).
@@ -175,8 +189,13 @@ export function COBIL00(): ReactNode {
 
   const keys = useMemo<PfKeyBarEntry[]>(() => {
     const actions: PfKeyHandlers = { F3: back, F4: clear };
-    return KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
-  }, [back, clear]);
+    // F3 stays available while a request is in flight; ENTER and F4 wait for its reply.
+    return KEY_ITEMS.map((item) => ({
+      ...item,
+      onPress: actions[item.key],
+      disabled: pending && item.key !== "F3",
+    }));
+  }, [back, clear, pending]);
 
   const keyOptions = useMemo<PfKeyOptions>(
     () => ({
@@ -187,10 +206,24 @@ export function COBIL00(): ReactNode {
     [],
   );
 
-  function submit(values: Cobil00Values): void {
-    if (pending) {
+  /** Frees the keyboard once validation has refused the values or the reply has settled. */
+  function release(): void {
+    inFlight.current = false;
+    setPending(false);
+  }
+
+  /** Takes ENTER and locks the keyboard, or refuses the submit while a request holds it. */
+  function accept(event: FormEvent<HTMLFormElement>): void {
+    if (inFlight.current) {
+      event.preventDefault();
       return;
     }
+    inFlight.current = true;
+    setPending(true);
+    void form.handleSubmit(submit, reject)(event);
+  }
+
+  function submit(values: Cobil00Values): void {
     pay.mutate(
       { body: { acct_id: values.acctId, confirm: values.confirm } },
       {
@@ -213,6 +246,7 @@ export function COBIL00(): ReactNode {
             setFocus(field);
           }
         },
+        onSettled: release,
       },
     );
   }
@@ -221,6 +255,7 @@ export function COBIL00(): ReactNode {
   // message takes the message row until the server's next message replaces it, and the form
   // moves the cursor to the field.
   function reject(errors: FieldErrors<Cobil00Values>): void {
+    release();
     setMessage({
       text: errors.acctId?.message ?? errors.confirm?.message ?? "",
       kind: "error",
@@ -236,9 +271,10 @@ export function COBIL00(): ReactNode {
       message={message}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} noValidate onSubmit={form.handleSubmit(submit, reject)}>
+        <form id={formId} noValidate aria-busy={pending} onSubmit={accept}>
           <FieldGrid>
             <FormField
               control={form.control}
@@ -257,6 +293,7 @@ export function COBIL00(): ReactNode {
                         autoFocus
                         autoComplete="off"
                         spellCheck={false}
+                        readOnly={pending}
                         className={ACCT_CLASS}
                       />
                     </FormControl>
@@ -292,6 +329,7 @@ export function COBIL00(): ReactNode {
                         maxLength={COBIL00_LENGTHS.confirm}
                         autoComplete="off"
                         spellCheck={false}
+                        readOnly={pending}
                         className={CONFIRM_CLASS}
                       />
                     </FormControl>

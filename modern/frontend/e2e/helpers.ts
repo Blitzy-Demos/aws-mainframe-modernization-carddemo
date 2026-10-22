@@ -140,15 +140,16 @@ export async function select(page: Page, row: number, code: SelectionCode): Prom
 
 /**
  * Asserts that `e` is the screen shown: the route, the level-1 heading, the first field and, when
- * given, the `PGMNAME` header. Playwright normalises whitespace in string expectations, so the
- * caller passes map texts without their padding.
+ * given, the value of the read-only `PGMNAME` header input, which holds the eight-character
+ * program name exactly. Playwright normalises whitespace in text expectations, so the caller
+ * passes map texts without their padding.
  */
 export async function expectScreen(page: Page, e: ScreenExpectation): Promise<void> {
   await expect(page).toHaveURL((url) => url.pathname === e.route);
   await expect(page.getByRole("heading", { level: 1 })).toHaveText(e.title);
   await expect(page.getByLabel(labelMatcher(e.firstField)).first()).toBeVisible();
   if (e.program !== undefined) {
-    await expect(page.locator('[data-field="PGMNAME"]')).toHaveText(e.program);
+    await expect(page.locator('[data-field="PGMNAME"]')).toHaveValue(e.program);
   }
 }
 

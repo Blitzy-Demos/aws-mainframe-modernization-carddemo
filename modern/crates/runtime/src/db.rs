@@ -1,12 +1,13 @@
 //! `PostgreSQL` connection pool of the `carddemo-api`, `carddemo-mq`, `carddemo-batch` and
 //! `carddemo-migrate` binaries.
 //!
-//! [`connect`] opens a [`PgPool`] on [`Config::database_url`]. Its default names the local
-//! `PostgreSQL` 16 service of `modern/compose.yaml`, and an integration test hands a binary its
-//! testcontainers instance through `DATABASE_URL`. The `sqlx` feature set has no TLS backend, so
-//! every connection is unencrypted, and a URL that requires TLS (`sslmode` `require`,
-//! `verify-ca` or `verify-full`) fails to connect. This module does not restrict which host a
-//! URL names.
+//! [`connect`] opens a [`PgPool`] on [`Config::database_url`], and [`connect_for_requests`] opens
+//! one whose sessions also start with the request deadlines described below. The default URL
+//! names the local `PostgreSQL` 16 service of `modern/compose.yaml`, and an integration test
+//! hands a binary its testcontainers instance through `DATABASE_URL`. The `sqlx` feature set has
+//! no TLS backend, so every connection is unencrypted, and a URL that requires TLS (`sslmode`
+//! `require`, `verify-ca` or `verify-full`) fails to connect. This module does not restrict
+//! which host a URL names.
 //!
 //! Connecting never applies migrations. The schema reaches the database only through the
 //! `apply` function in the `migrate` module (`crate::migrate`), run by the `carddemo-migrate`
@@ -42,12 +43,34 @@
 //!
 //! # Unreachable servers
 //!
-//! Before it builds the pool, [`connect`] makes one connection of its own within 30 seconds,
-//! the default acquire timeout of a `sqlx` pool, resolving the host first. The pool alone would
-//! retry a refused connection until that timeout and then report only that it timed out, and
-//! would report an unresolvable host as an uncategorized I/O error. The single connection
-//! reports the cause instead, which [`ErrorSummary`] renders as `io (connection refused)`,
-//! `io (host name not resolved)` or `io (timed out)`.
+//! Every pool opened here waits at most [`ACQUIRE_TIMEOUT`], 5 seconds rather than the 30 of
+//! the `sqlx` default, for a connection: a caller that finds none idle and the server
+//! unreachable, as during an outage, gets [`sqlx::Error::PoolTimedOut`] once it has passed. A
+//! request of `carddemo-api` then answers its 500 after 5 seconds and logs the failure, instead
+//! of holding it for half a minute with nothing in the log.
+//!
+//! Before it builds the pool, [`connect`] makes one connection of its own within the same 5
+//! seconds, resolving the host first. The pool alone would retry a refused connection until its
+//! acquire timeout and then report only that it timed out, and would report an unresolvable
+//! host as an uncategorized I/O error. The single connection reports the cause instead, which
+//! [`ErrorSummary`] renders as `io (connection refused)`, `io (host name not resolved)` or
+//! `io (timed out)`. It shares the acquire timeout because the pool bounds each connection it
+//! opens by that timeout too: a server that the first connection reaches in time is one the
+//! pool's own connections can reach.
+//!
+//! # Request deadlines
+//!
+//! Each session of the pool [`connect_for_requests`] opens starts with `lock_timeout`
+//! [`LOCK_TIMEOUT`] and `statement_timeout` [`STATEMENT_TIMEOUT`], so the server itself ends a
+//! row lock wait, such as a `SELECT … FOR UPDATE` of an account or a user that another
+//! transaction holds, and any statement that runs too long. They are sent as server options of
+//! the startup packet, ahead of those `DATABASE_URL` names, and no statement is issued for them.
+//! The server applies the last of repeated settings, so a `lock_timeout` or `statement_timeout`
+//! that `DATABASE_URL` sets, as an `options[<name>]` parameter or inside its `options`
+//! parameter, prevails. Like every setting a client sends, both take precedence over a value set
+//! with `ALTER ROLE` or `ALTER DATABASE`. Only `carddemo-api` serves requests; the other
+//! binaries use [`connect`], whose sessions keep the server's settings (see
+//! [`connect_for_requests`]).
 //!
 //! # Credential-safe diagnostics
 //!
@@ -60,6 +83,7 @@
 //! class and, for a database error, the SQLSTATE, and never the driver's or the server's text:
 //! that text can quote a rejected option value or a key value.
 
+use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
 use std::io;
@@ -112,13 +136,39 @@ const VERTICAL_TAB: u8 = 0x0B;
 /// The port that libpq and `PostgreSQL` use when none is named.
 const DEFAULT_PORT: u16 = 5432;
 
-/// How long [`connect`] waits for its own first connection, name resolution included: the
-/// default acquire timeout of a `sqlx` pool, which then bounds each connection the pool opens.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a caller of a pool opened here waits for a connection before the pool returns
+/// [`sqlx::Error::PoolTimedOut`]: its acquire timeout, which also bounds each connection the
+/// pool opens. A connection the server refuses is retried until then. A fixed value, not a
+/// setting of [`Config`]: the `sqlx` default is 30 seconds.
+pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Opens a [`PgPool`] on [`Config::database_url`] with the default `sqlx` pool settings, and
-/// establishes one connection before returning, so a wrong URL, an unreachable server or rejected
-/// credentials surface at startup rather than at the first query.
+/// How long [`connect`] waits for its own first connection, name resolution included: the
+/// [`ACQUIRE_TIMEOUT`] that then bounds each connection the pool opens.
+const CONNECT_TIMEOUT: Duration = ACQUIRE_TIMEOUT;
+
+/// How long a session of [`connect_for_requests`] waits for a lock before the server ends the
+/// statement with SQLSTATE `55P03` (`lock_not_available`): its `lock_timeout`.
+pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a statement of a session of [`connect_for_requests`] runs before the server cancels
+/// it with SQLSTATE `57014` (`query_canceled`): its `statement_timeout`. It is longer than
+/// [`LOCK_TIMEOUT`], so a lock wait ends as `55P03`.
+pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A server setting that the sessions of a pool start with: its name and its value, which is
+/// sent in milliseconds.
+type ServerSetting = (&'static str, Duration);
+
+/// The server settings each session of [`connect_for_requests`] starts with.
+const REQUEST_SETTINGS: [ServerSetting; 2] = [
+    ("lock_timeout", LOCK_TIMEOUT),
+    ("statement_timeout", STATEMENT_TIMEOUT),
+];
+
+/// Opens a [`PgPool`] on [`Config::database_url`] with the default `sqlx` pool settings but an
+/// acquire timeout of [`ACQUIRE_TIMEOUT`], and establishes one connection before returning, so a
+/// wrong URL, an unreachable server or rejected credentials surface at startup rather than at
+/// the first query.
 ///
 /// The URL's query parameter names are checked before `sqlx` parses it: each must be one that
 /// `sqlx` recognizes, compared exactly as written, so a percent-encoded or `+`-encoded name is
@@ -138,31 +188,76 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// - [`sqlx::Error::Io`] when the server cannot be reached, at once rather than after the
 ///   pool's acquire timeout. [`ErrorSummary`] reports it as `io (connection refused)` when
 ///   nothing listens on the port, `io (host name not resolved)` when the host resolves to no
-///   address, `io (timed out)` when no connection is established within 30 seconds, and by its
-///   kind for any other I/O failure.
+///   address, `io (timed out)` when no connection is established within [`ACQUIRE_TIMEOUT`], 5
+///   seconds, and by its kind for any other I/O failure.
 /// - [`sqlx::Error::Tls`] when the URL requires TLS, which this build cannot provide.
 /// - [`sqlx::Error::Database`] when the server rejects the connection, for example on an
 ///   authentication failure or an unknown database.
-/// - [`sqlx::Error::PoolTimedOut`] only when the server stops accepting connections between
-///   that first connection and the pool's own.
+/// - [`sqlx::Error::PoolTimedOut`] only when, between that first connection and the pool's own,
+///   the server stops accepting connections or comes to take longer than [`ACQUIRE_TIMEOUT`] to
+///   accept one.
 pub async fn connect(config: &Config) -> Result<PgPool, sqlx::Error> {
-    connect_within(config, CONNECT_TIMEOUT).await
+    connect_within(config, &[], CONNECT_TIMEOUT).await
 }
 
-/// [`connect`], with its first connection bounded by `timeout`.
+/// Opens the request pool of `carddemo-api`: [`connect`], with every check, setting and error
+/// of it, and each session the pool opens starts with `lock_timeout` [`LOCK_TIMEOUT`] (5
+/// seconds) and `statement_timeout` [`STATEMENT_TIMEOUT`] (10 seconds).
+///
+/// A request that waits for a row lock another transaction holds, such as the
+/// `SELECT … FOR UPDATE` of an account or a user, therefore waits at most 5 seconds, and any of
+/// its statements runs at most 10 seconds, before the server ends the statement with SQLSTATE
+/// `55P03` (`lock_not_available`) or `57014` (`query_canceled`). The server ends the wait
+/// itself, so the request's connection and the locks it holds are released even when nobody
+/// awaits the request any more. A service answers either failure as it answers any failed read
+/// or write, with the program's audited message once its transaction is rolled back.
+///
+/// The settings are server options of the startup packet, sent ahead of those `DATABASE_URL`
+/// names; no statement is issued. The server applies the last of repeated settings, so a
+/// `lock_timeout` or `statement_timeout` that `DATABASE_URL` sets, as
+/// `options[lock_timeout]=…` or `options[statement_timeout]=…` or inside its `options`
+/// parameter, prevails. Like every setting a client sends, both take precedence over a value
+/// set with `ALTER ROLE` or `ALTER DATABASE`.
+///
+/// `carddemo-mq`, `carddemo-batch` and `carddemo-migrate` use [`connect`], whose sessions keep
+/// the server's settings: the CP00 workers of two processes serialise the decisions for one
+/// account by waiting on its summary row lock for as long as the other process holds it (i10),
+/// a batch job's statements and lock waits last as long as its input requires, and a migration
+/// waits for the locks its DDL needs.
+///
+/// # Errors
+///
+/// Those of [`connect`]. A value that `DATABASE_URL` gives either setting and the server rejects
+/// is [`sqlx::Error::Database`].
+pub async fn connect_for_requests(config: &Config) -> Result<PgPool, sqlx::Error> {
+    connect_within(config, &REQUEST_SETTINGS, CONNECT_TIMEOUT).await
+}
+
+/// [`connect`], with `leading` sent ahead of the server options `DATABASE_URL` names (see
+/// [`connect_options`]) and the first connection bounded by `timeout`.
 ///
 /// The pool alone would retry a refused connection until its acquire timeout and then report
 /// only [`sqlx::Error::PoolTimedOut`], and would report a host that resolves to no address as
 /// an uncategorized I/O error. So one connection is made first, outside the pool, and its
 /// failure is returned as it happened: an elapsed `timeout` as [`io::ErrorKind::TimedOut`] and
-/// an unresolved host with [`HostNotResolved`] as its cause. The pool, with its default
-/// settings, is built only once that connection has succeeded.
-async fn connect_within(config: &Config, timeout: Duration) -> Result<PgPool, sqlx::Error> {
-    let options = connect_options(&config.database_url)?;
+/// an unresolved host with [`HostNotResolved`] as its cause. The pool, with [`pool_options`], is
+/// built only once that connection has succeeded.
+async fn connect_within(
+    config: &Config,
+    leading: &[ServerSetting],
+    timeout: Duration,
+) -> Result<PgPool, sqlx::Error> {
+    let options = connect_options(&config.database_url, leading)?;
     tokio::time::timeout(timeout, connect_once(&options))
         .await
         .map_err(|_| sqlx::Error::Io(io::ErrorKind::TimedOut.into()))??;
-    PgPoolOptions::new().connect_with(options).await
+    pool_options().connect_with(options).await
+}
+
+/// The settings of every pool opened here: those of `sqlx`, but an acquire timeout of
+/// [`ACQUIRE_TIMEOUT`].
+fn pool_options() -> PgPoolOptions {
+    PgPoolOptions::new().acquire_timeout(ACQUIRE_TIMEOUT)
 }
 
 /// Resolves the host that `options` name, unless they name a Unix-domain socket, then opens one
@@ -192,16 +287,18 @@ impl fmt::Display for HostNotResolved {
 
 impl StdError for HostNotResolved {}
 
-/// Parses `url` into connect options in which no setting comes from the environment.
+/// Parses `url` into connect options in which no setting comes from the environment, with the
+/// server settings `leading` ahead of those the URL names.
 ///
 /// [`check_query_parameters`] runs first, then [`UrlParts::of`]. The URL must name a host, a
 /// user and a password, and `PGOPTIONS` must name no server option ([`names_server_options`]),
 /// because `sqlx` takes each of these from the libpq environment, or the password from the
-/// pgpass file, when the URL omits it. Any parse error of `sqlx` becomes [`UrlError::Invalid`]:
-/// the `sqlx` text can quote a rejected value, such as an unknown `sslmode`. The port, the TLS
-/// mode, the database and the application name are then set explicitly wherever the URL leaves
-/// them to the environment.
-fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
+/// pgpass file, when the URL omits it. `sqlx` then parses the URL with `leading` added at the
+/// head of its query ([`with_leading_settings`]), and any parse error becomes
+/// [`UrlError::Invalid`]: the `sqlx` text can quote a rejected value, such as an unknown
+/// `sslmode`. The port, the TLS mode, the database and the application name are then set
+/// explicitly wherever the URL leaves them to the environment.
+fn connect_options(url: &str, leading: &[ServerSetting]) -> Result<PgConnectOptions, UrlError> {
     check_query_parameters(url)?;
     let parts = UrlParts::of(url)?;
     if !parts.names_host() {
@@ -223,7 +320,7 @@ fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
     {
         return Err(UrlError::EnvironmentOptions);
     }
-    let mut options = url
+    let mut options = with_leading_settings(url, leading)
         .parse::<PgConnectOptions>()
         .map_err(|_| UrlError::Invalid)?;
     if !parts.names_port() {
@@ -244,6 +341,45 @@ fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
         options = options.application_name("");
     }
     Ok(options)
+}
+
+/// `url` with each of `leading` as an `options[<name>]=<milliseconds>ms` query parameter at the
+/// head of its query, or `url` itself when `leading` is empty.
+///
+/// `sqlx` appends each `options` parameter to the server options in query order, after any that
+/// `PGOPTIONS` holds, so the settings of `leading` precede every one the URL names. The query is
+/// located as [`query_parameter_names`] locates it, the text after the first `?` that precedes
+/// the first `#`; a URL without one gains a query ahead of its fragment. Nothing outside the
+/// query changes, so `sqlx` reads every other part as [`UrlParts::of`] located it, and the
+/// checks made on `url` hold for the result.
+#[deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
+fn with_leading_settings<'a>(url: &'a str, leading: &[ServerSetting]) -> Cow<'a, str> {
+    if leading.is_empty() {
+        return Cow::Borrowed(url);
+    }
+    let settings = leading
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{OPTIONS_PREFIX}{name}{OPTIONS_SUFFIX}={}ms",
+                value.as_millis()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let (before_fragment, fragment) = match url.split_once('#') {
+        Some((head, fragment)) => (head, Some(fragment)),
+        None => (url, None),
+    };
+    let mut with_settings = match before_fragment.split_once('?') {
+        Some((head, query)) => format!("{head}?{settings}&{query}"),
+        None => format!("{before_fragment}?{settings}"),
+    };
+    if let Some(fragment) = fragment {
+        with_settings.push('#');
+        with_settings.push_str(fragment);
+    }
+    Cow::Owned(with_settings)
 }
 
 /// The parts of a connection URL that decide which settings it states, located as the URL
@@ -619,8 +755,9 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        CONNECT_TIMEOUT, ErrorSummary, HostNotResolved, RECOGNIZED_PARAMETERS, UrlError,
-        check_query_parameters, connect, connect_options, connect_within, names_server_options,
+        ACQUIRE_TIMEOUT, CONNECT_TIMEOUT, ErrorSummary, HostNotResolved, RECOGNIZED_PARAMETERS,
+        REQUEST_SETTINGS, ServerSetting, UrlError, check_query_parameters, connect,
+        connect_for_requests, connect_options, connect_within, names_server_options, pool_options,
     };
     use crate::config::Config;
     use crate::telemetry::json_layer;
@@ -662,6 +799,21 @@ mod tests {
     /// A `PGOPTIONS` of the ASCII whitespace that the server skips between options, which
     /// therefore names none.
     const BLANK_PGOPTIONS: &str = " \t\x0B ";
+    /// The server options that [`REQUEST_SETTINGS`] become: a 5-second `lock_timeout` and a
+    /// 10-second `statement_timeout`.
+    const REQUEST_DEADLINES: &str = "-c lock_timeout=5000ms -c statement_timeout=10000ms";
+    /// The server settings ahead of the URL's own, for [`connect`] and for
+    /// [`connect_for_requests`].
+    const LEADING: [&[ServerSetting]; 2] = [&[], &REQUEST_SETTINGS];
+
+    /// The public entry points, which make the same checks and connect the same way.
+    #[derive(Debug, Clone, Copy)]
+    enum Entry {
+        Connect,
+        ForRequests,
+    }
+
+    const ENTRIES: [Entry; 2] = [Entry::Connect, Entry::ForRequests];
 
     /// In-memory writer standing in for standard output.
     #[derive(Clone, Default)]
@@ -696,14 +848,17 @@ mod tests {
         }
     }
 
-    /// Runs [`connect`] on `url` and returns its result and everything it logged, as
+    /// Runs `entry` on `url` and returns its result and everything it logged, as
     /// [`logged_while`] records it.
-    async fn connect_captured(url: &str) -> (Result<PgPool, sqlx::Error>, String) {
+    async fn connect_captured(url: &str, entry: Entry) -> (Result<PgPool, sqlx::Error>, String) {
         let config = Config {
             database_url: url.to_owned(),
             ..Config::default()
         };
-        logged_while(connect(&config)).await
+        match entry {
+            Entry::Connect => logged_while(connect(&config)).await,
+            Entry::ForRequests => logged_while(connect_for_requests(&config)).await,
+        }
     }
 
     /// Awaits `future` and returns its output and everything logged meanwhile.
@@ -733,25 +888,30 @@ mod tests {
         }
     }
 
-    /// Asserts that [`connect`] refuses `url` for `reason` before any connection attempt,
-    /// without reading a pgpass file, and with none of `secrets` in its log, its error, the
-    /// error's `Debug` or its summary.
+    /// Asserts that [`connect`] and [`connect_for_requests`] each refuse `url` for `reason`
+    /// before any connection attempt, without reading a pgpass file, and with none of `secrets`
+    /// in the log, the error, the error's `Debug` or its summary.
     async fn assert_refused(url: &str, reason: UrlError, secrets: &[&str]) {
-        let (result, output) = connect_captured(url).await;
-        assert!(!output.contains(PGPASS_TARGET), "{output}");
-        let error = match result {
-            Err(error @ sqlx::Error::Configuration(_)) => error,
-            Err(other) => panic!("expected the configuration error {reason}, got {other}"),
-            Ok(_) => panic!("a URL refused for {reason} must not yield a pool"),
-        };
-        assert_eq!(
-            error.to_string(),
-            format!("error with configuration: {reason}")
-        );
-        let summary = ErrorSummary::from(&error).to_string();
-        assert_eq!(summary, format!("configuration: {reason}"));
-        for text in [error.to_string(), format!("{error:?}"), summary, output] {
-            assert_free_of(&text, secrets);
+        for entry in ENTRIES {
+            let (result, output) = connect_captured(url, entry).await;
+            assert!(!output.contains(PGPASS_TARGET), "{entry:?}: {output}");
+            let error = match result {
+                Err(error @ sqlx::Error::Configuration(_)) => error,
+                Err(other) => {
+                    panic!("{entry:?}: expected the configuration error {reason}, got {other}")
+                }
+                Ok(_) => panic!("{entry:?}: a URL refused for {reason} must not yield a pool"),
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("error with configuration: {reason}"),
+                "{entry:?}"
+            );
+            let summary = ErrorSummary::from(&error).to_string();
+            assert_eq!(summary, format!("configuration: {reason}"), "{entry:?}");
+            for text in [error.to_string(), format!("{error:?}"), summary, output] {
+                assert_free_of(&text, secrets);
+            }
         }
     }
 
@@ -797,7 +957,7 @@ mod tests {
 
     /// Asserts, for URLs that state some settings in the authority, some as query parameters and
     /// omit others, that every setting comes from the URL or from the explicit default, whatever
-    /// the libpq environment holds.
+    /// the libpq environment holds, with or without the request settings ahead of the URL's.
     fn assert_settings_come_from_the_url() {
         let settings = |host, port, user, database, ssl_mode, application_name| Settings {
             host,
@@ -849,12 +1009,15 @@ mod tests {
             ),
         ];
         for (url, expected) in cases {
-            let options = connect_options(url).unwrap_or_else(|reason| panic!("{url}: {reason}"));
-            assert_eq!(Settings::of(&options), expected, "{url}");
-            // `Debug` shows every option, the password and the certificate paths included.
-            let every_option = format!("{options:?}");
-            for (variable, value) in LIBPQ_ENVIRONMENT.into_iter().chain([PGPASSWORD]) {
-                assert!(!every_option.contains(value), "{url}: {variable} was read");
+            for leading in LEADING {
+                let options = connect_options(url, leading)
+                    .unwrap_or_else(|reason| panic!("{url}: {reason}"));
+                assert_eq!(Settings::of(&options), expected, "{url} {leading:?}");
+                // `Debug` shows every option, the password and the certificate paths included.
+                let every_option = format!("{options:?}");
+                for (variable, value) in LIBPQ_ENVIRONMENT.into_iter().chain([PGPASSWORD]) {
+                    assert!(!every_option.contains(value), "{url}: {variable} was read");
+                }
             }
         }
     }
@@ -941,15 +1104,20 @@ mod tests {
                 UrlError::Invalid,
             ),
         ];
-        for (query, reason) in refused {
+        for ((query, reason), entry) in refused
+            .iter()
+            .flat_map(|case| ENTRIES.map(|entry| (case, entry)))
+        {
             let url = format!("postgres://carddemo:{OTHER_SECRET}@127.0.0.1:5432/carddemo{query}");
-            let (result, output) = connect_captured(&url).await;
+            let (result, output) = connect_captured(&url, entry).await;
             assert!(!output.contains(SQLX_UNRECOGNIZED), "{output}");
             assert_free_of(&output, &[SECRET, OTHER_SECRET]);
             let error = match result {
                 Err(error @ sqlx::Error::Configuration(_)) => error,
-                Err(other) => panic!("expected a configuration error for {query}, got {other}"),
-                Ok(_) => panic!("{query} must not yield a pool"),
+                Err(other) => {
+                    panic!("{entry:?}: expected a configuration error for {query}, got {other}")
+                }
+                Ok(_) => panic!("{entry:?}: {query} must not yield a pool"),
             };
             assert_eq!(
                 error.to_string(),
@@ -967,28 +1135,31 @@ mod tests {
     async fn a_failed_connection_setup_logs_and_returns_no_credential() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
         let port = listener.local_addr().expect("listener address").port();
-        // The peer accepts and closes without answering, so the first connection fails on its
-        // first read. A refused, unresolved or silent server is the subject of
-        // `an_unreachable_server_is_reported_by_its_cause`.
-        let peer = thread::spawn(move || listener.accept().map(drop));
+        // The peer accepts and closes without answering, once per entry point, so each first
+        // connection fails on its first read. A refused, unresolved or silent server is the
+        // subject of `an_unreachable_server_is_reported_by_its_cause`.
+        let peer =
+            thread::spawn(move || ENTRIES.iter().try_for_each(|_| listener.accept().map(drop)));
         let url = format!(
             "postgres://carddemo:{SECRET}@127.0.0.1:{port}/carddemo\
              ?application_name=carddemo&password={OTHER_SECRET}"
         );
-        let (result, output) = connect_captured(&url).await;
-        let error = match result {
-            Err(error @ sqlx::Error::Io(_)) => error,
-            Err(other) => panic!("expected an I/O error, got {other}"),
-            Ok(_) => panic!("a peer that closes at once must not yield a pool"),
-        };
+        for entry in ENTRIES {
+            let (result, output) = connect_captured(&url, entry).await;
+            let error = match result {
+                Err(error @ sqlx::Error::Io(_)) => error,
+                Err(other) => panic!("{entry:?}: expected an I/O error, got {other}"),
+                Ok(_) => panic!("{entry:?}: a peer that closes at once must not yield a pool"),
+            };
+            let summary = ErrorSummary::from(&error).to_string();
+            assert!(summary.starts_with("io ("), "{entry:?}: {summary}");
+            for text in [error.to_string(), format!("{error:?}"), summary, output] {
+                assert_free_of(&text, &[SECRET, OTHER_SECRET]);
+            }
+        }
         peer.join()
             .expect("the peer thread ends")
-            .expect("the peer accepted the connection");
-        let summary = ErrorSummary::from(&error).to_string();
-        assert!(summary.starts_with("io ("), "{summary}");
-        for text in [error.to_string(), format!("{error:?}"), summary, output] {
-            assert_free_of(&text, &[SECRET, OTHER_SECRET]);
-        }
+            .expect("the peer accepted every connection");
     }
 
     #[test]
@@ -1255,6 +1426,46 @@ mod tests {
         assert_settings_come_from_the_url();
     }
 
+    /// The request settings precede every server option the URL names, in either form, so the
+    /// URL's own `lock_timeout` or `statement_timeout` is the one the server applies last; the
+    /// URL's other settings are those it gives without the request settings.
+    #[test]
+    fn request_sessions_carry_the_deadlines_ahead_of_the_urls_own() {
+        let cases = [
+            ("", None),
+            ("?", None),
+            ("?sslmode=disable&application_name=carddemo", None),
+            ("#options[lock_timeout]=1s", None),
+            ("?application_name=carddemo#?x", None),
+            ("?options[lock_timeout]=1s", Some("-c lock_timeout=1s")),
+            (
+                "?options[statement_timeout]=0&options[lock_timeout]=0",
+                Some("-c statement_timeout=0 -c lock_timeout=0"),
+            ),
+            (
+                "?options=-c%20statement_timeout%3D2s",
+                Some("-c statement_timeout=2s"),
+            ),
+            (
+                "?user=carddemo&options[search_path]=public#fragment",
+                Some("-c search_path=public"),
+            ),
+        ];
+        for (suffix, own) in cases {
+            let url = format!("postgres://carddemo:{SECRET}@db.local:6543/carddemo{suffix}");
+            let plain = connect_options(&url, &[]).unwrap_or_else(|reason| panic!("{reason}"));
+            let request = connect_options(&url, &REQUEST_SETTINGS)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            assert_eq!(plain.get_options(), own, "{suffix}");
+            let expected = own.map_or_else(
+                || REQUEST_DEADLINES.to_owned(),
+                |own| format!("{REQUEST_DEADLINES} {own}"),
+            );
+            assert_eq!(request.get_options(), Some(expected.as_str()), "{suffix}");
+            assert_eq!(Settings::of(&request), Settings::of(&plain), "{suffix}");
+        }
+    }
+
     #[test]
     fn only_whitespace_the_server_skips_names_no_server_option() {
         let cases = [
@@ -1379,9 +1590,15 @@ mod tests {
             }
             "pgoptions-blank" => {
                 let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
-                let options = connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"));
+                let options =
+                    connect_options(&url, &[]).unwrap_or_else(|reason| panic!("{reason}"));
                 // Only the whitespace, which the server skips, reaches it as server options.
                 assert_eq!(options.get_options(), Some(BLANK_PGOPTIONS));
+                // The request settings follow that whitespace.
+                let request = connect_options(&url, &REQUEST_SETTINGS)
+                    .unwrap_or_else(|reason| panic!("{reason}"));
+                let expected = format!("{BLANK_PGOPTIONS} {REQUEST_DEADLINES}");
+                assert_eq!(request.get_options(), Some(expected.as_str()));
             }
             other => panic!("unknown child mode {other}"),
         }
@@ -1395,13 +1612,17 @@ mod tests {
             .and_then(|listener| listener.local_addr())
             .expect("a free local port")
             .port();
-        // This peer accepts and never answers, reading until the client goes away.
+        // This peer accepts and never answers, reading until the client goes away, once for the
+        // sessions of each entry point.
         let silent = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
         let silent_port = silent.local_addr().expect("listener address").port();
         let peer = thread::spawn(move || {
-            silent
-                .accept()
-                .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
+            LEADING.iter().try_for_each(|_| {
+                silent
+                    .accept()
+                    .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
+                    .map(drop)
+            })
         });
         let cases = [
             (
@@ -1420,21 +1641,24 @@ mod tests {
                 "io (timed out)",
             ),
         ];
-        for (url, timeout, expected) in cases {
+        for ((url, timeout, expected), leading) in cases
+            .iter()
+            .flat_map(|case| LEADING.map(|leading| (case, leading)))
+        {
             let config = Config {
-                database_url: url,
+                database_url: url.clone(),
                 ..Config::default()
             };
             let started = Instant::now();
-            let (result, output) = logged_while(connect_within(&config, timeout)).await;
+            let (result, output) = logged_while(connect_within(&config, leading, *timeout)).await;
             let elapsed = started.elapsed();
             let error = match result {
                 Err(error @ sqlx::Error::Io(_)) => error,
-                Err(other) => panic!("expected {expected}, got {other}"),
+                Err(other) => panic!("expected {expected} with {leading:?}, got {other}"),
                 Ok(_) => panic!("an unreachable server must not yield a pool ({expected})"),
             };
             let summary = ErrorSummary::from(&error).to_string();
-            assert_eq!(summary, expected);
+            assert_eq!(summary, *expected, "{leading:?}");
             // Reported by the first connection, not after the pool's acquire timeout.
             assert!(elapsed < CONNECT_TIMEOUT / 2, "{expected} took {elapsed:?}");
             for text in [error.to_string(), format!("{error:?}"), summary, output] {
@@ -1444,5 +1668,45 @@ mod tests {
         peer.join()
             .expect("the peer thread ends")
             .expect("the peer read until the client went away");
+    }
+
+    /// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made
+    /// here so that no test macro expands into a lint suppression or an unchecked pin.
+    fn current_thread() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime builds")
+    }
+
+    /// A pool that finds no idle connection and a server that refuses every new one, as during
+    /// an outage, gives up after [`ACQUIRE_TIMEOUT`] rather than the 30 seconds of `sqlx`.
+    #[test]
+    fn a_pool_waits_for_a_connection_no_longer_than_the_acquire_timeout() {
+        current_thread().block_on(async {
+            assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(5));
+            assert_eq!(CONNECT_TIMEOUT, ACQUIRE_TIMEOUT);
+            let refused_port = TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free local port")
+                .port();
+            let url = format!("postgres://carddemo:{SECRET}@127.0.0.1:{refused_port}/carddemo");
+            let options = connect_options(&url, &REQUEST_SETTINGS)
+                .unwrap_or_else(|reason| panic!("{reason}"));
+            let pool = pool_options().connect_lazy_with(options);
+            assert_eq!(pool.options().get_acquire_timeout(), ACQUIRE_TIMEOUT);
+            let started = Instant::now();
+            let acquired = pool.acquire().await;
+            let waited = started.elapsed();
+            assert!(
+                matches!(acquired, Err(sqlx::Error::PoolTimedOut)),
+                "expected the pool to time out, got {:?}",
+                acquired.map(drop)
+            );
+            assert!(
+                ACQUIRE_TIMEOUT <= waited && waited < ACQUIRE_TIMEOUT * 2,
+                "the pool waited {waited:?}"
+            );
+        });
     }
 }

@@ -26,7 +26,8 @@
 //! The process exits non-zero on any failure it does not retry: a configuration or telemetry
 //! error as one line on standard error, since no subscriber exists yet; a signal-handler or
 //! database error, or the broker configuration error `messaging::run` returns, as one JSON
-//! `ERROR` event on standard output. No message names the connection URLs or any value they
+//! `ERROR` event on standard output. A connection failure names the variable that holds the URL,
+//! `DATABASE_URL` or `CARDDEMO_AMQP_URL`; no message names the connection URLs or any value they
 //! carry.
 
 use std::io;
@@ -88,7 +89,7 @@ async fn main() -> ExitCode {
             // Logged only as the value-free summary: the driver's own text can quote the
             // connection URL, password included.
             let error = runtime::db::ErrorSummary::from(&error);
-            tracing::error!(%error, "database connection failed");
+            tracing::error!(%error, "database connection failed (DATABASE_URL)");
             return ExitCode::FAILURE;
         }
     };

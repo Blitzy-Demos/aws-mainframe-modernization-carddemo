@@ -76,7 +76,7 @@ Every variable the code reads, with the value `.env.example` gives it:
 | `CARDDEMO_MQ_POLL_MS` | `250` (1 to 5000; a larger value is refused at startup) | messaging |
 | `CARDDEMO_API_BIND` | `127.0.0.1:8080` | api (listen address); the Vite dev server's `/api` proxy target |
 | `CARDDEMO_JWT_SECRET` | none in code; `.env.example` carries a local-only placeholder | api |
-| `CARDDEMO_JWT_TTL_SECONDS` | `3600` (a positive integer) | api |
+| `CARDDEMO_JWT_TTL_SECONDS` | `3600` (1 to 9223372036854775807, which is `i64::MAX`; a larger value is refused at startup) | api |
 | `CARDDEMO_VAR_DIR` | `./var` | batch (`dalyrejs/`, `systran/`, `reports/` under it); api, as the base of `CARDDEMO_INTRDR_DIR` when that is unset |
 | `CARDDEMO_STATEMENT_DIR` | `./var/statements/` | batch (`creastmt`) |
 | `CARDDEMO_INTRDR_DIR` | `./var/jobs/` (created by the first submission; a path that names something other than a directory is refused at startup) | api (the job decks of the report request, endpoint 14) |
@@ -144,7 +144,7 @@ With the stack up, the schema applied and `.env` exported:
 cargo run -p api --bin carddemo-api
 ```
 
-The server listens on `CARDDEMO_API_BIND` (default `127.0.0.1:8080`), serves the 27 operations under `/api/v1`, and serves its OpenAPI document at `GET /api-docs/openapi.json`. It writes JSON log events to standard output and stops gracefully on Ctrl-C or SIGTERM. It connects to PostgreSQL only; no online transaction sends a broker message.
+The server listens on `CARDDEMO_API_BIND` (default `127.0.0.1:8080`), serves the 27 operations under `/api/v1`, and serves its OpenAPI document at `GET /api-docs/openapi.json`. It writes JSON log events to standard output and stops gracefully on Ctrl-C or SIGTERM: the requests in flight get 8 seconds to finish and the server exits 0, or, when that deadline passes first, they are abandoned, an `ERROR` event says so and it exits 1, in either case within about 9 seconds of the signal. It connects to PostgreSQL only; no online transaction sends a broker message.
 
 After `dusrsecj` has loaded the users, sign on as `ADMIN001` (user type `A`, admin menu) or `USER0001` (user type `U`, main menu), both with the password `PASSWORD`, the local users of the root [README.md:203-204](../../README.md):
 

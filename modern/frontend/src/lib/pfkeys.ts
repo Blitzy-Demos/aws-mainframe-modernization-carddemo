@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 /**
  * Function keys of the 3270 key rows: ENTER and PF1–PF12 (AAP 0.3.5).
@@ -851,10 +851,11 @@ export interface PfKeyOptions {
  * An event the screen does not take is left untouched. All decisions are `resolvePfKey`'s.
  */
 export function usePfKeys(handlers: PfKeyHandlers, options: PfKeyOptions = {}): void {
-  // The latest arguments, read at keydown time: a re-render never re-binds the listener, and
-  // the listener never runs a stale handler.
+  // The arguments of the committed render, read at keydown time: a re-render never re-binds the
+  // listener. They are stored during the commit, before the browser paints or delivers another
+  // event, so a key always acts as the buttons now shown do and never runs a stale handler.
   const latest = useRef({ handlers, options });
-  useEffect(() => {
+  useLayoutEffect(() => {
     latest.current = { handlers, options };
   });
 

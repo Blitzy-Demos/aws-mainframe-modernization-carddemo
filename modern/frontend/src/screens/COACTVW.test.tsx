@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
@@ -15,9 +15,11 @@ import { COACTVW } from "./COACTVW";
  * by hand from those rows, never read from the screen.
  *
  * Not tagged here:
- * - COACTVW-001 to COACTVW-010 describe the header literals and values as `Label` and read-only
- *   `Input` elements, while `ScreenShell` renders them as text; their content rows (COACTVW-101 to
- *   COACTVW-106) and the absence of the unnamed (1,1) field (COACTVW-098) are proved instead.
+ * - The header literals COACTVW-001, COACTVW-004, COACTVW-006 and COACTVW-009, which NAV tags.
+ *   They and the header values COACTVW-002 to COACTVW-010 are described as `Label` and read-only
+ *   `Input` elements, as `ScreenShell` renders them; the value rows are tagged here on each
+ *   value's read-only `Input`, width, map `POS`, `LENGTH`, label and content, as are their content
+ *   rows (COACTVW-101 to COACTVW-106) and the absence of the unnamed (1,1) field (COACTVW-098).
  * - COACTVW-013 is a `both` row; its client half lives in src/schemas/COACTVW.test.ts.
  *
  * COACTVWC's blank, non-numeric and all-zero edits are `server` rows (COACTVWC-030, COACTVWC-031):
@@ -378,13 +380,25 @@ function field(name: string): HTMLInputElement {
   return input;
 }
 
-/** The text of the header value whose `data-field` is the BMS field `name`. */
-function headerValue(name: string): string {
-  const value = document.querySelector(`span[data-field="${name}"]`);
-  if (value === null) {
-    throw new Error(`no header value for BMS field ${name}`);
+/**
+ * The header field whose `data-field` is the BMS field `name`: the one `Input` of that name in the
+ * `CardHeader` title rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerField(name: string): HTMLInputElement {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [input] = fields;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`no header input for BMS field ${name}`);
   }
-  return value.textContent ?? "";
+  return input;
+}
+
+/** The value of the header field whose `data-field` is the BMS field `name`. */
+function headerValue(name: string): string {
+  return headerField(name).value;
 }
 
 /** The one message row of `kind` (MessageLine). */
@@ -450,6 +464,54 @@ function outputValues(): Record<string, string> {
 const NO_BLOCK: Record<string, string> = Object.fromEntries(
   OUTPUTS.map((output) => [output.name, ""]),
 );
+
+/** The screen's form, which holds the account number. */
+function accountForm(): HTMLFormElement {
+  const form = field("ACCTSID").form;
+  if (form === null) {
+    throw new Error("the account number belongs to no form");
+  }
+  return form;
+}
+
+/**
+ * The keyboard locked while a view is awaited, or open again: ENTER disabled, the key row and the
+ * form busy and the account number read-only. F3 sends no request and is available either way.
+ */
+function expectLocked(locked: boolean): void {
+  const keyRow = screen.getByRole("group", { name: "Function keys" });
+  expect({
+    enterDisabled: within(keyRow).getByRole("button", { name: "ENTER" }).hasAttribute("disabled"),
+    exitDisabled: within(keyRow).getByRole("button", { name: "F3=Exit" }).hasAttribute("disabled"),
+    keyRowBusy: keyRow.getAttribute("aria-busy"),
+    formBusy: accountForm().getAttribute("aria-busy"),
+    accountReadOnly: field("ACCTSID").readOnly,
+  }).toEqual({
+    enterDisabled: locked,
+    exitDisabled: false,
+    keyRowBusy: String(locked),
+    formBusy: String(locked),
+    accountReadOnly: locked,
+  });
+}
+
+/**
+ * Replaces `fetch` with a stub of endpoint 4 that holds each view until the test answers it.
+ * Returns the requests received and the answers still awaited, in order.
+ */
+function stubHeldFetch(): {
+  requests: ReturnType<typeof stubFetch>;
+  answers: ((response: Response) => void)[];
+} {
+  const answers: ((response: Response) => void)[] = [];
+  const requests = stubFetch(
+    () =>
+      new Promise<Response>((resolve) => {
+        answers.push(resolve);
+      }),
+  );
+  return { requests, answers };
+}
 
 /** The account-number field in the red of an error, or in its default colour. */
 function expectAccountColour(red: boolean): void {
@@ -660,6 +722,93 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     }
     expect(field("ACSADL2").getAttribute("aria-label")).toBe("Address line 2");
   });
+
+  it.each([
+    // audit: COACTVW-002
+    {
+      id: "COACTVW-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CAVW",
+    },
+    // audit: COACTVW-003
+    {
+      id: "COACTVW-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE01,
+    },
+    // audit: COACTVW-005
+    {
+      id: "COACTVW-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COACTVW-007
+    {
+      id: "COACTVW-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COACTVWC",
+    },
+    // audit: COACTVW-008
+    {
+      id: "COACTVW-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE02,
+    },
+    // audit: COACTVW-010
+    {
+      id: "COACTVW-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const requests = stubFetch();
+      renderScreen();
+
+      const value = headerField(name);
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(value);
+      expect(requests).toEqual([]);
+    },
+  );
 
   // audit: COACTVW-016
   // audit: COACTVW-019
@@ -934,16 +1083,87 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     );
     expect(field("ACCTSID").value).toBe("123");
     expectAccountColour(true);
+    // Nothing was sent, so the keyboard is not locked: the next full number is sent.
+    expectLocked(false);
+    typeAccount(OTHER_ACCOUNT);
+    pressEnterButton();
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expect(requests[1]?.path).toBe(`/api/v1/accounts/${OTHER_ACCOUNT}/view`);
   });
 
-  it("ignores ENTER while the previous view is awaited, as the terminal inhibits input", async () => {
-    const gate: { open?: (response: Response) => void } = {};
-    const requests = stubFetch(
-      () =>
-        new Promise<Response>((resolve) => {
-          gate.open = resolve;
-        }),
-    );
+  it("locks the keyboard while a view is awaited: only the first ENTER is sent, every key repeated before the answer is refused, and the next ENTER is sent", async () => {
+    const { requests, answers } = stubHeldFetch();
+    renderScreen();
+    expectLocked(false);
+
+    typeAccount(ACCOUNT);
+    const enter = screen.getByRole("button", { name: "ENTER" });
+    // Presses in one task, before the screen renders the lock: the button twice, the Enter key
+    // and a key COACTVWC processes as ENTER. The lock taken by the first refuses the others.
+    act(() => {
+      enter.click();
+      enter.click();
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+    });
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expectLocked(true);
+
+    // The same presses on the locked screen, and a submission of its form, send nothing.
+    pressEnterButton();
+    fireEvent.keyDown(window, { key: "Enter" });
+    fireEvent.keyDown(window, { key: "F5" });
+    fireEvent.submit(accountForm());
+    expectLocked(true);
+
+    act(() => {
+      answers[0]?.(json(200, view));
+    });
+    await waitFor(() => {
+      expect(field("ACSTSSN").value).toBe("***-**-1234");
+    });
+    await waitFor(() => {
+      expectLocked(false);
+    });
+
+    typeAccount(OTHER_ACCOUNT);
+    pressEnterButton();
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    expectLocked(true);
+    act(() => {
+      answers[1]?.(json(200, { ...view, acct_id: OTHER_ACCOUNT }));
+    });
+    await waitFor(() => {
+      expectLocked(false);
+    });
+
+    expect(requests.map((request) => [request.method, request.path])).toEqual([
+      ["GET", `/api/v1/accounts/${ACCOUNT}/view`],
+      ["GET", `/api/v1/accounts/${OTHER_ACCOUNT}/view`],
+    ]);
+  });
+
+  it.each([
+    {
+      label: "the F3=Exit button",
+      press: () => {
+        fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      },
+    },
+    {
+      label: "the F3 key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "F3" });
+      },
+    },
+  ])("$label stays available while a view is awaited and returns to the main menu", async ({ press }) => {
+    const { requests, answers } = stubHeldFetch();
     renderScreen();
 
     typeAccount(ACCOUNT);
@@ -951,12 +1171,13 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     await waitFor(() => {
       expect(requests).toHaveLength(1);
     });
-    pressEnterButton();
-    gate.open?.(json(200, view));
-    await waitFor(() => {
-      expect(field("ACSTSSN").value).toBe("***-**-1234");
-    });
+    expectLocked(true);
+    press();
 
+    expect(await screen.findByText("COMEN01 main menu stub")).toBeTruthy();
+    act(() => {
+      answers[0]?.(json(200, view));
+    });
     expect(requests).toHaveLength(1);
   });
 

@@ -277,7 +277,8 @@ function LabelCell({ row, col, span, text, htmlFor }: LabelCellProps): ReactNode
  *   message (COPAUS0C-004).
  *
  * While a request is outstanding the keyboard is locked, as the terminal's is, so every response
- * is applied to the state it was sent from. The cursor returns to the account field after every
+ * is applied to the state it was sent from: every key is disabled, F3 included, and the account
+ * and the selectors are read-only. The cursor returns to the account field after every
  * response (COPAUS0C-053). Nothing here logs or stores a response; the screen shows no card
  * number, and endpoint 21 returns none (COPAUS0C-055).
  */
@@ -315,6 +316,23 @@ export function COPAU00(): ReactNode {
   const [pageRead, setPageRead] = useState(false);
   const [message, setMessage] = useState<string>();
   const entered = useRef(false);
+  // Whether a read is outstanding, from the key that sends it to its answer. The ref decides at
+  // once; the state renders the locked keys and fields, which a key pressed before that render
+  // would pass.
+  const [pending, setPending] = useState(false);
+  const pendingRef = useRef(false);
+
+  /** Locks the keyboard for one read, from before its edits run. */
+  function lock(): void {
+    pendingRef.current = true;
+    setPending(true);
+  }
+
+  /** Unlocks the keyboard: the edits refused ENTER, a selection transferred, or a read answered. */
+  function unlock(): void {
+    pendingRef.current = false;
+    setPending(false);
+  }
 
   /** Shows `text` in the message row (none when `undefined`) and puts the cursor on the account. */
   function settle(text: string | undefined): void {
@@ -358,22 +376,25 @@ export function COPAU00(): ReactNode {
    */
   function readAccount(account: string, selectionMessage: string | undefined): void {
     setPaging((state) => ({ ...state, account, pageNum: 0, firstKeys: EMPTY_PAGING.firstKeys }));
-    summary.mutate(
-      { path: { acct_id: account }, query: {} },
-      {
-        onSuccess: (page) => {
-          form.setValue("acctId", page.acct_id);
-          setBlock(page.summary);
-          setErased(false);
-          showRows(page);
-          if (page.summary.summary_found) {
-            setPaging((state) => afterPageRead(state, page));
-          }
-          settle(selectionMessage);
+    lock();
+    void summary
+      .mutateAsync(
+        { path: { acct_id: account }, query: {} },
+        {
+          onSuccess: (page) => {
+            form.setValue("acctId", page.acct_id);
+            setBlock(page.summary);
+            setErased(false);
+            showRows(page);
+            if (page.summary.summary_found) {
+              setPaging((state) => afterPageRead(state, page));
+            }
+            settle(selectionMessage);
+          },
+          onError: fail,
         },
-        onError: fail,
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
   /**
@@ -385,17 +406,20 @@ export function COPAU00(): ReactNode {
     pageKey: string,
     direction: components["schemas"]["PageDirection"],
   ): void {
-    summary.mutate(
-      { path: { acct_id: account }, query: { page_key: pageKey, direction } },
-      {
-        onSuccess: (page) => {
-          showRows(page);
-          setPaging((state) => afterPageRead(state, page));
-          settle(undefined);
+    lock();
+    void summary
+      .mutateAsync(
+        { path: { acct_id: account }, query: { page_key: pageKey, direction } },
+        {
+          onSuccess: (page) => {
+            showRows(page);
+            setPaging((state) => afterPageRead(state, page));
+            settle(undefined);
+          },
+          onError: fail,
         },
-        onError: fail,
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
   useEffect(() => {
@@ -419,6 +443,7 @@ export function COPAU00(): ReactNode {
       const code = values.selections[row];
       if (code === "S" || code === "s") {
         // COPAUS0C-010: XCTL COPAUS1C with the account typed on this ENTER and the row's key.
+        unlock();
         navigate(PATHS.COPAU01, {
           state: { from: PATHS.COPAU00, acct_id: values.acctId, auth_key: key },
         });
@@ -436,6 +461,7 @@ export function COPAU00(): ReactNode {
    * page read stores it anew (COPAUS0C-039, COPAUS0C-046), so they are dropped here.
    */
   function onRejected(errors: FieldErrors<Copau00Values>): void {
+    unlock();
     if (errors.acctId !== undefined) {
       form.setValue("acctId", "");
       setPaging((state) => ({ ...state, pageNum: 0, firstKeys: EMPTY_PAGING.firstKeys }));
@@ -444,17 +470,28 @@ export function COPAU00(): ReactNode {
     settle(firstMessage(errors));
   }
 
+  /**
+   * ENTER, refused while a read is outstanding. The lock is taken before the edits, which
+   * `handleSubmit` runs asynchronously, and released at their refusal or failure, at a transfer,
+   * or at the read's answer.
+   */
   function onSubmit(event: FormEvent<HTMLFormElement>): void {
-    if (summary.isPending) {
+    if (pendingRef.current) {
       event.preventDefault();
       return;
     }
-    void form.handleSubmit(onEnter, onRejected)(event);
+    lock();
+    void form
+      .handleSubmit(onEnter, onRejected)(event)
+      .catch((error: unknown) => {
+        unlock();
+        throw error;
+      });
   }
 
   /** F3, COPAUS0C-003: XCTL COMEN01C with no request; the paging state is dropped. */
   function back(): void {
-    if (summary.isPending) {
+    if (pendingRef.current) {
       return;
     }
     navigate(PATHS.COMEN01, { state: { from: PATHS.COPAU00 } });
@@ -466,7 +503,7 @@ export function COPAU00(): ReactNode {
    * for that page number. The page read adds the 1 back (X-COPAUS0C-2, preserved).
    */
   function pageBackward(): void {
-    if (summary.isPending) {
+    if (pendingRef.current) {
       return;
     }
     form.clearErrors();
@@ -492,7 +529,7 @@ export function COPAU00(): ReactNode {
    * without a request there, which is not a parity result.
    */
   function pageForward(): void {
-    if (summary.isPending) {
+    if (pendingRef.current) {
       return;
     }
     form.clearErrors();
@@ -505,7 +542,7 @@ export function COPAU00(): ReactNode {
 
   /** COPAUS0C-004: an unserved key is refused; the map goes with `ERASE` and nothing is read. */
   function invalidKey(): void {
-    if (summary.isPending) {
+    if (pendingRef.current) {
       return;
     }
     form.clearErrors();
@@ -514,7 +551,11 @@ export function COPAU00(): ReactNode {
   }
 
   const actions: PfKeyHandlers = { F3: back, F7: pageBackward, F8: pageForward };
-  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: actions[item.key],
+    disabled: pending,
+  }));
 
   /** A block field the map does not declare `FSET`: blank after an erasing send. */
   const unsent = (value: string | undefined): string => (erased ? "" : (value ?? ""));
@@ -543,10 +584,11 @@ export function COPAU00(): ReactNode {
       formId={formId}
       message={{ text: message, kind: "error" }}
       keys={keys}
+      busy={pending}
       keyOptions={{ foldShifted: KEY_ROWS.COPAU00.foldShifted, onInvalidKey: invalidKey }}
     >
       <Form {...form}>
-        <form id={formId} noValidate aria-busy={summary.isPending} onSubmit={onSubmit}>
+        <form id={formId} noValidate aria-busy={pending} onSubmit={onSubmit}>
           <FieldGrid>
             <FormField
               control={form.control}
@@ -562,6 +604,7 @@ export function COPAU00(): ReactNode {
                       {/* COPAUS0C-053: the cursor starts, and stays, on the account field. */}
                       <Input
                         {...field}
+                        readOnly={pending}
                         maxLength={COPAU00_LENGTHS.acctId}
                         size={COPAU00_LENGTHS.acctId}
                         autoComplete="off"
@@ -728,7 +771,7 @@ export function COPAU00(): ReactNode {
                                     aria-label={`Select row ${index + 1}`}
                                     maxLength={COPAU00_LENGTHS.selection}
                                     autoComplete="off"
-                                    readOnly={isProtected}
+                                    readOnly={isProtected || pending}
                                     tabIndex={isProtected ? -1 : undefined}
                                     className="w-9"
                                   />

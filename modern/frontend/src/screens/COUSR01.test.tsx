@@ -247,9 +247,20 @@ function marks(): (string | null)[] {
   return inputs().map(markOf);
 }
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const found = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(found).toHaveLength(1);
+  const [box] = found;
+  if (!(box instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return box.value;
 }
 
 /**
@@ -258,13 +269,13 @@ function headerField(container: HTMLElement, name: string): string | null {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -295,9 +306,13 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.dataset.slot).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
@@ -305,9 +320,8 @@ function expectHeaderValues(
     expect(element.parentElement?.className).toBe(
       `row-start-${row} col-start-${col} col-span-${length}`,
     );
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -343,6 +357,57 @@ function lineColumns(form: HTMLFormElement, line: number): string[] {
 function expectNoNavigation(): void {
   expect(screen.getByRole("heading", { level: 1, name: "Add User" })).toBeTruthy();
   expect(screen.queryByText(/^Stub at /)).toBeNull();
+}
+
+/** The row-24 labels in map order (COUSR01-028). */
+const KEY_LABELS = ["ENTER=Add User", "F3=Back", "F4=Clear", "F12=Exit"];
+
+/**
+ * The keyboard lock the screen shows: the disabled row-24 buttons, the labels of the read-only
+ * inputs, and the `aria-busy` of the key row and of the form.
+ */
+function lockShown(): { disabled: string[]; readOnly: string[]; busy: (string | null)[] } {
+  return {
+    disabled: KEY_LABELS.filter((label) => key(label).hasAttribute("disabled")),
+    readOnly: Object.values(LABELS).filter((label) => inputFor(label).readOnly),
+    busy: [
+      screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),
+      formOf(inputFor(LABELS.firstName)).getAttribute("aria-busy"),
+    ],
+  };
+}
+
+/** An idle screen: every key acts, every input is editable, nothing is busy. */
+const UNLOCKED = { disabled: [], readOnly: [], busy: ["false", "false"] };
+
+/** An add in flight: every key but F3 refused, the five inputs read-only, busy. */
+const SENDING_LOCK = {
+  disabled: ["ENTER=Add User", "F4=Clear", "F12=Exit"],
+  readOnly: Object.values(LABELS),
+  busy: ["true", "true"],
+};
+
+/** Waits until the screen shows `lock`. */
+async function lockReaches(lock: ReturnType<typeof lockShown>): Promise<void> {
+  await waitFor(() => {
+    expect(lockShown()).toEqual(lock);
+  });
+}
+
+/** A held-back answer: `gate` settles once `open` is called. */
+function heldAnswer(): { readonly gate: Promise<void>; readonly open: () => void } {
+  const releases: (() => void)[] = [];
+  const gate = new Promise<void>((resolve) => {
+    releases.push(resolve);
+  });
+  return {
+    gate,
+    open: () => {
+      for (const release of releases) {
+        release();
+      }
+    },
+  };
 }
 
 describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
@@ -489,7 +554,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
   // audit: COUSR01-007
   // audit: COUSR01-008
   // audit: COUSR01-010
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", () => {
     // Only `Date` is faked, so the timers that React and TanStack Query use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
@@ -704,6 +769,74 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
     }
     await waitFor(() => {
       expect(messageRow("error").textContent).toBe("User ID already exist...");
+    });
+    expect(sent).toHaveLength(1);
+  });
+
+  // audit: COUSR01C-006
+  // audit: COUSR01C-022
+  it("an add in flight locks ENTER, F4, F12 and the inputs and sends one request; its answer unlocks the screen", async () => {
+    const answer = heldAnswer();
+    const { sent } = stubFetch({ status: 200, body: added, gate: answer.gate });
+    renderScreen();
+    expect(lockShown()).toEqual(UNLOCKED);
+
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+    await waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
+    await lockReaches(SENDING_LOCK);
+
+    // ENTER by its button, by the Enter key outside the form and by the form's submission; F4 and
+    // F12 by button and key; an unserved key. None acts while the answer is held back.
+    fireEvent.click(key("ENTER=Add User"));
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    fireEvent.submit(formOf(inputFor(LABELS.password)));
+    fireEvent.click(key("F4=Clear"));
+    fireEvent.keyDown(inputFor(LABELS.password), { key: "F4" });
+    fireEvent.click(key("F12=Exit"));
+    fireEvent.keyDown(inputFor(LABELS.password), { key: "F12" });
+    fireEvent.keyDown(inputFor(LABELS.password), { key: "F5" });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(sent).toHaveLength(1);
+    expect(values()).toEqual(inMapOrder(typed));
+    expect(messageRow("error").textContent).toBe("");
+    expectNoNavigation();
+
+    answer.open();
+    await waitFor(() => {
+      expect(messageRow("info").textContent).toBe(added.message);
+    });
+    await lockReaches(UNLOCKED);
+    expect(values()).toEqual(["", "", "", "", ""]);
+
+    // Answered, the keys act again: a later ENTER sends a second add.
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+    await waitFor(() => {
+      expect(sent).toHaveLength(2);
+    });
+    await lockReaches(UNLOCKED);
+  });
+
+  // audit: COUSR01C-007
+  it("F3 while the add is in flight stays enabled and returns to the admin menu", async () => {
+    const answer = heldAnswer();
+    const { sent } = stubFetch({ status: 200, body: added, gate: answer.gate });
+    renderScreen();
+
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+    await lockReaches(SENDING_LOCK);
+    fireEvent.click(key("F3=Back"));
+
+    expect(await screen.findByText(`Stub at ${PATHS.COADM01} null`)).toBeTruthy();
+    answer.open();
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(sent).toHaveLength(1);
   });

@@ -328,8 +328,9 @@ function optionNumber(index: number): string {
 /**
  * Asserts the header labels of `map` in the screen's `CardHeader`: each literal in BLUE
  * (`text-muted-foreground`) in the grid cell of its map `POS` and `LENGTH`, and, as rendered by
- * the browser, on the line of the value it labels and ending before it. The values themselves are
- * the transaction, the program, the date as `MM/DD/YY` and the time as `HH:MM:SS`.
+ * the browser, on the line of the value it labels and ending before it. The values themselves,
+ * read-only inputs, hold the transaction, the program, the date as `MM/DD/YY` and the time as
+ * `HH:MM:SS`.
  */
 async function expectHeader(page: Page, map: MapName): Promise<void> {
   const header = page.locator('[data-slot="card-header"]');
@@ -354,10 +355,10 @@ async function expectHeader(page: Page, map: MapName): Promise<void> {
       true,
     );
   }
-  await expect(header.locator('[data-field="TRNNAME"]')).toHaveText(TRANSACTION[map]);
-  await expect(header.locator('[data-field="PGMNAME"]')).toHaveText(SCREEN[map].program ?? "");
-  await expect(header.locator('[data-field="CURDATE"]')).toHaveText(/^\d{2}\/\d{2}\/\d{2}$/);
-  await expect(header.locator('[data-field="CURTIME"]')).toHaveText(/^\d{2}:\d{2}:\d{2}$/);
+  await expect(header.locator('[data-field="TRNNAME"]')).toHaveValue(TRANSACTION[map]);
+  await expect(header.locator('[data-field="PGMNAME"]')).toHaveValue(SCREEN[map].program ?? "");
+  await expect(header.locator('[data-field="CURDATE"]')).toHaveValue(/^\d{2}\/\d{2}\/\d{2}$/);
+  await expect(header.locator('[data-field="CURTIME"]')).toHaveValue(/^\d{2}:\d{2}:\d{2}$/);
 }
 
 /**

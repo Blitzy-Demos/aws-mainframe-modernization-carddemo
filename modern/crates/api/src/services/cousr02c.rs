@@ -18,19 +18,38 @@
 //!
 //! # Endpoint 19 (`update`)
 //!
-//! `UPDATE-USER-INFO` and `UPDATE-USER-SEC-FILE`, in one `PgTx`:
+//! `UPDATE-USER-INFO` and `UPDATE-USER-SEC-FILE`. The COBOL runs its change test against the
+//! row its `READ … UPDATE` holds. Here the change test's argon2id work runs while no
+//! transaction is open, against a basis read of the row, and the locked re-read then confirms
+//! that the row is still the one it was run against:
 //!
 //! 1. The empty-field edits, in the program's order, before any read (COUSR02C-018 to
 //!    COUSR02C-023).
-//! 2. The re-read `FOR UPDATE` of the path ID, which holds the row until the rewrite
-//!    (COUSR02C-024). No row or a failed read rolls back with the domain's answer, and nothing
-//!    is written (COUSR02C-025, halt candidate `X-COUSR02C-H1`).
-//! 3. The change test against the row as read now: names and type byte for byte, a supplied
-//!    password verified against the stored argon2id hash; nothing changed is `Please modify to
-//!    update ...` (COUSR02C-026 to COUSR02C-028).
-//! 4. The rewrite of the whole row: ID and `FILLER` as read, the request's names and type, and
+//! 2. An unlocked read of the path ID, the basis of the change test. No row is the domain's
+//!    answer to the re-read, and nothing is written (COUSR02C-025, halt candidate
+//!    `X-COUSR02C-H1`). A failed read is recovered by step 4's locked re-read, in a `PgTx` of
+//!    its own that rolls back as soon as the row is read, so that a store failure keeps the
+//!    answer of the COBOL's order, the locked read first: `ServiceError::Store` when the
+//!    transaction cannot begin, the domain's answer when the re-read finds no row or fails too
+//!    (COUSR02C-025). The row it read is then the basis.
+//! 3. The change test against the basis, in no transaction: names and type byte for byte, a
+//!    supplied password verified against the stored argon2id hash, and the new hash computed
+//!    when the password changed; nothing changed is `Please modify to update ...`
+//!    (COUSR02C-026 to COUSR02C-028). A refusal writes nothing, so it answers as of the basis
+//!    read and opens no transaction.
+//! 4. In one `PgTx`, the re-read `FOR UPDATE` of the path ID, which holds the row until the
+//!    rewrite (COUSR02C-024). No row or a failed read rolls back with the domain's answer
+//!    (COUSR02C-025). A row that differs from the basis, rewritten by another request in
+//!    between, rolls back and becomes the basis of the next attempt, from step 3. When the
+//!    row has changed before each of [`OPTIMISTIC_ATTEMPTS`] locks, the last one rolls back too
+//!    and the update answers as a failed rewrite, `Unable to Update User...` (COUSR02C-032),
+//!    with an `ERROR` event. The COBOL cannot reach that case, because its `READ … UPDATE`
+//!    holds the record from the change test to the `REWRITE`, so it adds no message. So every
+//!    rewrite is decided against the row its own transaction holds, and every refusal against
+//!    the row the last read or lock read.
+//! 5. The rewrite of the whole row: ID and `FILLER` as read, the request's names and type, and
 //!    a new hash only when the password changed, else the stored one (COUSR02C-029, `E27`).
-//! 5. Commit and `User <id> has been updated ...` (COUSR02C-029, COUSR02C-030); a rewrite that
+//! 6. Commit and `User <id> has been updated ...` (COUSR02C-029, COUSR02C-030); a rewrite that
 //!    finds no row (COUSR02C-031) or fails (COUSR02C-032) rolls back with its message.
 //!
 //! # Password (`E27`, Cardholder Data Redaction)
@@ -41,11 +60,15 @@
 //! and `Held`, neither of which this module formats, and no value of either is logged.
 //!
 //! argon2id costs milliseconds of CPU per call, so the change test and the hashing run on
-//! Tokio's blocking pool rather than on the thread that drives other requests. Their failures
-//! are logged once the task is awaited, on the request's own thread and span: a stored hash that
-//! cannot be verified, a new password that cannot be hashed, by the fixed class text of
-//! `PasswordError`, and a task that did not complete, by whether it panicked, never its payload.
-//! No event names the password, the hash or the user.
+//! Tokio's blocking pool, within the API's password-work budget (`crate::app::PasswordWork`),
+//! rather than on the thread that drives other requests; and they run only while no
+//! transaction is open, on every path, so that no pooled connection or row lock is held while
+//! they compute or wait for a worker. Their failures are logged once the task is awaited, on
+//! the request's own thread and span: a stored hash that cannot be verified, a new password that
+//! cannot be hashed, by the fixed class text of `PasswordError`, and a task that did not
+//! complete, by whether it panicked, never its payload. A test the full budget refuses is
+//! answered as a task that did not complete, a 500, and logged by the budget. No event names
+//! the password, the hash or the user.
 //!
 //! # Store failures
 //!
@@ -69,9 +92,8 @@ use domain::online::cousr02c::{
 use domain::password::{self, PasswordError};
 use domain::records::UserEntry;
 use persistence::{PersistenceError, PgTx, UserRepository};
-use tokio::task::JoinError;
 
-use crate::app::AppState;
+use crate::app::{AppState, PasswordWork, PasswordWorkError};
 use crate::auth::extract::AdminUser;
 use crate::dto::cousr02c::UserUpdateRequest;
 use crate::error::ServiceError;
@@ -88,6 +110,16 @@ const REWRITE_PARAGRAPH: &str = "UPDATE-USER-SEC-FILE";
 /// The paragraph of the change test, whose password compare the replacement runs as argon2id
 /// verification and hashing (COUSR02C-026 to COUSR02C-029, `E27`).
 const CHANGE_PARAGRAPH: &str = "UPDATE-USER-INFO";
+
+/// How many change tests endpoint 19 runs at most, each outside any transaction and each
+/// confirmed by one transaction's locked re-read (see "Endpoint 19" above). A basis goes stale
+/// only when another request rewrites the same user between the read and the lock, so the
+/// second attempt nearly always confirms. Four attempts bound what one update can cost under
+/// such contention to four change tests, as many argon2id runs as the update ever spent, and
+/// four confirming transactions, besides the one that recovers a failed unlocked read. When
+/// the row has changed before every one of them, the update answers `Unable to Update User...`
+/// rather than run a fifth.
+const OPTIMISTIC_ATTEMPTS: usize = 4;
 
 /// What both endpoints answer with when they do not succeed.
 type Refusal = ServiceError<UserMaintFailure>;
@@ -123,12 +155,13 @@ pub(crate) async fn fetch(
 /// # Errors
 ///
 /// - `ServiceError::Rule` with the domain's failure: an empty-field edit (400), `Please modify
-///   to update ...` (400), `User ID NOT found...` (404) from the re-read or the rewrite, and
-///   `Unable to lookup User...` or `Unable to Update User...` (500) when the re-read, the
-///   stored hash's verification or the rewrite fails.
-/// - `ServiceError::Store` when the transaction cannot begin, commit or roll back.
-/// - `ServiceError::Internal` when the new password cannot be hashed or the blocking task that
-///   runs argon2id does not complete.
+///   to update ...` (400), `User ID NOT found...` (404) from the read, the re-read or the
+///   rewrite, and `Unable to lookup User...` or `Unable to Update User...` (500) when the read,
+///   the re-read, the stored hash's verification or the rewrite fails, or, for `Unable to
+///   Update User...`, when the row changed before each of [`OPTIMISTIC_ATTEMPTS`] locks.
+/// - `ServiceError::Store` when a transaction cannot begin, commit or roll back.
+/// - `ServiceError::Internal` when the new password cannot be hashed, the password-work budget
+///   refuses the change test or the blocking task that runs argon2id does not complete.
 pub(crate) async fn update(
     state: &AppState,
     _admin: &AdminUser,
@@ -149,17 +182,82 @@ pub(crate) async fn update(
     };
     let update = rules::edit_update(user_id, &input).map_err(ServiceError::Rule)?;
 
-    let mut tx = state.store.begin().await?;
-    let looked = looked_up(UserRepository::lock_by_id(&mut tx, update.user_id()).await);
-    match looked {
-        Ok(entry) => rewrite(tx, update, Held::from(entry)).await,
-        Err(absent) => abandon(tx, reread_refusal(absent)).await,
+    let mut basis = basis_read(state, update.user_id()).await?;
+    let work = &state.password_work;
+    let mut attempts = 1;
+    loop {
+        // No transaction is open: the change test computes and waits for a worker holding no
+        // connection and no lock, and a refusal returns from here and writes nothing.
+        let entry = changed_entry(work, update.clone(), Held::from(basis.clone())).await?;
+        let mut tx = state.store.begin().await?;
+        let locked = match looked_up(UserRepository::lock_by_id(&mut tx, update.user_id()).await) {
+            Ok(locked) => locked,
+            Err(absent) => return abandon(tx, reread_refusal(absent)).await,
+        };
+        if locked == basis {
+            return rewritten(tx, &entry).await;
+        }
+        if attempts >= OPTIMISTIC_ATTEMPTS {
+            return abandon(tx, kept_changing()).await;
+        }
+        tx.rollback().await?;
+        basis = locked;
+        attempts += 1;
     }
 }
 
-/// The row the locked re-read holds, split as the change test and the rewrite take it: the
-/// stored view the domain compares with, and the hash and `FILLER` that the view leaves out and
-/// the rewrite keeps.
+/// The first basis of the change test: the unlocked read of `id` on a pooled connection, or,
+/// when that read fails, the locked re-read of a transaction that rolls back as soon as it has
+/// read the row, so that no transaction stays open into the change test (COUSR02C-024,
+/// COUSR02C-025).
+///
+/// The recovery keeps every answer of the COBOL's own order, which reads `UPDATE` first:
+/// `ServiceError::Store` when the transaction cannot begin or roll back, `User ID NOT
+/// found...` when the re-read finds no row and `Unable to lookup User...` when it fails too.
+///
+/// # Errors
+///
+/// As above; and `User ID NOT found...` when the unlocked read finds no row.
+async fn basis_read(state: &AppState, id: &PicX<8>) -> Result<UserEntry, Refusal> {
+    let mut store = state.store.clone();
+    match looked_up(UserRepository::find_by_id(&mut store, id).await) {
+        Ok(basis) => Ok(basis),
+        Err(UserRead::Error) => {
+            let mut tx = state.store.begin().await?;
+            match looked_up(UserRepository::lock_by_id(&mut tx, id).await) {
+                Ok(locked) => {
+                    tx.rollback().await?;
+                    Ok(locked)
+                }
+                Err(absent) => abandon(tx, reread_refusal(absent)).await,
+            }
+        }
+        Err(absent) => Err(reread_refusal(absent)),
+    }
+}
+
+/// The answer once the row has changed before each of [`OPTIMISTIC_ATTEMPTS`] locks: the
+/// rewrite's own failure, `Unable to Update User...` on `first_name` (COUSR02C-032), with one
+/// `ERROR` event, since the answer is a 500, that names the program, the paragraph and the
+/// bound, and no value of the request or the row.
+///
+/// The COBOL cannot reach this case: its `READ … UPDATE` holds the record from the change test
+/// to the `REWRITE`, so no other task rewrites it in between. The replacement runs the change
+/// test with no lock held, so another request can rewrite the row each time; the update then
+/// gives up without rewriting, as a rewrite that failed, and adds no message of its own.
+fn kept_changing() -> Refusal {
+    tracing::error!(
+        program = PROGRAM,
+        paragraph = REWRITE_PARAGRAPH,
+        attempts = OPTIMISTIC_ATTEMPTS,
+        "user row kept changing before its lock; answering Unable to Update User"
+    );
+    ServiceError::Rule(UserMaintFailure::update_failed())
+}
+
+/// The basis of a change test, the row read before it, split as the change test and the
+/// rewrite take it: the stored view the domain compares with, and the hash and `FILLER` that
+/// the view leaves out and the rewrite keeps.
 ///
 /// Neither `Debug` nor any other formatting exists, so the hash cannot be printed.
 struct Held {
@@ -198,8 +296,8 @@ fn looked_up(
     }
 }
 
-/// The domain's answer to a re-read that found no row or failed: `User ID NOT found...` or
-/// `Unable to lookup User...` (COUSR02C-025).
+/// The domain's answer to a read or re-read that found no row or failed: `User ID NOT
+/// found...` or `Unable to lookup User...` (COUSR02C-025).
 ///
 /// `rules::reread` returns a row only for `UserRead::Found`, which `looked_up` never yields as
 /// an absence, so that arm is the 500 of an inconsistent answer rather than a success.
@@ -207,18 +305,10 @@ fn reread_refusal(absent: UserRead<'_>) -> Refusal {
     rules::reread(absent).map_or_else(ServiceError::Rule, |_| ServiceError::Internal)
 }
 
-/// The change test, the rewrite and its outcome, inside the transaction that holds the row
-/// (COUSR02C-026 to COUSR02C-032). Commits only on the domain's success.
-async fn rewrite(
-    mut tx: PgTx<'static>,
-    update: ValidatedUpdate,
-    held: Held,
-) -> Result<String, Refusal> {
-    let entry = match changed_entry(update, held).await {
-        Ok(entry) => entry,
-        Err(refusal) => return abandon(tx, refusal).await,
-    };
-    let result = rewrite_result(UserRepository::update(&mut tx, &entry).await);
+/// The rewrite of `entry` and its outcome, inside the transaction that holds its row
+/// (COUSR02C-029 to COUSR02C-032). Commits only on the domain's success.
+async fn rewritten(mut tx: PgTx<'static>, entry: &UserEntry) -> Result<String, Refusal> {
+    let result = rewrite_result(UserRepository::update(&mut tx, entry).await);
     match rules::rewrite_outcome(&entry.id, result) {
         Ok(message) => {
             tx.commit().await?;
@@ -228,12 +318,16 @@ async fn rewrite(
     }
 }
 
-/// The row to rewrite, from the change test on Tokio's blocking pool, where argon2id verifies
-/// a supplied password and hashes a changed one; [`answered`] logs its failures once it is
-/// awaited.
-async fn changed_entry(update: ValidatedUpdate, held: Held) -> Result<UserEntry, Refusal> {
-    let joined = tokio::task::spawn_blocking(move || changed(&update, held)).await;
-    answered(joined)
+/// The row to rewrite, from the change test on Tokio's blocking pool within `work`, where
+/// argon2id verifies a supplied password and hashes a changed one; [`answered`] logs its
+/// failures once it is awaited. [`update`] awaits it only while no transaction is open.
+async fn changed_entry(
+    work: &PasswordWork,
+    update: ValidatedUpdate,
+    held: Held,
+) -> Result<UserEntry, Refusal> {
+    let computed = work.run(move || changed(&update, held)).await;
+    answered(computed)
 }
 
 /// Why the change test yields no row to rewrite.
@@ -246,17 +340,19 @@ enum Unchanged {
 }
 
 /// The change test's answer, on the thread that awaited its task: the row, the domain's
-/// refusal, or `ServiceError::Internal` when the new password cannot be hashed or the task did
-/// not complete.
+/// refusal, or `ServiceError::Internal` when the new password cannot be hashed, the
+/// password-work budget refused the test or its task did not complete.
 ///
 /// Each operational failure is logged here, once, rather than on the blocking pool, so that the
 /// event falls in the request's span, and as `ERROR`, since each answers a 500: the unverifiable
 /// stored hash with the program's own `Unable to lookup User...`; the hash failure, by the fixed
 /// class text of [`PasswordError`], and the task failure, by whether it panicked and never its
-/// payload, with the unaudited 500. A refusal for nothing modified is the user's input and logs
-/// nothing.
-fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<UserEntry, Refusal> {
-    match joined {
+/// payload, with the unaudited 500. A refusal by the full budget is logged by the budget itself,
+/// and a refusal for nothing modified is the user's input; neither logs here.
+fn answered(
+    computed: Result<Result<UserEntry, Unchanged>, PasswordWorkError>,
+) -> Result<UserEntry, Refusal> {
+    match computed {
         Ok(Ok(entry)) => Ok(entry),
         Ok(Err(Unchanged::Refused(failure))) => {
             // `rules::modified` refuses with a store-class failure only when the stored hash
@@ -279,11 +375,12 @@ fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<U
             );
             Err(ServiceError::Internal)
         }
-        Err(error) => {
+        Err(PasswordWorkError::Saturated) => Err(ServiceError::Internal),
+        Err(PasswordWorkError::Interrupted { panicked }) => {
             tracing::error!(
                 program = PROGRAM,
                 paragraph = CHANGE_PARAGRAPH,
-                panicked = error.is_panic(),
+                panicked,
                 "password task did not complete; answering 500"
             );
             Err(ServiceError::Internal)
@@ -291,9 +388,9 @@ fn answered(joined: Result<Result<UserEntry, Unchanged>, JoinError>) -> Result<U
     }
 }
 
-/// The change test against the held row and the row it yields: the request's names and type,
-/// the held ID's key and `FILLER`, and a new hash only for a changed password (COUSR02C-026 to
-/// COUSR02C-029, `E27`).
+/// The change test against the held row, its basis, and the row it yields: the request's names
+/// and type, the held ID's key and `FILLER`, and a new hash only for a changed password
+/// (COUSR02C-026 to COUSR02C-029, `E27`).
 ///
 /// It runs on the blocking pool and logs nothing: [`answered`] logs what it returns.
 fn changed(update: &ValidatedUpdate, held: Held) -> Result<UserEntry, Unchanged> {
@@ -354,6 +451,8 @@ mod tests {
     use std::error::Error as StdError;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use domain::SystemClock;
     use domain::copybook::PicX;
@@ -362,17 +461,30 @@ mod tests {
     use domain::password::{self, PasswordError};
     use domain::records::UserEntry;
     use persistence::{PersistenceError, PgStore, UserRepository};
-    use test_support::postgres::start_postgres;
+    use test_support::postgres::{PostgresGuard, start_postgres};
     use test_support::trace_capture;
 
-    use super::{Unchanged, answered, fetch, reread_refusal, rewrite_result, update};
-    use crate::app::AppState;
+    use super::{
+        OPTIMISTIC_ATTEMPTS, Refusal, Unchanged, answered, fetch, reread_refusal, rewrite_result,
+        update,
+    };
+    use crate::app::worker_hold::{WorkerHold, until_saturated};
+    use crate::app::{AppState, PasswordWork, PasswordWorkError};
     use crate::auth::extract::{AdminUser, SignedOnUser};
     use crate::auth::jwt::JwtKeys;
     use crate::dto::cousr02c::UserUpdateRequest;
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A failure as the response shows it: message, field name and HTTP status.
     type Shown = (&'static str, &'static str, u16);
@@ -386,8 +498,25 @@ mod tests {
     /// The synthetic password the update tests submit.
     const NEW_PASSWORD: &str = "NEWPW123";
 
+    /// The synthetic password another admin stores while an update is in progress.
+    const OTHER_PASSWORD: &str = "OTHERPW1";
+
+    /// How long a test lets an update or a wait run before it counts it as stuck, as behind a
+    /// row lock that is never released.
+    const STUCK: Duration = Duration::from_secs(60);
+
     /// The `FILLER` every seeded row holds, so a rewrite that loses it shows.
     const FILLER: [u8; 23] = [b'Z'; 23];
+
+    /// The `lock_timeout` of every session of an [`own_store`]: a free row is locked at once, so
+    /// a lock wait the server ends after this long, SQLSTATE `55P03`, shows a row held by
+    /// another transaction.
+    const LOCK_TIMEOUT: &str = "1s";
+
+    /// How long the first connection of an [`own_store`] that withholds it keeps its statement
+    /// waiting before the pool gives up, as the database unavailable. Every later connection
+    /// is ordinary and opens well within it.
+    const WITHHELD: Duration = Duration::from_secs(2);
 
     /// The audited answers, written out apart from the domain's constants.
     const NOT_FOUND: Shown = ("User ID NOT found...", "user_id", 404);
@@ -435,6 +564,50 @@ mod tests {
         )
     }
 
+    /// A store on `guard`'s database with a pool of its own, whose every session ends a lock
+    /// wait after [`LOCK_TIMEOUT`].
+    ///
+    /// With `withhold_first`, the pool's first connection never becomes usable, so the first
+    /// statement through the store fails as the database unavailable once its acquire has
+    /// waited [`WITHHELD`], and every later statement runs on an ordinary connection. For
+    /// endpoint 19 that makes the unlocked read fail and the reads after it succeed, with no
+    /// hook in the service or the store.
+    fn own_store(guard: &PostgresGuard, withhold_first: bool) -> PgStore {
+        let pool = guard.pool();
+        let connect = pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .options([("lock_timeout", LOCK_TIMEOUT)]);
+        let mut options = pool.options().clone().min_connections(0);
+        if withhold_first {
+            let first = AtomicBool::new(true);
+            options = options
+                .acquire_timeout(WITHHELD)
+                .after_connect(move |_connection, _meta| {
+                    let withhold = first.swap(false, Ordering::SeqCst);
+                    Box::pin(async move {
+                        if withhold {
+                            std::future::pending::<()>().await;
+                        }
+                        Ok(())
+                    })
+                });
+        }
+        PgStore::new(options.connect_lazy_with(connect))
+    }
+
+    /// Locks `id` in a transaction of `store` and rolls it back, failing when the row is held
+    /// elsewhere for longer than the store's lock wait.
+    async fn locks_at_once(store: &PgStore, id: &PicX<8>) -> TestResult {
+        let mut tx = store.begin().await?;
+        UserRepository::lock_by_id(&mut tx, id)
+            .await?
+            .ok_or("no row to lock")?;
+        tx.rollback().await?;
+        Ok(())
+    }
+
     fn admin() -> Result<AdminUser, Box<dyn StdError>> {
         Ok(AdminUser(SignedOnUser {
             user_id: PicX::from_text("ADMIN001")?,
@@ -461,6 +634,30 @@ mod tests {
             )),
             _ => None,
         }
+    }
+
+    /// Endpoint 19 for `body` on `USER0001`, with `meanwhile` run while its first change test
+    /// waits for a worker: after the update's basis read and before its transaction begins.
+    ///
+    /// `state`'s budget must have one worker and one waiting place. A held computation keeps
+    /// the worker, so the update's change test waits in the place, which it takes only after its
+    /// read; `meanwhile` runs once every place is taken, and the worker is then released.
+    async fn interleaved_update(
+        state: &AppState,
+        body: UserUpdateRequest,
+        meanwhile: impl Future<Output = TestResult>,
+    ) -> Result<Result<String, Refusal>, Box<dyn StdError>> {
+        let admin = admin()?;
+        let hold = WorkerHold::start(&state.password_work).await?;
+        let interleaved = async {
+            tokio::time::timeout(STUCK, until_saturated(&state.password_work)).await??;
+            meanwhile.await?;
+            hold.release().await
+        };
+        let (outcome, released) =
+            tokio::join!(update(state, &admin, "USER0001", body), interleaved);
+        assert!(released?, "the held computation was not released");
+        Ok(outcome)
     }
 
     #[tokio::test]
@@ -664,7 +861,7 @@ mod tests {
             &entry("BADHASH1", "not-a-phc-string".to_owned())?,
         )
         .await?;
-        let state = app_state(store.clone());
+        let state = app_state(store.clone()).with_password_work(PasswordWork::new(1, 1));
         let admin = admin()?;
         let traces = trace_capture::capture();
         let before = stored(&store, "USER0001").await?;
@@ -690,7 +887,18 @@ mod tests {
         );
         assert!(traces.contains("stored password hash could not be verified"));
 
-        store.pool().close().await;
+        // The store goes away after the read and before the transaction, which then cannot
+        // begin: that has no audited text.
+        let outcome = interleaved_update(&state, request("A", "B", None, "U"), async {
+            store.pool().close().await;
+            Ok(())
+        })
+        .await?;
+        assert_eq!(
+            outcome,
+            Err(ServiceError::Store(PersistenceError::Unavailable))
+        );
+
         // audit: COUSR02C-016
         // audit: COUSR03C-014
         assert_eq!(
@@ -715,14 +923,305 @@ mod tests {
         Ok(())
     }
 
+    /// Another admin rewrites the row after the update's unlocked read: the lock finds a row
+    /// other than the basis, so the change test runs again against that row, and the rewrite is
+    /// the request's change to that row, its hash and `FILLER` kept.
+    #[test]
+    fn a_row_rewritten_before_the_lock_is_tested_again_as_it_now_is() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            let state = app_state(store.clone()).with_password_work(PasswordWork::new(1, 1));
+            let original = stored(&store, "USER0001").await?;
+            let larry = PicX::from_text("LARRY")?;
+
+            let cases = [
+                // A new password and `FILLER`: the rename lands on that row.
+                (
+                    UserEntry {
+                        password_hash: password::hash(password_bytes(OTHER_PASSWORD)?)?,
+                        filler: PicX::from_array([b'Y'; 23]),
+                        ..original.clone()
+                    },
+                    Ok("User USER0001 has been updated ..."),
+                ),
+                // The very rename this request makes: against that row nothing is modified.
+                (
+                    UserEntry {
+                        fname: larry.clone(),
+                        ..original.clone()
+                    },
+                    Err(NOT_MODIFIED),
+                ),
+            ];
+            for (theirs, expected) in cases {
+                assert!(UserRepository::update(&mut store, &original).await?);
+                let mut other = store.clone();
+                let written = theirs.clone();
+                let body = request("LARRY", "THOMAS", None, "U");
+                let outcome = interleaved_update(&state, body, async move {
+                    assert!(UserRepository::update(&mut other, &written).await?);
+                    Ok(())
+                })
+                .await?;
+
+                let answer = match &outcome {
+                    Ok(message) => Ok(message.as_str()),
+                    Err(_) => Err(shown(&outcome)),
+                };
+                assert_eq!(answer, expected.map_err(Some));
+                let after = stored(&store, "USER0001").await?;
+                assert_eq!(
+                    after,
+                    UserEntry {
+                        fname: larry.clone(),
+                        ..theirs
+                    }
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// The unlocked read fails, so the update recovers its basis by the locked re-read of a
+    /// transaction it rolls back at once: while the change test then waits for a worker, the row
+    /// is free for another transaction to lock, and the rewrite lands afterwards. The recovery
+    /// keeps the answers of the COBOL's order, the locked read first: nothing modified against
+    /// the row it read, no row under the key, and a re-read that fails too, here a lock wait the
+    /// server ends while another transaction holds the row; none of them writes. A transaction
+    /// that cannot begin is `ServiceError::Store`, which the closed pool of
+    /// `store_failures_answer_with_the_programs_messages_and_trace_no_value` shows.
+    #[test]
+    fn a_failed_unlocked_read_is_recovered_by_a_lock_released_before_the_change_test() -> TestResult
+    {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            let other = own_store(&guard, false);
+            let key = PicX::from_text("USER0001")?;
+            let admin = admin()?;
+            let traces = trace_capture::capture();
+
+            let state =
+                app_state(own_store(&guard, true)).with_password_work(PasswordWork::new(1, 1));
+            let body = request("LARRY", "THOMAS", None, "U");
+            let outcome = interleaved_update(&state, body, locks_at_once(&other, &key)).await?;
+            assert_eq!(outcome, Ok("User USER0001 has been updated ...".to_owned()));
+            assert!(
+                traces.contains("READ-USER-SEC-FILE"),
+                "the unlocked read did not fail"
+            );
+            let renamed = stored(&store, "USER0001").await?;
+            assert_eq!(
+                (&renamed.fname, &renamed.filler),
+                (&PicX::from_text("LARRY")?, &PicX::from_array(FILLER))
+            );
+
+            let cases = [
+                (
+                    "USER0001",
+                    request("LARRY", "THOMAS", None, "U"),
+                    false,
+                    NOT_MODIFIED,
+                ),
+                (
+                    "NOBODY01",
+                    request("ANN", "LEE", None, "U"),
+                    false,
+                    NOT_FOUND,
+                ),
+                (
+                    "USER0001",
+                    request("ANN", "LEE", None, "U"),
+                    true,
+                    LOOKUP_FAILED,
+                ),
+            ];
+            for (user_id, body, held, expected) in cases {
+                let state = app_state(own_store(&guard, true));
+                let mut holder = store.begin().await?;
+                if held {
+                    UserRepository::lock_by_id(&mut holder, &key)
+                        .await?
+                        .ok_or("no row to lock")?;
+                }
+                let outcome =
+                    tokio::time::timeout(STUCK, update(&state, &admin, user_id, body)).await?;
+                holder.rollback().await?;
+                assert_eq!(shown(&outcome), Some(expected), "{user_id} held: {held}");
+            }
+            assert_eq!(stored(&store, "USER0001").await?, renamed);
+            Ok(())
+        })
+    }
+
+    /// Another admin rewrites the row while each change test waits for a worker, so every lock
+    /// finds a row other than its basis. After [`OPTIMISTIC_ATTEMPTS`] change tests the update
+    /// rolls back and answers as a failed rewrite, `Unable to Update User...`, with one event
+    /// that holds no value: the row is as the other admin left it, and at every wait the other
+    /// admin locks it at once, since the update holds no lock while its change test waits.
+    #[test]
+    fn a_row_that_keeps_changing_is_refused_after_the_bounded_attempts() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            let state = app_state(store.clone()).with_password_work(PasswordWork::new(1, 1));
+            let work = &state.password_work;
+            let other = own_store(&guard, false);
+            let key = PicX::from_text("USER0001")?;
+            let admin = admin()?;
+            let traces = trace_capture::capture();
+
+            let first = WorkerHold::start(work).await?;
+            let other_admin = async {
+                let mut worker = Some(first);
+                let mut last = None;
+                for attempt in 1..=OPTIMISTIC_ATTEMPTS {
+                    tokio::time::timeout(STUCK, until_saturated(work)).await??;
+                    // The lock is granted within the store's lock wait, or this read fails with
+                    // `55P03`: the waiting update holds none.
+                    let mut tx = other.begin().await?;
+                    let row = UserRepository::lock_by_id(&mut tx, &key)
+                        .await?
+                        .ok_or("no row to lock")?;
+                    let theirs = UserEntry {
+                        filler: PicX::from_text(&format!("OTHER ADMIN {attempt}"))?,
+                        ..row
+                    };
+                    assert!(UserRepository::update(&mut tx, &theirs).await?);
+                    tx.commit().await?;
+                    last = Some(theirs);
+                    // The waiting change test takes the worker; the next one waits behind a new
+                    // hold, which runs once this change test has returned.
+                    let hold = worker.take().ok_or("no held worker")?;
+                    assert!(
+                        hold.release().await?,
+                        "the held computation was not released"
+                    );
+                    if attempt < OPTIMISTIC_ATTEMPTS {
+                        worker = Some(WorkerHold::start(work).await?);
+                    }
+                }
+                last.ok_or_else(|| Box::<dyn StdError>::from("no attempt ran"))
+            };
+            let body = request("LARRY", "THOMAS", None, "U");
+            let (outcome, theirs) =
+                tokio::join!(update(&state, &admin, "USER0001", body), other_admin);
+
+            assert_eq!(
+                shown(&outcome),
+                Some(("Unable to Update User...", "first_name", 500))
+            );
+            assert_eq!(stored(&store, "USER0001").await?, theirs?);
+            let logged: Vec<String> = traces
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains("kept changing"))
+                .collect();
+            let [line] = logged.as_slice() else {
+                return Err(format!("{} events: {}", logged.len(), traces.text()).into());
+            };
+            let attempts = format!(r#""attempts":{OPTIMISTIC_ATTEMPTS}"#);
+            for part in [
+                r#""level":"ERROR""#,
+                r#""program":"COUSR02C""#,
+                r#""paragraph":"UPDATE-USER-SEC-FILE""#,
+                attempts.as_str(),
+            ] {
+                assert!(line.contains(part), "{part} missing from {line}");
+            }
+            for value in ["USER0001", "LARRY", "LAWRENCE", "OTHER ADMIN", "$argon2id$"] {
+                assert!(!line.contains(value), "the event holds {value}");
+            }
+            assert!(!traces.contains("$argon2id$"), "the trace holds a hash");
+            Ok(())
+        })
+    }
+
+    /// A refusal the change test decides opens no transaction, so it answers while another
+    /// transaction holds the row `FOR UPDATE`, which any locked re-read would wait for.
+    #[test]
+    fn refusals_answer_without_the_row_lock_and_write_nothing() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            UserRepository::insert(
+                &mut store,
+                &entry("BADHASH1", "not-a-phc-string".to_owned())?,
+            )
+            .await?;
+            let state = app_state(store.clone());
+            let full = app_state(store.clone()).with_password_work(PasswordWork::new(1, 0));
+            let admin = admin()?;
+            let before = [
+                stored(&store, "USER0001").await?,
+                stored(&store, "BADHASH1").await?,
+            ];
+
+            let mut holder = store.begin().await?;
+            for id in ["USER0001", "BADHASH1"] {
+                UserRepository::lock_by_id(&mut holder, &PicX::from_text(id)?)
+                    .await?
+                    .ok_or("no row to lock")?;
+            }
+            let hold = WorkerHold::start(&full.password_work).await?;
+            let cases = [
+                // Nothing modified, with and without the stored password.
+                (
+                    &state,
+                    "USER0001",
+                    request("LAWRENCE", "THOMAS", None, "U"),
+                    Some(NOT_MODIFIED),
+                ),
+                (
+                    &state,
+                    "USER0001",
+                    request("LAWRENCE", "THOMAS", Some(STORED_PASSWORD), "U"),
+                    Some(NOT_MODIFIED),
+                ),
+                // A stored hash that cannot be verified (`X-COUSR02C-4`).
+                (
+                    &state,
+                    "BADHASH1",
+                    request("LAWRENCE", "THOMAS", Some(NEW_PASSWORD), "U"),
+                    Some(LOOKUP_FAILED),
+                ),
+                // A change the full budget refuses: the 500 of a test that cannot finish.
+                (
+                    &full,
+                    "USER0001",
+                    request("LARRY", "THOMAS", None, "U"),
+                    None,
+                ),
+            ];
+            for (state, user_id, body, expected) in cases {
+                let outcome =
+                    tokio::time::timeout(STUCK, update(state, &admin, user_id, body)).await?;
+                assert_eq!(shown(&outcome), expected, "{user_id}");
+                if expected.is_none() {
+                    assert_eq!(outcome, Err(ServiceError::Internal));
+                }
+            }
+            assert!(hold.release().await?);
+            holder.rollback().await?;
+            let after = [
+                stored(&store, "USER0001").await?,
+                stored(&store, "BADHASH1").await?,
+            ];
+            assert_eq!(after, before);
+            Ok(())
+        })
+    }
+
     /// The change test's failures are logged once, after the task is awaited, with their class
     /// and never a value, and keep their answers: the unverifiable stored hash its `Unable to
     /// lookup User...` (`X-COUSR02C-4`), the hash and task failures their 500.
     #[tokio::test]
     async fn change_test_failures_are_logged_once_and_keep_their_answers() -> TestResult {
-        let task = tokio::spawn(std::future::pending::<()>());
-        task.abort();
-        let cancelled = task.await.err().ok_or("an aborted task completed")?;
         let unverified = rules::read(UserRead::Error)
             .err()
             .ok_or("a failed read gave a view")?;
@@ -733,9 +1232,15 @@ mod tests {
         let traces = trace_capture::capture();
         let cases = [
             (
-                Err(cancelled),
+                Err(PasswordWorkError::Interrupted { panicked: false }),
                 Err(ServiceError::Internal),
                 Some(("ERROR", r#""panicked":false"#)),
+            ),
+            // The full budget has logged its own refusal.
+            (
+                Err(PasswordWorkError::Saturated),
+                Err(ServiceError::Internal),
+                None,
             ),
             (
                 Ok(Err(Unchanged::NotHashed(PasswordError::Hash))),
@@ -754,9 +1259,9 @@ mod tests {
             ),
             (Ok(Ok(row.clone())), Ok(row), None),
         ];
-        for (joined, expected, logged) in cases {
+        for (computed, expected, logged) in cases {
             traces.clear();
-            let answer = answered(joined);
+            let answer = answered(computed);
             assert!(answer == expected, "{logged:?}");
             let lines = traces.lines();
             match logged {

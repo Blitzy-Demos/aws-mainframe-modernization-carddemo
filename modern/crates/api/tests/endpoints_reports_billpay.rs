@@ -17,6 +17,21 @@
 //! - Every response body is kept and searched for the 50 fixture card numbers, which no body of
 //!   either endpoint may hold (Cardholder Data Redaction). The deck files are read from disk and
 //!   never served.
+//! - An account read that fails at once, whatever the confirmation (COBIL00C-015, beside the
+//!   lock waits below), and the outcomes a running database cannot raise once that read holds
+//!   its lock, a failed payment insert or balance rewrite (COBIL00C-030, COBIL00C-033) and a
+//!   rewrite that matches no row (COBIL00C-032), come from a [`Script`] installed with
+//!   `PgStore::with_probe` on the store of the request's state. At each probe point it names, the
+//!   store skips the statement, sending no SQL, and fails with the scripted error or answers as
+//!   when no row has the key; every other statement runs against the database. The script counts
+//!   the calls at the lock, the insert and the rewrite, and each test asserts them, so the
+//!   scripted statement is shown reached exactly once. Effects are read back through an unprobed
+//!   store over the same pool.
+//! - The deadlines of the pool `carddemo-api` serves requests from,
+//!   `runtime::db::connect_for_requests` on the container's URL, are proved over that pool: an
+//!   account read that waits for the row lock a transaction of the test holds, ended by the
+//!   server's `lock_timeout` or `statement_timeout`, is COBIL00C-015's failed read, and once the
+//!   container is removed a payment answers within the pool's acquire timeout.
 //!
 //! # Halts
 //!
@@ -28,18 +43,10 @@
 //! - A payment against an empty `transactions` table is halt candidate X-COBIL00C-H3, so each
 //!   payment test first inserts the first record of `dailytran.txt` and expects the next ID above
 //!   it, never the end-of-file ID `0000000000000001`.
-//!
-//! # Rows not proved here
-//!
-//! - COBIL00C-015, COBIL00C-030 and COBIL00C-033 need the account read, the payment insert
-//!   (other than a duplicate) or the balance rewrite to fail, and COBIL00C-032 a rewrite that
-//!   matches no row, which the read's row lock prevents. `AppState` holds a concrete `PgStore`,
-//!   so no failing store can be injected, and no fixture state makes the database refuse those
-//!   statements; `domain::online::cobil00c`'s unit tests and `crates/domain/tests/online_rules.rs`
-//!   prove their messages and statuses.
-//! - COBIL00C-022 needs a second cross-reference for one account, a record type outside this
-//!   file's dependencies. Apart from its halted card number, its effects are those COBIL00C-021
-//!   proves here.
+//! - What the COBOL runs after the screen of a failed account read (X-COBIL00C-H1) and the card
+//!   number a payment writes with no cross-reference or after `DUPKEY` (X-COBIL00C-H2) are not
+//!   asserted: COBIL00C-015, COBIL00C-021 and COBIL00C-022 assert every other effect, and the
+//!   `blocked_*` tests report those parts.
 
 use std::cell::RefCell;
 use std::error::Error;
@@ -47,10 +54,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use api::app::{AppState, app, check_intrdr_dir};
 use api::dto::{FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE};
+use api::error::UNABLE_TO_PROCESS;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -61,9 +70,17 @@ use domain::clock::{Clock, FixedClock};
 use domain::copybook::{FixedRecord, PicU, PicX, TsForm};
 use domain::money::{Decimal, Money};
 use domain::records::account::AccountRecord;
+use domain::records::card_xref::CardXrefRecord;
 use domain::records::transaction::TransactionRecord;
-use persistence::{AccountRepository, PgStore, TransactionRepository};
+use domain::sensitive::CardNumber;
+use persistence::{
+    AccountRepository, CardXrefRepository, PersistenceError, PgStore, ProbeCall, ProbePoint,
+    ProbeVerdict, RepositoryProbe, TransactionRepository,
+};
 use runtime::config::Config;
+use runtime::db::{
+    ACQUIRE_TIMEOUT, ErrorSummary, LOCK_TIMEOUT, STATEMENT_TIMEOUT, connect, connect_for_requests,
+};
 use serde_json::{Value, json};
 use test_support::fixtures::{fixture_card_numbers, fixture_path, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
@@ -118,9 +135,20 @@ const END_DATE_INVALID: &str = "End Date - Not a valid date...";
 const ACCT_ID_EMPTY: &str = "Acct ID can NOT be empty...";
 const CONFIRM_INVALID: &str = "Invalid value. Valid values are (Y/N)...";
 const ACCOUNT_NOT_FOUND: &str = "Account ID NOT found...";
+const ACCOUNT_LOOKUP_FAILED: &str = "Unable to lookup Account...";
 const NOTHING_TO_PAY: &str = "You have nothing to pay...";
 const PAY_PROMPT: &str = "Confirm to make a bill payment...";
 const TRAN_ID_EXISTS: &str = "Tran ID already exist...";
+const TRAN_WRITE_FAILED: &str = "Unable to Add Bill pay Transaction...";
+const ACCOUNT_UPDATE_FAILED: &str = "Unable to Update Account...";
+
+/// The probe points of a payment, in the order the service reaches them: the account read for
+/// update, the payment insert and the balance rewrite. [`Script::calls`] counts in this order.
+const PAYMENT_POINTS: [ProbePoint; 3] = [
+    ProbePoint::AccountLock,
+    ProbePoint::TransactionInsert,
+    ProbePoint::AccountUpdate,
+];
 
 /// The text CSUTLDTC writes into its 80-byte result, labels, picture and `WS-RESULT` values
 /// alike: none of it reaches any consumer's response (CSUTLDTC-003, CSUTLDTC-007, CSUTLDTC-009
@@ -222,7 +250,16 @@ impl Api {
         intrdr_dir: PathBuf,
         at: NaiveDateTime,
     ) -> Outcome<Self> {
-        let store = PgStore::new(db.pool().clone());
+        Self::signed_on_over(PgStore::new(db.pool().clone()), intrdr_dir, at).await
+    }
+
+    /// Signs `USER0001` on through endpoint 1 against the state over `store`, with job decks
+    /// under `intrdr_dir` and time from a `FixedClock` at `at`.
+    async fn signed_on_over(
+        store: PgStore,
+        intrdr_dir: PathBuf,
+        at: NaiveDateTime,
+    ) -> Outcome<Self> {
         let unsigned = Self {
             router: router(store.clone(), intrdr_dir, at)?,
             store,
@@ -245,6 +282,24 @@ impl Api {
         Ok(Self {
             store: self.store.clone(),
             router: router(self.store.clone(), intrdr_dir, at)?,
+            token: self.token.clone(),
+            bodies: Rc::clone(&self.bodies),
+        })
+    }
+
+    /// The same token and ledger over a state whose store answers to `script`, with job decks
+    /// under `intrdr_dir` and time from a `FixedClock` at `at`. The returned API keeps this one's
+    /// unprobed store, so what a test reads back is what the database holds.
+    fn probed(
+        &self,
+        script: &Arc<Script>,
+        intrdr_dir: PathBuf,
+        at: NaiveDateTime,
+    ) -> Outcome<Self> {
+        let probe: Arc<dyn RepositoryProbe> = Arc::<Script>::clone(script);
+        Ok(Self {
+            store: self.store.clone(),
+            router: router(self.store.clone().with_probe(probe), intrdr_dir, at)?,
             token: self.token.clone(),
             bodies: Rc::clone(&self.bodies),
         })
@@ -979,6 +1034,62 @@ fn assert_no_result_text(api: &Api) {
     }
 }
 
+/// A [`RepositoryProbe`] that answers each point it scripts with its verdict and every other
+/// point with [`ProbeVerdict::Proceed`], and keeps every point it is asked at.
+struct Script {
+    verdicts: Vec<(ProbePoint, ProbeVerdict)>,
+    seen: Mutex<Vec<ProbePoint>>,
+}
+
+impl Script {
+    /// A script that answers the point of each pair of `verdicts` with the pair's verdict.
+    fn new(verdicts: Vec<(ProbePoint, ProbeVerdict)>) -> Arc<Self> {
+        Arc::new(Self {
+            verdicts,
+            seen: Mutex::default(),
+        })
+    }
+
+    /// The number of calls asked at each of [`PAYMENT_POINTS`], in its order.
+    fn calls(&self) -> [usize; 3] {
+        let seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
+        PAYMENT_POINTS.map(|point| seen.iter().filter(|&&asked| asked == point).count())
+    }
+}
+
+impl RepositoryProbe for Script {
+    fn answer(&self, call: &ProbeCall<'_>) -> ProbeVerdict {
+        let point = call.point();
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(point);
+        self.verdicts
+            .iter()
+            .find(|(scripted, _)| *scripted == point)
+            .map_or(ProbeVerdict::Proceed, |(_, verdict)| verdict.clone())
+    }
+}
+
+/// A statement the server cancelled, SQLSTATE `57014`: a failure that is neither a missing row
+/// nor a duplicate key.
+fn cancelled() -> PersistenceError {
+    PersistenceError::Database {
+        sqlstate: Some("57014".to_owned()),
+        constraint: None,
+    }
+}
+
+/// The text of a card number that no fixture holds, assembled from its parts at run time and
+/// checked against the 50 fixture numbers. Never printed.
+fn synthetic_card_text() -> Outcome<String> {
+    let text = format!("{}{}", "9".repeat(4), "0".repeat(12));
+    if fixture_card_numbers()?.contains(&text) {
+        return Err("the synthetic card number is a fixture card number".into());
+    }
+    Ok(text)
+}
+
 /// An endpoint 15 body.
 fn pay(acct_id: &str, confirm: &str) -> Value {
     json!({"acct_id": acct_id, "confirm": confirm})
@@ -1513,6 +1624,450 @@ async fn pay_wrapped_id_rows(api: &Api, seed: &TransactionRecord) -> TestResult 
         }
     );
     Ok(())
+}
+
+/// COBIL00C-015: the read for update of account 1 fails for a reason other than not found,
+/// whether the confirmation is `Y`, `y` or blank: 500 `Unable to lookup Account...` on
+/// `acct_id`, and nothing is written. What the COBOL runs after that screen is
+/// `HALTED(X-COBIL00C-H1)` (COBIL00C-016) and is not asserted.
+#[test]
+fn cobil00c_account_read_failure_row() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let dir = fresh_dir("cobil00c_account_read_failure_row")?;
+        let api = Api::signed_on(&db, dir.clone(), at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        let cases = [
+            ("Y", cancelled()),
+            ("y", PersistenceError::Unavailable),
+            ("", PersistenceError::Check { constraint: None }),
+        ];
+        for (confirm, error) in cases {
+            let script = Script::new(vec![(ProbePoint::AccountLock, ProbeVerdict::Fail(error))]);
+            let reply = api
+                .probed(&script, dir.clone(), at)?
+                .post(BILL_PAYMENTS, &pay("00000000001", confirm))
+                .await?;
+            // audit: COBIL00C-015
+            assert_eq!(
+                reply.screen(),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(ACCOUNT_LOOKUP_FAILED),
+                    Some("acct_id")
+                )
+            );
+            // audit: COBIL00C-015
+            assert_eq!(script.calls(), [1, 0, 0]);
+            // audit: COBIL00C-015
+            assert_unwritten(&api, &before, &seed).await?;
+        }
+        assert_no_card_number(&api)
+    })
+}
+
+/// COBIL00C-022: account 1 with a second cross-reference, so its read through the path ends
+/// `DUPKEY`. The payment block tests no error between its steps, so the payment proceeds as in
+/// COBIL00C-021: written with the next ID, the balance debited and the write's message the
+/// answer. The card number written is `HALTED(X-COBIL00C-H2)`, reported by
+/// `blocked_cobil00c_candidate_parts`, and is not asserted.
+#[test]
+fn cobil00c_duplicate_xref_row() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let api = Api::signed_on(&db, fresh_dir("cobil00c_duplicate_xref_row")?, at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        let mut store = api.store.clone();
+        let only = CardXrefRepository::find_by_acct_id(&mut store, before.id)
+            .await?
+            .ok_or("account 1 has no cross-reference")?;
+        let synthetic = synthetic_card_text()?;
+        let second = CardXrefRecord {
+            card_num: CardNumber::parse(&synthetic)?,
+            ..only
+        };
+        CardXrefRepository::insert(&mut store, &second).await?;
+        // audit: COBIL00C-022
+        assert_eq!(
+            CardXrefRepository::find_first_two_by_acct_id(&mut store, before.id)
+                .await?
+                .len(),
+            2
+        );
+        let new_id = following_id(&seed.id)?;
+        let reply = api.post(BILL_PAYMENTS, &pay("00000000001", "Y")).await?;
+        // audit: COBIL00C-022
+        assert_eq!(
+            (reply.status, reply.body),
+            (
+                StatusCode::OK,
+                json!({
+                    "acct_id": "",
+                    "message": payment_message(&new_id),
+                    "new_tran_id": new_id,
+                    "cleared": true,
+                })
+            )
+        );
+        let written = transaction(&api.store, &new_id)
+            .await?
+            .ok_or("the payment was not written")?;
+        // audit: COBIL00C-022
+        assert_payment_record(&written, "194.00", &seed, at)?;
+        // audit: COBIL00C-022
+        assert_eq!(
+            account(&api.store, 1).await?,
+            AccountRecord {
+                curr_bal: money("0.00")?,
+                ..before
+            }
+        );
+        assert!(
+            !api.bodies
+                .borrow()
+                .iter()
+                .any(|body| body.contains(synthetic.as_str())),
+            "a response body holds the synthetic card number"
+        );
+        assert_no_card_number(&api)
+    })
+}
+
+/// COBIL00C-030 and E11: the payment insert fails for a reason other than a duplicate ID:
+/// 500 `Unable to Add Bill pay Transaction...` on `acct_id`. No transaction is written, yet the
+/// rewrite after it runs and the debit of account 1 stands.
+#[test]
+fn cobil00c_insert_failure_row() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let dir = fresh_dir("cobil00c_insert_failure_row")?;
+        let api = Api::signed_on(&db, dir.clone(), at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        let script = Script::new(vec![(
+            ProbePoint::TransactionInsert,
+            ProbeVerdict::Fail(cancelled()),
+        )]);
+        let reply = api
+            .probed(&script, dir, at)?
+            .post(BILL_PAYMENTS, &pay("00000000001", "Y"))
+            .await?;
+        // audit: COBIL00C-030
+        assert_eq!(
+            reply.screen(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(TRAN_WRITE_FAILED),
+                Some("acct_id")
+            )
+        );
+        // audit: COBIL00C-030
+        assert_eq!(script.calls(), [1, 1, 1]);
+        // audit: COBIL00C-030
+        assert_eq!(
+            TransactionRepository::find_last(&mut api.store.clone()).await?,
+            Some(seed)
+        );
+        // audit: COBIL00C-030
+        assert_eq!(
+            account(&api.store, 1).await?,
+            AccountRecord {
+                curr_bal: money("0.00")?,
+                ..before
+            }
+        );
+        assert_no_card_number(&api)
+    })
+}
+
+/// COBIL00C-032 (X-COBIL00C-2): the balance rewrite matches no row, which the read's row lock
+/// otherwise prevents: 404 `Account ID NOT found...` on `acct_id`, and the balance of account 1
+/// is unchanged. The payment written before the rewrite stands, because the transaction commits
+/// whatever the rewrite gave.
+#[test]
+fn cobil00c_rewrite_not_found_row() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let dir = fresh_dir("cobil00c_rewrite_not_found_row")?;
+        let api = Api::signed_on(&db, dir.clone(), at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        let new_id = following_id(&seed.id)?;
+        let script = Script::new(vec![(ProbePoint::AccountUpdate, ProbeVerdict::NoRow)]);
+        let reply = api
+            .probed(&script, dir, at)?
+            .post(BILL_PAYMENTS, &pay("00000000001", "Y"))
+            .await?;
+        // audit: COBIL00C-032
+        assert_eq!(
+            reply.screen(),
+            (
+                StatusCode::NOT_FOUND,
+                Some(ACCOUNT_NOT_FOUND),
+                Some("acct_id")
+            )
+        );
+        // audit: COBIL00C-032
+        assert_eq!(script.calls(), [1, 1, 1]);
+        // audit: COBIL00C-032
+        assert_eq!(account(&api.store, 1).await?, before);
+        let written = transaction(&api.store, &new_id)
+            .await?
+            .ok_or("the payment was not written")?;
+        // audit: COBIL00C-032
+        assert_payment_record(&written, "194.00", &seed, at)?;
+        assert_no_card_number(&api)
+    })
+}
+
+/// COBIL00C-033: the balance rewrite fails: 500 `Unable to Update Account...` on `acct_id`
+/// replaces the write's message, and the balance of account 1 is unchanged. After a written
+/// payment (COBIL00C-028) that transaction stays written; after a failed insert (COBIL00C-030)
+/// nothing is written at all.
+#[test]
+fn cobil00c_rewrite_failure_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let dir = fresh_dir("cobil00c_rewrite_failure_rows")?;
+        let api = Api::signed_on(&db, dir.clone(), at).await?;
+        seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        let update_failed = (
+            ProbePoint::AccountUpdate,
+            ProbeVerdict::Fail(PersistenceError::Unavailable),
+        );
+        let cases = [
+            (vec![update_failed.clone()], true),
+            (
+                vec![
+                    (
+                        ProbePoint::TransactionInsert,
+                        ProbeVerdict::Fail(cancelled()),
+                    ),
+                    update_failed,
+                ],
+                false,
+            ),
+        ];
+        let mut store = api.store.clone();
+        for (verdicts, kept) in cases {
+            let prior = TransactionRepository::find_last(&mut store)
+                .await?
+                .ok_or("no transaction precedes the payment")?;
+            let new_id = following_id(&prior.id)?;
+            let script = Script::new(verdicts);
+            let reply = api
+                .probed(&script, dir.clone(), at)?
+                .post(BILL_PAYMENTS, &pay("00000000001", "Y"))
+                .await?;
+            // audit: COBIL00C-033
+            assert_eq!(
+                reply.screen(),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Some(ACCOUNT_UPDATE_FAILED),
+                    Some("acct_id")
+                )
+            );
+            // audit: COBIL00C-033
+            assert_eq!(script.calls(), [1, 1, 1]);
+            // audit: COBIL00C-033
+            assert_eq!(account(&api.store, 1).await?, before);
+            let found = transaction(&api.store, &new_id).await?;
+            if kept {
+                // audit: COBIL00C-033
+                assert_payment_record(
+                    &found.ok_or("the payment was not written")?,
+                    "194.00",
+                    &prior,
+                    at,
+                )?;
+            } else {
+                // audit: COBIL00C-033
+                assert_eq!(found, None);
+                assert_eq!(
+                    TransactionRepository::find_last(&mut store).await?,
+                    Some(prior)
+                );
+            }
+        }
+        assert_no_card_number(&api)
+    })
+}
+
+/// A store over the pool `carddemo-api` serves requests from, `runtime::db::connect_for_requests`
+/// on `database_url`.
+async fn request_store(database_url: String) -> Outcome<PgStore> {
+    let config = Config {
+        database_url,
+        jwt_secret: SECRET.to_owned(),
+        ..Config::default()
+    };
+    Ok(PgStore::new(connect_for_requests(&config).await?))
+}
+
+/// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made here so
+/// that no test macro expands into a lint suppression or an unchecked pin.
+fn current_thread() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// COBIL00C-015 through the request deadlines: while a transaction of the test holds the row
+/// lock of account 1, a balance request (blank confirmation) and a payment (`Y`) each wait in
+/// the account read for update until the server ends the read, then answer `Unable to lookup
+/// Account...` with 500, and once the lock is released the account and the transactions are as
+/// they were.
+///
+/// Each case is the query of the request pool's `DATABASE_URL` and the window the wait ends in:
+///
+/// 1. none: the pool's `lock_timeout` ends it (`55P03`), before its `statement_timeout` could;
+/// 2. a `lock_timeout` of 1 second, which prevails and ends it before the pool's own could;
+/// 3. no lock timeout and a `statement_timeout` of 2 seconds, which prevails and cancels the
+///    read (`57014`);
+/// 4. no lock timeout: the pool's own `statement_timeout` cancels the read.
+#[test]
+fn cobil00c_lock_wait_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let dir = fresh_dir("cobil00c_lock_wait_rows")?;
+        let holder = PgStore::new(db.pool().clone());
+        let seed = seed_transaction(&holder).await?;
+        let before = account(&holder, 1).await?;
+        let cases = [
+            ("", LOCK_TIMEOUT, STATEMENT_TIMEOUT),
+            (
+                "options[lock_timeout]=1s",
+                Duration::from_secs(1),
+                LOCK_TIMEOUT,
+            ),
+            (
+                "options[lock_timeout]=0&options[statement_timeout]=2s",
+                Duration::from_secs(2),
+                LOCK_TIMEOUT,
+            ),
+            (
+                "options[lock_timeout]=0",
+                STATEMENT_TIMEOUT,
+                STATEMENT_TIMEOUT + LOCK_TIMEOUT,
+            ),
+        ];
+        let mut apis = Vec::new();
+        for (query, _, _) in cases {
+            let database_url = match query {
+                "" => db.database_url().to_owned(),
+                query => format!("{}?{query}", db.database_url()),
+            };
+            let store = request_store(database_url).await?;
+            apis.push(Api::signed_on_over(store, dir.clone(), at).await?);
+        }
+        let mut lock = holder.begin().await?;
+        let held = AccountRepository::lock_by_id(&mut lock, PicU::new(1)?).await?;
+        assert_eq!(held.as_ref(), Some(&before));
+        for (api, (query, from, until)) in apis.iter().zip(cases) {
+            for confirm in ["", "Y"] {
+                let started = Instant::now();
+                let reply = api
+                    .post(BILL_PAYMENTS, &pay("00000000001", confirm))
+                    .await?;
+                let waited = started.elapsed();
+                // audit: COBIL00C-015
+                assert_eq!(
+                    reply.screen(),
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Some(ACCOUNT_LOOKUP_FAILED),
+                        Some("acct_id")
+                    ),
+                    "{query:?} {confirm:?}"
+                );
+                assert!(
+                    from <= waited && waited < until,
+                    "{query:?} {confirm:?}: the read waited {waited:?}, outside [{from:?}, {until:?})"
+                );
+            }
+        }
+        lock.rollback().await?;
+        for api in &apis {
+            // audit: COBIL00C-015
+            assert_unwritten(api, &before, &seed).await?;
+            assert_no_card_number(api)?;
+        }
+        Ok(())
+    })
+}
+
+/// Waits, for at most a minute, until a connection to `database_url` is refused, as once its
+/// container is removed. While the removal is under way a connection can also fail otherwise,
+/// for example on a reset, which a pool does not retry.
+///
+/// `database_url` names an IPv4 address: a connection to `localhost` that also fails on `::1`,
+/// where the container maps no port, ends as `address not available`, which a pool does not
+/// retry either.
+async fn wait_until_refused(database_url: &str) -> TestResult {
+    let config = Config {
+        database_url: database_url.to_owned(),
+        ..Config::default()
+    };
+    let started = Instant::now();
+    loop {
+        let refused = connect(&config).await.is_err_and(|error| {
+            ErrorSummary::from(&error).to_string() == "io (connection refused)"
+        });
+        if refused {
+            return Ok(());
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            return Err("the server's port does not refuse connections".into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A `PostgreSQL` outage: once the server's port refuses connections, a payment's transaction
+/// cannot begin, because the pool retries a refused connection until its acquire timeout,
+/// `runtime::db::ACQUIRE_TIMEOUT`. Endpoint 15 then answers the API's fixed 500 for a store
+/// failure without an audited message after that timeout, rather than after the 30 seconds a
+/// `sqlx` pool waits by default.
+///
+/// The pool connects to `127.0.0.1`, as the local stack's `DATABASE_URL` does, rather than to
+/// the container's `localhost` (see [`wait_until_refused`]).
+#[test]
+fn cobil00c_outage_row() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let database_url = db.database_url().replacen("@localhost:", "@127.0.0.1:", 1);
+        let store = request_store(database_url.clone()).await?;
+        let api = Api::signed_on_over(store, fresh_dir("cobil00c_outage_row")?, at).await?;
+        drop(db);
+        wait_until_refused(&database_url).await?;
+        let started = Instant::now();
+        let reply = api.post(BILL_PAYMENTS, &pay("00000000001", "Y")).await?;
+        let waited = started.elapsed();
+        assert_eq!(
+            reply.screen(),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Some(UNABLE_TO_PROCESS),
+                None
+            )
+        );
+        assert!(
+            ACQUIRE_TIMEOUT <= waited && waited < ACQUIRE_TIMEOUT * 2,
+            "the request waited {waited:?} for a connection"
+        );
+        assert_no_card_number(&api)
+    })
 }
 
 // audit: CORPT00C-027

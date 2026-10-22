@@ -65,7 +65,7 @@ use super::card_xref::select_first_two_by_acct_id;
 use super::customers;
 use crate::error::PersistenceError;
 use crate::rows::{AccountRow, pic_u_to_i64};
-use crate::{PgSession, PgStore, PgTx};
+use crate::{PgSession, PgStore, PgTx, ProbePoint, RepositoryProbe, probe_verdict, probed};
 
 /// Column of `ACCT-ID`, named by a key conversion error.
 const ACCT_ID: &str = "acct_id";
@@ -304,7 +304,15 @@ fn xref_link(rows: Vec<CardXrefRecord>) -> ChainLink<CardXrefRecord> {
 /// `acct_id`, at most its first two rows, then, only when exactly one was found, the account by
 /// `acct_id` and the customer by the cross-reference's customer ID, whatever the account read
 /// returned.
-async fn chain_in(conn: &mut PgConnection, acct_id: PicU<11>) -> AccountCustomerChain {
+///
+/// `probe` is asked before the account read ([`ProbePoint::AccountRead`]) and before the
+/// customer read ([`ProbePoint::CustomerRead`]), so a skipped read becomes the link its verdict
+/// answers, through [`link`], and the reads after it still run.
+async fn chain_in(
+    conn: &mut PgConnection,
+    probe: Option<&dyn RepositoryProbe>,
+    acct_id: PicU<11>,
+) -> AccountCustomerChain {
     // 9200-GETCARDXREF-BYACCT, then IF FLG-ACCTFILTER-NOT-OK GO TO 9000-READ-ACCT-EXIT.
     let xref = match select_first_two_by_acct_id(&mut *conn, acct_id).await {
         Ok(rows) => match xref_link(rows) {
@@ -314,9 +322,11 @@ async fn chain_in(conn: &mut PgConnection, acct_id: PicU<11>) -> AccountCustomer
         Err(error) => return AccountCustomerChain::ended_at_xref(ChainLink::Failed(error)),
     };
     // 9300-GETACCTDATA-BYACCT; its exit test is never true (COACTVWC-033, COACTUPC-084).
-    let account = link(select_by_id(&mut *conn, acct_id).await);
+    let verdict = probe_verdict(probe, ProbePoint::AccountRead, &[&acct_id]);
+    let account = link(probed(verdict, select_by_id(&mut *conn, acct_id)).await);
     // 9400-GETCUSTDATA-BYCUST, keyed by CDEMO-CUST-ID, which 9200 moved from XREF-CUST-ID.
-    let customer = link(customers::select_by_id(&mut *conn, xref.cust_id).await);
+    let verdict = probe_verdict(probe, ProbePoint::CustomerRead, &[&xref.cust_id]);
+    let customer = link(probed(verdict, customers::select_by_id(&mut *conn, xref.cust_id)).await);
     AccountCustomerChain {
         xref: ChainLink::Found(xref),
         account,
@@ -494,10 +504,11 @@ impl AccountRepository for PgStore {
         acct_id: PicU<11>,
     ) -> impl Future<Output = AccountCustomerChain> + Send {
         let acquire = self.pool().acquire();
+        let probe = self.probe();
         async move {
             match acquire.await {
                 // The three reads share one connection, each statement in autocommit.
-                Ok(mut conn) => chain_in(&mut conn, acct_id).await,
+                Ok(mut conn) => chain_in(&mut conn, probe, acct_id).await,
                 Err(error) => AccountCustomerChain::ended_at_xref(ChainLink::Failed(error.into())),
             }
         }
@@ -507,14 +518,16 @@ impl AccountRepository for PgStore {
         &mut self,
         id: PicU<11>,
     ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
-        select_by_id(self.pool(), id)
+        let verdict = self.verdict(ProbePoint::AccountRead, &[&id]);
+        probed(verdict, select_by_id(self.pool(), id))
     }
 
     fn lock_by_id(
         &mut self,
         id: PicU<11>,
     ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
-        select_for_update(self.pool(), id)
+        let verdict = self.verdict(ProbePoint::AccountLock, &[&id]);
+        probed(verdict, select_for_update(self.pool(), id))
     }
 
     fn find_all(
@@ -538,7 +551,8 @@ impl AccountRepository for PgStore {
         &mut self,
         record: &AccountRecord,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_one(self.pool(), record)
+        let verdict = self.verdict(ProbePoint::AccountUpdate, &[record]);
+        probed(verdict, update_one(self.pool(), record))
     }
 
     fn replace_all(
@@ -562,21 +576,24 @@ impl AccountRepository for PgTx<'_> {
         &mut self,
         acct_id: PicU<11>,
     ) -> impl Future<Output = AccountCustomerChain> + Send {
-        chain_in(self.conn(), acct_id)
+        let (conn, probe) = self.conn_and_probe();
+        chain_in(conn, probe, acct_id)
     }
 
     fn find_by_id(
         &mut self,
         id: PicU<11>,
     ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
-        select_by_id(self.conn(), id)
+        let verdict = self.verdict(ProbePoint::AccountRead, &[&id]);
+        probed(verdict, select_by_id(self.conn(), id))
     }
 
     fn lock_by_id(
         &mut self,
         id: PicU<11>,
     ) -> impl Future<Output = Result<Option<AccountRecord>, PersistenceError>> + Send {
-        select_for_update(self.conn(), id)
+        let verdict = self.verdict(ProbePoint::AccountLock, &[&id]);
+        probed(verdict, select_for_update(self.conn(), id))
     }
 
     fn find_all(
@@ -600,7 +617,8 @@ impl AccountRepository for PgTx<'_> {
         &mut self,
         record: &AccountRecord,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_one(self.conn(), record)
+        let verdict = self.verdict(ProbePoint::AccountUpdate, &[record]);
+        probed(verdict, update_one(self.conn(), record))
     }
 
     fn replace_all(
@@ -611,12 +629,13 @@ impl AccountRepository for PgTx<'_> {
     }
 }
 
+// A session is never probed (see "Probes" in the crate documentation).
 impl AccountRepository for PgSession {
     fn find_with_customer(
         &mut self,
         acct_id: PicU<11>,
     ) -> impl Future<Output = AccountCustomerChain> + Send {
-        chain_in(self.conn(), acct_id)
+        chain_in(self.conn(), None, acct_id)
     }
 
     fn find_by_id(

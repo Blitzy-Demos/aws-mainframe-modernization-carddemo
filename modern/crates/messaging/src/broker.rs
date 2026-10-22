@@ -94,7 +94,7 @@ use std::error::Error;
 use std::fmt;
 use std::hash::{BuildHasher, Hasher, RandomState};
 use std::io;
-use std::net::{Shutdown, TcpStream as Socket, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream as Socket, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -294,8 +294,9 @@ impl AmqpError {
 /// that came with it.
 ///
 /// [`Fault::from`] keeps the AMQP reply code of a protocol error and drops its `reply_text`,
-/// keeps the [`io::ErrorKind`] of an I/O error and drops the operating system's message, keeps
-/// the state name of a channel or connection state error, and keeps only the class of a parse or
+/// keeps the [`io::ErrorKind`] of an I/O error and drops the operating system's message, names a
+/// host that [`connect`] could not resolve only as [`Fault::HostNotResolved`], keeps the state
+/// name of a channel or connection state error, and keeps only the class of a parse or
 /// serialisation error, whose text can quote frame bytes. No variant holds a string.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Fault {
@@ -315,6 +316,9 @@ pub enum Fault {
     },
     /// An I/O error of the socket, by its kind.
     Io(io::ErrorKind),
+    /// The host that `CARDDEMO_AMQP_URL` names could not be resolved, or resolved to no address,
+    /// so no socket was opened. The host itself is not kept.
+    HostNotResolved,
     /// No heartbeat came from the broker for too long.
     MissingHeartbeat,
     /// A frame from the broker could not be parsed.
@@ -339,11 +343,11 @@ impl Fault {
     /// Whether the fault ends the connection or leaves its state unknown:
     ///
     /// - lost: a missed deadline ([`Fault::TimedOut`]), after which neither the channel nor the
-    ///   connection can be trusted to settle the right delivery; an I/O error; a missed
-    ///   heartbeat; a frame the client could not parse or serialise, or a protocol version it
-    ///   rejected, each of which closes the connection; a connection state other than
-    ///   connected; a hard AMQP error such as `CONNECTION_FORCED`, with which the broker closes
-    ///   the connection.
+    ///   connection can be trusted to settle the right delivery; an I/O error, an unresolved host
+    ///   included; a missed heartbeat; a frame the client could not parse or serialise, or a
+    ///   protocol version it rejected, each of which closes the connection; a connection state
+    ///   other than connected; a hard AMQP error such as `CONNECTION_FORCED`, with which the
+    ///   broker closes the connection.
     /// - not lost: a soft AMQP error such as `NOT_FOUND` or `PRECONDITION_FAILED`, which closes
     ///   only the channel; an invalid channel or channel state; the channel limit; an
     ///   unclassified client error.
@@ -352,6 +356,7 @@ impl Fault {
         match self {
             Self::TimedOut { .. }
             | Self::Io(_)
+            | Self::HostNotResolved
             | Self::MissingHeartbeat
             | Self::Parsing
             | Self::Serialisation
@@ -375,6 +380,9 @@ impl From<&lapin::Error> for Fault {
             lapin::Error::ProtocolError(protocol) => Self::Protocol {
                 code: protocol.get_id(),
             },
+            // Before the arm below: the error `connect_socket` returns for an unresolved host
+            // has kind `Other`, and only its cause tells it apart.
+            lapin::Error::IOError(io) if is_host_not_resolved(io) => Self::HostNotResolved,
             lapin::Error::IOError(io) => Self::Io(io.kind()),
             lapin::Error::MissingHeartbeatError => Self::MissingHeartbeat,
             lapin::Error::ParsingError(_) => Self::Parsing,
@@ -411,6 +419,7 @@ impl fmt::Display for Fault {
                 None => write!(f, "AMQP error with reply code {code}"),
             },
             Self::Io(kind) => write!(f, "I/O error: {kind}"),
+            Self::HostNotResolved => fmt::Display::fmt(&HostNotResolved, f),
             Self::MissingHeartbeat => f.write_str("no heartbeat from the broker for too long"),
             Self::Parsing => f.write_str("a frame from the broker could not be parsed"),
             Self::Serialisation => f.write_str("a frame could not be serialised"),
@@ -425,6 +434,28 @@ impl fmt::Display for Fault {
 }
 
 impl Error for Fault {}
+
+/// The cause of the I/O error [`connect_socket`] returns when the host that the AMQP URL names
+/// cannot be resolved or resolves to no address; [`Fault::from`] classifies that error as
+/// [`Fault::HostNotResolved`]. It never names the host, and the resolver's own error is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostNotResolved;
+
+impl fmt::Display for HostNotResolved {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("host name not resolved")
+    }
+}
+
+impl Error for HostNotResolved {}
+
+/// Whether `error` is the one [`connect_socket`] returns for an unresolved host: its cause is
+/// [`HostNotResolved`].
+fn is_host_not_resolved(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(<dyn Error + Send + Sync>::is::<HostNotResolved>)
+}
 
 /// A queue as diagnostics name it, value-free by construction: a configured request queue by the
 /// environment variable that holds its name, and a queue whose name is a constant of the source
@@ -507,7 +538,10 @@ impl fmt::Display for AmqpError {
                 f,
                 "{variable} must name a queue of at most {max_len} bytes of printable ASCII"
             ),
-            Self::Connect(fault) => write!(f, "cannot connect to the AMQP broker: {fault}"),
+            Self::Connect(fault) => write!(
+                f,
+                "cannot connect to the AMQP broker (CARDDEMO_AMQP_URL): {fault}"
+            ),
             Self::Channel(fault) => write!(f, "cannot open an AMQP channel: {fault}"),
             Self::Declare { queue, source } => {
                 write!(f, "passive declare of {queue} failed: {source}")
@@ -606,8 +640,9 @@ async fn within<T>(
 /// # Errors
 ///
 /// [`AmqpError::InvalidUrl`] when `amqp_url` does not parse as an AMQP URL, and
-/// [`AmqpError::Connect`] when the broker cannot be reached, refuses the login or does not
-/// finish the handshake in time ([`Fault::TimedOut`]).
+/// [`AmqpError::Connect`] when its host is not resolved ([`Fault::HostNotResolved`]), the broker
+/// cannot be reached, refuses the login or does not finish the handshake in time
+/// ([`Fault::TimedOut`]).
 pub async fn connect(amqp_url: &str) -> Result<Session, AmqpError> {
     connect_within(amqp_url, CONNECT_DEADLINE).await
 }
@@ -802,19 +837,40 @@ fn open_socket(
 ///
 /// # Errors
 ///
-/// The error of the last address tried; [`io::ErrorKind::TimedOut`] when no time is left for
-/// the next address; [`io::ErrorKind::AddrNotAvailable`] when the name resolves to no address.
+/// An error caused by [`HostNotResolved`] when the host cannot be resolved; otherwise those of
+/// [`connect_first`].
 fn connect_socket(uri: &AMQPUri, started: Instant, deadline: Duration) -> io::Result<Socket> {
     let address = format!("{}:{}", uri.authority.host, uri.authority.port);
-    let mut failure = io::Error::from(io::ErrorKind::AddrNotAvailable);
-    for address in address.to_socket_addrs()? {
+    // The resolver's own error is replaced: its kind is uncategorized, so its class alone would
+    // show only as `I/O error: uncategorized error`.
+    let addresses = address
+        .to_socket_addrs()
+        .map_err(|_| io::Error::other(HostNotResolved))?;
+    connect_first(addresses, uri.query.connection_timeout, started, deadline)
+}
+
+/// Connects to the first of `addresses` that accepts within what is left of `deadline` since
+/// `started`, each attempt also bounded by `connection_timeout` in milliseconds when it is
+/// above 0.
+///
+/// # Errors
+///
+/// The error of the last address tried; [`io::ErrorKind::TimedOut`] when no time is left for
+/// the next address; an error caused by [`HostNotResolved`] when `addresses` is empty, because
+/// the host resolved to no address.
+fn connect_first(
+    addresses: impl IntoIterator<Item = SocketAddr>,
+    connection_timeout: Option<u64>,
+    started: Instant,
+    deadline: Duration,
+) -> io::Result<Socket> {
+    let mut failure = io::Error::other(HostNotResolved);
+    for address in addresses {
         let left = deadline.saturating_sub(started.elapsed());
         if left.is_zero() {
             return Err(io::Error::from(io::ErrorKind::TimedOut));
         }
-        let wait = uri
-            .query
-            .connection_timeout
+        let wait = connection_timeout
             .filter(|timeout| *timeout > 0)
             .map_or(left, |timeout| left.min(Duration::from_millis(timeout)));
         match Socket::connect_timeout(&address, wait) {
@@ -1353,8 +1409,9 @@ mod tests {
 
     use super::{
         AmqpError, BACKOFF_CAP, Backoff, CONNECT_DEADLINE, CP00_REPLY_EXPIRATION,
-        DEAD_LETTER_QUEUE, Fault, OPERATION_DEADLINE, PUBLISH_DEADLINE, PublishFailure, QueueCheck,
-        QueueLabel, Request, copied_properties, cp00_properties, jittered, parse_url, within,
+        DEAD_LETTER_QUEUE, Fault, HostNotResolved, OPERATION_DEADLINE, PUBLISH_DEADLINE,
+        PublishFailure, QueueCheck, QueueLabel, Request, connect_first, copied_properties,
+        cp00_properties, is_host_not_resolved, jittered, parse_url, within,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
@@ -1978,6 +2035,117 @@ mod tests {
         })
         .await;
         assert_eq!(failed, Err(Fault::Io(io::ErrorKind::ConnectionRefused)));
+    }
+
+    #[test]
+    fn a_connect_failure_names_the_url_variable_and_its_fault() {
+        let cases = [
+            (Fault::HostNotResolved, "host name not resolved"),
+            (
+                Fault::Protocol { code: 403 },
+                "AMQP soft error ACCESS-REFUSED (reply code 403)",
+            ),
+            (
+                Fault::Io(io::ErrorKind::ConnectionRefused),
+                "I/O error: connection refused",
+            ),
+            (
+                Fault::TimedOut {
+                    after: CONNECT_DEADLINE,
+                },
+                "no response within the 10s deadline",
+            ),
+        ];
+        for (fault, shown) in cases {
+            assert_eq!(fault.to_string(), shown);
+            let connect = AmqpError::Connect(fault.clone());
+            assert_eq!(
+                connect.to_string(),
+                format!("cannot connect to the AMQP broker (CARDDEMO_AMQP_URL): {shown}")
+            );
+            assert!(connect.is_connection_lost(), "{connect}");
+            assert!(
+                connect
+                    .source()
+                    .and_then(|source| source.downcast_ref::<Fault>())
+                    .is_some_and(|source| *source == fault)
+            );
+        }
+    }
+
+    #[test]
+    fn an_unresolved_host_is_its_own_fault_and_names_no_host() {
+        // A host that resolves to no address.
+        let resolved_to_none = connect_first(
+            std::iter::empty::<std::net::SocketAddr>(),
+            None,
+            std::time::Instant::now(),
+            CONNECT_DEADLINE,
+        );
+        assert!(
+            resolved_to_none
+                .as_ref()
+                .err()
+                .is_some_and(is_host_not_resolved),
+            "{resolved_to_none:?}"
+        );
+        let fault = Fault::from(lapin::Error::IOError(Arc::new(io::Error::other(
+            HostNotResolved,
+        ))));
+        assert_eq!(fault, Fault::HostNotResolved);
+        assert!(fault.is_connection_lost());
+        assert_eq!(
+            format!("{fault} | {fault:?}"),
+            "host name not resolved | HostNotResolved"
+        );
+        // Any other I/O error keeps only its kind, `Other` included.
+        let other = Fault::from(lapin::Error::IOError(Arc::new(io::Error::other(
+            "failed to lookup address information",
+        ))));
+        assert_eq!(other, Fault::Io(io::ErrorKind::Other));
+    }
+
+    /// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made
+    /// here so that no test macro expands into a lint suppression or an unchecked pin.
+    fn current_thread() -> tokio::runtime::Runtime {
+        match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => panic!("a current-thread runtime does not build: {error}"),
+        }
+    }
+
+    #[test]
+    fn an_unresolvable_host_fails_the_connect_without_naming_it() {
+        use super::connect_within;
+
+        current_thread().block_on(async {
+            // `.invalid` never resolves (RFC 6761). The credentials are assembled at run time.
+            let host = "qa-no-such-host.invalid";
+            let user = ["qa", "user"].join("-");
+            let password = ["qa", "pass", "word"].join("-");
+            let url = format!("amqp://{user}:{password}@{host}:5672/%2f");
+            let outcome = connect_within(&url, CONNECT_DEADLINE).await;
+            let error = outcome.err();
+            assert!(
+                matches!(error, Some(AmqpError::Connect(Fault::HostNotResolved))),
+                "{error:?}"
+            );
+            let shown = error
+                .map(|error| format!("{error} | {error:?}"))
+                .unwrap_or_default();
+            assert_eq!(
+                shown,
+                "cannot connect to the AMQP broker (CARDDEMO_AMQP_URL): host name not resolved \
+                 | Connect(HostNotResolved)"
+            );
+            let protected: [&str; 4] = [host, "qa-no-such-host", &user, &password];
+            for value in protected {
+                assert!(!shown.contains(value), "{value} shown in: {shown}");
+            }
+        });
     }
 
     #[test]

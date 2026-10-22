@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -213,18 +213,40 @@ function json(status: number, body: unknown): Response {
 }
 
 /**
+ * A gate for the replies of {@link stubApi}: every reply waits for `held` until `open` is called,
+ * so a read stays outstanding while a test presses keys; once open, replies arrive at once.
+ */
+function gate(): { held: Promise<void>; open: () => void } {
+  const opens: (() => void)[] = [];
+  const held = new Promise<void>((resolve) => {
+    opens.push(resolve);
+  });
+  return {
+    held,
+    open: () => {
+      for (const open of opens) {
+        open();
+      }
+    },
+  };
+}
+
+/**
  * Replaces `fetch`. Endpoint 12 answers {@link selectedView} and {@link typedView} by their IDs,
  * 404 {@link notFound} for {@link UNKNOWN_ID} and 500 {@link lookupFailed} for
- * {@link FAILING_ID}; any other request gets a 500. Returns every request in the order the screen
- * sent it.
+ * {@link FAILING_ID}; any other request gets a 500. With `held`, every reply waits for it. Returns
+ * every request in the order the screen sent it.
  */
-function stubApi(): Request[] {
+function stubApi(held?: Promise<void>): Request[] {
   const requests: Request[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const req = input instanceof Request ? input : new Request(input, init);
       requests.push(req);
+      if (held !== undefined) {
+        await held;
+      }
       const { pathname } = new URL(req.url);
       const tranId =
         req.method === "GET" && pathname.startsWith(ENDPOINT)
@@ -362,9 +384,20 @@ function expectShownOnce(message: string): void {
   expect(row?.contains(visible[0] ?? null)).toBe(true);
 }
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const fields = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [box] = fields;
+  if (!(box instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return box.value;
 }
 
 /**
@@ -411,6 +444,55 @@ function pfKeyButton(label: string): HTMLElement {
 function pressKey(key: string, shiftKey = false): void {
   fireEvent.keyDown(document.activeElement ?? document.body, { key, shiftKey });
 }
+
+/** The row-24 button labelled `label`, as the `<button>` it must be. */
+function keyButton(label: string): HTMLButtonElement {
+  const button = screen.getByRole("button", { name: label });
+  if (!(button instanceof HTMLButtonElement)) {
+    throw new Error(`"${label}" names <${button.tagName.toLowerCase()}>, not a button`);
+  }
+  return button;
+}
+
+/**
+ * Whether the screen shows itself waiting for a read: `aria-busy` of the "Function keys" group
+ * and of the form, the `disabled` of each row-24 button by label, and whether the Tran ID input
+ * is read-only.
+ */
+function lockState(container: HTMLElement) {
+  return {
+    keyRowBusy: screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),
+    formBusy: container.querySelector("form")?.getAttribute("aria-busy") ?? null,
+    disabled: Object.fromEntries(
+      ["ENTER=Fetch", "F3=Back", "F4=Clear", "F5=Browse Tran."].map((label) => [
+        label,
+        keyButton(label).disabled,
+      ]),
+    ),
+    tranIdReadOnly: tranIdInput().readOnly,
+  };
+}
+
+/** {@link lockState} while a read is outstanding: ENTER and F4 refused, F3 and F5 available. */
+const LOCKED = {
+  keyRowBusy: "true",
+  formBusy: "true",
+  disabled: { "ENTER=Fetch": true, "F3=Back": false, "F4=Clear": true, "F5=Browse Tran.": false },
+  tranIdReadOnly: true,
+};
+
+/** {@link lockState} with no read outstanding: every key and the Tran ID input available. */
+const UNLOCKED = {
+  keyRowBusy: "false",
+  formBusy: "false",
+  disabled: {
+    "ENTER=Fetch": false,
+    "F3=Back": false,
+    "F4=Clear": false,
+    "F5=Browse Tran.": false,
+  },
+  tranIdReadOnly: false,
+};
 
 /**
  * Moves the cursor to `element`, so that its return to the Tran ID input is observable. The move
@@ -578,49 +660,114 @@ describe("COTRN01 transaction view screen", () => {
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
   });
 
-  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
-  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
-  // are proved under COTRN01-057 to COTRN01-062.
-  // audit: COTRN01-002
-  // audit: COTRN01-003
-  // audit: COTRN01-005
-  // audit: COTRN01-007
-  // audit: COTRN01-008
-  // audit: COTRN01-010
-  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
-    stubApi();
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
+  // The values these fields show are proved under COTRN01-057 to COTRN01-062.
+  it.each([
+    // audit: COTRN01-002
+    {
+      id: "COTRN01-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CT01",
+    },
+    // audit: COTRN01-003
+    {
+      id: "COTRN01-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COTRN01-005
+    {
+      id: "COTRN01-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COTRN01-007
+    {
+      id: "COTRN01-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COTRN01C",
+    },
+    // audit: COTRN01-008
+    {
+      id: "COTRN01-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // audit: COTRN01-010
+    {
+      id: "COTRN01-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id: header value $name is a read-only Input of the CardHeader title rows at its map POS and LENGTH",
+    ({ name, row, col, length, label, shows }) => {
+      stubApi();
+      const { container } = renderScreen({ from: PATHS.COMEN01 });
 
-    const header = container.querySelector('[data-slot="card-header"]');
-    expect(header).not.toBeNull();
-    // The title rows hold no form control.
-    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
-    for (const { name, row, col, length } of [
-      { name: "TRNNAME", row: 1, col: 7, length: 4 },
-      { name: "TITLE01", row: 1, col: 21, length: 40 },
-      { name: "CURDATE", row: 1, col: 71, length: 8 },
-      { name: "PGMNAME", row: 2, col: 7, length: 8 },
-      { name: "TITLE02", row: 2, col: 21, length: 40 },
-      { name: "CURTIME", row: 2, col: 71, length: 8 },
-    ]) {
+      const header = container.querySelector('[data-slot="card-header"]');
+      if (!(header instanceof HTMLElement)) {
+        throw new Error("COTRN1A renders no card header");
+      }
       // The field's one element stands in the title rows, not in the body or the footer.
-      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      const shown = document.querySelectorAll(`[data-field="${name}"]`);
       expect(shown).toHaveLength(1);
       const value = shown.item(0);
-      expect(header?.contains(value)).toBe(true);
-      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
-      // centres the titles included.
-      const cell = value?.parentElement;
-      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
-      expect(value?.textContent).toHaveLength(length);
-      // Neither the value nor anything in its cell takes input or focus.
-      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
-      for (const element of [value, cell]) {
-        expect(element?.hasAttribute("contenteditable")).toBe(false);
-        expect(element?.hasAttribute("tabindex")).toBe(false);
+      expect(header.contains(value)).toBe(true);
+      expect(value.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+      // It is an output field of the map: a read-only `Input` as wide as its LENGTH (`size`), in
+      // the cell of its POS and LENGTH, holding LENGTH characters, the padding that centres the
+      // titles included.
+      if (!(value instanceof HTMLInputElement)) {
+        throw new Error(`The header field ${name} is not an input`);
       }
-    }
-  });
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      expect(value.value).toHaveLength(length);
+      // The map literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(value.getAttribute("aria-label")).toBe(label === null ? `Title row ${row}` : null);
+      // The title rows hold no editable control: their six controls are the read-only values.
+      const controls = Array.from(
+        header.querySelectorAll("input, textarea, select, button, [contenteditable]"),
+      );
+      expect(controls).toHaveLength(6);
+      expect(
+        controls.every((control) => control instanceof HTMLInputElement && control.readOnly),
+      ).toBe(true);
+    },
+  );
 
   // audit: COTRN01C-002
   it.each([
@@ -1079,6 +1226,151 @@ describe("COTRN01 transaction view screen", () => {
     expect(stub.path).toBe("/transactions");
     expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: "pf3", list: LIST });
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`, `${ENDPOINT}${TYPED_ID}`]);
+  });
+
+  // The terminal keyboard stays locked until the program answers, so a read is never sent twice.
+  it.each([
+    {
+      title: "the entry read of a COTRN00 selection",
+      state: FROM_LIST,
+      typed: undefined,
+      tranId: SELECTED_ID,
+      shown: SHOWN_SELECTED,
+    },
+    {
+      title: "a read ENTER sent",
+      state: { from: PATHS.COMEN01 },
+      typed: TYPED_ID,
+      tranId: TYPED_ID,
+      shown: SHOWN_TYPED,
+    },
+  ])(
+    "during $title, ENTER by button, key and form submit, F4 and invalid keys send and change nothing",
+    async (row) => {
+      const reply = gate();
+      const requests = stubApi(reply.held);
+      const { container } = renderScreen(row.state);
+      if (row.typed !== undefined) {
+        fetchTyped(row.typed);
+      }
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      await waitFor(() => {
+        expect(lockState(container)).toEqual(LOCKED);
+      });
+      const form = container.querySelector("form");
+      if (form === null) {
+        throw new Error("no form");
+      }
+
+      fireEvent.click(keyButton("ENTER=Fetch"));
+      fireEvent.click(keyButton("ENTER=Fetch"));
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+      fireEvent.click(keyButton("F4=Clear"));
+      pressKey("F4");
+      pressKey("F7");
+      await settle();
+
+      expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`]);
+      expect(lockState(container)).toEqual(LOCKED);
+      expect(tranIdInput().value).toBe(row.tranId);
+      expect(shownDetails()).toEqual(BLANK_DETAILS);
+      expect(errorText()).toBe("");
+
+      reply.open();
+      await waitFor(() => {
+        expect(shownDetails()).toEqual(row.shown);
+        expect(lockState(container)).toEqual(UNLOCKED);
+      });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(tranIdInput());
+      });
+      await settle();
+      expect(requests).toHaveLength(1);
+
+      // Answered, the keyboard takes the next ENTER: a second read of the same ID.
+      fireEvent.click(keyButton("ENTER=Fetch"));
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      await waitFor(() => {
+        expect(shownDetails()).toEqual(row.shown);
+        expect(lockState(container)).toEqual(UNLOCKED);
+      });
+      expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`, `${ENDPOINT}${row.tranId}`]);
+    },
+  );
+
+  it("takes one ENTER of several pressed before the screen renders again", async () => {
+    const reply = gate();
+    const requests = stubApi(reply.held);
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+    const form = container.querySelector("form");
+    if (form === null) {
+      throw new Error("no form");
+    }
+    fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
+
+    // One batch: React renders the lock only after all four, so only the screen's ref stops them.
+    act(() => {
+      keyButton("ENTER=Fetch").click();
+      keyButton("ENTER=Fetch").click();
+      form.requestSubmit();
+      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    });
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expect(lockState(container)).toEqual(LOCKED);
+    await settle();
+    expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
+
+    reply.open();
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(SHOWN_TYPED);
+      expect(lockState(container)).toEqual(UNLOCKED);
+    });
+  });
+
+  it("ENTER with a blank Tran ID releases the keyboard with no request", async () => {
+    const requests = stubApi();
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+
+    fetchTyped("");
+
+    await waitFor(() => {
+      expect(errorText()).toBe("Tran ID can NOT be empty...");
+    });
+    expect(lockState(container)).toEqual(UNLOCKED);
+    fetchTyped(TYPED_ID);
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(SHOWN_TYPED);
+    });
+    expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
+  });
+
+  it.each([
+    { label: "F3=Back", entryKey: "pf3" },
+    { label: "F5=Browse Tran.", entryKey: "pf5" },
+  ])("$label still leaves for the list while a read is outstanding", async (row) => {
+    const reply = gate();
+    const requests = stubApi(reply.held);
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+
+    fireEvent.click(keyButton(row.label));
+
+    const stub = await reachedStub();
+    expect(stub.path).toBe("/transactions");
+    expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: row.entryKey });
+    reply.open();
+    await settle();
+    expect(requests).toHaveLength(1);
   });
 });
 

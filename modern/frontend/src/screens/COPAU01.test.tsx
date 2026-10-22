@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -446,9 +446,20 @@ function errorText(): string {
   return rows[0]?.textContent ?? "";
 }
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const fields = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [box] = fields;
+  if (!(box instanceof HTMLInputElement)) {
+    throw new Error(`the header has no input ${name}`);
+  }
+  return box.value;
 }
 
 /**
@@ -456,10 +467,10 @@ function headerField(container: HTMLElement, name: string): string | null {
  * `COPAU01-009`): each `INITIAL` with the grid cell of its `POS` and `LENGTH`, and the value
  * field it labels with that field's cell.
  *
- * The six value rows of those lines (`COPAU01-002`, `-003`, `-005`, `-007`, `-008`, `-010`)
- * describe read-only `Input` elements, which `ScreenShell` renders as read-only text; their
- * placement and read-only state are proved by {@link expectHeaderValues}, and their content rows,
- * `COPAU01-055` to `COPAU01-060`, by the values shown.
+ * The six value rows of those lines (`COPAU01-002`, `-003`, `-005`, `-007`, `-008`, `-010`) are
+ * the read-only `Input`s `ScreenShell` renders in the `CardHeader` title rows, skipped by Tab.
+ * {@link expectHeaderValues} proves their placement, read-only state and width; their content
+ * rows, `COPAU01-055` to `COPAU01-060`, are proved by the values those inputs hold.
  */
 const HEADER_LABELS = [
   {
@@ -503,13 +514,13 @@ function cardHeader(container: HTMLElement): HTMLElement {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   container: HTMLElement,
@@ -537,9 +548,13 @@ function expectHeaderValues(
     const found = container.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.dataset.slot).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
@@ -547,9 +562,8 @@ function expectHeaderValues(
     expect(element.parentElement?.className).toBe(
       `row-start-${row} col-start-${col} col-span-${length}`,
     );
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -604,6 +618,27 @@ function focusKey(label: string): HTMLElement {
   button.focus();
   expect(document.activeElement).toBe(button);
   return button;
+}
+
+/**
+ * Checks the keyboard lock as rendered. While `busy`, ENTER, F5 and F8 are disabled and the key
+ * row is `aria-busy`; F3 stays enabled either way.
+ */
+function expectLocked(busy: boolean): void {
+  const labels = ["ENTER", "F3=Back", "F5=Mark/Remove Fraud", "F8=Next Auth"];
+  expect(
+    labels.map((label) => [
+      label,
+      screen.getByRole("button", { name: label }).hasAttribute("disabled"),
+    ]),
+  ).toEqual([
+    ["ENTER", busy],
+    ["F3=Back", false],
+    ["F5=Mark/Remove Fraud", busy],
+    ["F8=Next Auth", busy],
+  ]);
+  const group = screen.getByRole("group", { name: "Function keys" });
+  expect(group.getAttribute("aria-busy")).toBe(String(busy));
 }
 
 /** Clicks the key-row button `label` as the browser does: jsdom's click alone does not focus it. */
@@ -719,7 +754,10 @@ describe("COPAU01 authorization detail screen", () => {
         `row-start-${spec.row} col-start-${spec.labelCol} col-span-${spec.labelSpan}`,
       );
     }
-    expect(document.querySelectorAll("input")).toHaveLength(FIELDS.length);
+    // The body holds no other input; the header values of `ScreenShell` stand outside it.
+    expect(document.querySelectorAll('[data-slot="card-content"] input')).toHaveLength(
+      FIELDS.length,
+    );
 
     const caption = screen.getByText(`Merchant Details ${"-".repeat(59)}`);
     expect(caption.textContent).toHaveLength(76);
@@ -868,7 +906,7 @@ describe("COPAU01 authorization detail screen", () => {
   // audit: COPAU01-007
   // audit: COPAU01-008
   // audit: COPAU01-010
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
@@ -1186,7 +1224,7 @@ describe("COPAU01 authorization detail screen", () => {
     expect(errorText()).toBe(text);
   });
 
-  it("ignores ENTER, F5, F8 and unserved keys while a call is in flight", async () => {
+  it("disables and ignores ENTER, F5, F8 and unserved keys while a call is in flight", async () => {
     let release: () => void = () => undefined;
     const hold = new Promise<void>((resolve) => {
       release = resolve;
@@ -1196,21 +1234,129 @@ describe("COPAU01 authorization detail screen", () => {
     await waitFor(() => {
       expect(requests).toHaveLength(1);
     });
+    expectLocked(true);
 
     fireEvent.click(enterButton());
     fireEvent.click(pfKeyButton("F8=Next Auth"));
     fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
     pressKey("F2");
+    pressKey("F5");
+    pressKey("F8");
     await settle();
     expect(requests).toHaveLength(1);
     expect(shown()).toEqual(BLANK);
+    expect(errorText()).toBe("");
 
     release();
     await waitFor(() => {
       expect(shown()).toEqual(SHOWN_SELECTED);
     });
+    expectLocked(false);
     expect(errorText()).toBe("");
     expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
+
+    // The answer unlocks the keyboard: the next key is served.
+    clickKey("ENTER");
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    await settle();
+    expectLocked(false);
+    expect(calls(requests)).toEqual([
+      `GET ${ENDPOINT}${SELECTED_KEY}`,
+      `GET ${ENDPOINT}${SELECTED_KEY}`,
+    ]);
+  });
+
+  // The lock is taken by the key itself: keys pressed in one burst, before React renders the
+  // disabled keys, send one call, and its answer unlocks the next key.
+  it.each([
+    {
+      title: "three clicks on ENTER",
+      presses: ["ENTER", "ENTER", "ENTER"],
+      sent: `GET ${ENDPOINT}${SELECTED_KEY}`,
+      kept: SELECTED_KEY,
+    },
+    {
+      title: "three Enter keys",
+      presses: ["Enter", "Enter", "Enter"],
+      sent: `GET ${ENDPOINT}${SELECTED_KEY}`,
+      kept: SELECTED_KEY,
+    },
+    {
+      title: "three clicks on F5=Mark/Remove Fraud",
+      presses: ["F5=Mark/Remove Fraud", "F5=Mark/Remove Fraud", "F5=Mark/Remove Fraud"],
+      sent: `POST ${ENDPOINT}${SELECTED_KEY}/fraud`,
+      kept: SELECTED_KEY,
+    },
+    {
+      title: "three F5 keys",
+      presses: ["F5", "F5", "F5"],
+      sent: `POST ${ENDPOINT}${SELECTED_KEY}/fraud`,
+      kept: SELECTED_KEY,
+    },
+    {
+      title: "three clicks on F8=Next Auth",
+      presses: ["F8=Next Auth", "F8=Next Auth", "F8=Next Auth"],
+      sent: `GET ${ENDPOINT}${SELECTED_KEY}?direction=forward`,
+      kept: NEXT_KEY,
+    },
+    {
+      title: "three F8 keys",
+      presses: ["F8", "F8", "F8"],
+      sent: `GET ${ENDPOINT}${SELECTED_KEY}?direction=forward`,
+      kept: NEXT_KEY,
+    },
+    {
+      title: "clicks on F8=Next Auth, ENTER and F5=Mark/Remove Fraud",
+      presses: ["F8=Next Auth", "ENTER", "F5=Mark/Remove Fraud"],
+      sent: `GET ${ENDPOINT}${SELECTED_KEY}?direction=forward`,
+      kept: NEXT_KEY,
+    },
+    {
+      title: "the F5, Enter, F8 and F2 keys",
+      presses: ["F5", "Enter", "F8", "F2"],
+      sent: `POST ${ENDPOINT}${SELECTED_KEY}/fraud`,
+      kept: SELECTED_KEY,
+    },
+  ])("$title in one burst send one call until it is answered", async ({ presses, sent, kept }) => {
+    await renderSelected();
+    // From here every reply waits for `release`.
+    let release: () => void = () => undefined;
+    const hold = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const requests = stubApi(hold);
+
+    // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
+    act(() => {
+      for (const label of presses) {
+        if (label === "ENTER" || label.includes("=")) {
+          fireEvent.click(screen.getByRole("button", { name: label }));
+        } else {
+          fireEvent.keyDown(window, { key: label });
+        }
+      }
+    });
+    await waitFor(() => {
+      expect(requests).toHaveLength(1);
+    });
+    expectLocked(true);
+    await settle();
+    expect(calls(requests)).toEqual([sent]);
+
+    release();
+    await waitFor(() => {
+      expectLocked(false);
+    });
+    expect(errorText()).not.toBe(INVALID_KEY_TEXT);
+
+    clickKey("ENTER");
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+    });
+    await settle();
+    expect(calls(requests)).toEqual([sent, `GET ${ENDPOINT}${kept}`]);
   });
 
   it("F3 leaves while a call is in flight", async () => {
@@ -1223,6 +1369,7 @@ describe("COPAU01 authorization detail screen", () => {
     await waitFor(() => {
       expect(requests).toHaveLength(1);
     });
+    expectLocked(true);
 
     fireEvent.click(pfKeyButton("F3=Back"));
     expect(await reachedStub()).toEqual({

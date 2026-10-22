@@ -558,9 +558,24 @@ export function COTRTUP(): ReactNode {
     defaultValues: { typeCode: "", description: "" },
   });
   // Set from the key that starts a request until its reply, as the 3270 keyboard locks until the
-  // program answers; a ref, so a second key pressed before the next render is refused too.
+  // program answers; a ref, so a second key pressed before the next render is refused too, and
+  // `pending`, which renders it: every key disabled, the key row and the form busy and both
+  // inputs read-only.
   const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
   const searching = SEARCH_STATES.has(view.state);
+
+  /** Locks (`true`) or opens (`false`) the keyboard, for the key handlers and for the screen. */
+  function setInFlight(locked: boolean): void {
+    inFlight.current = locked;
+    setPending(locked);
+  }
+
+  /** A form check that failed unexpectedly sent nothing: the keyboard opens, the error stands. */
+  function unlockAndRethrow(error: unknown): never {
+    setInFlight(false);
+    throw error;
+  }
 
   // Each screen sent places the cursor where `3300-SETUP-SCREEN-ATTRS` puts it (COTRTUPC-046).
   // A layout effect, so it runs after the `autoFocus` of a newly mounted form and before paint.
@@ -597,7 +612,7 @@ export function COTRTUP(): ReactNode {
   /** Endpoint 26 for the code typed (COTRTUPC-009 to COTRTUPC-012). */
   function fetchCode(from: ScreenView, typeCode: string): void {
     const sent = { code: typeCode, description: "" };
-    inFlight.current = true;
+    setInFlight(true);
     fetchType.mutate(
       { path: { type_code: typeCode } },
       {
@@ -608,7 +623,7 @@ export function COTRTUP(): ReactNode {
           failed(from, sent, error);
         },
         onSettled: () => {
-          inFlight.current = false;
+          setInFlight(false);
         },
       },
     );
@@ -620,7 +635,7 @@ export function COTRTUP(): ReactNode {
     aid: components["schemas"]["CotrtupcAid"],
     sent: Values,
   ): void {
-    inFlight.current = true;
+    setInFlight(true);
     actOnType.mutate(
       {
         path: { type_code: sent.code },
@@ -635,7 +650,7 @@ export function COTRTUP(): ReactNode {
           failed(from, sent, error);
         },
         onSettled: () => {
-          inFlight.current = false;
+          setInFlight(false);
         },
       },
     );
@@ -647,7 +662,7 @@ export function COTRTUP(): ReactNode {
    * their message where they do.
    */
   function refusedHere(from: ScreenView, codeMessage?: string, descriptionMessage?: string): void {
-    inFlight.current = false;
+    setInFlight(false);
     if (codeMessage !== undefined) {
       show(codeRefused(from, codeMessage));
     } else if (descriptionMessage !== undefined) {
@@ -663,40 +678,46 @@ export function COTRTUP(): ReactNode {
     const from = view;
     switch (from.state) {
       case "fresh":
-        inFlight.current = true;
-        void searchForm.handleSubmit(
-          (values) => {
-            fetchCode(from, values.typeCode);
-          },
-          (errors) => {
-            refusedHere(from, errors.typeCode?.message);
-          },
-        )();
+        setInFlight(true);
+        void searchForm
+          .handleSubmit(
+            (values) => {
+              fetchCode(from, values.typeCode);
+            },
+            (errors) => {
+              refusedHere(from, errors.typeCode?.message);
+            },
+          )()
+          .catch(unlockAndRethrow);
         return;
       case "X":
-        inFlight.current = true;
-        void detailsForm.handleSubmit(
-          (values) => {
-            fetchCode(from, values.typeCode);
-          },
-          (errors) => {
-            refusedHere(from, errors.typeCode?.message, errors.description?.message);
-          },
-        )();
+        setInFlight(true);
+        void detailsForm
+          .handleSubmit(
+            (values) => {
+              fetchCode(from, values.typeCode);
+            },
+            (errors) => {
+              refusedHere(from, errors.typeCode?.message, errors.description?.message);
+            },
+          )()
+          .catch(unlockAndRethrow);
         return;
       case "S":
       case "E":
       case "B":
       case "R":
-        inFlight.current = true;
-        void detailsForm.handleSubmit(
-          (values) => {
-            actOn(from, "ENTER", { code: values.typeCode, description: values.description });
-          },
-          (errors) => {
-            refusedHere(from, errors.typeCode?.message, errors.description?.message);
-          },
-        )();
+        setInFlight(true);
+        void detailsForm
+          .handleSubmit(
+            (values) => {
+              actOn(from, "ENTER", { code: values.typeCode, description: values.description });
+            },
+            (errors) => {
+              refusedHere(from, errors.typeCode?.message, errors.description?.message);
+            },
+          )()
+          .catch(unlockAndRethrow);
         return;
       case "N":
         // No edit runs once changes are validated: the same screen again (COTRTUPC-022).
@@ -806,6 +827,8 @@ export function COTRTUP(): ReactNode {
       dark: item.dark,
       hidden: !item.shown,
       onPress: handlers[item.key],
+      // `unlessPending` refuses every key while a request is out, F3 included.
+      disabled: pending,
     }));
 
   /** A submit the ENTER button did not intercept is still the screen's ENTER. */
@@ -847,10 +870,11 @@ export function COTRTUP(): ReactNode {
           handlers[key]?.();
         },
       }}
+      busy={pending}
     >
       {searching ? (
         <Form {...searchForm}>
-          <form key="search" id={formId} noValidate onSubmit={submit}>
+          <form key="search" id={formId} noValidate aria-busy={pending} onSubmit={submit}>
             <FieldGrid>
               <FormField
                 control={searchForm.control}
@@ -862,7 +886,7 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.typeCode}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={CODE_EDITABLE.has(view.state)}
+                    editable={CODE_EDITABLE.has(view.state) && !pending}
                     mark={view.codeMark}
                     message={view.message}
                     autoFocus
@@ -894,7 +918,7 @@ export function COTRTUP(): ReactNode {
         </Form>
       ) : (
         <Form {...detailsForm}>
-          <form key="details" id={formId} noValidate onSubmit={submit}>
+          <form key="details" id={formId} noValidate aria-busy={pending} onSubmit={submit}>
             <FieldGrid>
               <FormField
                 control={detailsForm.control}
@@ -906,7 +930,7 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.typeCode}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={CODE_EDITABLE.has(view.state)}
+                    editable={CODE_EDITABLE.has(view.state) && !pending}
                     mark={view.codeMark}
                     message={view.message}
                     autoFocus
@@ -923,7 +947,7 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.description}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={DESCRIPTION_EDITABLE.has(view.state)}
+                    editable={DESCRIPTION_EDITABLE.has(view.state) && !pending}
                     mark={view.descriptionMark}
                     message={view.message}
                   />

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
@@ -210,6 +210,29 @@ export function COUSR00(): ReactNode {
   const [pagenum, setPagenum] = useState("");
   const [message, setMessage] = useState("");
 
+  // The terminal keyboard stays locked until the program's answer arrives. `inFlight` is taken
+  // when a key is accepted, before the form's asynchronous validation, and freed when the key
+  // ends without a request or its page request settles; `pending` shows the same lock on the
+  // keys and inputs.
+  const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
+
+  /** Locks the keyboard for one key; `false`, and nothing locked, while another holds it. */
+  function lock(): boolean {
+    if (inFlight.current) {
+      return false;
+    }
+    inFlight.current = true;
+    setPending(true);
+    return true;
+  }
+
+  /** Frees the keyboard for the next key. */
+  function unlock(): void {
+    inFlight.current = false;
+    setPending(false);
+  }
+
   /** Puts the cursor on the search field, as every send does (`USRIDINL` = -1, COUSR00C-032). */
   function focusSearch(): void {
     form.setFocus("startUserId");
@@ -254,6 +277,7 @@ export function COUSR00(): ReactNode {
           }
           focusSearch();
         },
+        onSettled: unlock,
       },
     );
   }
@@ -266,18 +290,29 @@ export function COUSR00(): ReactNode {
       return;
     }
     entered.current = true;
-    // `echo` still holds the keys the entry carried, the only state this request sends.
-    requestPage(echo, { clearsSearch: true });
+    if (lock()) {
+      // `echo` still holds the keys the entry carried, the only state this request sends.
+      requestPage(echo, { clearsSearch: true });
+    }
   }, []);
+
+  /**
+   * Takes ENTER and locks the keyboard before the form validates, so no selection is acted on
+   * and no list is requested while a page request is outstanding.
+   */
+  function onSubmit(event: FormEvent<HTMLFormElement>): void {
+    if (!lock()) {
+      event.preventDefault();
+      return;
+    }
+    void form.handleSubmit(onEnter, onInvalid)(event);
+  }
 
   /** ENTER (COUSR00-096): a selection transfers; otherwise list from the search field. */
   function onEnter(values: Cousr00Values): void {
-    // The terminal keyboard stays locked until the program's answer arrives.
-    if (list.isPending) {
-      return;
-    }
     const outcome = selectionOutcome(values.selections, rows);
     if (outcome.action !== "list") {
+      unlock();
       // XCTL COUSR02C or COUSR03C with the selected user ID (COUSR00C-008, COUSR00C-009). The
       // keys ride along as the COMMAREA does, for a partner screen that returns its state.
       navigate(outcome.action === "update" ? PATHS.COUSR02 : PATHS.COUSR03, {
@@ -301,6 +336,7 @@ export function COUSR00(): ReactNode {
 
   /** A map length the schema refuses: its message in the error row, no request. */
   function onInvalid(): void {
+    unlock();
     const result = cousr00Schema.safeParse(form.getValues());
     setMessage(result.success ? "" : (result.error.issues[0]?.message ?? ""));
     focusSearch();
@@ -308,7 +344,7 @@ export function COUSR00(): ReactNode {
 
   /** F7 (COUSR00-098): the page before, read back from the first user ID shown. */
   function pageBackward(): void {
-    if (list.isPending) {
+    if (!lock()) {
       return;
     }
     requestPage(
@@ -319,7 +355,7 @@ export function COUSR00(): ReactNode {
 
   /** F8 (COUSR00-099): the page after, read on from the last user ID shown. */
   function pageForward(): void {
-    if (list.isPending) {
+    if (!lock()) {
       return;
     }
     requestPage({ ...echo, direction: "forward", page_key: echo.last_key }, { clearsSearch: true });
@@ -339,8 +375,13 @@ export function COUSR00(): ReactNode {
     F7: pageBackward,
     F8: pageForward,
   };
-  // ENTER has no action of its own: its button and the Enter key submit the form.
-  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: actions[item.key] }));
+  // ENTER has no action of its own: its button and the Enter key submit the form. F3 stays
+  // available while a page request is outstanding; ENTER, F7 and F8 wait for its answer.
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: actions[item.key],
+    disabled: pending && item.key !== "F3",
+  }));
 
   return (
     <ScreenShell
@@ -351,9 +392,10 @@ export function COUSR00(): ReactNode {
       message={{ text: message.slice(0, ERRMSG_LENGTH), kind: "error" }}
       keys={keys}
       keyOptions={{ onInvalidKey: showInvalidKey }}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} noValidate onSubmit={form.handleSubmit(onEnter, onInvalid)}>
+        <form id={formId} noValidate aria-busy={pending} onSubmit={onSubmit}>
           {/*
            * BLITZY [LAYOUT]: the map's line tracks are sized to content (`grid-rows-none`, which
            * overrides FieldGrid's 24 equal tracks). The list block is one `Table` on line 8 that
@@ -398,6 +440,7 @@ export function COUSR00(): ReactNode {
                         maxLength={COUSR00_LENGTHS.startUserId}
                         autoComplete="off"
                         autoFocus
+                        readOnly={pending}
                         className={EIGHT_CHARACTER_FIELD}
                       />
                     </FormControl>
@@ -453,6 +496,7 @@ export function COUSR00(): ReactNode {
                                   {...field}
                                   maxLength={COUSR00_LENGTHS.selection}
                                   autoComplete="off"
+                                  readOnly={pending}
                                   className="w-10 text-center"
                                 />
                               </FormControl>

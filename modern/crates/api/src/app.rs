@@ -4,8 +4,10 @@
 //!
 //! - [`AppState`] holds what the services reach: the [`PgStore`], their only path to
 //!   `PostgreSQL` (R4), the [`JwtKeys`] that sign and verify the sign-on token, the injected
-//!   [`Clock`], their only time source, and the job-deck directory of endpoint 14
-//!   (`CARDDEMO_INTRDR_DIR`), the counterpart of CORPT00C's `JOBS` transient data queue.
+//!   [`Clock`], their only time source, the job-deck directory of endpoint 14
+//!   (`CARDDEMO_INTRDR_DIR`), the counterpart of CORPT00C's `JOBS` transient data queue, and the
+//!   [`PasswordWork`] budget every argon2id computation of sign-on, user add and user update
+//!   runs under (see "Password work" below).
 //!   [`check_intrdr_dir`] is the check `carddemo-api` runs on that directory before it connects,
 //!   through the one service that touches the filesystem (AAP 0.5.3).
 //! - [`router`] registers every handler through `operation`, which builds what
@@ -35,6 +37,23 @@
 //! the latency, so the default `info` output records every request. tower-http's default request
 //! event (`DEBUG`) and failure event (`ERROR`, for a 5xx) are kept: neither names the URI.
 //!
+//! # Password work
+//!
+//! argon2id is deliberately CPU- and memory-hard: with argon2's default parameters, the ones
+//! `domain::password::hash` writes into every stored hash, one computation holds about 19 MiB
+//! and a core for its whole run. The services run each one on Tokio's blocking pool, so no
+//! runtime worker stalls, but the pool alone bounds nothing: it grows to 512 threads and queues
+//! the rest without limit, and a task it has started runs to its end even when its request is
+//! dropped. A burst of sign-ons for a known user ID, which anyone can send, would then exhaust
+//! the host's memory and starve every other blocking task: uncontrolled resource consumption.
+//!
+//! [`PasswordWork`] bounds that work for the whole process. A computation is admitted only while
+//! fewer than `running + queued` are admitted, runs only while fewer than `running` run, and
+//! keeps both places until argon2 returns, whatever happens to the request that asked for it. A
+//! request that finds every place taken is refused at once, never queued: its service answers
+//! the 500 it gives a computation that cannot finish. Argon2's parameters, the verification and
+//! every ordinary answer are unchanged; only admission is bounded.
+//!
 //! # What is deliberately absent
 //!
 //! - No CORS layer: the Vite dev server proxies `/api`, so the browser sees a single origin.
@@ -49,6 +68,7 @@
 
 use std::fmt;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +82,7 @@ use domain::clock::Clock;
 use persistence::PgStore;
 use runtime::config::{Config, EnvError};
 use runtime::telemetry::{UNMATCHED_ROUTE, record_response, request_span};
+use tokio::sync::Semaphore;
 use tower_http::trace::{MakeSpan, OnResponse, TraceLayer};
 use tracing::Span;
 use utoipa::__dev::{SchemaReferences, Tags};
@@ -88,7 +109,8 @@ pub const DOCUMENT_ROUTE: &str = "/api-docs/openapi.json";
 /// What every handler receives through `axum::extract::State`, and its extractors through
 /// [`FromRef`].
 ///
-/// Cloning is cheap: the store clones a pool handle, the keys and the clock an `Arc`.
+/// Cloning is cheap: the store clones a pool handle, the keys and the clock an `Arc`, and the
+/// password budget two, so every clone shares one budget.
 #[derive(Clone)]
 pub struct AppState {
     /// The executor of every repository trait, the services' only path to `PostgreSQL` (R4). A
@@ -102,11 +124,16 @@ pub struct AppState {
     /// `CARDDEMO_INTRDR_DIR`: where endpoint 14 writes each job deck as the next `TRNRPT00`
     /// generation.
     pub intrdr_dir: PathBuf,
+    /// The budget every argon2id computation runs under: sign-on's verification, the user add's
+    /// hash and the user update's change test (see "Password work" in the module
+    /// documentation).
+    pub password_work: PasswordWork,
 }
 
 impl AppState {
     /// The state over `store`, signing and verifying tokens with `jwt`, reading time from
-    /// `clock` and writing job decks under `intrdr_dir`.
+    /// `clock`, writing job decks under `intrdr_dir` and running password work under the
+    /// process's default budget, [`PasswordWork::default`].
     #[must_use]
     pub fn new(store: PgStore, jwt: JwtKeys, clock: Arc<dyn Clock>, intrdr_dir: PathBuf) -> Self {
         Self {
@@ -114,6 +141,17 @@ impl AppState {
             jwt,
             clock,
             intrdr_dir,
+            password_work: PasswordWork::default(),
+        }
+    }
+
+    /// The same state with `password_work` in place of its budget, for a caller that sizes the
+    /// budget itself, such as a test that must fill it.
+    #[must_use]
+    pub fn with_password_work(self, password_work: PasswordWork) -> Self {
+        Self {
+            password_work,
+            ..self
         }
     }
 
@@ -186,8 +224,8 @@ pub fn check_intrdr_dir(config: &Config) -> Result<(), IntrdrDirError> {
     check_deck_dir(&config.intrdr_dir).map_err(|kind| IntrdrDirError { kind })
 }
 
-/// Names every field but shows only the job-deck directory: the keys are secret, and neither the
-/// store nor the clock has anything a diagnostic needs.
+/// Names every field but shows only the job-deck directory and the password budget's limits: the
+/// keys are secret, and neither the store nor the clock has anything a diagnostic needs.
 impl fmt::Debug for AppState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppState")
@@ -195,7 +233,219 @@ impl fmt::Debug for AppState {
             .field("jwt", &format_args!(".."))
             .field("clock", &format_args!(".."))
             .field("intrdr_dir", &self.intrdr_dir)
+            .field("password_work", &self.password_work)
             .finish()
+    }
+}
+
+/// The most argon2id computations [`PasswordWork::default`] runs at once, however many cores the
+/// host has. Each one holds about 19 MiB and a core until it returns, so eight bound the
+/// budget's argon2 memory to about 152 MiB and leave the other cores, and the rest of Tokio's
+/// blocking pool, to every other request.
+pub const MAX_PASSWORD_WORKERS: usize = 8;
+
+/// How many argon2id computations [`PasswordWork::default`] lets wait for a worker once every
+/// worker is busy. A waiting computation has not started, so it holds no argon2 memory and no
+/// thread, only its request; 64 places are eight rounds of a full complement of eight workers,
+/// enough to absorb an ordinary burst of sign-ons, and a request beyond them is refused at once
+/// rather than kept waiting behind an unbounded queue.
+pub const PASSWORD_QUEUE: usize = 64;
+
+/// The budget every argon2id computation of the API runs under: sign-on's verification
+/// (COSGN00C), the user add's hash (COUSR01C) and the user update's change test (COUSR02C). See
+/// "Password work" in the module documentation for why it exists.
+///
+/// At most `running` computations run at once, each on a thread of Tokio's blocking pool, and at
+/// most `queued` more wait for one. A computation keeps its places until it returns, so a
+/// request that is dropped while its computation runs frees nothing early. A request that finds
+/// every place taken is refused at once ([`PasswordWorkError::Saturated`]).
+///
+/// Cloning is cheap and shares the budget: each limit is one `Arc`ed semaphore.
+#[derive(Clone)]
+pub struct PasswordWork {
+    /// One permit per computation that may run at once.
+    running: Arc<Semaphore>,
+    /// One permit per computation admitted, running or waiting for a `running` permit.
+    admitted: Arc<Semaphore>,
+    /// The `running` limit, as `Debug` and the saturation event show it.
+    workers: usize,
+    /// The waiting places beyond the workers, as `Debug` and the saturation event show them.
+    queue: usize,
+}
+
+impl PasswordWork {
+    /// A budget of `running` computations at once and `queued` more waiting for a worker.
+    ///
+    /// `running` is raised to 1 when it is 0, because a budget that runs nothing would keep
+    /// every admitted request waiting forever. `queued` may be 0: every request that finds all
+    /// workers busy is then refused. Both are capped so that their sum fits one Tokio semaphore
+    /// ([`Semaphore::MAX_PERMITS`]).
+    #[must_use]
+    pub fn new(running: usize, queued: usize) -> Self {
+        let workers = running.clamp(1, Semaphore::MAX_PERMITS);
+        let admitted = workers.saturating_add(queued).min(Semaphore::MAX_PERMITS);
+        Self {
+            running: Arc::new(Semaphore::new(workers)),
+            admitted: Arc::new(Semaphore::new(admitted)),
+            workers,
+            queue: admitted.saturating_sub(workers),
+        }
+    }
+
+    /// Runs `work`, an argon2id computation, on Tokio's blocking pool within the budget, and
+    /// returns its result.
+    ///
+    /// The request takes a waiting place first, without waiting for one, then waits for a
+    /// worker. Both places move into the blocking task and are given back only when `work`
+    /// returns or unwinds, so dropping the returned future frees a place only while `work` has
+    /// not started. A refusal is logged here, once, as an `ERROR`, since its request is answered
+    /// with a 500, naming the budget's limits and nothing of the request.
+    ///
+    /// # Errors
+    ///
+    /// - [`PasswordWorkError::Saturated`] at once when every place is taken; `work` never runs.
+    /// - [`PasswordWorkError::Interrupted`] when the blocking task does not complete: `work`
+    ///   panicked, or the runtime shut down first. Only whether it panicked is kept.
+    pub(crate) async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, PasswordWorkError> {
+        // Neither semaphore is ever closed, so only `NoPermits` refuses in practice; a closed
+        // one would admit nothing, which is what a refusal answers.
+        let admitted = Arc::clone(&self.admitted)
+            .try_acquire_owned()
+            .map_err(|_| self.refused())?;
+        let running = Arc::clone(&self.running)
+            .acquire_owned()
+            .await
+            .map_err(|_| self.refused())?;
+        tokio::task::spawn_blocking(move || {
+            let output = work();
+            drop((admitted, running));
+            output
+        })
+        .await
+        .map_err(|error| PasswordWorkError::Interrupted {
+            panicked: error.is_panic(),
+        })
+    }
+
+    /// Logs a refusal and returns it: the one event of a saturated budget, naming its limits
+    /// alone, never a user ID, a password or a hash.
+    fn refused(&self) -> PasswordWorkError {
+        tracing::error!(
+            running = self.workers,
+            queued = self.queue,
+            "password work budget saturated; refusing the request"
+        );
+        PasswordWorkError::Saturated
+    }
+}
+
+/// The budget of the `carddemo-api` process: as many workers as the host's available
+/// parallelism, at least 1, and 1 when it cannot be determined, but never more than
+/// [`MAX_PASSWORD_WORKERS`]; and [`PASSWORD_QUEUE`] waiting places.
+impl Default for PasswordWork {
+    fn default() -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        Self::new(parallelism.min(MAX_PASSWORD_WORKERS), PASSWORD_QUEUE)
+    }
+}
+
+/// Shows the two limits and leaves out the semaphores, whose momentary state is not a setting.
+impl fmt::Debug for PasswordWork {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PasswordWork")
+            .field("running", &self.workers)
+            .field("queued", &self.queue)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Why [`PasswordWork::run`] returned no result. Neither variant carries a value of the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasswordWorkError {
+    /// Every worker was busy and every waiting place taken, so the computation was refused at
+    /// once and never ran.
+    Saturated,
+    /// The computation's blocking task did not complete. Only whether it panicked is kept, never
+    /// the panic's payload, which can carry any value the computation held.
+    Interrupted {
+        /// Whether the computation panicked, rather than being cancelled by a shutting-down
+        /// runtime.
+        panicked: bool,
+    },
+}
+
+/// Test support for the services that run password work: a computation that holds one worker
+/// of a [`PasswordWork`] until the test lets it go, so that a test can fill a budget, and a wait
+/// for a budget whose every place is taken.
+#[cfg(test)]
+pub(crate) mod worker_hold {
+    use std::error::Error as StdError;
+    use std::future::poll_fn;
+    use std::pin::pin;
+    use std::sync::mpsc;
+    use std::task::Poll;
+    use std::time::Duration;
+
+    use tokio::sync::oneshot;
+    use tokio::task::JoinHandle;
+
+    use super::{PasswordWork, PasswordWorkError};
+
+    /// A computation that holds a worker and a place of its budget until
+    /// [`release`](Self::release), or until it is dropped.
+    pub(crate) struct WorkerHold {
+        /// Lets the computation return.
+        release: mpsc::Sender<()>,
+        /// The request that runs it: `Ok(true)` when the computation was released by a send.
+        task: JoinHandle<Result<bool, PasswordWorkError>>,
+    }
+
+    impl WorkerHold {
+        /// Starts the computation under `work` and returns once it is running.
+        pub(crate) async fn start(work: &PasswordWork) -> Result<Self, Box<dyn StdError>> {
+            let (started, has_started) = oneshot::channel();
+            let (release, released) = mpsc::channel();
+            let work = work.clone();
+            let task = tokio::spawn(async move {
+                work.run(move || started.send(()).is_ok() && released.recv().is_ok())
+                    .await
+            });
+            has_started.await?;
+            Ok(Self { release, task })
+        }
+
+        /// Lets the computation return, and answers what its request received.
+        pub(crate) async fn release(self) -> Result<bool, Box<dyn StdError>> {
+            self.release.send(())?;
+            self.task
+                .await?
+                .map_err(|error| format!("the held computation failed: {error:?}").into())
+        }
+    }
+
+    /// Returns once every place of `work` is taken, which a probe computation refused as
+    /// saturated shows.
+    ///
+    /// Each probe is polled exactly once and dropped at once when it is admitted instead, so it
+    /// never keeps a place from the request the caller waits for, even across the pause between
+    /// probes.
+    pub(crate) async fn until_saturated(work: &PasswordWork) -> Result<(), Box<dyn StdError>> {
+        loop {
+            let answered = {
+                let mut probe = pin!(work.run(|| ()));
+                poll_fn(|cx| Poll::Ready(probe.as_mut().poll(cx))).await
+            };
+            match answered {
+                Poll::Ready(Err(PasswordWorkError::Saturated)) => return Ok(()),
+                Poll::Ready(other) => {
+                    return Err(format!("a probe was not refused: {other:?}").into());
+                }
+                Poll::Pending => tokio::time::sleep(Duration::from_millis(1)).await,
+            }
+        }
     }
 }
 
@@ -368,8 +618,12 @@ impl<B> OnResponse<B> for ResponseFields {
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error as StdError;
+    use std::num::NonZeroUsize;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
 
     use axum::body::{self, Body};
     use axum::extract::FromRef;
@@ -383,9 +637,14 @@ mod tests {
     use serde_json::Value;
     use test_support::postgres::{PostgresGuard, start_postgres};
     use test_support::trace_capture;
+    use tokio::sync::{Semaphore, oneshot};
     use tower::ServiceExt as _;
 
-    use super::{AppState, DOCUMENT_ROUTE, app, openapi};
+    use super::worker_hold::WorkerHold;
+    use super::{
+        AppState, DOCUMENT_ROUTE, MAX_PASSWORD_WORKERS, PASSWORD_QUEUE, PasswordWork,
+        PasswordWorkError, app, openapi,
+    };
     use crate::auth::jwt::JwtKeys;
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -560,6 +819,124 @@ mod tests {
         builder.body(Body::empty())
     }
 
+    #[test]
+    fn password_budgets_keep_valid_limits() {
+        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let host_workers = parallelism.min(MAX_PASSWORD_WORKERS);
+        assert!((1..=MAX_PASSWORD_WORKERS).contains(&host_workers));
+        let cases = [
+            // A budget that ran nothing would keep every request waiting: one worker at least.
+            (PasswordWork::new(0, 0), 1, 0),
+            (PasswordWork::new(2, 3), 2, 3),
+            // Capped so that every place fits one semaphore.
+            (
+                PasswordWork::new(usize::MAX, usize::MAX),
+                Semaphore::MAX_PERMITS,
+                0,
+            ),
+            (PasswordWork::default(), host_workers, PASSWORD_QUEUE),
+        ];
+        for (work, running, queued) in cases {
+            assert_eq!(
+                format!("{work:?}"),
+                format!("PasswordWork {{ running: {running}, queued: {queued}, .. }}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_password_budget_refuses_at_once_and_logs_no_value() -> TestResult {
+        block_on(async {
+            let work = PasswordWork::new(1, 0);
+            let shared = work.clone();
+            let hold = WorkerHold::start(&work).await?;
+            let traces = trace_capture::capture();
+
+            // The refusal is the answer to the first poll: a request never waits for a place, and
+            // a clone draws on the same places.
+            let refused = tokio::time::timeout(Duration::ZERO, shared.run(|| 1)).await;
+            assert_eq!(refused, Ok(Err(PasswordWorkError::Saturated)));
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{} lines", lines.len()).into());
+            };
+            for part in [
+                r#""level":"ERROR""#,
+                "password work budget saturated",
+                r#""running":1"#,
+                r#""queued":0"#,
+            ] {
+                assert!(line.contains(part), "{part} missing from {line}");
+            }
+
+            // Once the computation returns, its places serve the next request.
+            assert!(hold.release().await?);
+            assert_eq!(shared.run(|| 2).await, Ok(2));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn an_abandoned_computation_keeps_its_places_until_it_returns() -> TestResult {
+        block_on(async {
+            let work = PasswordWork::new(1, 1);
+            let finished = Arc::new(AtomicBool::new(false));
+            let (started, has_started) = oneshot::channel();
+            let (release, released) = mpsc::channel::<()>();
+            let request = tokio::spawn({
+                let work = work.clone();
+                let finished = Arc::clone(&finished);
+                async move {
+                    work.run(move || {
+                        let sent = started.send(()).is_ok() && released.recv().is_ok();
+                        finished.store(true, Ordering::SeqCst);
+                        sent
+                    })
+                    .await
+                }
+            });
+            has_started.await?;
+            // The request is dropped while its computation runs, as when a client disconnects.
+            request.abort();
+            assert!(request.await.is_err_and(|error| error.is_cancelled()));
+
+            // The next computation takes the waiting place and waits for the worker the abandoned
+            // one still holds ...
+            let mut waiting = pin!(work.run({
+                let finished = Arc::clone(&finished);
+                move || finished.load(Ordering::SeqCst)
+            }));
+            let first_poll = tokio::time::timeout(Duration::ZERO, waiting.as_mut()).await;
+            assert!(
+                first_poll.is_err(),
+                "the waiting computation finished at once"
+            );
+            // ... and the abandoned one's admission is still taken too: a third is refused.
+            assert_eq!(work.run(|| false).await, Err(PasswordWorkError::Saturated));
+
+            // Released, the abandoned computation returns, and only then does the waiting one run.
+            release.send(())?;
+            assert_eq!(waiting.await, Ok(true));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_panicking_computation_is_interrupted_and_gives_its_places_back() -> TestResult {
+        block_on(async {
+            let work = PasswordWork::new(1, 0);
+            let interrupted = work
+                .run(|| -> u8 { panic!("a stand-in for a failed computation") })
+                .await;
+            assert_eq!(
+                interrupted,
+                Err(PasswordWorkError::Interrupted { panicked: true })
+            );
+            assert_eq!(work.run(|| 5).await, Ok(5));
+            Ok(())
+        })
+    }
+
     /// Runs `test` to completion on a current-thread runtime with I/O and time enabled, the
     /// runtime `#[tokio::test]` builds. It is built here because that attribute's expansion
     /// carries lint-suppression attributes, which R15 admits nowhere (escalation E46). The test
@@ -592,7 +969,10 @@ mod tests {
             let shown = format!("{state:?}");
             assert_eq!(
                 shown,
-                r#"AppState { store: .., jwt: .., clock: .., intrdr_dir: "var/test-jobs" }"#
+                format!(
+                    r#"AppState {{ store: .., jwt: .., clock: .., intrdr_dir: "var/test-jobs", password_work: {:?} }}"#,
+                    PasswordWork::default()
+                )
             );
             assert!(!shown.contains(SECRET));
 
@@ -607,6 +987,13 @@ mod tests {
             // A `U` token reaches no admin operation.
             let (status, _) = send(&state, get("/api/v1/menus/admin", Some(&token))?).await?;
             assert_eq!(status, StatusCode::FORBIDDEN);
+
+            // A budget sized by the caller replaces the default one and nothing else.
+            let resized = state.with_password_work(PasswordWork::new(2, 3));
+            assert_eq!(
+                format!("{resized:?}"),
+                r#"AppState { store: .., jwt: .., clock: .., intrdr_dir: "var/test-jobs", password_work: PasswordWork { running: 2, queued: 3, .. } }"#
+            );
             Ok(())
         })
     }

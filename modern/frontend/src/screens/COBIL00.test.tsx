@@ -22,10 +22,11 @@ import { COBIL00 } from "./COBIL00";
  * `PIC +9999999999.99` edits (ARITH-019); it is compared as text, never read as an amount. The
  * endpoint carries no card number, and no SSN or password appears.
  *
- * Of the header rows, the label rows `COBIL00-001`, `-004`, `-006` and `-009` are proved by NAV
- * (`frontend/e2e/nav.spec.ts`). The value rows `COBIL00-002`, `-003`, `-005`, `-007`, `-008` and
- * `-010` are tagged here, on the read-only title-row cells the shared `ScreenShell` renders them
- * in, and so are their content rows (`COBIL00-025` to `COBIL00-030`).
+ * The header values are the read-only `Input`s the shared `ScreenShell` renders in the
+ * `CardHeader` title rows. Their label rows `COBIL00-001`, `-004`, `-006` and `-009` are proved by
+ * NAV (`frontend/e2e/nav.spec.ts`). The value rows `COBIL00-002`, `-003`, `-005`, `-007`, `-008`
+ * and `-010` are tagged here, and so are their content rows (`COBIL00-025` to `COBIL00-030`), read
+ * from those inputs' values.
  */
 
 const ENDPOINT = "/api/v1/bill-payments";
@@ -325,9 +326,20 @@ function messageRow(): HTMLElement {
   return row;
 }
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
+ * of that name in the `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerField(container: HTMLElement, name: string): string {
+  const fields = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [field] = fields;
+  if (!(field instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return field.value;
 }
 
 /** The row-24 button labelled `label`, checked to be a plain `outline`, `sm` button. */
@@ -575,49 +587,114 @@ describe("COBIL00 bill payment screen", () => {
     expect(headerField(container, "CURTIME")).toBe("23:59:58");
   });
 
-  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
-  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
-  // are proved under COBIL00-025 to COBIL00-030.
-  // audit: COBIL00-002
-  // audit: COBIL00-003
-  // audit: COBIL00-005
-  // audit: COBIL00-007
-  // audit: COBIL00-008
-  // audit: COBIL00-010
-  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", () => {
-    stubApi();
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
+  // The values these fields show are proved under COBIL00-025 to COBIL00-030.
+  it.each([
+    // audit: COBIL00-002
+    {
+      id: "COBIL00-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CB00",
+    },
+    // audit: COBIL00-003
+    {
+      id: "COBIL00-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COBIL00-005
+    {
+      id: "COBIL00-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COBIL00-007
+    {
+      id: "COBIL00-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COBIL00C",
+    },
+    // audit: COBIL00-008
+    {
+      id: "COBIL00-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // audit: COBIL00-010
+    {
+      id: "COBIL00-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id: header value $name is a read-only Input of the CardHeader title rows at its map POS and LENGTH",
+    ({ name, row, col, length, label, shows }) => {
+      stubApi();
+      const { container } = renderScreen({ from: PATHS.COMEN01 });
 
-    const header = container.querySelector('[data-slot="card-header"]');
-    expect(header).not.toBeNull();
-    // The title rows hold no form control.
-    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
-    for (const { name, row, col, length } of [
-      { name: "TRNNAME", row: 1, col: 7, length: 4 },
-      { name: "TITLE01", row: 1, col: 21, length: 40 },
-      { name: "CURDATE", row: 1, col: 71, length: 8 },
-      { name: "PGMNAME", row: 2, col: 7, length: 8 },
-      { name: "TITLE02", row: 2, col: 21, length: 40 },
-      { name: "CURTIME", row: 2, col: 71, length: 8 },
-    ]) {
+      const header = container.querySelector('[data-slot="card-header"]');
+      if (!(header instanceof HTMLElement)) {
+        throw new Error("COBIL0A renders no card header");
+      }
       // The field's one element stands in the title rows, not in the body or the footer.
-      const shown = container.querySelectorAll(`[data-field="${name}"]`);
+      const shown = document.querySelectorAll(`[data-field="${name}"]`);
       expect(shown).toHaveLength(1);
       const value = shown.item(0);
-      expect(header?.contains(value)).toBe(true);
-      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
-      // centres the titles included.
-      const cell = value?.parentElement;
-      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
-      expect(value?.textContent).toHaveLength(length);
-      // Neither the value nor anything in its cell takes input or focus.
-      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
-      for (const element of [value, cell]) {
-        expect(element?.hasAttribute("contenteditable")).toBe(false);
-        expect(element?.hasAttribute("tabindex")).toBe(false);
+      expect(header.contains(value)).toBe(true);
+      expect(value.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+      // It is an output field of the map: a read-only `Input` as wide as its LENGTH (`size`), in
+      // the cell of its POS and LENGTH, holding LENGTH characters, the padding that centres the
+      // titles included.
+      if (!(value instanceof HTMLInputElement)) {
+        throw new Error(`The header field ${name} is not an input`);
       }
-    }
-  });
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      expect(value.value).toHaveLength(length);
+      // The map literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(value.getAttribute("aria-label")).toBe(label === null ? `Title row ${row}` : null);
+      // The title rows hold no editable control: their six controls are the read-only values.
+      const controls = Array.from(
+        header.querySelectorAll("input, textarea, select, button, [contenteditable]"),
+      );
+      expect(controls).toHaveLength(6);
+      expect(
+        controls.every((control) => control instanceof HTMLInputElement && control.readOnly),
+      ).toBe(true);
+    },
+  );
 
   // audit: COBIL00C-035
   // audit: COBIL00C-037
@@ -840,14 +917,14 @@ describe("COBIL00 bill payment screen", () => {
   });
 
   // A failure of the replacement alone, which no audit row covers: a reply without a JSON object
-  // body, such as the dev proxy's empty 502 while the API is down, carries no message of the
-  // program's, so the row names the status, and no field takes the cursor. openapi-fetch hands
-  // over a 204's or a `Content-Length: 0` body as nothing and any other error body as its text or
-  // parsed JSON, so an empty body of no declared length, a chunked one, plain text and JSON `null`
-  // are no `ScreenError` either; a success without a body has no data.
+  // body, such as an empty 502 from a gateway, carries no message of the program's, so the row
+  // names the status, and no field takes the cursor. openapi-fetch hands over a 204's or a
+  // `Content-Length: 0` body as nothing and any other error body as its text or parsed JSON, so
+  // an empty body of no declared length, a chunked one, plain text and JSON `null` are no
+  // `ScreenError` either; a success without a body has no data.
   it.each([
     {
-      reply: "the dev proxy's empty 502",
+      reply: "an empty 502 from a gateway",
       response: () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
       message: "HTTP 502 Bad Gateway",
     },
@@ -1042,28 +1119,50 @@ describe("COBIL00 bill payment screen", () => {
     expect(requests).toHaveLength(1);
   });
 
-  // The terminal keyboard stays locked until the program's reply arrives; the screen holds ENTER
-  // and F4 while its request is in flight, so a second ENTER cannot pay twice.
-  it("ignores ENTER and F4 while its request is in flight, then shows the reply", async () => {
+  // The terminal keyboard stays locked until the program's reply arrives; the screen disables
+  // ENTER and F4 while its request is in flight, so a second ENTER cannot pay twice.
+  it("locks ENTER, F4 and the inputs while its request is in flight, keeps F3, then frees them", async () => {
     const releases: (() => void)[] = [];
     const hold = new Promise<void>((resolve) => {
       releases.push(resolve);
     });
     const requests = stubApi(hold);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { container } = renderScreen({ from: PATHS.COMEN01 });
+    const form = container.querySelector("form");
+    if (form === null) {
+      throw new Error("COBIL0A renders no form");
+    }
+    const keyBar = screen.getByRole("group", { name: "Function keys" });
+    const enter = screen.getByRole("button", { name: "ENTER=Continue" });
+    const clear = pfKeyButton("F4=Clear");
+    const back = pfKeyButton("F3=Back");
+    expect(keyBar.getAttribute("aria-busy")).toBe("false");
+    expect(form.getAttribute("aria-busy")).toBe("false");
 
     typeInputs(ACCT, "");
-    pressEnter();
+    // The second submit arrives while the first is still being validated, before any request.
+    fireEvent.submit(form);
+    fireEvent.submit(form);
     await waitFor(() => {
       expect(requests).toHaveLength(1);
     });
-    await settle();
+    expect(keyBar.getAttribute("aria-busy")).toBe("true");
+    expect(form.getAttribute("aria-busy")).toBe("true");
+    expect(enter.hasAttribute("disabled")).toBe(true);
+    expect(clear.hasAttribute("disabled")).toBe(true);
+    expect(back.hasAttribute("disabled")).toBe(false);
+    expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([true, true]);
 
+    // The buttons, the keys and an unserved key all do nothing until the reply arrives.
     pressEnter();
-    fireEvent.click(pfKeyButton("F4=Clear"));
+    fireEvent.click(clear);
+    fireEvent.keyDown(document.body, { key: "Enter" });
+    pressKey("F4");
+    pressKey("F5");
     await settle();
     expect(requests).toHaveLength(1);
     expect(shown()).toEqual({ acct: ACCT, balance: "", confirm: "" });
+    expect(errorText()).toBe("");
 
     for (const release of releases) {
       release();
@@ -1072,7 +1171,65 @@ describe("COBIL00 bill payment screen", () => {
       expect(balanceOutput().value).toBe(BALANCE);
     });
     expect(errorText()).toBe("Confirm to make a bill payment...");
+    expect(keyBar.getAttribute("aria-busy")).toBe("false");
+    expect(form.getAttribute("aria-busy")).toBe("false");
+    expect([enter.hasAttribute("disabled"), clear.hasAttribute("disabled")]).toEqual([
+      false,
+      false,
+    ]);
+    expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([false, false]);
+
+    // Once answered, the next ENTER is sent.
+    fireEvent.change(confirmInput(), { target: { value: "N" } });
+    pressEnter();
+    await waitFor(() => {
+      expect(shown()).toEqual(BLANK);
+    });
     await settle();
+    expect(await bodies(requests)).toStrictEqual([
+      { acct_id: ACCT, confirm: "" },
+      { acct_id: ACCT, confirm: "N" },
+    ]);
+  });
+
+  it("frees the keyboard when the schema refuses ENTER, so a corrected ENTER is sent", async () => {
+    const requests = stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    typeInputs(ACCT, "YY");
+    pressEnter();
+    await waitFor(() => {
+      expect(errorText()).toBe("String must contain at most 1 character(s)");
+    });
+    expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+      "false",
+    );
+    expect(pfKeyButton("F4=Clear").hasAttribute("disabled")).toBe(false);
+    expect(confirmInput().readOnly).toBe(false);
+
+    fireEvent.change(confirmInput(), { target: { value: "" } });
+    pressEnter();
+    await waitFor(() => {
+      expect(balanceOutput().value).toBe(BALANCE);
+    });
+    await settle();
+    expect(await bodies(requests)).toStrictEqual([{ acct_id: ACCT, confirm: "" }]);
+  });
+
+  it("F3 goes back while ENTER's request is in flight", async () => {
+    const requests = stubApi(new Promise<void>(() => undefined));
+    renderScreen({ from: PATHS.COMEN01 });
+    typeInputs(ACCT, "");
+    pressEnter();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "ENTER=Continue" }).hasAttribute("disabled")).toBe(
+        true,
+      );
+    });
+
+    fireEvent.click(pfKeyButton("F3=Back"));
+
+    const stub = await reachedStub();
+    expect(stub.path).toBe("/menu");
     expect(requests).toHaveLength(1);
   });
 

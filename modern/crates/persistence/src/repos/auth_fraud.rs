@@ -66,7 +66,7 @@ use sqlx::PgExecutor;
 use crate::error::PersistenceError;
 use crate::rows::auth_fraud::storable_timestamp;
 use crate::rows::{AuthFraudBinds, AuthFraudRow, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgStore, PgTx, ProbePoint, probed};
 
 /// The fraud rows of `auth_fraud`, as COPAUS2C writes them, implemented by [`PgStore`] and
 /// [`PgTx`].
@@ -138,7 +138,8 @@ impl AuthFraudRepository for PgStore {
         record: &FraudRecord,
         report_date: NaiveDate,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-        insert_one(self.pool(), record, report_date)
+        let verdict = self.verdict(ProbePoint::AuthFraudInsert, &[record, &report_date]);
+        probed(verdict, insert_one(self.pool(), record, report_date))
     }
 
     fn update_flag(
@@ -148,7 +149,14 @@ impl AuthFraudRepository for PgStore {
         flag: &PicX<1>,
         report_date: NaiveDate,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_one(self.pool(), card, auth_ts, flag, report_date)
+        let verdict = self.verdict(
+            ProbePoint::AuthFraudUpdate,
+            &[card, &auth_ts, flag, &report_date],
+        );
+        probed(
+            verdict,
+            update_one(self.pool(), card, auth_ts, flag, report_date),
+        )
     }
 
     fn find_by_id(
@@ -167,7 +175,8 @@ impl AuthFraudRepository for PgTx<'_> {
         record: &FraudRecord,
         report_date: NaiveDate,
     ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
-        insert_one(self.conn(), record, report_date)
+        let verdict = self.verdict(ProbePoint::AuthFraudInsert, &[record, &report_date]);
+        probed(verdict, insert_one(self.conn(), record, report_date))
     }
 
     fn update_flag(
@@ -177,7 +186,14 @@ impl AuthFraudRepository for PgTx<'_> {
         flag: &PicX<1>,
         report_date: NaiveDate,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_one(self.conn(), card, auth_ts, flag, report_date)
+        let verdict = self.verdict(
+            ProbePoint::AuthFraudUpdate,
+            &[card, &auth_ts, flag, &report_date],
+        );
+        probed(
+            verdict,
+            update_one(self.conn(), card, auth_ts, flag, report_date),
+        )
     }
 
     fn find_by_id(

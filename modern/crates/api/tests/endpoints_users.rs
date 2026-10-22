@@ -13,10 +13,11 @@
 //!
 //! Each test function owns one `postgres:16` container from `test_support`, loaded with the
 //! fixtures (`ADMIN001` to `ADMIN005` of type `A`, `USER0001` to `USER0005` of type `U`, every
-//! password `PASSWORD`), or left empty and closed for the store failures. Requests go through
-//! `tower::ServiceExt::oneshot`, so nothing listens on a port. The `A` token is the one endpoint
-//! 1 issues to `ADMIN001`; every sign-on check also goes through endpoint 1. Store effects are
-//! read back through the real `persistence::UserRepository`.
+//! password `PASSWORD`), or left empty and closed for the store failures. One loaded container
+//! is served through a probed store (see "Rewrite and delete outcomes after the locked read").
+//! Requests go through `tower::ServiceExt::oneshot`, so nothing listens on a port. The `A` token
+//! is the one endpoint 1 issues to `ADMIN001`; every sign-on check also goes through endpoint 1.
+//! Store effects are read back through the real `persistence::UserRepository`.
 //!
 //! # Rows without a parity value
 //!
@@ -27,14 +28,26 @@
 //! only the store effect the row leaves assertable, and print the case as `BLOCKED`. No halt of
 //! `modern/audit/HALTS.md` names any of these rows, so no test here is ignored.
 //!
-//! # Rows not tagged here
+//! # Rewrite and delete outcomes after the locked read
 //!
 //! COUSR02C-031, COUSR02C-032, COUSR03C-021 and COUSR03C-022 are a rewrite or a delete that
 //! affects no row or fails after the locked read has found the row. The lock rules the first
-//! out and a real store gives no ordinary trigger for the second, so no request to endpoint 19
-//! or 20 reaches them; their audits prove them over a repository test double, which only the
-//! crate-private services accept, in the unit tests of `api::services::cousr02c` and
-//! `api::services::cousr03c`. A tag here would claim an endpoint result no test observes.
+//! out and a real store gives no ordinary trigger for the second, so
+//! `cousr02c_cousr03c_write_outcome_rows` proves them through endpoints 19 and 20 over the real
+//! store of a loaded container with a `ScriptedProbe` installed (`PgStore::with_probe`), which
+//! the transactions the store opens answer to as well:
+//!
+//! - Every read runs for real: the sign-on's, endpoint 19's unlocked read, and the locked
+//!   `FOR UPDATE` read that finds the row in the endpoint's transaction. No read is a probe
+//!   point.
+//! - The probe answers only the statement that follows the lock, `UserRepository::update` or
+//!   `UserRepository::delete`: `NoRow` skips it as a statement that matched no row, and `Fail`
+//!   as one that failed with SQLSTATE `57014`. The SQLSTATE stands for the CICS codes, which
+//!   are never asserted (halt H4).
+//! - Each case asserts the endpoint's status, message and `field`, that the probed statement was
+//!   reached exactly once with the entry or key the service built, and that the `users` table is
+//!   unchanged afterwards. A last request that the probe lets proceed then succeeds, so each
+//!   refusal came from the probed statement alone and its transaction ended.
 //!
 //! # Redaction
 //!
@@ -44,7 +57,7 @@
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use api::app::{AppState, app};
 use api::dto::FIELD_LENGTH_MESSAGE;
@@ -61,7 +74,9 @@ use domain::copybook::PicX;
 use domain::online::cosgn00c::UserType;
 use domain::password;
 use domain::records::{UserEntry, UserListEntry};
-use persistence::{PgStore, UserRepository};
+use persistence::{
+    PersistenceError, PgStore, ProbeCall, ProbePoint, ProbeVerdict, RepositoryProbe, UserRepository,
+};
 use runtime::config::Config;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -70,6 +85,15 @@ use test_support::postgres::{PostgresGuard, start_postgres};
 use tower::ServiceExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
+
+/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+/// without the lint attributes that macro's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
 
 /// A local-only signing secret for the tokens of these tests.
 const JWT_SECRET: &str = "endpoints-users-local-test-secret";
@@ -109,6 +133,7 @@ const PASSWORD_EMPTY: &str = "Password can NOT be empty...";
 const USER_TYPE_EMPTY: &str = "User Type can NOT be empty...";
 const ALREADY_EXISTS: &str = "User ID already exist...";
 const ADD_FAILED: &str = "Unable to Add User...";
+const UPDATE_FAILED: &str = "Unable to Update User...";
 const NOT_FOUND: &str = "User ID NOT found...";
 const NOT_MODIFIED: &str = "Please modify to update ...";
 const UPDATE_PROMPT: &str = "Press PF5 key to save your updates ...";
@@ -248,19 +273,29 @@ impl Api {
         Self::over(db)
     }
 
-    /// The state `carddemo-api` builds from its configuration, over `db`, with the fixed
-    /// clock and a job-deck directory of the test target's own.
+    /// The API over a fixture-loaded database whose store, and every transaction it opens,
+    /// asks `probe` at each probe point (see "Rewrite and delete outcomes after the locked
+    /// read").
+    async fn probed(probe: Arc<dyn RepositoryProbe>) -> Result<Self, Box<dyn Error>> {
+        let db = start_loaded_postgres().await?;
+        let store = PgStore::new(db.pool().clone()).with_probe(probe);
+        Self::serving(store, db)
+    }
+
+    /// The state `carddemo-api` builds from its configuration, over `db`.
     fn over(db: PostgresGuard) -> Result<Self, Box<dyn Error>> {
+        Self::serving(PgStore::new(db.pool().clone()), db)
+    }
+
+    /// The state `carddemo-api` builds from its configuration, over `store`, a store on the
+    /// pool of `db`, with the fixed clock and a job-deck directory of the test target's own.
+    fn serving(store: PgStore, db: PostgresGuard) -> Result<Self, Box<dyn Error>> {
         let config = Config {
             jwt_secret: JWT_SECRET.to_owned(),
             intrdr_dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("endpoints_users_jobs"),
             ..Config::default()
         };
-        let state = AppState::from_config(
-            PgStore::new(db.pool().clone()),
-            &config,
-            Arc::new(FixedClock::new(instant()?)),
-        )?;
+        let state = AppState::from_config(store, &config, Arc::new(FixedClock::new(instant()?)))?;
         Ok(Self { state, _db: db })
     }
 
@@ -1653,10 +1688,11 @@ async fn store_failure_rows() -> TestResult {
         Some("first_name"),
     )?;
 
-    // The update and the delete open their transaction before they read, and a transaction
-    // that cannot begin has no audited text, so the API's fixed 500 answers, with no store
-    // detail. The rewrite and delete failures of COUSR02C-032 and COUSR03C-022 follow a
-    // successful locked read, which a closed pool never gives; this file does not claim them.
+    // The delete opens its transaction before it reads, and the update, whose unlocked read
+    // fails, then reads inside its transaction. A transaction that cannot begin has no audited
+    // text, so the API's fixed 500 answers, with no store detail. The rewrite and delete
+    // failures of COUSR02C-032 and COUSR03C-022 follow a successful locked read, which a closed
+    // pool never gives; `cousr02c_cousr03c_write_outcome_rows` proves them over a probed store.
     let body = update_body("LAWRENCE", "THOMSON", "U", None);
     let update = api.update(Some(&admin), "USER0001", &body).await?;
     expect_error(
@@ -1672,4 +1708,210 @@ async fn store_failure_rows() -> TestResult {
         UNABLE_TO_PROCESS,
         None,
     )
+}
+
+/// One call a [`ScriptedProbe`] was asked about, with the argument it carried.
+#[derive(Debug, PartialEq, Eq)]
+enum Probed {
+    /// `UserRepository::update`, with the entry it rewrites.
+    Update(UserEntry),
+    /// `UserRepository::delete`, with the key it deletes.
+    Delete(PicX<8>),
+    /// A call at any other point, or one whose argument is not the type its point lists.
+    Other(ProbePoint),
+}
+
+/// The probe of [`Api::probed`]: it answers its scripted verdict at its scripted point, lets
+/// every other call proceed, and logs every call it is asked about.
+struct ScriptedProbe {
+    /// The point to answer and the verdict to answer there; `None` lets every call proceed.
+    script: Mutex<Option<(ProbePoint, ProbeVerdict)>>,
+    /// The calls asked about since the last look.
+    seen: Mutex<Vec<Probed>>,
+}
+
+impl ScriptedProbe {
+    /// A probe that lets every call proceed until it is scripted.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            script: Mutex::new(None),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Answers `verdict` at `point` from now on.
+    fn script(&self, point: ProbePoint, verdict: ProbeVerdict) -> TestResult {
+        *self.script.lock().map_err(|_| "script lock poisoned")? = Some((point, verdict));
+        Ok(())
+    }
+
+    /// The calls asked about since the last look, in the order they were asked.
+    fn seen(&self) -> Result<Vec<Probed>, Box<dyn Error>> {
+        Ok(std::mem::take(
+            &mut *self.seen.lock().map_err(|_| "seen lock poisoned")?,
+        ))
+    }
+}
+
+impl RepositoryProbe for ScriptedProbe {
+    fn answer(&self, call: &ProbeCall<'_>) -> ProbeVerdict {
+        let probed = match call.point() {
+            ProbePoint::UserUpdate => call.arg::<UserEntry>(0).cloned().map(Probed::Update),
+            ProbePoint::UserDelete => call.arg::<PicX<8>>(0).cloned().map(Probed::Delete),
+            _ => None,
+        };
+        // A poisoned log loses this call, and the test's next look at the log fails.
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.push(probed.unwrap_or(Probed::Other(call.point())));
+        }
+        self.script
+            .lock()
+            .ok()
+            .and_then(|script| script.clone())
+            .filter(|(point, _)| *point == call.point())
+            .map_or(ProbeVerdict::Proceed, |(_, verdict)| verdict)
+    }
+}
+
+/// The failure the probe injects in place of a rewrite or a delete: SQLSTATE `57014`
+/// (`query_canceled`), which no statement of these tests raises. It stands for the CICS codes
+/// of the `WHEN OTHER` branch, whose values are never asserted (halt H4).
+fn canceled() -> PersistenceError {
+    PersistenceError::Database {
+        sqlstate: Some("57014".to_owned()),
+        constraint: None,
+    }
+}
+
+/// Endpoints 19 and 20 whose rewrite or delete, after the real locked read has found the row,
+/// affects no row or fails, over a loaded database whose store a [`ScriptedProbe`] watches
+/// (COUSR02C-031, COUSR02C-032, COUSR03C-021, COUSR03C-022).
+#[test]
+fn cousr02c_cousr03c_write_outcome_rows() -> TestResult {
+    block_on(async {
+        let probe = ScriptedProbe::new();
+        let api = Api::probed(probe.clone()).await?;
+        let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
+        assert!(
+            probe.seen()?.is_empty(),
+            "sign-on's read is not a probe point"
+        );
+        rewrite_outcome_rows(&api, &probe, &admin).await?;
+        delete_outcome_rows(&api, &probe, &admin).await
+    })
+}
+
+/// Endpoint 19 with new names and type for `USER0001` and no password: the unlocked read and
+/// the locked read run on the real store, with the change test between them, and the probe
+/// answers the rewrite in the transaction that holds the row. `NoRow` is a rewrite that finds
+/// no row, 404 `User ID NOT found...` on `user_id` (COUSR02C-031); `Fail` is any other failure,
+/// 500 `Unable to Update User...` on `first_name` (COUSR02C-032). Either way nothing is
+/// written.
+async fn rewrite_outcome_rows(api: &Api, probe: &ScriptedProbe, admin: &str) -> TestResult {
+    let stored = api
+        .user("USER0001")
+        .await?
+        .ok_or("USER0001 is not stored")?;
+    let before = api.users().await?;
+    let body = update_body("LAURENT", "THOMSON", "A", None);
+    // The request's names and type over the row as read: its ID, its hash, since no password
+    // was supplied, and its filler.
+    let intended = UserEntry {
+        fname: PicX::from_text("LAURENT")?,
+        lname: PicX::from_text("THOMSON")?,
+        usr_type: PicX::from_text("A")?,
+        ..stored.clone()
+    };
+    for (verdict, status, message, field) in [
+        (
+            ProbeVerdict::NoRow,
+            StatusCode::NOT_FOUND,
+            NOT_FOUND,
+            "user_id",
+        ),
+        (
+            ProbeVerdict::Fail(canceled()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            UPDATE_FAILED,
+            "first_name",
+        ),
+    ] {
+        probe.script(ProbePoint::UserUpdate, verdict)?;
+        let reply = api.update(Some(admin), "USER0001", &body).await?;
+        // audit: COUSR02C-031
+        // audit: COUSR02C-032
+        expect_error(&reply, status, message, Some(field))?;
+        // The rewrite is reached once, after the locked read, with the entry the service built.
+        // audit: COUSR02C-031
+        // audit: COUSR02C-032
+        assert_eq!(probe.seen()?, [Probed::Update(intended.clone())]);
+        // The transaction rolled back: the row and the table are as they were.
+        // audit: COUSR02C-031
+        // audit: COUSR02C-032
+        assert_eq!(api.user("USER0001").await?.as_ref(), Some(&stored));
+        // audit: COUSR02C-031
+        // audit: COUSR02C-032
+        assert_eq!(api.users().await?, before);
+    }
+
+    // With the rewrite let through, the same request locks the row again and rewrites it.
+    probe.script(ProbePoint::UserUpdate, ProbeVerdict::Proceed)?;
+    let reply = api.update(Some(admin), "USER0001", &body).await?;
+    expect_message(&reply, "User USER0001 has been updated ...")?;
+    assert_eq!(probe.seen()?, [Probed::Update(intended.clone())]);
+    assert_eq!(api.user("USER0001").await?, Some(intended));
+    Ok(())
+}
+
+/// Endpoint 20 for `USER0002`: the locked read runs on the real store and finds the row, and
+/// the probe answers the delete in the transaction that holds it. `NoRow` is a delete that
+/// finds no row, 404 `User ID NOT found...` on `user_id` (COUSR03C-021); `Fail` is any other
+/// failure, 500 `Unable to Update User...` on `first_name`, `Update` kept (COUSR03C-022).
+/// Either way the user stays.
+async fn delete_outcome_rows(api: &Api, probe: &ScriptedProbe, admin: &str) -> TestResult {
+    let stored = api
+        .user("USER0002")
+        .await?
+        .ok_or("USER0002 is not stored")?;
+    let before = api.users().await?;
+    let target = key("USER0002")?;
+    for (verdict, status, message, field) in [
+        (
+            ProbeVerdict::NoRow,
+            StatusCode::NOT_FOUND,
+            NOT_FOUND,
+            "user_id",
+        ),
+        (
+            ProbeVerdict::Fail(canceled()),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            UPDATE_FAILED,
+            "first_name",
+        ),
+    ] {
+        probe.script(ProbePoint::UserDelete, verdict)?;
+        let reply = api.delete(Some(admin), "USER0002").await?;
+        // audit: COUSR03C-021
+        // audit: COUSR03C-022
+        expect_error(&reply, status, message, Some(field))?;
+        // The delete is reached once, after the locked read, with the path's key.
+        // audit: COUSR03C-021
+        // audit: COUSR03C-022
+        assert_eq!(probe.seen()?, [Probed::Delete(target.clone())]);
+        // The transaction rolled back: the user and the table are as they were.
+        // audit: COUSR03C-021
+        // audit: COUSR03C-022
+        assert_eq!(api.user("USER0002").await?.as_ref(), Some(&stored));
+        // audit: COUSR03C-021
+        // audit: COUSR03C-022
+        assert_eq!(api.users().await?, before);
+    }
+
+    // With the delete let through, the same request locks the row again and deletes it.
+    probe.script(ProbePoint::UserDelete, ProbeVerdict::Proceed)?;
+    let reply = api.delete(Some(admin), "USER0002").await?;
+    expect_message(&reply, "User USER0002 has been deleted ...")?;
+    assert_eq!(probe.seen()?, [Probed::Delete(target)]);
+    assert_eq!(api.user("USER0002").await?, None);
+    Ok(())
 }

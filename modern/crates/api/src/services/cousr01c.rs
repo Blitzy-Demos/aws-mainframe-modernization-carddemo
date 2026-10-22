@@ -25,7 +25,7 @@
 //! |---|---|---|---|
 //! | row inserted | `NORMAL` | 200, [`cousr01c::added_message`]: `User <id> has been added ...` | COUSR01C-021 |
 //! | [`PersistenceError::is_duplicate`], the `users_pkey` violation | `DUPKEY`, `DUPREC` | [`cousr01c::duplicate_user_id`]: `User ID already exist...` on `user_id`, 400 by its class | COUSR01C-023 |
-//! | any other store error, or a hash that could not be computed | `WHEN OTHER` | [`cousr01c::write_failure`]: `Unable to Add User...` on `first_name`, 500 | COUSR01C-024 |
+//! | any other store error, a hash that could not be computed, or a hash the API's password-work budget refused or could not finish | `WHEN OTHER` | [`cousr01c::write_failure`]: `Unable to Add User...` on `first_name`, 500 | COUSR01C-024 |
 //!
 //! Every outcome is the program's own answer, a [`ServiceError::Rule`]; none is the unaudited
 //! [`ServiceError::Store`] or [`ServiceError::Internal`].
@@ -53,15 +53,15 @@
 //! A `WHEN OTHER` failure is logged once before it is answered: a store error by its `Display`,
 //! an SQLSTATE and a constraint or column at most; a hash failure by the fixed class text of
 //! [`PasswordError`]; a hashing task that did not complete by whether it panicked, never its
-//! payload. No event names the user, the password or the hash.
+//! payload; a hash the full budget refused by the budget's own event, which names its limits
+//! alone. No event names the user, the password or the hash.
 
 use domain::online::cousr01c::{self, UserAddFailure, UserAddInput};
 use domain::password::{self, PasswordError};
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
-use tokio::task::JoinError;
 
-use crate::app::AppState;
+use crate::app::{AppState, PasswordWork, PasswordWorkError};
 use crate::auth::extract::AdminUser;
 use crate::dto::cousr01c::UserAddRequest;
 use crate::error::ServiceError;
@@ -90,8 +90,9 @@ const WRITE_PARAGRAPH: &str = "WRITE-USER-SEC-FILE";
 ///   [`cousr01c::edit`] (COUSR01C-010 to COUSR01C-014);
 /// - [`cousr01c::duplicate_user_id`] when a stored row has the same 8 user ID bytes
 ///   (COUSR01C-023);
-/// - [`cousr01c::write_failure`] when the hash cannot be computed or the insert fails for any
-///   other reason (COUSR01C-024).
+/// - [`cousr01c::write_failure`] when the hash cannot be computed, the password-work budget
+///   refuses it or its task does not complete, or the insert fails for any other reason
+///   (COUSR01C-024).
 pub(crate) async fn add(
     state: &AppState,
     _admin: &AdminUser,
@@ -99,13 +100,14 @@ pub(crate) async fn add(
 ) -> Result<String, ServiceError<UserAddFailure>> {
     // Cloning copies the pool handle only; repository calls take the executor by `&mut`.
     let mut store = state.store.clone();
-    insert_user(&mut store, request).await
+    insert_user(&mut store, &state.password_work, request).await
 }
 
-/// The add of [`add`] on any `users` executor: the pool in service, a test double in the unit
-/// tests below.
+/// The add of [`add`] on any `users` executor, the pool in service and a test double in the unit
+/// tests below, hashing within `work`.
 async fn insert_user<R: UserRepository>(
     store: &mut R,
+    work: &PasswordWork,
     request: UserAddRequest,
 ) -> Result<String, ServiceError<UserAddFailure>> {
     let UserAddRequest {
@@ -126,17 +128,19 @@ async fn insert_user<R: UserRepository>(
         .map_err(ServiceError::Rule)?
         .into_record();
 
-    // argon2id is deliberately CPU- and memory-hard, so it runs on the blocking pool rather than
-    // stalling a runtime worker. A hash that fails, or a hashing task that cannot finish, is the
-    // `WHEN OTHER` answer `Unable to Add User...` that COUSR01C-024 assigns to it, not the
+    // argon2id is deliberately CPU- and memory-hard, so it runs on the blocking pool within the
+    // API's password-work budget rather than stalling a runtime worker or running without
+    // bound. A hash that fails, that the full budget refuses, or whose task cannot finish, is
+    // the `WHEN OTHER` answer `Unable to Add User...` that COUSR01C-024 assigns to it, not the
     // unaudited `ServiceError::Internal`; `hashed` logs its class here, after the await, and the
     // answer never echoes it.
-    let joined = tokio::task::spawn_blocking(move || {
-        let hashed = password::hash(record.pwd.expose());
-        (record, hashed)
-    })
-    .await;
-    let (record, password_hash) = hashed(joined)?;
+    let computed = work
+        .run(move || {
+            let hashed = password::hash(record.pwd.expose());
+            (record, hashed)
+        })
+        .await;
+    let (record, password_hash) = hashed(computed)?;
 
     // `record.pwd` stops here: the row holds the hash in its place (E25).
     let entry = UserEntry {
@@ -154,15 +158,16 @@ async fn insert_user<R: UserRepository>(
 }
 
 /// The record and its password hash from the hashing task (COUSR01C-018), or `Unable to Add
-/// User...` when the task did not complete or argon2id could not hash (COUSR01C-024).
+/// User...` when the budget refused the task, the task did not complete or argon2id could not
+/// hash (COUSR01C-024).
 ///
-/// Either failure is logged first: the task's as whether it panicked, never its payload, which
-/// the `JoinError`'s `Display` could carry; the hash's as the fixed class text of
-/// [`PasswordError`]. Neither event names the user, the password or the hash.
+/// A failure is logged first, once: the task's as whether it panicked, never its payload; the
+/// hash's as the fixed class text of [`PasswordError`]; a refusal by the budget itself, so
+/// nothing more here. No event names the user, the password or the hash.
 fn hashed<T>(
-    joined: Result<(T, Result<String, PasswordError>), JoinError>,
+    computed: Result<(T, Result<String, PasswordError>), PasswordWorkError>,
 ) -> Result<(T, String), ServiceError<UserAddFailure>> {
-    match joined {
+    match computed {
         Ok((record, Ok(password_hash))) => Ok((record, password_hash)),
         Ok((_, Err(error))) => {
             tracing::error!(
@@ -173,11 +178,12 @@ fn hashed<T>(
             );
             Err(ServiceError::Rule(cousr01c::write_failure()))
         }
-        Err(error) => {
+        Err(PasswordWorkError::Saturated) => Err(ServiceError::Rule(cousr01c::write_failure())),
+        Err(PasswordWorkError::Interrupted { panicked }) => {
             tracing::error!(
                 program = PROGRAM,
                 paragraph = ENTER_PARAGRAPH,
-                panicked = error.is_panic(),
+                panicked,
                 "password hashing task did not complete; answering Unable to Add User"
             );
             Err(ServiceError::Rule(cousr01c::write_failure()))
@@ -220,10 +226,21 @@ mod tests {
     use test_support::trace_capture;
 
     use super::{hashed, insert_user};
+    use crate::app::worker_hold::WorkerHold;
+    use crate::app::{PasswordWork, PasswordWorkError};
     use crate::dto::cousr01c::UserAddRequest;
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A fake password the tests submit, with a lower-case letter and shorter than its 8 bytes.
     const PASSWORD: &str = "fakePw";
@@ -344,7 +361,7 @@ mod tests {
     async fn a_valid_request_stores_every_field_as_typed_with_the_hash_of_its_password()
     -> TestResult {
         let mut store = InsertOnly::answering(Ok(()));
-        let message = insert_user(&mut store, request()).await?;
+        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
         assert_eq!(message, "User NEWUSR01 has been added ...");
 
         let [entry] = store.inserted.as_slice() else {
@@ -415,7 +432,7 @@ mod tests {
             }
             for case in [alone, with_later] {
                 let mut store = InsertOnly::answering(Ok(()));
-                let failure = rule(insert_user(&mut store, case).await)?;
+                let failure = rule(insert_user(&mut store, &PasswordWork::default(), case).await)?;
                 assert_eq!(
                     (failure.message(), failure.field().name()),
                     (message, field)
@@ -433,7 +450,7 @@ mod tests {
         let traces = trace_capture::capture();
         for constraint in [Some("users_pkey".to_owned()), None] {
             let mut store = InsertOnly::answering(Err(PersistenceError::Duplicate { constraint }));
-            let failure = rule(insert_user(&mut store, request()).await)?;
+            let failure = rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
             assert_eq!(failure, cousr01c::duplicate_user_id());
             assert_eq!(
                 (failure.message(), failure.field().name()),
@@ -468,7 +485,7 @@ mod tests {
             let shown = format!("{error:?}");
             let cause = error.to_string();
             let mut store = InsertOnly::answering(Err(error));
-            let failure = rule(insert_user(&mut store, request()).await)?;
+            let failure = rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
             assert_eq!(failure, cousr01c::write_failure(), "{shown}");
             assert_eq!(
                 (failure.message(), failure.field().name()),
@@ -500,13 +517,10 @@ mod tests {
     // audit: COUSR01C-024
     #[tokio::test]
     async fn a_hash_or_task_failure_is_logged_and_answers_unable_to_add_user() -> TestResult {
-        let task = tokio::spawn(std::future::pending::<()>());
-        task.abort();
-        let cancelled = task.await.err().ok_or("an aborted task completed")?;
         let traces = trace_capture::capture();
         let cases = [
             (
-                Err(cancelled),
+                Err(PasswordWorkError::Interrupted { panicked: false }),
                 [
                     "password hashing task did not complete",
                     r#""panicked":false"#,
@@ -517,10 +531,10 @@ mod tests {
                 ["password not hashed", "password hashing failed"],
             ),
         ];
-        for (joined, texts) in cases {
+        for (computed, texts) in cases {
             traces.clear();
             assert_eq!(
-                hashed(joined),
+                hashed(computed),
                 Err(ServiceError::Rule(cousr01c::write_failure()))
             );
             let lines = traces.lines();
@@ -546,11 +560,49 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn a_full_password_budget_answers_unable_to_add_user_and_writes_nothing() -> TestResult {
+        block_on(async {
+            let work = PasswordWork::new(1, 0);
+            let hold = WorkerHold::start(&work).await?;
+            let traces = trace_capture::capture();
+            let mut store = InsertOnly::answering(Ok(()));
+
+            let failure = rule(insert_user(&mut store, &work, request()).await)?;
+            assert_eq!(failure, cousr01c::write_failure());
+            assert_eq!(
+                (
+                    failure.message(),
+                    failure.field().name(),
+                    failure.class().http_status()
+                ),
+                ("Unable to Add User...", "first_name", 500)
+            );
+            assert!(store.inserted.is_empty());
+            // The budget's refusal is the one event, and it names no request value.
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("{} lines", lines.len()).into());
+            };
+            assert!(line.contains("password work budget saturated"), "{line}");
+            for value in [PASSWORD, "NEWUSR01"] {
+                assert!(!line.contains(value), "the event holds {value}");
+            }
+
+            // Once the place frees, the same request is added.
+            assert!(hold.release().await?);
+            let message = insert_user(&mut store, &work, request()).await?;
+            assert_eq!(message, "User NEWUSR01 has been added ...");
+            assert_eq!(store.inserted.len(), 1);
+            Ok(())
+        })
+    }
+
     // audit: COUSR01C-018
     #[tokio::test]
     async fn no_answer_or_stored_value_shows_the_password_or_its_hash() -> TestResult {
         let mut store = InsertOnly::answering(Ok(()));
-        let message = insert_user(&mut store, request()).await?;
+        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
         assert!(!message.contains(PASSWORD));
 
         let [entry] = store.inserted.as_slice() else {
@@ -566,7 +618,7 @@ mod tests {
         ];
         for answer in answers {
             let mut store = InsertOnly::answering(answer);
-            let error = match insert_user(&mut store, request()).await {
+            let error = match insert_user(&mut store, &PasswordWork::default(), request()).await {
                 Ok(message) => return Err(format!("added: {message}").into()),
                 Err(error) => error,
             };
@@ -584,7 +636,7 @@ mod tests {
         let mut store = PgStore::new(guard.pool().clone());
         let key = PicX::from_array(*b"NEWUSR01");
 
-        let message = insert_user(&mut store, request()).await?;
+        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
         assert_eq!(message, "User NEWUSR01 has been added ...");
         let stored = UserRepository::find_by_id(&mut store, &key)
             .await?
@@ -602,7 +654,7 @@ mod tests {
             first_name: "OTHER".to_owned(),
             ..request()
         };
-        let failure = rule(insert_user(&mut store, again).await)?;
+        let failure = rule(insert_user(&mut store, &PasswordWork::default(), again).await)?;
         assert_eq!(failure, cousr01c::duplicate_user_id());
         let kept = UserRepository::find_by_id(&mut store, &key)
             .await?
@@ -614,7 +666,7 @@ mod tests {
             user_id: "newusr01".to_owned(),
             ..request()
         };
-        let message = insert_user(&mut store, lower).await?;
+        let message = insert_user(&mut store, &PasswordWork::default(), lower).await?;
         assert_eq!(message, "User newusr01 has been added ...");
         Ok(())
     }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -162,10 +162,13 @@ function json(status: number, body: unknown): Response {
 
 /**
  * Replaces `fetch`. Each request is routed on `<METHOD> <path>` and answered with the next reply
- * listed for that route; any other request, and one past the end of its list, gets a 500. Every
- * request is recorded with its query, JSON body and `Authorization` header.
+ * listed for that route, once the reply's `held` promise, if any, has settled; any other request,
+ * and one past the end of its list, gets a 500. Every request is recorded with its query, JSON
+ * body and `Authorization` header.
  */
-function stubApi(replies: Record<string, { status: number; body: unknown }[]>) {
+function stubApi(
+  replies: Record<string, { status: number; body: unknown; held?: Promise<void> }[]>,
+) {
   const queues = new Map(Object.entries(replies).map(([route, list]) => [route, [...list]]));
   const calls: {
     route: string;
@@ -194,10 +197,27 @@ function stubApi(replies: Record<string, { status: number; body: unknown }[]>) {
         };
         return json(500, unexpected);
       }
+      if (reply.held !== undefined) {
+        await reply.held;
+      }
       return json(reply.status, reply.body);
     }),
   );
   return calls;
+}
+
+/** A promise for `stubApi`'s `held`, and the function that settles it. */
+function hold(): { held: Promise<void>; open: () => void } {
+  let release = (): void => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return {
+    held,
+    open: () => {
+      release();
+    },
+  };
 }
 
 /** The screen a navigation reached, by its path, with the route state it was handed. */
@@ -251,6 +271,12 @@ function shownValues(): Record<string, string> {
   );
 }
 
+/** The text inputs of the screen body, its form; the header values of `ScreenShell` are outside. */
+function bodyTextboxes(): HTMLElement[] {
+  const form = screen.getByRole("form", { name: "Update Credit Card Details" });
+  return within(form).getAllByRole("textbox");
+}
+
 /**
  * A PF-key button of row 24 by its label, shown or hidden. Matched by its text: a button with the
  * HTML `hidden` attribute has an empty accessible name, so `getByRole` with `hidden: true` finds
@@ -263,6 +289,48 @@ function key(label: string): HTMLButtonElement {
     throw new Error(`Expected a button, found <${element.tagName.toLowerCase()}>`);
   }
   return element;
+}
+
+/** The key row, `PfKeyBar`'s group. */
+function keyRow(): HTMLElement {
+  return screen.getByRole("group", { name: "Function keys" });
+}
+
+/** The screen's form, named by the map title. */
+function updateForm(): HTMLElement {
+  return screen.getByRole("form", { name: "Update Credit Card Details" });
+}
+
+/** The labels of the 13 key-row buttons, shown or hidden. */
+const KEY_LABELS = [
+  "ENTER=Process",
+  "F3=Exit",
+  "F5=Save",
+  "F12=Cancel",
+  "F1",
+  "F2",
+  "F4",
+  "F6",
+  "F7",
+  "F8",
+  "F9",
+  "F10",
+  "F11",
+] as const;
+
+/** Whether each key-row button, shown or hidden, is disabled, by its label. */
+function disabledKeys(): Record<string, boolean> {
+  return Object.fromEntries(
+    Array.from(keyRow().querySelectorAll("button"), (button) => [
+      button.textContent ?? "",
+      button.disabled,
+    ]),
+  );
+}
+
+/** `disabledKeys` while the keys are `locked`: every button disabled except `F3=Exit`. */
+function lockedKeys(locked: boolean): Record<string, boolean> {
+  return Object.fromEntries(KEY_LABELS.map((label) => [label, locked && label !== "F3=Exit"]));
 }
 
 /** The one message row of `kind` (`MessageLine`). */
@@ -313,9 +381,20 @@ function expectNoFullCardDigits() {
   }
 }
 
-/** The text of a header value field (`ScreenShell`), by its BMS name. */
-function headerValue(name: string): string | null {
-  return document.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The value of a header value field (`ScreenShell`), by its BMS name: the one read-only `Input` of
+ * that name in the `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerValue(name: string): string {
+  const fields = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [input] = fields;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`No header input ${name}`);
+  }
+  return input.value;
 }
 
 /** The `GridCell` classes that place map `POS=(row,col)` with `LENGTH=span`. */
@@ -493,7 +572,7 @@ describe("COCRDUP rendering", () => {
       expect(element.getAttribute("data-slot")).toBe("form-label");
       expect(element.getAttribute("for")).toBe(field(label).id);
     }
-    expect(screen.getAllByRole("textbox")).toHaveLength(6);
+    expect(bodyTextboxes()).toHaveLength(6);
     expect(
       Object.fromEntries(
         Object.entries(LABELS).map(([name, label]) => [name, field(label).maxLength]),
@@ -572,50 +651,113 @@ describe("COCRDUP rendering", () => {
     }
   });
 
-  // `ScreenShell` realises each header value field as read-only text in its title-row cell rather
-  // than as an `Input` with `readOnly`, so these rows are proved on that cell. The values it shows
-  // are proved under COCRDUP-035 to COCRDUP-040.
-  // audit: COCRDUP-002
-  // audit: COCRDUP-003
-  // audit: COCRDUP-005
-  // audit: COCRDUP-007
-  // audit: COCRDUP-008
-  // audit: COCRDUP-010
-  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", async () => {
-    stubApi({});
-    renderScreen();
-    await settle();
+  // The values these fields show are proved under COCRDUP-035 to COCRDUP-040.
+  it.each([
+    // audit: COCRDUP-002
+    {
+      id: "COCRDUP-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CCUP",
+    },
+    // audit: COCRDUP-003
+    {
+      id: "COCRDUP-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE01,
+    },
+    // audit: COCRDUP-005
+    {
+      id: "COCRDUP-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COCRDUP-007
+    {
+      id: "COCRDUP-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COCRDUPC",
+    },
+    // audit: COCRDUP-008
+    {
+      id: "COCRDUP-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE02,
+    },
+    // audit: COCRDUP-010
+    {
+      id: "COCRDUP-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id: header value $name is a read-only Input of the CardHeader title rows at its map POS and LENGTH",
+    async ({ name, row, col, length, label, shows }) => {
+      stubApi({});
+      renderScreen();
+      await settle();
 
-    const header = document.querySelector('[data-slot="card-header"]');
-    expect(header).not.toBeNull();
-    // The title rows hold no form control.
-    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
-    for (const { name, row, col, length } of [
-      { name: "TRNNAME", row: 1, col: 7, length: 4 },
-      { name: "TITLE01", row: 1, col: 21, length: 40 },
-      { name: "CURDATE", row: 1, col: 71, length: 8 },
-      { name: "PGMNAME", row: 2, col: 7, length: 8 },
-      { name: "TITLE02", row: 2, col: 21, length: 40 },
-      { name: "CURTIME", row: 2, col: 71, length: 8 },
-    ]) {
+      const header = document.querySelector('[data-slot="card-header"]');
+      if (!(header instanceof HTMLElement)) {
+        throw new Error("No card header");
+      }
       // The field's one element stands in the title rows, not in the body or the footer.
       const shown = document.querySelectorAll(`[data-field="${name}"]`);
       expect(shown).toHaveLength(1);
       const value = shown.item(0);
-      expect(header?.contains(value)).toBe(true);
-      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
-      // centres the titles included.
-      const cell = value?.parentElement;
-      expect(cell?.className).toBe(cellClass(row, col, length));
-      expect(value?.textContent).toHaveLength(length);
-      // Neither the value nor anything in its cell takes input or focus.
-      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
-      for (const element of [value, cell]) {
-        expect(element?.hasAttribute("contenteditable")).toBe(false);
-        expect(element?.hasAttribute("tabindex")).toBe(false);
+      expect(header.contains(value)).toBe(true);
+      expect(value.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+      // It is an output field of the map: a read-only `Input` as wide as its LENGTH (`size`), in
+      // the cell of its POS and LENGTH, holding LENGTH characters, the padding that centres the
+      // titles included.
+      if (!(value instanceof HTMLInputElement)) {
+        throw new Error(`Header field ${name} is not an input`);
       }
-    }
-  });
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(cellClass(row, col, length));
+      expect(value.value).toEqual(shows);
+      expect(value.value).toHaveLength(length);
+      // The map literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(value.getAttribute("aria-label")).toBe(label === null ? `Title row ${row}` : null);
+      // The title rows hold no editable control: their six controls are the read-only values.
+      const controls = Array.from(
+        header.querySelectorAll("input, textarea, select, button, [contenteditable]"),
+      );
+      expect(controls).toHaveLength(6);
+      expect(
+        controls.every((control) => control instanceof HTMLInputElement && control.readOnly),
+      ).toBe(true);
+    },
+  );
 
   // audit: COCRDUPC-045
   // audit: COCRDUPC-046
@@ -639,7 +781,7 @@ describe("COCRDUP rendering", () => {
       month: "06",
       year: "2030",
     });
-    expect(screen.getAllByRole("textbox")).toHaveLength(6);
+    expect(bodyTextboxes()).toHaveLength(6);
     expectEnterable(false, true);
     await expectFocus(LABELS.name);
     expect(infoText()).toBe(INFO_SHOWN);
@@ -782,7 +924,7 @@ describe("COCRDUP keys", () => {
     expectConfirmationKeys(true);
     expectEnterable(false, false);
     expect(field(LABELS.name).value).toBe(NEW_NAME);
-    expect(screen.getAllByRole("textbox")).toHaveLength(6);
+    expect(bodyTextboxes()).toHaveLength(6);
 
     fireEvent.click(screen.getByRole("button", { name: "F5=Save" }));
     await waitFor(() => {
@@ -1201,6 +1343,268 @@ describe("COCRDUP keys", () => {
       expect([field(LABELS.month).value, field(LABELS.year).value]).toEqual([sentMonth, sentYear]);
     },
   );
+
+  it.each([
+    {
+      title: "the entry fetch from COCRDLI",
+      edits: [{ status: 200, body: view, gated: true }],
+      puts: [{ status: 200, body: validated, gated: false }],
+      reach: async () => {
+        renderScreen(FROM_LIST);
+      },
+      pendingAt: 1,
+      enterable: [false, true],
+      next: async () => {
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+        fireEvent.click(key("ENTER=Process"));
+        await waitFor(() => {
+          expect(infoText()).toBe(INFO_CONFIRM);
+        });
+      },
+      routes: [CARDS_EDIT, CARD_PUT],
+    },
+    {
+      title: "a typed search on ENTER",
+      edits: [{ status: 200, body: view, gated: true }],
+      puts: [{ status: 200, body: validated, gated: false }],
+      reach: async () => {
+        renderScreen();
+        typeSearchKeys(ACCT_ID, TYPED_CARD);
+        fireEvent.click(key("ENTER=Process"));
+      },
+      pendingAt: 1,
+      enterable: [false, true],
+      next: async () => {
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+        fireEvent.click(key("ENTER=Process"));
+        await waitFor(() => {
+          expect(infoText()).toBe(INFO_CONFIRM);
+        });
+      },
+      routes: [CARDS_EDIT, CARD_PUT],
+    },
+    {
+      title: "a validation on ENTER",
+      edits: [{ status: 200, body: view, gated: false }],
+      puts: [
+        { status: 200, body: validated, gated: true },
+        { status: 200, body: committed, gated: false },
+      ],
+      reach: async () => {
+        await showFromList();
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+        fireEvent.click(key("ENTER=Process"));
+      },
+      pendingAt: 2,
+      enterable: [false, false],
+      next: async () => {
+        await save(INFO_DONE);
+      },
+      routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
+    },
+    {
+      title: "a save on F5",
+      edits: [{ status: 200, body: view, gated: false }],
+      puts: [
+        { status: 200, body: validated, gated: false },
+        { status: 200, body: committed, gated: true },
+      ],
+      reach: async () => {
+        await showFromList();
+        await validate();
+        fireEvent.click(key("F5=Save"));
+      },
+      pendingAt: 3,
+      enterable: [false, false],
+      next: async () => {
+        fireEvent.click(key("ENTER=Process"));
+        expect(await screen.findByText("Stub at /cards, state null")).not.toBeNull();
+      },
+      routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
+    },
+    {
+      title: "the fetch that follows a 409 on F5",
+      edits: [
+        { status: 200, body: view, gated: false },
+        { status: 200, body: changedView, gated: true },
+      ],
+      puts: [
+        { status: 200, body: validated, gated: false },
+        { status: 409, body: changedByOther, gated: false },
+        { status: 200, body: validated, gated: false },
+      ],
+      reach: async () => {
+        await showFromList();
+        await validate();
+        pressKey("F5");
+      },
+      pendingAt: 4,
+      enterable: [false, true],
+      next: async () => {
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+        fireEvent.click(key("ENTER=Process"));
+        await waitFor(() => {
+          expect(infoText()).toBe(INFO_CONFIRM);
+        });
+      },
+      routes: [CARDS_EDIT, CARD_PUT, CARD_PUT, CARDS_EDIT, CARD_PUT],
+    },
+  ])("locks every key but F3 and the inputs during $title, then frees them", async ({
+    edits,
+    puts,
+    reach,
+    pendingAt,
+    enterable,
+    next,
+    routes,
+  }) => {
+    const { held, open } = hold();
+    const withGate = ({ gated, ...reply }: { status: number; body: unknown; gated: boolean }) =>
+      gated ? { ...reply, held } : reply;
+    const calls = stubApi({ [CARDS_EDIT]: edits.map(withGate), [CARD_PUT]: puts.map(withGate) });
+    await reach();
+    await waitFor(() => {
+      expect(calls).toHaveLength(pendingAt);
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    expect(disabledKeys()).toEqual(lockedKeys(true));
+    expect(updateForm().getAttribute("aria-busy")).toBe("true");
+    expect(Object.values(LABELS).map((label) => field(label).readOnly)).toEqual(
+      Object.values(LABELS).map(() => true),
+    );
+    // Neither the buttons nor the keys send a second request while the first is out.
+    for (const label of ["ENTER=Process", "F5=Save", "F12=Cancel", "F7"]) {
+      fireEvent.click(key(label));
+    }
+    for (const name of ["Enter", "F5", "F12", "F7"]) {
+      pressKey(name);
+    }
+    fireEvent.submit(updateForm());
+    await settle();
+    expect(calls).toHaveLength(pendingAt);
+
+    open();
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("false");
+    });
+    expect(updateForm().getAttribute("aria-busy")).toBe("false");
+    expect(disabledKeys()).toEqual(lockedKeys(false));
+    expectEnterable(enterable[0], enterable[1]);
+
+    // The next key acts again.
+    await next();
+    await settle();
+    expect(calls.map((call) => call.route)).toEqual(routes);
+  });
+
+  it.each([
+    {
+      title: "ENTER clicked twice before a fetch",
+      reach: async () => {
+        renderScreen();
+        typeSearchKeys(ACCT_ID, TYPED_CARD);
+      },
+      keys: () => {
+        fireEvent.click(key("ENTER=Process"));
+        fireEvent.click(key("ENTER=Process"));
+      },
+      info: INFO_SHOWN,
+      routes: [CARDS_EDIT],
+      aids: [],
+    },
+    {
+      title: "ENTER clicked and the form submitted with the card shown",
+      reach: async () => {
+        await showFromList();
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+      },
+      keys: () => {
+        fireEvent.click(key("ENTER=Process"));
+        fireEvent.submit(updateForm());
+      },
+      info: INFO_CONFIRM,
+      routes: [CARDS_EDIT, CARD_PUT],
+      aids: ["ENTER"],
+    },
+    {
+      title: "F5 clicked, then ENTER, in the confirmation",
+      reach: async () => {
+        await showFromList();
+        await validate();
+      },
+      keys: () => {
+        fireEvent.click(key("F5=Save"));
+        fireEvent.click(key("ENTER=Process"));
+      },
+      info: INFO_DONE,
+      routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
+      aids: ["ENTER", "PF5"],
+    },
+    {
+      title: "the keys F5 and Enter in the confirmation",
+      reach: async () => {
+        await showFromList();
+        await validate();
+      },
+      keys: () => {
+        pressKey("F5");
+        pressKey("Enter");
+      },
+      info: INFO_DONE,
+      routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
+      aids: ["ENTER", "PF5"],
+    },
+  ])("sends one request for $title before the screen shows the lock", async ({
+    reach,
+    keys,
+    info,
+    routes,
+    aids,
+  }) => {
+    const calls = stubApi({
+      [CARDS_EDIT]: [{ status: 200, body: view }],
+      [CARD_PUT]: [
+        { status: 200, body: validated },
+        { status: 200, body: committed },
+      ],
+    });
+    await reach();
+
+    // One act: the screen renders only after both keys, so the second meets the enabled keys.
+    act(() => {
+      keys();
+    });
+
+    await waitFor(() => {
+      expect(infoText()).toBe(info);
+    });
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("false");
+    });
+    await settle();
+    expect(calls.map((call) => call.route)).toEqual(routes);
+    expect(calls.filter((call) => call.route === CARD_PUT).map((call) => call.body)).toMatchObject(
+      aids.map((aid) => ({ aid })),
+    );
+  });
+
+  // audit: COCRDUPC-004
+  it("F3 returns to COCRDLI while the entry fetch is out", async () => {
+    const { held, open } = hold();
+    const calls = stubApi({ [CARDS_EDIT]: [{ status: 200, body: view, held }] });
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+    });
+
+    fireEvent.click(key("F3=Exit"));
+
+    expect(await screen.findByText("Stub at /cards, state null")).not.toBeNull();
+    open();
+    await settle();
+    expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT]);
+  });
 });
 
 describe("COCRDUP messages", () => {

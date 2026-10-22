@@ -1,4 +1,12 @@
-import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
+import {
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type BaseSyntheticEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
@@ -17,7 +25,13 @@ import {
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { KEY_ROWS, keyRowItems, type PfKeyHandlers, type PfKeyItem } from "@/lib/pfkeys";
+import {
+  KEY_ROWS,
+  keyRowItems,
+  type PfKey,
+  type PfKeyHandlers,
+  type PfKeyItem,
+} from "@/lib/pfkeys";
 import { PATHS, SCREENS } from "@/routes";
 import { COUSR03_LENGTHS, cousr03Schema, type Cousr03Values } from "@/schemas/COUSR03";
 
@@ -86,6 +100,9 @@ const MAP_KEYS = keyRowItems(KEY_ROWS.COUSR03);
  * labelled `F12` after the map's labels (COUSR03-037, X-SCREENS-10).
  */
 const F12_KEY: PfKeyItem = { key: "F12", label: "F12", dark: false };
+
+/** The keys refused while a request is outstanding; F3 and F12 leave at any time. */
+const LOCKED_KEYS: ReadonlySet<PfKey> = new Set(["ENTER", "F4", "F5"]);
 
 /**
  * What a transfer to this screen passes in route state, the counterparts of `CDEMO-FROM-PROGRAM`
@@ -196,8 +213,9 @@ function OutputField({
  *   message (COUSR03C-009).
  *
  * The user ID is the target user, validated input only: the API's admin gate decides who may
- * delete. No password is shown or asked for. While a request is outstanding ENTER, F4 and F5 do
- * nothing, as the 3270 keyboard stays locked until the program's answer.
+ * delete. No password is shown or asked for. While a request is outstanding ENTER, F4 and F5 are
+ * disabled and the user ID is read-only, as the 3270 keyboard stays locked until the program's
+ * answer; F3 and F12 still leave.
  */
 export function COUSR03(): ReactNode {
   const navigate = useNavigate();
@@ -222,7 +240,22 @@ export function COUSR03(): ReactNode {
   const lastNameRef = useRef<HTMLInputElement>(null);
   const userTypeRef = useRef<HTMLInputElement>(null);
   const entered = useRef(false);
-  const busy = fetchUser.isPending || deleteUser.isPending;
+  // Whether a request is outstanding, from the key that sends it to its answer. The ref decides
+  // at once; the state renders the locked keys, which a key pressed before that render would pass.
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+
+  /** Locks the keyboard for one request, before its edits run. */
+  function lock(): void {
+    busyRef.current = true;
+    setBusy(true);
+  }
+
+  /** Unlocks the keyboard: the edits refused the request, or its answer is shown. */
+  function unlock(): void {
+    busyRef.current = false;
+    setBusy(false);
+  }
 
   /**
    * Puts the cursor where the program's `MOVE -1 TO <field>L` puts it: the field a `ScreenError`
@@ -258,6 +291,7 @@ export function COUSR03(): ReactNode {
 
   /** The schema's blank-user-ID edit (COUSR03C-010, COUSR03C-016); the fields keep their values. */
   function showEditError(errors: FieldErrors<Cousr03Values>): void {
+    unlock();
     setOutputError(null);
     setMessage({ kind: "error", text: errors.userId?.message });
     focusField();
@@ -268,58 +302,77 @@ export function COUSR03(): ReactNode {
    * replaced the form's errors; an output field's mark goes too.
    */
   function fetchById({ userId }: Cousr03Values): void {
-    if (busy) {
-      return;
-    }
     setOutputError(null);
-    fetchUser.mutate(
-      { path: { user_id: userId } },
-      {
-        onSuccess: (view) => {
-          setShown(view);
-          setMessage({ kind: "info", text: view.delete_prompt });
-          focusField();
+    void fetchUser
+      .mutateAsync(
+        { path: { user_id: userId } },
+        {
+          onSuccess: (view) => {
+            setShown(view);
+            setMessage({ kind: "info", text: view.delete_prompt });
+            focusField();
+          },
+          onError: (error) => {
+            setShown(null);
+            setMessage({ kind: "error", text: error.message });
+            markField(error);
+            focusField(error.field);
+          },
         },
-        onError: (error) => {
-          setShown(null);
-          setMessage({ kind: "error", text: error.message });
-          markField(error);
-          focusField(error.field);
-        },
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
   /** F5 (`DELETE-USER-INFO`): endpoint 20 with the typed user ID, the marks cleared as for ENTER. */
   function deleteById({ userId }: Cousr03Values): void {
-    if (busy) {
-      return;
-    }
     setOutputError(null);
-    deleteUser.mutate(
-      { path: { user_id: userId } },
-      {
-        onSuccess: (result) => {
-          form.reset({ userId: "" });
-          setShown(null);
-          setMessage({ kind: "info", text: result.message });
-          focusField();
+    void deleteUser
+      .mutateAsync(
+        { path: { user_id: userId } },
+        {
+          onSuccess: (result) => {
+            form.reset({ userId: "" });
+            setShown(null);
+            setMessage({ kind: "info", text: result.message });
+            focusField();
+          },
+          onError: (error) => {
+            const neutral = NEUTRAL_DELETE_ERRORS.has(error.message);
+            setMessage({ kind: neutral ? "info" : "error", text: error.message });
+            // A neutral failure only moves the cursor (COUSR03C-025).
+            if (!neutral) {
+              markField(error);
+            }
+            focusField(error.field);
+          },
         },
-        onError: (error) => {
-          const neutral = NEUTRAL_DELETE_ERRORS.has(error.message);
-          setMessage({ kind: neutral ? "info" : "error", text: error.message });
-          // A neutral failure only moves the cursor (COUSR03C-025).
-          if (!neutral) {
-            markField(error);
-          }
-          focusField(error.field);
-        },
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
-  const submitFetch = form.handleSubmit(fetchById, showEditError);
-  const submitDelete = form.handleSubmit(deleteById, showEditError);
+  /**
+   * `submit`, the edits and request of one key, refused while a request is outstanding. The lock
+   * is taken before the edits, which `handleSubmit` runs asynchronously, and released at their
+   * refusal or failure, or at the request's answer.
+   */
+  function locked(
+    submit: (event?: BaseSyntheticEvent) => Promise<void>,
+  ): (event?: BaseSyntheticEvent) => Promise<void> {
+    return (event) => {
+      if (busyRef.current) {
+        event?.preventDefault();
+        return Promise.resolve();
+      }
+      lock();
+      return submit(event).catch((error: unknown) => {
+        unlock();
+        throw error;
+      });
+    };
+  }
+
+  const submitFetch = locked(form.handleSubmit(fetchById, showEditError));
+  const submitDelete = locked(form.handleSubmit(deleteById, showEditError));
 
   // The first-entry fetch of COUSR03C-004, run with the first render's handlers and form values.
   // The ref keeps StrictMode's second effect run in development from fetching again.
@@ -333,7 +386,7 @@ export function COUSR03(): ReactNode {
 
   /** F4 (`CLEAR-CURRENT-SCREEN`). */
   function clear(): void {
-    if (busy) {
+    if (busyRef.current) {
       return;
     }
     form.reset({ userId: "" });
@@ -353,7 +406,11 @@ export function COUSR03(): ReactNode {
     },
   };
   const keys: PfKeyBarEntry[] = [
-    ...MAP_KEYS.map((item) => ({ ...item, onPress: actions[item.key] })),
+    ...MAP_KEYS.map((item) => ({
+      ...item,
+      onPress: actions[item.key],
+      disabled: busy && LOCKED_KEYS.has(item.key),
+    })),
     {
       ...F12_KEY,
       onPress: () => {
@@ -370,6 +427,7 @@ export function COUSR03(): ReactNode {
       formId={formId}
       message={message}
       keys={keys}
+      busy={busy}
       keyOptions={{
         foldShifted: KEY_ROWS.COUSR03.foldShifted,
         onInvalidKey: () => {
@@ -401,6 +459,7 @@ export function COUSR03(): ReactNode {
                           field.ref(element);
                           userIdRef.current = element;
                         }}
+                        readOnly={busy}
                         maxLength={COUSR03_LENGTHS.userId}
                         size={COUSR03_LENGTHS.userId}
                         autoFocus

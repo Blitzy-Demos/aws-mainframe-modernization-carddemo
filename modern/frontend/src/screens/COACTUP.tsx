@@ -1,4 +1,4 @@
-import { useId, useState, type ReactNode } from "react";
+import { useId, useRef, useState, type ReactNode } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import {
   useForm,
@@ -740,11 +740,16 @@ function fieldDescription(name: FieldName): string {
  * and `F` starts over on every key but F3 (COACTUPC-006). `PfKeyBar` binds only the keys it is
  * given, so the nine keys the map does not label are added as hidden entries carrying their role's
  * action; their buttons are never shown.
+ *
+ * While `busy`, every key but F3 is disabled, as the keyboard stays locked until the program's
+ * answer arrives: each would send a request or change the screen the answer replaces. F3 sends no
+ * request and stays available (COACTUPC-005).
  */
 function keyEntries(
   availability: PfKeyAvailability,
   handlers: PfKeyHandlers,
   served: ScreenModel["served"],
+  busy: boolean,
 ): PfKeyBarEntry[] {
   const shows = (key: PfKey): boolean => {
     if (key === "F5" && served !== undefined) {
@@ -760,10 +765,18 @@ function keyEntries(
       ...item,
       onPress: item.key === "ENTER" ? undefined : handlers[item.key],
       hidden: !shows(item.key),
+      disabled: busy && item.key !== "F3",
     }),
   );
   const unlabelled = PF_KEYS.filter((key) => !LABELLED_KEY_NAMES.has(key)).map(
-    (key): PfKeyBarEntry => ({ key, label: key, dark: true, onPress: handlers[key], hidden: true }),
+    (key): PfKeyBarEntry => ({
+      key,
+      label: key,
+      dark: true,
+      onPress: handlers[key],
+      hidden: true,
+      disabled: busy,
+    }),
   );
   return [...labelled, ...unlabelled];
 }
@@ -868,8 +881,24 @@ export function COACTUP(): ReactNode {
     defaultValues: INITIAL_VALUES,
   });
   const [screen, setScreen] = useState<ScreenModel>(INITIAL_SCREEN);
-  // The terminal keyboard stays locked until the program's answer arrives.
-  const busy = fetchAccount.isPending || saveAccount.isPending;
+  // The terminal keyboard stays locked from the key that sends a request until the program's
+  // answer has been shown. `locked` is the lock the key handlers read at once, so a key pressed
+  // before the next render is refused too; `busy` renders it: the keys but F3 disabled, the key
+  // row and the form busy, every field read-only.
+  const locked = useRef(false);
+  const [busy, setBusy] = useState(false);
+
+  /** Locks the keyboard for the request a key has just been accepted to send. */
+  function lock(): void {
+    locked.current = true;
+    setBusy(true);
+  }
+
+  /** Opens the lock: the answer has been shown, or the request was not sent. */
+  function unlock(): void {
+    locked.current = false;
+    setBusy(false);
+  }
 
   /**
    * Marks the field a failure names: red through the form error, `*` in it when it was received
@@ -893,11 +922,15 @@ export function COACTUP(): ReactNode {
     form.setFocus(name, { shouldSelect: true });
   }
 
-  /** A length the schema rejects: zod's message in the error row, the field marked. */
+  /**
+   * A length the schema rejects: zod's message in the error row, the field marked. Nothing is
+   * sent, so the lock the key took opens again.
+   */
   function showSchemaFailure(errors: FieldErrors<CoactupValues>): void {
     const first = MAP_INPUTS.find((input) => errors[input.name] !== undefined);
     const message = first === undefined ? undefined : errors[first.name]?.message;
     setScreen((current) => ({ ...current, message }));
+    unlock();
   }
 
   /** The empty screen of the first entry, the account number cleared (COACTUPC-001, -006). */
@@ -919,7 +952,8 @@ export function COACTUP(): ReactNode {
       return;
     }
     form.clearErrors();
-    fetchAccount.mutate(
+    lock();
+    const request = fetchAccount.mutateAsync(
       { path: accountPath(parsed.data.acctId) },
       {
         onSuccess: (view) => {
@@ -941,6 +975,8 @@ export function COACTUP(): ReactNode {
         },
       },
     );
+    // The lock opens once the answer has been shown, whichever way the request settles.
+    void request.then(unlock, unlock);
   }
 
   /** ENTER (`aid` ENTER) or F5 (`aid` PF5) with details shown: endpoint 6. */
@@ -950,13 +986,16 @@ export function COACTUP(): ReactNode {
       return;
     }
     const { state: echoed, details } = screen;
-    void form.handleSubmit((values) => {
+    // The lock is taken before the schema's asynchronous check, so a key that arrives during the
+    // check or while the request is out sends nothing.
+    lock();
+    const validation = form.handleSubmit((values) => {
       const received = receivedValues(values);
       // The screen shows what the program received (COACTUPC-078).
       for (const name of JUSTIFIED) {
         form.setValue(name, received[name]);
       }
-      saveAccount.mutate(
+      const request = saveAccount.mutateAsync(
         {
           path: accountPath(received.acctId),
           body: {
@@ -1005,12 +1044,19 @@ export function COACTUP(): ReactNode {
           },
         },
       );
+      // The lock opens once the answer has been shown, whichever way the request settles.
+      void request.then(unlock, unlock);
     }, showSchemaFailure)();
+    // A check that fails unexpectedly sends nothing, so the lock opens; its error still surfaces.
+    void validation.catch((error: unknown) => {
+      unlock();
+      throw error;
+    });
   }
 
   /** ENTER's own action: the fetch, or the validation once details are shown. */
   function processEnter(): void {
-    if (busy) {
+    if (locked.current) {
       return;
     }
     if (screen.state === "not-fetched") {
@@ -1022,14 +1068,14 @@ export function COACTUP(): ReactNode {
 
   /** F5 in state `N`, the only state whose role for F5 is its own (COACTUPC-071). */
   function save(): void {
-    if (!busy) {
+    if (!locked.current) {
       sendChanges("PF5");
     }
   }
 
   /** F12 in `S`, `E` and `N`: the values of the fetch again, no request (COACTUPC-069). */
   function cancel(): void {
-    if (busy || screen.state === "not-fetched") {
+    if (locked.current || screen.state === "not-fetched") {
       return;
     }
     form.reset(screen.details.values, RESET_OPTIONS);
@@ -1047,7 +1093,7 @@ export function COACTUP(): ReactNode {
     own: { ENTER: processEnter, F3: exit, F5: save, F12: cancel },
     reset: startOver,
   });
-  const keys = keyEntries(availability, handlers, screen.served);
+  const keys = keyEntries(availability, handlers, screen.served, busy);
 
   return (
     <ScreenShell
@@ -1059,6 +1105,7 @@ export function COACTUP(): ReactNode {
       info={screen.info}
       keys={keys}
       keyOptions={KEY_OPTIONS}
+      busy={busy}
     >
       <Form {...form}>
         <form
@@ -1076,7 +1123,7 @@ export function COACTUP(): ReactNode {
                 key={input.name}
                 control={form.control}
                 input={input}
-                readOnly={!enterable(input.name, screen.state)}
+                readOnly={busy || !enterable(input.name, screen.state)}
               />
             ))}
             {/* COACTUP-057: the NEUTRAL caption of the customer block. */}
@@ -1094,7 +1141,7 @@ export function COACTUP(): ReactNode {
                 key={input.name}
                 control={form.control}
                 input={input}
-                readOnly={!enterable(input.name, screen.state)}
+                readOnly={busy || !enterable(input.name, screen.state)}
               />
             ))}
           </FieldGrid>

@@ -48,6 +48,11 @@ import {
  * - The card number is shown only as endpoint 9 sends it, redacted, and the card is addressed by
  *   `card_ref` alone; no typed number is sent once a card is shown (COCRDUPC-042, COCRDUPC-043).
  *   Nothing here logs or stores a payload.
+ * - While a request is out every key but F3 is refused, as the terminal keyboard locks until the
+ *   program answers; F3 still exits. The lock is taken when a key that may send is accepted,
+ *   before the forms' checks, and opens when a check refuses the input or the last request of the
+ *   key settles, the fetch that follows a 409 included. While it holds, every key but `F3=Exit` is
+ *   disabled, the key row and the form are busy and every input is read-only.
  */
 
 /** The map's screen title, `POS=(4,30)` (COCRDUP-011). */
@@ -407,6 +412,11 @@ export function COCRDUP(): ReactNode {
   const fetchCard = useCocrdupcFetch();
   const saveCard = useCocrdupcSave();
   const [model, setModel] = useState<ScreenModel>(INITIAL_MODEL);
+  // `inFlight` is the lock the key handlers read at once; `busy` renders it while a request is
+  // out. Only the settlement of the latest request, numbered by `latestRequest`, opens it.
+  const inFlight = useRef(false);
+  const [busy, setBusy] = useState(false);
+  const latestRequest = useRef(0);
   /** The field the cursor goes to once the next render has mounted it (COCRDUPC-046). */
   const pendingFocus = useRef<FieldPath<CocrdupValues> | undefined>(undefined);
   const entered = useRef(false);
@@ -420,7 +430,6 @@ export function COCRDUP(): ReactNode {
     defaultValues: BLANK_VALUES,
   });
 
-  const busy = fetchCard.isPending || saveCard.isPending;
   const availability = cocrdupKeys(model.state);
   const keysOnKeyForm = model.state === "not-fetched";
   // COCRDUPC-004: back to the screen that transferred here, else the main menu.
@@ -438,6 +447,45 @@ export function COCRDUP(): ReactNode {
       detailForm.setFocus(name);
     }
   });
+
+  /** Takes the key lock for a key that may send a request. */
+  function lockKeys() {
+    inFlight.current = true;
+    setBusy(true);
+  }
+
+  /** Opens the key lock: the last request has settled, or the key that took it sends nothing. */
+  function unlockKeys() {
+    inFlight.current = false;
+    setBusy(false);
+  }
+
+  /**
+   * Holds the key lock until `request` settles, whatever its outcome, after its outcome is shown.
+   * A request sent while that outcome is shown, the fetch after a 409, holds it in turn.
+   */
+  function holdUntilSettled(request: Promise<unknown>) {
+    lockKeys();
+    latestRequest.current += 1;
+    const number = latestRequest.current;
+    const settled = () => {
+      if (latestRequest.current === number) {
+        unlockKeys();
+      }
+    };
+    void request.then(settled, settled);
+  }
+
+  /**
+   * Runs a form check the key lock was taken for. A check that fails unexpectedly opens the lock
+   * again, as nothing was sent, and still reports its error.
+   */
+  function checkLocked(check: Promise<void>) {
+    void check.catch((error: unknown) => {
+      unlockKeys();
+      throw error;
+    });
+  }
 
   /**
    * Marks the field a server message names: red, `*` when blank, cursor there (COCRDUPC-046).
@@ -550,31 +598,35 @@ export function COCRDUP(): ReactNode {
     keptMessage: string | undefined,
     otherwise: CocrdupKeyState,
   ) {
-    fetchCard.mutate(
-      { query: { acct_id: listKeys.acctId, card_ref: listKeys.cardRef } },
-      {
-        onSuccess: (view) => {
-          showFetched(view, keptMessage);
+    holdUntilSettled(
+      fetchCard.mutateAsync(
+        { query: { acct_id: listKeys.acctId, card_ref: listKeys.cardRef } },
+        {
+          onSuccess: (view) => {
+            showFetched(view, keptMessage);
+          },
+          onError: (error) => {
+            fetchFailed(error, listKeys, otherwise);
+          },
         },
-        onError: (error) => {
-          fetchFailed(error, listKeys, otherwise);
-        },
-      },
+      ),
     );
   }
 
   /** ENTER before a fetch: endpoint 9 with the keys as typed, never a `card_ref` (COCRDUPC-016). */
   function search(keys: CocrdupKeyValues) {
-    fetchCard.mutate(
-      { query: { acct_id: keys.acctId, card_num: keys.cardNum } },
-      {
-        onSuccess: (view) => {
-          showFetched(view);
+    holdUntilSettled(
+      fetchCard.mutateAsync(
+        { query: { acct_id: keys.acctId, card_num: keys.cardNum } },
+        {
+          onSuccess: (view) => {
+            showFetched(view);
+          },
+          onError: (error) => {
+            fetchFailed(error, undefined, "not-fetched");
+          },
         },
-        onError: (error) => {
-          fetchFailed(error, undefined, "not-fetched");
-        },
-      },
+      ),
     );
   }
 
@@ -645,10 +697,14 @@ export function COCRDUP(): ReactNode {
     markField(error, state, message !== NO_CHANGES_DETECTED);
   }
 
-  /** ENTER (validate) or F5 (save) with the card shown: endpoint 10 by `card_ref`. */
+  /**
+   * ENTER (validate) or F5 (save) with the card shown: endpoint 10 by `card_ref`. With no card
+   * shown nothing is sent, so the key lock opens again.
+   */
   function sendChanges(aid: components["schemas"]["CocrdupcAid"], values: CocrdupValues) {
     const { card, snapshot } = model;
     if (card === undefined || snapshot === undefined) {
+      unlockKeys();
       return;
     }
     const fields: components["schemas"]["CardUpdateFields"] = {
@@ -657,21 +713,27 @@ export function COCRDUP(): ReactNode {
       expiry_month: zeroFilled(values.expiryMonth, COCRDUP_LENGTHS.expiryMonth),
       expiry_year: zeroFilled(values.expiryYear, COCRDUP_LENGTHS.expiryYear),
     };
-    saveCard.mutate(
-      { path: { card_ref: card.cardRef }, body: { aid, fields, snapshot } },
-      {
-        onSuccess: (result) => {
-          saved(result, fields, card, snapshot);
+    holdUntilSettled(
+      saveCard.mutateAsync(
+        { path: { card_ref: card.cardRef }, body: { aid, fields, snapshot } },
+        {
+          onSuccess: (result) => {
+            saved(result, fields, card, snapshot);
+          },
+          onError: (error) => {
+            saveFailed(error, card, snapshot);
+          },
         },
-        onError: (error) => {
-          saveFailed(error, card, snapshot);
-        },
-      },
+      ),
     );
   }
 
-  /** A field over its map `LENGTH`: zod's message in the error row, cursor on the field. */
+  /**
+   * A field over its map `LENGTH`: zod's message in the error row, cursor on the field. Nothing
+   * is sent, so the key lock opens again.
+   */
   function showInvalid(errors: Partial<Record<FieldPath<CocrdupValues>, { message?: string }>>) {
+    unlockKeys();
     const name = FIELD_ORDER.find((key) => errors[key]?.message !== undefined);
     if (name === undefined) {
       return;
@@ -707,6 +769,9 @@ export function COCRDUP(): ReactNode {
   // `CDEMO-LAST-MAPSET` has no route-state counterpart (X-COCRDUPC-10), so the caller recorded in
   // `from` stands for it: entered from the menu, the next key always starts over.
   function restart() {
+    if (inFlight.current) {
+      return;
+    }
     if (entry.from === PATHS.COCRDLI) {
       navigate(PATHS.COCRDLI);
       return;
@@ -722,7 +787,7 @@ export function COCRDUP(): ReactNode {
   /** F12 in `S`, `E` or `N`: the last endpoint 9 values again, state `S` (COCRDUPC-006). */
   function cancel() {
     const { card } = model;
-    if (busy || card === undefined) {
+    if (inFlight.current || card === undefined) {
       return;
     }
     detailForm.reset(card.values);
@@ -739,12 +804,15 @@ export function COCRDUP(): ReactNode {
 
   /** F5 in `N`: endpoint 10 with `aid` PF5 (COCRDUPC-036 to COCRDUPC-041). */
   function confirmSave() {
-    if (busy) {
+    if (inFlight.current) {
       return;
     }
-    void detailForm.handleSubmit((values) => {
-      sendChanges("PF5", values);
-    }, showInvalid)();
+    lockKeys();
+    checkLocked(
+      detailForm.handleSubmit((values) => {
+        sendChanges("PF5", values);
+      }, showInvalid)(),
+    );
   }
 
   /** ENTER, and every key COCRDUPC takes as ENTER: the form's submit (COCRDUPC-008). */
@@ -752,23 +820,30 @@ export function COCRDUP(): ReactNode {
     formRef.current?.requestSubmit();
   }
 
-  /** ENTER: search before a fetch, validate after it; in `C`, `L` and `F` the restart. */
+  /**
+   * ENTER: search before a fetch, validate after it; in `C`, `L` and `F` the restart. The key lock
+   * is taken before the asynchronous checks, so a key that arrives during them or while the
+   * request is out sends nothing.
+   */
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (busy) {
+    if (inFlight.current) {
       return;
     }
     if (availability.roles.ENTER === "reset") {
       restart();
       return;
     }
+    lockKeys();
     if (keysOnKeyForm) {
-      void keyForm.handleSubmit(search, showInvalid)();
+      checkLocked(keyForm.handleSubmit(search, showInvalid)());
       return;
     }
-    void detailForm.handleSubmit((values) => {
-      sendChanges("ENTER", values);
-    }, showInvalid)();
+    checkLocked(
+      detailForm.handleSubmit((values) => {
+        sendChanges("ENTER", values);
+      }, showInvalid)(),
+    );
   }
 
   const handlers = bindPfKeys(availability, {
@@ -777,12 +852,14 @@ export function COCRDUP(): ReactNode {
   });
   const items = keyRowItemsFor(KEY_ROWS.COCRDUP, availability);
   const labelled = new Set(items.map((item) => item.key));
+  // While a request is out only F3 stays enabled, the hidden keys included.
   const keys: PfKeyBarEntry[] = [
     // ENTER keeps no action of its own: its button and the Enter key submit the form natively.
     ...items.map((item) => ({
       ...item,
       hidden: item.key === "F5" || item.key === "F12" ? !model.saveEnabled : !item.shown,
       onPress: item.key === "ENTER" ? undefined : handlers[item.key],
+      disabled: busy && item.key !== "F3",
     })),
     // COCRDUPC-008: the keys the map labels nowhere (F1, F2, F4, F6 to F11) still reach the
     // program, which processes them as ENTER; they get hidden entries so `PfKeyBar` binds them.
@@ -792,6 +869,7 @@ export function COCRDUP(): ReactNode {
       dark: true,
       hidden: true,
       onPress: handlers[key],
+      disabled: busy,
     })),
   ];
 
@@ -808,8 +886,16 @@ export function COCRDUP(): ReactNode {
       info={model.info}
       keys={keys}
       keyOptions={KEY_OPTIONS}
+      busy={busy}
     >
-      <form id={formId} ref={formRef} noValidate aria-label={TITLE} onSubmit={onSubmit}>
+      <form
+        id={formId}
+        ref={formRef}
+        noValidate
+        aria-label={TITLE}
+        aria-busy={busy}
+        onSubmit={onSubmit}
+      >
         <FieldGrid>
           {keysOnKeyForm && (
             <Form {...keyForm}>
@@ -823,7 +909,7 @@ export function COCRDUP(): ReactNode {
                       {/* `IC` on ACCTSID: the cursor starts on the account (COCRDUP-013). */}
                       <Input
                         {...field}
-                        {...inputAttributes(name, true)}
+                        {...inputAttributes(name, !busy)}
                         autoFocus={name === "acctId"}
                       />
                     </FieldCells>
@@ -841,7 +927,7 @@ export function COCRDUP(): ReactNode {
                   name={name}
                   render={({ field }) => (
                     <FieldCells spec={FIELDS[name]}>
-                      <Input {...field} {...inputAttributes(name, keysEnterable)} />
+                      <Input {...field} {...inputAttributes(name, keysEnterable && !busy)} />
                     </FieldCells>
                   )}
                 />
@@ -853,7 +939,7 @@ export function COCRDUP(): ReactNode {
                 name={name}
                 render={({ field }) => (
                   <FieldCells spec={FIELDS[name]}>
-                    <Input {...field} {...inputAttributes(name, detailsEnterable)} />
+                    <Input {...field} {...inputAttributes(name, detailsEnterable && !busy)} />
                   </FieldCells>
                 )}
               />

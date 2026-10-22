@@ -30,9 +30,10 @@ import { COMEN01 } from "./COMEN01";
  * The rows of `COMEN01C-003` and `COMEN01C-010` are blocked by halt candidates `X-COMEN01C-2` and
  * `X-COMEN01C-1`: their tests are reported BLOCKED and assert only the replacement's path the rows
  * state, never a COBOL result. Rows `COMEN01-001` to `COMEN01-010` place the header labels in a
- * `Label` and the header values in a read-only `Input`; the shared `ScreenShell` renders both as
- * plain text, so those rows are not tagged here. Their content rows (`COMEN01-029` to
- * `COMEN01-034`) are.
+ * `Label` and the header values in a read-only `Input`, as the shared `ScreenShell` renders them.
+ * The label rows are tagged in NAV. The value rows are tagged here, on each value's read-only
+ * `Input`, its width, its map `POS` and `LENGTH`, its label and its content, as are their content
+ * rows (`COMEN01-029` to `COMEN01-034`).
  */
 
 const TOKEN = "test-token";
@@ -282,6 +283,42 @@ async function enterOption(typed: string): Promise<void> {
   fireEvent.click(enterButton());
 }
 
+/** The menu's `<form>`, which holds the option input. */
+function menuForm(): HTMLFormElement {
+  const form = optionInput().form;
+  if (form === null) {
+    throw new TypeError("the OPTION field is not in a form");
+  }
+  return form;
+}
+
+/**
+ * Whether the screen shows the locked keyboard of a load in progress: ENTER disabled, the key row
+ * and the form busy, the option input read-only; or, with `busy` false, all of them free. F3 is
+ * free either way.
+ */
+function expectBusy(busy: boolean): void {
+  expect(enterButton()).toHaveProperty("disabled", busy);
+  expect(screen.getByRole("button", { name: "F3=Exit" })).toHaveProperty("disabled", false);
+  expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+    String(busy),
+  );
+  expect(menuForm().getAttribute("aria-busy")).toBe(String(busy));
+  expect(optionInput().readOnly).toBe(busy);
+}
+
+/**
+ * Gives a refused key the time its submit handler would take to decide and render. The wait runs
+ * inside `act`, as the form's own state updates after an ENTER do.
+ */
+async function lingers(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+}
+
 /** Lets a pending submit handler and the renders it schedules finish: `waitFor` drains them. */
 async function settled(): Promise<void> {
   await waitFor(() => {
@@ -319,9 +356,23 @@ function cardHeader(): HTMLElement {
   return header;
 }
 
-/** The header value field `name` of rows 1 and 2. */
-function headerValue(name: string): string | null | undefined {
-  return cardHeader().querySelector(`[data-field="${name}"]`)?.textContent;
+/**
+ * The header field `name` of rows 1 and 2 (`data-field`): the one `Input` of that name in the
+ * `CardHeader`, failing the test when there is not exactly one.
+ */
+function headerInput(name: string): HTMLInputElement {
+  const fields = cardHeader().querySelectorAll(`input[data-field="${name}"]`);
+  expect(fields).toHaveLength(1);
+  const [field] = fields;
+  if (!(field instanceof HTMLInputElement)) {
+    throw new TypeError(`the header has no input ${name}`);
+  }
+  return field;
+}
+
+/** The value of the header field `name` of rows 1 and 2. */
+function headerValue(name: string): string {
+  return headerInput(name).value;
 }
 
 /** Header rows 1 and 2 as `POPULATE-HEADER-INFO` fills them (COMEN01C-019). */
@@ -393,7 +444,7 @@ describe("COMEN01 first entry", () => {
     );
     expect(cells.every((cell) => cell.getAttribute("data-slot") === "table-cell")).toBe(true);
 
-    // The header labels are shown; `ScreenShell` renders them as text, not as `Label`s.
+    // The header labels are shown, each the `Label` of the value after it.
     for (const label of ["Tran:", "Date:", "Prog:", "Time:"]) {
       expect(within(cardHeader()).getByText(label)).toBeTruthy();
     }
@@ -432,6 +483,96 @@ describe("COMEN01 first entry", () => {
     expect(new URL(load.url).search).toBe("");
     expect(load.headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
   });
+
+  it.each([
+    // audit: COMEN01-002
+    {
+      id: "COMEN01-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CM00",
+    },
+    // audit: COMEN01-003
+    {
+      id: "COMEN01-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE01,
+    },
+    // audit: COMEN01-005
+    {
+      id: "COMEN01-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COMEN01-007
+    {
+      id: "COMEN01-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COMEN01C",
+    },
+    // audit: COMEN01-008
+    {
+      id: "COMEN01-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE02,
+    },
+    // audit: COMEN01-010
+    {
+      id: "COMEN01-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    async ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      serve(MENU);
+      renderMenu();
+      await loaded();
+
+      const field = headerInput(name);
+      expect(field.dataset.slot).toBe("input");
+      expect(field.readOnly).toBe(true);
+      expect(field.size).toBe(length);
+      expect(field.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(field.value).toEqual(shows);
+      const labels = Array.from(field.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(within(cardHeader()).getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(
+        field,
+      );
+      expect(requests).toHaveLength(1);
+    },
+  );
 });
 
 describe("COMEN01 ENTER", () => {
@@ -532,7 +673,27 @@ describe("COMEN01 ENTER", () => {
     },
   );
 
-  it("decides nothing while endpoint 2 loads or reloads", async () => {
+  it.each([
+    {
+      how: "a click on ENTER=Continue",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      how: "the Enter key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+      },
+    },
+    {
+      how: "a submit of the form",
+      press: () => {
+        fireEvent.submit(menuForm());
+      },
+    },
+  ])("$how decides nothing while endpoint 2 loads or reloads", async ({ press }) => {
+    // audit: COMEN01-035
     const load = deferred();
     const reload = deferred();
     stubFetch(async () => {
@@ -541,12 +702,17 @@ describe("COMEN01 ENTER", () => {
     });
     const client = renderMenu();
 
-    await enterOption("1");
-    await settled();
-    load.release();
-    await loaded();
+    // First entry: the load is out. The input is read-only, so the entry is set, not typed.
+    expectBusy(true);
+    fireEvent.change(optionInput(), { target: { value: "1" } });
+    press();
+    press();
+    await lingers();
     expectNoTransfer();
     expect(errorRow().textContent).toBe("");
+    load.release();
+    await loaded();
+    expectBusy(false);
 
     await enterOption("1");
     expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
@@ -555,17 +721,22 @@ describe("COMEN01 ENTER", () => {
       expect(menuRequests()).toHaveLength(2);
     });
 
-    await enterOption("6");
-    await settled();
+    // A return to the menu: the cached table shows while the reload is out.
+    expectBusy(true);
+    fireEvent.change(optionInput(), { target: { value: "6" } });
+    press();
+    press();
+    await lingers();
     expectNoTransfer();
     expect(errorRow().textContent).toBe("");
 
     reload.release();
     await waitFor(() => {
       expect(client.isFetching()).toBe(0);
+      expectBusy(false);
     });
     expectNoTransfer();
-    fireEvent.click(enterButton());
+    press();
     expect(await screen.findByText(`arrived at ${PATHS.COTRN00}`)).toBeTruthy();
     expect(menuRequests()).toHaveLength(2);
   });
@@ -627,6 +798,29 @@ describe("COMEN01 function keys", () => {
     // COSGN00C is entered with no COMMAREA, and its own first entry ends the session.
     expect(screen.getByLabelText("Route state").textContent).toBe("null");
     expect(getSession()).not.toBeNull();
+    expect(requests).toHaveLength(1);
+  });
+
+  it("F3 still goes to sign-on while endpoint 2 loads, and an unserved key is refused", async () => {
+    // audit: COMEN01C-006
+    // audit: COMEN01-036
+    const load = deferred();
+    stubFetch(async () => {
+      await load.done;
+      return json(200, MENU);
+    });
+    renderMenu();
+    expectBusy(true);
+
+    // The locked keyboard takes the unserved key without the invalid-key text.
+    fireEvent.keyDown(optionInput(), { key: "F5" });
+    await lingers();
+    expect(errorRow().textContent).toBe("");
+
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+    expect(screen.getByLabelText("Route state").textContent).toBe("null");
+    load.release();
     expect(requests).toHaveLength(1);
   });
 

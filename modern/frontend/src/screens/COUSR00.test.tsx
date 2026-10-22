@@ -363,9 +363,20 @@ function expectNoFieldMessage(input: HTMLElement): void {
   expect(descriptionsOf(input)).toEqual([]);
 }
 
-/** The text of the header field `name` (`TRNNAME`, `CURDATE`, …). */
-function headerField(name: string): string | null | undefined {
-  return document.querySelector(`[data-field="${name}"]`)?.textContent;
+/**
+ * The value of the header field `name` (`TRNNAME`, `CURDATE`, …): the one read-only `Input` of
+ * that `data-field` in the `CardHeader`, failing when there is not exactly one.
+ */
+function headerField(name: string): string {
+  const inputs = document.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(inputs).toHaveLength(1);
+  const [input] = inputs;
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`The header has no input ${name}`);
+  }
+  return input.value;
 }
 
 /** Waits until `count` requests were sent and row 1 shows `userId`. */
@@ -389,6 +400,68 @@ function expectNoPageSize(sent: readonly { url: string }[]): void {
   for (const request of sent) {
     expect(request.url).not.toContain("page_size");
   }
+}
+
+/** The keys refused while a page request is outstanding. */
+const LOCKED_KEYS = ["ENTER=Continue", "F7=Backward", "F8=Forward"] as const;
+
+/**
+ * A reply for {@link stubFetch} that stays outstanding until `release`, which answers it with
+ * `answer`.
+ */
+function heldReply(answer: () => Response): {
+  reply: () => Promise<Response>;
+  release: () => void;
+} {
+  const resolvers: ((response: Response) => void)[] = [];
+  const outstanding = new Promise<Response>((resolve) => {
+    resolvers.push(resolve);
+  });
+  return {
+    reply: () => outstanding,
+    release: () => {
+      for (const resolve of resolvers) {
+        resolve(answer());
+      }
+    },
+  };
+}
+
+/** The screen's form, which ENTER submits. */
+function mapForm(): HTMLFormElement {
+  const form = document.querySelector("form");
+  if (form === null) {
+    throw new Error("COUSR0A renders no form");
+  }
+  return form;
+}
+
+/** Whether the row-24 key labelled `label` is disabled. */
+function isDisabled(label: string): boolean {
+  return screen.getByRole("button", { name: label }).hasAttribute("disabled");
+}
+
+/** Whether each editable input is read-only: Search User ID, then the ten selectors. */
+function readOnlyStates(): boolean[] {
+  const fields = [searchField(), ...Array.from({ length: 10 }, (_, index) => selector(index + 1))];
+  return fields.map((field) => {
+    if (!(field instanceof HTMLInputElement)) {
+      throw new TypeError(`${field.tagName} is not an input`);
+    }
+    return field.readOnly;
+  });
+}
+
+/**
+ * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
+ * send has been sent before a test counts the requests.
+ */
+async function settle(): Promise<void> {
+  await waitFor(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 20);
+    });
+  });
 }
 
 beforeEach(() => {
@@ -435,10 +508,11 @@ describe("COUSR00 List Users", () => {
 
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("List Users");
     /*
-     * The header labels' placement and the values the program moves (COUSR00-090 to COUSR00-095).
-     * The label rows COUSR00-001, -004, -006 and -009 are proved by NAV
-     * (`frontend/e2e/nav.spec.ts`), and the value-field rows COUSR00-002, -003, -005, -007, -008
-     * and -010 by the test of their read-only title-row cells below.
+     * The header labels' placement and the values the program moves (COUSR00-090 to COUSR00-095),
+     * read from the read-only `Input`s `ScreenShell` renders in the `CardHeader` title rows. The
+     * label rows COUSR00-001, -004, -006 and -009 are proved by NAV (`frontend/e2e/nav.spec.ts`),
+     * and the value rows COUSR00-002, -003, -005, -007, -008 and -010 by the test of those inputs
+     * below.
      */
     expect(screen.getByText("Tran:").parentElement?.className).toBe(
       "row-start-1 col-start-1 col-span-5",
@@ -527,50 +601,115 @@ describe("COUSR00 List Users", () => {
     }
   });
 
-  it("header values TRNNAME, TITLE01, CURDATE, PGMNAME, TITLE02 and CURTIME are read-only cells of the CardHeader title rows at their map POS and LENGTH", async () => {
-    // `ScreenShell` realises each header value field as read-only text in its title-row cell
-    // rather than as an `Input` with `readOnly`, so these rows are proved on that cell. The values
-    // it shows are proved under COUSR00-090 to COUSR00-095.
+  it.each([
     // audit: COUSR00-002
+    {
+      id: "COUSR00-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 7,
+      length: 4,
+      label: "Tran:",
+      shows: "CU00",
+    },
     // audit: COUSR00-003
+    {
+      id: "COUSR00-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE01,
+    },
     // audit: COUSR00-005
+    {
+      id: "COUSR00-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date:",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
     // audit: COUSR00-007
+    {
+      id: "COUSR00-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 7,
+      length: 8,
+      label: "Prog:",
+      shows: "COUSR00C",
+    },
     // audit: COUSR00-008
+    {
+      id: "COUSR00-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: TITLE02,
+    },
     // audit: COUSR00-010
-    const sent = stubFetch(json(200, FIRST_PAGE));
-    renderList();
-    await listed(sent, 1, "ADMIN001");
+    {
+      id: "COUSR00-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 8,
+      label: "Time:",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id: header value $name is a read-only Input of the CardHeader title rows at its map POS and LENGTH",
+    async ({ name, row, col, length, label, shows }) => {
+      // The values these fields show are proved under COUSR00-090 to COUSR00-095.
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      renderList();
+      await listed(sent, 1, "ADMIN001");
 
-    const header = document.querySelector('[data-slot="card-header"]');
-    expect(header).not.toBeNull();
-    // The title rows hold no form control.
-    expect(header?.querySelector("input, textarea, select, button")).toBeNull();
-    for (const { name, row, col, length } of [
-      { name: "TRNNAME", row: 1, col: 7, length: 4 },
-      { name: "TITLE01", row: 1, col: 21, length: 40 },
-      { name: "CURDATE", row: 1, col: 71, length: 8 },
-      { name: "PGMNAME", row: 2, col: 7, length: 8 },
-      { name: "TITLE02", row: 2, col: 21, length: 40 },
-      { name: "CURTIME", row: 2, col: 71, length: 8 },
-    ]) {
+      const header = document.querySelector('[data-slot="card-header"]');
+      if (!(header instanceof HTMLElement)) {
+        throw new Error("The screen has no card header");
+      }
       // The field's one element stands in the title rows, not in the body or the footer.
       const shown = document.querySelectorAll(`[data-field="${name}"]`);
       expect(shown).toHaveLength(1);
       const value = shown.item(0);
-      expect(header?.contains(value)).toBe(true);
-      // Its cell is the map POS and LENGTH, and its text fills the field box, the padding that
-      // centres the titles included.
-      const cell = value?.parentElement;
-      expect(cell?.className).toBe(`row-start-${row} col-start-${col} col-span-${length}`);
-      expect(value?.textContent).toHaveLength(length);
-      // Neither the value nor anything in its cell takes input or focus.
-      expect(cell?.querySelector("input, textarea, select, button, [contenteditable]")).toBeNull();
-      for (const element of [value, cell]) {
-        expect(element?.hasAttribute("contenteditable")).toBe(false);
-        expect(element?.hasAttribute("tabindex")).toBe(false);
+      expect(header.contains(value)).toBe(true);
+      expect(value.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
+      // It is an output field of the map: a read-only `Input` as wide as its LENGTH (`size`), in
+      // the cell of its POS and LENGTH, holding LENGTH characters, the padding that centres the
+      // titles included.
+      if (!(value instanceof HTMLInputElement)) {
+        throw new Error(`The header field ${name} is not an input`);
       }
-    }
-  });
+      expect(value.dataset.slot).toBe("input");
+      expect(value.readOnly).toBe(true);
+      expect(value.size).toBe(length);
+      expect(value.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(value.value).toEqual(shows);
+      expect(value.value).toHaveLength(length);
+      // The map literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const labels = Array.from(value.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(value.getAttribute("aria-label")).toBe(label === null ? `Title row ${row}` : null);
+      // The title rows hold no editable control: their six controls are the read-only values.
+      const controls = Array.from(
+        header.querySelectorAll("input, textarea, select, button, [contenteditable]"),
+      );
+      expect(controls).toHaveLength(6);
+      expect(
+        controls.every((control) => control instanceof HTMLInputElement && control.readOnly),
+      ).toBe(true);
+    },
+  );
 
   it.each([
     { title: "two users and the end-of-file message", page: PAGE, message: BOTTOM_REACHED },
@@ -1253,31 +1392,147 @@ describe("COUSR00 List Users", () => {
     },
   );
 
-  it("keeps the keyboard locked while a request is outstanding", async () => {
-    const releases: ((reply: Response) => void)[] = [];
-    const outstanding = new Promise<Response>((resolve) => {
-      releases.push(resolve);
+  it.each([
+    { trigger: "the entry list", before: [], start: () => undefined, held: FIRST_PAGE },
+    {
+      trigger: "the ENTER=Continue button",
+      before: [FIRST_PAGE],
+      start: () => {
+        typeInto(searchField(), "USER0001");
+        press("ENTER=Continue");
+      },
+      held: SEARCH_PAGE,
+    },
+    {
+      trigger: "the Enter key",
+      before: [FIRST_PAGE],
+      start: () => {
+        typeInto(searchField(), "USER0001");
+        pressKey("Enter");
+      },
+      held: SEARCH_PAGE,
+    },
+    {
+      trigger: "the F7=Backward button",
+      before: [FIRST_PAGE],
+      start: () => {
+        press("F7=Backward");
+      },
+      held: TOP_KEPT,
+    },
+    {
+      trigger: "the F8 key",
+      before: [FIRST_PAGE],
+      start: () => {
+        pressKey("F8");
+      },
+      held: SECOND_PAGE,
+    },
+  ])(
+    "locks ENTER, F7, F8 and the inputs while $trigger is outstanding, keeps F3, then frees them",
+    async ({ before, start, held }) => {
+      const gate = heldReply(json(200, held));
+      const sent = stubFetch(
+        ...before.map((page) => json(200, page)),
+        gate.reply,
+        json(200, BOTTOM_KEPT),
+      );
+      renderList();
+      if (before.length > 0) {
+        await listed(sent, 1, "ADMIN001");
+      }
+      const count = before.length + 1;
+      start();
+      await waitFor(() => {
+        expect(sent).toHaveLength(count);
+      });
+
+      const keyBar = screen.getByRole("group", { name: "Function keys" });
+      await waitFor(() => {
+        expect(keyBar.getAttribute("aria-busy")).toBe("true");
+      });
+      expect(mapForm().getAttribute("aria-busy")).toBe("true");
+      expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([true, true, true]);
+      expect(isDisabled("F3=Back")).toBe(false);
+      expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => true));
+
+      // Every locked key, by button and by keyboard, a direct submit and an unserved key: no
+      // request, no message.
+      for (const label of LOCKED_KEYS) {
+        press(label);
+      }
+      for (const key of ["Enter", "F7", "F8", "F5"]) {
+        pressKey(key);
+      }
+      fireEvent.submit(mapForm());
+      await settle();
+      expect(sent).toHaveLength(count);
+      expect(errorRow().textContent).toBe("");
+
+      gate.release();
+      await waitFor(() => {
+        expect(keyBar.getAttribute("aria-busy")).toBe("false");
+      });
+      expect(mapForm().getAttribute("aria-busy")).toBe("false");
+      expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([false, false, false]);
+      expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => false));
+
+      // Once answered, the next key is served.
+      press("F8=Forward");
+      await waitFor(() => {
+        expect(sent).toHaveLength(count + 1);
+      });
+      await settle();
+      expect(sent).toHaveLength(count + 1);
+      expect(sent[count].query).toMatchObject({ direction: "forward" });
+    },
+  );
+
+  it("acts on no selection while a page request is outstanding, then on the page it answered", async () => {
+    const gate = heldReply(json(200, SECOND_PAGE));
+    const sent = stubFetch(json(200, FIRST_PAGE), gate.reply);
+    renderList();
+    await listed(sent, 1, "ADMIN001");
+
+    typeInto(selector(1), "U");
+    pressKey("F8");
+    await waitFor(() => {
+      expect(sent).toHaveLength(2);
     });
-    const sent = stubFetch(() => outstanding, json(200, SECOND_PAGE));
+    press("ENTER=Continue");
+    pressKey("Enter");
+    fireEvent.submit(mapForm());
+    await settle();
+    expect(screen.queryByRole("region", { name: "Update User" })).toBeNull();
+    expect(sent).toHaveLength(2);
+
+    gate.release();
+    await listed(sent, 2, "USER0006");
+    expect(valueOf(selector(1))).toBe("U");
+    press("ENTER=Continue");
+
+    await screen.findByRole("region", { name: "Update User" });
+    expect(transferState("Update User")).toEqual({
+      from: PATHS.COUSR00,
+      user_id: "USER0006",
+      first_key: "USER0006",
+      last_key: "USER0005",
+    });
+    expect(sent).toHaveLength(2);
+  });
+
+  it("F3 returns to the admin menu while the entry list is outstanding", async () => {
+    const gate = heldReply(json(200, FIRST_PAGE));
+    const sent = stubFetch(gate.reply);
     renderList();
     await waitFor(() => {
-      expect(sent).toHaveLength(1);
+      expect(isDisabled("ENTER=Continue")).toBe(true);
     });
 
-    // ENTER, F7 and F8 are ignored until the entry's answer arrives.
-    press("ENTER=Continue");
-    press("F7=Backward");
-    press("F8=Forward");
-    pressKey("F8");
-    expect(releases).toHaveLength(1);
-    releases[0](json(200, FIRST_PAGE)());
-    await listed(sent, 1, "ADMIN001");
-    expect(valueOf(pageField())).toBe("00000001");
+    press("F3=Back");
 
-    // Once answered, the next key is served.
-    press("F8=Forward");
-    await listed(sent, 2, "USER0006");
-    expect(sent[1].query).toMatchObject({ direction: "forward", page_key: "USER0005" });
+    await screen.findByRole("region", { name: "Admin Menu" });
+    expect(sent).toHaveLength(1);
   });
 
   it("refuses a search value longer than the map's 8 characters with no request", async () => {

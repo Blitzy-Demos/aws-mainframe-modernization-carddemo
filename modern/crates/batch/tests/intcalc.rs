@@ -157,11 +157,12 @@ const ABEND_STDERR_PREFIX: &str = "carddemo-batch intcalc: ABEND: ";
 
 /// The start of the standard-error line of a run that cannot connect to `PostgreSQL`, which the
 /// value-free summary of the error follows (`main.rs`, "Standard error").
-const CONNECT_STDERR_PREFIX: &str = "carddemo-batch intcalc: cannot connect to the database: ";
+const CONNECT_STDERR_PREFIX: &str =
+    "carddemo-batch intcalc: cannot connect to the database (DATABASE_URL): ";
 
 /// The message of the event `main` emits when it cannot connect, before any line of the job
 /// (`main.rs`, `execute`).
-const CONNECTION_FAILED: &str = "database connection failed";
+const CONNECTION_FAILED: &str = "database connection failed (DATABASE_URL)";
 
 /// A loopback address and port where no server listens, so every connection is refused at once.
 const UNREACHABLE_SERVER: &str = "127.0.0.1:1";

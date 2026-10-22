@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -509,6 +509,49 @@ async function answered(seen: ReturnType<typeof stubFetch>, count: number): Prom
 }
 
 /**
+ * Lets every pending promise and timer run, so a request a key would send has been sent. Run
+ * inside `waitFor`, so any state update it lets through lands where React expects it.
+ */
+async function settle(): Promise<void> {
+  await waitFor(async () => {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+/** A reply held back until the test passes it to `release`. */
+function heldReply(): {
+  readonly reply: Promise<Response>;
+  readonly release: (response: Response) => void;
+} {
+  let resolveReply: (response: Response) => void = () => undefined;
+  const reply = new Promise<Response>((resolve) => {
+    resolveReply = resolve;
+  });
+  return {
+    reply,
+    release: (response) => {
+      resolveReply(response);
+    },
+  };
+}
+
+/** The row-24 key group, busy while a request is out. */
+function functionKeys(): HTMLElement {
+  return screen.getByRole("group", { name: "Function keys" });
+}
+
+/** The key-row button labelled `name`. */
+function keyButton(name: string): HTMLButtonElement {
+  const button = within(functionKeys()).getByRole("button", { name });
+  if (!(button instanceof HTMLButtonElement)) {
+    throw new Error(`the key ${name} is not a button`);
+  }
+  return button;
+}
+
+/**
  * Waits until the cursor is on the field `target` finds: the screen moves it in an effect after
  * it shows a response, so it can arrive after the response's text.
  */
@@ -621,13 +664,13 @@ function pressKey(key: string, shiftKey = false): void {
  * row and column, the `LENGTH`, the value shown, and whether the map colours the field YELLOW.
  *
  * The rows describe each value as a read-only `Input` of the field's width in the `CardHeader`
- * title rows of `ScreenShell`. `ScreenShell` realises it as read-only text in those title rows,
- * its recorded decision (the header rows belong to the frame's title rows, not to the map's input
- * or output fields). The assertions prove what the rows require of that text: it is read-only and
- * out of the tab order, as an `ASKIP` field is skipped; its grid cell is the field box at `POS`
- * with `LENGTH` as its width, and it shows exactly `LENGTH` characters; it stands in the
- * `CardHeader`, not in the body or the footer; and it carries the tokens of AAP 0.4.3: the
- * foreground with `font-semibold` for a YELLOW title, the foreground alone for a `NORM` value.
+ * title rows of `ScreenShell`, as `ScreenShell` renders it. The assertions prove what the rows
+ * require of that input: it is the shadcn `Input` (`data-slot="input"`), read-only and out of the
+ * tab order, as an `ASKIP` field is skipped; it is `LENGTH` characters wide (`size`), its grid
+ * cell is the field box at `POS` with `LENGTH` as its width, and it holds exactly `LENGTH`
+ * characters; it stands in the `CardHeader`, not in the body or the footer; and it carries the
+ * tokens of AAP 0.4.3: the foreground with `font-semibold` for a YELLOW title, the foreground
+ * alone for a `NORM` value.
  */
 function expectHeaderValues(
   root: ParentNode,
@@ -658,9 +701,13 @@ function expectHeaderValues(
     const found = root.querySelectorAll(`[data-field="${name}"]`);
     expect(found).toHaveLength(1);
     const element = found[0];
-    if (!(element instanceof HTMLElement)) {
-      throw new Error(`the screen renders no header field ${name}`);
+    if (!(element instanceof HTMLInputElement)) {
+      throw new Error(`the screen renders no header input ${name}`);
     }
+    // The shadcn `Input`, read-only and LENGTH characters wide.
+    expect(element.getAttribute("data-slot")).toBe("input");
+    expect(element.readOnly).toBe(true);
+    expect(element.size).toBe(length);
     // Placement: in the CardHeader title rows, not in the body or the footer.
     expect(element.closest('[data-slot="card-header"]')).toBe(header);
     expect(element.closest('[data-slot="card-content"], [data-slot="card-footer"]')).toBeNull();
@@ -668,9 +715,8 @@ function expectHeaderValues(
     expect(element.parentElement?.className).toBe(
       `row-start-${row} col-start-${col} col-span-${length}`,
     );
-    const shown = element instanceof HTMLInputElement ? element.value : element.textContent;
-    expect(shown).toBe(value);
-    expect(shown).toHaveLength(length);
+    expect(element.value).toBe(value);
+    expect(element.value).toHaveLength(length);
     // Read-only and skipped by Tab: neither the field nor anything inside it takes typing or is a
     // tab stop.
     const nodes = [element, ...Array.from(element.querySelectorAll("*"))];
@@ -775,8 +821,18 @@ describe("COTRTLI", () => {
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe(
       "Maintain Transaction Type",
     );
-    const header = (field: string) =>
-      document.querySelector(`[data-field="${field}"]`)?.textContent;
+    // A header value is the one read-only `Input` of its `data-field` in the `CardHeader`.
+    const header = (field: string) => {
+      const inputs = document.querySelectorAll(
+        `[data-slot="card-header"] input[data-field="${field}"]`,
+      );
+      expect(inputs).toHaveLength(1);
+      const [input] = inputs;
+      if (!(input instanceof HTMLInputElement)) {
+        throw new Error(`The header has no input ${field}`);
+      }
+      return input.value;
+    };
     expect(header("TRNNAME")).toBe("CTLI");
     expect(header("PGMNAME")).toBe("COTRTLIC");
     expect(header("TITLE01")).toBe("      AWS Mainframe Modernization       ");
@@ -785,15 +841,18 @@ describe("COTRTLI", () => {
     expect(header("CURTIME")).toMatch(/^\d{2}:\d{2}:\d{2}$/);
 
     // The first display: both filters empty and enterable, the cursor on the type filter (`IC`).
+    // They take typing once the first entry's request is answered.
     expect(typeFilter().getAttribute("maxlength")).toBe("2");
     expect(descFilter().getAttribute("maxlength")).toBe("50");
     for (const filter of [typeFilter(), descFilter()]) {
       expect(filter).toHaveProperty("value", "");
-      expect(filter).toHaveProperty("readOnly", false);
     }
     expect(document.activeElement).toBe(typeFilter());
 
     await answered(seen, 1);
+    for (const filter of [typeFilter(), descFilter()]) {
+      expect(filter).toHaveProperty("readOnly", false);
+    }
     const load = sent(seen, 1, `GET ${LIST_PATH}`);
     // The first entry sends no member of the query at all (COTRTLIC-002).
     expect(load.url.search).toBe("");
@@ -880,7 +939,7 @@ describe("COTRTLI", () => {
     expect(keys.every((key) => !key.hidden)).toBe(true);
   });
 
-  it("shows the six header values as read-only text in the CardHeader title rows, each at its POS and LENGTH", async () => {
+  it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
     // audit: COTRTLI-002
     // audit: COTRTLI-003
     // audit: COTRTLI-005
@@ -1317,29 +1376,151 @@ describe("COTRTLI", () => {
     },
   );
 
-  it("keys pressed while a request is pending send nothing", async () => {
-    let release: (response: Response) => void = () => undefined;
-    const pending = new Promise<Response>((resolve) => {
-      release = resolve;
-    });
-    const seen = stubFetch([pending]);
-    renderScreen();
-    await waitFor(() => {
+  it.each([
+    { title: "the first entry", prior: [], start: null, answer: [200, LOADED], filtersOpen: true },
+    {
+      title: "ENTER by its button",
+      prior: [LOADED],
+      start: { via: "button", name: "ENTER" },
+      answer: [200, REFRESHED],
+      filtersOpen: true,
+    },
+    {
+      title: "Enter on the keyboard",
+      prior: [LOADED],
+      start: { via: "key", name: "Enter" },
+      answer: [200, REFRESHED],
+      filtersOpen: true,
+    },
+    {
+      title: "F10 by its button",
+      prior: [LOADED],
+      start: { via: "button", name: "F10=Save" },
+      answer: [200, REFRESHED],
+      filtersOpen: true,
+    },
+    {
+      title: "F8 by its button",
+      prior: [LOADED],
+      start: { via: "button", name: "F8=Page Dn" },
+      answer: [200, LAST_PAGE_AGAIN],
+      filtersOpen: true,
+    },
+    {
+      title: "F7 on the keyboard",
+      prior: [LOADED],
+      start: { via: "key", name: "F7" },
+      answer: [200, FIRST_PAGE_AGAIN],
+      filtersOpen: true,
+    },
+    {
+      title: "F10 on the keyboard with an update pending",
+      prior: [LOADED, UPDATE_PROMPTED],
+      start: { via: "key", name: "F10" },
+      answer: [400, UPDATE_REJECTED],
+      filtersOpen: false,
+      description: 6,
+    },
+  ] satisfies readonly {
+    readonly title: string;
+    readonly prior: readonly components["schemas"]["TranTypeListResponse"][];
+    readonly start: { readonly via: "button" | "key"; readonly name: string } | null;
+    readonly answer: readonly [number, unknown];
+    readonly filtersOpen: boolean;
+    readonly description?: number;
+  }[])(
+    "while $title is out, its keys are disabled and send nothing, F2 and F3 stay, and the inputs wait",
+    async (example) => {
+      const { prior, start, answer, filtersOpen } = example;
+      const description = "description" in example ? example.description : undefined;
+      const held = heldReply();
+      const seen = stubFetch([
+        ...prior.map((page): readonly [number, unknown] => [200, page]),
+        held.reply,
+        [200, REFRESHED],
+      ]);
+      renderScreen();
+      for (let shown = 1; shown <= prior.length; shown += 1) {
+        if (shown > 1) {
+          press("ENTER");
+        }
+        await answered(seen, shown);
+      }
+      if (description !== undefined) {
+        expect(descriptionAt(description)).toHaveProperty("readOnly", false);
+      }
+      const refused = ["ENTER", "F7=Page Up", "F8=Page Dn", "F10=Save"];
+      const available = ["F2=Add", "F3=Exit"];
+      /** Every key that sends a request, by its button and on the keyboard; F1 counts as ENTER. */
+      function pressRequestKeys(): void {
+        for (const label of refused) {
+          press(label);
+        }
+        for (const key of ["Enter", "F7", "F8", "F10", "F1"]) {
+          fireEvent.keyDown(window, { key });
+        }
+      }
+      /** The key that starts the request, by its button or on the keyboard. */
+      function startRequest(): void {
+        if (start?.via === "button") {
+          press(start.name);
+        } else if (start?.via === "key") {
+          fireEvent.keyDown(window, { key: start.name });
+        }
+      }
+
+      // The key twice and every other request key in one batch, before the screen re-renders:
+      // only the lock the first key took refuses the rest.
+      act(() => {
+        startRequest();
+        startRequest();
+        pressRequestKeys();
+      });
+      await waitFor(() => {
+        expect(seen).toHaveLength(prior.length + 1);
+      });
+
+      expect(functionKeys().getAttribute("aria-busy")).toBe("true");
       expect(form().getAttribute("aria-busy")).toBe("true");
-    });
+      for (const label of refused) {
+        expect(keyButton(label).disabled).toBe(true);
+      }
+      for (const label of available) {
+        expect(keyButton(label).disabled).toBe(false);
+      }
+      expect(typeFilter()).toHaveProperty("readOnly", true);
+      expect(descFilter()).toHaveProperty("readOnly", true);
+      for (const row of [1, 2, 3, 4, 5, 6, 7]) {
+        expect(selectorAt(row)).toHaveProperty("readOnly", true);
+        expect(descriptionAt(row)).toHaveProperty("readOnly", true);
+      }
 
-    press("F8=Page Dn");
-    press("F7=Page Up");
-    press("ENTER");
-    press("F10=Save");
-    release(json(200, LOADED));
-    await answered(seen, 1);
-    await waitFor(() => {
-      expect(codesShown()).toEqual(SEEDED_TYPES.map(([code]) => code));
-    });
+      pressRequestKeys();
+      await settle();
+      expect(seen).toHaveLength(prior.length + 1);
 
-    expect(seen).toHaveLength(1);
-  });
+      held.release(json(answer[0], answer[1]));
+      await answered(seen, prior.length + 1);
+      expect(functionKeys().getAttribute("aria-busy")).toBe("false");
+      for (const label of [...refused, ...available]) {
+        expect(keyButton(label).disabled).toBe(false);
+      }
+      expect(typeFilter()).toHaveProperty("readOnly", !filtersOpen);
+      expect(descFilter()).toHaveProperty("readOnly", !filtersOpen);
+      for (const row of [1, 2, 3, 4, 5, 6, 7]) {
+        expect(selectorAt(row)).toHaveProperty("readOnly", false);
+        expect(descriptionAt(row)).toHaveProperty("readOnly", row !== description);
+      }
+
+      // The keyboard is open again: the next ENTER is sent.
+      press("ENTER");
+      await answered(seen, prior.length + 2);
+      expect(sent(seen, prior.length + 2, `POST ${ACTIONS_PATH}`).body).toHaveProperty(
+        "aid",
+        "ENTER",
+      );
+    },
+  );
 
   it.each([
     { name: "Enter", key: "Enter", shiftKey: false, aid: "ENTER" },

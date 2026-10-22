@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ReactNode,
+} from "react";
 import { useNavigate } from "react-router";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -17,7 +25,6 @@ import {
   FormMessage,
 } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import { INVALID_KEY, THANK_YOU } from "@/lib/header";
 import { KEY_ROWS, keyRowItems, type PfKeyOptions } from "@/lib/pfkeys";
 import { SCREENS } from "@/routes";
@@ -88,11 +95,17 @@ function formFieldOf(field: string | null | undefined): keyof Cosgn00Values | un
  * (COSGN00C-009, E26). On success the session is stored and the screen goes to the `next_route`
  * the server chose (COSGN00C-017); the stored user type only chooses navigation and never grants
  * anything. On a `ScreenError` the message fills the error row, the inputs keep what was typed and
- * the input the error names takes the focus (COSGN00C-011). F3 ends the conversation with the
- * session-end text (COSGN00C-004); any other F-key shows the invalid-key message (COSGN00C-005).
+ * the input the error names takes the focus (COSGN00C-011). That input is also marked invalid with
+ * the server message, so assistive technology reads the message with the input; an error that
+ * names no input marks none, and the next sign-on sent clears every mark. F3 ends the conversation
+ * with the session-end text (COSGN00C-004); any other F-key shows the invalid-key message
+ * (COSGN00C-005).
  *
  * While a sign-on is in flight every key is refused, as the terminal keyboard stays locked until
- * the program answers; a late answer can therefore never sign on a user who has pressed F3.
+ * the program answers; a late answer can therefore never sign on a user who has pressed F3. The
+ * lock is taken when ENTER is accepted, before the schema's check, and opens when the check
+ * refuses the input or the answer arrives. While the request is out, `ENTER=Sign-on` and `F3=Exit`
+ * are disabled, the key row and the form are busy and both inputs are read-only.
  */
 export function COSGN00(): ReactNode {
   const navigate = useNavigate();
@@ -101,13 +114,14 @@ export function COSGN00(): ReactNode {
     resolver: zodResolver(cosgn00Schema),
     defaultValues: { userId: "", password: "" },
   });
-  const { reset, setFocus } = form;
+  const { reset, clearErrors, setError } = form;
   const [message, setMessage] = useState("");
   const [ended, setEnded] = useState(false);
+  // `inFlight` is the lock the key handlers read at once; `pending` renders it while the sign-on
+  // request is out.
   const inFlight = useRef(false);
+  const [pending, setPending] = useState(false);
   const endedRef = useRef<HTMLElement>(null);
-  const applidId = useId();
-  const sysidId = useId();
 
   // COSGN00C-002: no COMMAREA reaches COSGN00C, so every entry starts without a session.
   useEffect(() => {
@@ -139,21 +153,26 @@ export function COSGN00(): ReactNode {
   }, []);
 
   const keys = useMemo<PfKeyBarEntry[]>(
-    () => KEY_ITEMS.map((item) => (item.key === "F3" ? { ...item, onPress: endSession } : item)),
-    [endSession],
+    () =>
+      KEY_ITEMS.map((item) =>
+        item.key === "F3"
+          ? { ...item, onPress: endSession, disabled: pending }
+          : { ...item, disabled: pending },
+      ),
+    [endSession, pending],
   );
   const keyOptions = useMemo<PfKeyOptions>(
     () => ({ foldShifted: KEY_ROWS.COSGN00.foldShifted, onInvalidKey: showInvalidKey }),
     [showInvalidKey],
   );
 
+  // Reached only through `onSubmit`, which has already taken the lock.
   function submit(values: Cosgn00Values): void {
-    if (inFlight.current) {
-      return;
-    }
-    inFlight.current = true;
-    // COSGN00C-001: the message row shows only the outcome of the key just pressed.
+    setPending(true);
+    // COSGN00C-001: the message row, and the input an earlier answer marked, show only the
+    // outcome of the key just pressed.
     setMessage("");
+    clearErrors();
     signon.mutate(
       { body: { user_id: values.userId, password: values.password } },
       {
@@ -163,24 +182,46 @@ export function COSGN00(): ReactNode {
         },
         onError: (error) => {
           setMessage(error.message);
+          // COSGN00C-011: the error row stays the only visible message; the input it names is
+          // marked invalid with it, read through its `FormMessage`, and takes the cursor.
           const name = formFieldOf(error.field);
           if (name !== undefined) {
-            setFocus(name);
+            setError(name, { type: "server", message: error.message }, { shouldFocus: true });
           }
         },
         onSettled: () => {
           inFlight.current = false;
+          setPending(false);
         },
       },
     );
   }
 
   // A value longer than its map LENGTH (COSGN00-027, COSGN00-031) is never sent; the schema's
-  // message takes the message row, and the form focuses the first rejected input.
+  // message takes the message row, and the form focuses the first rejected input. No request is
+  // out, so the lock ENTER took opens again.
   function reject(errors: FieldErrors<Cosgn00Values>): void {
-    if (!inFlight.current) {
-      setMessage(errors.userId?.message ?? errors.password?.message ?? "");
+    inFlight.current = false;
+    setMessage(errors.userId?.message ?? errors.password?.message ?? "");
+  }
+
+  /**
+   * ENTER, by the button, the key or an Enter in a field. The lock is taken here, before the
+   * schema's asynchronous check, so an ENTER that arrives during the check or while the sign-on is
+   * out submits nothing and never reaches the browser's own form submission. A check that fails
+   * unexpectedly opens the lock again, as no request was sent, and still reports its error.
+   */
+  function onSubmit(event: FormEvent<HTMLFormElement>): void {
+    if (inFlight.current) {
+      event.preventDefault();
+      return;
     }
+    inFlight.current = true;
+    void form.handleSubmit(submit, reject)(event).catch((error: unknown) => {
+      inFlight.current = false;
+      setPending(false);
+      throw error;
+    });
   }
 
   if (ended) {
@@ -202,29 +243,14 @@ export function COSGN00(): ReactNode {
       message={{ kind: "error", text: message }}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
+      // COSGN00-001 to COSGN00-014: the shell's sign-on layout holds the map's header rows 1 to 3,
+      // with `APPLID` and `SYSID` empty outside a CICS region (COSGN00-044, COSGN00-045).
       headerLayout="signon"
     >
       <Form {...form}>
-        <form id={FORM_ID} onSubmit={form.handleSubmit(submit, reject)}>
+        <form id={FORM_ID} aria-busy={pending} onSubmit={onSubmit}>
           <FieldGrid>
-            {/* COSGN00-011 to COSGN00-014, COSGN00-044, COSGN00-045: no CICS region, so empty. */}
-            <GridCell row={3} col={1} span={6}>
-              <Label htmlFor={applidId} className={`${LITERAL} ${BLUE}`}>
-                AppID:
-              </Label>
-            </GridCell>
-            <GridCell row={3} col={8} span={8}>
-              <Input id={applidId} readOnly value="" />
-            </GridCell>
-            <GridCell row={3} col={64} span={6}>
-              <Label htmlFor={sysidId} className={`${LITERAL} ${BLUE}`}>
-                SysID:
-              </Label>
-            </GridCell>
-            <GridCell row={3} col={71} span={8}>
-              <Input id={sysidId} readOnly value="" />
-            </GridCell>
-
             {NOTE_ROWS.map((text, index) => (
               <GridCell
                 key={NOTE_FIRST_ROW + index}
@@ -250,8 +276,8 @@ export function COSGN00(): ReactNode {
              * COSGN00-026, COSGN00-027 (IC: the initial cursor), COSGN00-029. Each `FormItem` is
              * `contents`, so its label, input and hint sit on the map grid in cells of their own.
              * The `(8 Char)` hint is the input's description. The error row is the only visible
-             * message, so the schema message `FormMessage` adds is for assistive technology only,
-             * read with the input it rejects.
+             * message, so the schema or server message `FormMessage` adds is for assistive
+             * technology only, read with the input it rejects or names.
              */}
             <FormField
               control={form.control}
@@ -265,6 +291,7 @@ export function COSGN00(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={pending}
                         maxLength={COSGN00_LENGTHS.userId}
                         autoFocus
                         autoComplete="off"
@@ -297,6 +324,7 @@ export function COSGN00(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={pending}
                         type="password"
                         maxLength={COSGN00_LENGTHS.password}
                         autoComplete="off"

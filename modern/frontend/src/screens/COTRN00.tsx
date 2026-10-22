@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn00cList } from "@/api/hooks";
@@ -233,6 +233,9 @@ function firstFormError(errors: FieldErrors<Cotrn00Values>): string | undefined 
  * - The rows, `PAGENUM` and the search field change only when a page was read, the search field
  *   clearing after a forward page (COTRN00C-036, COTRN00C-037). Selectors are never cleared
  *   (COTRN00C-038), and the cursor returns to the search field after every answer.
+ * - While a request is outstanding the keyboard is locked, as the terminal's stays until the
+ *   program answers: ENTER, F7 and F8 are refused before any selection is read, an unserved F-key
+ *   shows nothing, and the search field and selectors are read-only. F3 still leaves.
  *
  * The page size is never sent, so the server's ten rows, the map's, decide each page.
  */
@@ -254,26 +257,39 @@ export function COTRN00(): ReactNode {
   const [paging, setPaging] = useState(() => pagingOf(location.state));
   const [message, setMessage] = useState<string>();
   const [busy, setBusy] = useState(false);
-  // One request at a time, as the terminal keyboard locks until the program answers.
+  // One request at a time, as the terminal keyboard locks until the program answers. ENTER takes
+  // the lock before the form's validation starts, so no selection is acted on while it is held.
   const inFlight = useRef(false);
   // The entry request runs once, also when StrictMode runs the mount effect twice.
   const entered = useRef(false);
 
+  /** Locks the keyboard for one key; `false` while another key holds it. */
+  function lock(): boolean {
+    if (inFlight.current) {
+      return false;
+    }
+    inFlight.current = true;
+    setBusy(true);
+    return true;
+  }
+
+  /** Releases the keyboard: the answer arrived, or ENTER ended without a request. */
+  function unlock(): void {
+    inFlight.current = false;
+    setBusy(false);
+  }
+
   /**
-   * Sends endpoint 11 for `key` with the current paging state echoed, then shows the answer.
-   * The promise of `mutateAsync` carries the answer, so it lands even when the mutation
-   * observer is detached, as StrictMode's simulated unmount does to the entry request.
+   * Sends endpoint 11 for `key` under the lock its caller holds, with the current paging state
+   * echoed, then shows the answer and releases the lock. The promise of `mutateAsync` carries the
+   * answer, so it lands even when the mutation observer is detached, as StrictMode's simulated
+   * unmount does to the entry request.
    */
   function send(
     key: ListKey,
     query: NonNullable<Parameters<typeof list.mutateAsync>[0]["query"]>,
     selectionMessage?: string,
   ): void {
-    if (inFlight.current) {
-      return;
-    }
-    inFlight.current = true;
-    setBusy(true);
     // A server error marks the field only until the next answer, so each request drops it. A
     // correction drops it sooner: the server rejects the field only on ENTER, after which the
     // form revalidates a field on every change (its default `reValidateMode`).
@@ -313,8 +329,7 @@ export function COTRN00(): ReactNode {
         },
       )
       .finally(() => {
-        inFlight.current = false;
-        setBusy(false);
+        unlock();
         form.setFocus("startTranId");
       });
   }
@@ -324,10 +339,13 @@ export function COTRN00(): ReactNode {
       return;
     }
     entered.current = true;
-    send("entry", { entry_key: entryKeyOf(location.state) });
+    if (lock()) {
+      send("entry", { entry_key: entryKeyOf(location.state) });
+    }
     // Runs on mount only: later requests come from the keys.
   }, []);
 
+  /** ENTER after validation, under the lock {@link onSubmit} took. */
   function onEnter(values: Cotrn00Values): void {
     const selected = values.selections.findIndex((code) => !isBlank(code));
     let selectionMessage: string | undefined;
@@ -336,6 +354,7 @@ export function COTRN00(): ReactNode {
       const tranId = rows[selected]?.tran_id ?? "";
       if (!isBlank(tranId)) {
         if (code === "S" || code === "s") {
+          unlock();
           navigate(PATHS.COTRN01, {
             state: { from: PATHS.COTRN00, tran_id: tranId, list: paging },
           });
@@ -352,7 +371,19 @@ export function COTRN00(): ReactNode {
   }
 
   function onInvalid(errors: FieldErrors<Cotrn00Values>): void {
+    unlock();
     setMessage(firstFormError(errors));
+  }
+
+  const validate = form.handleSubmit(onEnter, onInvalid);
+
+  /** ENTER: refused while a request is outstanding, else validated and acted on under the lock. */
+  function onSubmit(event: FormEvent<HTMLFormElement>): void {
+    if (!lock()) {
+      event.preventDefault();
+      return;
+    }
+    void validate(event);
   }
 
   const handlers: PfKeyHandlers = {
@@ -360,14 +391,23 @@ export function COTRN00(): ReactNode {
       navigate(PATHS.COMEN01);
     },
     F7: () => {
-      send("pf7", { direction: "backward" });
+      if (lock()) {
+        send("pf7", { direction: "backward" });
+      }
     },
     F8: () => {
-      send("pf8", { direction: "forward" });
+      if (lock()) {
+        send("pf8", { direction: "forward" });
+      }
     },
   };
-  // ENTER has no action of its own, so its button and the Enter key submit the form.
-  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({ ...item, onPress: handlers[item.key] }));
+  // ENTER has no action of its own, so its button and the Enter key submit the form. While a
+  // request is outstanding ENTER, F7 and F8 are refused; F3 still leaves.
+  const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
+    ...item,
+    onPress: handlers[item.key],
+    disabled: busy && (item.key === "ENTER" || item.key === "F7" || item.key === "F8"),
+  }));
 
   return (
     <ScreenShell
@@ -380,18 +420,17 @@ export function COTRN00(): ReactNode {
       keyOptions={{
         foldShifted: KEY_ROWS.COTRN00.foldShifted,
         onInvalidKey: () => {
+          if (inFlight.current) {
+            return;
+          }
           setMessage(INVALID_KEY);
           form.setFocus("startTranId");
         },
       }}
+      busy={busy}
     >
       <Form {...form}>
-        <form
-          id={formId}
-          noValidate
-          aria-busy={busy}
-          onSubmit={form.handleSubmit(onEnter, onInvalid)}
-        >
+        <form id={formId} noValidate aria-busy={busy} onSubmit={onSubmit}>
           {/*
            * Auto-height lines: with the grid's equal lines, the ten-row table on line 8 would
            * make every one of the 24 lines as tall as the table.
@@ -431,6 +470,7 @@ export function COTRN00(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={busy}
                         maxLength={COTRN00_LENGTHS.startTranId}
                         autoComplete="off"
                         autoFocus
@@ -488,6 +528,7 @@ export function COTRN00(): ReactNode {
                                 <FormControl>
                                   <Input
                                     {...field}
+                                    readOnly={busy}
                                     maxLength={COTRN00_LENGTHS.selection}
                                     autoComplete="off"
                                     className="w-9 text-center"

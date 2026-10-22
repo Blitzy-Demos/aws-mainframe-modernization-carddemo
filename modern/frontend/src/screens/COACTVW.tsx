@@ -1,4 +1,13 @@
-import { useCallback, useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type BaseSyntheticEvent,
+  type ReactNode,
+} from "react";
 import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -369,6 +378,11 @@ export function COACTVW(): ReactNode {
   const navigate = useNavigate();
   const view = useCoactvwcView();
   const [shown, setShown] = useState<Shown>(NOTHING_SHOWN);
+  // The terminal inhibits input until the answer arrives. `locked` is the lock the key handlers
+  // read at once; `pending` renders it: ENTER disabled, the key row and the form busy, the
+  // account number read-only.
+  const locked = useRef(false);
+  const [pending, setPending] = useState(false);
 
   // The error row reflects the last ENTER only, so the schema re-validates on submit, not while
   // the operator types.
@@ -387,12 +401,14 @@ export function COACTVW(): ReactNode {
     }
   }, [shown.responses, setFocus]);
 
+  /** Opens the lock ENTER took: the answer has been shown, or nothing was sent. */
+  function unlock(): void {
+    locked.current = false;
+    setPending(false);
+  }
+
   function onValid({ acctId }: CoactvwValues): void {
-    // The terminal inhibits input until the answer arrives.
-    if (view.isPending) {
-      return;
-    }
-    view.mutate(
+    const request = view.mutateAsync(
       // The field's 11 positions, as COACTVWC moves them into `CC-ACCT-ID PIC X(11)`: endpoint 4
       // edits the text exactly as typed (COACTVWC-005, COACTVWC-029), and an empty field would
       // leave an empty path segment, which addresses no endpoint.
@@ -417,15 +433,39 @@ export function COACTVW(): ReactNode {
         },
       },
     );
+    // The lock opens once the answer has been shown, whichever way the request settles.
+    void request.then(unlock, unlock);
   }
 
   // A partly filled field is not transmitted (MUSTFILL, COACTVW-013): nothing is sent, the blocks
-  // stay, and the schema's message replaces the last answer's.
+  // stay, and the schema's message replaces the last answer's. No request is out, so the lock
+  // ENTER took opens again.
   function onInvalid(): void {
     setShown((previous) => ({ ...previous, error: null }));
+    unlock();
   }
 
-  const submit = form.handleSubmit(onValid, onInvalid);
+  /**
+   * ENTER, by the button, the Enter key or a key COACTVWC processes as ENTER. The lock is taken
+   * here, before the schema's asynchronous check, so a key that arrives during the check or while
+   * the view is out sends nothing and never reaches the browser's own form submission. A check
+   * that fails unexpectedly opens the lock again, as no request was sent, and still reports its
+   * error.
+   */
+  function submit(event?: BaseSyntheticEvent): void {
+    if (locked.current) {
+      event?.preventDefault();
+      return;
+    }
+    locked.current = true;
+    setPending(true);
+    void form
+      .handleSubmit(onValid, onInvalid)(event)
+      .catch((error: unknown) => {
+        unlock();
+        throw error;
+      });
+  }
 
   const exit = useCallback(() => {
     // COMEN01C is the only program that transfers here, and PF3 returns to it on every visit
@@ -433,15 +473,16 @@ export function COACTVW(): ReactNode {
     void navigate(PATHS.COMEN01);
   }, [navigate]);
 
-  // Stable while `exit` is, so PfKeyBar keeps its key binding across renders.
+  // Stable while `exit` and `pending` are, so PfKeyBar keeps its key binding across renders.
+  // ENTER is refused while the view is out; F3 sends no request and stays available.
   const keys = useMemo<readonly PfKeyBarEntry[]>(
     () => [
-      ENTER_KEY,
+      { ...ENTER_KEY, disabled: pending },
       ...keyRowItems(KEY_ROWS.COACTVW).map((item) =>
         item.key === "F3" ? { ...item, onPress: exit } : item,
       ),
     ],
-    [exit],
+    [exit, pending],
   );
 
   // Only ENTER and PF3 are valid: COACTVWC processes every other key as ENTER, and folds
@@ -449,7 +490,7 @@ export function COACTVW(): ReactNode {
   const keyOptions: PfKeyOptions = {
     foldShifted: KEY_ROWS.COACTVW.foldShifted,
     onInvalidKey: () => {
-      void submit();
+      submit();
     },
   };
 
@@ -469,9 +510,10 @@ export function COACTVW(): ReactNode {
       info={PROMPT_FOR_INPUT}
       keys={keys}
       keyOptions={keyOptions}
+      busy={pending}
     >
       <Form {...form}>
-        <form id={formId} onSubmit={submit} noValidate>
+        <form id={formId} onSubmit={submit} noValidate aria-busy={pending}>
           <FieldGrid className={BODY_GRID_ROWS}>
             <FormField
               control={form.control}
@@ -492,6 +534,7 @@ export function COACTVW(): ReactNode {
                     <FormControl>
                       <Input
                         {...field}
+                        readOnly={pending}
                         data-field="ACCTSID"
                         maxLength={COACTVW_LENGTHS.acctId}
                         size={COACTVW_LENGTHS.acctId}

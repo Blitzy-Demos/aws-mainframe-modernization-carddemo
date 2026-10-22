@@ -12,40 +12,60 @@
 //! pending authorizations and the cross-references a case needs are seeded through the real
 //! repositories (Repository Method Naming); `pending_auth_*` and `auth_fraud` start empty.
 //!
-//! A store failure is produced against the real store, never through a test double, because
-//! `AppState` holds the concrete `PgStore`:
+//! No test double replaces the store: every store failure is produced on a real `PgStore` over
+//! the test's database, in one of three ways:
 //!
 //! - a second pool on the same database, closed before the request, fails the first read;
 //! - a second pool whose sessions carry `lock_timeout`, beside a transaction of the test that
 //!   holds a row lock, fails exactly the statement that needs that row, the insert into
-//!   `auth_fraud` or the replace of the detail, and leaves every earlier statement untouched.
+//!   `auth_fraud` or the replace of the detail, and leaves every earlier statement untouched;
+//! - a `ScriptedProbe` installed with `PgStore::with_probe` skips every call at one
+//!   `ProbePoint`, sending no SQL for it, and answers it with a store error or, for
+//!   `FRAUD-UPDATE`, with no row matched, while every other statement runs against the database
+//!   (see "Probed failures and recordings").
 //!
 //! # Halted rows
 //!
 //! A row a halt blocks keeps its tag, on a `BLOCKED` report printed by the test that reaches
 //! the halted case, and no value is asserted for it (`modern/audit/README.md`, "Layers and
 //! required tags"): halt H4 for the CICS and IMS codes of COPAUS0C-056 and COPAUS1C-038, halt
-//! H3 for COPAUS2C-011, and the halt candidates X-COPAUS1C-H1, X-COPAUS1C-H2 and X-COPAUS2C-H3
-//! for COPAUS1C-027, COPAUS1C-029, COPAUS1C-032 and COPAUS2C-001. Where a halted row also names
-//! what stays assertable, the fixed pieces of COPAUS2C-005 and COPAUS2C-010 included, those
-//! pieces are asserted and the halted positions skipped. The committed fraud toggle,
-//! COPAUS1C-032's success branch, is still driven once to check the replacement's intended
-//! behaviour; its checks carry no tag, so it is a parity result for no row. The two ignored
-//! tests at the end name the halts H3 and H4 and carry no tag.
+//! H3 for the Db2 codes of COPAUS2C-005, COPAUS2C-010 and COPAUS2C-011, the halt candidate
+//! X-COPAUS2C-H2 for bytes 49-50 of COPAUS2C-011's text, and the halt candidates X-COPAUS1C-H1,
+//! X-COPAUS1C-H2 and X-COPAUS2C-H3 for COPAUS1C-027, COPAUS1C-029, COPAUS1C-032 and
+//! COPAUS2C-001. Where a halted row also names what stays assertable, the fixed pieces of
+//! COPAUS2C-005, COPAUS2C-010 and COPAUS2C-011 and the format of COPAUS2C-001's report date
+//! included, those parts are asserted and the halted positions skipped. The committed fraud
+//! toggle, COPAUS1C-032's success branch, is still driven once to check the replacement's
+//! intended behaviour; its checks carry no tag, so it is a parity result for no row. The two
+//! ignored tests at the end name the halts H3 and H4 and carry no tag.
 //!
-//! # Rows this file cannot prove
+//! # Probed failures and recordings
 //!
-//! Each needs a store failure after the first read of its request, or an observation inside
-//! endpoint 23's transaction, which only a test double over the repository traits gives, and
-//! `AppState` admits none. They carry no tag here, so the audit coverage check reports them:
+//! Plain reads take no lock, so no held lock fails a read after the reads before it succeeded,
+//! and what endpoint 23 hands to its writes is committed only on COPAUS1C-032's halted branch.
+//! Nor does any real-store failure make COPAUS2C's `FRAUD-UPDATE` fail after its insert met the
+//! duplicate key. A `ScriptedProbe` reaches all three: it skips one `ProbePoint`, lets every
+//! other statement run, and records each call it is asked about, in order, its arguments cloned,
+//! so that a test asserts the calls reached before the failure and the values each write carried:
 //!
-//! - COPAUS0C-017, COPAUS0C-019, COPAUS0C-030, COPAUS0C-037 and COPAUS0C-038, the account,
-//!   customer, summary, detail and repositioning reads failing after the cross-reference read
-//!   succeeded; COPAUS1C-011 and COPAUS1C-026, the detail and next-detail reads failing after
-//!   the summary read succeeded. Plain reads take no lock, so no held lock can fail them.
-//! - COPAUS1C-028, COPAUS1C-030 and COPAUS1C-034, and COPAUS2C-006: the flipped flag, the
-//!   customer passed to COPAUS2C, the key handed back and the column moves show only in the
-//!   writes endpoint 23 commits, COPAUS1C-032's halted branch, or in a recording double.
+//! - endpoint 21: the account, customer, summary, first-page and repositioning reads failing
+//!   after the cross-reference was found (COPAUS0C-017, COPAUS0C-019, COPAUS0C-030,
+//!   COPAUS0C-037, COPAUS0C-038), each 500 holding only its read's message;
+//! - endpoint 22: the detail read failing after the summary was found, on ENTER and F8, and the
+//!   next read failing after the current detail was found (COPAUS1C-011, COPAUS1C-026);
+//! - endpoint 23: the replace of the detail failing, so that F5 takes COPAUS1C-033's rollback
+//!   and never COPAUS1C-032's halted success branch. The recorded `auth_fraud` insert or update
+//!   and the replace show the flag decided from the stored detail, the account, customer and
+//!   detail handed to COPAUS2C, the key handed back and COPAUS2C's column moves (COPAUS1C-028,
+//!   COPAUS1C-030, COPAUS1C-034, COPAUS2C-006), and the database shows that nothing was
+//!   committed. The 500 is a `ScreenError`, which carries no key, so the screen keeps the key it
+//!   holds; `FraudToggleResult` carries the key only with a 200;
+//! - endpoint 23: `FRAUD-UPDATE`, run because the insert met the key of a seeded `auth_fraud`
+//!   row, answering no row matched and a store error, so that F5 takes COPAUS1C-031's rollback
+//!   with the update-failure text, issues no replace and changes nothing (COPAUS2C-011).
+//!
+//! The codes in each message stay halt H4 or, in COPAUS2C's text, halt H3 and X-COPAUS2C-H2,
+//! and are reported `BLOCKED` (COPAUS0C-056, COPAUS1C-038, COPAUS2C-011).
 //!
 //! # Rules
 //!
@@ -59,7 +79,7 @@
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use api::app::{AppState, app};
 use axum::Router;
@@ -75,7 +95,8 @@ use domain::records::{
 use domain::{CardNumber, Clock, FixedClock};
 use persistence::{
     AccountRepository, AuthFraudRepository, CardXrefRepository, PendingAuthDetailRepository,
-    PendingAuthSummaryRepository, PgStore,
+    PendingAuthSummaryRepository, PersistenceError, PgStore, ProbeCall, ProbePoint, ProbeVerdict,
+    RepositoryProbe,
 };
 use runtime::config::Config;
 use serde_json::{Value, json};
@@ -85,6 +106,15 @@ use tower::ServiceExt;
 
 /// The result of every test and helper.
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+/// without the lint attributes that macro's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
 
 /// The HS256 secret of the API under test, a local-only value.
 const JWT_SECRET: &str = "endpoints-authorizations-local-secret";
@@ -117,6 +147,10 @@ const TAGGING_ERROR: &str = " System error while FRAUD Tagging, ROLLBACK||";
 /// (COPAUS2C-010).
 const SYSTEM_ERROR: &str = " SYSTEM ERROR DB2: CODE:";
 const STATE_LABEL: &str = ", STATE: ";
+
+/// COPAUS2C's update-failure text: bytes 1-22, before the Db2 code; [`STATE_LABEL`] is at bytes
+/// 30-38 (COPAUS2C-011).
+const UPDT_ERROR: &str = " UPDT ERROR DB2: CODE:";
 
 /// One seeded detail: its key parts and the fields in which the details differ. The amounts are
 /// in cents.
@@ -600,10 +634,15 @@ fn auth_acct(acct: u64) -> TestResult<PicS<11>> {
 /// The card of account `acct`, read from its one cross-reference, so that no test writes a
 /// fixture card number.
 async fn card_of(store: &mut PgStore, acct: u64) -> TestResult<CardNumber> {
+    Ok(xref_of(store, acct).await?.card_num)
+}
+
+/// The one cross-reference of account `acct`.
+async fn xref_of(store: &mut PgStore, acct: u64) -> TestResult<CardXrefRecord> {
     let xrefs = CardXrefRepository::find_first_two_by_acct_id(store, PicU::new(acct)?).await?;
-    match xrefs.as_slice() {
-        [xref] => Ok(xref.card_num.clone()),
-        _ => Err(format!("account {acct} has {} cross-references", xrefs.len()).into()),
+    match <[CardXrefRecord; 1]>::try_from(xrefs) {
+        Ok([xref]) => Ok(xref),
+        Err(xrefs) => Err(format!("account {acct} has {} cross-references", xrefs.len()).into()),
     }
 }
 
@@ -1346,8 +1385,9 @@ fn seeded_report_date() -> TestResult<NaiveDate> {
     NaiveDate::from_ymd_opt(2022, 7, 1).ok_or_else(|| "2022-07-01 is a date".into())
 }
 
-/// Endpoint 23 failing after its first statements, against a held row lock: the second pool's
-/// sessions give up a lock wait after 500 milliseconds.
+/// Endpoint 23 failing after its first statements: against a held row lock, which the second
+/// pool's sessions give up waiting for after 500 milliseconds, and at `FRAUD-UPDATE`, which a
+/// probe answers.
 #[tokio::test]
 async fn copaus2c_rollback_paths() -> TestResult {
     let guard = start_loaded_postgres().await?;
@@ -1361,8 +1401,7 @@ async fn copaus2c_rollback_paths() -> TestResult {
     AuthFraudRepository::insert(&mut store, &seeded, seeded_report_date()?).await?;
     insert_fails_on_held_key(&mut api, &mut store, &card).await?;
     replace_fails_after_update(&mut api, &mut store, &card).await?;
-    // audit: COPAUS2C-011
-    report_blocked("H3: COPAUS2C-011, the update failure: no real-store path reaches it");
+    update_fails_through_probe(&mut api, &guard, &mut store, &card).await?;
     // audit: COPAUS2C-013
     api.assert_redacted()
 }
@@ -1481,6 +1520,857 @@ async fn replace_fails_after_update(
     assert_eq!(
         stored_detail(store, &LOCKED_SPEC).await?,
         Some(detail_of(&LOCKED_SPEC, card)?)
+    );
+    Ok(())
+}
+
+/// The insert meets the committed row's key, and a probe answers the `FRAUD-UPDATE` that follows
+/// with no row matched, Db2's `SQLCODE +100`, then with a store error: each F5 rolls back with
+/// COPAUS2C's update-failure text before any replace, and the row and the detail stay as seeded.
+/// Each response joins `api`'s, so that its redaction scan covers them.
+async fn update_fails_through_probe(
+    api: &mut Api,
+    guard: &PostgresGuard,
+    store: &mut PgStore,
+    card: &CardNumber,
+) -> TestResult {
+    let auth_ts = locked_auth_ts()?;
+    let flag = PicX::<1>::from_text("F")?;
+    let inserted = fraud_row_of(&LOCKED_SPEC, card, auth_ts, "F")?;
+    let seeded = fraud_row_of(&LOCKED_SPEC, card, auth_ts, "R")?;
+    for (answer, verdict) in [
+        ("no row matched", ProbeVerdict::NoRow),
+        ("a store error", ProbeVerdict::Fail(probed_store_error())),
+    ] {
+        let probe = ScriptedProbe::answering(ProbePoint::AuthFraudUpdate, verdict);
+        let mut probed = probed_api(guard, &probe, &api.token)?;
+        let reply = probed.post(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY)).await?;
+        api.bodies.append(&mut probed.bodies);
+        // audit: COPAUS2C-011
+        // audit: COPAUS1C-031
+        assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR, "{answer}");
+        // The 50-byte `WS-FRD-ACT-MSG`, its bytes 49-50 included but not asserted.
+        // audit: COPAUS2C-011
+        // audit: COPAUS1C-031
+        assert_fixed_pieces(reply.message(), 50, &[(0, UPDT_ERROR), (29, STATE_LABEL)]);
+        // audit: COPAUS2C-011
+        report_blocked(
+            "H3, X-COPAUS2C-H2: COPAUS2C-011, the SQLCODE and SQLSTATE positions and bytes 49-50",
+        );
+        // audit: COPAUS1C-031
+        assert!(is_bare_error(&reply), "{answer}: more than a message");
+        let log = probe.seen();
+        let updates: Vec<_> = log.iter().filter_map(Seen::fraud_update).collect();
+        // audit: COPAUS2C-008
+        // audit: COPAUS2C-011
+        assert_eq!(updates, [(card, auth_ts, &flag)], "{answer}: FRAUD-UPDATE");
+        let duplicate_then_update = [
+            Seen::FraudInsert(Box::new(inserted.clone())),
+            Seen::FraudUpdate(card.clone(), auth_ts, flag.clone()),
+        ];
+        // audit: COPAUS2C-008
+        assert!(
+            holds_in_order(&log, &duplicate_then_update),
+            "{answer}: the insert before FRAUD-UPDATE"
+        );
+        let replaces = log
+            .iter()
+            .filter(|call| {
+                matches!(
+                    call,
+                    Seen::DetailUpdate(..) | Seen::Other(ProbePoint::AuthDetailUpdate)
+                )
+            })
+            .count();
+        // audit: COPAUS2C-011
+        // audit: COPAUS1C-031
+        assert_eq!(replaces, 0, "{answer}: replaces of the detail");
+        let fraud = AuthFraudRepository::find_by_id(store, card, auth_ts).await?;
+        // audit: COPAUS2C-011
+        // audit: COPAUS2C-012
+        // audit: COPAUS1C-031
+        assert_eq!(
+            fraud,
+            Some((seeded.clone(), Some(seeded_report_date()?))),
+            "{answer}: auth_fraud after the rollback"
+        );
+        // audit: COPAUS2C-011
+        // audit: COPAUS2C-012
+        // audit: COPAUS1C-031
+        assert_eq!(
+            stored_detail(store, &LOCKED_SPEC).await?,
+            Some(detail_of(&LOCKED_SPEC, card)?),
+            "{answer}: the detail after the rollback"
+        );
+    }
+    Ok(())
+}
+
+/// One call a [`ScriptedProbe`] was asked about: the arguments a test asserts on, cloned inside
+/// [`RepositoryProbe::answer`], or the point alone for any other call, and for a call whose
+/// arguments are not the types its point lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Seen {
+    /// `AccountRead`: the account ID.
+    AccountRead(PicU<11>),
+    /// `CustomerRead`: the customer ID.
+    CustomerRead(PicU<9>),
+    /// `AuthSummaryRead`: the account ID.
+    SummaryRead(PicS<11>),
+    /// `AuthDetailRead`: the account ID and the inverted date and time.
+    DetailRead(PicS<11>, PicS<5>, PicS<9>),
+    /// `AuthDetailPage`: the account ID and the inverted start date and time.
+    DetailPage(PicS<11>, PicS<5>, PicS<9>),
+    /// `AuthDetailUpdate`: the account ID and the record the replace carries.
+    DetailUpdate(PicS<11>, Box<PendingAuthDetailRecord>),
+    /// `AuthFraudInsert`: the `auth_fraud` row.
+    FraudInsert(Box<AuthFraudRow>),
+    /// `AuthFraudUpdate`: the card number, the timestamp and the flag of the row's update.
+    FraudUpdate(CardNumber, NaiveDateTime, PicX<1>),
+    /// Any other call.
+    Other(ProbePoint),
+}
+
+impl Seen {
+    /// The record of `call`, by the argument list of its point.
+    fn of(call: &ProbeCall<'_>) -> Self {
+        let point = call.point();
+        let seen = match point {
+            ProbePoint::AccountRead => call.arg::<PicU<11>>(0).map(|acct| Self::AccountRead(*acct)),
+            ProbePoint::CustomerRead => {
+                call.arg::<PicU<9>>(0).map(|cust| Self::CustomerRead(*cust))
+            }
+            ProbePoint::AuthSummaryRead => {
+                call.arg::<PicS<11>>(0).map(|acct| Self::SummaryRead(*acct))
+            }
+            ProbePoint::AuthDetailRead => {
+                Self::key_args(call).map(|(acct, date, time)| Self::DetailRead(acct, date, time))
+            }
+            ProbePoint::AuthDetailPage => {
+                Self::key_args(call).map(|(acct, date, time)| Self::DetailPage(acct, date, time))
+            }
+            ProbePoint::AuthDetailUpdate => call
+                .arg::<PicS<11>>(0)
+                .zip(call.arg::<PendingAuthDetailRecord>(1))
+                .map(|(acct, record)| Self::DetailUpdate(*acct, Box::new(record.clone()))),
+            ProbePoint::AuthFraudInsert => call
+                .arg::<AuthFraudRow>(0)
+                .map(|row| Self::FraudInsert(Box::new(row.clone()))),
+            ProbePoint::AuthFraudUpdate => call
+                .arg::<CardNumber>(0)
+                .zip(call.arg::<NaiveDateTime>(1))
+                .zip(call.arg::<PicX<1>>(2))
+                .map(|((card, auth_ts), flag)| {
+                    Self::FraudUpdate(card.clone(), *auth_ts, flag.clone())
+                }),
+            _ => None,
+        };
+        seen.unwrap_or(Self::Other(point))
+    }
+
+    /// The account and the inverted date and time a detail read or page query starts from.
+    fn key_args(call: &ProbeCall<'_>) -> Option<(PicS<11>, PicS<5>, PicS<9>)> {
+        let acct = call.arg::<PicS<11>>(0)?;
+        let date = call.arg::<PicS<5>>(1)?;
+        let time = call.arg::<PicS<9>>(2)?;
+        Some((*acct, *date, *time))
+    }
+
+    /// The start of a page query.
+    fn page_start(&self) -> Option<(PicS<11>, PicS<5>, PicS<9>)> {
+        if let Self::DetailPage(acct, date, time) = self {
+            Some((*acct, *date, *time))
+        } else {
+            None
+        }
+    }
+
+    /// The account and record of a replace.
+    fn detail_update(&self) -> Option<(PicS<11>, &PendingAuthDetailRecord)> {
+        if let Self::DetailUpdate(acct, record) = self {
+            Some((*acct, record.as_ref()))
+        } else {
+            None
+        }
+    }
+
+    /// The row of an `auth_fraud` insert.
+    fn fraud_insert(&self) -> Option<&AuthFraudRow> {
+        if let Self::FraudInsert(row) = self {
+            Some(row.as_ref())
+        } else {
+            None
+        }
+    }
+
+    /// The key and flag of an `auth_fraud` update.
+    fn fraud_update(&self) -> Option<(&CardNumber, NaiveDateTime, &PicX<1>)> {
+        if let Self::FraudUpdate(card, auth_ts, flag) = self {
+            Some((card, *auth_ts, flag))
+        } else {
+            None
+        }
+    }
+}
+
+/// The endpoint tests' probe: every call at `fails` gets `verdict`, every other call runs its
+/// statement, and each call is recorded, in order.
+struct ScriptedProbe {
+    /// The point whose calls are answered with `verdict`.
+    fails: ProbePoint,
+    /// The answer at `fails`: a store error, or no row matched, either skipping the statement.
+    verdict: ProbeVerdict,
+    /// The calls asked about so far.
+    seen: Mutex<Vec<Seen>>,
+}
+
+impl ScriptedProbe {
+    /// A probe that fails every call at `point` with [`probed_store_error`].
+    fn failing_at(point: ProbePoint) -> Arc<Self> {
+        Self::answering(point, ProbeVerdict::Fail(probed_store_error()))
+    }
+
+    /// A probe that answers every call at `point` with `verdict`.
+    fn answering(point: ProbePoint, verdict: ProbeVerdict) -> Arc<Self> {
+        Arc::new(Self {
+            fails: point,
+            verdict,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The calls recorded so far, in order. A test that panicked while recording leaves its
+    /// records readable.
+    fn seen(&self) -> Vec<Seen> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl RepositoryProbe for ScriptedProbe {
+    fn answer(&self, call: &ProbeCall<'_>) -> ProbeVerdict {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Seen::of(call));
+        if call.point() == self.fails {
+            self.verdict.clone()
+        } else {
+            ProbeVerdict::Proceed
+        }
+    }
+}
+
+/// The error a probed call fails with: an SQLSTATE `XX000` internal error with no constraint,
+/// as `persistence::error` maps an unexpected server error.
+fn probed_store_error() -> PersistenceError {
+    PersistenceError::Database {
+        sqlstate: Some("XX000".to_owned()),
+        constraint: None,
+    }
+}
+
+/// The API over a store on `guard`'s database that answers to `probe`, called with `token`.
+fn probed_api(guard: &PostgresGuard, probe: &Arc<ScriptedProbe>, token: &str) -> TestResult<Api> {
+    let shared: Arc<dyn RepositoryProbe> = probe.clone();
+    let store = PgStore::new(guard.pool().clone()).with_probe(shared);
+    Ok(Api::with_token(router_over(store)?, token))
+}
+
+/// Whether `log` holds every call of `expected`, in that order, with any other calls between.
+fn holds_in_order(log: &[Seen], expected: &[Seen]) -> bool {
+    let mut rest = log.iter();
+    expected.iter().all(|want| rest.any(|call| call == want))
+}
+
+/// Whether `reply` is a bare `ScreenError`: a message and at most a field, so no list, summary
+/// block, detail field or key.
+fn is_bare_error(reply: &Reply) -> bool {
+    reply
+        .body
+        .as_object()
+        .is_some_and(|members| members.keys().all(|key| key == "message" || key == "field"))
+}
+
+/// One read failure the probe injects into endpoint 21 or 22, and what the response and the
+/// probe's log show.
+struct ReadFailure {
+    /// The request.
+    uri: String,
+    /// The point whose read fails.
+    fails: ProbePoint,
+    /// The message's length and its fixed pieces at their 0-based offsets.
+    len: usize,
+    pieces: &'static [(usize, &'static str)],
+    /// The reads issued up to the failing one, in order, the failing one included.
+    reached: Vec<Seen>,
+    /// The account and start key of the one page query the request issued; `None` when it
+    /// issued none.
+    page: Option<(PicS<11>, PicS<5>, PicS<9>)>,
+    /// The `BLOCKED` report of the message's halted positions.
+    blocked: &'static str,
+}
+
+/// Endpoint 21's failure texts of the first page query and of a repositioning one, before the
+/// IMS status (COPAUS0C-037, COPAUS0C-038).
+const DETAILS_TEXT: &str = " System error while reading AUTH Details: Code:";
+const REPOSITION_TEXT: &str = " System error while repos. AUTH Details: Code:";
+
+/// The inverted key parts of account 50's detail `SPECS[index]`.
+fn key_parts(index: usize) -> TestResult<(PicS<5>, PicS<9>)> {
+    let spec = SPECS.get(index).ok_or("no such detail")?;
+    Ok((PicS::new(spec.date_9c)?, PicS::new(spec.time_9c)?))
+}
+
+/// The read failures of endpoint 21, after the cross-reference of account 50 was found: the
+/// account read is asked only then, so its record in the log shows that read succeeded.
+fn summary_read_failures() -> TestResult<Vec<ReadFailure>> {
+    let account_read = Seen::AccountRead(PicU::new(ACCT_50)?);
+    // The customer of the cross-reference, `XREF-CUST-ID`.
+    let customer_read = Seen::CustomerRead(PicU::new(ACCT_50)?);
+    let acct = auth_acct(ACCT_50)?;
+    let summary_read = Seen::SummaryRead(acct);
+    // The lowest key any detail can hold, where the first page starts.
+    let first = (PicS::new(-99_999)?, PicS::new(-999_999_999)?);
+    let (f8_date, f8_time) = key_parts(4)?;
+    let (f7_date, f7_time) = key_parts(1)?;
+    Ok(vec![
+        // audit: COPAUS0C-017
+        ReadFailure {
+            uri: summary_uri(ACCT_50_TEXT, ""),
+            fails: ProbePoint::AccountRead,
+            len: 78,
+            pieces: &[
+                (0, "Account:"),
+                (8, ACCT_50_TEXT),
+                (19, " System error while reading ACCT file. Resp:"),
+                (72, " Reas:"),
+            ],
+            reached: vec![account_read.clone()],
+            page: None,
+            blocked: "H4: COPAUS0C-056, the RESP position of the ACCT system-error text",
+        },
+        // audit: COPAUS0C-019
+        ReadFailure {
+            uri: summary_uri(ACCT_50_TEXT, ""),
+            fails: ProbePoint::CustomerRead,
+            len: 78,
+            pieces: &[
+                (0, "Customer:"),
+                (9, "000000050"),
+                (18, " System error while reading CUST file. Resp:"),
+                (71, " Reas:"),
+            ],
+            reached: vec![account_read.clone(), customer_read.clone()],
+            page: None,
+            blocked: "H4: COPAUS0C-056, the RESP and RESP2 positions of the CUST system-error text",
+        },
+        // audit: COPAUS0C-030
+        ReadFailure {
+            uri: summary_uri(ACCT_50_TEXT, ""),
+            fails: ProbePoint::AuthSummaryRead,
+            len: 49,
+            pieces: &[(0, " System error while reading AUTH Summary: Code:")],
+            reached: vec![account_read, customer_read, summary_read.clone()],
+            page: None,
+            blocked: "H4: COPAUS0C-056, the IMS status position of the AUTH Summary text",
+        },
+        // ENTER: the first page.
+        // audit: COPAUS0C-037
+        ReadFailure {
+            uri: summary_uri(ACCT_50_TEXT, ""),
+            fails: ProbePoint::AuthDetailPage,
+            len: 49,
+            pieces: &[(0, DETAILS_TEXT)],
+            reached: vec![summary_read.clone()],
+            page: Some((acct, first.0, first.1)),
+            blocked: "H4: COPAUS0C-056, the IMS status position of the AUTH Details text",
+        },
+        // F8 after the page that ended with the fifth detail.
+        // audit: COPAUS0C-038
+        ReadFailure {
+            uri: summary_uri(
+                ACCT_50_TEXT,
+                &format!("?page_key={}&direction=forward", KEYS[4]),
+            ),
+            fails: ProbePoint::AuthDetailPage,
+            len: 48,
+            pieces: &[(0, REPOSITION_TEXT)],
+            reached: vec![summary_read.clone()],
+            page: Some((acct, f8_date, f8_time)),
+            blocked: "H4: COPAUS0C-056, the IMS status position of the repos. text after F8",
+        },
+        // F7 to the page that starts with the second detail.
+        // audit: COPAUS0C-038
+        ReadFailure {
+            uri: summary_uri(
+                ACCT_50_TEXT,
+                &format!("?page_key={}&direction=backward", KEYS[1]),
+            ),
+            fails: ProbePoint::AuthDetailPage,
+            len: 48,
+            pieces: &[(0, REPOSITION_TEXT)],
+            reached: vec![summary_read],
+            page: Some((acct, f7_date, f7_time)),
+            blocked: "H4: COPAUS0C-056, the IMS status position of the repos. text after F7",
+        },
+    ])
+}
+
+/// The read failures of endpoint 22 on account 50's first detail, after its summary was found.
+fn detail_read_failures() -> TestResult<Vec<ReadFailure>> {
+    let acct = auth_acct(ACCT_50)?;
+    let (date, time) = key_parts(0)?;
+    let summary_read = Seen::SummaryRead(acct);
+    let detail_read = Seen::DetailRead(acct, date, time);
+    let detail_error: &[(usize, &str)] = &[(0, " System error while reading Auth Details: Code:")];
+    let detail_blocked = "H4: COPAUS1C-038, the IMS status position of the Auth Details text";
+    Ok(vec![
+        // ENTER.
+        // audit: COPAUS1C-011
+        ReadFailure {
+            uri: detail_uri(ACCT_50_TEXT, KEYS[0], ""),
+            fails: ProbePoint::AuthDetailRead,
+            len: 49,
+            pieces: detail_error,
+            reached: vec![summary_read.clone(), detail_read.clone()],
+            page: None,
+            blocked: detail_blocked,
+        },
+        // F8 stops at the failed current read and never reads on.
+        // audit: COPAUS1C-011
+        ReadFailure {
+            uri: detail_uri(ACCT_50_TEXT, KEYS[0], "?direction=forward"),
+            fails: ProbePoint::AuthDetailRead,
+            len: 49,
+            pieces: detail_error,
+            reached: vec![summary_read.clone(), detail_read.clone()],
+            page: None,
+            blocked: detail_blocked,
+        },
+        // F8: the current detail is found and the next read, from its key, fails.
+        // audit: COPAUS1C-026
+        ReadFailure {
+            uri: detail_uri(ACCT_50_TEXT, KEYS[0], "?direction=forward"),
+            fails: ProbePoint::AuthDetailPage,
+            len: 46,
+            pieces: &[(0, " System error while reading next Auth: Code:")],
+            reached: vec![summary_read, detail_read],
+            page: Some((acct, date, time)),
+            blocked: "H4: COPAUS1C-038, the IMS status position of the next Auth text",
+        },
+    ])
+}
+
+/// Endpoints 21 and 22 over account 50's six details, each request through a store whose probe
+/// fails one read after the reads before it succeeded: a 500 with that read's message alone, no
+/// list, summary block or detail field, and the codes in the message reported `BLOCKED`.
+#[test]
+fn probed_read_failures() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, &SPECS).await?;
+        let api = Api::signed_on(router_over(store)?).await?;
+        let mut cases = summary_read_failures()?;
+        cases.extend(detail_read_failures()?);
+        for case in &cases {
+            let probe = ScriptedProbe::failing_at(case.fails);
+            let mut probed = probed_api(&guard, &probe, &api.token)?;
+            let reply = probed.get(&case.uri).await?;
+            assert_eq!(
+                reply.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{}",
+                case.uri
+            );
+            assert_fixed_pieces(reply.message(), case.len, case.pieces);
+            assert!(is_bare_error(&reply), "{}: more than a message", case.uri);
+            let log = probe.seen();
+            assert!(
+                holds_in_order(&log, &case.reached),
+                "{}: reads reached {log:?}",
+                case.uri
+            );
+            let pages: Vec<_> = log.iter().filter_map(Seen::page_start).collect();
+            let expected_pages: Vec<_> = case.page.into_iter().collect();
+            assert_eq!(pages, expected_pages, "{}: page queries", case.uri);
+            // audit: COPAUS0C-056
+            // audit: COPAUS1C-038
+            report_blocked(case.blocked);
+            probed.assert_redacted()?;
+        }
+        api.assert_redacted()
+    })
+}
+
+/// The invented account of [`FRAUD_CASES`] whose cross-reference names customer 27, so that the
+/// customer COPAUS2C receives differs from the account in its digits (X-COPAUS1C-4), and the
+/// invented card of that cross-reference, which no fixture holds.
+const ACCT_OTHER_CUSTOMER: u64 = 12_345_678_903;
+const CUST_OTHER: u64 = 27;
+const CARD_OTHER_CUSTOMER: &str = "9200000000000019";
+
+/// The report date a detail flagged before carries, as COPAUS2C last set it.
+const EARLIER_REPORT_DATE: &str = "07/01/22";
+
+/// One F5 whose replace the probe fails: the account and detail `SPECS[spec]`, the flag the
+/// stored detail holds and the one COPAUS1C-028 flips it to, and whether a committed
+/// `auth_fraud` row already holds the detail's key.
+struct FraudCase {
+    acct: u64,
+    spec: usize,
+    stored: &'static str,
+    flipped: &'static str,
+    committed_row: bool,
+}
+
+/// The F5 cases: a blank flag, as CP00 writes it, is reported; a confirmed fraud is removed; a
+/// removed one is reported again; a confirmed fraud whose `auth_fraud` row is committed takes
+/// `FRAUD-UPDATE`; and the account whose customer number differs from its own.
+const FRAUD_CASES: [FraudCase; 5] = [
+    FraudCase {
+        acct: ACCT_50,
+        spec: 0,
+        stored: " ",
+        flipped: "F",
+        committed_row: false,
+    },
+    FraudCase {
+        acct: ACCT_50,
+        spec: 1,
+        stored: "F",
+        flipped: "R",
+        committed_row: false,
+    },
+    FraudCase {
+        acct: ACCT_50,
+        spec: 2,
+        stored: "R",
+        flipped: "F",
+        committed_row: false,
+    },
+    FraudCase {
+        acct: ACCT_50,
+        spec: 4,
+        stored: "F",
+        flipped: "R",
+        committed_row: true,
+    },
+    FraudCase {
+        acct: ACCT_OTHER_CUSTOMER,
+        spec: 5,
+        stored: " ",
+        flipped: "F",
+        committed_row: false,
+    },
+];
+
+/// The `AUTH_TS` of account 50's detail `SPECS[4]`: its request date, 2022-07-16, with CP00's
+/// processing time, 08:00:00.500, under which [`FRAUD_CASES`] commits an `auth_fraud` row.
+fn committed_row_auth_ts() -> TestResult<NaiveDateTime> {
+    at(2022, 7, 16, (8, 0, 0, 500))
+}
+
+/// F5 through a store whose probe fails the replace of the detail, so that every request rolls
+/// back (COPAUS1C-033) and none reaches COPAUS1C-032's halted success branch; the probe records
+/// what the service handed to COPAUS2C's statements and to the replace.
+#[test]
+fn copaus1c_fraud_rollback_observations() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        seed_xref(
+            &mut store,
+            CARD_OTHER_CUSTOMER,
+            ACCT_OTHER_CUSTOMER,
+            CUST_OTHER,
+        )
+        .await?;
+        seed_summary(&mut store, ACCT_50, ACCT_50).await?;
+        seed_summary(&mut store, ACCT_OTHER_CUSTOMER, CUST_OTHER).await?;
+        let api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
+        for case in &FRAUD_CASES {
+            observed_toggle(&api.token, &guard, &mut store, case).await?;
+        }
+        api.assert_redacted()
+    })
+}
+
+/// Seeds `case`'s detail, and its committed `auth_fraud` row when it has one, runs F5 on it
+/// through a probe that fails the replace, and asserts the rollback and what was recorded.
+async fn observed_toggle(
+    token: &str,
+    guard: &PostgresGuard,
+    store: &mut PgStore,
+    case: &FraudCase,
+) -> TestResult {
+    let spec = SPECS.get(case.spec).ok_or("no such detail")?;
+    let key = KEYS.get(case.spec).ok_or("no such key")?;
+    let xref = xref_of(store, case.acct).await?;
+    let mut seeded = detail_of(spec, &xref.card_num)?;
+    seeded.auth_fraud = PicX::from_text(case.stored)?;
+    if !seeded.auth_fraud.is_spaces() {
+        seeded.fraud_rpt_date = PicX::from_text(EARLIER_REPORT_DATE)?;
+    }
+    PendingAuthDetailRepository::insert(store, auth_acct(case.acct)?, &seeded).await?;
+    let committed = if case.committed_row {
+        let row = fraud_row_of(spec, &xref.card_num, committed_row_auth_ts()?, case.stored)?;
+        AuthFraudRepository::insert(store, &row, seeded_report_date()?).await?;
+        Some((row, Some(seeded_report_date()?)))
+    } else {
+        None
+    };
+    let probe = ScriptedProbe::failing_at(ProbePoint::AuthDetailUpdate);
+    let mut probed = probed_api(guard, &probe, token)?;
+    let reply = probed
+        .post(&fraud_uri(&format!("{:011}", case.acct), key))
+        .await?;
+    assert_tagging_error(&reply);
+    // A rolled-back F5 is a `ScreenError`: no key and no detail field, so the screen keeps the
+    // key it holds.
+    // audit: COPAUS1C-034
+    assert!(is_bare_error(&reply), "{key}: more than a message");
+    let log = probe.seen();
+    let rows: Vec<_> = log.iter().filter_map(Seen::fraud_insert).collect();
+    let rewrites: Vec<_> = log.iter().filter_map(Seen::detail_update).collect();
+    let ([row], [(replace_acct, replaced)]) = (rows.as_slice(), rewrites.as_slice()) else {
+        return Err(format!(
+            "{key}: {} inserts and {} replaces",
+            rows.len(),
+            rewrites.len()
+        )
+        .into());
+    };
+    let flipped = PicX::<1>::from_text(case.flipped)?;
+    // audit: COPAUS1C-028
+    assert_eq!(replaced.auth_fraud, flipped, "{key}: the replaced flag");
+    // audit: COPAUS1C-028
+    assert_eq!(row.auth_fraud, flipped, "{key}: the action COPAUS2C writes");
+    let updates: Vec<_> = log.iter().filter_map(Seen::fraud_update).collect();
+    let committed_ts = committed_row_auth_ts()?;
+    let expected_updates: Vec<_> = committed
+        .iter()
+        .map(|_| (&xref.card_num, committed_ts, &flipped))
+        .collect();
+    // audit: COPAUS1C-028
+    // audit: COPAUS1C-030
+    assert_eq!(updates, expected_updates, "{key}: FRAUD-UPDATE");
+    // audit: COPAUS1C-030
+    assert_eq!(row.acct_id, PicU::new(case.acct)?, "{key}: WS-FRD-ACCT-ID");
+    // audit: COPAUS1C-030
+    assert_eq!(row.cust_id, xref.cust_id, "{key}: WS-FRD-CUST-ID");
+    // The 200-byte detail COPAUS2C received and handed back: every byte as stored but the flipped
+    // flag and the report date COPAUS2C moved in, which is compared by format only.
+    let mut handed = seeded.clone();
+    handed.auth_fraud = flipped.clone();
+    handed.fraud_rpt_date = replaced.fraud_rpt_date.clone();
+    // audit: COPAUS1C-030
+    assert_eq!(*replaced, &handed, "{key}: the detail handed to COPAUS2C");
+    // audit: COPAUS2C-001
+    assert!(
+        is_slashed_date(&replaced.fraud_rpt_date),
+        "{key}: report date {:?}",
+        replaced.fraud_rpt_date
+    );
+    // audit: COPAUS1C-034
+    assert_eq!(
+        *replace_acct,
+        auth_acct(case.acct)?,
+        "{key}: the account replaced"
+    );
+    // audit: COPAUS1C-034
+    assert_eq!(
+        (replaced.auth_date_9c, replaced.auth_time_9c),
+        (seeded.auth_date_9c, seeded.auth_time_9c),
+        "{key}: the key replaced"
+    );
+    assert_fraud_moves(row, &seeded, &xref, case)?;
+    // Nothing committed: the `auth_fraud` row under the key the insert carried is as before, and
+    // the detail as seeded.
+    let fraud = AuthFraudRepository::find_by_id(store, &row.card_num, row.auth_ts).await?;
+    // audit: COPAUS1C-033
+    // audit: COPAUS2C-012
+    assert_eq!(fraud, committed, "{key}: auth_fraud after the rollback");
+    let stored = PendingAuthDetailRepository::find_by_id(
+        store,
+        auth_acct(case.acct)?,
+        seeded.auth_date_9c,
+        seeded.auth_time_9c,
+    )
+    .await?;
+    // audit: COPAUS1C-033
+    // audit: COPAUS2C-012
+    assert_eq!(stored, Some(seeded), "{key}: the detail after the rollback");
+    probed.assert_redacted()
+}
+
+/// Whether `date` is `MM/DD/YY` by format: two digits, `/`, two digits, `/`, two digits.
+fn is_slashed_date(date: &PicX<8>) -> bool {
+    date.as_bytes().iter().enumerate().all(|(offset, byte)| {
+        if offset == 2 || offset == 5 {
+            *byte == b'/'
+        } else {
+            byte.is_ascii_digit()
+        }
+    })
+}
+
+/// The fields COPAUS2C-006 moves byte for byte between equal widths: each field's name, its
+/// bytes in `row` and in the `detail` it was moved from.
+fn byte_moves<'a>(
+    row: &'a AuthFraudRow,
+    detail: &'a PendingAuthDetailRecord,
+) -> [(&'static str, &'a [u8], &'a [u8]); 15] {
+    [
+        (
+            "AUTH-TYPE",
+            row.auth_type.as_bytes(),
+            detail.auth_type.as_bytes(),
+        ),
+        (
+            "CARD-EXPIRY-DATE",
+            row.card_expiry_date.as_bytes(),
+            detail.card_expiry_date.as_bytes(),
+        ),
+        (
+            "MESSAGE-TYPE",
+            row.message_type.as_bytes(),
+            detail.message_type.as_bytes(),
+        ),
+        (
+            "MESSAGE-SOURCE",
+            row.message_source.as_bytes(),
+            detail.message_source.as_bytes(),
+        ),
+        (
+            "AUTH-ID-CODE",
+            row.auth_id_code.as_bytes(),
+            detail.auth_id_code.as_bytes(),
+        ),
+        (
+            "AUTH-RESP-CODE",
+            row.auth_resp_code.as_bytes(),
+            detail.auth_resp_code.as_bytes(),
+        ),
+        (
+            "AUTH-RESP-REASON",
+            row.auth_resp_reason.as_bytes(),
+            detail.auth_resp_reason.as_bytes(),
+        ),
+        (
+            "MERCHANT-CATAGORY-CODE",
+            row.merchant_catagory_code.as_bytes(),
+            detail.merchant_catagory_code.as_bytes(),
+        ),
+        (
+            "ACQR-COUNTRY-CODE",
+            row.acqr_country_code.as_bytes(),
+            detail.acqr_country_code.as_bytes(),
+        ),
+        (
+            "MERCHANT-ID",
+            row.merchant_id.as_bytes(),
+            detail.merchant_id.as_bytes(),
+        ),
+        (
+            "MERCHANT-CITY",
+            row.merchant_city.as_bytes(),
+            detail.merchant_city.as_bytes(),
+        ),
+        (
+            "MERCHANT-STATE",
+            row.merchant_state.as_bytes(),
+            detail.merchant_state.as_bytes(),
+        ),
+        (
+            "MERCHANT-ZIP",
+            row.merchant_zip.as_bytes(),
+            detail.merchant_zip.as_bytes(),
+        ),
+        (
+            "TRANSACTION-ID",
+            row.transaction_id.as_bytes(),
+            detail.transaction_id.as_bytes(),
+        ),
+        (
+            "MATCH-STATUS",
+            row.match_status.as_bytes(),
+            detail.match_status.as_bytes(),
+        ),
+    ]
+}
+
+/// COPAUS2C-006 on the `auth_fraud` row the service handed to the insert, against the detail
+/// stored for `case` and its account's cross-reference.
+fn assert_fraud_moves(
+    row: &AuthFraudRow,
+    detail: &PendingAuthDetailRecord,
+    xref: &CardXrefRecord,
+    case: &FraudCase,
+) -> TestResult {
+    // `CARD-NUM`: the full number, compared as a `CardNumber` and never printed in full.
+    // audit: COPAUS2C-006
+    assert!(
+        row.card_num == xref.card_num,
+        "CARD-NUM is not the cross-reference's card"
+    );
+    // audit: COPAUS2C-006
+    assert!(
+        row.card_num == detail.card_num,
+        "CARD-NUM is not PA-CARD-NUM"
+    );
+    for (field, moved, read) in byte_moves(row, detail) {
+        // audit: COPAUS2C-006
+        assert_eq!(moved, read, "{field} is not moved byte for byte");
+    }
+    // `CARD-EXPIRY-DATE` stays the `X(4)` text, not a typed date.
+    // audit: COPAUS2C-006
+    assert_eq!(row.card_expiry_date.as_bytes(), CARD_EXPIRY.as_bytes());
+    // `PROCESSING-CODE X(6)` from `PA-PROCESSING-CODE 9(06)`: its six digits, leading zeros
+    // included.
+    let processing_code = format!("{:06}", detail.processing_code.get());
+    // audit: COPAUS2C-006
+    assert_eq!(row.processing_code.as_bytes(), processing_code.as_bytes());
+    // audit: COPAUS2C-006
+    assert_eq!(row.processing_code.as_bytes(), b"001234");
+    // audit: COPAUS2C-006
+    assert_eq!(
+        (row.transaction_amt, row.approved_amt),
+        (detail.transaction_amt, detail.approved_amt),
+        "the amounts are unchanged"
+    );
+    // audit: COPAUS2C-006
+    assert_eq!(
+        (row.pos_entry_mode, row.pos_entry_mode.get()),
+        (detail.pos_entry_mode, POS_ENTRY_MODE),
+        "POS-ENTRY-MODE"
+    );
+    // All 22 bytes of `PA-MERCHANT-NAME`, its trailing spaces included.
+    let merchant_name = format!("{MERCHANT_NAME:<22}");
+    // audit: COPAUS2C-006
+    assert_eq!(
+        row.merchant_name.as_bytes(),
+        detail.merchant_name.as_bytes()
+    );
+    // audit: COPAUS2C-006
+    assert_eq!(row.merchant_name.as_bytes(), merchant_name.as_bytes());
+    // `AUTH-FRAUD` from `WS-FRD-ACTION`, not from the `PA-AUTH-FRAUD` the detail stores.
+    // audit: COPAUS2C-006
+    assert_eq!(row.auth_fraud.as_bytes(), case.flipped.as_bytes());
+    // audit: COPAUS2C-006
+    assert_ne!(
+        row.auth_fraud, detail.auth_fraud,
+        "AUTH-FRAUD is the stored flag"
+    );
+    // audit: COPAUS2C-006
+    assert_eq!(
+        (row.acct_id, row.cust_id),
+        (PicU::new(case.acct)?, xref.cust_id),
+        "ACCT-ID and CUST-ID"
     );
     Ok(())
 }

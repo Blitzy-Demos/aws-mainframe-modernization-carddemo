@@ -51,9 +51,10 @@
 //!
 //! A failed run writes one line, `carddemo-batch <subcommand>: <reason>`. The reason is a
 //! refused `cbpaup0j` SYSIN record, a configuration error that names its variable and never its
-//! value, a telemetry failure, a database connection failure as the value-free summary of
-//! `runtime::db`, the job's error, or a failure to write standard output. None of them shows a
-//! record, a card number, an SSN, a password or the connection URL (Cardholder Data Redaction).
+//! value, a telemetry failure, a database connection failure that names `DATABASE_URL` and
+//! gives the value-free summary of `runtime::db`, the job's error, or a failure to write
+//! standard output. None of them shows a record, a card number, an SSN, a password or the
+//! connection URL (Cardholder Data Redaction).
 //! A job's error on its output directory, such as `allocating generation (reports under
 //! CARDDEMO_VAR_DIR): not a directory`, names the setting of that directory instead of its path.
 //! `posttran`, `intcalc` and `tranrept` end such a failure with their audited abend,
@@ -299,7 +300,7 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
             // The summary keeps an error class and a SQLSTATE at most: the driver's own text can
             // quote the connection URL.
             let error = runtime::db::ErrorSummary::from(&error);
-            tracing::error!(job, error = %error, "database connection failed");
+            tracing::error!(job, error = %error, "database connection failed (DATABASE_URL)");
             // CBACT04C-034: the connection stands for INTCALC's input opens, so its failure is
             // the first open's, shown with that open's abend lines. Every other job shows none.
             if matches!(selected, CheckedJob::Intcalc(_)) {
@@ -307,7 +308,7 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
             }
             return fail(
                 job,
-                &format_args!("cannot connect to the database: {error}"),
+                &format_args!("cannot connect to the database (DATABASE_URL): {error}"),
             );
         }
     };

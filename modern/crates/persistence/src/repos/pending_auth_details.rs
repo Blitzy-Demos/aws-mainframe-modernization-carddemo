@@ -57,7 +57,7 @@ use sqlx::PgExecutor;
 
 use crate::error::PersistenceError;
 use crate::rows::{PendingAuthDetailRow, pic_s_to_i64};
-use crate::{PgStore, PgTx};
+use crate::{PgStore, PgTx, ProbePoint, probed};
 
 /// The pending-authorization details, one row per `PAUTDTL1` segment, keyed by the summary's
 /// account and the inverted date and time of the authorization.
@@ -191,7 +191,8 @@ impl PendingAuthDetailRepository for PgStore {
         time_9c: PicS<9>,
     ) -> impl Future<Output = Result<Option<PendingAuthDetailRecord>, PersistenceError>> + Send
     {
-        select_by_key(self.pool(), acct, date_9c, time_9c)
+        let verdict = self.verdict(ProbePoint::AuthDetailRead, &[&acct, &date_9c, &time_9c]);
+        probed(verdict, select_by_key(self.pool(), acct, date_9c, time_9c))
     }
 
     fn page_after(
@@ -201,7 +202,14 @@ impl PendingAuthDetailRepository for PgStore {
         start_time_9c: PicS<9>,
         limit: i64,
     ) -> impl Future<Output = Result<Vec<PendingAuthDetailRecord>, PersistenceError>> + Send {
-        select_page_forward(self.pool(), acct, start_date_9c, start_time_9c, limit)
+        let verdict = self.verdict(
+            ProbePoint::AuthDetailPage,
+            &[&acct, &start_date_9c, &start_time_9c, &limit],
+        );
+        probed(
+            verdict,
+            select_page_forward(self.pool(), acct, start_date_9c, start_time_9c, limit),
+        )
     }
 
     fn find_all_by_acct_id(
@@ -224,7 +232,8 @@ impl PendingAuthDetailRepository for PgStore {
         acct: PicS<11>,
         record: &PendingAuthDetailRecord,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_row(self.pool(), acct, record)
+        let verdict = self.verdict(ProbePoint::AuthDetailUpdate, &[&acct, record]);
+        probed(verdict, update_row(self.pool(), acct, record))
     }
 
     fn delete(
@@ -245,7 +254,8 @@ impl PendingAuthDetailRepository for PgTx<'_> {
         time_9c: PicS<9>,
     ) -> impl Future<Output = Result<Option<PendingAuthDetailRecord>, PersistenceError>> + Send
     {
-        select_by_key(self.conn(), acct, date_9c, time_9c)
+        let verdict = self.verdict(ProbePoint::AuthDetailRead, &[&acct, &date_9c, &time_9c]);
+        probed(verdict, select_by_key(self.conn(), acct, date_9c, time_9c))
     }
 
     fn page_after(
@@ -255,7 +265,14 @@ impl PendingAuthDetailRepository for PgTx<'_> {
         start_time_9c: PicS<9>,
         limit: i64,
     ) -> impl Future<Output = Result<Vec<PendingAuthDetailRecord>, PersistenceError>> + Send {
-        select_page_forward(self.conn(), acct, start_date_9c, start_time_9c, limit)
+        let verdict = self.verdict(
+            ProbePoint::AuthDetailPage,
+            &[&acct, &start_date_9c, &start_time_9c, &limit],
+        );
+        probed(
+            verdict,
+            select_page_forward(self.conn(), acct, start_date_9c, start_time_9c, limit),
+        )
     }
 
     fn find_all_by_acct_id(
@@ -278,7 +295,8 @@ impl PendingAuthDetailRepository for PgTx<'_> {
         acct: PicS<11>,
         record: &PendingAuthDetailRecord,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_row(self.conn(), acct, record)
+        let verdict = self.verdict(ProbePoint::AuthDetailUpdate, &[&acct, record]);
+        probed(verdict, update_row(self.conn(), acct, record))
     }
 
     fn delete(

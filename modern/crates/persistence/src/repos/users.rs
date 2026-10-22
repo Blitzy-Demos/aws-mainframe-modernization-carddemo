@@ -79,7 +79,7 @@ use sqlx::{PgConnection, PgExecutor};
 
 use crate::error::PersistenceError;
 use crate::rows::{UserListRow, UserRow, pic_x_to_string};
-use crate::{PgStore, PgTx};
+use crate::{PgStore, PgTx, ProbePoint, probed};
 
 /// The key column, `SEC-USR-ID PIC X(08)` (CSUSR01Y-001), as errors name it.
 const KEY_COLUMN: &str = "usr_id";
@@ -258,14 +258,16 @@ impl UserRepository for PgStore {
         &mut self,
         entry: &UserEntry,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_in(self.pool(), entry)
+        let verdict = self.verdict(ProbePoint::UserUpdate, &[entry]);
+        probed(verdict, update_in(self.pool(), entry))
     }
 
     fn delete(
         &mut self,
         id: &PicX<8>,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        delete_in(self.pool(), id)
+        let verdict = self.verdict(ProbePoint::UserDelete, &[id]);
+        probed(verdict, delete_in(self.pool(), id))
     }
 
     fn replace_all(
@@ -325,14 +327,16 @@ impl UserRepository for PgTx<'_> {
         &mut self,
         entry: &UserEntry,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        update_in(self.conn(), entry)
+        let verdict = self.verdict(ProbePoint::UserUpdate, &[entry]);
+        probed(verdict, update_in(self.conn(), entry))
     }
 
     fn delete(
         &mut self,
         id: &PicX<8>,
     ) -> impl Future<Output = Result<bool, PersistenceError>> + Send {
-        delete_in(self.conn(), id)
+        let verdict = self.verdict(ProbePoint::UserDelete, &[id]);
+        probed(verdict, delete_in(self.conn(), id))
     }
 
     fn replace_all(

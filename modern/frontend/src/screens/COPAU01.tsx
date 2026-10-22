@@ -7,7 +7,7 @@ import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { KEY_ROWS, keyRowItems, type PfKeyHandlers } from "@/lib/pfkeys";
+import { KEY_ROWS, keyRowItems, type PfKey, type PfKeyHandlers } from "@/lib/pfkeys";
 import { PATHS, SCREENS } from "@/routes";
 
 /**
@@ -52,6 +52,9 @@ const MERCHANT_CAPTION = `Merchant Details ${"-".repeat(59)}`;
 
 /** COPAU01-054: `F3=Back`, `F5=Mark/Remove Fraud` and `F8=Next Auth`, in map order. */
 const MAP_KEYS = keyRowItems(KEY_ROWS.COPAU01);
+
+/** The map's keys refused while a call is in flight, as ENTER is; F3 leaves at any time. */
+const LOCKED_KEYS: ReadonlySet<PfKey> = new Set(["F5", "F8"]);
 
 /** The `COLOR` the map declares for an output field. */
 type MapColour = "PINK" | "BLUE" | "RED";
@@ -398,8 +401,8 @@ function detailEntry(state: unknown): DetailEntry | null {
  * - any other F-key reads as ENTER does, then shows the invalid-key message in place of the
  *   read's message.
  *
- * A request key pressed while a call is in flight is ignored, as the 3270 keyboard stays locked
- * until the program's answer arrives; F3 always leaves.
+ * While a call is in flight ENTER, F5 and F8 are disabled and a request key is ignored, as the
+ * 3270 keyboard stays locked until the program's answer arrives; F3 always leaves.
  */
 function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): ReactNode {
   const navigate = useNavigate();
@@ -411,9 +414,24 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
     null,
   );
   const [message, setMessage] = useState("");
+  // Whether a call is in flight, from the key that sends it to its answer. The ref decides at
+  // once; the state renders the locked keys, which a key pressed before that render would pass.
   const inFlight = useRef(false);
+  const [busy, setBusy] = useState(false);
   const entered = useRef(false);
   const cardNumInput = useRef<HTMLInputElement>(null);
+
+  /** Locks the keyboard for one call. */
+  function lock(): void {
+    inFlight.current = true;
+    setBusy(true);
+  }
+
+  /** Unlocks the keyboard once the call's answer is shown. */
+  function unlock(): void {
+    inFlight.current = false;
+    setBusy(false);
+  }
 
   // An empty account or key would leave a path segment empty, a request the API cannot route.
   // COPAUS1C reads nothing for such a state and shows every field blank with an empty message
@@ -446,28 +464,29 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
       placeCursor();
       return;
     }
-    inFlight.current = true;
-    detailCall.mutate(
-      {
-        path: { acct_id: acctId, auth_key: authKey },
-        query: direction === undefined ? {} : { direction },
-      },
-      {
-        onSuccess: (found) => {
-          setDetail(found);
-          setAuthKey(found.auth_key);
-          setMessage(shown ?? found.message ?? "");
+    lock();
+    void detailCall
+      .mutateAsync(
+        {
+          path: { acct_id: acctId, auth_key: authKey },
+          query: direction === undefined ? {} : { direction },
         },
-        onError: (error) => {
-          setDetail(null);
-          setMessage(shown ?? errorMessage(error));
+        {
+          onSuccess: (found) => {
+            setDetail(found);
+            setAuthKey(found.auth_key);
+            setMessage(shown ?? found.message ?? "");
+          },
+          onError: (error) => {
+            setDetail(null);
+            setMessage(shown ?? errorMessage(error));
+          },
+          onSettled: () => {
+            placeCursor();
+          },
         },
-        onSettled: () => {
-          inFlight.current = false;
-          placeCursor();
-        },
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
   /**
@@ -486,25 +505,26 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
       placeCursor();
       return;
     }
-    inFlight.current = true;
-    fraudCall.mutate(
-      { path: { acct_id: acctId, auth_key: authKey } },
-      {
-        onSuccess: (result) => {
-          setMessage(result.message);
-          if (result.detail !== undefined && result.detail !== null) {
-            setDetail(result.detail);
-          }
+    lock();
+    void fraudCall
+      .mutateAsync(
+        { path: { acct_id: acctId, auth_key: authKey } },
+        {
+          onSuccess: (result) => {
+            setMessage(result.message);
+            if (result.detail !== undefined && result.detail !== null) {
+              setDetail(result.detail);
+            }
+          },
+          onError: (error) => {
+            setMessage(errorMessage(error));
+          },
+          onSettled: () => {
+            placeCursor();
+          },
         },
-        onError: (error) => {
-          setMessage(errorMessage(error));
-        },
-        onSettled: () => {
-          inFlight.current = false;
-          placeCursor();
-        },
-      },
-    );
+      )
+      .then(unlock, unlock);
   }
 
   /** F3: XCTL COPAUS0C, which loads the account on its first entry (COPAUS1C-004, COPAUS0C-002). */
@@ -541,8 +561,13 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
       onPress: () => {
         read(undefined);
       },
+      disabled: busy,
     },
-    ...MAP_KEYS.map((item) => ({ ...item, onPress: actions[item.key] })),
+    ...MAP_KEYS.map((item) => ({
+      ...item,
+      onPress: actions[item.key],
+      disabled: busy && LOCKED_KEYS.has(item.key),
+    })),
   ];
 
   function renderField(field: DetailField): ReactNode {
@@ -580,6 +605,7 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
       title={TITLE}
       message={{ text: message, kind: "error" }}
       keys={keys}
+      busy={busy}
       keyOptions={{
         foldShifted: KEY_ROWS.COPAU01.foldShifted,
         onInvalidKey: () => {

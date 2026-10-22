@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -160,9 +160,25 @@ function errorRow(): HTMLElement {
   return rows[0];
 }
 
-/** The text of the header field `name` (`data-field` of `ScreenShell`). */
-function headerField(container: HTMLElement, name: string): string | null {
-  return container.querySelector(`[data-field="${name}"]`)?.textContent ?? null;
+/**
+ * The header field `name` (`data-field`): the one `Input` of that name in the `CardHeader` title
+ * rows of `ScreenShell`, failing the test when there is not exactly one.
+ */
+function headerInput(container: HTMLElement, name: string): HTMLInputElement {
+  const fields = container.querySelectorAll(
+    `[data-slot="card-header"] input[data-field="${name}"]`,
+  );
+  expect(fields).toHaveLength(1);
+  const [field] = fields;
+  if (!(field instanceof HTMLInputElement)) {
+    throw new Error(`Expected the header input ${name}`);
+  }
+  return field;
+}
+
+/** The value of the header field `name`. */
+function headerField(container: HTMLElement, name: string): string {
+  return headerInput(container, name).value;
 }
 
 /** The text of every map-grid cell whose `POS` is (`row`, `col`), as `GridCell` places it. */
@@ -174,6 +190,82 @@ function cellsStartingAt(container: HTMLElement, row: number, col: number): (str
 function typeCredentials(userId: string, password: string): void {
   fireEvent.change(userIdInput(), { target: { value: userId } });
   fireEvent.change(passwordInput(), { target: { value: password } });
+}
+
+/** The texts of the `FormMessage`s that `input` names in its `aria-describedby`. */
+function fieldMessages(input: HTMLInputElement): (string | null)[] {
+  const ids = input.getAttribute("aria-describedby")?.split(" ") ?? [];
+  return ids.flatMap((id) => {
+    const note = document.getElementById(id);
+    return note?.getAttribute("data-slot") === "form-message" ? [note.textContent] : [];
+  });
+}
+
+/**
+ * Asserts the form's error state of the two inputs (COSGN00C-011): only `marked`, the input the
+ * last `ScreenError` named, is `aria-invalid` and described by a `FormMessage` holding `message`;
+ * with `marked` null neither input is. Every `FormMessage` is visually hidden, because the error
+ * row is the screen's one visible message.
+ */
+function expectMarked(
+  container: HTMLElement,
+  marked: HTMLInputElement | null,
+  message: string,
+): void {
+  for (const input of [userIdInput(), passwordInput()]) {
+    const named = input === marked;
+    expect(input.getAttribute("aria-invalid")).toBe(String(named));
+    expect(fieldMessages(input)).toEqual(named ? [message] : []);
+  }
+  const notes = Array.from(container.querySelectorAll('[data-slot="form-message"]'));
+  expect(notes).toHaveLength(marked === null ? 0 : 1);
+  expect(notes.filter((note) => !note.classList.contains("sr-only"))).toEqual([]);
+}
+
+/** The `ENTER=Sign-on` button (COSGN00-046). */
+function enterButton(): HTMLElement {
+  return screen.getByRole("button", { name: "ENTER=Sign-on" });
+}
+
+/** The `F3=Exit` button (COSGN00-047). */
+function exitButton(): HTMLElement {
+  return screen.getByRole("button", { name: "F3=Exit" });
+}
+
+/** The sign-on `<form>`, which holds both inputs. */
+function signonForm(): HTMLFormElement {
+  const form = userIdInput().form;
+  if (form === null) {
+    throw new Error("The user ID input is not in a form");
+  }
+  return form;
+}
+
+/**
+ * Whether the screen shows the locked keyboard of a sign-on in flight: both keys disabled, the key
+ * row and the form busy, both inputs read-only; or, with `locked` false, all of them free.
+ */
+function expectLocked(locked: boolean): void {
+  expect(enterButton()).toHaveProperty("disabled", locked);
+  expect(exitButton()).toHaveProperty("disabled", locked);
+  expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+    String(locked),
+  );
+  expect(signonForm().getAttribute("aria-busy")).toBe(String(locked));
+  expect(userIdInput().readOnly).toBe(locked);
+  expect(passwordInput().readOnly).toBe(locked);
+}
+
+/**
+ * Gives a refused key the time a sign-on it had started would take to reach `fetch`. The wait runs
+ * inside `act`, as the form's own state updates after an ENTER do.
+ */
+async function lingers(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
 }
 
 /** Types the credentials, presses ENTER and waits for the main menu `userSignon` routes to. */
@@ -276,6 +368,132 @@ describe("COSGN00 sign-on screen", () => {
     expect(errorRow().textContent).toBe("");
   });
 
+  it.each([
+    // audit: COSGN00-002
+    {
+      id: "COSGN00-002",
+      name: "TRNNAME",
+      row: 1,
+      col: 8,
+      length: 4,
+      label: "Tran :",
+      shows: "CC00",
+    },
+    // audit: COSGN00-003
+    {
+      id: "COSGN00-003",
+      name: "TITLE01",
+      row: 1,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "      AWS Mainframe Modernization       ",
+    },
+    // audit: COSGN00-005
+    {
+      id: "COSGN00-005",
+      name: "CURDATE",
+      row: 1,
+      col: 71,
+      length: 8,
+      label: "Date :",
+      shows: expect.stringMatching(/^\d{2}\/\d{2}\/\d{2}$/),
+    },
+    // audit: COSGN00-007
+    {
+      id: "COSGN00-007",
+      name: "PGMNAME",
+      row: 2,
+      col: 8,
+      length: 8,
+      label: "Prog :",
+      shows: "COSGN00C",
+    },
+    // audit: COSGN00-008
+    {
+      id: "COSGN00-008",
+      name: "TITLE02",
+      row: 2,
+      col: 21,
+      length: 40,
+      label: null,
+      shows: "              CardDemo                  ",
+    },
+    // The eight-character time leaves the ninth position of `CURTIME` blank (X-SCREENS-11).
+    // audit: COSGN00-010
+    {
+      id: "COSGN00-010",
+      name: "CURTIME",
+      row: 2,
+      col: 71,
+      length: 9,
+      label: "Time :",
+      shows: expect.stringMatching(/^\d{2}:\d{2}:\d{2}$/),
+    },
+  ])(
+    "$id shows $name in a read-only Input at ($row,$col), $length wide, in the card header",
+    ({ name, row, col, length, label, shows }) => {
+      // The header value is an output field of the map: a read-only `Input` that holds `LENGTH`
+      // characters (`size`), in the cell of its `POS` and `LENGTH` in the frame's title rows. The
+      // map's literal before it is its bound `Label`; a title, which no literal labels, is named
+      // by `aria-label`.
+      const { fetchStub } = stubFetch();
+      const { container } = renderScreen();
+
+      const field = headerInput(container, name);
+      expect(field.dataset.slot).toBe("input");
+      expect(field.readOnly).toBe(true);
+      expect(field.size).toBe(length);
+      expect(field.parentElement?.className).toBe(
+        `row-start-${row} col-start-${col} col-span-${length}`,
+      );
+      expect(field.value).toEqual(shows);
+      const labels = Array.from(field.labels ?? []);
+      expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
+      expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
+      expect(screen.getByRole("textbox", { name: label ?? `Title row ${row}` })).toBe(field);
+      expect(fetchStub).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    // audit: COSGN00-011
+    // audit: COSGN00-012
+    { label: "AppID:", labelCol: 1, name: "APPLID", fieldCol: 8 },
+    // audit: COSGN00-013
+    // audit: COSGN00-014
+    { label: "SysID:", labelCol: 64, name: "SYSID", fieldCol: 71 },
+  ])(
+    "$label in BLUE at (3,$labelCol) labels the empty read-only $name at (3,$fieldCol) in the header",
+    ({ label, labelCol, name, fieldCol }) => {
+      // Map line 3 is the third of COSGN00's title rows in the frame's `CardHeader`: each `Label`
+      // is bound to a read-only `Input` eight characters wide that stays empty, as no CICS region
+      // assigns the IDs (X-SCREENS-1).
+      const { fetchStub } = stubFetch();
+      const { container } = renderScreen();
+
+      const text = screen.getByText(label, exactText);
+      if (!(text instanceof HTMLLabelElement)) {
+        throw new Error(`${label} is not a <label>`);
+      }
+      expect(text.dataset.slot).toBe("label");
+      expect(text.classList.contains("text-muted-foreground")).toBe(true);
+      expect(text.parentElement?.className).toBe(`row-start-3 col-start-${labelCol} col-span-6`);
+      expect(text.closest('[data-slot="card-header"]')).not.toBeNull();
+
+      const field = headerInput(container, name);
+      expect(field.id).not.toBe("");
+      expect(text.htmlFor).toBe(field.id);
+      expect(asInput(screen.getByLabelText(label, exactText))).toBe(field);
+      expect(field.dataset.slot).toBe("input");
+      expect(field.readOnly).toBe(true);
+      expect(field.size).toBe(8);
+      expect(field.value).toBe("");
+      expect(field.parentElement?.className).toBe(`row-start-3 col-start-${fieldCol} col-span-8`);
+      expect(fetchStub).not.toHaveBeenCalled();
+    },
+  );
+
   // audit: COSGN00C-017
   // audit: COSGN00-046
   it.each([
@@ -317,31 +535,163 @@ describe("COSGN00 sign-on screen", () => {
 
   // audit: COSGN00C-011
   // audit: COSGN00-036
-  it("shows a failed sign-on in the error row, keeps the input and stores no session", async () => {
-    const failure: components["schemas"]["ScreenError"] = {
+  it.each([
+    {
+      outcome: "a blank user ID (COSGN00C-007)",
+      typedUserId: "",
+      typedPassword: TYPED_PASSWORD,
+      status: 400,
+      failure: { message: "Please enter User ID ...", field: "user_id" },
+      marked: userIdInput,
+    },
+    {
+      outcome: "a blank password (COSGN00C-008)",
+      typedUserId: TYPED_USER_ID,
+      typedPassword: "",
+      status: 400,
+      failure: { message: "Please enter Password ...", field: "password" },
+      marked: passwordInput,
+    },
+    {
+      outcome: "a wrong password (COSGN00C-018)",
+      typedUserId: TYPED_USER_ID,
+      typedPassword: TYPED_PASSWORD,
+      status: 401,
+      failure: { message: "Wrong Password. Try again ...", field: "password" },
+      marked: passwordInput,
+    },
+    {
+      outcome: "an unknown user (COSGN00C-019)",
+      typedUserId: TYPED_USER_ID,
+      typedPassword: TYPED_PASSWORD,
+      status: 401,
+      failure: { message: "User not found. Try again ...", field: "user_id" },
+      marked: userIdInput,
+    },
+    {
+      outcome: "a failed user read (COSGN00C-020)",
+      typedUserId: TYPED_USER_ID,
+      typedPassword: TYPED_PASSWORD,
+      status: 500,
+      failure: { message: "Unable to verify the User ...", field: "user_id" },
+      marked: userIdInput,
+    },
+  ])(
+    "shows $outcome in the error row, marks the input it names and stores no session",
+    async ({ typedUserId, typedPassword, status, failure, marked }) => {
+      const { sent } = stubFetch({ status, body: failure });
+      const { container } = renderScreen();
+      expect(errorRow().textContent).toBe("");
+      expectMarked(container, null, "");
+
+      typeCredentials(typedUserId, typedPassword);
+      fireEvent.click(screen.getByRole("button", { name: "ENTER=Sign-on" }));
+
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(failure.message);
+      });
+      expect(sent).toHaveLength(1);
+      expect(getSession()).toBeNull();
+      // The map is sent again from the fields as typed, with the cursor on the field the error
+      // names, which is marked invalid with the server message for assistive technology.
+      expect(userIdInput().value).toBe(typedUserId);
+      expect(passwordInput().value).toBe(typedPassword);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(marked());
+      });
+      expectMarked(container, marked(), failure.message);
+      expect(headerField(container, "TRNNAME")).toBe("CC00");
+      expect(screen.queryByText(/^Stub at /)).toBeNull();
+    },
+  );
+
+  // audit: COSGN00C-011
+  it("moves the mark to the input each answer names and clears it on the next ENTER", async () => {
+    const wrongPassword: components["schemas"]["ScreenError"] = {
       message: "Wrong Password. Try again ...",
       field: "password",
     };
-    const { sent } = stubFetch({ status: 401, body: failure });
+    stubFetch({ status: 401, body: wrongPassword });
     const { container } = renderScreen();
-    expect(errorRow().textContent).toBe("");
-
     typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
-    fireEvent.click(screen.getByRole("button", { name: "ENTER=Sign-on" }));
+    const enter = screen.getByRole("button", { name: "ENTER=Sign-on" });
 
+    fireEvent.click(enter);
     await waitFor(() => {
       expect(errorRow().textContent).toBe("Wrong Password. Try again ...");
     });
-    expect(sent).toHaveLength(1);
-    expect(getSession()).toBeNull();
-    // The map is sent again from the fields as typed, with the cursor on the field the error names.
+    expectMarked(container, passwordInput(), "Wrong Password. Try again ...");
+
+    // The next answer names the user ID: the mark moves there, and the kept dark password is sent
+    // again as typed (FSET).
+    const unverified: components["schemas"]["ScreenError"] = {
+      message: "Unable to verify the User ...",
+      field: "user_id",
+    };
+    const retry = stubFetch({ status: 500, body: unverified });
+    fireEvent.click(enter);
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe("Unable to verify the User ...");
+    });
+    const typed: components["schemas"]["SignonRequest"] = {
+      user_id: TYPED_USER_ID,
+      password: TYPED_PASSWORD,
+    };
+    expect(retry.sent).toEqual([{ authorization: null, body: typed }]);
+    await waitFor(() => {
+      expect(document.activeElement).toBe(userIdInput());
+    });
+    expectMarked(container, userIdInput(), "Unable to verify the User ...");
+
+    // A sign-on sent clears every mark before its answer arrives; the success then leaves.
+    const releases: (() => void)[] = [];
+    const gate = new Promise<void>((resolve) => {
+      releases.push(resolve);
+    });
+    const success = stubFetch({ status: 200, body: userSignon, gate });
+    fireEvent.click(enter);
+    await waitFor(() => {
+      expect(success.sent).toHaveLength(1);
+      expect(errorRow().textContent).toBe("");
+    });
+    expectMarked(container, null, "");
+    for (const release of releases) {
+      release();
+    }
+    expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
+  });
+
+  // audit: COSGN00C-011
+  it("marks no input for a failure that names none, clearing the earlier mark", async () => {
+    const notFound: components["schemas"]["ScreenError"] = {
+      message: "User not found. Try again ...",
+      field: "user_id",
+    };
+    stubFetch({ status: 401, body: notFound });
+    const { container } = renderScreen();
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+    const enter = screen.getByRole("button", { name: "ENTER=Sign-on" });
+
+    fireEvent.click(enter);
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe("User not found. Try again ...");
+    });
+    expectMarked(container, userIdInput(), "User not found. Try again ...");
+
+    // A gateway's empty 502 carries no `ScreenError`, so no field: only the row shows it.
+    const badGateway = vi.fn(
+      async () => new Response(null, { status: 502, statusText: "Bad Gateway" }),
+    );
+    vi.stubGlobal("fetch", badGateway);
+    fireEvent.click(enter);
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe("HTTP 502 Bad Gateway");
+    });
+    expect(badGateway).toHaveBeenCalledTimes(1);
+    expectMarked(container, null, "");
     expect(userIdInput().value).toBe(TYPED_USER_ID);
     expect(passwordInput().value).toBe(TYPED_PASSWORD);
-    await waitFor(() => {
-      expect(document.activeElement).toBe(passwordInput());
-    });
-    expect(headerField(container, "TRNNAME")).toBe("CC00");
-    expect(screen.queryByText(/^Stub at /)).toBeNull();
+    expect(getSession()).toBeNull();
   });
 
   // audit: COSGN00C-001
@@ -406,6 +756,135 @@ describe("COSGN00 sign-on screen", () => {
     expect(screen.queryAllByRole("button")).toHaveLength(0);
     expect(screen.queryAllByRole("textbox")).toHaveLength(0);
     expect(screen.queryByText("CC00")).toBeNull();
+  });
+
+  // audit: COSGN00-046
+  // audit: COSGN00-047
+  it.each([
+    {
+      how: "a click on ENTER=Sign-on",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      how: "the Enter key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+      },
+    },
+    {
+      how: "a submit of the form",
+      press: () => {
+        fireEvent.submit(signonForm());
+      },
+    },
+    {
+      how: "a click on F3=Exit",
+      press: () => {
+        fireEvent.click(exitButton());
+      },
+    },
+    {
+      how: "the F3 key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "F3" });
+      },
+    },
+    {
+      how: "the unserved F5 key",
+      press: () => {
+        fireEvent.keyDown(userIdInput(), { key: "F5" });
+      },
+    },
+  ])(
+    "while a sign-on is out, $how is refused and the keys unlock when its answer arrives",
+    async ({ press }) => {
+      let release = (): void => undefined;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const wrongPassword: components["schemas"]["ScreenError"] = {
+        message: "Wrong Password. Try again ...",
+        field: "password",
+      };
+      const { fetchStub, sent } = stubFetch({ status: 401, body: wrongPassword, gate });
+      renderScreen();
+      expectLocked(false);
+
+      typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+      fireEvent.click(enterButton());
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+        expectLocked(true);
+      });
+
+      press();
+      press();
+      await lingers();
+      // Nothing was sent, ended or shown: the screen is as the first ENTER left it.
+      expect(fetchStub).toHaveBeenCalledTimes(1);
+      expect(sent).toHaveLength(1);
+      expect(errorRow().textContent).toBe("");
+      expect(screen.queryByText("Thank you for using CardDemo application...")).toBeNull();
+      expectLocked(true);
+
+      release();
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe("Wrong Password. Try again ...");
+        expectLocked(false);
+      });
+      expect(userIdInput().value).toBe(TYPED_USER_ID);
+      expect(passwordInput().value).toBe(TYPED_PASSWORD);
+
+      // The next ENTER is taken: a new sign-on goes out with the same input.
+      fireEvent.click(enterButton());
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      expect(sent[1]).toEqual(sent[0]);
+      await waitFor(() => {
+        expectLocked(false);
+      });
+    },
+  );
+
+  // audit: COSGN00-046
+  it("takes ENTER once when it is pressed again before the first sign-on is accepted", async () => {
+    const { fetchStub, sent } = stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+
+    // All three arrive before the schema's check of the first has finished.
+    fireEvent.click(enterButton());
+    fireEvent.click(enterButton());
+    fireEvent.keyDown(window, { key: "Enter" });
+
+    expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
+    await lingers();
+    expect(fetchStub).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(1);
+  });
+
+  // audit: COSGN00-027
+  it("sends nothing for a value the schema refuses and takes the next ENTER", async () => {
+    const { fetchStub, sent } = stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+
+    // Nine characters, one past `LENGTH=8`; `maxLength` stops typing, not a value set at once.
+    typeCredentials(`${TYPED_USER_ID}x`, TYPED_PASSWORD);
+    fireEvent.click(enterButton());
+    await waitFor(() => {
+      expect(errorRow().textContent).not.toBe("");
+    });
+    await lingers();
+    expect(fetchStub).not.toHaveBeenCalled();
+    expectLocked(false);
+
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+    fireEvent.click(enterButton());
+    expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
+    expect(sent).toHaveLength(1);
   });
 });
 

@@ -62,7 +62,7 @@ use sqlx::PgConnection;
 
 use crate::error::PersistenceError;
 use crate::rows::{PendingAuthSummaryRow, pic_s_to_i64};
-use crate::{PgStore, PgTx};
+use crate::{PgStore, PgTx, ProbePoint, probed};
 
 /// How often `lock_or_create` runs its insert and locking read before it gives up: once, and
 /// once more when a concurrent delete removed the row in between.
@@ -199,11 +199,12 @@ impl PendingAuthSummaryRepository for PgStore {
         acct_id: PicS<11>,
     ) -> impl Future<Output = Result<Option<PendingAuthSummaryRecord>, PersistenceError>> + Send
     {
+        let verdict = self.verdict(ProbePoint::AuthSummaryRead, &[&acct_id]);
         let pool = self.pool().clone();
-        async move {
+        probed(verdict, async move {
             let mut conn = pool.acquire().await?;
             find_by_id_in(&mut conn, acct_id).await
-        }
+        })
     }
 
     /// Runs the insert and the locking read in a transaction of its own and commits it, so the
@@ -287,7 +288,8 @@ impl PendingAuthSummaryRepository for PgTx<'_> {
         acct_id: PicS<11>,
     ) -> impl Future<Output = Result<Option<PendingAuthSummaryRecord>, PersistenceError>> + Send
     {
-        find_by_id_in(self.conn(), acct_id)
+        let verdict = self.verdict(ProbePoint::AuthSummaryRead, &[&acct_id]);
+        probed(verdict, find_by_id_in(self.conn(), acct_id))
     }
 
     /// Runs the insert and the locking read inside this transaction: the row lock holds until
