@@ -15,8 +15,11 @@
 //! span as a multi-line, human-readable text block, interleaved with the JSON event lines; the
 //! exporter has no JSON format. A consumer that parses standard output line by line as JSON
 //! therefore runs with export off. Exported spans and their events carry no source-location
-//! attributes, so no source or host path reaches standard output. No event or span of the
-//! [`SILENCED_TARGETS`] reaches it, at any `RUST_LOG`.
+//! attributes, so no source or host path reaches standard output. The `Resource` block of the
+//! export names the emitting binary: its `service.name` is the file name stem of the running
+//! executable (`carddemo-mq`, `carddemo-batch`, `carddemo-migrate`, `carddemo-api`), never a
+//! directory of its path. No event or span of the [`SILENCED_TARGETS`] reaches standard output,
+//! at any `RUST_LOG`.
 //!
 //! # Redaction boundary
 //!
@@ -60,9 +63,13 @@
 use std::env::VarError;
 use std::error::Error;
 use std::fmt;
+use std::path::Path;
 use std::time::Duration;
 
+use opentelemetry::KeyValue;
 use opentelemetry::trace::TracerProvider as _;
+use opentelemetry_sdk::Resource;
+use opentelemetry_sdk::export::trace::SpanExporter;
 use opentelemetry_sdk::trace::{Tracer, TracerProvider};
 use tracing::field::Empty;
 use tracing::{Span, Subscriber, info_span};
@@ -91,6 +98,10 @@ pub const UNMATCHED_ROUTE: &str = "<unmatched>";
 
 /// Instrumentation scope name of the `OpenTelemetry` tracer.
 const TRACER_NAME: &str = "carddemo";
+
+/// Key of the `OpenTelemetry` resource attribute that names the emitting service. The SDK's own
+/// constant for it is private to the SDK crate.
+const SERVICE_NAME_KEY: &str = "service.name";
 
 /// The targets whose events and spans are never recorded, whatever `RUST_LOG` says: the AMQP
 /// client `lapin`, its protocol crates and `pinky_swear`, the promise crate behind every `lapin`
@@ -180,6 +191,13 @@ where
 /// runs with [`OtelExport::Off`], where every line is one JSON event. Exported spans and their
 /// events carry no source-location attributes.
 ///
+/// The resource of the exported spans, which the exporter prints in its `Resource` block, names
+/// the emitting binary: its `service.name` is the file name stem of the running executable, such
+/// as `carddemo-mq` for `…/target/debug/carddemo-mq`, beside the SDK's `telemetry.sdk.*`
+/// attributes. Only the stem is exported, never a directory of the path. When the executable path
+/// is unavailable, or its stem is empty or not valid UTF-8, the resource is the SDK's default,
+/// whose `service.name` is `unknown_service`.
+///
 /// The returned [`FlushGuard`] shuts the span exporter down when dropped; bind it for the life of
 /// `main`.
 ///
@@ -195,11 +213,13 @@ pub fn init(otel_export: OtelExport) -> Result<FlushGuard, InitError> {
 
     let provider = match otel_export {
         OtelExport::Off => None,
-        OtelExport::Stdout => Some(
-            TracerProvider::builder()
-                .with_simple_exporter(opentelemetry_stdout::SpanExporter::default())
-                .build(),
-        ),
+        OtelExport::Stdout => {
+            let executable = std::env::current_exe().ok();
+            Some(tracer_provider(
+                opentelemetry_stdout::SpanExporter::default(),
+                service_resource(executable.as_deref()),
+            ))
+        }
     };
     let otel = provider.as_ref().map(otel_layer);
 
@@ -235,6 +255,55 @@ fn env_filter(
             None => Err(InitError::Filter(err)),
         }
     })
+}
+
+/// The `service.name` of the spans a process exports: the file name stem of its `executable`, so
+/// `/…/target/debug/carddemo-mq` gives `carddemo-mq` and `carddemo-api.exe` gives
+/// `carddemo-api`.
+///
+/// `None` when the path has no file name, or its stem is empty or not valid UTF-8. Only the stem is
+/// returned, so no directory of the host path reaches standard output.
+#[must_use]
+fn service_name(executable: &Path) -> Option<&str> {
+    executable
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+}
+
+/// The resource of the tracer provider [`init`] builds: the SDK's default resource, its
+/// `telemetry.sdk.*` attributes included, with `service.name` overridden by the [`service_name`]
+/// of `executable`.
+///
+/// Without an executable path, or with one [`service_name`] finds no name in, it is the SDK's
+/// default resource alone, whose `service.name` is the `OpenTelemetry` fallback
+/// `unknown_service`.
+#[must_use]
+fn service_resource(executable: Option<&Path>) -> Resource {
+    match executable.and_then(service_name) {
+        Some(name) => {
+            Resource::new_with_defaults([KeyValue::new(SERVICE_NAME_KEY, name.to_owned())])
+        }
+        None => Resource::default(),
+    }
+}
+
+/// A tracer provider whose simple span processor hands each finished span to `exporter`, with
+/// `resource` as the resource of every span.
+///
+/// Building the provider passes `resource` on to the exporter, which is how `opentelemetry-stdout`
+/// learns what to print in its `Resource` block. [`init`] builds its provider here over that
+/// exporter, and the unit tests build theirs here over an in-memory one, so they check the
+/// construction [`init`] uses.
+#[must_use]
+fn tracer_provider<E>(exporter: E, resource: Resource) -> TracerProvider
+where
+    E: SpanExporter + 'static,
+{
+    TracerProvider::builder()
+        .with_simple_exporter(exporter)
+        .with_resource(resource)
+        .build()
 }
 
 /// The `tracing-opentelemetry` layer that bridges spans and their events into `provider`'s
@@ -433,10 +502,13 @@ mod tests {
     use std::ffi::OsString;
     use std::io;
     use std::os::unix::ffi::OsStringExt;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::sync::{Arc, Mutex, PoisonError};
     use std::time::Duration;
 
+    use opentelemetry::Key;
+    use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
     use opentelemetry_sdk::trace::TracerProvider;
     use tracing_subscriber::filter::{EnvFilter, FromEnvError, LevelFilter};
@@ -444,9 +516,9 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, InitError, OtelExport, SILENCED_TARGETS, ScreenedText, UNMATCHED_ROUTE,
-        env_filter, init, job_span, json_layer, json_subscriber, message_span, otel_layer,
-        record_response, request_span,
+        ALERT_TARGET, InitError, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS, ScreenedText,
+        UNMATCHED_ROUTE, env_filter, init, job_span, json_layer, json_subscriber, message_span,
+        otel_layer, record_response, request_span, service_name, service_resource, tracer_provider,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
@@ -515,13 +587,21 @@ mod tests {
     }
 
     /// In-memory span exporter standing in for `opentelemetry-stdout`: it keeps every span it is
-    /// handed, as the stdout exporter would print it.
+    /// handed, as the stdout exporter would print it, and the last resource the provider hands
+    /// it, which the stdout exporter prints as its `Resource` block.
     #[derive(Clone, Debug, Default)]
-    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    struct Exported(Arc<Mutex<Vec<SpanData>>>, Arc<Mutex<Option<Resource>>>);
 
     impl Exported {
         fn spans(&self) -> Vec<SpanData> {
             self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn resource(&self) -> Option<Resource> {
+            self.1
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .clone()
@@ -539,6 +619,17 @@ mod tests {
                 .extend(batch);
             Box::pin(std::future::ready(Ok(())))
         }
+
+        fn set_resource(&mut self, resource: &Resource) {
+            *self.1.lock().unwrap_or_else(PoisonError::into_inner) = Some(resource.clone());
+        }
+    }
+
+    /// The value `resource` holds under `key`, as text.
+    fn resource_attribute(resource: &Resource, key: &'static str) -> Option<String> {
+        resource
+            .get(Key::from_static_str(key))
+            .map(|value| value.as_str().into_owned())
     }
 
     #[test]
@@ -812,6 +903,89 @@ mod tests {
                     "{probe:?} in {span:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn service_name_is_the_file_name_stem_of_the_executable() {
+        let not_utf8 = PathBuf::from(OsString::from_vec(
+            b"/x/target/debug/carddemo-\xff".to_vec(),
+        ));
+        let cases = [
+            (
+                Path::new("/x/target/debug/carddemo-mq"),
+                Some("carddemo-mq"),
+            ),
+            (
+                Path::new("/x/target/debug/carddemo-batch"),
+                Some("carddemo-batch"),
+            ),
+            (
+                Path::new("/x/target/debug/carddemo-migrate"),
+                Some("carddemo-migrate"),
+            ),
+            (
+                Path::new("/x/target/debug/carddemo-api.exe"),
+                Some("carddemo-api"),
+            ),
+            (Path::new("carddemo-api"), Some("carddemo-api")),
+            (Path::new(""), None),
+            (Path::new("/"), None),
+            (Path::new("/x/target/debug/.."), None),
+            (not_utf8.as_path(), None),
+        ];
+        for (executable, expected) in cases {
+            assert_eq!(service_name(executable), expected, "{executable:?}");
+        }
+    }
+
+    #[test]
+    fn exported_spans_carry_the_service_name_of_the_executable() {
+        // Executable path, and the `service.name` the exporter must be handed for it.
+        let cases = [
+            (
+                Some(Path::new("/x/target/debug/carddemo-mq")),
+                "carddemo-mq",
+            ),
+            (
+                Some(Path::new("/x/target/debug/carddemo-batch")),
+                "carddemo-batch",
+            ),
+            (
+                Some(Path::new("/x/target/debug/carddemo-migrate")),
+                "carddemo-migrate",
+            ),
+            (Some(Path::new("/")), "unknown_service"),
+            (None, "unknown_service"),
+        ];
+        for (executable, expected) in cases {
+            let exported = Exported::default();
+            let provider = tracer_provider(exported.clone(), service_resource(executable));
+            let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
+            tracing::subscriber::with_default(subscriber, || {
+                job_span("acctfile").in_scope(|| {});
+            });
+
+            assert_eq!(exported.spans().len(), 1, "{executable:?}");
+            let Some(resource) = exported.resource() else {
+                panic!("{executable:?}: the provider handed the exporter no resource");
+            };
+            assert_eq!(
+                resource_attribute(&resource, SERVICE_NAME_KEY).as_deref(),
+                Some(expected),
+                "{executable:?}: {resource:?}"
+            );
+            assert_eq!(
+                resource_attribute(&resource, "telemetry.sdk.language").as_deref(),
+                Some("rust"),
+                "{executable:?}: {resource:?}"
+            );
+            let directories: Vec<String> = resource
+                .iter()
+                .map(|(_, value)| value.as_str().into_owned())
+                .filter(|value| value.contains('/'))
+                .collect();
+            assert!(directories.is_empty(), "{executable:?}: {resource:?}");
         }
     }
 

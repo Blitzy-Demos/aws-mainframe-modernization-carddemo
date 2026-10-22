@@ -503,6 +503,18 @@ mod tests {
             .collect()
     }
 
+    /// The 1-based position of the first element at which `left` and `right` differ, or `None`
+    /// when they are equal. A slice that ends first differs at its length plus one.
+    ///
+    /// The needle tests report this position instead of comparing with `assert_eq!`, whose
+    /// failure prints both operands and so the protected values.
+    fn first_difference<T: PartialEq>(left: &[T], right: &[T]) -> Option<usize> {
+        (1_usize..)
+            .zip(left.iter().zip(right))
+            .find_map(|(position, (one, other))| (one != other).then_some(position))
+            .or_else(|| (left.len() != right.len()).then(|| left.len().min(right.len()) + 1))
+    }
+
     /// The paths name the fixtures where they lie, under the repository root.
     #[test]
     fn paths_name_the_fixtures_in_place() {
@@ -564,14 +576,15 @@ mod tests {
     }
 
     /// The card numbers are the 16-digit `CARD-NUM` of every `carddata.txt` line, the same 50
-    /// values as the `XREF-CARD-NUM` of `cardxref.txt`.
+    /// values as the `XREF-CARD-NUM` of `cardxref.txt`. A failure names a line or a count,
+    /// never a card number.
     #[test]
     fn card_numbers_are_the_card_num_field_of_every_card() -> TestResult {
         let numbers = fixture_card_numbers()?;
         assert_eq!(numbers.len(), 50);
-        assert_eq!(
-            numbers.first().map(String::as_str),
-            Some("0500024453765740")
+        assert!(
+            numbers.first().map(String::as_str) == Some("0500024453765740"),
+            "carddata.txt line 1: CARD-NUM is not the audited first card number"
         );
         assert!(
             numbers
@@ -584,34 +597,57 @@ mod tests {
             .iter()
             .map(|number| number.clone().into_bytes())
             .collect();
-        assert_eq!(as_bytes, by_offset);
+        let mismatch = first_difference(&as_bytes, &by_offset);
+        assert!(
+            mismatch.is_none(),
+            "carddata.txt line {}: codec A's CARD-NUM differs from bytes 0..16",
+            mismatch.unwrap_or_default()
+        );
 
         let cards: BTreeSet<Vec<u8>> = by_offset.into_iter().collect();
         let xrefs: BTreeSet<Vec<u8>> = columns("cardxref.txt", 0, 16)?.into_iter().collect();
         assert_eq!(cards.len(), 50);
-        assert_eq!(cards, xrefs);
+        let unmatched = cards.symmetric_difference(&xrefs).count();
+        assert!(
+            unmatched == 0,
+            "cardxref.txt: {unmatched} card numbers are not in both carddata.txt and cardxref.txt"
+        );
         Ok(())
     }
 
     /// The SSNs are the 9-digit `CUST-SSN` of every `custdata.txt` line, and each appears plain
-    /// and dashed among the forms.
+    /// and dashed among the forms. A failure names a line, never an SSN.
     #[test]
     fn ssns_are_the_cust_ssn_field_in_both_forms() -> TestResult {
         let ssns = fixture_ssns()?;
         assert_eq!(ssns.len(), 50);
-        assert_eq!(ssns.first().map(String::as_str), Some("020973888"));
+        assert!(
+            ssns.first().map(String::as_str) == Some("020973888"),
+            "custdata.txt line 1: CUST-SSN is not the audited first SSN"
+        );
         let as_bytes: Vec<Vec<u8>> = ssns.iter().map(|ssn| ssn.clone().into_bytes()).collect();
-        assert_eq!(as_bytes, columns("custdata.txt", 279, 288)?);
+        let mismatch = first_difference(&as_bytes, &columns("custdata.txt", 279, 288)?);
+        assert!(
+            mismatch.is_none(),
+            "custdata.txt line {}: codec A's CUST-SSN differs from bytes 279..288",
+            mismatch.unwrap_or_default()
+        );
 
         let forms = fixture_ssn_forms()?;
         assert_eq!(forms.len(), 100);
-        assert_eq!(
-            forms.get(..2),
-            Some(["020973888".to_owned(), "020-97-3888".to_owned()].as_slice())
+        assert!(
+            forms.get(..2) == Some(["020973888".to_owned(), "020-97-3888".to_owned()].as_slice()),
+            "custdata.txt line 1: the forms are not the audited first SSN, plain then dashed"
         );
-        for (pair, ssn) in forms.chunks(2).zip(&ssns) {
-            assert_eq!(pair.first(), Some(ssn));
-            assert_eq!(pair.get(1).cloned(), dashed_ssn(ssn));
+        for (line, (pair, ssn)) in (1_usize..).zip(forms.chunks(2).zip(&ssns)) {
+            assert!(
+                pair.first() == Some(ssn),
+                "custdata.txt line {line}: the plain form is not CUST-SSN"
+            );
+            assert!(
+                pair.get(1).cloned() == dashed_ssn(ssn),
+                "custdata.txt line {line}: the dashed form does not follow the plain form"
+            );
         }
         Ok(())
     }
@@ -632,12 +668,16 @@ mod tests {
         }
     }
 
-    /// The passwords are the 8-byte `SEC-USR-PWD` of the ten in-stream records.
+    /// The passwords are the 8-byte `SEC-USR-PWD` of the ten in-stream records. A failure names
+    /// the deck or a record, never a password.
     #[test]
     fn passwords_are_the_sec_usr_pwd_field_of_every_user() -> TestResult {
         let passwords = fixture_user_passwords()?;
         assert_eq!(passwords.len(), 10);
-        assert!(passwords.iter().all(|pwd| pwd.as_slice() == b"PASSWORD"));
+        assert!(
+            passwords.iter().all(|pwd| pwd.as_slice() == b"PASSWORD"),
+            "DUSRSECJ.jcl: a SEC-USR-PWD is not the audited fixture password"
+        );
 
         let deck = read(&dusrsecj_path())?;
         let by_offset = usrsec_instream_lines(&deck)?
@@ -649,7 +689,12 @@ mod tests {
                     .ok_or("a short card")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(passwords, by_offset);
+        let mismatch = first_difference(&passwords, &by_offset);
+        assert!(
+            mismatch.is_none(),
+            "DUSRSECJ.jcl in-stream record {}: codec A's SEC-USR-PWD differs from bytes 48..56",
+            mismatch.unwrap_or_default()
+        );
         Ok(())
     }
 

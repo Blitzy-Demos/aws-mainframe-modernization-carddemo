@@ -67,6 +67,13 @@ const DEFAULT_QUEUE_REQUEST_DATE: &str = "CARD.DEMO.REQUEST.DATE";
 const DEFAULT_QUEUE_REQUEST_ACCT: &str = "CARD.DEMO.REQUEST.ACCT";
 const DEFAULT_QUEUE_REQUEST_PAUTH: &str = "CARD.DEMO.REQUEST.PAUTH";
 const DEFAULT_MQ_POLL_MS: u64 = 250;
+/// The longest `CARDDEMO_MQ_POLL_MS` accepted: five seconds. The poll replaces the `MQGMO-WAIT`
+/// of `CODATE01`, `COACCT01` and `COPAUA0C`, each of which waits at most 5000 ms for a request
+/// (`CODATE01.cbl:286`, `COACCT01.cbl:337`, `COPAUA0C.cbl:242`, as
+/// `modern/audit/messaging/{CODATE01,COACCT01,COPAUA0C}.md` record). It also equals the reconnect
+/// backoff cap of the `messaging` crate (`broker::BACKOFF_CAP`), so no configuration leaves an
+/// empty request queue unpolled for longer.
+const MAX_MQ_POLL_MS: u64 = 5_000;
 const DEFAULT_API_BIND: &str = "127.0.0.1:8080";
 const DEFAULT_JWT_TTL_SECONDS: u64 = 3600;
 const DEFAULT_VAR_DIR: &str = "./var";
@@ -82,6 +89,8 @@ const REPORTS_SUBDIR: &str = "reports";
 const OTEL_EXPORT_STDOUT: &str = "stdout";
 
 const EXPECTED_POSITIVE_INTEGER: &str = "a positive integer of decimal digits";
+/// [`EXPECTED_POSITIVE_INTEGER`] bounded by [`MAX_MQ_POLL_MS`].
+const EXPECTED_MQ_POLL_MS: &str = "a positive integer of decimal digits, at most 5000";
 const EXPECTED_OTEL_EXPORT: &str = "unset, empty or stdout";
 
 /// Text the `Debug` output of [`Config`] shows in place of a credential.
@@ -121,7 +130,7 @@ pub struct Config {
     /// `CARD.DEMO.REQUEST.PAUTH`). A renamed queue needs the same dead-letter arguments.
     pub queue_request_pauth: String,
     /// Milliseconds between polls of an empty request queue (`CARDDEMO_MQ_POLL_MS`, default
-    /// `250`, never zero).
+    /// `250`, from `1` to `5000`).
     pub mq_poll_ms: u64,
     /// Listen address of the API, `host:port` (`CARDDEMO_API_BIND`, default `127.0.0.1:8080`).
     /// Kept as given; the API resolves it when it binds.
@@ -239,6 +248,7 @@ impl Config {
     /// [`EnvError::Invalid`], naming the variable, when:
     /// - `CARDDEMO_MQ_POLL_MS` or `CARDDEMO_JWT_TTL_SECONDS` holds anything but ASCII decimal
     ///   digits (a sign included), is zero, or exceeds the 64-bit unsigned range;
+    /// - `CARDDEMO_MQ_POLL_MS` exceeds `5000`, the COBOL's five-second wait;
     /// - `CARDDEMO_OTEL_EXPORT` is anything other than exactly `stdout`.
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, EnvError> {
         let get = |var: &str| lookup(var).filter(|value| !value.is_empty());
@@ -261,6 +271,8 @@ impl Config {
                 CARDDEMO_MQ_POLL_MS,
                 get(CARDDEMO_MQ_POLL_MS).as_deref(),
                 DEFAULT_MQ_POLL_MS,
+                MAX_MQ_POLL_MS,
+                EXPECTED_MQ_POLL_MS,
             )?,
             api_bind: text(CARDDEMO_API_BIND, DEFAULT_API_BIND),
             jwt_secret: get(CARDDEMO_JWT_SECRET).unwrap_or_default(),
@@ -268,6 +280,8 @@ impl Config {
                 CARDDEMO_JWT_TTL_SECONDS,
                 get(CARDDEMO_JWT_TTL_SECONDS).as_deref(),
                 DEFAULT_JWT_TTL_SECONDS,
+                u64::MAX,
+                EXPECTED_POSITIVE_INTEGER,
             )?,
             var_dir,
             statement_dir,
@@ -319,22 +333,26 @@ impl Config {
     }
 }
 
-/// Parses a positive count of ASCII decimal digits, or returns `default` when `value` is unset.
-fn positive_integer(var: &'static str, value: Option<&str>, default: u64) -> Result<u64, EnvError> {
+/// Parses a positive count of ASCII decimal digits no greater than `max`, or returns `default`
+/// when `value` is unset. Every rejected value, out of range or malformed, reports `expected`.
+fn positive_integer(
+    var: &'static str,
+    value: Option<&str>,
+    default: u64,
+    max: u64,
+    expected: &'static str,
+) -> Result<u64, EnvError> {
     let Some(value) = value else {
         return Ok(default);
     };
-    let invalid = EnvError::Invalid {
-        var,
-        expected: EXPECTED_POSITIVE_INTEGER,
-    };
+    let invalid = EnvError::Invalid { var, expected };
     // `str::parse` alone would also accept a leading `+`.
     if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Err(invalid);
     }
     match value.parse::<u64>() {
-        Ok(0) | Err(_) => Err(invalid),
-        Ok(number) => Ok(number),
+        Ok(number) if (1..=max).contains(&number) => Ok(number),
+        Ok(_) | Err(_) => Err(invalid),
     }
 }
 
@@ -573,40 +591,73 @@ mod tests {
 
     #[test]
     fn numeric_variables_accept_only_positive_decimal_digits() {
-        for var in [CARDDEMO_MQ_POLL_MS, CARDDEMO_JWT_TTL_SECONDS] {
-            for rejected in [
-                "abc",
-                "+250",
-                "-1",
-                " 250",
-                "250 ",
-                "2.5",
-                "0",
-                "000",
-                "1234567890123456789012345",
-            ] {
-                match parse(&[(var, rejected)]) {
-                    Err(EnvError::Invalid { var: named, .. }) => {
-                        assert_eq!(named, var, "{rejected:?}");
-                    }
-                    other => panic!("{var}={rejected:?} must be invalid, got {other:?}"),
-                }
+        /// One numeric variable: the text every rejected value reports, the values rejected
+        /// beyond the malformed ones, and the values accepted with the number each parses to.
+        struct Case {
+            var: &'static str,
+            expected: &'static str,
+            out_of_range: &'static [&'static str],
+            accepted: &'static [(&'static str, u64)],
+        }
+
+        let malformed = [
+            "abc",
+            "+250",
+            "-1",
+            " 250",
+            "250 ",
+            "2.5",
+            "0",
+            "000",
+            "1234567890123456789012345",
+        ];
+        let cases = [
+            Case {
+                var: CARDDEMO_MQ_POLL_MS,
+                expected: "a positive integer of decimal digits, at most 5000",
+                out_of_range: &["5001", "999999999999", "18446744073709551615"],
+                accepted: &[("1", 1), ("250", 250), ("007", 7), ("5000", 5000)],
+            },
+            Case {
+                var: CARDDEMO_JWT_TTL_SECONDS,
+                expected: "a positive integer of decimal digits",
+                out_of_range: &[],
+                accepted: &[
+                    ("1", 1),
+                    ("250", 250),
+                    ("007", 7),
+                    ("18446744073709551615", u64::MAX),
+                ],
+            },
+        ];
+        for Case {
+            var,
+            expected,
+            out_of_range,
+            accepted,
+        } in cases
+        {
+            for rejected in malformed.iter().chain(out_of_range).copied() {
+                assert_eq!(
+                    parse(&[(var, rejected)]),
+                    Err(EnvError::Invalid { var, expected }),
+                    "{var}={rejected:?}"
+                );
             }
-            for (accepted, number) in [
-                ("1", 1),
-                ("250", 250),
-                ("007", 7),
-                ("18446744073709551615", u64::MAX),
-            ] {
-                let config = parse_ok(&[(var, accepted)]);
+            for &(value, number) in accepted {
+                let config = parse_ok(&[(var, value)]);
                 let parsed = if var == CARDDEMO_MQ_POLL_MS {
                     config.mq_poll_ms
                 } else {
                     config.jwt_ttl_seconds
                 };
-                assert_eq!(parsed, number, "{var}={accepted:?}");
+                assert_eq!(parsed, number, "{var}={value:?}");
             }
         }
+        assert_eq!(
+            parse_ok(&[(CARDDEMO_MQ_POLL_MS, "5000")]).mq_poll_interval(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -685,9 +736,21 @@ mod tests {
         assert_eq!(
             message,
             "environment variable CARDDEMO_MQ_POLL_MS is invalid: \
-             expected a positive integer of decimal digits"
+             expected a positive integer of decimal digits, at most 5000"
         );
         assert!(!message.contains("p4ssw0rd"));
+
+        let above_bound =
+            parse(&[(CARDDEMO_MQ_POLL_MS, "999999999999")]).expect_err("above the bound");
+        assert_eq!(
+            above_bound,
+            EnvError::Invalid {
+                var: CARDDEMO_MQ_POLL_MS,
+                expected: "a positive integer of decimal digits, at most 5000"
+            }
+        );
+        assert_eq!(above_bound.to_string(), message);
+        assert!(!above_bound.to_string().contains("999999999999"));
 
         let not_unicode = EnvError::NotUnicode {
             var: "DATABASE_URL",

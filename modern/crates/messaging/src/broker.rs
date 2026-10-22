@@ -1231,7 +1231,8 @@ impl Backoff {
 
 /// Waits `poll_interval` (`CARDDEMO_MQ_POLL_MS`, default 250 ms) after [`Consumer::get`] found
 /// the request queue empty. This poll replaces the COBOL's five-second `MQGMO-WAIT`; no stream
-/// consumer is used.
+/// consumer is used. The interval is at most five seconds, because the configuration refuses a
+/// longer one.
 pub async fn idle(poll_interval: Duration) {
     tokio::time::sleep(poll_interval).await;
 }

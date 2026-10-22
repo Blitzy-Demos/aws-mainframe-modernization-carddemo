@@ -8,13 +8,17 @@
 //! - `PIC X(n)` and every `FILLER` are `CHAR(n)`; the five `X(10)` dates are nullable `DATE` and
 //!   the two `X(26)` timestamps nullable `TIMESTAMP(6)`, each with a nullable `CHAR(1)` layout
 //!   code (E33), `NULL` standing for an all-space value;
-//! - `PIC 9(n)` and `PIC S9(n)` are `BIGINT` with a range check of n nines (Checked Integer
-//!   Narrowing), `PIC S9(n)V9(m)` is `NUMERIC(n+m, m)`, `PIC S9(4) COMP` is `SMALLINT`;
+//! - `PIC 9(n)` and `PIC S9(n)` are `BIGINT` with a range check of n nines, compared by its
+//!   complete definition (Checked Integer Narrowing), `PIC S9(n)V9(m)` is `NUMERIC(n+m, m)`,
+//!   `PIC S9(4) COMP` is `SMALLINT`;
 //! - `users.password_hash` (`TEXT`) takes the place of `SEC-USR-PWD` (E25);
 //! - Db2 columns keep their declared types, with `DECIMAL(n)` as a signed `BIGINT`.
 //!
 //! Keys and indexes follow the KSDS keys, the alternate indexes, the IMS hierarchy and the Db2 DDL.
-//! A third test drives the constraints through the repository traits and checked statements.
+//! Every check constraint, the timestamp layout checks of `transactions` included, is compared by
+//! its complete definition, so a check joined by `OR` or carrying an extra predicate fails with its
+//! table and name. A third test drives the constraints through the repository traits and checked
+//! statements, both mismatched `NULL` states of each timestamp pair included.
 //!
 //! Every database comes migrated from the `test-support` harness, and every statement is a
 //! compile-time-checked query macro (R4). Failure messages name schema objects, layout codes and
@@ -669,11 +673,37 @@ const FOREIGN_KEYS: [ForeignKey; 2] = [
     },
 ];
 
-/// The check constraints that pair each timestamp with its layout code: both `NULL` for a blank
-/// value or both present (PIC-017 to PIC-020, E33).
-const FORM_PAIR_CHECKS: [&str; 2] = [
-    "transactions_orig_ts_form_ck",
-    "transactions_proc_ts_form_ck",
+/// The check constraints of `transactions` besides its range checks, each as `(name, definition)`
+/// in the words `pg_get_constraintdef` writes: each timestamp and its layout code are both `NULL`
+/// for a blank value or both present (PIC-017), the code is one of `I`, `D` and `S` (PIC-018 to
+/// PIC-020), and a layout-`S` value is a date at midnight (PIC-020, E33).
+const TIMESTAMP_LAYOUT_CHECKS: [(&str, &str); 6] = [
+    (
+        "transactions_orig_ts_form_ck",
+        "CHECK (((orig_ts IS NULL) = (orig_ts_form IS NULL)))",
+    ),
+    (
+        "transactions_proc_ts_form_ck",
+        "CHECK (((proc_ts IS NULL) = (proc_ts_form IS NULL)))",
+    ),
+    (
+        "transactions_orig_ts_form_code_ck",
+        "CHECK ((orig_ts_form = ANY (ARRAY['I'::bpchar, 'D'::bpchar, 'S'::bpchar])))",
+    ),
+    (
+        "transactions_proc_ts_form_code_ck",
+        "CHECK ((proc_ts_form = ANY (ARRAY['I'::bpchar, 'D'::bpchar, 'S'::bpchar])))",
+    ),
+    (
+        "transactions_orig_ts_screen_date_ck",
+        "CHECK (((orig_ts_form <> 'S'::bpchar) OR ((orig_ts)::time without time zone = \
+         '00:00:00'::time without time zone)))",
+    ),
+    (
+        "transactions_proc_ts_screen_date_ck",
+        "CHECK (((proc_ts_form <> 'S'::bpchar) OR ((proc_ts)::time without time zone = \
+         '00:00:00'::time without time zone)))",
+    ),
 ];
 
 /// One row of `information_schema.columns`, its domain-typed columns cast to base types.
@@ -1042,66 +1072,81 @@ fn picture_range(ty: Ty) -> Option<(String, String)> {
     }
 }
 
-/// The words of a check constraint's definition without parentheses, quotes and the casts
-/// `PostgreSQL` adds to constants: `BETWEEN 0 AND 99999999999` comes back from
-/// `pg_get_constraintdef` as `((acct_id >= 0) AND (acct_id <= '99999999999'::bigint))`, which
-/// becomes `acct_id >= 0 AND acct_id <= 99999999999`.
-fn check_words(def: &str) -> Vec<String> {
-    let mut text = def
-        .replace("::bigint", " ")
-        .replace("::integer", " ")
-        .replace("::numeric", " ");
-    text.retain(|ch| !matches!(ch, '(' | ')' | '\''));
-    text.split_whitespace().map(str::to_owned).collect()
+/// The text after a cast to an integer type that `after` begins with, when `literal` is a whole
+/// number: an optional minus sign and at least one digit.
+fn after_integer_cast<'a>(literal: &str, after: &'a str) -> Option<&'a str> {
+    let digits = literal.strip_prefix('-').unwrap_or(literal);
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    ["::bigint", "::integer", "::smallint"]
+        .iter()
+        .find_map(|cast| after.strip_prefix(cast))
 }
 
-/// Whether `words` hold the comparison `column operator value`.
-fn compares(words: &[String], column: &str, operator: &str, value: &str) -> bool {
-    words
-        .windows(3)
-        .any(|window| matches!(window, [c, o, v] if c == column && o == operator && v == value))
-}
-
-/// Every `9(n)` and `S9(n)` column is bounded by a check constraint of its table to exactly the
-/// range its picture holds (PIC-003, PIC-023), so a value the field cannot hold is refused.
-fn check_ranges(constraints: &[CatalogConstraint], failures: &mut Vec<String>) {
-    for table in &TABLES {
-        let checks: Vec<Vec<String>> = constraints
-            .iter()
-            .filter(|c| c.kind == "c" && c.schema == table.schema && c.table == table.name)
-            .map(|c| check_words(&c.def))
-            .collect();
-        for column in table.columns {
-            let Some((low, high)) = picture_range(column.ty) else {
-                continue;
-            };
-            let bounded = checks.iter().any(|words| {
-                compares(words, column.name, ">=", &low)
-                    && compares(words, column.name, "<=", &high)
-            });
-            if !bounded {
-                failures.push(format!(
-                    "{}.{}.{}: no check constraint bounds it to {low} ..= {high}",
-                    table.schema, table.name, column.name
-                ));
-            }
+/// A check constraint's definition with every quoted whole number that carries a cast to an
+/// integer type written as the bare number, and every other character kept as it stands.
+/// `PostgreSQL` quotes and casts a bound that is negative or wider than `integer`, so
+/// `BETWEEN -99999 AND 99999999999` comes back from `pg_get_constraintdef` with
+/// `'-99999'::integer` and `'99999999999'::bigint`, which become `-99999` and `99999999999`.
+fn normalised_check(def: &str) -> String {
+    let mut normalised = String::with_capacity(def.len());
+    let mut rest = def;
+    while let Some((before, quoted)) = rest.split_once('\'') {
+        normalised.push_str(before);
+        let Some((literal, after)) = quoted.split_once('\'') else {
+            normalised.push('\'');
+            rest = quoted;
+            break;
+        };
+        if let Some(tail) = after_integer_cast(literal, after) {
+            normalised.push_str(literal);
+            rest = tail;
+        } else {
+            normalised.push('\'');
+            normalised.push_str(literal);
+            normalised.push('\'');
+            rest = after;
         }
     }
+    normalised.push_str(rest);
+    normalised
 }
 
-/// The two check constraints that pair each timestamp of `transactions` with its layout code
-/// exist on that table.
-fn check_form_pairs(constraints: &[CatalogConstraint], failures: &mut Vec<String>) {
-    for name in FORM_PAIR_CHECKS {
-        let present = constraints.iter().any(|c| {
-            c.kind == "c" && c.schema == "public" && c.table == "transactions" && c.name == name
-        });
-        if !present {
-            failures.push(format!(
-                "public.transactions: check constraint {name} missing"
-            ));
-        }
-    }
+/// The check constraints of [`TABLES`] are exactly one range check per `9(n)` and `S9(n)`
+/// column and [`TIMESTAMP_LAYOUT_CHECKS`], each compared by its complete definition. A range
+/// check carries `PostgreSQL`'s default `<table>_<column>_check` name and the conjunction
+/// `BETWEEN` expands to over the bounds its picture holds (PIC-003, PIC-023), so a check joined
+/// by `OR`, one with an extra predicate or another bound, and a missing or unexpected check are
+/// each reported with their table and name. A check admits `NULL`; whether a column does is
+/// proven by [`compare_columns`].
+fn check_constraints(constraints: &[CatalogConstraint], failures: &mut Vec<String>) {
+    let observed = constraints
+        .iter()
+        .filter(|c| c.kind == "c" && is_expected_table(&c.schema, &c.table))
+        .map(|c| {
+            let def = normalised_check(&c.def);
+            format!("{}.{} {} {def}", c.schema, c.table, c.name)
+        })
+        .collect();
+    let ranges = TABLES.iter().flat_map(|table| {
+        table.columns.iter().filter_map(move |column| {
+            let (low, high) = picture_range(column.ty)?;
+            let (schema, name, col) = (table.schema, table.name, column.name);
+            Some(format!(
+                "{schema}.{name} {name}_{col}_check \
+                 CHECK ((({col} >= {low}) AND ({col} <= {high})))"
+            ))
+        })
+    });
+    let expected = ranges
+        .chain(
+            TIMESTAMP_LAYOUT_CHECKS
+                .iter()
+                .map(|(name, def)| format!("public.transactions {name} {def}")),
+        )
+        .collect();
+    compare_sets("check", &expected, &observed, failures);
 }
 
 /// The indexes of [`TABLES`] are exactly those of the primary keys, the unique constraints and
@@ -1374,8 +1419,47 @@ async fn detail_hierarchy_is_enforced(store: &mut PgStore) {
     );
 }
 
-/// Each timestamp of `transactions` and its layout code are both `NULL` or both present, the
-/// code is one of `I`, `D` and `S`, and a layout-`S` value is a date at midnight.
+/// For `orig_ts` and for `proc_ts`, a timestamp without its layout code and a code without its
+/// timestamp are each refused by that pair's check, on the row
+/// [`timestamp_layout_codes_are_enforced`] stores: `orig_ts` in layout `I`, `proc_ts` blank. A
+/// code without its timestamp is `I`, which the code and screen-date checks admit, so only the
+/// pair's check can refuse it.
+async fn one_sided_timestamp_pairs_are_refused(pool: &PgPool) {
+    assert_check(
+        sqlx::query!("UPDATE transactions SET orig_ts_form = NULL")
+            .execute(pool)
+            .await,
+        "orig_ts without its layout code",
+        Some("transactions_orig_ts_form_ck"),
+    );
+    assert_check(
+        sqlx::query!("UPDATE transactions SET orig_ts = NULL")
+            .execute(pool)
+            .await,
+        "orig_ts_form without its timestamp",
+        Some("transactions_orig_ts_form_ck"),
+    );
+    assert_check(
+        sqlx::query!("UPDATE transactions SET proc_ts = TIMESTAMP '2022-06-10 19:27:53'")
+            .execute(pool)
+            .await,
+        "proc_ts without its layout code",
+        Some("transactions_proc_ts_form_ck"),
+    );
+    assert_check(
+        sqlx::query!("UPDATE transactions SET proc_ts_form = 'I'")
+            .execute(pool)
+            .await,
+        "proc_ts_form without its timestamp",
+        Some("transactions_proc_ts_form_ck"),
+    );
+}
+
+/// Each timestamp of `transactions` and its layout code are both `NULL` or both present: for
+/// `orig_ts` and for `proc_ts`, both one-sided pairs are refused
+/// ([`one_sided_timestamp_pairs_are_refused`]), and a pair with both present and a pair with both
+/// `NULL` are each stored. The code is one of `I`, `D` and `S`, and a layout-`S` value is a date
+/// at midnight.
 async fn timestamp_layout_codes_are_enforced(pool: &PgPool) {
     assert_one_row(
         sqlx::query!(
@@ -1390,20 +1474,7 @@ async fn timestamp_layout_codes_are_enforced(pool: &PgPool) {
         .await,
         "insert a transaction with a layout-I original timestamp",
     );
-    assert_check(
-        sqlx::query!("UPDATE transactions SET orig_ts_form = NULL")
-            .execute(pool)
-            .await,
-        "orig_ts without its layout code",
-        Some("transactions_orig_ts_form_ck"),
-    );
-    assert_check(
-        sqlx::query!("UPDATE transactions SET proc_ts = TIMESTAMP '2022-06-10 19:27:53'")
-            .execute(pool)
-            .await,
-        "proc_ts without its layout code",
-        Some("transactions_proc_ts_form_ck"),
-    );
+    one_sided_timestamp_pairs_are_refused(pool).await;
     assert_check(
         sqlx::query!("UPDATE transactions SET orig_ts_form = 'X'")
             .execute(pool)
@@ -1455,6 +1526,12 @@ async fn timestamp_layout_codes_are_enforced(pool: &PgPool) {
             .execute(pool)
             .await,
         "a blank orig_ts as two NULLs",
+    );
+    assert_one_row(
+        sqlx::query!("UPDATE transactions SET proc_ts = NULL, proc_ts_form = NULL")
+            .execute(pool)
+            .await,
+        "a blank proc_ts as two NULLs",
     );
 }
 
@@ -1557,9 +1634,14 @@ async fn columns_follow_the_copybook_rules() {
     );
 }
 
-/// Keys, indexes, foreign keys and range checks follow the KSDS keys, the alternate indexes, the
-/// IMS hierarchy, the Db2 DDL and the integral pictures.
+/// Keys, indexes and foreign keys follow the KSDS keys, the alternate indexes, the IMS hierarchy
+/// and the Db2 DDL, and every check constraint equals, in its complete definition, the range of
+/// its integral picture or the timestamp layout rule it states.
 // audit: PIC-003
+// audit: PIC-017
+// audit: PIC-018
+// audit: PIC-019
+// audit: PIC-020
 #[tokio::test]
 async fn keys_indexes_and_checks_follow_the_sources() {
     let guard = start_postgres()
@@ -1569,8 +1651,7 @@ async fn keys_indexes_and_checks_follow_the_sources() {
     let constraints = fetch_constraints(pool).await;
     let mut failures = Vec::new();
     check_keys(&constraints, &mut failures);
-    check_ranges(&constraints, &mut failures);
-    check_form_pairs(&constraints, &mut failures);
+    check_constraints(&constraints, &mut failures);
     check_indexes(pool, &mut failures).await;
     assert!(
         failures.is_empty(),

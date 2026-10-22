@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transactions SET proc_ts = NULL, proc_ts_form = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "845f17f5157d7abfdd099a8717629377d0765a1a02bf5a271355bba146e405ea"
+}
