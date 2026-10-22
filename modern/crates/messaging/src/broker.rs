@@ -12,6 +12,7 @@
 //! | [`Publisher::publish`] | `MQPUT` / `MQPUT1` | CODATE01-002, CODATE01-012, CODATE01-014, COACCT01-023, COACCT01-026, COACCT01-033, COPAUA0C-066, COPAUA0C-117 |
 //! | [`copied_properties`] | `MOVE SAVE-MSGID`, `MOVE SAVE-CORELID` (`CODATE01.cbl:373-374`) | CODATE01-010, CODATE01-011, CODATE01-018, COACCT01-024, COACCT01-025, COACCT01-032 |
 //! | [`cp00_properties`] | the reply descriptor of `7100-SEND-RESPONSE` (`COPAUA0C.cbl:745-750`) | COPAUA0C-067 |
+//! | [`is_direct_reply_to`] | none: a `REPLYTOQ` always names a real queue | COPAUA0C-066, COPAUA0C-117 |
 //! | [`Acknowledger`] | the syncpoint that commits a get with its put; the task end that commits a get with nothing sent | CODATE01-012, CODATE01-019, COACCT01-026, COACCT01-034, COPAUA0C-006, COPAUA0C-081, COPAUA0C-082, COPAUA0C-117 |
 //! | [`Consumer::close`], [`Backoff`] | the task end and the next trigger | COPAUA0C-118 |
 //! | [`idle`] | `MQGMO-WAIT` with its wait interval | the `basic_get` poll of `CARDDEMO_MQ_POLL_MS` |
@@ -32,6 +33,10 @@
 //! - **Default exchange.** MQ point-to-point maps to the default exchange, with the queue name
 //!   as routing key and `mandatory: true`, so a message no queue accepts comes back as
 //!   [`PublishFailure::Returned`] instead of being dropped.
+//! - **No Direct Reply-to.** A destination that names `RabbitMQ`'s Direct Reply-to pseudo-queue
+//!   ([`is_direct_reply_to`]) is refused before any publication: `RabbitMQ` 3.13 both delivers
+//!   and returns a mandatory message sent there, so its publication can never be confirmed
+//!   without having been delivered.
 //! - **Queue names.** Request queues come from `runtime::config::Config`. Reply and error queues
 //!   are the COBOL literals, owned by `domain::messaging::codate01` and
 //!   `domain::messaging::coacct01`; CP00 replies go to the request's `reply_to`. The README
@@ -136,6 +141,29 @@ pub const OPERATION_DEADLINE: Duration = Duration::from_secs(5);
 /// whose card number cannot be parsed (i11; COPAUA0C-006) and one whose reply could not be
 /// published (`M004`; COPAUA0C-117).
 pub const DEAD_LETTER_QUEUE: &str = "CARD.DEMO.DEADLETTER.PAUTH";
+
+/// The name of `RabbitMQ`'s Direct Reply-to pseudo-queue. A requester that consumes from it
+/// sends it as its request's `reply_to`, and the broker hands the request on with the `reply_to`
+/// rewritten to this name, a `.` and a suffix that addresses the requester's channel. MQ has no
+/// counterpart: a `REPLYTOQ` always names a real queue.
+pub const DIRECT_REPLY_TO: &str = "amq.rabbitmq.reply-to";
+
+/// Whether `queue` names the Direct Reply-to pseudo-queue: exactly [`DIRECT_REPLY_TO`], or it
+/// followed by `.` and a suffix. The comparison is exact and case-sensitive, as `RabbitMQ`'s
+/// queue names are, so `amq.rabbitmq.reply-tox` is an ordinary queue name.
+///
+/// No publication to such a queue can meet the confirmation rule without delivering the message
+/// first: `RabbitMQ` 3.13 delivers a `mandatory: true` publication to the waiting requester and
+/// also returns it as unroutable, so [`Publisher::publish`] would report
+/// [`PublishFailure::Returned`] for a message the requester already holds. A worker therefore
+/// refuses such a destination before it publishes anything (COPAUA0C-117, `X-COPAUA0C-12`),
+/// whatever the broker version does with the return, and never relies on the return itself.
+#[must_use]
+pub fn is_direct_reply_to(queue: &str) -> bool {
+    queue
+        .strip_prefix(DIRECT_REPLY_TO)
+        .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with('.'))
+}
 
 /// The AMQP `expiration` of every CP00 reply, in milliseconds: the audited `MQMD-EXPIRY` of 50
 /// tenths of a second (`COPAUA0C.cbl:750`; COPAUA0C-067, E16). CDRD and CDRA replies carry none.

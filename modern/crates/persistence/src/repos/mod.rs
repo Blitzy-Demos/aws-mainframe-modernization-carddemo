@@ -85,7 +85,10 @@
 //! - [`PendingAuthSummaryRepository::lock_or_create`] inserts the account's summary when it is
 //!   absent and locks it, the i10 serialisation of every CP00 decision for the account
 //!   (COPAUA0C-026, AAP 0.3.4.2).
-//! - Both hold their row lock until the transaction ends only on a [`PgTx`](crate::PgTx); on
+//! - [`PendingAuthSummaryRepository::lock_next`] reads and locks the summary after a given key,
+//!   as the purge's `GN` reads each root when it reaches it under IMS program isolation, so the
+//!   purge's delete test sees the count CP00 last committed (CBPAUP0C-009).
+//! - All three hold their row lock until the transaction ends only on a [`PgTx`](crate::PgTx); on
 //!   [`PgStore`](crate::PgStore) and [`PgSession`](crate::PgSession) the lock ends with the
 //!   call. No process-local lock is used: only the database serialises, so a second process
 //!   sees every lock the first one holds.
@@ -132,7 +135,7 @@
 //! | [`Db2TransactionTypeRepository`] | `db2.transaction_type` | `find_by_id(&PicX<2>)`; `page_after`, `page_before` (`&PicX<2>` start, `Option<&PicX<2>>` type filter, `Option<&str>` description pattern, `limit`); `count_matching` (the two filters) → `i64`; `insert`; `update` → `bool`; `delete(&PicX<2>)` → `bool` |
 //! | [`DisclosureGroupRepository`] | `disclosure_groups` | `find_by_id(&PicX<10>, &PicX<2>, PicU<4>)`; `find_all`; `insert`; `replace_all` → `u64` |
 //! | [`PendingAuthDetailRepository`] | `pending_auth_details` | `find_by_id(PicS<11>, PicS<5>, PicS<9>)`; `page_after(PicS<11>, PicS<5>, PicS<9>, limit)`; `find_all_by_acct_id(PicS<11>)`; `insert(PicS<11>, record)`; `update(PicS<11>, record)` → `bool`; `delete(PicS<11>, PicS<5>, PicS<9>)` → `bool` |
-//! | [`PendingAuthSummaryRepository`] | `pending_auth_summaries` | `find_by_id(PicS<11>)`; `lock_or_create(template)` → locked record and whether this call created it; `find_all`; `insert`; `update` → `bool`; `delete(PicS<11>)` → `bool`, its details deleted with it |
+//! | [`PendingAuthSummaryRepository`] | `pending_auth_summaries` | `find_by_id(PicS<11>)`; `lock_or_create(template)` → locked record and whether this call created it; `lock_next(Option<PicS<11>>)` → the next record in key order, locked; `find_all`; `insert`; `update` → `bool`; `delete(PicS<11>)` → `bool`, its details deleted with it |
 //! | [`TranCatBalanceRepository`] | `tran_cat_balances` | `find_by_id(PicU<11>, &PicX<2>, PicU<4>)`; `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |
 //! | [`TransactionCategoryRepository`] | `transaction_categories` | `find_by_id(&PicX<2>, PicU<4>)`; `find_all`; `insert`; `replace_all` → `u64` |
 //! | [`TransactionTypeRepository`] | `transaction_types` | `find_by_id(&PicX<2>)`; `find_all`; `insert`; `replace_all` → `u64` |

@@ -12,8 +12,14 @@
 //!    connection, no table touched and a non-zero exit (CBPAUP0C-002). [`run`] receives the
 //!    parameters it accepted and reads today's `YYDDD` once from the injected clock
 //!    (CBPAUP0C-001).
-//! 2. A transaction is opened and every summary is read in ascending `acct_id`, the root-key
-//!    order of the unqualified `GN` (CBPAUP0C-009).
+//! 2. A transaction is opened and the summaries are read one at a time in ascending `acct_id`,
+//!    the root-key order of the unqualified `GN` (CBPAUP0C-009): each is read, with a row lock,
+//!    only when the previous one has been processed, as the one after the last `acct_id`
+//!    processed, and the read that finds none ends the loop. As `GN` under IMS program isolation
+//!    holds the root it read until the sync point, the lock holds until the interval's
+//!    checkpoint commit: a CP00 decision for an account the purge has read waits for that
+//!    commit, and the purge waits for a decision that holds the next summary, then reads it as
+//!    committed, so the delete test always starts from the stored count CP00 last committed.
 //! 3. Each summary's details are read in ascending (`auth_date_9c`, `auth_time_9c`) order, the
 //!    twin order of `GNP` (CBPAUP0C-010). A detail the domain qualifies is deleted by its key in
 //!    the open transaction (CBPAUP0C-011, CBPAUP0C-012, CBPAUP0C-015). After the last detail the
@@ -192,22 +198,28 @@ impl Stopped {
 }
 
 /// `MAIN-PARA` from the first summary read to the final checkpoint (CBPAUP0C-009 to
-/// CBPAUP0C-019). Every summary is read once, at the start, in root-key order; after an in-loop
-/// checkpoint the run goes on with the summary after the last one processed, which is not claimed
-/// as parity (X-CBPAUP0J-H5).
+/// CBPAUP0C-019). Each summary is read, and locked, only when the previous one has been
+/// processed: the one after the last `acct_id` processed, in root-key order, until the read finds
+/// none, the `GB` that ends the loop. After an in-loop checkpoint the run goes on with the summary
+/// after the last one processed, which is not claimed as parity (X-CBPAUP0J-H5).
 async fn purge_all(ctx: &JobContext<'_>, purge: &mut Purge) -> Result<(), Stopped> {
     let Some(mut tx) = begin(ctx).await else {
         return Err(Stopped::closed(Stop::Failed(PurgeFailure::SummaryRead)));
     };
-    let Some(summaries) = read_summaries(&mut tx).await else {
-        let stop = Stop::Failed(PurgeFailure::SummaryRead);
-        return Err(Stopped::in_interval(stop, tx).await);
-    };
-    for summary in &summaries {
-        let action = match purge_summary(&mut tx, purge, summary).await {
+    let mut after = None;
+    loop {
+        let Some(read) = read_next_summary(&mut tx, after).await else {
+            let stop = Stop::Failed(PurgeFailure::SummaryRead);
+            return Err(Stopped::in_interval(stop, tx).await);
+        };
+        let Some(summary) = read else {
+            break;
+        };
+        let action = match purge_summary(&mut tx, purge, &summary).await {
             Ok(action) => action,
             Err(stop) => return Err(Stopped::in_interval(stop, tx).await),
         };
+        after = Some(summary.acct_id);
         if action.checkpoint == CheckpointAction::Take {
             commit(tx, PurgeFailure::Checkpoint).await?;
             purge.checkpoint_taken();
@@ -284,11 +296,19 @@ async fn commit(tx: PgTx<'_>, failure: PurgeFailure) -> Result<(), Stopped> {
     })
 }
 
-/// Every summary in ascending `acct_id`, read in a savepoint of `tx` (CBPAUP0C-009); `None` when
-/// the read fails (CBPAUP0C-023).
-async fn read_summaries(tx: &mut PgTx<'_>) -> Option<Vec<PendingAuthSummaryRecord>> {
+/// The summary after account `after` in ascending `acct_id`, or the first when `after` is
+/// `None`, read and locked in a savepoint of `tx` when the purge reaches it, as the unqualified
+/// `GN` reads the next root (CBPAUP0C-009). A summary CP00 holds is waited for and read as CP00
+/// committed it. The released savepoint leaves the lock with `tx`, so it holds until the
+/// interval's checkpoint commit, as IMS program isolation holds a root until the sync point.
+/// `Some(None)` is the end of the database, IMS `GB`; `None` when the read fails
+/// (CBPAUP0C-023).
+async fn read_next_summary(
+    tx: &mut PgTx<'_>,
+    after: Option<PicS<11>>,
+) -> Option<Option<PendingAuthSummaryRecord>> {
     let mut point = savepoint(tx, GN_SUMMARY).await?;
-    let result = PendingAuthSummaryRepository::find_all(&mut point).await;
+    let result = PendingAuthSummaryRepository::lock_next(&mut point, after).await;
     settle(point, result, GN_SUMMARY).await
 }
 
@@ -492,12 +512,198 @@ const fn halted_reason(halt: PurgeHalt, committed: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use domain::batch::cbpaup0c::{PurgeHalt, SysinError};
+    use std::error::Error;
+    use std::pin::pin;
+    use std::time::Duration;
+
+    use chrono::NaiveDate;
+    use copybook::{Count, PicS, PicU, PicX};
+    use domain::batch::cbpaup0c::{Purge, PurgeHalt, PurgeParams, SysinError};
+    use domain::clock::FixedClock;
+    use domain::money::{Decimal, Money};
+    use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
+    use domain::sensitive::CardNumber;
+    use persistence::{PendingAuthDetailRepository, PendingAuthSummaryRepository, PgStore, PgTx};
+    use runtime::config::Config;
+    use tokio::time;
 
     use super::{
-        ABENDING, ABENDING_UNCOMMITTED, DLET_DETAIL, JobError, deleted, halted_reason,
+        ABENDING, ABENDING_UNCOMMITTED, DLET_DETAIL, JobError, deleted, halted_reason, run,
         sysin_refused,
     };
+    use crate::jobs::JobContext;
+
+    type TestResult = Result<(), Box<dyn Error>>;
+
+    /// How long the run is watched before the test treats it as waiting for a row lock.
+    const LOCK_WAIT: Duration = Duration::from_millis(500);
+
+    /// The run's SYSIN: details expire after one day, the default frequencies, debug off.
+    const SYSIN: &[u8] = b"01,00001,00001,N";
+
+    /// The account below the decided one, whose summary the purge reads and deletes first.
+    const PURGED: i64 = 7;
+
+    /// The account CP00 approves while the purge runs.
+    const DECIDED: i64 = 49;
+
+    /// Noon of 2022-07-18, the run's today.
+    fn clock() -> Result<FixedClock, Box<dyn Error>> {
+        let at = NaiveDate::from_ymd_opt(2022, 7, 18)
+            .and_then(|day| day.and_hms_opt(12, 0, 0))
+            .ok_or("2022-07-18 12:00:00 is a valid instant")?;
+        Ok(FixedClock::new(at))
+    }
+
+    /// The summary of account `acct` as CP00 creates it (COPAUA0C-092), with `declined`
+    /// declines totalling `declined_cents` hundredths and no approval.
+    fn summary(
+        acct: i64,
+        declined: i16,
+        declined_cents: i64,
+    ) -> Result<PendingAuthSummaryRecord, Box<dyn Error>> {
+        let mut record = PendingAuthSummaryRecord::initialized(PicS::new(acct)?, PicU::new(50)?);
+        record.declined_auth_cnt = Count::new(declined);
+        record.declined_auth_amt = Money::new(Decimal::new(declined_cents, 2))?;
+        Ok(record)
+    }
+
+    /// A detail of day `yyddd` at `hhmmssmmm` for `cents` hundredths, keyed as CP00 keys it
+    /// (COPAUA0C-098): an approval `00`, or a decline `05`/`4100` with no approved amount. The
+    /// card number is blank, as the purge never reads it.
+    fn detail(
+        yyddd: u32,
+        hhmmssmmm: u64,
+        approved: bool,
+        cents: i64,
+    ) -> Result<PendingAuthDetailRecord, Box<dyn Error>> {
+        let amount = Money::new(Decimal::new(cents, 2))?;
+        let (resp_code, resp_reason, approved_amt) = if approved {
+            (*b"00", *b"0000", amount)
+        } else {
+            (*b"05", *b"4100", Money::ZERO)
+        };
+        Ok(PendingAuthDetailRecord {
+            auth_date_9c: PicS::complement_from(u64::from(yyddd))?,
+            auth_time_9c: PicS::complement_from(hhmmssmmm)?,
+            orig_date: PicX::from_array(*b"220718"),
+            orig_time: PicX::spaces(),
+            card_num: CardNumber::new(PicX::spaces()),
+            auth_type: PicX::spaces(),
+            card_expiry_date: PicX::spaces(),
+            message_type: PicX::spaces(),
+            message_source: PicX::spaces(),
+            auth_id_code: PicX::spaces(),
+            auth_resp_code: PicX::from_array(resp_code),
+            auth_resp_reason: PicX::from_array(resp_reason),
+            processing_code: PicU::new(0)?,
+            transaction_amt: amount,
+            approved_amt,
+            merchant_catagory_code: PicX::spaces(),
+            acqr_country_code: PicX::spaces(),
+            pos_entry_mode: PicU::new(0)?,
+            merchant_id: PicX::spaces(),
+            merchant_name: PicX::spaces(),
+            merchant_city: PicX::spaces(),
+            merchant_state: PicX::spaces(),
+            merchant_zip: PicX::spaces(),
+            transaction_id: PicX::spaces(),
+            match_status: PicX::from_array(*b"P"),
+            auth_fraud: PicX::spaces(),
+            fraud_rpt_date: PicX::spaces(),
+            filler: PicX::spaces(),
+        })
+    }
+
+    /// Seeds `PURGED`, with no approval and no detail, and `DECIDED` as CP00 left it after a
+    /// `05`/`4100` reply of today: declined only, with that decline's detail. Returns
+    /// `DECIDED`'s summary and detail.
+    async fn seed(
+        store: &PgStore,
+        today: u32,
+    ) -> Result<(PendingAuthSummaryRecord, PendingAuthDetailRecord), Box<dyn Error>> {
+        let mut store = store.clone();
+        PendingAuthSummaryRepository::insert(&mut store, &summary(PURGED, 0, 0)?).await?;
+        let declined = summary(DECIDED, 1, 9_999_900)?;
+        PendingAuthSummaryRepository::insert(&mut store, &declined).await?;
+        let decline = detail(today, 120_000_000, false, 9_999_900)?;
+        PendingAuthDetailRepository::insert(&mut store, declined.acct_id, &decline).await?;
+        Ok((declined, decline))
+    }
+
+    /// CP00's approval of 1.00 a minute after the decline, on `cp00`, which holds the lock of
+    /// `locked`: the summary write, then the detail insert (COPAUA0C-097). Returns what it
+    /// wrote.
+    async fn approve(
+        cp00: &mut PgTx<'_>,
+        locked: &PendingAuthSummaryRecord,
+        today: u32,
+    ) -> Result<(PendingAuthSummaryRecord, PendingAuthDetailRecord), Box<dyn Error>> {
+        let mut approved = locked.clone();
+        approved.approved_auth_cnt = Count::new(1);
+        approved.approved_auth_amt = Money::new(Decimal::new(100, 2))?;
+        approved.credit_balance = Money::new(Decimal::new(100, 2))?;
+        assert!(PendingAuthSummaryRepository::update(&mut *cp00, &approved).await?);
+        let approval = detail(today, 120_100_000, true, 100)?;
+        PendingAuthDetailRepository::insert(&mut *cp00, approved.acct_id, &approval).await?;
+        Ok((approved, approval))
+    }
+
+    /// The purge reads each summary when it reaches it and locks it, so an approval CP00
+    /// commits while the purge waits for that summary is in the count its delete test uses:
+    /// the summary was declined only when the run started and is kept, column for column as
+    /// CP00 committed it and with both of today's details, while the summary read before it is
+    /// deleted. A copy of every summary read at the start would have deleted it.
+    // audit: CBPAUP0C-009
+    // audit: CBPAUP0C-016
+    // audit: CBPAUP0C-017
+    #[tokio::test]
+    async fn an_approval_committed_while_the_purge_waits_keeps_its_summary() -> TestResult {
+        let guard = test_support::postgres::start_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let config = Config::from_lookup(|_| None)?;
+        let clock = clock()?;
+        let ctx = JobContext {
+            store: &store,
+            config: &config,
+            clock: &clock,
+        };
+        let params = PurgeParams::parse(SYSIN)?;
+        let today = Purge::new(params.clone(), &clock).today();
+        let (declined, decline) = seed(&store, today).await?;
+
+        let mut cp00 = store.begin().await?;
+        let (locked, created) = cp00.lock_or_create(&declined).await?;
+        assert_eq!((&locked, created), (&declined, false));
+        let mut purge = pin!(run(&ctx, params));
+        assert!(
+            time::timeout(LOCK_WAIT, &mut purge).await.is_err(),
+            "the purge waits for the decision that holds the summary"
+        );
+        let (approved, approval) = approve(&mut cp00, &locked, today).await?;
+        cp00.commit().await?;
+        let outcome = purge.await?;
+
+        assert_eq!(outcome.return_code, 0);
+        assert_eq!(
+            outcome.counts,
+            [
+                ("summaries_read", 2),
+                ("summaries_deleted", 1),
+                ("details_read", 2),
+                ("details_deleted", 0),
+                ("checkpoints", 1),
+            ]
+        );
+        let mut reader = store.clone();
+        let kept = PendingAuthSummaryRepository::find_by_id(&mut reader, approved.acct_id).await?;
+        assert_eq!(kept, Some(approved.clone()));
+        let purged = PendingAuthSummaryRepository::find_by_id(&mut reader, PicS::new(PURGED)?);
+        assert_eq!(purged.await?, None);
+        let details = reader.find_all_by_acct_id(approved.acct_id).await?;
+        assert_eq!(details, [approval, decline]);
+        Ok(())
+    }
 
     /// A refused SYSIN record ends the job without a return code, so the exit is non-zero, and
     /// its text shows neither the record nor the length or offset the domain error carries

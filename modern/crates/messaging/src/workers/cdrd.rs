@@ -16,7 +16,8 @@
 //! `CODATE01` copies the request into `REQUEST-MSG-COPY` and never reads it again, so the reply
 //! does not depend on it (CODATE01-001). The worker does not decode, inspect or log the body: the
 //! only request data it touches are the `message_id` and `correlation_id` the reply copies
-//! (CODATE01-010) and the span records, and the delivery tag that settles it. No byte of the body
+//! (CODATE01-010) and the span records, the redelivery flag and body length the settlement event
+//! records, and the delivery tag that settles it. No byte of the body
 //! reaches a reply, an error message, an event or a span (CODATE01-009; Cardholder Data
 //! Redaction). The request's `reply_to` is ignored: the reply always goes to
 //! `domain::messaging::codate01::REPLY_QUEUE` (CODATE01-002).
@@ -55,7 +56,6 @@ use domain::Clock;
 use domain::messaging::codate01;
 use lapin::Connection;
 use runtime::config::Config;
-use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
@@ -148,7 +148,10 @@ impl<A: Acknowledger> Step for Worker<A> {
     /// one clock reading, published to `CARD.DEMO.REPLY.DATE` with the request's IDs and then
     /// acknowledged, or the `MQPUT ERR` body routed to `CARD.DEMO.ERROR` when the reply is not
     /// confirmed (CODATE01-001, CODATE01-002, CODATE01-010 to CODATE01-012, CODATE01-014,
-    /// CODATE01-018, CODATE01-019). The body is never read.
+    /// CODATE01-018, CODATE01-019). The body is never read. `super::in_message_span` opens the
+    /// span and records a settled request there with one `INFO` event of its outcome, its
+    /// redelivery flag and its body length, never a body byte or an ID; a requeued request gets
+    /// none.
     async fn process_next(&mut self, connection: &Connection) -> Result<Processed, StepError> {
         let Self {
             channels,
@@ -158,12 +161,10 @@ impl<A: Acknowledger> Step for Worker<A> {
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
-        let span = super::message_span(request_queue, &request);
-        let processed = async {
+        let processed = super::in_message_span(request_queue, &request, async {
             let body = codate01::reply_body(clock.as_ref());
             super::reply_fixed(channels, connection, &request, Flow::Cdrd, &body).await
-        }
-        .instrument(span)
+        })
         .await;
         Ok(processed)
     }

@@ -9,7 +9,8 @@
 //! | `find_by_id` | `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)`: COPAUS0C `GET-AUTH-SUMMARY` (`COPAUS0C.cbl:966-998`) and COPAUS1C `READ-AUTH-RECORD` (`COPAUS1C.cbl:436-443`); `None` is IMS `GE` | COPAUS0C-027, COPAUS0C-029, COPAUS0C-030, COPAUS1C-008 |
 //! | `lock_or_create` | COPAUA0C `5500-READ-AUTH-SUMMRY` (`COPAUA0C.cbl:616-643`), with the `INITIALIZE … REPLACING NUMERIC DATA BY ZERO` summary of `8400-UPDATE-SUMMARY` for an account that has none (`COPAUA0C.cbl:801-806`) | COPAUA0C-025, COPAUA0C-026, COPAUA0C-092, COPAUA0C-125 |
 //! | `update` | `8400-UPDATE-SUMMARY` `REPL` of a found summary or `ISRT` of a new one (`COPAUA0C.cbl:824-847`) | COPAUA0C-097, COPAUA0C-119 |
-//! | `find_all` | CBPAUP0C `2000-FIND-NEXT-AUTH-SUMMARY`, the unqualified `GN` in root-key order (`CBPAUP0C.cbl:223-245`) | CBPAUP0C-009 |
+//! | `lock_next` | CBPAUP0C `2000-FIND-NEXT-AUTH-SUMMARY`, the unqualified `GN` that reads the next root in root-key order when the purge processes it (`CBPAUP0C.cbl:216-245`); `None` is IMS `GB` | CBPAUP0C-009, CBPAUP0C-023 |
+//! | `find_all` | none: every summary at once in root-key order, for callers that inspect the whole table, such as tests; the purge reads with `lock_next` | — |
 //! | `delete` | CBPAUP0C `6000-DELETE-AUTH-SUMMARY` `DLET`, which removes the dependent details with the root (`CBPAUP0C.cbl:328-350`) | CBPAUP0C-016, CBPAUP0C-026 |
 //! | `insert` | none: a whole summary written at once, for callers that seed one | — |
 //!
@@ -38,6 +39,15 @@
 //! - A row that a concurrent purge deletes after the insert saw it, and before the lock is
 //!   granted, is not returned by the locking read. The insert and the read then run once more,
 //!   and a second miss is [`PersistenceError::NotFound`].
+//!
+//! # The purge's read (CBPAUP0C-009)
+//!
+//! `lock_next` reads, with `FOR UPDATE`, the summary after the last one the purge processed, as
+//! the purge's `GN` reads each root when it reaches it and IMS program isolation holds that root
+//! against other updaters until the purge's next sync point. On the purge's [`PgTx`] the lock
+//! holds until the checkpoint commit, so a CP00 decision for an account the purge has read waits
+//! for that commit, and the purge's delete test sees the count CP00 last committed, never a copy
+//! taken earlier in the run.
 //!
 //! # Statements and redaction
 //!
@@ -103,13 +113,39 @@ pub trait PendingAuthSummaryRepository: Send {
         template: &PendingAuthSummaryRecord,
     ) -> impl Future<Output = Result<(PendingAuthSummaryRecord, bool), PersistenceError>> + Send;
 
-    /// Every summary in ascending `acct_id`, the root-key order of CBPAUP0C's unqualified `GN`
-    /// (CBPAUP0C-009). The read is unbounded and serves the batch purge only.
+    /// The summary with the lowest `acct_id` above `after`, or the lowest of all when `after` is
+    /// `None`, read and locked with `SELECT … ORDER BY acct_id LIMIT 1 FOR UPDATE`: CBPAUP0C's
+    /// unqualified `GN`, which returns the next root in root-key order when the purge reaches it
+    /// (CBPAUP0C-009). `None` is the end of the database, IMS `GB`.
+    ///
+    /// The primary-key index serves both forms. Under `READ COMMITTED`, a row another
+    /// transaction has locked, such as CP00's [`Self::lock_or_create`], is waited for and read
+    /// again once that transaction ends, so the record returned holds what it committed; a row it
+    /// deleted is skipped and the next one returned. On a [`PgTx`] the lock holds until that
+    /// transaction commits or rolls back, as IMS program isolation holds a root read by `GN`
+    /// until the sync point; on a [`PgStore`] the read runs on a pooled connection in autocommit
+    /// mode, so the lock ends with the call.
     ///
     /// # Errors
     ///
-    /// [`PersistenceError::Unavailable`] and [`PersistenceError::Database`] for a failed read
-    /// (CBPAUP0C-023); [`PersistenceError::Decode`] when a stored row does not fit its pictures.
+    /// [`PersistenceError::Unavailable`] and [`PersistenceError::Database`] for a failed read or
+    /// lock wait, such as a deadlock (`40P01`), CBPAUP0C's `AUTH SUMMARY READ FAILED` case
+    /// (CBPAUP0C-023); [`PersistenceError::Decode`] when the stored row does not fit its
+    /// pictures. A failed statement aborts a [`PgTx`].
+    fn lock_next(
+        &mut self,
+        after: Option<PicS<11>>,
+    ) -> impl Future<Output = Result<Option<PendingAuthSummaryRecord>, PersistenceError>> + Send;
+
+    /// Every summary in ascending `acct_id`, the root-key order of CBPAUP0C's unqualified `GN`,
+    /// read at once and without a lock. The read is unbounded and serves callers that inspect the
+    /// whole table, such as tests; the purge reads one summary at a time with
+    /// [`Self::lock_next`] instead (CBPAUP0C-009).
+    ///
+    /// # Errors
+    ///
+    /// [`PersistenceError::Unavailable`] and [`PersistenceError::Database`] for a failed read;
+    /// [`PersistenceError::Decode`] when a stored row does not fit its pictures.
     fn find_all(
         &mut self,
     ) -> impl Future<Output = Result<Vec<PendingAuthSummaryRecord>, PersistenceError>> + Send;
@@ -187,6 +223,20 @@ impl PendingAuthSummaryRepository for PgStore {
         }
     }
 
+    /// Runs the locking read on a pooled connection in autocommit mode: it still waits for a
+    /// row another transaction holds, but its own lock is released before the call returns.
+    fn lock_next(
+        &mut self,
+        after: Option<PicS<11>>,
+    ) -> impl Future<Output = Result<Option<PendingAuthSummaryRecord>, PersistenceError>> + Send
+    {
+        let pool = self.pool().clone();
+        async move {
+            let mut conn = pool.acquire().await?;
+            lock_next_in(&mut conn, after).await
+        }
+    }
+
     fn find_all(
         &mut self,
     ) -> impl Future<Output = Result<Vec<PendingAuthSummaryRecord>, PersistenceError>> + Send {
@@ -250,6 +300,17 @@ impl PendingAuthSummaryRepository for PgTx<'_> {
         lock_or_create_in(self.conn(), template)
     }
 
+    /// Runs the locking read inside this transaction: the row lock holds until
+    /// [`PgTx::commit`] or [`PgTx::rollback`], also when the read ran in a
+    /// [`PgTx::savepoint`] that was then released.
+    fn lock_next(
+        &mut self,
+        after: Option<PicS<11>>,
+    ) -> impl Future<Output = Result<Option<PendingAuthSummaryRecord>, PersistenceError>> + Send
+    {
+        lock_next_in(self.conn(), after)
+    }
+
     fn find_all(
         &mut self,
     ) -> impl Future<Output = Result<Vec<PendingAuthSummaryRecord>, PersistenceError>> + Send {
@@ -305,6 +366,19 @@ async fn lock_or_create_in(
         }
     }
     Err(PersistenceError::NotFound)
+}
+
+/// `lock_next` on `conn`: the first row above `after`, or the first of all, locked and decoded
+/// through codec B.
+async fn lock_next_in(
+    conn: &mut PgConnection,
+    after: Option<PicS<11>>,
+) -> Result<Option<PendingAuthSummaryRecord>, PersistenceError> {
+    let row = match after {
+        None => select_first_for_update(conn).await?,
+        Some(key) => select_next_for_update(conn, pic_s_to_i64(key)).await?,
+    };
+    row.map(PendingAuthSummaryRow::into_record).transpose()
 }
 
 /// `find_all` on `conn`: every row in key order, decoded through codec B.
@@ -372,6 +446,45 @@ async fn select_for_update(
          approved_auth_amt, declined_auth_amt, filler \
          FROM pending_auth_summaries WHERE acct_id = $1 FOR UPDATE",
         acct_id
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
+/// `SELECT … FOR UPDATE` of the row with the lowest key: waits for any transaction that holds
+/// its lock, skips it when that transaction deleted it, then locks the row returned until this
+/// transaction ends.
+async fn select_first_for_update(
+    conn: &mut PgConnection,
+) -> Result<Option<PendingAuthSummaryRow>, PersistenceError> {
+    let row = sqlx::query_as!(
+        PendingAuthSummaryRow,
+        "SELECT acct_id, cust_id, auth_status, account_status_1, account_status_2, \
+         account_status_3, account_status_4, account_status_5, credit_limit, cash_limit, \
+         credit_balance, cash_balance, approved_auth_cnt, declined_auth_cnt, \
+         approved_auth_amt, declined_auth_amt, filler \
+         FROM pending_auth_summaries ORDER BY acct_id LIMIT 1 FOR UPDATE"
+    )
+    .fetch_optional(conn)
+    .await?;
+    Ok(row)
+}
+
+/// `SELECT … FOR UPDATE` of the row with the lowest key above `after`, waiting and skipping as
+/// [`select_first_for_update`] does.
+async fn select_next_for_update(
+    conn: &mut PgConnection,
+    after: i64,
+) -> Result<Option<PendingAuthSummaryRow>, PersistenceError> {
+    let row = sqlx::query_as!(
+        PendingAuthSummaryRow,
+        "SELECT acct_id, cust_id, auth_status, account_status_1, account_status_2, \
+         account_status_3, account_status_4, account_status_5, credit_limit, cash_limit, \
+         credit_balance, cash_balance, approved_auth_cnt, declined_auth_cnt, \
+         approved_auth_amt, declined_auth_amt, filler \
+         FROM pending_auth_summaries WHERE acct_id > $1 ORDER BY acct_id LIMIT 1 FOR UPDATE",
+        after
     )
     .fetch_optional(conn)
     .await?;
@@ -537,6 +650,9 @@ mod tests {
     /// What a `lock_or_create` running in a task of its own returns.
     type Locked = Result<(PendingAuthSummaryRecord, bool), PersistenceError>;
 
+    /// What a `lock_next` running in a task of its own returns.
+    type Next = Result<Option<PendingAuthSummaryRecord>, PersistenceError>;
+
     /// How long a call that must wait for a row lock is watched before the test treats it as
     /// waiting.
     const LOCK_WAIT: Duration = Duration::from_millis(500);
@@ -600,6 +716,31 @@ mod tests {
             tx.commit().await?;
             Ok(locked)
         })
+    }
+
+    /// Runs `lock_next(after)` in a transaction of its own on a spawned task, the way the purge
+    /// reads its next summary beside CP00, and commits it.
+    fn next_elsewhere(store: &PgStore, after: Option<PicS<11>>) -> JoinHandle<Next> {
+        let begin = store.begin();
+        tokio::spawn(async move {
+            let mut tx = begin.await?;
+            let next = tx.lock_next(after).await?;
+            tx.commit().await?;
+            Ok(next)
+        })
+    }
+
+    /// The keys `lock_next` returns on `repo`, one call at a time from no key to `None`.
+    async fn walk(
+        repo: &mut impl PendingAuthSummaryRepository,
+    ) -> Result<Vec<i64>, PersistenceError> {
+        let mut keys = Vec::new();
+        let mut after = None;
+        while let Some(summary) = repo.lock_next(after).await? {
+            keys.push(summary.acct_id.get());
+            after = Some(summary.acct_id);
+        }
+        Ok(keys)
     }
 
     /// Inserts one detail under the summary of `acct_id`: blank texts, zero numbers.
@@ -709,12 +850,70 @@ mod tests {
         Ok(())
     }
 
+    /// The purge's read returns the summaries one at a time in key order, then `None`. It waits
+    /// for a decision that holds the next row's lock and returns what that decision committed,
+    /// skips a row the lock holder deleted, and on a transaction holds its own lock, through a
+    /// released savepoint, until the commit.
+    // audit: CBPAUP0C-009
+    #[tokio::test]
+    async fn lock_next_reads_each_summary_as_last_committed_in_key_order() -> TestResult {
+        let guard = test_support::postgres::start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        assert_eq!(store.lock_next(None).await?, None);
+        for acct in [30, 10, 20] {
+            store.insert(&template(acct, 1)?).await?;
+        }
+        assert_eq!(walk(&mut store).await?, [10, 20, 30]);
+        let between = Some(PicS::new(15)?);
+        assert_eq!(store.lock_next(between).await?, Some(template(20, 1)?));
+        let mut tx = store.begin().await?;
+        assert_eq!(walk(&mut tx).await?, [10, 20, 30]);
+        tx.rollback().await?;
+
+        let after_first = Some(PicS::new(10)?);
+        let mut cp00 = store.begin().await?;
+        let (row, created) = cp00.lock_or_create(&template(20, 1)?).await?;
+        assert!(!created);
+        let mut next = next_elsewhere(&store, after_first);
+        assert!(
+            time::timeout(LOCK_WAIT, &mut next).await.is_err(),
+            "the read waits for the decision that holds the row"
+        );
+        let written = charged(&row)?;
+        assert!(cp00.update(&written).await?);
+        cp00.commit().await?;
+        assert_eq!(next.await??, Some(written));
+
+        let mut holder = store.begin().await?;
+        assert!(!holder.lock_or_create(&template(20, 1)?).await?.1);
+        let mut skipping = next_elsewhere(&store, after_first);
+        assert!(
+            time::timeout(LOCK_WAIT, &mut skipping).await.is_err(),
+            "the read waits for the transaction that deletes the row"
+        );
+        assert!(holder.delete(PicS::new(20)?).await?);
+        holder.commit().await?;
+        assert_eq!(skipping.await??, Some(template(30, 1)?));
+
+        let mut purge = store.begin().await?;
+        let mut point = purge.savepoint().await?;
+        assert_eq!(point.lock_next(None).await?, Some(template(10, 1)?));
+        point.commit().await?;
+        let mut decision = lock_elsewhere(&store, &template(10, 1)?);
+        assert!(
+            time::timeout(LOCK_WAIT, &mut decision).await.is_err(),
+            "a decision waits for the commit of the transaction that read the row"
+        );
+        purge.commit().await?;
+        assert_eq!(decision.await??, (template(10, 1)?, false));
+        Ok(())
+    }
+
     /// Reads, inserts, updates and deletes on both executors, the cascade to the details and
     /// the key order of `find_all`.
     // audit: COPAUS0C-027
     // audit: COPAUS0C-029
     // audit: COPAUA0C-097
-    // audit: CBPAUP0C-009
     // audit: CBPAUP0C-016
     #[tokio::test]
     async fn statements_report_their_outcome_and_deletes_cascade() -> TestResult {

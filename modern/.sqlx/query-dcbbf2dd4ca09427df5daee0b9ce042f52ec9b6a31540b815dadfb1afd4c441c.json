@@ -1,0 +1,118 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT acct_id, cust_id, auth_status, account_status_1, account_status_2, account_status_3, account_status_4, account_status_5, credit_limit, cash_limit, credit_balance, cash_balance, approved_auth_cnt, declined_auth_cnt, approved_auth_amt, declined_auth_amt, filler FROM pending_auth_summaries WHERE acct_id > $1 ORDER BY acct_id LIMIT 1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "cust_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "auth_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "account_status_1",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "account_status_2",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "account_status_3",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "account_status_4",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "account_status_5",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "credit_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 9,
+        "name": "cash_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 10,
+        "name": "credit_balance",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 11,
+        "name": "cash_balance",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 12,
+        "name": "approved_auth_cnt",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 13,
+        "name": "declined_auth_cnt",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 14,
+        "name": "approved_auth_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 15,
+        "name": "declined_auth_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 16,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "dcbbf2dd4ca09427df5daee0b9ce042f52ec9b6a31540b815dadfb1afd4c441c"
+}

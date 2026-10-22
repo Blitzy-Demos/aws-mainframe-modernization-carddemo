@@ -57,8 +57,9 @@
 //!
 //! No CDRA reply or error body holds a card number, an SSN or a password: the account record
 //! has no such field, the not-found and bad-parameter replies mask the key, and a body that
-//! does not decode echoes nothing (COACCT01-035). Spans and events name the queue, the IDs and
-//! the outcome, never a body byte, a key, a balance or an `AccountRecord`.
+//! does not decode echoes nothing (COACCT01-035). Spans and events name the queue, the screened
+//! IDs, the outcome, the redelivery flag and the body length, never a body byte, a key, a
+//! balance or an `AccountRecord`.
 
 use std::fmt;
 
@@ -67,7 +68,6 @@ use domain::messaging::coacct01::{self, AccountLookup, CdraAction, CdraResponse}
 use lapin::Connection;
 use persistence::{AccountRepository, PgStore};
 use runtime::config::Config;
-use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
@@ -165,7 +165,9 @@ impl<A: Acknowledger> Step for Worker<A> {
     /// account-read error body published to `CARD.DEMO.ERROR` and then acknowledged
     /// (COACCT01-001, COACCT01-023 to COACCT01-026, COACCT01-028, COACCT01-032). An unconfirmed
     /// reply routes `MQPUT ERR` to `CARD.DEMO.ERROR`, and an unconfirmed error message discards
-    /// the request (COACCT01-033, COACCT01-034).
+    /// the request (COACCT01-033, COACCT01-034). `super::in_message_span` opens the span and
+    /// records a settled request there with one `INFO` event of its outcome, its redelivery flag
+    /// and its body length, never a body byte or an ID; a requeued request gets none.
     async fn process_next(&mut self, connection: &Connection) -> Result<Processed, StepError> {
         let Self {
             channels,
@@ -175,8 +177,7 @@ impl<A: Acknowledger> Step for Worker<A> {
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
-        let span = super::message_span(request_queue, &request);
-        let processed = async {
+        let processed = super::in_message_span(request_queue, &request, async {
             match answer(store, request_queue, &request.body).await {
                 CdraResponse::Reply(body) => {
                     super::reply_fixed(channels, connection, &request, Flow::Cdra, &body).await
@@ -185,8 +186,7 @@ impl<A: Acknowledger> Step for Worker<A> {
                     super::route_error(channels, connection, &request, Flow::Cdra, &body).await
                 }
             }
-        }
-        .instrument(span)
+        })
         .await;
         Ok(processed)
     }

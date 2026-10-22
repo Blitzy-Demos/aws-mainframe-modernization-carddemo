@@ -4,8 +4,8 @@
 //! This module owns what the three would otherwise repeat: the [`Step`] trait each worker
 //! implements, the poll loop [`drive`] that runs one worker until a stop or a lost connection, and
 //! the crate-internal plumbing every flow uses, the check of the configured request queue name,
-//! the worker's channel pair, its span and the put path of the two fixed-queue flows. Each child
-//! module owns only its own flow.
+//! the worker's channel pair, the request span with its settlement event and the put path of the
+//! two fixed-queue flows. Each child module owns only its own flow.
 //!
 //! # Layering
 //!
@@ -30,16 +30,23 @@
 //!
 //! A request is acknowledged only after the publication it causes is confirmed (CODATE01-012,
 //! COACCT01-026, COPAUA0C-081, COPAUA0C-082). Every [`Step::process_next`] ends in one
-//! [`Processed`] outcome:
+//! [`Processed`] outcome, and every request it takes leaves one settlement event in the JSON log,
+//! besides any warning or error on its path:
 //!
-//! | Outcome | Publication | Settlement of the request |
-//! |---|---|---|
-//! | [`Processed::Idle`] | none: the queue was empty | none |
-//! | [`Processed::Replied`] | the reply, confirmed | acknowledged |
-//! | [`Processed::ErrorRouted`] | the `CARD.DEMO.ERROR` body, confirmed | acknowledged |
-//! | [`Processed::DeadLettered`] | none confirmed | rejected, moved to the dead-letter queue |
-//! | [`Processed::Discarded`] | none confirmed | rejected, dropped by the broker |
-//! | [`Processed::Requeued`] | any | none: the consumer channel closed, the broker requeues it |
+//! | Outcome | Publication | Settlement of the request | Event |
+//! |---|---|---|---|
+//! | [`Processed::Idle`] | none: the queue was empty | none | none |
+//! | [`Processed::Replied`] | the reply, confirmed | acknowledged | `INFO`, `outcome` `replied` |
+//! | [`Processed::ErrorRouted`] | the `CARD.DEMO.ERROR` body, confirmed | acknowledged | `INFO`, `outcome` `error-routed` |
+//! | [`Processed::DeadLettered`] | none confirmed | rejected, moved to the dead-letter queue | `INFO`, `outcome` `dead-lettered` |
+//! | [`Processed::Discarded`] | none confirmed | rejected, dropped by the broker | `INFO`, `outcome` `discarded` |
+//! | [`Processed::Requeued`] | any | none: the consumer channel closed, the broker requeues it | `WARN`, `outcome` `requeued`, from [`drive`] |
+//!
+//! Each worker runs its processing of a request through `in_message_span`, which opens the
+//! request's `mq.message` span and emits the `INFO` event of a settled request inside it, with
+//! the queue, the outcome, the `redelivered` flag of a request the broker delivered before, and
+//! the body length. A request the broker requeues is taken again later and settles with
+//! `redelivered` true. [`drive`] emits the `WARN` of a requeued request after the span closes.
 //!
 //! # What the workers never do
 //!
@@ -57,7 +64,8 @@
 //! requester chooses both and either can be a card number, an SSN or a password, so the span
 //! records only whether each is present and its length, never its text. Events here name the
 //! queue, the outcome and the [`AmqpError`] or [`PublishFailure`] text, never a body byte or a
-//! record.
+//! record. The settlement event adds only the `redelivered` flag and the body length in bytes,
+//! and repeats neither ID: every line written inside the span already shows both, screened.
 
 use std::error::Error;
 use std::fmt;
@@ -65,7 +73,7 @@ use std::time::Duration;
 
 use lapin::{BasicProperties, Connection};
 use runtime::telemetry;
-use tracing::Span;
+use tracing::Instrument;
 
 use crate::Stop;
 use crate::broker::{
@@ -165,7 +173,10 @@ pub trait Step: Send {
     fn queue(&self) -> &str;
 
     /// Takes the next request from [`Step::queue`], processes it inside its `mq.message` span and
-    /// settles it, returning what was done.
+    /// settles it, returning what was done. A settled request leaves one `INFO` event inside the
+    /// span, with the queue, the outcome, the redelivery flag and the body length, never a body
+    /// byte or an ID; every implementation gets the span and the event from the crate's one
+    /// helper, `in_message_span`.
     ///
     /// # Errors
     ///
@@ -196,9 +207,11 @@ pub trait Step: Send {
 ///   the worker has taken is always finished through its own path, so a CP00 authorization is
 ///   never cut between its acknowledgement and its commit.
 /// - [`Processed::Idle`]: waits `poll_interval` (`CARDDEMO_MQ_POLL_MS`), then polls again.
-/// - Any other processed request resets `backoff`.
-/// - [`Processed::Requeued`] or [`StepError::Channel`]: waits the next `backoff` delay and
-///   reopens the worker's channels, repeating while the connection stays up, then polls again.
+/// - Any other processed request resets `backoff`. A settled one has already left its `INFO`
+///   event inside its span (`in_message_span`), so `drive` adds none.
+/// - [`Processed::Requeued`] or [`StepError::Channel`]: emits a `WARN`, waits the next `backoff`
+///   delay and reopens the worker's channels, repeating while the connection stays up, then
+///   polls again.
 ///
 /// It never returns while the connection is healthy and no stop is requested. Events name the
 /// queue and the outcome, never a body.
@@ -343,18 +356,61 @@ pub(crate) fn check_request_queue(
     }
 }
 
-/// The span of one request taken from `queue`: `runtime::telemetry::message_span` with the
-/// request's `message_id` and `correlation_id` as [`Request::screened_message_id`] and
-/// [`Request::screened_correlation_id`] give them, one `*` per byte, so no field holds the text
-/// of either ID. A worker runs its handling of the request inside it through
-/// `tracing::Instrument::instrument`; no field ever holds the body.
-#[must_use]
-pub(crate) fn message_span(queue: &str, request: &Request) -> Span {
-    telemetry::message_span(
+/// Runs `handling`, a worker's processing of `request` taken from `queue`, inside the request's
+/// `mq.message` span, and records a settled request there with one `INFO` event.
+///
+/// - The span is `runtime::telemetry::message_span` with the request's `message_id` and
+///   `correlation_id` as [`Request::screened_message_id`] and
+///   [`Request::screened_correlation_id`] give them, one `*` per byte, so no field holds the text
+///   of either ID.
+/// - When `handling` returns [`Processed::Replied`], [`Processed::ErrorRouted`],
+///   [`Processed::DeadLettered`] or [`Processed::Discarded`], one `INFO` event inside the span
+///   records `queue`, `outcome` (`replied`, `error-routed`, `dead-lettered` or `discarded`),
+///   `redelivered`, which shows a request the broker delivered before, and `body_len`, the
+///   body's length in bytes. The event repeats neither ID, which the span around it shows
+///   screened.
+/// - [`Processed::Requeued`] adds no event here: [`drive`] warns of it after the span, as it
+///   reopens the channels. [`Processed::Idle`] never reaches it, as no request was taken.
+///
+/// No field of the span or the event holds a body byte or the `reply_to`. The future is `Send`
+/// whenever `handling` is, as [`Step::process_next`] requires.
+pub(crate) async fn in_message_span<F>(queue: &str, request: &Request, handling: F) -> Processed
+where
+    F: Future<Output = Processed>,
+{
+    let span = telemetry::message_span(
         queue,
         request.screened_message_id(),
         request.screened_correlation_id(),
-    )
+    );
+    async {
+        let processed = handling.await;
+        if let Some(outcome) = settled_outcome(processed) {
+            tracing::info!(
+                queue,
+                outcome,
+                redelivered = request.redelivered,
+                body_len = request.body.len(),
+                "the request is settled"
+            );
+        }
+        processed
+    }
+    .instrument(span)
+    .await
+}
+
+/// The `outcome` label of the event [`in_message_span`] emits for a request `processed`
+/// settled, or `None` for [`Processed::Idle`], which took no request, and for
+/// [`Processed::Requeued`], which left the request to the broker.
+fn settled_outcome(processed: Processed) -> Option<&'static str> {
+    match processed {
+        Processed::Replied => Some("replied"),
+        Processed::ErrorRouted => Some("error-routed"),
+        Processed::DeadLettered => Some("dead-lettered"),
+        Processed::Discarded => Some("discarded"),
+        Processed::Idle | Processed::Requeued => None,
+    }
 }
 
 /// The channel pair of one worker: the [`Consumer`] that takes requests and holds their
@@ -659,8 +715,106 @@ async fn acknowledged<A: Acknowledger>(
 
 #[cfg(test)]
 mod tests {
-    use super::{AMQP_QUEUE_NAME_LEN, cdrd, check_request_queue, cp00};
-    use crate::broker::AmqpError;
+    use test_support::trace_capture;
+
+    use super::{AMQP_QUEUE_NAME_LEN, Processed, cdrd, check_request_queue, cp00, in_message_span};
+    use crate::broker::{AmqpError, Request};
+
+    /// The request queue of the settlement cases, the default of `CARDDEMO_QUEUE_REQUEST_PAUTH`.
+    const QUEUE: &str = "CARD.DEMO.REQUEST.PAUTH";
+
+    /// The members of the `fields` object of the JSON line `line`, the event's own fields without
+    /// its span's, or `None` when the line has none. No field value here holds a `}`.
+    fn event_fields(line: &str) -> Option<&str> {
+        let (_, rest) = line.split_once(r#""fields":{"#)?;
+        rest.split_once('}').map(|(fields, _)| fields)
+    }
+
+    #[tokio::test]
+    async fn a_settled_request_leaves_one_info_event_in_its_span_with_no_body_or_id_text() {
+        // A test card number, an SSN and a password, assembled at run time.
+        let card = format!("4111{}", "1".repeat(12));
+        let ssn = ["123-45", "-6789"].concat();
+        let password = ["PASS", "WORD"].concat();
+        let body = format!("220718,102030,{card},{ssn},{password},").into_bytes();
+        let body_len = body.len();
+        let correlation_id = format!("{ssn} {password}");
+        let cases = [
+            (Processed::Replied, Some("replied"), false),
+            (Processed::ErrorRouted, Some("error-routed"), true),
+            (Processed::DeadLettered, Some("dead-lettered"), false),
+            (Processed::Discarded, Some("discarded"), true),
+            (Processed::Requeued, None, true),
+        ];
+        for (processed, outcome, redelivered) in cases {
+            let request = Request {
+                delivery_tag: 5,
+                body: body.clone(),
+                message_id: Some(card.clone()),
+                correlation_id: Some(correlation_id.clone()),
+                reply_to: Some(password.clone()),
+                redelivered,
+            };
+
+            let capture = trace_capture::capture();
+            let returned = in_message_span(QUEUE, &request, async { processed }).await;
+            assert_eq!(returned, processed);
+
+            let lines = capture.lines();
+            let events: Vec<&String> = lines
+                .iter()
+                .filter(|line| line.contains(r#""message":"the request is settled""#))
+                .collect();
+            if let Some(outcome) = outcome {
+                let [event] = events.as_slice() else {
+                    panic!("{outcome}: expected one settlement event, got {lines:?}");
+                };
+                // The span's opening line, the event and the span's closing line.
+                assert_eq!(lines.len(), 3, "{outcome}: {lines:?}");
+                for member in [
+                    r#""level":"INFO""#.to_owned(),
+                    r#""name":"mq.message""#.to_owned(),
+                    format!(r#""message_id":"{}""#, "*".repeat(card.len())),
+                    format!(r#""correlation_id":"{}""#, "*".repeat(correlation_id.len())),
+                ] {
+                    assert!(event.contains(&member), "{member} missing from {event}");
+                }
+                let fields = event_fields(event).unwrap_or_default();
+                for member in [
+                    format!(r#""queue":"{QUEUE}""#),
+                    format!(r#""outcome":"{outcome}""#),
+                    format!(r#""redelivered":{redelivered}"#),
+                    format!(r#""body_len":{body_len}"#),
+                ] {
+                    assert!(fields.contains(&member), "{member} missing from {event}");
+                }
+                for id in ["message_id", "correlation_id", "reply_to"] {
+                    assert!(!fields.contains(id), "{id} among the fields of {event}");
+                }
+            } else {
+                assert!(events.is_empty(), "{processed:?}: {lines:?}");
+                assert!(
+                    !capture.contains(r#""outcome""#),
+                    "{processed:?}: {lines:?}"
+                );
+                // The span's opening and closing lines only.
+                assert_eq!(lines.len(), 2, "{processed:?}: {lines:?}");
+            }
+
+            // The protected values, and the body's fields in the comma-delimited context they
+            // have in the body, so that a timestamp's digits cannot match them.
+            let text = capture.text();
+            for value in [
+                card.as_str(),
+                ssn.as_str(),
+                password.as_str(),
+                "220718,",
+                ",102030,",
+            ] {
+                assert!(!text.contains(value), "{value:?} in {text}");
+            }
+        }
+    }
 
     #[test]
     fn a_cdrd_or_cp00_request_queue_the_amqp_frame_cannot_carry_is_a_startup_refusal() {

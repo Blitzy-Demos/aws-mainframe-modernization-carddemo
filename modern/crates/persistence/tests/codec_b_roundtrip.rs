@@ -11,8 +11,13 @@
 //!   records of `DUSRSECJ.jcl` come back in every field but `SEC-USR-PWD`, which is stored only
 //!   as its argon2id hash (E25).
 //! - `generated_records_round_trip_through_postgres` writes and reads back 64 generated records
-//!   of each of the nine layouts across the whole range of every picture, each inside a
-//!   transaction it then rolls back.
+//!   of each of the nine layouts, each inside a transaction it then rolls back. The field
+//!   generators draw from codec A's domains and weight in every boundary codec A weights, and a
+//!   few more: every `PIC 9(n)` value, and every amount and rate of either sign, with zero and
+//!   the extremes weighted in; every date of the years 0000 to 9999, calendar boundaries and leap
+//!   days weighted in; blank dates and timestamps; timestamps in each of the layouts `I`, `D`
+//!   and `S`, midnight and the last microsecond of the day weighted in; and `PIC X(n)` text,
+//!   all-space values and trailing spaces weighted in.
 //!
 //! Each test runs on a `postgres:16` container of its own from `test_support::postgres`, whose
 //! schema the single schema executor applies; this file issues no SQL. A failure names the file
@@ -1073,8 +1078,10 @@ fn generated_records_round_trip_through_postgres() {
 }
 
 /// Writes and reads back `CASES` generated records of `R`, each inside a transaction that is
-/// then rolled back, so no two cases share a key. A failure names the layout; proptest adds the
-/// minimal failing record, whose `Debug` redacts every protected field.
+/// then rolled back, so no two cases share a key. `strategy` builds each record from the field
+/// generators below, which draw from codec A's domains and weight in its boundaries. A failure
+/// names the layout; proptest adds the minimal failing record, whose `Debug` redacts every
+/// protected field.
 fn generated<R: Stored>(runtime: &Runtime, store: &PgStore, strategy: &impl Strategy<Value = R>) {
     let layout = R::LAYOUT;
     let mut runner = TestRunner::new(Config {
@@ -1111,41 +1118,65 @@ async fn write_and_read<R: Stored>(
 
 /// `PIC X(N)` of printable ASCII, the bytes a `CHAR(N)` column holds (PIC-001, PIC-002).
 ///
-/// A quarter of the bytes or more are spaces, so trailing padding, all-space fields and keys that
-/// end in spaces occur in most cases: `CHAR(n)` treats trailing spaces specially, and a key
-/// parameter compared as `text` instead of `bpchar` finds no row for such a key.
+/// One value in ten is all spaces. Every other value draws its bytes independently, each a space
+/// one time in four and otherwise any of the 95 printable bytes, space included, so a byte is a
+/// space with probability about 0.26. About a third of all values, keys included, therefore end
+/// in a space: `CHAR(n)` treats trailing spaces specially, and a key parameter compared as `text`
+/// instead of `bpchar` finds no row for such a key. The independent draws alone make a value all
+/// spaces only with probability 0.26 to the power `N`, about 0.07 for two bytes and under 0.005
+/// from four bytes up, so the all-space arm is what makes all-space values of wide fields occur.
 ///
 /// The bytes are drawn as a `Vec`, whose value tree lives on the heap: an array of `N` union
 /// value trees, nested in a record's tuples, overflows a test thread's stack in a debug build.
 fn pic_x<const N: usize>() -> impl Strategy<Value = PicX<N>> {
-    proptest::collection::vec(prop_oneof![1 => Just(b' '), 3 => 0x20_u8..=0x7E], N).prop_map(
-        |bytes| {
-            let bytes = <[u8; N]>::try_from(bytes)
-                .unwrap_or_else(|_| panic!("the strategy draws exactly N bytes"));
-            PicX::from_array(bytes)
-        },
-    )
+    let bytes = proptest::collection::vec(prop_oneof![1 => Just(b' '), 3 => 0x20_u8..=0x7E], N);
+    prop_oneof![
+        1 => Just(vec![b' '; N]),
+        9 => bytes,
+    ]
+    .prop_map(|bytes| {
+        let bytes = <[u8; N]>::try_from(bytes)
+            .unwrap_or_else(|_| panic!("the strategy draws exactly N bytes"));
+        PicX::from_array(bytes)
+    })
 }
 
-/// `PIC 9(N)`: every value from 0 to `N` nines (PIC-003).
+/// `PIC 9(N)`: every value from 0 to `N` nines, zero and `N` nines weighted in (PIC-003,
+/// PIC-023).
 fn pic_u<const N: u32>() -> impl Strategy<Value = PicU<N>> {
-    (0..=PicU::<N>::MAX).prop_map(|value| PicU::new(value).expect("a value of at most N nines"))
+    let max = PicU::<N>::MAX;
+    prop_oneof![
+        1 => Just(0),
+        1 => Just(max),
+        8 => 0..=max,
+    ]
+    .prop_map(|value| PicU::new(value).expect("a value of at most N nines"))
 }
 
-/// `PIC S9(N)V99` money: every whole number of cents of at most `N + 2` digits, either sign
+/// A `V99` decimal: every whole number of cents of at most `int_digits + 2` digits, either sign,
+/// zero and both extremes weighted in.
+fn scaled(int_digits: u32) -> impl Strategy<Value = Decimal> {
+    let max = 10_i64.pow(int_digits + 2) - 1;
+    prop_oneof![
+        1 => Just(-max),
+        1 => Just(0),
+        1 => Just(max),
+        7 => -max..=max,
+    ]
+    .prop_map(|cents| Decimal::new(cents, 2))
+}
+
+/// `PIC S9(N)V99` money: every amount the picture holds, zero and both extremes weighted in
 /// (PIC-005).
 fn money<const N: u32>() -> impl Strategy<Value = Money<N>> {
-    let bound = 10_i64.pow(N + 2) - 1;
-    (-bound..=bound).prop_map(|cents| {
-        Money::new(Decimal::new(cents, 2)).expect("cents of at most N + 2 digits fit S9(N)V99")
-    })
+    scaled(N)
+        .prop_map(|value| Money::new(value).expect("cents of at most N + 2 digits fit S9(N)V99"))
 }
 
-/// `DIS-INT-RATE PIC S9(04)V99`: every rate of at most six digits, either sign (PIC-005).
+/// `DIS-INT-RATE PIC S9(04)V99`: every rate of at most six digits, either sign, zero and both
+/// extremes weighted in (PIC-005).
 fn rate() -> impl Strategy<Value = Rate<4>> {
-    (-999_999_i64..=999_999).prop_map(|hundredths| {
-        Rate::new(Decimal::new(hundredths, 2)).expect("six digits fit S9(04)V99")
-    })
+    scaled(4).prop_map(|value| Rate::new(value).expect("six digits fit S9(04)V99"))
 }
 
 /// A card number, 16 ASCII digits.
@@ -1154,35 +1185,79 @@ fn card_number() -> impl Strategy<Value = CardNumber> {
         .prop_map(|digits| CardNumber::new(PicX::from_array(digits)))
 }
 
-/// A calendar day of the years 1900 to 2099; day 28 at most, so every month has it.
-fn calendar_day() -> impl Strategy<Value = NaiveDate> {
-    (1900_i32..=2099, 1_u32..=12, 1_u32..=28).prop_map(|(year, month, day)| {
-        NaiveDate::from_ymd_opt(year, month, day).expect("day 1 to 28 of any month is a date")
-    })
-}
-
-/// A `PIC X(10)` date: blank (`NULL`) or a calendar day (`DATE`) (PIC-015).
-fn date() -> impl Strategy<Value = PicDate> {
+/// A calendar date with a four-digit year, `0000-01-01` to `9999-12-31`: every day of every year,
+/// one draw in five taken from `calendar_boundaries`.
+fn calendar_date() -> impl Strategy<Value = NaiveDate> {
     prop_oneof![
-        Just(PicDate::BLANK),
-        calendar_day().prop_map(|day| PicDate::new(Some(day)).expect("a four-digit year")),
+        1 => proptest::sample::select(calendar_boundaries()),
+        4 => (0_i32..=9999, 1_u32..=366).prop_filter_map("a day of that year", |(year, ordinal)| {
+            NaiveDate::from_yo_opt(year, ordinal)
+        }),
     ]
 }
 
-/// A `PIC X(26)` timestamp: blank (PIC-017), a microsecond instant in layout `I` or `D` (PIC-018,
-/// PIC-019), or a screen date at midnight in layout `S` (PIC-020).
-fn timestamp() -> impl Strategy<Value = PicTimestamp> {
-    let clock = (0_u32..=23, 0_u32..=59, 0_u32..=59, 0_u32..=999_999).prop_map(
-        |(hour, minute, second, micro)| {
-            NaiveTime::from_hms_micro_opt(hour, minute, second, micro).expect("a time of day")
-        },
-    );
-    let form = prop_oneof![Just(TsForm::Iso), Just(TsForm::Db2)];
+/// The calendar boundaries and leap days a `DATE` or `TIMESTAMP(6)` column must keep: the first
+/// and last dates four digits carry, the leap day of year 0 (a proleptic leap year), the last
+/// day of February 1900 (a century year that is no leap year), the leap days of 2000 and 2024,
+/// `2000-01-01`, the epoch the binary wire encoding of `DATE` and `TIMESTAMP(6)` counts from, and
+/// the day before it, where the encoded offset changes sign.
+fn calendar_boundaries() -> Vec<NaiveDate> {
+    [
+        (0, 1, 1),
+        (0, 2, 29),
+        (1900, 2, 28),
+        (1999, 12, 31),
+        (2000, 1, 1),
+        (2000, 2, 29),
+        (2024, 2, 29),
+        (9999, 12, 31),
+    ]
+    .into_iter()
+    .map(|(year, month, day)| {
+        NaiveDate::from_ymd_opt(year, month, day).expect("every calendar boundary is a date")
+    })
+    .collect()
+}
+
+/// A time of day with microsecond precision and no leap second, midnight and the last
+/// microsecond of the day weighted in.
+fn time_of_day() -> impl Strategy<Value = NaiveTime> {
+    let last = NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).expect("a time of day");
     prop_oneof![
-        Just(PicTimestamp::BLANK),
-        (calendar_day(), clock, form)
-            .prop_map(|(day, clock, form)| stamp(day.and_time(clock), form)),
-        calendar_day().prop_map(|day| stamp(day.and_time(NaiveTime::MIN), TsForm::ScreenDate)),
+        1 => Just(NaiveTime::MIN),
+        1 => Just(last),
+        8 => (0_u32..=23, 0_u32..=59, 0_u32..=59, 0_u32..=999_999).prop_map(
+            |(hour, minute, second, micro)| {
+                NaiveTime::from_hms_micro_opt(hour, minute, second, micro).expect("a time of day")
+            },
+        ),
+    ]
+}
+
+/// A `PIC X(10)` date: blank (`NULL`) one time in five, otherwise a calendar date (`DATE`)
+/// (PIC-015).
+fn date() -> impl Strategy<Value = PicDate> {
+    prop_oneof![
+        1 => Just(PicDate::BLANK),
+        4 => calendar_date().prop_map(|day| PicDate::new(Some(day)).expect("a four-digit year")),
+    ]
+}
+
+/// A `PIC X(26)` timestamp: blank one time in five (PIC-017), otherwise a value on a
+/// `calendar_date` in one of the layouts `I`, `D` and `S`, chosen evenly: a microsecond instant
+/// in layout `I` or `D` (PIC-018, PIC-019), or the date at midnight in the screen-date layout
+/// `S`, which carries no other time (PIC-020).
+fn timestamp() -> impl Strategy<Value = PicTimestamp> {
+    let form = proptest::sample::select(vec![TsForm::Iso, TsForm::Db2, TsForm::ScreenDate]);
+    prop_oneof![
+        1 => Just(PicTimestamp::BLANK),
+        4 => (calendar_date(), time_of_day(), form).prop_map(|(day, clock, form)| {
+            let clock = match form {
+                TsForm::ScreenDate => NaiveTime::MIN,
+                TsForm::Iso | TsForm::Db2 => clock,
+            };
+            stamp(day.and_time(clock), form)
+        }),
     ]
 }
 

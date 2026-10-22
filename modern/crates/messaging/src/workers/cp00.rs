@@ -47,7 +47,7 @@
 //! | field error | `05`/`9000` | none | acknowledged (COPAUA0C-012) |
 //! | card not in the cross-reference | interim `05`/`3100` | `A001` | acknowledged (COPAUA0C-021, COPAUA0C-040) |
 //! | card found | the decision | `A002`, `A003` when not found | acknowledged, then written |
-//! | reply not confirmed, or no `reply_to` | none | `M004` | dead-lettered (COPAUA0C-117) |
+//! | reply not confirmed; no `reply_to`, or one naming the Direct Reply-to pseudo-queue, neither published | none | `M004` | dead-lettered (COPAUA0C-117, `X-COPAUA0C-12`) |
 //! | acknowledgement fails | confirmed | none | requeued by the broker, nothing written (COPAUA0C-118) |
 //! | summary update fails | confirmed | `I003` | acknowledged, nothing written (COPAUA0C-119) |
 //! | detail insert fails | confirmed | `I004` | acknowledged, summary committed alone (COPAUA0C-120) |
@@ -93,7 +93,6 @@ use persistence::{
 };
 use runtime::config::Config;
 use runtime::telemetry;
-use tracing::Instrument;
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{self, Acknowledger, AmqpError, Consumer, PublishFailure, QueueCheck, Request};
@@ -427,7 +426,9 @@ impl<S: AuthStore, A: Acknowledger> Step for Worker<S, A> {
 
     /// Takes the next request and processes it inside its `mq.message` span: parse, read,
     /// decide, reply, acknowledge, then write, as the module documentation states
-    /// (COPAUA0C-001, COPAUA0C-080, COPAUA0C-081).
+    /// (COPAUA0C-001, COPAUA0C-080, COPAUA0C-081). `super::in_message_span` opens the span and
+    /// records a settled request there with one `INFO` event of its outcome, its redelivery
+    /// flag and its body length, never a body byte or an ID; a requeued request gets none.
     async fn process_next(&mut self, connection: &Connection) -> Result<Processed, StepError> {
         let Self {
             channels,
@@ -438,7 +439,6 @@ impl<S: AuthStore, A: Acknowledger> Step for Worker<S, A> {
         let Some(request) = channels.next(request_queue).await? else {
             return Ok(Processed::Idle);
         };
-        let span = super::message_span(request_queue, &request);
         let mut message = Message {
             channels,
             connection,
@@ -446,7 +446,7 @@ impl<S: AuthStore, A: Acknowledger> Step for Worker<S, A> {
             clock: clock.as_ref(),
             request: &request,
         };
-        Ok(message.process().instrument(span).await)
+        Ok(super::in_message_span(request_queue, &request, message.process()).await)
     }
 
     async fn reopen(&mut self, connection: &Connection) -> Result<(), AmqpError> {
@@ -472,20 +472,51 @@ enum Unanswered {
     AckFailed(AmqpError),
 }
 
-/// Why a reply was not confirmed.
+/// Why a reply was not confirmed: the `M004` cases of COPAUA0C-117. Only [`Undelivered::Failed`]
+/// follows a publication; the other two are refused before anything is published, so they leave
+/// the publisher channel as it was.
 enum Undelivered {
     /// The request carries no `reply_to`, so there is no queue to publish to (`X-COPAUA0C-7`).
     NoReplyTo,
+    /// The request's `reply_to` names `RabbitMQ`'s Direct Reply-to pseudo-queue
+    /// ([`broker::is_direct_reply_to`]), whose mandatory publication the broker would deliver
+    /// and also return, so it cannot be confirmed without the requester holding the reply
+    /// (COPAUA0C-117, `X-COPAUA0C-12`).
+    DirectReplyTo,
     /// The publication failed, was negatively acknowledged or came back unroutable.
     Failed(PublishFailure),
 }
 
 impl fmt::Display for Undelivered {
+    /// The case only, never the `reply_to` text: the requester chooses that value, and any
+    /// diagnostic shows it only screened.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoReplyTo => f.write_str("the request names no reply_to queue"),
+            Self::DirectReplyTo => f.write_str(
+                "the request's reply_to names the Direct Reply-to pseudo-queue, whose mandatory \
+                 publication cannot be confirmed without delivering it; it is refused before \
+                 publication",
+            ),
             Self::Failed(failure) => failure.fmt(f),
         }
+    }
+}
+
+/// The queue a reply to `request` is published to: its `reply_to`, unless that is absent
+/// ([`Undelivered::NoReplyTo`], `X-COPAUA0C-7`) or names the Direct Reply-to pseudo-queue
+/// ([`Undelivered::DirectReplyTo`], COPAUA0C-117, `X-COPAUA0C-12`). Any other value is a
+/// destination, the empty string included, which is published and comes back unroutable
+/// (`X-COPAUA0C-7`).
+///
+/// # Errors
+///
+/// The [`Undelivered`] case of a `reply_to` that is refused before any publication.
+fn reply_queue(request: &Request) -> Result<&str, Undelivered> {
+    match request.reply_to.as_deref() {
+        None => Err(Undelivered::NoReplyTo),
+        Some(queue) if broker::is_direct_reply_to(queue) => Err(Undelivered::DirectReplyTo),
+        Some(queue) => Ok(queue),
     }
 }
 
@@ -786,17 +817,19 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// The body is the 63 written bytes of `copaua0c::reply_body`, its card field redacted; the
     /// COBOL's 64-byte length is HALTED(H6) (COPAUA0C-060 to COPAUA0C-065). The properties are
     /// `broker::cp00_properties` with a new `message_id` from the injected clock: the request's
-    /// `correlation_id`, persistent, `expiration` `"5000"` (E16). An absent `reply_to` is not
-    /// published; an empty one is, and comes back unroutable (`X-COPAUA0C-7`).
+    /// `correlation_id`, persistent, `expiration` `"5000"` (E16). The destination is
+    /// [`reply_queue`]'s: an absent `reply_to` is not published; an empty one is, and comes back
+    /// unroutable (`X-COPAUA0C-7`); one naming the Direct Reply-to pseudo-queue is not published,
+    /// because `RabbitMQ` 3.13 would deliver it and also return it, and a delivered decision
+    /// must never take the `M004` path (COPAUA0C-117, `X-COPAUA0C-12`).
     ///
     /// # Errors
     ///
-    /// [`Unanswered::NotConfirmed`] when no confirmation came, before any acknowledgement;
-    /// [`Unanswered::AckFailed`] when the confirmed reply's acknowledgement failed.
+    /// [`Unanswered::NotConfirmed`] when no confirmation came, or when the destination was
+    /// refused before any publication, before any acknowledgement; [`Unanswered::AckFailed`]
+    /// when the confirmed reply's acknowledgement failed.
     async fn answer(&self, reply: &AuthReply) -> Result<(), Unanswered> {
-        let Some(reply_to) = self.request.reply_to.as_deref() else {
-            return Err(Unanswered::NotConfirmed(Undelivered::NoReplyTo));
-        };
+        let reply_to = reply_queue(self.request).map_err(Unanswered::NotConfirmed)?;
         let body = copaua0c::reply_body(reply);
         let properties = broker::cp00_properties(self.request, ids::next_message_id(self.clock));
         self.channels
@@ -963,7 +996,7 @@ mod tests {
     use runtime::telemetry::ALERT_TARGET;
     use test_support::trace_capture;
 
-    use super::unparseable_alert;
+    use super::{Undelivered, reply_queue, unparseable_alert};
     use crate::broker::Request;
 
     // audit: COPAUA0C-006
@@ -1026,6 +1059,45 @@ mod tests {
             ",ABC",
         ] {
             assert!(!text.contains(value), "{value:?} in {text}");
+        }
+    }
+
+    // audit: COPAUA0C-117
+    #[test]
+    fn the_reply_queue_refuses_an_absent_reply_to_and_the_direct_reply_to_pseudo_queue() {
+        let cases: [(Option<&str>, Result<&str, &str>); 6] = [
+            (None, Err("NoReplyTo")),
+            (Some("amq.rabbitmq.reply-to"), Err("DirectReplyTo")),
+            (
+                Some("amq.rabbitmq.reply-to.g1h2AAZjM2FiZmI3"),
+                Err("DirectReplyTo"),
+            ),
+            (Some(""), Ok("")),
+            (Some("QA.REPLY.CTRL"), Ok("QA.REPLY.CTRL")),
+            (Some("amq.rabbitmq.reply-tox"), Ok("amq.rabbitmq.reply-tox")),
+        ];
+        for (reply_to, expected) in cases {
+            let request = Request {
+                delivery_tag: 1,
+                body: Vec::new(),
+                message_id: None,
+                correlation_id: None,
+                reply_to: reply_to.map(str::to_owned),
+                redelivered: false,
+            };
+            let outcome = reply_queue(&request).map_err(|undelivered| {
+                // A refusal names its case and never the requester's value.
+                let text = undelivered.to_string();
+                if let Some(value) = reply_to.filter(|value| !value.is_empty()) {
+                    assert!(!text.contains(value), "{value:?} in {text:?}");
+                }
+                match undelivered {
+                    Undelivered::NoReplyTo => "NoReplyTo",
+                    Undelivered::DirectReplyTo => "DirectReplyTo",
+                    Undelivered::Failed(_) => "Failed",
+                }
+            });
+            assert_eq!(outcome, expected, "reply_to {reply_to:?}");
         }
     }
 }
