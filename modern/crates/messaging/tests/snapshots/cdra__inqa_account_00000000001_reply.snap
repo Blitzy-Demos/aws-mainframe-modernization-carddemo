@@ -1,0 +1,7 @@
+---
+source: crates/messaging/tests/cdra.rs
+expression: snapshot_text(data)?
+snapshot_kind: text
+---
+len=1000
+response=[ACCOUNT ID : 00000000001ACCOUNT STATUS : YBALANCE : 00000001940{CREDIT LIMIT : 00000020200{CASH LIMIT : 00000010200{OPEN DATE : 2014-11-20EXPR DATE : 2025-05-20REIS DATE : 2025-05-20CREDIT BAL : 00000000000{DEBIT BAL : 00000000000{GROUP ID :           ]
