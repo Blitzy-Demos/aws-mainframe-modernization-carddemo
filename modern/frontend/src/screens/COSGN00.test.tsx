@@ -495,6 +495,60 @@ describe("COSGN00 sign-on screen", () => {
     },
   );
 
+  it("frames the map in a positioned main that holds every control at text-sm, with a skip link shown over it", () => {
+    // jsdom applies no Tailwind CSS, so the frame's token rules are proved by the classes that
+    // produce them: `main` is the containing block of its positioned descendants, has no side
+    // padding below `lg`, and gives every `<input>` `text-sm` and every `<label>` the
+    // `--text-sm--line-height` line height (AAP 0.4.3), whatever the generated defaults are. The
+    // rule matches the element: inside `FormControl` an Input's `data-slot` is `form-control`.
+    const { fetchStub } = stubFetch();
+    const { container } = renderScreen();
+
+    const main = screen.getByRole("main");
+    for (const token of [
+      "relative",
+      "overflow-x-auto",
+      "py-4",
+      "lg:px-4",
+      "[&_input]:text-sm",
+      "[&_label]:leading-(--text-sm--line-height)",
+    ]) {
+      expect(main.classList.contains(token)).toBe(true);
+    }
+    const inputs = Array.from(container.querySelectorAll("input"));
+    const labels = Array.from(container.querySelectorAll("label"));
+    expect(new Set(inputs.map((input) => input.dataset.slot))).toEqual(
+      new Set(["input", "form-control"]),
+    );
+    expect(labels.length).toBeGreaterThan(0);
+    expect([...inputs, ...labels].filter((control) => !main.contains(control))).toEqual([]);
+
+    // The skip link leads `main`, is visually hidden until keyboard focus, and is then placed
+    // absolutely over the frame's top left in the frame's font, with the system focus ring and no
+    // layer token.
+    const skip = screen.getByRole("link", { name: "Skip to main content" });
+    expect(main.firstElementChild).toBe(skip);
+    const body = container.querySelector('[data-slot="card-content"]');
+    expect(skip.getAttribute("href")).toBe(`#${body?.id ?? ""}`);
+    for (const token of [
+      "sr-only",
+      "font-mono",
+      "text-sm",
+      "bg-background",
+      "focus-visible:not-sr-only",
+      "focus-visible:absolute",
+      "focus-visible:top-2",
+      "focus-visible:left-2",
+      "focus-visible:ring-3",
+      "focus-visible:ring-ring/50",
+      "focus-visible:outline-hidden",
+    ]) {
+      expect(skip.classList.contains(token)).toBe(true);
+    }
+    expect(Array.from(skip.classList).filter((token) => /(^|:)-?z-/.test(token))).toEqual([]);
+    expect(fetchStub).not.toHaveBeenCalled();
+  });
+
   // audit: COSGN00C-017
   // audit: COSGN00-046
   it.each([

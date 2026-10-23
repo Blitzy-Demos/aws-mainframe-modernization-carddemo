@@ -528,6 +528,33 @@ export function COTRTLI(): ReactNode {
       transaction={SCREENS.COTRTLI.transaction}
       program={SCREENS.COTRTLI.program}
       title={TITLE}
+      titleRow={
+        <>
+          {/* COTRTLI-012, COTRTLI-013: `Page ` and `PAGENO`, on the title's line 4 of the map. */}
+          <GridCell row={1} col={70} span={5}>
+            <Label htmlFor={pageNoId} className={LINE_LABEL}>
+              Page
+            </Label>
+          </GridCell>
+          <GridCell row={1} col={76} span={3}>
+            {/*
+             * Every input of the screen carries `size` = its map `LENGTH` and takes the shared
+             * map-field box (`FIELD_INPUT`, through `fieldInputClass` for the two-character type
+             * filter): a grid field covers its `LENGTH` columns, a list description fills its
+             * table column, a list selector is a one-character box (`w-9`), and none is
+             * narrower than its value plus the inset.
+             */}
+            <Input
+              id={pageNoId}
+              readOnly
+              tabIndex={-1}
+              size={PAGE_NO_LENGTH}
+              className={FIELD_INPUT}
+              value={page === null ? "" : String(page.page_no)}
+            />
+          </GridCell>
+        </>
+      }
       formId={formId}
       message={{ text: message, kind: "error" }}
       info={centredInfo(page?.info_message)}
@@ -551,29 +578,6 @@ export function COTRTLI(): ReactNode {
           }}
         >
           <FieldGrid>
-            <GridCell row={4} col={70} span={5}>
-              <Label htmlFor={pageNoId} className={LINE_LABEL}>
-                Page
-              </Label>
-            </GridCell>
-            <GridCell row={4} col={76} span={3}>
-              {/*
-               * Every input of the screen carries `size` = its map `LENGTH` and takes the shared
-               * map-field box (`FIELD_INPUT`, through `fieldInputClass` for the two-character type
-               * filter): a grid field covers its `LENGTH` columns, a list description fills its
-               * table column, a list selector is a one-character box (`w-9`), and none is
-               * narrower than its value plus the inset.
-               */}
-              <Input
-                id={pageNoId}
-                readOnly
-                tabIndex={-1}
-                size={PAGE_NO_LENGTH}
-                className={FIELD_INPUT}
-                value={page === null ? "" : String(page.page_no)}
-              />
-            </GridCell>
-
             <FormField
               control={form.control}
               name="typeFilter"

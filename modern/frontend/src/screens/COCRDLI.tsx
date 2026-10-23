@@ -479,6 +479,29 @@ export function COCRDLI(): ReactNode {
       transaction={SCREENS.COCRDLI.transaction}
       program={SCREENS.COCRDLI.program}
       title={TITLE}
+      titleRow={
+        <>
+          {/*
+           * COCRDLI-012, COCRDLI-013: `Page ` and the page number of the last answer, on the
+           * title's line 4 of the map. `PAGENO` is `ASKIP`, which the 3270 cursor skips, so Tab
+           * passes over it.
+           */}
+          <GridCell row={1} col={70} span={5}>
+            <Label htmlFor={pageNoId} className={LABEL}>
+              {"Page "}
+            </Label>
+          </GridCell>
+          <GridCell row={1} col={76} span={3}>
+            <Input
+              id={pageNoId}
+              readOnly
+              tabIndex={-1}
+              value={page === undefined ? "" : String(page.page_no)}
+              className={fieldBox(3)}
+            />
+          </GridCell>
+        </>
+      }
       formId={formId}
       message={message}
       info={info}
@@ -498,21 +521,6 @@ export function COCRDLI(): ReactNode {
         >
           {/* Centred in their lines, so a label sits level with the input beside it. */}
           <FieldGrid className="items-center">
-            {/* COCRDLI-012, COCRDLI-013: `Page ` and the page number of the last answer. */}
-            <GridCell row={4} col={70} span={5}>
-              <Label htmlFor={pageNoId} className={LABEL}>
-                {"Page "}
-              </Label>
-            </GridCell>
-            <GridCell row={4} col={76} span={3}>
-              <Input
-                id={pageNoId}
-                readOnly
-                value={page === undefined ? "" : String(page.page_no)}
-                className={fieldBox(3)}
-              />
-            </GridCell>
-
             {/*
              * COCRDLI-014, COCRDLI-015: the account filter, the initial cursor (`IC`). The error
              * line is the map's one visible message, so a filter's own message, the schema's or

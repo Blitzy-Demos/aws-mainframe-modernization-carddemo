@@ -999,6 +999,27 @@ describe("COTRTLI", () => {
     expect(pageNo()).toHaveProperty("readOnly", true);
     expect(pageNo().getAttribute("size")).toBe("3");
     expect(pageNo()).toHaveProperty("value", "1");
+    // Skipped by Tab, as the 3270 cursor skips the `ASKIP` field.
+    expect(pageNo().tabIndex).toBe(-1);
+    // `Page ` (4,70) and `PAGENO` (4,76) share the title's map line 4: the heading's line of the
+    // CardHeader, on its 80 columns, outside the heading, whose name stays the title, and outside
+    // the body form.
+    const heading = screen.getByRole("heading", { level: 1, name: "Maintain Transaction Type" });
+    const titleLine = heading.parentElement;
+    expect(titleLine?.parentElement?.dataset.slot).toBe("card-header");
+    expect(titleLine?.className).toBe("grid grid-cols-80 items-center gap-x-2");
+    expect(heading.classList.contains("col-span-full")).toBe(true);
+    expect(heading.classList.contains("row-start-1")).toBe(true);
+    const pageLabel = screen.getByText("Page ".trimEnd());
+    expect(pageLabel.getAttribute("for")).toBe(pageNo().id);
+    expect(pageLabel.parentElement?.className).toBe("row-start-1 col-start-70 col-span-5");
+    expect(pageNo().parentElement?.className).toBe("row-start-1 col-start-76 col-span-3");
+    for (const element of [pageLabel, pageNo()]) {
+      expect(element.parentElement?.parentElement).toBe(titleLine);
+      expect(heading.contains(element)).toBe(false);
+      expect(form().contains(element)).toBe(false);
+    }
+
     // Every input takes the shared map-field box, `MAP_FIELD_BOX` with `size` = its LENGTH, so a
     // full-length value, the 50-character row description included, shows on the narrowest frame.
     for (const [box, length] of [
@@ -1048,13 +1069,12 @@ describe("COTRTLI", () => {
       expectHighlighted(row, false);
     }
 
-    // The form's inputs are exactly the map's input and output fields, in map order: no
-    // element stands for a zero-length stopper, and none for the eighth row.
+    // The form's inputs are exactly the map's input and output fields below the title's line, in
+    // map order: no element stands for a zero-length stopper, and none for the eighth row.
     const names = Array.from(form().querySelectorAll("input"), (input) => {
       return input.labels?.item(0)?.textContent ?? input.getAttribute("aria-label");
     });
     expect(names).toEqual([
-      "Page ".trimEnd(),
       "Type Filter:",
       "Description Filter:",
       ...SEEDED_TYPES.flatMap(([code]) => [`Select type ${code}`, `Description type ${code}`]),

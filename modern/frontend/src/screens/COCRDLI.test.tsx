@@ -700,10 +700,30 @@ describe("COCRDLI", () => {
       throw new Error("the screen rendered no form");
     }
 
-    // `PAGENO`, `POS=(4,76) LENGTH=3`: read-only, showing the page number endpoint 7 sent.
-    expect(pageNo().parentElement?.className).toBe("row-start-4 col-start-76 col-span-3");
+    // `PAGENO`, `POS=(4,76) LENGTH=3`: read-only, showing the page number endpoint 7 sent, and
+    // skipped by Tab as the 3270 cursor skips the `ASKIP` field.
     expect(pageNo()).toHaveProperty("readOnly", true);
     expect(pageNo()).toHaveProperty("value", String(FIRST_PAGE.page_no));
+    expect(pageNo().tabIndex).toBe(-1);
+
+    // `Page ` (4,70) and `PAGENO` (4,76) share the title's map line 4: the heading's line of the
+    // CardHeader, on its 80 columns, outside the heading, whose name stays the title, and outside
+    // the body form.
+    const heading = screen.getByRole("heading", { level: 1, name: "List Credit Cards" });
+    const titleLine = heading.parentElement;
+    expect(titleLine?.parentElement?.dataset.slot).toBe("card-header");
+    expect(titleLine?.className).toBe("grid grid-cols-80 items-center gap-x-2");
+    expect(heading.classList.contains("col-span-full")).toBe(true);
+    expect(heading.classList.contains("row-start-1")).toBe(true);
+    const pageLabel = screen.getByText("Page ", EXACT);
+    expect(pageLabel.getAttribute("for")).toBe(pageNo().id);
+    expect(pageLabel.parentElement?.className).toBe("row-start-1 col-start-70 col-span-5");
+    expect(pageNo().parentElement?.className).toBe("row-start-1 col-start-76 col-span-3");
+    for (const element of [pageLabel, pageNo()]) {
+      expect(element.parentElement?.parentElement).toBe(titleLine);
+      expect(heading.contains(element)).toBe(false);
+      expect(form.contains(element)).toBe(false);
+    }
 
     // Every placed element of the body grid as its line, column and width. No cell stands at the
     // zero-length stoppers (6,56), (7,61) and (20,65): their columns stay empty.
@@ -713,8 +733,6 @@ describe("COCRDLI", () => {
       /\bcol-span-(\d+)\b/.exec(cell.className)?.[1],
     ]);
     expect(placed).toEqual([
-      ["4", "70", "5"],
-      ["4", "76", "3"],
       ["6", "22", "19"],
       ["6", "44", "11"],
       ["7", "22", "19"],
@@ -732,8 +750,8 @@ describe("COCRDLI", () => {
       expect(cells.at(0)?.textContent).toBe("");
       expect(row.querySelectorAll("input")).toHaveLength(1);
     }
-    // The form's inputs are the page number, the two filters and the seven selectors.
-    expect(form.querySelectorAll("input")).toHaveLength(10);
+    // The form's inputs are the two filters and the seven selectors.
+    expect(form.querySelectorAll("input")).toHaveLength(9);
     expect(form.querySelectorAll('input[type="hidden"]')).toHaveLength(0);
   });
 

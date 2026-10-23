@@ -47,6 +47,14 @@ export type ScreenShellProps = {
   program: string;
   /** The map's screen title (`Main Menu`, `View Account`), the screen's single level-1 heading. */
   title: string;
+  /**
+   * The map's other fields on the screen title's line, such as the `Page ` literal and `PAGENO`
+   * that COCRDLI and COTRTLI place beside the title on line 4: each a `GridCell` with `row={1}`
+   * at its map column and `LENGTH`. They stand on the title's line, on the 80 columns of the
+   * header and the body, outside the heading, whose name stays `title`. Without it the title
+   * stands alone on its line.
+   */
+  titleRow?: ReactNode;
   /** `id` of the screen's `<form>`, which ENTER submits; forwarded to `PfKeyBar`. */
   formId?: string;
   /** The `ERRMSG` row (row 23). Without it the row is empty and stays an error row. */
@@ -133,6 +141,42 @@ const LABEL = "h-full whitespace-pre text-muted-foreground";
 const VALUE = "text-foreground";
 const TITLE = "mx-auto block w-(--field-width) font-semibold text-foreground";
 
+/*
+ * The page's `main` landmark around the frame. The 80 columns need a minimum width (the Card's
+ * `min-w-3xl`): below it `main` scrolls the frame sideways rather than overlapping fields, and
+ * above `max-w-7xl` the frame stops widening and is centred. The side padding starts at `lg`, so
+ * the minimum-width frame fits a 768px window whole.
+ *
+ * `relative` makes `main` the containing block of every absolutely positioned descendant, the
+ * screens' `sr-only` texts and the skip link included, so they stay inside its scroll area
+ * instead of widening the page.
+ *
+ * Two descendant rules give the generated controls, which stay as generated, the `text-sm` of
+ * AAP 0.4.3: every `input` element (each one an `Input`; `FormControl` replaces the Input's
+ * `data-slot`, so the element is matched rather than the slot) is `text-sm` at every width, in
+ * place of the Input's `text-base` below `md`, so a box keeps the width it has on wide windows,
+ * including a control that does not take `fieldBox` or `FIELD_INPUT`; and every `label` element
+ * (`Label`, `FormLabel`) takes the `--text-sm--line-height` line height in place of the Label's
+ * `leading-none`.
+ */
+const MAIN = [
+  "relative mx-auto w-full max-w-7xl overflow-x-auto py-4 lg:px-4",
+  "[&_input]:text-sm [&_label]:leading-(--text-sm--line-height)",
+].join(" ");
+
+/*
+ * The skip link is `sr-only` until it has keyboard focus. Then it is placed over the top left of
+ * `main`, across the Card's top edge and above the header rows, so showing it moves nothing and
+ * needs no layer (AAP 0.4.3 has no z-index token). It uses the frame's `font-mono` and `text-sm`,
+ * and the system focus ring (`--ring`) in place of the browser's outline.
+ */
+const SKIP_LINK = [
+  "sr-only rounded-md bg-background font-mono text-sm underline",
+  "focus-visible:not-sr-only focus-visible:absolute focus-visible:top-2 focus-visible:left-2",
+  "focus-visible:px-2 focus-visible:py-1",
+  "focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-hidden",
+].join(" ");
+
 /** The accessible names of the two titles, which no map literal labels. */
 const TITLE01_NAME = "Title row 1";
 const TITLE02_NAME = "Title row 2";
@@ -192,7 +236,8 @@ export const TransferPendingContext = createContext(false);
  *
  * - `CardHeader`: header rows 1 and 2 on the 80-column grid of `FieldGrid` (the transaction,
  *   the titles of `COTTL01Y`, the date, the program, the time), with COSGN00's row 3 (the
- *   application and system IDs), then the screen title;
+ *   application and system IDs), then the screen title, on one line with the map's other fields
+ *   of that line (`titleRow`) when it has any;
  * - `CardContent`: the screen body;
  * - `CardFooter`: the `INFOMSG` row when the map has one, the `ERRMSG` row and the row-24 keys.
  *
@@ -231,6 +276,7 @@ export function ScreenShell({
   transaction,
   program,
   title,
+  titleRow,
   formId,
   message,
   info,
@@ -289,86 +335,109 @@ export function ScreenShell({
     APPLID: "",
     SYSID: "",
   };
+  /*
+   * `CardTitle` renders a `div`, so the heading role and level make it the screen's level-1
+   * heading. `text-base` is the title size of AAP 0.4.3; the map titles sit near column 40, so the
+   * text is centred. Beside the fields of `titleRow` it spans all 80 columns of their line
+   * (`col-span-full`) and is placed on it (`row-start-1`), so the fields at their own columns
+   * share the line instead of pushing the title to a line of its own.
+   */
+  const heading = (
+    <CardTitle
+      role="heading"
+      aria-level={1}
+      className={
+        titleRow === undefined
+          ? "text-center text-base"
+          : "col-span-full row-start-1 text-center text-base"
+      }
+    >
+      {title}
+    </CardTitle>
+  );
 
   return (
-    // The 80 columns need a minimum width (`min-w-3xl`); below it the page scrolls sideways
-    // rather than overlapping fields. The side padding starts at `lg`, so the minimum-width frame
-    // fits a 768px viewport whole. Above `max-w-7xl` the frame stops widening and is centred.
-    <main className="mx-auto w-full max-w-7xl overflow-x-auto py-4 lg:px-4">
-      <a href={`#${bodyId}`} className="sr-only underline focus-visible:not-sr-only">
+    // `MAIN` scrolls the frame sideways below its minimum width, contains its positioned texts and
+    // holds every control at `text-sm`; `SKIP_LINK` shows over the frame without moving it.
+    <main className={MAIN}>
+      <a href={`#${bodyId}`} className={SKIP_LINK}>
         Skip to main content
       </a>
       {/*
        * `font-mono` and `text-sm` are inherited by every control, so the 80 columns align and
-       * labels, values, inputs, table cells, messages and keys share the `text-sm` of AAP 0.4.3;
-       * `gap-4` replaces the Card's default `gap-6`.
+       * labels, values, inputs, table cells, messages and keys share the `text-sm` of AAP 0.4.3.
+       * The Card keeps its default `gap-6`; the frame's own column inside it spaces the header,
+       * the body and the footer by the `gap-4` of AAP 0.4.3.
        */}
-      <Card className="min-w-3xl gap-4 font-mono text-sm">
-        <CardHeader>
-          <div className="grid grid-cols-80 gap-x-2">
-            {HEADER_CELLS[headerLayout].map((cell) => (
-              <GridCell
-                key={`${cell.row}-${cell.col}`}
-                row={cell.row}
-                col={cell.col}
-                span={cell.span}
-              >
-                {cell.field === undefined ? (
-                  <Label htmlFor={`${headerId}-${cell.labels}`} className={cell.className}>
-                    {cell.label}
-                  </Label>
-                ) : (
-                  <Input
-                    id={`${headerId}-${cell.field}`}
-                    data-field={cell.field}
-                    aria-label={cell.name}
-                    readOnly
-                    tabIndex={-1}
-                    value={values[cell.field]}
-                    size={cell.span}
-                    className={cn(fieldBox(cell.span), cell.className)}
-                  />
-                )}
-              </GridCell>
-            ))}
-          </div>
+      <Card className="min-w-3xl font-mono text-sm">
+        <div className="flex flex-col gap-4">
+          <CardHeader>
+            <div className="grid grid-cols-80 gap-x-2">
+              {HEADER_CELLS[headerLayout].map((cell) => (
+                <GridCell
+                  key={`${cell.row}-${cell.col}`}
+                  row={cell.row}
+                  col={cell.col}
+                  span={cell.span}
+                >
+                  {cell.field === undefined ? (
+                    <Label htmlFor={`${headerId}-${cell.labels}`} className={cell.className}>
+                      {cell.label}
+                    </Label>
+                  ) : (
+                    <Input
+                      id={`${headerId}-${cell.field}`}
+                      data-field={cell.field}
+                      aria-label={cell.name}
+                      readOnly
+                      tabIndex={-1}
+                      value={values[cell.field]}
+                      size={cell.span}
+                      className={cn(fieldBox(cell.span), cell.className)}
+                    />
+                  )}
+                </GridCell>
+              ))}
+            </div>
+            {titleRow === undefined ? (
+              heading
+            ) : (
+              // The title's line on the header's 80 columns and gaps, each field centred on it.
+              <div className="grid grid-cols-80 items-center gap-x-2">
+                {heading}
+                {titleRow}
+              </div>
+            )}
+          </CardHeader>
           {/*
-           * `CardTitle` renders a `div`, so the heading role and level make it the screen's
-           * level-1 heading. `text-base` is the title size of AAP 0.4.3; the map titles sit near
-           * column 40, so the text is centred.
+           * `tabIndex={-1}` lets the skip link move focus into the body, not only scroll to it.
+           * BLITZY [A11Y]: the body then shows the theme's default focus outline (`outline-ring/50`
+           * of `src/index.css`), about 1.5:1 against the card, below the 3:1 of WCAG 1.4.11. Kept
+           * as the system token; flagged for designer review.
            */}
-          <CardTitle role="heading" aria-level={1} className="text-center text-base">
-            {title}
-          </CardTitle>
-        </CardHeader>
-        {/*
-         * `tabIndex={-1}` lets the skip link move focus into the body, not only scroll to it.
-         * BLITZY [A11Y]: the body then shows the theme's default focus outline (`outline-ring/50`
-         * of `src/index.css`), about 1.5:1 against the card, below the 3:1 of WCAG 1.4.11. Kept as
-         * the system token; flagged for designer review.
-         */}
-        <CardContent id={bodyId} tabIndex={-1}>
-          {children}
-        </CardContent>
-        <CardFooter className="flex-col items-stretch gap-2">
-          {info !== undefined && <MessageLine kind="info" bright={infoBright} text={info} />}
-          {/*
-           * Every map declares `ERRMSG` `ATTRB=(ASKIP,BRT,FSET)` and no program changes its
-           * attribute byte, so the row is bright whatever colour its message takes.
-           */}
-          <MessageLine
-            kind={message?.kind ?? "error"}
-            bright
-            text={message?.text}
-            send={message?.send}
-          />
-          <PfKeyBar
-            keys={shownKeys}
-            formId={formId}
-            options={keyOptions}
-            busy={transferPending || busy === true}
-          />
-        </CardFooter>
+          <CardContent id={bodyId} tabIndex={-1}>
+            {children}
+          </CardContent>
+          <CardFooter className="flex-col items-stretch gap-2">
+            {info !== undefined && <MessageLine kind="info" bright={infoBright} text={info} />}
+            {/*
+             * Every map declares `ERRMSG` `ATTRB=(ASKIP,BRT,FSET)` and no program changes its
+             * attribute byte, so the row is bright whatever colour its message takes.
+             */}
+            <MessageLine
+              kind={message?.kind ?? "error"}
+              bright
+              text={message?.text}
+              send={message?.send}
+            />
+            <PfKeyBar
+              keys={shownKeys}
+              formId={formId}
+              options={keyOptions}
+              busy={transferPending || busy === true}
+            />
+          </CardFooter>
+        </div>
       </Card>
     </main>
   );

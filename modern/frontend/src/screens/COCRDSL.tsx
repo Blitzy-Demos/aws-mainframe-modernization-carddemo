@@ -188,8 +188,8 @@ type Display = {
  *   (COCRDSLC-001).
  * - From a COCRDLI `S` selection, whose route state names the card list as `from` and carries
  *   the row's `acct_id` and `card_ref`, the screen reads that card at once, and both inputs stay
- *   read-only for the visit, as the program protects them while the card list is its caller
- *   (COCRDSLC-002).
+ *   read-only and out of the Tab order for the visit, as the program protects them while the card
+ *   list is its caller (COCRDSLC-002).
  * - ENTER, and every other key except F3, searches (COCRDSLC-003, COCRDSL-038). The request
  *   carries the account and exactly one of `card_num` (the typed card number) or `card_ref` (the
  *   handle of the card shown, while the card input still shows its number, COCRDSLC-026).
@@ -428,6 +428,10 @@ export function COCRDSL(): ReactNode {
            */}
           <FieldGrid className="grid-rows-none gap-y-2">
             {/*
+             * Both inputs are protected while the card list is the caller (`DFHBMPRF`,
+             * COCRDSLC-002): read-only for the visit and, as the 3270 cursor skips a protected
+             * field, out of the Tab order.
+             *
              * The error row is the map's one visible message, so an input's own message is for
              * assistive technology only, read with the input it marks: the schema's message, or
              * the row's text for a mark the screen keeps outside react-hook-form. It is the
@@ -452,6 +456,7 @@ export function COCRDSL(): ReactNode {
                         size={COCRDSL_LENGTHS.acctId}
                         autoFocus
                         readOnly={fromList || pending}
+                        tabIndex={fromList ? -1 : undefined}
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.acctMarked || fieldState.invalid}
@@ -481,6 +486,7 @@ export function COCRDSL(): ReactNode {
                         maxLength={COCRDSL_LENGTHS.cardNum}
                         size={COCRDSL_LENGTHS.cardNum}
                         readOnly={fromList || pending}
+                        tabIndex={fromList ? -1 : undefined}
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.cardMarked || fieldState.invalid}
@@ -495,6 +501,10 @@ export function COCRDSL(): ReactNode {
               )}
             />
 
+            {/*
+             * The four outputs are `ASKIP` (`CRDNAME` by the BMS default), which the 3270 cursor
+             * skips, so each is read-only and out of the Tab order.
+             */}
             <GridCell row={11} col={4} span={20}>
               <Label htmlFor={`${outputId}-name`} className={LABEL_CLASS}>
                 {LABELS.name}
@@ -505,6 +515,7 @@ export function COCRDSL(): ReactNode {
                 id={`${outputId}-name`}
                 data-field="CRDNAME"
                 readOnly
+                tabIndex={-1}
                 value={view?.embossed_name ?? ""}
                 size={OUTPUT_LENGTHS.name}
                 className={inputClass(OUTPUT_LENGTHS.name)}
@@ -521,6 +532,7 @@ export function COCRDSL(): ReactNode {
                 id={`${outputId}-status`}
                 data-field="CRDSTCD"
                 readOnly
+                tabIndex={-1}
                 value={view?.status ?? ""}
                 size={OUTPUT_LENGTHS.status}
                 className={inputClass(OUTPUT_LENGTHS.status)}
@@ -537,6 +549,7 @@ export function COCRDSL(): ReactNode {
                 id={`${outputId}-month`}
                 data-field="EXPMON"
                 readOnly
+                tabIndex={-1}
                 value={expiry.month}
                 size={OUTPUT_LENGTHS.month}
                 className={inputClass(OUTPUT_LENGTHS.month)}
@@ -554,6 +567,7 @@ export function COCRDSL(): ReactNode {
                 data-field="EXPYEAR"
                 aria-label="Expiry year"
                 readOnly
+                tabIndex={-1}
                 value={expiry.year}
                 size={OUTPUT_LENGTHS.year}
                 className={inputClass(OUTPUT_LENGTHS.year)}

@@ -366,6 +366,8 @@ describe("COCRDSL", () => {
     const title = screen.getByRole("heading", { level: 1 });
     expect(title.textContent).toBe("View Credit Card Detail");
     expect(title.dataset.slot).toBe("card-title");
+    // The map has no other field on the title's line, so the title stands alone on it.
+    expect(title.parentElement?.dataset.slot).toBe("card-header");
 
     // The lengths are `both` rows, whose client half the schema test proves.
     expect(field(ACCOUNT).maxLength).toBe(11);
@@ -482,6 +484,8 @@ describe("COCRDSL", () => {
       const output = field(label);
       expect(output.dataset.slot).toBe("input");
       expect(output.readOnly).toBe(true);
+      // `ASKIP`, which the 3270 cursor skips: out of the Tab order.
+      expect(output.tabIndex).toBe(-1);
       expect(output.size).toBe(size);
       expect(output.parentElement?.className).toBe(cell);
       await requestsSettled(seen, 1);
@@ -679,6 +683,7 @@ describe("COCRDSL", () => {
     expect(field(ACCOUNT).readOnly).toBe(false);
     expect(field(CARD).value).toBe("");
     expect(field(CARD).readOnly).toBe(false);
+    expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual([0, 0]);
     expect(document.activeElement).toBe(field(ACCOUNT));
     expect(cardDetails()).toEqual(["", "", "", ""]);
     expect(messageRow("error").textContent).toBe("");
@@ -710,8 +715,10 @@ describe("COCRDSL", () => {
       expect(field(MONTH).value).toBe(month);
       expect(field(YEAR).value).toBe(year);
       expect(screen.queryByDisplayValue("31")).toBeNull();
+      // Protected for the visit (`DFHBMPRF`): read-only and skipped by Tab.
       for (const label of [ACCOUNT, CARD]) {
         expect(field(label).readOnly).toBe(true);
+        expect(field(label).tabIndex).toBe(-1);
         expect(field(label).className).not.toContain("text-destructive");
       }
       expect(messageRow("info").textContent).toBe(FOUND_INFO);
@@ -1037,6 +1044,9 @@ describe("COCRDSL", () => {
     expect(disabledKeys()).toEqual({ "ENTER=Search Cards": true, "F3=Exit": false });
     expect(form().getAttribute("aria-busy")).toBe("true");
     expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([true, true]);
+    // The lock leaves the Tab order as it was: only the list's protection takes them out of it.
+    const tabOrder = editable ? [0, 0] : [-1, -1];
+    expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
     // Neither the button nor the keys send a second request, and no key counts as invalid.
     fireEvent.click(enterButton());
     for (const key of ["Enter", "F5"]) {
@@ -1052,6 +1062,7 @@ describe("COCRDSL", () => {
     expect(disabledKeys()).toEqual({ "ENTER=Search Cards": false, "F3=Exit": false });
     // Entered from the list, both inputs stay protected for the visit (COCRDSLC-002).
     expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([!editable, !editable]);
+    expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
 
     // The next ENTER reads again.
     fireEvent.click(enterButton());
