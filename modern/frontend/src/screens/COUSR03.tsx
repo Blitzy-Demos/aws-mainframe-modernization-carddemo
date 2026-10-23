@@ -70,7 +70,7 @@ const SCREEN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
 /**
  * Width of an input: its `LENGTH` columns, and never fewer characters than its `size`, which each
  * input sets to its `LENGTH`. BLITZY [LAYOUT]: on narrow screens the 80 columns are narrower than
- * the characters, and without the floor the user ID and full 20-character names were clipped.
+ * the characters, and the floor keeps the user ID and the full 20-character names unclipped.
  */
 const FIELD_WIDTH = "min-w-max";
 

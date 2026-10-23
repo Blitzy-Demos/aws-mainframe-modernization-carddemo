@@ -49,7 +49,7 @@ const TYPED_CARD = ["0000", "0000", "0000", "5740"].join("");
 
 /** The prompt that follows every passed edit with a blank, `N` or `n` confirmation. */
 const PROMPT_TEXT = "Confirm to add this transaction...";
-/** `CCDA-MSG-INVALID-KEY`, its 50 bytes with the nine trailing spaces (COTRN02C-006). */
+/** `CCDA-MSG-INVALID-KEY`, its 50 bytes with the ten trailing spaces (COTRN02C-006). */
 const INVALID_KEY_TEXT = "Invalid key pressed. Please see below...".padEnd(50, " ");
 
 /** Each input's label `INITIAL`, by the form member it labels, in map order. */

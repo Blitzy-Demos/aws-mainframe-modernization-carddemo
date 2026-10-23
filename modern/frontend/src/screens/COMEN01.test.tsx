@@ -333,7 +333,11 @@ async function lingers(): Promise<void> {
   });
 }
 
-/** Lets a pending submit handler and the renders it schedules finish: `waitFor` drains them. */
+/**
+ * Confirms the Main Menu heading is still shown. The heading is already rendered, so `waitFor`
+ * passes at its first check and returns after the one zero-delay timer turn Testing Library yields,
+ * which lets work already queued run. It does not wait for a submit to finish.
+ */
 async function settled(): Promise<void> {
   await waitFor(() => {
     expect(screen.getByRole("heading", { level: 1, name: "Main Menu" })).toBeTruthy();

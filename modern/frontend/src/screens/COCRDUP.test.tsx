@@ -254,7 +254,11 @@ function renderScreen(state?: unknown) {
   );
 }
 
-/** Lets every pending promise settle, so any request the screen would send has been sent. */
+/**
+ * Yields one macrotask turn (a zero-delay timer). Work already queued, pending microtasks and
+ * earlier zero-delay timers, runs first, so a request it starts has been recorded when this
+ * resolves; a request the screen starts later escapes it.
+ */
 async function settle(): Promise<void> {
   await new Promise((resolve) => {
     setTimeout(resolve, 0);

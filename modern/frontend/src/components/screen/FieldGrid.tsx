@@ -150,8 +150,10 @@ export function FieldGrid({ children, className }: FieldGridProps): ReactNode {
  * row-span class. The computed class names are generated through the `@source inline` list of
  * `src/index.css`.
  *
- * Children are not formatted, trimmed or rewritten: screens pass card numbers and SSNs already
- * redacted, and the cell shows them as received.
+ * Children are shown as the screen passes them, not formatted, trimmed or rewritten, and the cell
+ * neither masks nor checks them. Card numbers and SSNs the endpoints return are redacted, except
+ * the full card number endpoint 8 (`GET /api/v1/cards/view`) discloses to an administrator token,
+ * which COCRDSL shows.
  */
 export function GridCell({ row, col, span, rowSpan = 1, children }: GridCellProps): ReactNode {
   const r = clamp(row, 1, SCREEN_ROWS);

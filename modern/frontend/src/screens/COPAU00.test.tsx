@@ -358,7 +358,11 @@ async function answered(sent: readonly unknown[], count: number): Promise<void> 
   });
 }
 
-/** Lets pending tasks run, so a request the screen should not send would have been recorded. */
+/**
+ * Waits a bounded window of 20 ms so queued tasks run. A request the screen starts within the
+ * window has been recorded when it ends; one started later escapes it, so this shows only that
+ * nothing was sent within the window.
+ */
 async function idle(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }

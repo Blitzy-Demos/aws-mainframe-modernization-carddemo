@@ -81,7 +81,10 @@ export type ScreenShellProps = {
    * COACTUPC (`DFHBMASB`, COACTUPC-083) and COTRTUPC (`DFHBMASB`, COTRTUPC-045).
    */
   infoBright?: boolean;
-  /** The map's row-24 keys, forwarded to `PfKeyBar` unchanged. */
+  /**
+   * The map's row-24 keys, forwarded to `PfKeyBar` as given, except that while a transfer to
+   * another screen is under way each one is forwarded as a `disabled` copy.
+   */
   keys: PfKeyBarProps["keys"];
   /** Settings of the keyboard binding, forwarded to `PfKeyBar` as `options`. */
   keyOptions?: PfKeyBarProps["options"];
@@ -274,8 +277,10 @@ export const TransferPendingContext = createContext(false);
  * the root route's `ScreenOutlet` provides: the target route's loader is running and this screen
  * stays mounted), the frame locks them all itself: every key it forwards is `disabled` and the row
  * is `busy`, whatever the screen passes, so no key acts on the screen being left and an unserved
- * F-key shows no invalid-key message. Every text passed in is shown verbatim and never logged:
- * card numbers and SSNs arrive already redacted.
+ * F-key shows no invalid-key message. Every text passed in is shown verbatim and never logged;
+ * the frame neither masks nor checks it. Card numbers and SSNs the endpoints return are redacted,
+ * except the full card number endpoint 8 (`GET /api/v1/cards/view`) discloses to an administrator
+ * token, which COCRDSL shows.
  *
  * The frame is the page's `main` landmark. The skip link, shown only on keyboard focus, moves past
  * the header rows and the title to the screen body.

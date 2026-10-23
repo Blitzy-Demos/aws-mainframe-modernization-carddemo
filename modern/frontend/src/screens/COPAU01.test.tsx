@@ -24,10 +24,10 @@ import { COPAU01 } from "./COPAU01";
  */
 
 /*
- * A flow waits on up to five stubbed round-trips in jsdom. Alone a test takes under 2 s, but under
- * coverage on a host shared with other suites one took 2.8 s, its waits close to Testing
- * Library's 1 s default. The file raises its wait limit to 10 s (the `dom` project of
- * `vite.config.ts` allows 30 s per test); a passing test runs no longer for it.
+ * A flow waits on up to five stubbed round-trips in jsdom. Under coverage on a shared, loaded
+ * host a single answer can approach Testing Library's 1 s default wait, so the file raises its
+ * wait limit to 10 s, within the 30 s per-test limit of the `dom` project in `vite.config.ts`.
+ * A passing test runs no longer for it, and one that never answers still fails at the raised limit.
  */
 configure({ asyncUtilTimeout: 10_000 });
 

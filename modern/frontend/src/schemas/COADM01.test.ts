@@ -5,10 +5,12 @@ import { COADM01_LENGTHS, type Coadm01Values, coadm01Schema } from "./COADM01";
  * Unit tests of the `COADM1A` form schema: the admin menu's one input, `OPTION`
  * (`LENGTH=2`, `NUM`, screens.md COADM01-025). Every expected length, issue code and message is
  * written by hand from that row and from zod's default messages, as the audit records no message
- * for the field; none is read from the schema. The option is never sent, so COADM01-025 and every
- * COADM01C row are `client` rows and no `both` row exists for this map: the zero-fill of the
- * entry, the invalid-option edit and the not-installed message belong to the screen, and the
- * values they answer must pass this schema unchanged. All values are synthetic.
+ * for the field; none is read from the schema. The option is never sent, so no `both` row exists
+ * for this map. COADM01-025 and the COADM01C rows on the entry are `client` rows: the zero-fill
+ * (COADM01C-015), the invalid-option edit (COADM01C-016), the transfer (COADM01C-017) and the
+ * not-installed message (COADM01C-018, COADM01C-019) belong to the screen, and the values they
+ * answer must pass this schema unchanged. The admin gate and the menu endpoint 3 serves are
+ * `server` rows (COADM01C-001, COADM01C-005 to COADM01C-014). All values are synthetic.
  */
 
 type ParseCase = { name: string; values: Coadm01Values };

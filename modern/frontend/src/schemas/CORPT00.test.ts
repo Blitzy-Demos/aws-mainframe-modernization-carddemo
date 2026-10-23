@@ -254,7 +254,8 @@ describe("corpt00Schema", () => {
   });
 
   // The date parts are reported in the program's order: start month, day and year, then end
-  // month, day and year, so the first issue is the part the server would also name first.
+  // month, day and year. The request DTO instead names the first failing wire key in ascending
+  // order, which here is end_day.
   it("reports every non-digit date part in program order", () => {
     const result = check({
       ...CUSTOM_RANGE,
