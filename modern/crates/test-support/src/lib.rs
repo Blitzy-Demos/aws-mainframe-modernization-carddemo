@@ -81,7 +81,9 @@
 //! [`run_child`] runs a child process of a test, such as `carddemo-batch`, with its output
 //! captured, for at most a deadline, [`CHILD_DEADLINE`] unless the test chooses another. A child
 //! still running at the deadline, or when the test gives up on the run through a panic, a
-//! timeout or a runtime shutdown, is killed and waited for, so that no process outlives its run.
+//! timeout or a runtime shutdown, is killed (`SIGKILL`) and waited for, so that it does not
+//! outlive its run. The kill and the wait reach that child alone: a process it starts is the
+//! caller's to stop.
 //!
 //! # Modules
 //!
@@ -119,6 +121,7 @@ use std::process::{self, Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{LazyLock, OnceLock};
+use std::task::Poll;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -152,9 +155,8 @@ const HANDLED_SIGNALS: [(&str, SignalKind); 2] = [
     ("SIGINT", SignalKind::interrupt()),
     ("SIGTERM", SignalKind::terminate()),
 ];
-/// Bound on the cleanup after an interrupting signal ([`drain`]): every removal it makes and its
-/// wait for the starts still running, three times the 10 seconds a busy engine took to finish
-/// the creates an interrupt left in flight.
+/// Bound on the whole cleanup after an interrupting signal ([`drain`]): every removal it makes
+/// and its wait for the starts still running, three times [`INTERRUPT_ROUND_TIMEOUT`].
 const INTERRUPT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on one removal round of that cleanup, a listing and the removals it leads to. A round
 /// cut off at it counts as failed and the next one starts, so that a request Docker does not
@@ -280,12 +282,13 @@ const CHILD_POLL: Duration = Duration::from_millis(10);
 ///
 /// The run is done once the child has exited and both pipes have closed. A run not done at
 /// `deadline` first kills (`SIGKILL`) and waits for its child, unless the child has already
-/// exited, so that no process is left behind, and then fails with an error of kind
+/// exited, so that the child does not outlive the run, and then fails with an error of kind
 /// [`io::ErrorKind::TimedOut`] that names the program and the deadline, never the arguments or
 /// the output (Cardholder Data Redaction). A run whose future is dropped before it is done, by a
 /// panic, an outer timeout or a runtime shutdown, kills and waits for its child in the drop the
-/// same way. Neither waits for a pipe that a process the child started holds open: the thread
-/// reading it ends when that process closes it.
+/// same way. Either way only the child is killed and waited for: a process the child started is
+/// not signalled and is the caller's to stop. Neither waits for a pipe that a process the child
+/// started holds open: the thread reading it ends when that process closes it.
 ///
 /// # Errors
 ///
@@ -1018,6 +1021,9 @@ fn ignored_signal(status: &str, number: c_int) -> bool {
     else {
         return false;
     };
+    // TRUNCATION: checked, so no signal is misread: a `number` below 1 fails `checked_sub` or
+    // `u32::try_from` and shows as not ignored; for a positive `number`, `number - 1` always fits
+    // a `u32`, and `checked_shr` shows a bit of 64 or more, past the mask, as not ignored.
     let Some(bit) = number
         .checked_sub(1)
         .and_then(|bit| u32::try_from(bit).ok())
@@ -1032,22 +1038,25 @@ fn ignored_signal(status: &str, number: c_int) -> bool {
 }
 
 /// Waits for the next delivery of either handled signal and returns its name and kind.
-async fn next_signal([first, second]: &mut [Handler; 2]) -> (&'static str, SignalKind) {
-    tokio::select! {
-        delivered = arrival(first) => delivered,
-        delivered = arrival(second) => delivered,
-    }
-}
-
-/// Waits for the next delivery of `handler`'s signal and returns its name and kind. It never
-/// returns for a signal the process inherited as ignored, nor once the stream has ended.
-async fn arrival(handler: &mut Handler) -> (&'static str, SignalKind) {
-    if let Some(stream) = handler.stream.as_mut() {
-        if stream.recv().await.is_some() {
-            return (handler.name, handler.kind);
+///
+/// Each poll looks at the handlers in order, so when both signals are waiting the first
+/// handler's is returned and the other stays queued for the next wait. A handler never ends the
+/// wait for a signal the process inherited as ignored, which has no stream, nor once its stream
+/// has ended.
+async fn next_signal(handlers: &mut [Handler; 2]) -> (&'static str, SignalKind) {
+    future::poll_fn(|cx| {
+        for handler in handlers.iter_mut() {
+            let delivered = handler
+                .stream
+                .as_mut()
+                .is_some_and(|stream| stream.poll_recv(cx) == Poll::Ready(Some(())));
+            if delivered {
+                return Poll::Ready((handler.name, handler.kind));
+            }
         }
-    }
-    future::pending().await
+        Poll::Pending
+    })
+    .await
 }
 
 /// Ends the process after `first`, the first signal delivered: sets [`STOPPING`], removes this
@@ -1061,16 +1070,28 @@ async fn interrupt(
 ) {
     let (name, kind) = first;
     STOPPING.store(true, Ordering::SeqCst);
-    let (line, kind) = tokio::select! {
-        drained = drain(docker, process_token()) => (format!("{name} received; {drained}"), kind),
-        (again, again_kind) = next_signal(handlers) => (
-            format!(
-                "{again} received during the cleanup after {name}; containers labelled \
-                 {PROCESS_LABEL}={} may remain",
-                process_token()
-            ),
-            again_kind,
-        ),
+    let (line, kind) = {
+        let mut cleanup = Box::pin(drain(docker, process_token()));
+        let mut second = Box::pin(next_signal(handlers));
+        // The cleanup is polled first, so a cleanup that has finished is reported as finished,
+        // while a second signal that arrives as it runs ends the wait at that poll. The future
+        // that did not finish drops at the end of this block, before the line is written.
+        future::poll_fn(|cx| {
+            if let Poll::Ready(drained) = cleanup.as_mut().poll(cx) {
+                return Poll::Ready((format!("{name} received; {drained}"), kind));
+            }
+            second.as_mut().poll(cx).map(|(again, again_kind)| {
+                (
+                    format!(
+                        "{again} received during the cleanup after {name}; containers labelled \
+                         {PROCESS_LABEL}={} may remain",
+                        process_token()
+                    ),
+                    again_kind,
+                )
+            })
+        })
+        .await
     };
     let status = 128_i32.saturating_add(kind.as_raw_value());
     // Standard error is the only place left to report to, and the process ends next, so a failed
@@ -1142,6 +1163,7 @@ mod tests {
     use std::collections::HashMap;
     use std::env;
     use std::fs;
+    use std::future;
     use std::io::{self, BufRead, BufReader, Read};
     use std::net::TcpListener;
     use std::path::{Path, PathBuf};
@@ -1150,7 +1172,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, TryRecvError};
-    use std::task::{Context, Wake, Waker};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::Duration;
 
@@ -1406,6 +1428,43 @@ mod tests {
     /// The `postgres:16` image as a bare request, for the containers the fake starts create.
     fn postgres_request() -> ContainerRequest<GenericImage> {
         GenericImage::new("postgres", "16").into()
+    }
+
+    /// Runs `test` to completion on a current-thread runtime with every driver enabled, the
+    /// runtime Tokio's test attribute builds by default, without the lint suppressions and the
+    /// unchecked pin that attribute's expansion carries. A runtime that cannot be built fails the
+    /// test with the builder's error rather than a panic.
+    pub(crate) fn block_on<T, E: From<HarnessError>>(
+        test: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        run_on(&mut Builder::new_current_thread(), test)
+    }
+
+    /// Runs `test` to completion as [`block_on`] does, on a multi-thread runtime instead: with
+    /// `workers` worker threads, or with Tokio's default count for `None`, as the multi-thread
+    /// flavour of Tokio's test attribute builds it.
+    pub(crate) fn block_on_multi_thread<T, E: From<HarnessError>>(
+        workers: Option<usize>,
+        test: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let mut builder = Builder::new_multi_thread();
+        if let Some(workers) = workers {
+            builder.worker_threads(workers);
+        }
+        run_on(&mut builder, test)
+    }
+
+    /// Builds the runtime `builder` describes, with every driver enabled, and runs `test` to
+    /// completion on it; a build failure is the test's error.
+    fn run_on<T, E: From<HarnessError>>(
+        builder: &mut Builder,
+        test: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        builder
+            .enable_all()
+            .build()
+            .map_err(|err| HarnessError::new("build the test runtime", &err))?
+            .block_on(test)
     }
 
     /// The Docker client testcontainers is configured with.
@@ -2329,104 +2388,112 @@ mod tests {
     /// caller left it: inherited, as `PATH` shows, with the variables the caller set. It reads
     /// both pipes at the same time: the child writes [`CHILD_ZEROS`] bytes to standard error,
     /// past any pipe buffer, while its standard output is still open.
-    #[tokio::test]
-    async fn a_child_run_returns_its_status_and_both_outputs() -> Result<(), HarnessError> {
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(format!(
-                "cat; printf '%s|%s' \"$CARDDEMO_TEST_SUPPORT_CHILD\" \"$PATH\"; \
-                 head -c {CHILD_ZEROS} /dev/zero >&2; printf err >&2; exit 3"
-            ))
-            .env("CARDDEMO_TEST_SUPPORT_CHILD", "as set");
-        let output = run_child(command, CHILD_DEADLINE)
-            .await
-            .map_err(|err| HarnessError::new("run the child", &err))?;
+    #[test]
+    fn a_child_run_returns_its_status_and_both_outputs() -> Result<(), HarnessError> {
+        block_on(async {
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "cat; printf '%s|%s' \"$CARDDEMO_TEST_SUPPORT_CHILD\" \"$PATH\"; \
+                     head -c {CHILD_ZEROS} /dev/zero >&2; printf err >&2; exit 3"
+                ))
+                .env("CARDDEMO_TEST_SUPPORT_CHILD", "as set");
+            let output = run_child(command, CHILD_DEADLINE)
+                .await
+                .map_err(|err| HarnessError::new("run the child", &err))?;
 
-        assert_eq!(output.status.code(), Some(3), "{:?}", output.status);
-        assert_eq!(
-            String::from_utf8_lossy(&output.stdout),
-            format!("as set|{}", env::var("PATH").unwrap_or_default())
-        );
-        assert!(
-            output.stderr.strip_suffix(b"err").is_some_and(
-                |zeros| zeros.len() == CHILD_ZEROS && zeros.iter().all(|&byte| byte == 0)
-            ),
-            "{} bytes of standard error",
-            output.stderr.len()
-        );
-        Ok(())
+            assert_eq!(output.status.code(), Some(3), "{:?}", output.status);
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("as set|{}", env::var("PATH").unwrap_or_default())
+            );
+            assert!(
+                output.stderr.strip_suffix(b"err").is_some_and(
+                    |zeros| zeros.len() == CHILD_ZEROS && zeros.iter().all(|&byte| byte == 0)
+                ),
+                "{} bytes of standard error",
+                output.stderr.len()
+            );
+            Ok(())
+        })
     }
 
     /// A child still running at its deadline is killed and waited for before its run fails with
     /// [`io::ErrorKind::TimedOut`], naming the program and the deadline: once the error has
     /// returned, no process has the child's ID.
-    #[tokio::test]
-    async fn a_child_past_its_deadline_is_killed_and_reaped() -> Result<(), HarnessError> {
-        let pid_file = pid_file("deadline");
-        let began = Instant::now();
-        let run = run_child(sleeper(&pid_file), CHILD_CUT).await;
-        let took = began.elapsed();
-        let exists = recorded_pid(&pid_file).and_then(process_exists);
+    #[test]
+    fn a_child_past_its_deadline_is_killed_and_reaped() -> Result<(), HarnessError> {
+        block_on(async {
+            let pid_file = pid_file("deadline");
+            let began = Instant::now();
+            let run = run_child(sleeper(&pid_file), CHILD_CUT).await;
+            let took = began.elapsed();
+            let exists = recorded_pid(&pid_file).and_then(process_exists);
 
-        let Err(err) = run else {
-            panic!("a child past its deadline finished: {run:?}");
-        };
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert_eq!(
-            err.to_string(),
-            "/bin/sh did not finish within 500ms and was killed"
-        );
-        assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
-        assert!(matches!(exists, Ok(false)), "{exists:?}");
-        Ok(())
+            let Err(err) = run else {
+                panic!("a child past its deadline finished: {run:?}");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+            assert_eq!(
+                err.to_string(),
+                "/bin/sh did not finish within 500ms and was killed"
+            );
+            assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
+            assert!(matches!(exists, Ok(false)), "{exists:?}");
+            Ok(())
+        })
     }
 
     /// A run whose future is dropped while its child runs, here by an outer timeout, kills and
     /// waits for the child in the drop: once the drop has returned, no process has the child's
     /// ID.
-    #[tokio::test]
-    async fn a_dropped_run_kills_and_reaps_its_child() -> Result<(), HarnessError> {
-        let pid_file = pid_file("dropped");
-        let cut = time::timeout(CHILD_CUT, run_child(sleeper(&pid_file), CHILD_DEADLINE)).await;
-        let exists = recorded_pid(&pid_file).and_then(process_exists);
+    #[test]
+    fn a_dropped_run_kills_and_reaps_its_child() -> Result<(), HarnessError> {
+        block_on(async {
+            let pid_file = pid_file("dropped");
+            let cut = time::timeout(CHILD_CUT, run_child(sleeper(&pid_file), CHILD_DEADLINE)).await;
+            let exists = recorded_pid(&pid_file).and_then(process_exists);
 
-        assert!(cut.is_err(), "the run finished before the cut: {cut:?}");
-        assert!(matches!(exists, Ok(false)), "{exists:?}");
-        Ok(())
+            assert!(cut.is_err(), "the run finished before the cut: {cut:?}");
+            assert!(matches!(exists, Ok(false)), "{exists:?}");
+            Ok(())
+        })
     }
 
     /// A child that exits while a process it started holds its output open ends its run at the
     /// deadline with [`io::ErrorKind::TimedOut`], rather than waiting for that process, which
     /// the run leaves alone and the case then ends.
-    #[tokio::test]
-    async fn an_output_held_open_past_the_deadline_ends_the_run() -> Result<(), HarnessError> {
-        let pid_file = pid_file("held-open");
-        let mut command = Command::new("/bin/sh");
-        command
-            .arg("-c")
-            .arg(format!(
-                "sleep {} & echo $! > \"$0\"",
-                CHILD_SLEEP.as_secs()
-            ))
-            .arg(&pid_file);
-        let began = Instant::now();
-        let run = run_child(command, CHILD_CUT).await;
-        let took = began.elapsed();
-        // The holder still runs, as the run left it alone, so its ID is still its own.
-        let ended = recorded_pid(&pid_file).map(|pid| send_signal(pid, "SIGTERM"));
+    #[test]
+    fn an_output_held_open_past_the_deadline_ends_the_run() -> Result<(), HarnessError> {
+        block_on(async {
+            let pid_file = pid_file("held-open");
+            let mut command = Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg(format!(
+                    "sleep {} & echo $! > \"$0\"",
+                    CHILD_SLEEP.as_secs()
+                ))
+                .arg(&pid_file);
+            let began = Instant::now();
+            let run = run_child(command, CHILD_CUT).await;
+            let took = began.elapsed();
+            // The holder still runs, as the run left it alone, so its ID is still its own.
+            let ended = recorded_pid(&pid_file).map(|pid| send_signal(pid, "SIGTERM"));
 
-        let Err(err) = run else {
-            panic!("a run whose output stayed open finished: {run:?}");
-        };
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert_eq!(
-            err.to_string(),
-            "/bin/sh exited, but its output did not close within 500ms"
-        );
-        assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
-        assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
-        Ok(())
+            let Err(err) = run else {
+                panic!("a run whose output stayed open finished: {run:?}");
+            };
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+            assert_eq!(
+                err.to_string(),
+                "/bin/sh exited, but its output did not close within 500ms"
+            );
+            assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
+            assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
+            Ok(())
+        })
     }
 
     #[test]
@@ -2439,74 +2506,72 @@ mod tests {
         assert_eq!(finish_bound(Some(Duration::MAX)), Duration::MAX);
     }
 
-    #[tokio::test]
-    async fn a_timeout_waits_for_a_late_create_on_a_current_thread_runtime()
-    -> Result<(), HarnessError> {
-        late_create_case(GiveUp::Timeout).await
+    #[test]
+    fn a_timeout_waits_for_a_late_create_on_a_current_thread_runtime() -> Result<(), HarnessError> {
+        block_on(late_create_case(GiveUp::Timeout))
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_timeout_waits_for_a_late_create_on_a_multi_thread_runtime()
-    -> Result<(), HarnessError> {
-        late_create_case(GiveUp::Timeout).await
+    #[test]
+    fn a_timeout_waits_for_a_late_create_on_a_multi_thread_runtime() -> Result<(), HarnessError> {
+        block_on_multi_thread(None, late_create_case(GiveUp::Timeout))
     }
 
-    #[tokio::test]
-    async fn a_current_thread_runtime_shutdown_waits_for_a_late_create() -> Result<(), HarnessError>
-    {
-        late_create_case(GiveUp::Shutdown {
+    #[test]
+    fn a_current_thread_runtime_shutdown_waits_for_a_late_create() -> Result<(), HarnessError> {
+        block_on(late_create_case(GiveUp::Shutdown {
             multi_thread: false,
-        })
-        .await
+        }))
     }
 
-    #[tokio::test]
-    async fn a_multi_thread_runtime_shutdown_waits_for_a_late_create() -> Result<(), HarnessError> {
-        late_create_case(GiveUp::Shutdown { multi_thread: true }).await
+    #[test]
+    fn a_multi_thread_runtime_shutdown_waits_for_a_late_create() -> Result<(), HarnessError> {
+        block_on(late_create_case(GiveUp::Shutdown { multi_thread: true }))
     }
 
     /// The fake start creates its container, then panics. The panic becomes the start's error,
     /// and the container is gone when the error returns.
-    #[tokio::test]
-    async fn a_start_that_panics_fails_and_removes_its_container() -> Result<(), HarnessError> {
-        let docker = docker().await?;
-        let instance = Instance::new("postgres");
-        let starting: Starting = Box::pin(panicking_create(same(&instance)));
-        let started = start_with(
-            starting,
-            "start panicking container",
-            &instance,
-            finish_bound(None),
-        )
-        .await;
-        let left = labelled(&docker, &instance.token).await;
-        let named = exists(&docker, &instance.name).await;
-        let leftovers_removed = remove_leftovers(
-            &docker,
-            left.as_deref()
-                .unwrap_or_default()
-                .iter()
-                .map(String::as_str)
-                .chain([instance.name.as_str()]),
-        )
-        .await;
-
-        let Err(err) = started else {
-            panic!("a start that panicked succeeded");
-        };
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "start panicking container: the start panicked; the cleanup removed 1 \
-                 container(s) labelled {INSTANCE_LABEL}={}",
-                instance.token
+    #[test]
+    fn a_start_that_panics_fails_and_removes_its_container() -> Result<(), HarnessError> {
+        block_on(async {
+            let docker = docker().await?;
+            let instance = Instance::new("postgres");
+            let starting: Starting = Box::pin(panicking_create(same(&instance)));
+            let started = start_with(
+                starting,
+                "start panicking container",
+                &instance,
+                finish_bound(None),
             )
-        );
-        assert!(
-            left.as_ref().is_ok_and(Vec::is_empty) && matches!(named, Ok(false)),
-            "{left:?}, {named:?}; removal: {leftovers_removed:?}"
-        );
-        Ok(())
+            .await;
+            let left = labelled(&docker, &instance.token).await;
+            let named = exists(&docker, &instance.name).await;
+            let leftovers_removed = remove_leftovers(
+                &docker,
+                left.as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(String::as_str)
+                    .chain([instance.name.as_str()]),
+            )
+            .await;
+
+            let Err(err) = started else {
+                panic!("a start that panicked succeeded");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "start panicking container: the start panicked; the cleanup removed 1 \
+                     container(s) labelled {INSTANCE_LABEL}={}",
+                    instance.token
+                )
+            );
+            assert!(
+                left.as_ref().is_ok_and(Vec::is_empty) && matches!(named, Ok(false)),
+                "{left:?}, {named:?}; removal: {leftovers_removed:?}"
+            );
+            Ok(())
+        })
     }
 
     #[test]
@@ -2547,144 +2612,180 @@ mod tests {
     /// harness's status rather than the watcher's. A case that ends first closes the child's
     /// standard input, and the child then sends itself SIGTERM, so that it leaves nothing behind
     /// either.
-    #[tokio::test]
-    async fn an_interrupt_child_holds_containers_until_its_signal() -> Result<(), HarnessError> {
+    #[test]
+    fn an_interrupt_child_holds_containers_until_its_signal() -> Result<(), HarnessError> {
         const CONTEXT: &str = "start sleeping container";
         if env::var_os(INTERRUPT_CHILD).is_none() {
             return Ok(());
         }
-        let guard = start_postgres().await?;
-        let (began_sender, began) = oneshot::channel();
-        let held_back = Instance::new("postgres");
-        let in_flight = tokio::spawn(async move {
-            let starting: Starting = Box::pin(start_after_stop(same(&held_back), began_sender));
-            start_with(starting, CONTEXT, &held_back, finish_bound(None)).await
-        });
-        began
-            .await
-            .map_err(|err| HarnessError::new("begin the held-back start", &err))?;
-        println!("{CHILD_READY}{}", process_token());
+        block_on(async {
+            let guard = start_postgres().await?;
+            let (began_sender, began) = oneshot::channel();
+            let held_back = Instance::new("postgres");
+            let in_flight = tokio::spawn(async move {
+                let starting: Starting = Box::pin(start_after_stop(same(&held_back), began_sender));
+                start_with(starting, CONTEXT, &held_back, finish_bound(None)).await
+            });
+            began
+                .await
+                .map_err(|err| HarnessError::new("begin the held-back start", &err))?;
+            println!("{CHILD_READY}{}", process_token());
 
-        let (closed_sender, closed) = oneshot::channel();
-        thread::Builder::new()
-            .name("test-support-child-stdin".to_owned())
-            .spawn(move || {
-                // Any end of the input, a read error included, means the case is gone.
-                let _ = io::copy(&mut io::stdin(), &mut io::sink());
-                let _ = closed_sender.send(());
-            })
-            .map_err(|err| HarnessError::new("spawn the child's stdin reader", &err))?;
-        tokio::select! {
-            // The sender drops unsent only if its thread panicked; either way the case is gone.
-            _ = closed => send_signal(process::id(), "SIGTERM")?,
-            () = stopped() => {}
-        }
-        stopped().await;
-
-        let runtime = Handle::current();
-        let (dropped_sender, dropped) = oneshot::channel();
-        thread::Builder::new()
-            .name("test-support-child-drop".to_owned())
-            .spawn(move || {
-                // The container handle's own drop needs the runtime, should the guard's return.
-                let _entered = runtime.enter();
-                drop(guard);
-                let _ = dropped_sender.send(());
-            })
-            .map_err(|err| HarnessError::new("spawn the child's drop thread", &err))?;
-        let late = Instance::new("postgres");
-        let went_on = tokio::select! {
-            outcome = in_flight => format!(
-                "the held-back start returned, ok: {}",
-                matches!(outcome, Ok(Ok(_)))
-            ),
-            started = start_as(sleeping_request(), CONTEXT, &late) => {
-                format!("a start after the signal returned, ok: {}", started.is_ok())
+            let (closed_sender, closed) = oneshot::channel();
+            thread::Builder::new()
+                .name("test-support-child-stdin".to_owned())
+                .spawn(move || {
+                    // Any end of the input, a read error included, means the case is gone.
+                    let _ = io::copy(&mut io::stdin(), &mut io::sink());
+                    let _ = closed_sender.send(());
+                })
+                .map_err(|err| HarnessError::new("spawn the child's stdin reader", &err))?;
+            // Whichever comes first, the end of the input or the signal; the other wait drops
+            // at the end of the block.
+            let gone = {
+                let mut closed = closed;
+                let mut signalled = Box::pin(stopped());
+                future::poll_fn(|cx| {
+                    // The sender drops unsent only if its thread panicked; either way the case
+                    // is gone.
+                    if Pin::new(&mut closed).poll(cx).is_ready() {
+                        return Poll::Ready(true);
+                    }
+                    signalled.as_mut().poll(cx).map(|()| false)
+                })
+                .await
+            };
+            if gone {
+                send_signal(process::id(), "SIGTERM")?;
             }
-            _ = dropped => "the drop of the guard returned".to_owned(),
-        };
-        Err(HarnessError::new("interrupt child", &went_on))
+            stopped().await;
+
+            let runtime = Handle::current();
+            let (dropped_sender, dropped) = oneshot::channel();
+            thread::Builder::new()
+                .name("test-support-child-drop".to_owned())
+                .spawn(move || {
+                    // The container handle's own drop needs the runtime, should the guard's
+                    // return.
+                    let _entered = runtime.enter();
+                    drop(guard);
+                    let _ = dropped_sender.send(());
+                })
+                .map_err(|err| HarnessError::new("spawn the child's drop thread", &err))?;
+            let late = Instance::new("postgres");
+            // The first of the three to return names itself; the others drop at the end of the
+            // block.
+            let went_on = {
+                let (mut in_flight, mut dropped) = (in_flight, dropped);
+                let mut started = Box::pin(start_as(sleeping_request(), CONTEXT, &late));
+                future::poll_fn(|cx| {
+                    if let Poll::Ready(outcome) = Pin::new(&mut in_flight).poll(cx) {
+                        return Poll::Ready(format!(
+                            "the held-back start returned, ok: {}",
+                            matches!(outcome, Ok(Ok(_)))
+                        ));
+                    }
+                    if let Poll::Ready(started) = started.as_mut().poll(cx) {
+                        return Poll::Ready(format!(
+                            "a start after the signal returned, ok: {}",
+                            started.is_ok()
+                        ));
+                    }
+                    Pin::new(&mut dropped)
+                        .poll(cx)
+                        .map(|_| "the drop of the guard returned".to_owned())
+                })
+                .await
+            };
+            Err(HarnessError::new("interrupt child", &went_on))
+        })
     }
 
     /// SIGTERM, as a runner's timeout sends it, and SIGINT, as Ctrl-C sends it, each remove every
     /// container of the process, one created after the signal included, and end it with 143 and
     /// 130; a SIGINT the process inherited as ignored leaves it running.
-    #[tokio::test]
-    async fn an_interrupted_run_leaves_no_container_of_its_process() -> Result<(), HarnessError> {
-        let [interrupt, terminate] = HANDLED_SIGNALS;
-        for (signal, trapped) in [(terminate, false), (interrupt, false), (interrupt, true)] {
-            interrupted_run_case(signal, trapped).await?;
-        }
-        Ok(())
+    #[test]
+    fn an_interrupted_run_leaves_no_container_of_its_process() -> Result<(), HarnessError> {
+        block_on(async {
+            let [interrupt, terminate] = HANDLED_SIGNALS;
+            for (signal, trapped) in [(terminate, false), (interrupt, false), (interrupt, true)] {
+                interrupted_run_case(signal, trapped).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Against an endpoint that accepts every connection and never answers, the cleanup after a
     /// signal cuts each removal round off at [`INTERRUPT_ROUND_TIMEOUT`], starts the next over a
     /// connection of its own, and ends at [`INTERRUPT_CLEANUP_TIMEOUT`] with a line naming the
     /// cut, rather than waiting out the client's [`DOCKER_ANSWER_TIMEOUT`] on its first request.
-    #[tokio::test]
-    async fn a_cleanup_round_without_an_answer_is_cut_off_and_the_next_starts()
-    -> Result<(), HarnessError> {
+    #[test]
+    fn a_cleanup_round_without_an_answer_is_cut_off_and_the_next_starts() -> Result<(), HarnessError>
+    {
         const TOKEN: &str = "unanswered";
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
-            .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
-        let address = listener
-            .local_addr()
-            .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopping = Arc::clone(&stop);
-        let endpoint = thread::Builder::new()
-            .name("test-support-silent-endpoint".to_owned())
-            .spawn(move || {
-                // Every connection stays open, unread and unanswered, until the case ends.
-                let mut held = Vec::new();
-                while !stopping.load(Ordering::SeqCst) {
-                    match listener.accept() {
-                        Ok((stream, _)) => held.push(stream),
-                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
-                        Err(_) => break,
+        block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+                .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
+            let address = listener
+                .local_addr()
+                .map_err(|err| HarnessError::new("bind the silent endpoint", &err))?;
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = Arc::clone(&stop);
+            let endpoint = thread::Builder::new()
+                .name("test-support-silent-endpoint".to_owned())
+                .spawn(move || {
+                    // Every connection stays open, unread and unanswered, until the case ends.
+                    let mut held = Vec::new();
+                    while !stopping.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((stream, _)) => held.push(stream),
+                            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                                thread::sleep(POLL);
+                            }
+                            Err(_) => break,
+                        }
                     }
-                }
-                held.len()
-            })
-            .map_err(|err| HarnessError::new("spawn the silent endpoint", &err))?;
-        let docker = Docker::connect_with_http(
-            &format!("tcp://{address}"),
-            DOCKER_ANSWER_TIMEOUT.as_secs(),
-            API_DEFAULT_VERSION,
-        )
-        .map_err(|err| HarnessError::new("connect to the silent endpoint", &err))?;
-        let began = Instant::now();
-        let line = drain(&docker, TOKEN).await;
-        let took = began.elapsed();
-        stop.store(true, Ordering::SeqCst);
-        let connections = endpoint.join();
+                    held.len()
+                })
+                .map_err(|err| HarnessError::new("spawn the silent endpoint", &err))?;
+            let docker = Docker::connect_with_http(
+                &format!("tcp://{address}"),
+                DOCKER_ANSWER_TIMEOUT.as_secs(),
+                API_DEFAULT_VERSION,
+            )
+            .map_err(|err| HarnessError::new("connect to the silent endpoint", &err))?;
+            let began = Instant::now();
+            let line = drain(&docker, TOKEN).await;
+            let took = began.elapsed();
+            stop.store(true, Ordering::SeqCst);
+            let connections = endpoint.join();
 
-        let label = format!("{PROCESS_LABEL}={TOKEN}");
-        let opening = format!(
-            "removed 0 container(s) labelled {label}; the cleanup did not finish within {} s, \
-             with ",
-            INTERRUPT_CLEANUP_TIMEOUT.as_secs()
-        );
-        let closing = format!(
-            "; the last removal failed: a removal round did not finish within {} s; containers \
-             labelled {label} may remain",
-            INTERRUPT_ROUND_TIMEOUT.as_secs()
-        );
-        assert!(
-            line.starts_with(&opening) && line.ends_with(&closing),
-            "{line:?}"
-        );
-        assert!(
-            took >= INTERRUPT_CLEANUP_TIMEOUT
-                && took < INTERRUPT_CLEANUP_TIMEOUT.saturating_add(INTERRUPT_ROUND_TIMEOUT),
-            "{took:?}"
-        );
-        assert!(
-            matches!(connections, Ok(rounds) if rounds >= 2),
-            "{connections:?}"
-        );
-        Ok(())
+            let label = format!("{PROCESS_LABEL}={TOKEN}");
+            let opening = format!(
+                "removed 0 container(s) labelled {label}; the cleanup did not finish within {} \
+                 s, with ",
+                INTERRUPT_CLEANUP_TIMEOUT.as_secs()
+            );
+            let closing = format!(
+                "; the last removal failed: a removal round did not finish within {} s; \
+                 containers labelled {label} may remain",
+                INTERRUPT_ROUND_TIMEOUT.as_secs()
+            );
+            assert!(
+                line.starts_with(&opening) && line.ends_with(&closing),
+                "{line:?}"
+            );
+            assert!(
+                took >= INTERRUPT_CLEANUP_TIMEOUT
+                    && took < INTERRUPT_CLEANUP_TIMEOUT.saturating_add(INTERRUPT_ROUND_TIMEOUT),
+                "{took:?}"
+            );
+            assert!(
+                matches!(connections, Ok(rounds) if rounds >= 2),
+                "{connections:?}"
+            );
+            Ok(())
+        })
     }
 }

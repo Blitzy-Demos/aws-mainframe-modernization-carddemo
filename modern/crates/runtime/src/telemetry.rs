@@ -108,10 +108,11 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::SpanExporter;
 use opentelemetry_sdk::trace::{Tracer, TracerProvider};
-use tracing::callsite::{Callsite as _, DefaultCallsite};
-use tracing::field::Empty;
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{Empty, FieldSet, Value};
 use tracing::level_filters::STATIC_MAX_LEVEL;
-use tracing::{Metadata, Span, Subscriber, info_span};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata, Span, Subscriber};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::filter::{
     Builder, EnvFilter, FromEnvError, LevelFilter, Targets, filter_fn,
@@ -126,12 +127,12 @@ use crate::config::OtelExport;
 
 /// Target of every alert event.
 ///
-/// An alert is emitted as
-/// `tracing::error!(target: runtime::telemetry::ALERT_TARGET, alert = "…", …)`. Its field values
-/// name the condition and give each requester-chosen message identifier only as its keyed
-/// [`ScreenedText`] shows it, the base64url HMAC-SHA256 under the same [`IdKey`] as the message
-/// spans, so an alert is matched to the message spans of the same request; they never hold a
-/// message body, the text of a requester's property or a protected value.
+/// An alert is an `ERROR` event whose target is this constant and whose `alert` field names the
+/// condition, such as `CP00_CARD_UNPARSEABLE`. Its field values give each requester-chosen
+/// message identifier only as its keyed [`ScreenedText`] shows it, the base64url HMAC-SHA256
+/// under the same [`IdKey`] as the message spans, so an alert is matched to the message spans of
+/// the same request; they never hold a message body, the text of a requester's property or a
+/// protected value.
 pub const ALERT_TARGET: &str = "carddemo::alert";
 
 /// Route the api records when axum provides no `MatchedPath` (a request no route matched), so a
@@ -445,10 +446,29 @@ impl Drop for FlushGuard {
     fn drop(&mut self) {
         if let Some(provider) = self.provider.take() {
             if let Err(err) = provider.shutdown() {
-                tracing::warn!(error = %err, "OpenTelemetry span export shutdown failed");
+                export_shutdown_failed(&err);
             }
         }
     }
+}
+
+/// `WARN` when the span exporter's shutdown fails, with the provider's `error`.
+fn export_shutdown_failed(error: &dyn fmt::Display) {
+    static SITE: Site<2> = Site::new(&METADATA);
+    static METADATA: Metadata<'static> = site_metadata(
+        "export_shutdown_failed",
+        Kind::EVENT,
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit_event(
+        &SITE,
+        [
+            Some(&"OpenTelemetry span export shutdown failed"),
+            Some(&tracing::field::display(error)),
+        ],
+    );
 }
 
 /// Why [`init`] could not install the subscriber.
@@ -503,12 +523,22 @@ impl Error for InitError {
 /// `TraceLayer` does; never hold `Span::enter` across an `.await`.
 #[must_use]
 pub fn request_span(method: &str, matched_path: &str) -> Span {
-    info_span!(
+    static SITE: Site<4> = Site::new(&METADATA);
+    static METADATA: Metadata<'static> = site_metadata(
         REQUEST_SPAN,
-        method,
-        route = matched_path,
-        status = Empty,
-        latency_ms = Empty
+        Kind::SPAN,
+        Level::INFO,
+        &["method", "route", "status", "latency_ms"],
+        &SITE,
+    );
+    new_span(
+        &SITE,
+        [
+            Some(&method),
+            Some(&matched_path),
+            Some(&Empty),
+            Some(&Empty),
+        ],
     )
 }
 
@@ -656,12 +686,17 @@ pub fn message_span(
     message_id: Option<ScreenedText<'_>>,
     correlation_id: Option<ScreenedText<'_>>,
 ) -> Span {
-    let span = info_span!(
+    static SITE: Site<4> = Site::new(&METADATA);
+    static METADATA: Metadata<'static> = site_metadata(
         "mq.message",
-        queue,
-        message_id = Empty,
-        correlation_id = Empty,
-        reply_message_id = Empty
+        Kind::SPAN,
+        Level::INFO,
+        &["queue", "message_id", "correlation_id", "reply_message_id"],
+        &SITE,
+    );
+    let span = new_span(
+        &SITE,
+        [Some(&queue), Some(&Empty), Some(&Empty), Some(&Empty)],
     );
     if let Some(message_id) = message_id {
         span.record("message_id", tracing::field::display(message_id));
@@ -698,26 +733,36 @@ pub fn record_reply_message_id(span: &Span, message_id: &str) {
 pub fn job_span(job: &str) -> Span {
     // A span's fields are declared here, where it is created, and a later record of a name it
     // does not declare is dropped: each counter's name is the literal `JobCounter::field` gives.
-    info_span!(
+    static SITE: Site<17> = Site::new(&METADATA);
+    static METADATA: Metadata<'static> = site_metadata(
         "batch.job",
-        job,
-        return_code = Empty,
-        records = Empty,
-        processed = Empty,
-        rejected = Empty,
-        failed = Empty,
-        transactions = Empty,
-        accounts = Empty,
-        statements = Empty,
-        text_records = Empty,
-        html_records = Empty,
-        report_lines = Empty,
-        summaries_read = Empty,
-        summaries_deleted = Empty,
-        details_read = Empty,
-        details_deleted = Empty,
-        checkpoints = Empty
-    )
+        Kind::SPAN,
+        Level::INFO,
+        &[
+            "job",
+            "return_code",
+            "records",
+            "processed",
+            "rejected",
+            "failed",
+            "transactions",
+            "accounts",
+            "statements",
+            "text_records",
+            "html_records",
+            "report_lines",
+            "summaries_read",
+            "summaries_deleted",
+            "details_read",
+            "details_deleted",
+            "checkpoints",
+        ],
+        &SITE,
+    );
+    // `job` opens with its value; the outcome fields, `return_code` and the counters, open empty.
+    let mut values: [Option<&dyn Value>; 17] = [Some(&Empty); 17];
+    values[0] = Some(&job);
+    new_span(&SITE, values)
 }
 
 /// A counter of a batch job's outcome, recorded on its [`job_span`] under the field name
@@ -839,12 +884,18 @@ pub fn record_job_outcome(span: &Span, return_code: u8, counts: &[(JobCounter, u
 /// `always` or the current dispatcher enables the event's metadata.
 ///
 /// It serves code that writes an event's callsite out by hand, a `DefaultCallsite` static over a
-/// `tracing::metadata!` static, and dispatches the event with `tracing::Event::dispatch` only when
-/// this returns `true`. Such code exists because the expansion of `tracing::info!` and the other
-/// event macros carries a lint suppression, an `allow(unused_imports)` attribute, and no source of
-/// this workspace, hand-written or generated, holds one.
+/// `Metadata` static, and dispatches the event with `tracing::Event::dispatch` only when this
+/// returns `true`. Such code exists because the expansion of `tracing::info!` and the other event
+/// macros carries a lint suppression, an `allow(unused_imports)` attribute, and no source of this
+/// workspace, hand-written or generated, holds one.
 #[must_use]
 pub fn event_enabled(callsite: &'static DefaultCallsite) -> bool {
+    callsite_enabled(callsite)
+}
+
+/// Whether a span or an event of `callsite` is enabled now, decided in the steps that
+/// [`event_enabled`] lists, which `tracing`'s span macros take as its event macros do.
+fn callsite_enabled(callsite: &'static DefaultCallsite) -> bool {
     let metadata = callsite.metadata();
     let level = *metadata.level();
     if level > STATIC_MAX_LEVEL || level > LevelFilter::current() {
@@ -854,6 +905,80 @@ pub fn event_enabled(callsite: &'static DefaultCallsite) -> bool {
     !interest.is_never()
         && (interest.is_always()
             || tracing::dispatcher::get_default(|dispatch| dispatch.enabled(metadata)))
+}
+
+/// A callsite of this module written out without a `tracing` macro, whose metadata names `N`
+/// fields.
+///
+/// The expansion of every `tracing` span and event macro carries an `allow(unused_imports)`
+/// attribute, so each span and event of this module is written out as two statics, a `Site` and
+/// the [`site_metadata`] it holds, and made with [`new_span`] or [`emit_event`]. All three take
+/// the same `N`, so a span or an event always carries exactly one value, or `None`, per field it
+/// declares.
+struct Site<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> Site<N> {
+    /// The callsite that `metadata` describes.
+    const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the span or event `name` of `kind` at `level`, with the field `names`, for the
+/// callsite `site`.
+///
+/// The target and the module path are this module's, `runtime::telemetry`, the ones a `tracing`
+/// macro here gives, so `RUST_LOG` directives and [`is_request_span`] select it as they would
+/// select a macro's. No source file or line is given: the JSON output and the span export print
+/// neither.
+const fn site_metadata<const N: usize>(
+    name: &'static str,
+    kind: Kind,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static Site<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        module_path!(),
+        level,
+        None,
+        None,
+        Some(module_path!()),
+        FieldSet::new(names, Identifier(&site.0)),
+        kind,
+    )
+}
+
+/// The span of `site` with `values`, one per field the site names and in that order, made as
+/// `tracing`'s span macros make one: a span in the current context when [`callsite_enabled`]
+/// says so, and a disabled span otherwise.
+///
+/// A disabled span is still handed `values` through `Span::record_all`, as the macros hand them:
+/// `tracing` built with its `log` feature passes them on to the `log` crate while no `tracing`
+/// dispatcher has been set, and otherwise does nothing with them.
+fn new_span<const N: usize>(site: &'static Site<N>, values: [Option<&dyn Value>; N]) -> Span {
+    let callsite = &site.0;
+    let metadata = callsite.metadata();
+    let values = metadata.fields().value_set_all(&values);
+    if callsite_enabled(callsite) {
+        Span::new(metadata, &values)
+    } else {
+        let span = Span::new_disabled(metadata);
+        span.record_all(&values);
+        span
+    }
+}
+
+/// Emits one event of `site` in the current span with `values`, one per field the site names
+/// and in that order, a `None` leaving its field out, when [`event_enabled`] says so.
+fn emit_event<const N: usize>(site: &'static Site<N>, values: [Option<&dyn Value>; N]) {
+    let callsite = &site.0;
+    if !event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
 }
 
 #[cfg(test)]
@@ -872,8 +997,8 @@ mod tests {
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
     use opentelemetry_sdk::trace::TracerProvider;
-    use tracing::callsite::{Callsite as _, DefaultCallsite};
-    use tracing::field::{Field, Value};
+    use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+    use tracing::field::{Field, FieldSet, Value};
     use tracing::metadata::Kind;
     use tracing::{Event, Level, Metadata};
     use tracing_subscriber::filter::{EnvFilter, FromEnvError, LevelFilter};
@@ -881,11 +1006,11 @@ mod tests {
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::{
-        ALERT_TARGET, IdKey, InitError, JobCounter, OtelExport, SERVICE_NAME_KEY, SILENCED_TARGETS,
-        ScreenedText, UNMATCHED_ROUTE, dependency_filter, env_filter, event_enabled, init,
-        is_request_span, job_span, json_layer, json_subscriber, message_span, otel_layer,
-        record_job_outcome, record_reply_message_id, record_response, request_span, service_name,
-        service_resource, tracer_provider,
+        ALERT_TARGET, FlushGuard, IdKey, InitError, JobCounter, OtelExport, SERVICE_NAME_KEY,
+        SILENCED_TARGETS, ScreenedText, Site, UNMATCHED_ROUTE, dependency_filter, emit_event,
+        env_filter, event_enabled, init, is_request_span, job_span, json_layer, json_subscriber,
+        message_span, otel_layer, record_job_outcome, record_reply_message_id, record_response,
+        request_span, service_name, service_resource, tracer_provider,
     };
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
@@ -973,7 +1098,6 @@ mod tests {
     /// The callsite of the `INFO` probe event, whose one field is its `message`.
     static PROBE: DefaultCallsite = DefaultCallsite::new(&PROBE_METADATA);
 
-    /// The metadata of [`PROBE`].
     static PROBE_METADATA: Metadata<'static> = tracing::metadata! {
         name: "probe",
         target: module_path!(),
@@ -986,7 +1110,6 @@ mod tests {
     /// The callsite of the `WARN` probe event, whose one field is its `message`.
     static WARN_PROBE: DefaultCallsite = DefaultCallsite::new(&WARN_PROBE_METADATA);
 
-    /// The metadata of [`WARN_PROBE`].
     static WARN_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
         name: "warn probe",
         target: module_path!(),
@@ -1017,12 +1140,105 @@ mod tests {
         emit(&PROBE, message);
     }
 
+    /// The metadata of a probe event of this module at `level` with `target` and the field
+    /// `names`, for the callsite `site`.
+    const fn probe_metadata<const N: usize>(
+        target: &'static str,
+        level: Level,
+        names: &'static [&'static str; N],
+        site: &'static Site<N>,
+    ) -> Metadata<'static> {
+        Metadata::new(
+            "probe",
+            target,
+            level,
+            None,
+            None,
+            Some(module_path!()),
+            FieldSet::new(names, Identifier(&site.0)),
+            Kind::EVENT,
+        )
+    }
+
+    /// The [`probe_metadata`] of a probe event whose one field is its `message`.
+    const fn message_probe(
+        target: &'static str,
+        level: Level,
+        site: &'static Site<1>,
+    ) -> Metadata<'static> {
+        probe_metadata(target, level, &["message"], site)
+    }
+
+    /// The callsite of the alert probe, an `ERROR` event of target [`ALERT_TARGET`] whose fields
+    /// are its `message` and `alert`.
+    static ALERT_PROBE: Site<2> = Site::new(&ALERT_PROBE_METADATA);
+
+    static ALERT_PROBE_METADATA: Metadata<'static> = probe_metadata(
+        ALERT_TARGET,
+        Level::ERROR,
+        &["message", "alert"],
+        &ALERT_PROBE,
+    );
+
+    /// Emits the alert probe with `message` and the `alert` `CP00_CARD_UNPARSEABLE`.
+    fn alert(message: &str) {
+        emit_event(
+            &ALERT_PROBE,
+            [Some(&message), Some(&"CP00_CARD_UNPARSEABLE")],
+        );
+    }
+
+    /// The callsites of the dependency probes: an `ERROR` and a `TRACE` event at each of
+    /// `lapin::channels`, `amq_protocol_tcp` and `pinky_swear`, whose one field is their
+    /// `message`.
+    static DEPENDENCY_PROBES: [Site<1>; 6] = [
+        Site::new(&DEPENDENCY_PROBE_METADATA[0]),
+        Site::new(&DEPENDENCY_PROBE_METADATA[1]),
+        Site::new(&DEPENDENCY_PROBE_METADATA[2]),
+        Site::new(&DEPENDENCY_PROBE_METADATA[3]),
+        Site::new(&DEPENDENCY_PROBE_METADATA[4]),
+        Site::new(&DEPENDENCY_PROBE_METADATA[5]),
+    ];
+
+    static DEPENDENCY_PROBE_METADATA: [Metadata<'static>; 6] = [
+        message_probe("lapin::channels", Level::ERROR, &DEPENDENCY_PROBES[0]),
+        message_probe("lapin::channels", Level::TRACE, &DEPENDENCY_PROBES[1]),
+        message_probe("amq_protocol_tcp", Level::ERROR, &DEPENDENCY_PROBES[2]),
+        message_probe("amq_protocol_tcp", Level::TRACE, &DEPENDENCY_PROBES[3]),
+        message_probe("pinky_swear", Level::ERROR, &DEPENDENCY_PROBES[4]),
+        message_probe("pinky_swear", Level::TRACE, &DEPENDENCY_PROBES[5]),
+    ];
+
+    /// The callsites of the application probes: an `INFO`, a `DEBUG` and a `TRACE` event of
+    /// target `messaging::workers`, whose one field is their `message`.
+    static APPLICATION_PROBES: [Site<1>; 3] = [
+        Site::new(&APPLICATION_PROBE_METADATA[0]),
+        Site::new(&APPLICATION_PROBE_METADATA[1]),
+        Site::new(&APPLICATION_PROBE_METADATA[2]),
+    ];
+
+    static APPLICATION_PROBE_METADATA: [Metadata<'static>; 3] = [
+        message_probe("messaging::workers", Level::INFO, &APPLICATION_PROBES[0]),
+        message_probe("messaging::workers", Level::DEBUG, &APPLICATION_PROBES[1]),
+        message_probe("messaging::workers", Level::TRACE, &APPLICATION_PROBES[2]),
+    ];
+
+    /// The callsite of the `INFO` step probe of this module, whose fields are its `message` and
+    /// `step`.
+    static STEP_PROBE: Site<2> = Site::new(&STEP_PROBE_METADATA);
+
+    static STEP_PROBE_METADATA: Metadata<'static> = probe_metadata(
+        module_path!(),
+        Level::INFO,
+        &["message", "step"],
+        &STEP_PROBE,
+    );
+
     /// The callsite of a span of the request span's name and fields made in another module, this
     /// test module.
     static OTHER_MODULE_REQUEST: DefaultCallsite =
         DefaultCallsite::new(&OTHER_MODULE_REQUEST_METADATA);
 
-    /// The metadata of [`OTHER_MODULE_REQUEST`].
     static OTHER_MODULE_REQUEST_METADATA: Metadata<'static> = tracing::metadata! {
         name: "http.request",
         target: module_path!(),
@@ -1035,7 +1251,6 @@ mod tests {
     /// The callsite of an event of the request span's name and target.
     static REQUEST_EVENT: DefaultCallsite = DefaultCallsite::new(&REQUEST_EVENT_METADATA);
 
-    /// The metadata of [`REQUEST_EVENT`].
     static REQUEST_EVENT_METADATA: Metadata<'static> = tracing::metadata! {
         name: "http.request",
         target: "runtime::telemetry",
@@ -1096,7 +1311,7 @@ mod tests {
         let output = capture(|| {
             let span = request_span("GET", "/api/v1/accounts/{acct_id}/view");
             record_response(&span, 200, Duration::from_millis(12));
-            span.in_scope(|| tracing::info!("probe"));
+            span.in_scope(|| probe("probe"));
         });
         assert_contains_all(
             &output,
@@ -1116,7 +1331,7 @@ mod tests {
     #[test]
     fn request_span_before_the_response_has_no_status_or_latency() {
         let output = capture(|| {
-            request_span("POST", UNMATCHED_ROUTE).in_scope(|| tracing::info!("probe"));
+            request_span("POST", UNMATCHED_ROUTE).in_scope(|| probe("probe"));
         });
         assert_contains_all(&output, &[r#""method":"POST""#, r#""route":"<unmatched>""#]);
         assert!(!output.contains(r#""status""#), "{output}");
@@ -1128,7 +1343,7 @@ mod tests {
         let output = capture(|| {
             let span = request_span("PUT", "/api/v1/cards/{card_ref}");
             record_response(&span, 500, Duration::MAX);
-            span.in_scope(|| tracing::info!("probe"));
+            span.in_scope(|| probe("probe"));
         });
         assert_contains_all(
             &output,
@@ -1306,7 +1521,7 @@ mod tests {
                     Some(ScreenedText::new(message_id)),
                     Some(ScreenedText::new(correlation_id)),
                 )
-                .in_scope(|| tracing::info!("probe"));
+                .in_scope(|| probe("probe"));
             });
             let message_stars = format!(r#""message_id":"{}""#, "*".repeat(message_id.len()));
             let correlation_stars =
@@ -1326,7 +1541,7 @@ mod tests {
         }
 
         let without_ids = capture(|| {
-            message_span("CARD.DEMO.REQUEST.DATE", None, None).in_scope(|| tracing::info!("probe"));
+            message_span("CARD.DEMO.REQUEST.DATE", None, None).in_scope(|| probe("probe"));
         });
         assert_contains_all(&without_ids, &[r#""queue":"CARD.DEMO.REQUEST.DATE""#]);
         assert!(!without_ids.contains("message_id"), "{without_ids}");
@@ -1409,9 +1624,9 @@ mod tests {
                     Some(ScreenedText::keyed(message_id, &key)),
                     Some(ScreenedText::keyed(correlation_id, &key)),
                 );
-                span.in_scope(|| tracing::info!("before the reply"));
+                span.in_scope(|| probe("before the reply"));
                 record_reply_message_id(&span, REPLY_MESSAGE_ID);
-                span.in_scope(|| tracing::info!("after the reply"));
+                span.in_scope(|| probe("after the reply"));
             });
             let lines: Vec<&str> = output.lines().collect();
             let [before, after] = lines.as_slice() else {
@@ -1449,14 +1664,14 @@ mod tests {
 
     #[test]
     fn job_span_records_the_job_name() {
-        let output = capture(|| job_span("posttran").in_scope(|| tracing::info!("probe")));
+        let output = capture(|| job_span("posttran").in_scope(|| probe("probe")));
         assert_contains_all(&output, &[r#""name":"batch.job""#, r#""job":"posttran""#]);
     }
 
     #[test]
     fn alerts_are_error_events_with_the_alert_target() {
         let output = capture(|| {
-            tracing::error!(target: ALERT_TARGET, alert = "CP00_CARD_UNPARSEABLE", "probe");
+            alert("probe");
         });
         assert_contains_all(
             &output,
@@ -1488,16 +1703,18 @@ mod tests {
             let captured = Captured::default();
             let subscriber = json_subscriber(EnvFilter::new(directives), captured.clone());
             tracing::subscriber::with_default(subscriber, || {
-                tracing::error!(target: "lapin::channels", "dependency probe");
-                tracing::trace!(target: "lapin::channels", "dependency probe");
-                tracing::error!(target: "amq_protocol_tcp", "dependency probe");
-                tracing::trace!(target: "amq_protocol_tcp", "dependency probe");
-                tracing::error!(target: "pinky_swear", "dependency probe");
-                tracing::trace!(target: "pinky_swear", "dependency probe");
-                tracing::info!(target: "messaging::workers", "application info probe");
-                tracing::debug!(target: "messaging::workers", "application debug probe");
-                tracing::trace!(target: "messaging::workers", "application trace probe");
-                tracing::error!(target: ALERT_TARGET, alert = "CP00_CARD_UNPARSEABLE", "alert");
+                for site in &DEPENDENCY_PROBES {
+                    emit_event(site, [Some(&"dependency probe")]);
+                }
+                let messages = [
+                    "application info probe",
+                    "application debug probe",
+                    "application trace probe",
+                ];
+                for (site, message) in APPLICATION_PROBES.iter().zip(messages) {
+                    emit_event(site, [Some(&message)]);
+                }
+                alert("alert");
             });
             let output = captured.text();
 
@@ -1567,7 +1784,8 @@ mod tests {
             .build();
         let subscriber = tracing_subscriber::registry().with(otel_layer(&provider));
         tracing::subscriber::with_default(subscriber, || {
-            job_span("posttran").in_scope(|| tracing::info!(step = "load", "probe"));
+            job_span("posttran")
+                .in_scope(|| emit_event(&STEP_PROBE, [Some(&"probe"), Some(&"load")]));
         });
 
         let spans = exported.spans();
@@ -1618,7 +1836,7 @@ mod tests {
                     Some(ScreenedText::new(message_id)),
                     Some(ScreenedText::new(correlation_id)),
                 )
-                .in_scope(|| tracing::info!("probe"));
+                .in_scope(|| probe("probe"));
             }
         });
 
@@ -1679,7 +1897,7 @@ mod tests {
                     Some(ScreenedText::keyed(correlation_id, &key)),
                 );
                 record_reply_message_id(&span, REPLY_MESSAGE_ID);
-                span.in_scope(|| tracing::info!("probe"));
+                span.in_scope(|| probe("probe"));
             }
         });
 
@@ -1915,6 +2133,44 @@ mod tests {
             Err(err @ InitError::NotUnicode) => assert!(err.source().is_none()),
             Err(other) => panic!("first install must succeed, got {other:?}"),
         }
+    }
+
+    /// Dropping the guard writes no warning when the exporter shuts down, and one `WARN` event
+    /// of this module naming the provider's error when the shutdown fails, here because the
+    /// provider is already shut down.
+    #[test]
+    fn the_flush_guard_warns_only_when_the_export_shutdown_fails() {
+        let provider = tracer_provider(Exported::default(), Resource::default());
+        let guard = FlushGuard {
+            provider: Some(provider),
+        };
+        let output = capture(|| drop(guard));
+        assert!(!output.contains(r#""level":"WARN""#), "{output}");
+        assert!(!output.contains("shutdown failed"), "{output}");
+
+        let provider = tracer_provider(Exported::default(), Resource::default());
+        // A clone shuts the provider down first, and stays alive past the capture, so the
+        // provider's own drop writes nothing into it.
+        let shut_down = provider.clone();
+        assert!(shut_down.shutdown().is_ok());
+        let guard = FlushGuard {
+            provider: Some(provider),
+        };
+        let output = capture(|| drop(guard));
+        drop(shut_down);
+        let lines: Vec<&str> = output.lines().collect();
+        let [line] = lines.as_slice() else {
+            panic!("expected exactly one line, got {output}");
+        };
+        assert_contains_all(
+            line,
+            &[
+                r#""level":"WARN""#,
+                r#""message":"OpenTelemetry span export shutdown failed""#,
+                r#""error":"TracerProvider already shutdown""#,
+                r#""target":"runtime::telemetry""#,
+            ],
+        );
     }
 
     /// The outcome the job span tests record: `posttran`'s counts over the fixtures, and a count

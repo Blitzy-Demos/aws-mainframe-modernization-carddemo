@@ -71,10 +71,13 @@ use domain::online::{
     cosgn00c, cotrn00c, cotrn01c, cotrn02c, cotrtlic, cotrtupc, cousr00c, cousr01c, cousr02c,
 };
 use persistence::PersistenceError;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
+use tracing::{Level, Metadata};
 use utoipa::ToSchema;
 
-use crate::app::PASSWORD_WAIT;
+use crate::app::{EventSite, PASSWORD_WAIT, emit, event_metadata};
 
 /// The message of a 500 that no COBOL program words: a store error with no audited message,
 /// such as a failed `begin` or `commit`, and an internal failure, such as token signing; and of
@@ -122,7 +125,9 @@ const PAGE_SIZE_FIELD: &str = "page_size";
 ///
 /// The schema name is `ScreenError`: the frontend's generated types refer to
 /// `components["schemas"]["ScreenError"]` (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+// `Serialize` and `Deserialize` are written by hand below; the `#[serde(..)]` attributes are
+// read by `ToSchema` alone.
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({"message": "Please enter User ID ...", "field": "user_id"}))]
 pub struct ScreenError {
     /// The message row, exactly as the program words it; it never holds a full card number,
@@ -285,6 +290,85 @@ impl fmt::Display for ScreenError {
 
 impl std::error::Error for ScreenError {}
 
+/// The wire names of a [`ScreenError`]'s members, in declaration order. The status is no member.
+const SCREEN_ERROR_FIELDS: &[&str] = &["message", "field"];
+
+impl ScreenError {
+    /// Writes the body's members into `map`: `message`, then `field` when present. The body of
+    /// an error that carries more beside the message, such as `dto::coactvwc::AccountViewError`,
+    /// writes these members first, at its own top level.
+    ///
+    /// # Errors
+    ///
+    /// The serialiser's error for either member.
+    pub(crate) fn serialize_members<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("message", &self.message)?;
+        if let Some(field) = &self.field {
+            map.serialize_entry("field", field)?;
+        }
+        Ok(())
+    }
+}
+
+/// `{"message": …, "field": …}`, `field` omitted when absent; the status is not written.
+impl Serialize for ScreenError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(1 + usize::from(self.field.is_some())))?;
+        self.serialize_members(&mut map)?;
+        map.end()
+    }
+}
+
+/// A JSON object with `message` and an optional `field`, `null` included, read with status 500
+/// (`status_not_carried`). An unknown member is skipped; a repeated one, or a missing
+/// `message`, is an error.
+impl<'de> Deserialize<'de> for ScreenError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("ScreenError", SCREEN_ERROR_FIELDS, ScreenErrorVisitor)
+    }
+}
+
+/// The visitor of [`ScreenError`]'s `Deserialize`: it accepts a map alone.
+struct ScreenErrorVisitor;
+
+impl<'de> Visitor<'de> for ScreenErrorVisitor {
+    type Value = ScreenError;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct ScreenError")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<ScreenError, A::Error> {
+        let mut message = None;
+        let mut field = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "message" => {
+                    if message.is_some() {
+                        return Err(de::Error::duplicate_field("message"));
+                    }
+                    message = Some(map.next_value::<String>()?);
+                }
+                "field" => {
+                    if field.is_some() {
+                        return Err(de::Error::duplicate_field("field"));
+                    }
+                    field = Some(map.next_value::<Option<String>>()?);
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let message = message.ok_or_else(|| de::Error::missing_field("message"))?;
+        Ok(ScreenError::new(
+            status_not_carried(),
+            message,
+            field.flatten(),
+        ))
+    }
+}
+
 /// The error of an `api::services` function: `Result<Outcome, ServiceError<ProgramFailure>>`,
 /// where `ProgramFailure` is the failure type of the program's `domain::online` module.
 ///
@@ -375,11 +459,26 @@ where
 /// column name at most, never a stored or request value (Cardholder Data Redaction); the
 /// request span it falls in names the route. A service that answers a store error with the
 /// program's own message logs it itself and never returns it as [`ServiceError::Store`].
+///
+/// The event, with target `api::error` and the fields `message` and `error`, is written out
+/// through `crate::app`'s `EventSite`, `event_metadata` and `emit` rather than a `tracing` macro,
+/// whose expansion carries a lint suppression; the subscriber's filters treat it as a macro's.
 impl From<PersistenceError> for ScreenError {
     fn from(error: PersistenceError) -> Self {
-        tracing::error!(
-            error = %error,
-            "store failure without an audited message; answering 500"
+        static SITE: EventSite<2> = EventSite::new(&METADATA);
+        static METADATA: Metadata<'static> = event_metadata(
+            "unaudited_store_failure",
+            module_path!(),
+            Level::ERROR,
+            &["message", "error"],
+            &SITE,
+        );
+        emit(
+            &SITE,
+            [
+                Some(&"store failure without an audited message; answering 500"),
+                Some(&tracing::field::display(&error)),
+            ],
         );
         Self::store(UNABLE_TO_PROCESS, None)
     }
@@ -753,6 +852,15 @@ mod tests {
         (error.status().as_u16(), error.message(), error.field())
     }
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     #[test]
     fn constructors_set_their_status_message_and_field() {
         let field = || Some("acct_id".to_owned());
@@ -875,11 +983,22 @@ mod tests {
             };
             for expected in [
                 r#""level":"ERROR""#,
+                r#""target":"api::error""#,
                 "store failure without an audited message",
                 cause.as_str(),
             ] {
                 assert!(line.contains(expected), "{expected} missing from {line}");
             }
+            // The event's fields are the message and the cause's `Display`, and nothing else.
+            let event: Value = serde_json::from_str(line)?;
+            assert_eq!(
+                event["fields"],
+                json!({
+                    "message": "store failure without an audited message; answering 500",
+                    "error": cause,
+                }),
+                "{line}"
+            );
         }
 
         // A domain answer or an internal failure is not a store error, and logs nothing here.
@@ -943,42 +1062,46 @@ mod tests {
         assert!(internal.source().is_none());
     }
 
-    #[tokio::test]
-    async fn responses_carry_the_status_and_a_body_without_it() -> TestResult {
-        let cases = [
-            (
-                ScreenError::input("Please enter User ID ...", Some("user_id".to_owned())),
-                json!({"message": "Please enter User ID ...", "field": "user_id"}),
-            ),
-            (ScreenError::forbidden("gate"), json!({"message": "gate"})),
-            (
-                ScreenError::page_size("size"),
-                json!({"message": "size", "field": "page_size"}),
-            ),
-            (
-                ScreenError::from(ServiceError::<cousr02c::UserMaintFailure>::Saturated),
-                json!({"message": UNABLE_TO_PROCESS}),
-            ),
-        ];
-        for (error, body) in cases {
-            let status = error.status();
-            let response = error.into_response();
-            assert_eq!(response.status(), status);
-            let content_type = response
-                .headers()
-                .get(CONTENT_TYPE)
-                .ok_or("no content type")?;
-            assert_eq!(content_type, "application/json");
-            let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
-            let sent: Value = serde_json::from_slice(&bytes)?;
-            assert_eq!(sent, body);
-        }
-        Ok(())
+    #[test]
+    fn responses_carry_the_status_and_a_body_without_it() -> TestResult {
+        block_on(async {
+            let cases = [
+                (
+                    ScreenError::input("Please enter User ID ...", Some("user_id".to_owned())),
+                    json!({"message": "Please enter User ID ...", "field": "user_id"}),
+                ),
+                (ScreenError::forbidden("gate"), json!({"message": "gate"})),
+                (
+                    ScreenError::page_size("size"),
+                    json!({"message": "size", "field": "page_size"}),
+                ),
+                (
+                    ScreenError::from(ServiceError::<cousr02c::UserMaintFailure>::Saturated),
+                    json!({"message": UNABLE_TO_PROCESS}),
+                ),
+            ];
+            for (error, body) in cases {
+                let status = error.status();
+                let response = error.into_response();
+                assert_eq!(response.status(), status);
+                let content_type = response
+                    .headers()
+                    .get(CONTENT_TYPE)
+                    .ok_or("no content type")?;
+                assert_eq!(content_type, "application/json");
+                let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
+                let sent: Value = serde_json::from_slice(&bytes)?;
+                assert_eq!(sent, body);
+            }
+            Ok(())
+        })
     }
 
     /// A saturated password-work budget answers 503 with the crate's fixed text, no field and
     /// `Retry-After` in seconds, for every program that runs password work; the error displays
-    /// no value and wraps nothing. No other answer carries `Retry-After`.
+    /// no value and wraps nothing. The non-503 answers checked here, a 400, a 422 and the 500 of
+    /// an internal failure, carry no `Retry-After`; the router's in-flight refusal, the other
+    /// 503, sets its own `Retry-After: 1` in `api::app`.
     #[test]
     fn a_saturated_budget_answers_503_with_retry_after_and_no_field() {
         let saturated = ServiceError::<cousr02c::UserMaintFailure>::Saturated;
@@ -1021,6 +1144,51 @@ mod tests {
         assert_eq!(parts(&read), (500, "m", Some("f")));
         let bare: ScreenError = serde_json::from_value(json!({"message": "m"}))?;
         assert_eq!(parts(&bare), (500, "m", None));
+        Ok(())
+    }
+
+    /// The body's bytes: `message`, then `field` only when present, and never the status.
+    #[test]
+    fn a_body_is_written_member_by_member_without_the_status() -> TestResult {
+        let cases = [
+            (
+                ScreenError::not_found("Account not found...", Some("acct_id".to_owned())),
+                r#"{"message":"Account not found...","field":"acct_id"}"#,
+            ),
+            (ScreenError::forbidden("gate"), r#"{"message":"gate"}"#),
+        ];
+        for (error, wire) in cases {
+            assert_eq!(serde_json::to_string(&error)?, wire);
+        }
+        Ok(())
+    }
+
+    /// What a body is read from: an object with `message`, `field` absent or `null` included,
+    /// unknown members such as a `status` skipped and the status always 500; a repeated member,
+    /// a missing `message`, a member of the wrong type and anything but an object refused.
+    #[test]
+    fn a_body_reads_back_from_an_object_with_a_message_only() -> TestResult {
+        let read = [
+            (r#"{"message":"m","field":null}"#, ("m", None)),
+            (r#"{"field":"f","message":"m"}"#, ("m", Some("f"))),
+            (r#"{"message":"m","status":404,"x":[1]}"#, ("m", None)),
+        ];
+        for (body, (message, field)) in read {
+            let error: ScreenError = serde_json::from_str(body)?;
+            assert_eq!(parts(&error), (500, message, field), "{body}");
+        }
+        for body in [
+            r#"{"message":"m","message":"n"}"#,
+            r#"{"message":"m","field":"f","field":"g"}"#,
+            r#"{"field":"f"}"#,
+            r#"{"message":7}"#,
+            r#"{"message":"m","field":7}"#,
+            r#"["m","f"]"#,
+            r#""m""#,
+            "null",
+        ] {
+            assert!(serde_json::from_str::<ScreenError>(body).is_err(), "{body}");
+        }
         Ok(())
     }
 

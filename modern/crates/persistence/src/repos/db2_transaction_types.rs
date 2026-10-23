@@ -559,6 +559,15 @@ mod tests {
         Ok((guard, store))
     }
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     // audit: COTRTUPC-009
     // audit: COTRTUPC-010
     // audit: COTRTLIC-004
@@ -566,83 +575,85 @@ mod tests {
     // audit: COTRTLIC-011
     // audit: COTRTLIC-012
     // audit: COTRTLIC-031
-    #[tokio::test]
-    async fn reads_follow_the_key_read_the_cursors_and_the_count() -> TestResult {
-        let (_guard, mut store) = seeded().await?;
+    #[test]
+    fn reads_follow_the_key_read_the_cursors_and_the_count() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = seeded().await?;
 
-        for (text, description) in SEED {
-            assert_eq!(
-                store.find_by_id(&code(text)?).await?,
-                Some(record(text, description)?)
-            );
-        }
-        assert_eq!(store.find_by_id(&code("99")?).await?, None);
-        assert_eq!(store.find_by_id(&PicX::spaces()).await?, None);
+            for (text, description) in SEED {
+                assert_eq!(
+                    store.find_by_id(&code(text)?).await?,
+                    Some(record(text, description)?)
+                );
+            }
+            assert_eq!(store.find_by_id(&code("99")?).await?, None);
+            assert_eq!(store.find_by_id(&PicX::spaces()).await?, None);
 
-        let all = store
-            .page_after(&PicX::spaces(), None, None, UNBOUNDED)
-            .await?;
-        let seed = SEED
-            .iter()
-            .map(|(text, description)| record(text, description))
-            .collect::<Result<Vec<_>, _>>()?;
-        assert_eq!(all, seed);
-
-        // (forward, start, limit, codes): the start key is inclusive forward and exclusive
-        // backward, and `limit` is bound as given.
-        let paging: [(bool, &str, i64, &[&str]); 6] = [
-            (true, "03", 3, &["03", "04", "05"]),
-            (true, "03", 1, &["03"]),
-            (false, "03", 8, &["02", "01"]),
-            (false, "06", 3, &["05", "04", "03"]),
-            (false, "01", 8, &[]),
-            (true, "08", 8, &[]),
-        ];
-        for (forward, start, limit, expected) in paging {
-            let start = code(start)?;
-            let page = if forward {
-                store.page_after(&start, None, None, limit).await?
-            } else {
-                store.page_before(&start, None, None, limit).await?
-            };
-            assert_eq!(codes(&page), expected, "forward {forward}, limit {limit}");
-        }
-
-        let type_06 = code("06")?;
-        let type_03 = code("03")?;
-        // (type filter, description pattern, codes the filters match). Db2's LIKE is
-        // case-sensitive, `TRIM` drops the spaces around the pattern, and with `ESCAPE ''` a
-        // backslash is an ordinary character, so `PURCHAS\E` matches nothing.
-        let filters: [(Option<&PicX<2>>, Option<&str>, &[&str]); 9] = [
-            (None, None, &["01", "02", "03", "04", "05", "06", "07"]),
-            (Some(&type_06), None, &["06"]),
-            (None, Some("%RE%"), &["03", "05", "06"]),
-            (None, Some("  %RE%  "), &["03", "05", "06"]),
-            (None, Some("%re%"), &[]),
-            (None, Some("PAY_ENT"), &["02"]),
-            (None, Some("PURCHAS\\E"), &[]),
-            (Some(&type_03), Some("%RE%"), &["03"]),
-            (Some(&type_06), Some("%PAY%"), &[]),
-        ];
-        for (type_filter, desc_pattern, expected) in filters {
-            let forward = store
-                .page_after(&PicX::spaces(), type_filter, desc_pattern, UNBOUNDED)
+            let all = store
+                .page_after(&PicX::spaces(), None, None, UNBOUNDED)
                 .await?;
-            assert_eq!(codes(&forward), expected);
+            let seed = SEED
+                .iter()
+                .map(|(text, description)| record(text, description))
+                .collect::<Result<Vec<_>, _>>()?;
+            assert_eq!(all, seed);
 
-            let mut backward = store
-                .page_before(&code("99")?, type_filter, desc_pattern, UNBOUNDED)
-                .await?;
-            backward.reverse();
-            assert_eq!(backward, forward);
+            // (forward, start, limit, codes): the start key is inclusive forward and exclusive
+            // backward, and `limit` is bound as given.
+            let paging: [(bool, &str, i64, &[&str]); 6] = [
+                (true, "03", 3, &["03", "04", "05"]),
+                (true, "03", 1, &["03"]),
+                (false, "03", 8, &["02", "01"]),
+                (false, "06", 3, &["05", "04", "03"]),
+                (false, "01", 8, &[]),
+                (true, "08", 8, &[]),
+            ];
+            for (forward, start, limit, expected) in paging {
+                let start = code(start)?;
+                let page = if forward {
+                    store.page_after(&start, None, None, limit).await?
+                } else {
+                    store.page_before(&start, None, None, limit).await?
+                };
+                assert_eq!(codes(&page), expected, "forward {forward}, limit {limit}");
+            }
 
-            let count = store.count_matching(type_filter, desc_pattern).await?;
-            // TRUNCATION: none survives. The conversion is checked: a SQL `count` is never
-            // negative and here is at most the seven seeded rows, which `usize` holds exactly,
-            // and `?` refuses a value `usize` cannot hold instead of wrapping.
-            assert_eq!(usize::try_from(count)?, forward.len());
-        }
-        Ok(())
+            let type_06 = code("06")?;
+            let type_03 = code("03")?;
+            // (type filter, description pattern, codes the filters match). Db2's LIKE is
+            // case-sensitive, `TRIM` drops the spaces around the pattern, and with `ESCAPE ''` a
+            // backslash is an ordinary character, so `PURCHAS\E` matches nothing.
+            let filters: [(Option<&PicX<2>>, Option<&str>, &[&str]); 9] = [
+                (None, None, &["01", "02", "03", "04", "05", "06", "07"]),
+                (Some(&type_06), None, &["06"]),
+                (None, Some("%RE%"), &["03", "05", "06"]),
+                (None, Some("  %RE%  "), &["03", "05", "06"]),
+                (None, Some("%re%"), &[]),
+                (None, Some("PAY_ENT"), &["02"]),
+                (None, Some("PURCHAS\\E"), &[]),
+                (Some(&type_03), Some("%RE%"), &["03"]),
+                (Some(&type_06), Some("%PAY%"), &[]),
+            ];
+            for (type_filter, desc_pattern, expected) in filters {
+                let forward = store
+                    .page_after(&PicX::spaces(), type_filter, desc_pattern, UNBOUNDED)
+                    .await?;
+                assert_eq!(codes(&forward), expected);
+
+                let mut backward = store
+                    .page_before(&code("99")?, type_filter, desc_pattern, UNBOUNDED)
+                    .await?;
+                backward.reverse();
+                assert_eq!(backward, forward);
+
+                let count = store.count_matching(type_filter, desc_pattern).await?;
+                // TRUNCATION: none survives. The conversion is checked: a SQL `count` is never
+                // negative and here is at most the seven seeded rows, which `usize` holds exactly,
+                // and `?` refuses a value `usize` cannot hold instead of wrapping.
+                assert_eq!(usize::try_from(count)?, forward.len());
+            }
+            Ok(())
+        })
     }
 
     // audit: COTRTUPC-023
@@ -657,41 +668,43 @@ mod tests {
     // audit: COTRTLIC-049
     // audit: COTRTLIC-050
     // audit: COTRTLIC-051
-    #[tokio::test]
-    async fn writes_report_changed_rows_duplicates_and_restricted_deletes() -> TestResult {
-        let (_guard, mut store) = seeded().await?;
+    #[test]
+    fn writes_report_changed_rows_duplicates_and_restricted_deletes() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = seeded().await?;
 
-        // An update stores the description verbatim, padding included.
-        let renamed = record("01", &format!("{:<50}", "PURCHASE RENAMED"))?;
-        assert!(store.update(&renamed).await?);
-        assert_eq!(store.find_by_id(&code("01")?).await?, Some(renamed));
+            // An update stores the description verbatim, padding included.
+            let renamed = record("01", &format!("{:<50}", "PURCHASE RENAMED"))?;
+            assert!(store.update(&renamed).await?);
+            assert_eq!(store.find_by_id(&code("01")?).await?, Some(renamed));
 
-        // SQLCODE +100: no row has the code, so nothing changes and COTRTUPC inserts instead.
-        let added = record("42", &format!("{:<50}", "NEW TYPE"))?;
-        assert!(!store.update(&added).await?);
-        assert_eq!(store.find_by_id(&code("42")?).await?, None);
-        store.insert(&added).await?;
-        assert_eq!(store.find_by_id(&code("42")?).await?, Some(added.clone()));
+            // SQLCODE +100: no row has the code, so nothing changes and COTRTUPC inserts instead.
+            let added = record("42", &format!("{:<50}", "NEW TYPE"))?;
+            assert!(!store.update(&added).await?);
+            assert_eq!(store.find_by_id(&code("42")?).await?, None);
+            store.insert(&added).await?;
+            assert_eq!(store.find_by_id(&code("42")?).await?, Some(added.clone()));
 
-        let other = record("42", "OTHER")?;
-        assert_eq!(store.insert(&other).await, Err(duplicate()));
-        assert_eq!(store.find_by_id(&code("42")?).await?, Some(added));
+            let other = record("42", "OTHER")?;
+            assert_eq!(store.insert(&other).await, Err(duplicate()));
+            assert_eq!(store.find_by_id(&code("42")?).await?, Some(added));
 
-        // A type without categories is deleted once; a second delete finds no row.
-        assert!(store.delete(&code("42")?).await?);
-        assert_eq!(store.find_by_id(&code("42")?).await?, None);
-        assert!(!store.delete(&code("42")?).await?);
+            // A type without categories is deleted once; a second delete finds no row.
+            assert!(store.delete(&code("42")?).await?);
+            assert_eq!(store.find_by_id(&code("42")?).await?, None);
+            assert!(!store.delete(&code("42")?).await?);
 
-        // Every seeded type has categories, so ON DELETE RESTRICT refuses the delete (-532).
-        for (text, description) in SEED.iter().skip(1) {
-            assert_eq!(store.delete(&code(text)?).await, Err(restricted()));
-            assert_eq!(
-                store.find_by_id(&code(text)?).await?,
-                Some(record(text, description)?)
-            );
-        }
-        assert_eq!(store.count_matching(None, None).await?, 7);
-        Ok(())
+            // Every seeded type has categories, so ON DELETE RESTRICT refuses the delete (-532).
+            for (text, description) in SEED.iter().skip(1) {
+                assert_eq!(store.delete(&code(text)?).await, Err(restricted()));
+                assert_eq!(
+                    store.find_by_id(&code(text)?).await?,
+                    Some(record(text, description)?)
+                );
+            }
+            assert_eq!(store.count_matching(None, None).await?, 7);
+            Ok(())
+        })
     }
 
     /// The replacement of COBTUPDT's single unit of work: a failed statement aborts a
@@ -705,47 +718,48 @@ mod tests {
     // audit: COBTUPDT-016
     // audit: COBTUPDT-017
     // audit: COBTUPDT-024
-    #[tokio::test]
-    async fn a_transaction_goes_on_after_a_failed_statement_only_through_a_savepoint() -> TestResult
-    {
-        let (_guard, mut store) = seeded().await?;
-        let updated = record("02", &format!("{:<50}", "PAYMENT UPDATED BY MNTTRDB2"))?;
-        let added = record("43", &format!("{:<50}", "ADDED BY MNTTRDB2"))?;
+    #[test]
+    fn a_transaction_goes_on_after_a_failed_statement_only_through_a_savepoint() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = seeded().await?;
+            let updated = record("02", &format!("{:<50}", "PAYMENT UPDATED BY MNTTRDB2"))?;
+            let added = record("43", &format!("{:<50}", "ADDED BY MNTTRDB2"))?;
 
-        let mut tx = store.begin().await?;
-        tx.insert(&added).await?;
-        let mut statement = tx.savepoint().await?;
-        assert_eq!(statement.delete(&code("03")?).await, Err(restricted()));
-        statement.rollback().await?;
-        let mut statement = tx.savepoint().await?;
-        assert_eq!(statement.insert(&added).await, Err(duplicate()));
-        statement.rollback().await?;
-        assert!(tx.update(&updated).await?);
-        assert!(!tx.update(&record("44", "MISSING")?).await?);
-        assert!(!tx.delete(&code("44")?).await?);
-        tx.commit().await?;
+            let mut tx = store.begin().await?;
+            tx.insert(&added).await?;
+            let mut statement = tx.savepoint().await?;
+            assert_eq!(statement.delete(&code("03")?).await, Err(restricted()));
+            statement.rollback().await?;
+            let mut statement = tx.savepoint().await?;
+            assert_eq!(statement.insert(&added).await, Err(duplicate()));
+            statement.rollback().await?;
+            assert!(tx.update(&updated).await?);
+            assert!(!tx.update(&record("44", "MISSING")?).await?);
+            assert!(!tx.delete(&code("44")?).await?);
+            tx.commit().await?;
 
-        assert_eq!(store.find_by_id(&code("02")?).await?, Some(updated));
-        assert_eq!(store.find_by_id(&code("43")?).await?, Some(added));
-        assert_eq!(
-            store.find_by_id(&code("03")?).await?,
-            Some(record("03", "CREDIT")?)
-        );
+            assert_eq!(store.find_by_id(&code("02")?).await?, Some(updated));
+            assert_eq!(store.find_by_id(&code("43")?).await?, Some(added));
+            assert_eq!(
+                store.find_by_id(&code("03")?).await?,
+                Some(record("03", "CREDIT")?)
+            );
 
-        // Without a savepoint the restricted delete leaves the transaction aborted: the next
-        // statement fails with `in_failed_sql_transaction`, and nothing commits.
-        let mut tx = store.begin().await?;
-        assert!(tx.delete(&code("43")?).await?);
-        assert_eq!(tx.delete(&code("04")?).await, Err(restricted()));
-        assert_eq!(
-            tx.find_by_id(&code("05")?).await.map(drop),
-            Err(PersistenceError::Database {
-                sqlstate: Some("25P02".to_owned()),
-                constraint: None
-            })
-        );
-        tx.rollback().await?;
-        assert!(store.find_by_id(&code("43")?).await?.is_some());
-        Ok(())
+            // Without a savepoint the restricted delete leaves the transaction aborted: the next
+            // statement fails with `in_failed_sql_transaction`, and nothing commits.
+            let mut tx = store.begin().await?;
+            assert!(tx.delete(&code("43")?).await?);
+            assert_eq!(tx.delete(&code("04")?).await, Err(restricted()));
+            assert_eq!(
+                tx.find_by_id(&code("05")?).await.map(drop),
+                Err(PersistenceError::Database {
+                    sqlstate: Some("25P02".to_owned()),
+                    constraint: None
+                })
+            );
+            tx.rollback().await?;
+            assert!(store.find_by_id(&code("43")?).await?.is_some());
+            Ok(())
+        })
     }
 }

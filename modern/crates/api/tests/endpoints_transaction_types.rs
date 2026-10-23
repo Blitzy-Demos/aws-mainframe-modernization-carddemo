@@ -63,6 +63,15 @@ use tower::ServiceExt as _;
 type TestResult = Result<(), Box<dyn Error>>;
 type Outcome<T> = Result<T, Box<dyn Error>>;
 
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// The signing secret of every state this file builds: a local test value, never a credential.
 const SECRET: &str = "endpoints-transaction-types-secret";
 
@@ -603,688 +612,718 @@ fn assert_first_entry(status: StatusCode, loaded: &TranTypeListResponse) {
 
 // Endpoints 24 to 27 serve an `A` token only: 403 for `U`, 401 without a valid token, and the
 // refused requests read and write nothing.
-#[tokio::test]
-async fn admin_gate_guards_endpoints_24_to_27() -> TestResult {
-    let harness = Harness::start().await?;
-    let user = harness.user().await?;
-    let (status, loaded) = harness.admin.load().await?;
-    assert_eq!(status, StatusCode::OK);
-    let list_body = json_of(&action(ListAid::Enter, &loaded.state, ("", ""), &[]))?;
-    let maint_body = json!({ "aid": "PF5", "description": "PURCHASES" });
-    let calls = [
-        ("GET", LIST.to_owned(), None),
-        ("POST", LIST_ACTIONS.to_owned(), Some(&list_body)),
-        ("GET", format!("{LIST}/01"), None),
-        ("POST", format!("{LIST}/01/actions"), Some(&maint_body)),
-    ];
-    for (method, uri, body) in &calls {
-        // audit: COTRTLIC-001
-        // audit: COTRTUPC-001
-        let (status, _) = user.raw(method, uri, *body).await?;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
-        for token in [None, Some("not-a-token")] {
-            let unsigned = request(method, uri, token, *body)?;
-            let (status, _) = send(&harness.admin.router, unsigned).await?;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+#[test]
+fn admin_gate_guards_endpoints_24_to_27() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let user = harness.user().await?;
+        let (status, loaded) = harness.admin.load().await?;
+        assert_eq!(status, StatusCode::OK);
+        let list_body = json_of(&action(ListAid::Enter, &loaded.state, ("", ""), &[]))?;
+        let maint_body = json!({ "aid": "PF5", "description": "PURCHASES" });
+        let calls = [
+            ("GET", LIST.to_owned(), None),
+            ("POST", LIST_ACTIONS.to_owned(), Some(&list_body)),
+            ("GET", format!("{LIST}/01"), None),
+            ("POST", format!("{LIST}/01/actions"), Some(&maint_body)),
+        ];
+        for (method, uri, body) in &calls {
+            // audit: COTRTLIC-001
+            // audit: COTRTUPC-001
+            let (status, _) = user.raw(method, uri, *body).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+            for token in [None, Some("not-a-token")] {
+                let unsigned = request(method, uri, token, *body)?;
+                let (status, _) = send(&harness.admin.router, unsigned).await?;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {uri}");
+            }
+            assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
         }
-        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    }
-    // The admin token is served; the PF5 above is the one write, made only now.
-    for (method, uri, body) in &calls {
-        let (status, _) = harness.admin.raw(method, uri, *body).await?;
-        assert_eq!(status, StatusCode::OK, "{method} {uri}");
-    }
-    assert_eq!(harness.stored("01").await?, Some(padded("PURCHASES")));
-    Ok(())
+        // The admin token is served; the PF5 above is the one write, made only now.
+        for (method, uri, body) in &calls {
+            let (status, _) = harness.admin.raw(method, uri, *body).await?;
+            assert_eq!(status, StatusCode::OK, "{method} {uri}");
+        }
+        assert_eq!(harness.stored("01").await?, Some(padded("PURCHASES")));
+        Ok(())
+    })
 }
 
 // Endpoint 24: the screen load, the last-page messages, F7 on page 1, the refresh, and the move
 // to a second page and back once another user adds a type.
-#[tokio::test]
-async fn cotrtlic_list_and_paging_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (status, loaded) = api.load().await?;
-    assert_first_entry(status, &loaded);
+#[test]
+fn cotrtlic_list_and_paging_rows() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (status, loaded) = api.load().await?;
+        assert_first_entry(status, &loaded);
 
-    let (status, again) = api.page(&loaded.page_key, "forward", ("", "")).await?;
-    // audit: COTRTLIC-008
-    assert_eq!(
-        (status, codes(&again.rows), again.page_no),
-        (StatusCode::OK, seed_page(), 1)
-    );
-    assert_eq!(again.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
-    assert_eq!(again.info_message.as_deref(), Some(RECORD_ACTIONS));
-    assert!(again.state.last_page_shown);
-    let (status, last) = api.page(&again.page_key, "forward", ("", "")).await?;
-    // audit: COTRTLIC-009
-    assert_eq!((status, codes(&last.rows)), (StatusCode::OK, seed_page()));
-    assert_eq!(
-        (last.message.as_deref(), last.info_message),
-        (Some(NO_MORE_PAGES), None)
-    );
-    let (status, first) = api.page(&last.page_key, "backward", ("", "")).await?;
-    // audit: COTRTLIC-010
-    assert_eq!(
-        (status, codes(&first.rows), first.page_no),
-        (StatusCode::OK, seed_page(), 1)
-    );
-    assert_eq!(
-        (first.message.as_deref(), first.info_message),
-        (Some(NO_PREVIOUS_PAGES), None)
-    );
+        let (status, again) = api.page(&loaded.page_key, "forward", ("", "")).await?;
+        // audit: COTRTLIC-008
+        assert_eq!(
+            (status, codes(&again.rows), again.page_no),
+            (StatusCode::OK, seed_page(), 1)
+        );
+        assert_eq!(again.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
+        assert_eq!(again.info_message.as_deref(), Some(RECORD_ACTIONS));
+        assert!(again.state.last_page_shown);
+        let (status, last) = api.page(&again.page_key, "forward", ("", "")).await?;
+        // audit: COTRTLIC-009
+        assert_eq!((status, codes(&last.rows)), (StatusCode::OK, seed_page()));
+        assert_eq!(
+            (last.message.as_deref(), last.info_message),
+            (Some(NO_MORE_PAGES), None)
+        );
+        let (status, first) = api.page(&last.page_key, "backward", ("", "")).await?;
+        // audit: COTRTLIC-010
+        assert_eq!(
+            (status, codes(&first.rows), first.page_no),
+            (StatusCode::OK, seed_page(), 1)
+        );
+        assert_eq!(
+            (first.message.as_deref(), first.info_message),
+            (Some(NO_PREVIOUS_PAGES), None)
+        );
 
-    // Another user renames 03 and adds 08: ENTER re-reads the displayed page.
-    harness.rename("03", "CREDIT LINE").await?;
-    harness.insert("08", "OBSOLETE").await?;
-    let (status, refreshed) = api
-        .act(&action(ListAid::Enter, &first.state, ("", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-006
-    assert_eq!(
-        (status, codes(&refreshed.rows), refreshed.page_no),
-        (StatusCode::OK, seed_page(), 1)
-    );
-    assert_eq!(shown_descriptions(&refreshed.rows)[2], "CREDIT LINE");
-    assert_eq!(
-        (refreshed.message, refreshed.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    assert_eq!(refreshed.committed, TranTypeListCommitted::Nothing);
-    // audit: COTRTLIC-004
-    assert!(refreshed.state.next_page_exists && refreshed.has_next_page);
-    assert_eq!(refreshed.state.last_key.as_deref(), Some("08"));
+        // Another user renames 03 and adds 08: ENTER re-reads the displayed page.
+        harness.rename("03", "CREDIT LINE").await?;
+        harness.insert("08", "OBSOLETE").await?;
+        let (status, refreshed) = api
+            .act(&action(ListAid::Enter, &first.state, ("", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-006
+        assert_eq!(
+            (status, codes(&refreshed.rows), refreshed.page_no),
+            (StatusCode::OK, seed_page(), 1)
+        );
+        assert_eq!(shown_descriptions(&refreshed.rows)[2], "CREDIT LINE");
+        assert_eq!(
+            (refreshed.message, refreshed.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        assert_eq!(refreshed.committed, TranTypeListCommitted::Nothing);
+        // audit: COTRTLIC-004
+        assert!(refreshed.state.next_page_exists && refreshed.has_next_page);
+        assert_eq!(refreshed.state.last_key.as_deref(), Some("08"));
 
-    let (status, second) = api.page(&refreshed.page_key, "forward", ("", "")).await?;
-    // audit: COTRTLIC-007
-    assert_eq!(
-        (status, codes(&second.rows), second.page_no),
-        (StatusCode::OK, first_only("08"), 2)
-    );
-    assert_eq!(second.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
-    assert_eq!(second.info_message.as_deref(), Some(RECORD_ACTIONS));
-    assert!(second.state.last_page_shown && !second.has_next_page);
-    // audit: COTRTLIC-004
-    assert_eq!(
-        (second.state.first_key.as_deref(), second.state.last_key),
-        (Some("08"), None)
-    );
-    let (status, back) = api.page(&second.page_key, "backward", ("", "")).await?;
-    // audit: COTRTLIC-011
-    assert_eq!(
-        (status, codes(&back.rows), back.page_no),
-        (StatusCode::OK, seed_page(), 1)
-    );
-    assert_eq!(
-        (back.message.as_deref(), back.info_message),
-        (Some(NO_PREVIOUS_PAGES), None)
-    );
-    let keys = (
-        back.state.first_key.as_deref(),
-        back.state.last_key.as_deref(),
-    );
-    assert_eq!(keys, (Some("01"), Some("08")));
-    assert!(back.state.next_page_exists);
-    Ok(())
+        let (status, second) = api.page(&refreshed.page_key, "forward", ("", "")).await?;
+        // audit: COTRTLIC-007
+        assert_eq!(
+            (status, codes(&second.rows), second.page_no),
+            (StatusCode::OK, first_only("08"), 2)
+        );
+        assert_eq!(second.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
+        assert_eq!(second.info_message.as_deref(), Some(RECORD_ACTIONS));
+        assert!(second.state.last_page_shown && !second.has_next_page);
+        // audit: COTRTLIC-004
+        assert_eq!(
+            (second.state.first_key.as_deref(), second.state.last_key),
+            (Some("08"), None)
+        );
+        let (status, back) = api.page(&second.page_key, "backward", ("", "")).await?;
+        // audit: COTRTLIC-011
+        assert_eq!(
+            (status, codes(&back.rows), back.page_no),
+            (StatusCode::OK, seed_page(), 1)
+        );
+        assert_eq!(
+            (back.message.as_deref(), back.info_message),
+            (Some(NO_PREVIOUS_PAGES), None)
+        );
+        let keys = (
+            back.state.first_key.as_deref(),
+            back.state.last_key.as_deref(),
+        );
+        assert_eq!(keys, (Some("01"), Some("08")));
+        assert!(back.state.next_page_exists);
+        Ok(())
+    })
 }
 
 // Endpoint 24 under a description filter: F8 through three pages, F7 back, and F7 once another
 // user's deletes leave fewer than seven rows before the page.
-#[tokio::test]
-async fn cotrtlic_backward_paging_and_short_reads() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert_codes(10, 30, "EXTRA TYPE").await?;
-    let filters = ("", "EXTRA");
-    let (_, loaded) = api.load().await?;
-    let (status, first) = api
-        .act(&action(ListAid::Enter, &loaded.state, filters, &[]))
-        .await?;
-    // audit: COTRTLIC-005
-    // audit: COTRTLIC-035
-    assert_eq!(
-        (status, codes(&first.rows), first.page_no),
-        (StatusCode::OK, code_range(10, 16), 1)
-    );
-    assert!(first.has_next_page);
-    let (status, second) = api.page(&first.page_key, "forward", filters).await?;
-    // audit: COTRTLIC-007
-    assert_eq!(
-        (status, codes(&second.rows), second.page_no),
-        (StatusCode::OK, code_range(17, 23), 2)
-    );
-    assert_eq!(
-        (second.message, second.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    let (_, third) = api.page(&second.page_key, "forward", filters).await?;
-    // audit: COTRTLIC-007
-    assert_eq!((codes(&third.rows), third.page_no), (code_range(24, 30), 3));
-    assert_eq!(third.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
-    let (_, again) = api.page(&third.page_key, "forward", filters).await?;
-    // audit: COTRTLIC-009
-    assert_eq!((codes(&again.rows), again.page_no), (code_range(24, 30), 3));
-    assert_eq!(
-        (again.message.as_deref(), again.info_message),
-        (Some(NO_MORE_PAGES), None)
-    );
+#[test]
+fn cotrtlic_backward_paging_and_short_reads() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert_codes(10, 30, "EXTRA TYPE").await?;
+        let filters = ("", "EXTRA");
+        let (_, loaded) = api.load().await?;
+        let (status, first) = api
+            .act(&action(ListAid::Enter, &loaded.state, filters, &[]))
+            .await?;
+        // audit: COTRTLIC-005
+        // audit: COTRTLIC-035
+        assert_eq!(
+            (status, codes(&first.rows), first.page_no),
+            (StatusCode::OK, code_range(10, 16), 1)
+        );
+        assert!(first.has_next_page);
+        let (status, second) = api.page(&first.page_key, "forward", filters).await?;
+        // audit: COTRTLIC-007
+        assert_eq!(
+            (status, codes(&second.rows), second.page_no),
+            (StatusCode::OK, code_range(17, 23), 2)
+        );
+        assert_eq!(
+            (second.message, second.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        let (_, third) = api.page(&second.page_key, "forward", filters).await?;
+        // audit: COTRTLIC-007
+        assert_eq!((codes(&third.rows), third.page_no), (code_range(24, 30), 3));
+        assert_eq!(third.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
+        let (_, again) = api.page(&third.page_key, "forward", filters).await?;
+        // audit: COTRTLIC-009
+        assert_eq!((codes(&again.rows), again.page_no), (code_range(24, 30), 3));
+        assert_eq!(
+            (again.message.as_deref(), again.info_message),
+            (Some(NO_MORE_PAGES), None)
+        );
 
-    let (status, back) = api.page(&again.page_key, "backward", filters).await?;
-    // audit: COTRTLIC-005
-    // audit: COTRTLIC-011
-    assert_eq!(
-        (status, codes(&back.rows), back.page_no),
-        (StatusCode::OK, code_range(17, 23), 2)
-    );
-    assert_eq!(
-        (back.message, back.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    let keys = (
-        back.state.first_key.as_deref(),
-        back.state.last_key.as_deref(),
-    );
-    assert_eq!(keys, (Some("17"), Some("24")));
-    assert!(back.has_next_page);
-    let (_, top) = api.page(&back.page_key, "backward", filters).await?;
-    // audit: COTRTLIC-011
-    assert_eq!((codes(&top.rows), top.page_no), (code_range(10, 16), 1));
-    assert_eq!(
-        (top.message.as_deref(), top.info_message),
-        (Some(NO_PREVIOUS_PAGES), None)
-    );
+        let (status, back) = api.page(&again.page_key, "backward", filters).await?;
+        // audit: COTRTLIC-005
+        // audit: COTRTLIC-011
+        assert_eq!(
+            (status, codes(&back.rows), back.page_no),
+            (StatusCode::OK, code_range(17, 23), 2)
+        );
+        assert_eq!(
+            (back.message, back.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        let keys = (
+            back.state.first_key.as_deref(),
+            back.state.last_key.as_deref(),
+        );
+        assert_eq!(keys, (Some("17"), Some("24")));
+        assert!(back.has_next_page);
+        let (_, top) = api.page(&back.page_key, "backward", filters).await?;
+        // audit: COTRTLIC-011
+        assert_eq!((codes(&top.rows), top.page_no), (code_range(10, 16), 1));
+        assert_eq!(
+            (top.message.as_deref(), top.info_message),
+            (Some(NO_PREVIOUS_PAGES), None)
+        );
 
-    // Another user deletes 10 to 17: only six rows lie before page 3 now.
-    for number in 10..=17 {
-        assert!(harness.remove(&format!("{number:02}")).await?);
-    }
-    let mut bottom_up = vec![String::new()];
-    bottom_up.extend(code_range(18, 23));
-    let (status, short) = api.page(&again.page_key, "backward", filters).await?;
-    // audit: COTRTLIC-012
-    // audit: COTRTLIC-054
-    assert_eq!(
-        (status, codes(&short.rows), short.page_no),
-        (StatusCode::INTERNAL_SERVER_ERROR, bottom_up.clone(), 2)
-    );
-    assert_db2_prefix(short.message.as_deref(), BACKWARD_FETCH);
-    assert_eq!(short.info_message.as_deref(), Some(RECORD_ACTIONS));
-    let keys = (
-        short.state.first_key.as_deref(),
-        short.state.last_key.as_deref(),
-    );
-    assert_eq!(keys, (Some("24"), Some("24")));
-    let (status, short_top) = api.page(&short.page_key, "backward", filters).await?;
-    // audit: COTRTLIC-012
-    assert_eq!(
-        (status, codes(&short_top.rows), short_top.page_no),
-        (StatusCode::OK, bottom_up, 1)
-    );
-    assert_eq!(
-        (short_top.message.as_deref(), short_top.info_message),
-        (Some(NO_PREVIOUS_PAGES), None)
-    );
-    Ok(())
+        // Another user deletes 10 to 17: only six rows lie before page 3 now.
+        for number in 10..=17 {
+            assert!(harness.remove(&format!("{number:02}")).await?);
+        }
+        let mut bottom_up = vec![String::new()];
+        bottom_up.extend(code_range(18, 23));
+        let (status, short) = api.page(&again.page_key, "backward", filters).await?;
+        // audit: COTRTLIC-012
+        // audit: COTRTLIC-054
+        assert_eq!(
+            (status, codes(&short.rows), short.page_no),
+            (StatusCode::INTERNAL_SERVER_ERROR, bottom_up.clone(), 2)
+        );
+        assert_db2_prefix(short.message.as_deref(), BACKWARD_FETCH);
+        assert_eq!(short.info_message.as_deref(), Some(RECORD_ACTIONS));
+        let keys = (
+            short.state.first_key.as_deref(),
+            short.state.last_key.as_deref(),
+        );
+        assert_eq!(keys, (Some("24"), Some("24")));
+        let (status, short_top) = api.page(&short.page_key, "backward", filters).await?;
+        // audit: COTRTLIC-012
+        assert_eq!(
+            (status, codes(&short_top.rows), short_top.page_no),
+            (StatusCode::OK, bottom_up, 1)
+        );
+        assert_eq!(
+            (short_top.message.as_deref(), short_top.info_message),
+            (Some(NO_PREVIOUS_PAGES), None)
+        );
+        Ok(())
+    })
 }
 
 // Endpoint 24 past page 9 (the page number keeps one digit), then ENTER on page 1 after another
 // user deleted every row from its first key on.
-#[tokio::test]
-async fn cotrtlic_page_number_wraps_and_an_emptied_first_page() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert_codes(8, 70, "WRAP TYPE").await?;
-    let (_, mut page) = api.load().await?;
-    for number in 2..=9 {
-        let (status, next) = api.page(&page.page_key, "forward", ("", "")).await?;
-        assert_eq!((status, next.page_no), (StatusCode::OK, number));
-        page = next;
-    }
-    assert_eq!(codes(&page.rows), code_range(57, 63));
-    let (status, tenth) = api.page(&page.page_key, "forward", ("", "")).await?;
-    // audit: COTRTLIC-013
-    assert_eq!(
-        (status, codes(&tenth.rows), tenth.page_no),
-        (StatusCode::OK, code_range(64, 70), 1)
-    );
-    assert_eq!(tenth.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
-    let (status, refused_back) = api.page(&tenth.page_key, "backward", ("", "")).await?;
-    // audit: COTRTLIC-010
-    // audit: COTRTLIC-013
-    assert_eq!(
-        (status, codes(&refused_back.rows), refused_back.page_no),
-        (StatusCode::OK, code_range(64, 70), 1)
-    );
-    assert_eq!(
-        (refused_back.message.as_deref(), refused_back.info_message),
-        (Some(NO_PREVIOUS_PAGES), None)
-    );
+#[test]
+fn cotrtlic_page_number_wraps_and_an_emptied_first_page() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert_codes(8, 70, "WRAP TYPE").await?;
+        let (_, mut page) = api.load().await?;
+        for number in 2..=9 {
+            let (status, next) = api.page(&page.page_key, "forward", ("", "")).await?;
+            assert_eq!((status, next.page_no), (StatusCode::OK, number));
+            page = next;
+        }
+        assert_eq!(codes(&page.rows), code_range(57, 63));
+        let (status, tenth) = api.page(&page.page_key, "forward", ("", "")).await?;
+        // audit: COTRTLIC-013
+        assert_eq!(
+            (status, codes(&tenth.rows), tenth.page_no),
+            (StatusCode::OK, code_range(64, 70), 1)
+        );
+        assert_eq!(tenth.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
+        let (status, refused_back) = api.page(&tenth.page_key, "backward", ("", "")).await?;
+        // audit: COTRTLIC-010
+        // audit: COTRTLIC-013
+        assert_eq!(
+            (status, codes(&refused_back.rows), refused_back.page_no),
+            (StatusCode::OK, code_range(64, 70), 1)
+        );
+        assert_eq!(
+            (refused_back.message.as_deref(), refused_back.info_message),
+            (Some(NO_PREVIOUS_PAGES), None)
+        );
 
-    for number in 64..=70 {
-        assert!(harness.remove(&format!("{number:02}")).await?);
-    }
-    let (status, empty) = api
-        .act(&action(ListAid::Enter, &refused_back.state, ("", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-003
-    assert_eq!(
-        (status, codes(&empty.rows)),
-        (StatusCode::OK, listed(&[""; 7]))
-    );
-    assert_eq!(
-        (empty.message.as_deref(), empty.info_message),
-        (Some(NO_RECORDS_FOUND), None)
-    );
-    assert!(!empty.has_next_page);
-    Ok(())
+        for number in 64..=70 {
+            assert!(harness.remove(&format!("{number:02}")).await?);
+        }
+        let (status, empty) = api
+            .act(&action(ListAid::Enter, &refused_back.state, ("", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-003
+        assert_eq!(
+            (status, codes(&empty.rows)),
+            (StatusCode::OK, listed(&[""; 7]))
+        );
+        assert_eq!(
+            (empty.message.as_deref(), empty.info_message),
+            (Some(NO_RECORDS_FOUND), None)
+        );
+        assert!(!empty.has_next_page);
+        Ok(())
+    })
 }
 
 // Endpoint 25: a valid filter is counted, then read; the type filter is an equality, the
 // description filter a case-sensitive `LIKE '%text%'` of the trimmed text, and both are ANDed.
-#[tokio::test]
-async fn cotrtlic_valid_filters_select_by_type_and_like_pattern() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("08", "NEW  TYPE").await?;
-    let (_, loaded) = api.load().await?;
-    let cases = [
-        (("03", ""), first_only("03")),
-        (("", "PAY"), first_only("02")),
-        (("", "P_Y"), first_only("02")),
-        (("", "  PAYMENT  "), first_only("02")),
-        (("", "NEW  TYPE"), first_only("08")),
-        (("06", "R"), first_only("06")),
-        (("", "R"), listed(&["01", "03", "04", "05", "06", "", ""])),
-        (("", "%"), seed_page()),
-    ];
-    for (filters, expected) in cases {
-        let (status, page) = api
-            .act(&action(ListAid::Enter, &loaded.state, filters, &[]))
+#[test]
+fn cotrtlic_valid_filters_select_by_type_and_like_pattern() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("08", "NEW  TYPE").await?;
+        let (_, loaded) = api.load().await?;
+        let cases = [
+            (("03", ""), first_only("03")),
+            (("", "PAY"), first_only("02")),
+            (("", "P_Y"), first_only("02")),
+            (("", "  PAYMENT  "), first_only("02")),
+            (("", "NEW  TYPE"), first_only("08")),
+            (("06", "R"), first_only("06")),
+            (("", "R"), listed(&["01", "03", "04", "05", "06", "", ""])),
+            (("", "%"), seed_page()),
+        ];
+        for (filters, expected) in cases {
+            let (status, page) = api
+                .act(&action(ListAid::Enter, &loaded.state, filters, &[]))
+                .await?;
+            // audit: COTRTLIC-005
+            // audit: COTRTLIC-029
+            // audit: COTRTLIC-030
+            // audit: COTRTLIC-035
+            assert_eq!(
+                (status, codes(&page.rows), page.page_no),
+                (StatusCode::OK, expected, 1),
+                "{filters:?}"
+            );
+            assert_eq!(page.state.type_filter, filters.0, "{filters:?}");
+            assert_eq!(page.state.desc_filter, filters.1.trim_end(), "{filters:?}");
+            assert_eq!(
+                page.info_message.as_deref(),
+                Some(RECORD_ACTIONS),
+                "{filters:?}"
+            );
+        }
+        // An unchanged filter keeps its page: F8 on its only page re-reads it under the same
+        // filter.
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
             .await?;
-        // audit: COTRTLIC-005
+        let (status, kept) = api.page(&by_type.page_key, "forward", ("03", "")).await?;
         // audit: COTRTLIC-029
+        assert_eq!(
+            (status, codes(&kept.rows), kept.page_no),
+            (StatusCode::OK, first_only("03"), 1)
+        );
+        assert_eq!(kept.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
+        // `00` and a blank type filter add no predicate; with blank selections the filter shows
+        // empty.
+        for raw in ["00", "  ", ""] {
+            let (status, page) = api
+                .act(&action(ListAid::Enter, &loaded.state, (raw, ""), &[]))
+                .await?;
+            // audit: COTRTLIC-027
+            assert_eq!(
+                (status, codes(&page.rows)),
+                (StatusCode::OK, seed_page()),
+                "{raw:?}"
+            );
+            assert_eq!(page.type_filter.text, "", "{raw:?}");
+            assert_eq!(
+                page.type_filter.status,
+                TranTypeListFilterStatus::Blank,
+                "{raw:?}"
+            );
+        }
+        // A changed filter on F8 moves to page 1 of it: endpoint 24 runs the filter edits too.
+        let (status, moved) = api
+            .page(&loaded.page_key, "forward", ("", "REFUND"))
+            .await?;
         // audit: COTRTLIC-030
         // audit: COTRTLIC-035
         assert_eq!(
-            (status, codes(&page.rows), page.page_no),
-            (StatusCode::OK, expected, 1),
-            "{filters:?}"
+            (status, codes(&moved.rows), moved.page_no),
+            (StatusCode::OK, first_only("05"), 1)
         );
-        assert_eq!(page.state.type_filter, filters.0, "{filters:?}");
-        assert_eq!(page.state.desc_filter, filters.1.trim_end(), "{filters:?}");
-        assert_eq!(
-            page.info_message.as_deref(),
-            Some(RECORD_ACTIONS),
-            "{filters:?}"
-        );
-    }
-    // An unchanged filter keeps its page: F8 on its only page re-reads it under the same filter.
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
-        .await?;
-    let (status, kept) = api.page(&by_type.page_key, "forward", ("03", "")).await?;
-    // audit: COTRTLIC-029
-    assert_eq!(
-        (status, codes(&kept.rows), kept.page_no),
-        (StatusCode::OK, first_only("03"), 1)
-    );
-    assert_eq!(kept.message.as_deref(), Some(NO_MORE_PAGES_FOR_SEARCH));
-    // `00` and a blank type filter add no predicate; with blank selections the filter shows empty.
-    for raw in ["00", "  ", ""] {
-        let (status, page) = api
-            .act(&action(ListAid::Enter, &loaded.state, (raw, ""), &[]))
-            .await?;
-        // audit: COTRTLIC-027
-        assert_eq!(
-            (status, codes(&page.rows)),
-            (StatusCode::OK, seed_page()),
-            "{raw:?}"
-        );
-        assert_eq!(page.type_filter.text, "", "{raw:?}");
-        assert_eq!(
-            page.type_filter.status,
-            TranTypeListFilterStatus::Blank,
-            "{raw:?}"
-        );
-    }
-    // A changed filter on F8 moves to page 1 of it: endpoint 24 runs the filter edits too.
-    let (status, moved) = api
-        .page(&loaded.page_key, "forward", ("", "REFUND"))
-        .await?;
-    // audit: COTRTLIC-030
-    // audit: COTRTLIC-035
-    assert_eq!(
-        (status, codes(&moved.rows), moved.page_no),
-        (StatusCode::OK, first_only("05"), 1)
-    );
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25 and 24: a type filter that is not two digits, a filter that matches nothing, and
 // which message wins when several are raised.
-#[tokio::test]
-async fn cotrtlic_filter_edits_and_filters_matching_nothing() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    for raw in ["A1", "1", "1 ", "+1"] {
-        let body = action(ListAid::Enter, &loaded.state, (raw, ""), &[(1, "X", "")]);
-        let (status, page) = api.act(&body).await?;
+#[test]
+fn cotrtlic_filter_edits_and_filters_matching_nothing() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        for raw in ["A1", "1", "1 ", "+1"] {
+            let body = action(ListAid::Enter, &loaded.state, (raw, ""), &[(1, "X", "")]);
+            let (status, page) = api.act(&body).await?;
+            // audit: COTRTLIC-028
+            // audit: COTRTLIC-033
+            // audit: COTRTLIC-034
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{raw:?}");
+            assert_eq!(
+                page.message.as_deref(),
+                Some(TYPE_FILTER_NOT_NUMERIC),
+                "{raw:?}"
+            );
+            assert_eq!(
+                (page.info_message, page.type_filter.status),
+                (None, TranTypeListFilterStatus::InError)
+            );
+            assert_eq!(
+                (codes(&page.rows), selections(&page.rows)[0].as_str()),
+                (seed_page(), "X")
+            );
+            assert_eq!(
+                page.state.selectors,
+                TranTypeListSelectors::Protected,
+                "{raw:?}"
+            );
+            assert_eq!(
+                (page.state.page_no, page.state.type_filter.as_str()),
+                (0, raw.trim_end())
+            );
+            assert_eq!(page.committed, TranTypeListCommitted::Nothing);
+        }
+        let (status, paged) = api.page(&loaded.page_key, "forward", ("A1", "")).await?;
         // audit: COTRTLIC-028
-        // audit: COTRTLIC-033
-        // audit: COTRTLIC-034
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{raw:?}");
         assert_eq!(
-            page.message.as_deref(),
-            Some(TYPE_FILTER_NOT_NUMERIC),
-            "{raw:?}"
+            (status, paged.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(TYPE_FILTER_NOT_NUMERIC))
         );
-        assert_eq!(
-            (page.info_message, page.type_filter.status),
-            (None, TranTypeListFilterStatus::InError)
-        );
-        assert_eq!(
-            (codes(&page.rows), selections(&page.rows)[0].as_str()),
-            (seed_page(), "X")
-        );
-        assert_eq!(
-            page.state.selectors,
-            TranTypeListSelectors::Protected,
-            "{raw:?}"
-        );
-        assert_eq!(
-            (page.state.page_no, page.state.type_filter.as_str()),
-            (0, raw.trim_end())
-        );
-        assert_eq!(page.committed, TranTypeListCommitted::Nothing);
-    }
-    let (status, paged) = api.page(&loaded.page_key, "forward", ("A1", "")).await?;
-    // audit: COTRTLIC-028
-    assert_eq!(
-        (status, paged.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(TYPE_FILTER_NOT_NUMERIC))
-    );
 
-    // A valid filter that matches nothing: the description match is case-sensitive and interior
-    // spaces count.
-    for filters in [("09", ""), ("", "pay"), ("", "PUR CHASE"), ("03", "PAY")] {
-        let body = action(ListAid::Enter, &loaded.state, filters, &[(2, "D", "")]);
+        // A valid filter that matches nothing: the description match is case-sensitive and interior
+        // spaces count.
+        for filters in [("09", ""), ("", "pay"), ("", "PUR CHASE"), ("03", "PAY")] {
+            let body = action(ListAid::Enter, &loaded.state, filters, &[(2, "D", "")]);
+            let (status, page) = api.act(&body).await?;
+            // audit: COTRTLIC-005
+            // audit: COTRTLIC-031
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{filters:?}");
+            assert_eq!(
+                (page.message.as_deref(), page.info_message),
+                (Some(NO_RECORDS_FOR_FILTERS), None)
+            );
+            assert_eq!(codes(&page.rows), seed_page(), "{filters:?}");
+            assert_eq!((page.page_no, page.state.page_no), (0, 0), "{filters:?}");
+            assert_eq!(
+                page.state.selectors,
+                TranTypeListSelectors::Protected,
+                "{filters:?}"
+            );
+            let flagged_filter = if filters.0.is_empty() {
+                &page.desc_filter
+            } else {
+                &page.type_filter
+            };
+            assert_eq!(
+                flagged_filter.status,
+                TranTypeListFilterStatus::InError,
+                "{filters:?}"
+            );
+            // The single valid selection still becomes pending at its position in those rows.
+            assert_eq!(
+                page.state.pending_action,
+                TranTypeListPendingAction::Delete,
+                "{filters:?}"
+            );
+            assert_eq!(page.state.selected_row, Some(2), "{filters:?}");
+        }
+        // The no-match message replaces the selection message.
+        let body = action(ListAid::Enter, &loaded.state, ("09", ""), &[(3, "X", "")]);
         let (status, page) = api.act(&body).await?;
-        // audit: COTRTLIC-005
-        // audit: COTRTLIC-031
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{filters:?}");
+        // audit: COTRTLIC-033
         assert_eq!(
-            (page.message.as_deref(), page.info_message),
-            (Some(NO_RECORDS_FOR_FILTERS), None)
+            (status, page.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
         );
-        assert_eq!(codes(&page.rows), seed_page(), "{filters:?}");
-        assert_eq!((page.page_no, page.state.page_no), (0, 0), "{filters:?}");
-        assert_eq!(
-            page.state.selectors,
-            TranTypeListSelectors::Protected,
-            "{filters:?}"
-        );
-        let flagged_filter = if filters.0.is_empty() {
-            &page.desc_filter
-        } else {
-            &page.type_filter
-        };
-        assert_eq!(
-            flagged_filter.status,
-            TranTypeListFilterStatus::InError,
-            "{filters:?}"
-        );
-        // The single valid selection still becomes pending at its position in those rows.
-        assert_eq!(
-            page.state.pending_action,
-            TranTypeListPendingAction::Delete,
-            "{filters:?}"
-        );
-        assert_eq!(page.state.selected_row, Some(2), "{filters:?}");
-    }
-    // The no-match message replaces the selection message.
-    let body = action(ListAid::Enter, &loaded.state, ("09", ""), &[(3, "X", "")]);
-    let (status, page) = api.act(&body).await?;
-    // audit: COTRTLIC-033
-    assert_eq!(
-        (status, page.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
-    );
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP cases 7 and 8: invalid action codes, two actions, and a selection where no
 // row is shown.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_invalid_and_double_selections() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let start = &loaded.state;
-    for code in ["X", "d", "u"] {
-        let (status, result) = api
-            .act(&action(ListAid::Enter, start, ("", ""), &[(2, code, "")]))
-            .await?;
-        // audit: COTRTLIC-020
-        // audit: COTRTLIC-021
-        // audit: COTRTLIC-034
-        assert_eq!(
-            (status, result.message.as_deref()),
-            (StatusCode::BAD_REQUEST, Some(INVALID_ACTION))
-        );
-        assert_eq!(
-            result.info_message.as_deref(),
-            Some(RECORD_ACTIONS),
-            "{code}"
-        );
-        assert_eq!(flagged(&result), [(2, "selection")], "{code}");
-        assert_eq!(
-            (codes(&result.rows), selections(&result.rows)[1].as_str()),
-            (seed_page(), code)
-        );
-        assert_eq!(
-            result.state.pending_action,
-            TranTypeListPendingAction::None,
-            "{code}"
-        );
-    }
-    let body = action(
-        ListAid::Enter,
-        start,
-        ("", ""),
-        &[(1, "D", ""), (3, "U", "")],
-    );
-    let (status, two) = api.act(&body).await?;
-    // audit: COTRTLIC-022
-    assert_eq!(
-        (status, two.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(ONLY_ONE_ACTION))
-    );
-    assert_eq!(two.info_message.as_deref(), Some(RECORD_ACTIONS));
-    assert_eq!(flagged(&two), [(1, "selection"), (3, "selection")]);
-    assert_eq!(two.state.pending_action, TranTypeListPendingAction::None);
-    // Filter 03 shows one row, so a selection on row 2 is never received.
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, start, ("03", ""), &[]))
-        .await?;
-    let (status, unseen) = api
-        .act(&action(
+#[test]
+fn cotrtlic_list_actions_case_invalid_and_double_selections() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let start = &loaded.state;
+        for code in ["X", "d", "u"] {
+            let (status, result) = api
+                .act(&action(ListAid::Enter, start, ("", ""), &[(2, code, "")]))
+                .await?;
+            // audit: COTRTLIC-020
+            // audit: COTRTLIC-021
+            // audit: COTRTLIC-034
+            assert_eq!(
+                (status, result.message.as_deref()),
+                (StatusCode::BAD_REQUEST, Some(INVALID_ACTION))
+            );
+            assert_eq!(
+                result.info_message.as_deref(),
+                Some(RECORD_ACTIONS),
+                "{code}"
+            );
+            assert_eq!(flagged(&result), [(2, "selection")], "{code}");
+            assert_eq!(
+                (codes(&result.rows), selections(&result.rows)[1].as_str()),
+                (seed_page(), code)
+            );
+            assert_eq!(
+                result.state.pending_action,
+                TranTypeListPendingAction::None,
+                "{code}"
+            );
+        }
+        let body = action(
             ListAid::Enter,
-            &by_type.state,
-            ("03", ""),
-            &[(2, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-018
-    assert_eq!(
-        (status, unseen.message, unseen.info_message.as_deref()),
-        (StatusCode::OK, None, Some(RECORD_ACTIONS))
-    );
-    assert_eq!(
-        (unseen.state.pending_action, unseen.state.selected_row),
-        (TranTypeListPendingAction::None, None)
-    );
+            start,
+            ("", ""),
+            &[(1, "D", ""), (3, "U", "")],
+        );
+        let (status, two) = api.act(&body).await?;
+        // audit: COTRTLIC-022
+        assert_eq!(
+            (status, two.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(ONLY_ONE_ACTION))
+        );
+        assert_eq!(two.info_message.as_deref(), Some(RECORD_ACTIONS));
+        assert_eq!(flagged(&two), [(1, "selection"), (3, "selection")]);
+        assert_eq!(two.state.pending_action, TranTypeListPendingAction::None);
+        // Filter 03 shows one row, so a selection on row 2 is never received.
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, start, ("03", ""), &[]))
+            .await?;
+        let (status, unseen) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("03", ""),
+                &[(2, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-018
+        assert_eq!(
+            (status, unseen.message, unseen.info_message.as_deref()),
+            (StatusCode::OK, None, Some(RECORD_ACTIONS))
+        );
+        assert_eq!(
+            (unseen.state.pending_action, unseen.state.selected_row),
+            (TranTypeListPendingAction::None, None)
+        );
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP case 9 and the `U` description edits: the first `U` finds no change, an
 // unchanged description stays no change, and a changed one must be supplied and alphanumeric.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_update_description_edits() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let start = &loaded.state;
-    // The first `U` finds no change: its description is protected until this response.
-    let (status, opened) = api
-        .act(&action(
-            ListAid::Enter,
-            start,
-            ("", ""),
-            &[(1, "U", "Ignored")],
-        ))
-        .await?;
-    // audit: COTRTLIC-018
-    // audit: COTRTLIC-024
-    // audit: COTRTLIC-040
-    assert_eq!(
-        (status, opened.message.as_deref()),
-        (StatusCode::OK, Some(NO_CHANGE_DB))
-    );
-    assert_eq!(opened.info_message.as_deref(), Some(UPDATE_PROMPT));
-    assert_eq!(
-        (opened.state.pending_action, opened.state.selected_row),
-        (TranTypeListPendingAction::Update, Some(1))
-    );
-    assert_eq!(
-        (
-            opened.state.description_entry,
-            shown_descriptions(&opened.rows)[0].as_str()
-        ),
-        (Some(1), "PURCHASE")
-    );
-    let row = opened
-        .rows
-        .first()
-        .and_then(Option::as_ref)
-        .ok_or("row 1 is empty")?;
-    assert!(row.highlighted && row.description_enterable);
-    let body = action(
-        ListAid::Enter,
-        &opened.state,
-        ("", ""),
-        &[(1, "U", "  purchase ")],
-    );
-    let (status, same) = api.act(&body).await?;
-    // audit: COTRTLIC-017
-    // audit: COTRTLIC-024
-    assert_eq!(
-        (status, same.message.as_deref()),
-        (StatusCode::OK, Some(NO_CHANGE_DB))
-    );
-    // A changed description must be supplied and alphanumeric; the update stays pending.
-    for (typed, message, shown) in [
-        ("*", DESC_REQUIRED, "*"),
-        ("   ", DESC_REQUIRED, "*"),
-        ("Buy-now", DESC_ALPHANUM, "Buy-now"),
-    ] {
-        let body = action(ListAid::Enter, &opened.state, ("", ""), &[(1, "U", typed)]);
-        let (status, refused_edit) = api.act(&body).await?;
-        // audit: COTRTLIC-017
-        // audit: COTRTLIC-025
-        // audit: COTRTLIC-026
+#[test]
+fn cotrtlic_list_actions_case_update_description_edits() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let start = &loaded.state;
+        // The first `U` finds no change: its description is protected until this response.
+        let (status, opened) = api
+            .act(&action(
+                ListAid::Enter,
+                start,
+                ("", ""),
+                &[(1, "U", "Ignored")],
+            ))
+            .await?;
+        // audit: COTRTLIC-018
+        // audit: COTRTLIC-024
         // audit: COTRTLIC-040
         assert_eq!(
-            (status, refused_edit.message.as_deref()),
-            (StatusCode::BAD_REQUEST, Some(message))
+            (status, opened.message.as_deref()),
+            (StatusCode::OK, Some(NO_CHANGE_DB))
         );
+        assert_eq!(opened.info_message.as_deref(), Some(UPDATE_PROMPT));
         assert_eq!(
-            refused_edit.info_message.as_deref(),
-            Some(UPDATE_PROMPT),
-            "{typed:?}"
+            (opened.state.pending_action, opened.state.selected_row),
+            (TranTypeListPendingAction::Update, Some(1))
         );
         assert_eq!(
             (
-                flagged(&refused_edit),
-                shown_descriptions(&refused_edit.rows)[0].as_str()
+                opened.state.description_entry,
+                shown_descriptions(&opened.rows)[0].as_str()
             ),
-            (vec![(1, "description")], shown)
+            (Some(1), "PURCHASE")
         );
-        assert_eq!(
-            refused_edit.state.pending_action,
-            TranTypeListPendingAction::Update
-        );
-    }
-    // F10 while the description stays blank is an input error and commits nothing.
-    let (_, blank) = api
-        .act(&action(
+        let row = opened
+            .rows
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or("row 1 is empty")?;
+        assert!(row.highlighted && row.description_enterable);
+        let body = action(
             ListAid::Enter,
             &opened.state,
             ("", ""),
-            &[(1, "U", "*")],
-        ))
-        .await?;
-    let (status, kept) = api
-        .act(&action(
-            ListAid::Pf10,
-            &blank.state,
-            ("", ""),
-            &[(1, "U", "*")],
-        ))
-        .await?;
-    // audit: COTRTLIC-025
-    // audit: COTRTLIC-034
-    assert_eq!(
-        (status, kept.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(DESC_REQUIRED))
-    );
-    assert_eq!(kept.committed, TranTypeListCommitted::Nothing);
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    Ok(())
+            &[(1, "U", "  purchase ")],
+        );
+        let (status, same) = api.act(&body).await?;
+        // audit: COTRTLIC-017
+        // audit: COTRTLIC-024
+        assert_eq!(
+            (status, same.message.as_deref()),
+            (StatusCode::OK, Some(NO_CHANGE_DB))
+        );
+        // A changed description must be supplied and alphanumeric; the update stays pending.
+        for (typed, message, shown) in [
+            ("*", DESC_REQUIRED, "*"),
+            ("   ", DESC_REQUIRED, "*"),
+            ("Buy-now", DESC_ALPHANUM, "Buy-now"),
+        ] {
+            let body = action(ListAid::Enter, &opened.state, ("", ""), &[(1, "U", typed)]);
+            let (status, refused_edit) = api.act(&body).await?;
+            // audit: COTRTLIC-017
+            // audit: COTRTLIC-025
+            // audit: COTRTLIC-026
+            // audit: COTRTLIC-040
+            assert_eq!(
+                (status, refused_edit.message.as_deref()),
+                (StatusCode::BAD_REQUEST, Some(message))
+            );
+            assert_eq!(
+                refused_edit.info_message.as_deref(),
+                Some(UPDATE_PROMPT),
+                "{typed:?}"
+            );
+            assert_eq!(
+                (
+                    flagged(&refused_edit),
+                    shown_descriptions(&refused_edit.rows)[0].as_str()
+                ),
+                (vec![(1, "description")], shown)
+            );
+            assert_eq!(
+                refused_edit.state.pending_action,
+                TranTypeListPendingAction::Update
+            );
+        }
+        // F10 while the description stays blank is an input error and commits nothing.
+        let (_, blank) = api
+            .act(&action(
+                ListAid::Enter,
+                &opened.state,
+                ("", ""),
+                &[(1, "U", "*")],
+            ))
+            .await?;
+        let (status, kept) = api
+            .act(&action(
+                ListAid::Pf10,
+                &blank.state,
+                ("", ""),
+                &[(1, "U", "*")],
+            ))
+            .await?;
+        // audit: COTRTLIC-025
+        // audit: COTRTLIC-034
+        assert_eq!(
+            (status, kept.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(DESC_REQUIRED))
+        );
+        assert_eq!(kept.committed, TranTypeListCommitted::Nothing);
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP cases 1 and 3: ENTER and F10 after a changed type filter with blank
 // selections, then a `D` on the old page's row 1 together with a changed type filter.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_changed_type_filter() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("08", "OBSOLETE").await?;
-    let (_, loaded) = api.load().await?;
-    let (status, entered) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-029
-    // audit: COTRTLIC-035
-    assert_eq!(
-        (status, codes(&entered.rows), entered.page_no),
-        (StatusCode::OK, first_only("03"), 1)
-    );
-    assert_eq!(
-        (entered.message, entered.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    assert_eq!(
-        (entered.state.type_filter.as_str(), entered.committed),
-        ("03", TranTypeListCommitted::Nothing)
-    );
-    let (status, confirmed) = api
-        .act(&action(ListAid::Pf10, &entered.state, ("05", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-035
-    // audit: COTRTLIC-036
-    // audit: COTRTLIC-037
-    assert_eq!(
-        (status, codes(&confirmed.rows), confirmed.page_no),
-        (StatusCode::OK, first_only("05"), 1)
-    );
-    assert_eq!(
-        (confirmed.state.type_filter.as_str(), confirmed.committed),
-        ("05", TranTypeListCommitted::Nothing)
-    );
-    assert_eq!(confirmed.info_message.as_deref(), Some(RECORD_ACTIONS));
+#[test]
+fn cotrtlic_list_actions_case_changed_type_filter() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("08", "OBSOLETE").await?;
+        let (_, loaded) = api.load().await?;
+        let (status, entered) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-029
+        // audit: COTRTLIC-035
+        assert_eq!(
+            (status, codes(&entered.rows), entered.page_no),
+            (StatusCode::OK, first_only("03"), 1)
+        );
+        assert_eq!(
+            (entered.message, entered.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        assert_eq!(
+            (entered.state.type_filter.as_str(), entered.committed),
+            ("03", TranTypeListCommitted::Nothing)
+        );
+        let (status, confirmed) = api
+            .act(&action(ListAid::Pf10, &entered.state, ("05", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-035
+        // audit: COTRTLIC-036
+        // audit: COTRTLIC-037
+        assert_eq!(
+            (status, codes(&confirmed.rows), confirmed.page_no),
+            (StatusCode::OK, first_only("05"), 1)
+        );
+        assert_eq!(
+            (confirmed.state.type_filter.as_str(), confirmed.committed),
+            ("05", TranTypeListCommitted::Nothing)
+        );
+        assert_eq!(confirmed.info_message.as_deref(), Some(RECORD_ACTIONS));
+        delete_on_the_old_page_under_a_changed_type_filter(&harness, &loaded).await
+    })
+}
 
+/// AAP case 3 of endpoint 25, for `cotrtlic_list_actions_case_changed_type_filter`: a `D` on
+/// row 1 of `loaded`'s page entered together with the changed type filter `08`, its F10
+/// delete, and the ENTER after it from the state that delete reset.
+async fn delete_on_the_old_page_under_a_changed_type_filter(
+    harness: &Harness,
+    loaded: &TranTypeListResponse,
+) -> TestResult {
+    let api = &harness.admin;
     // The `D` is edited against the old page, where row 1 is 01; the new page holds 08 there.
     let (status, kept) = api
         .act(&action(
@@ -1367,1221 +1406,1257 @@ async fn cotrtlic_list_actions_case_changed_type_filter() -> TestResult {
 
 // Endpoint 25, AAP cases 2 and 4: ENTER and F10 after a changed description filter with blank
 // selections, then a `U` with an edited description together with a changed description filter.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_changed_description_filter() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let (status, entered) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("", "CREDIT"), &[]))
-        .await?;
-    // audit: COTRTLIC-030
-    // audit: COTRTLIC-035
-    assert_eq!(
-        (status, codes(&entered.rows), entered.page_no),
-        (StatusCode::OK, first_only("03"), 1)
-    );
-    assert_eq!(
-        (entered.state.desc_filter.as_str(), entered.committed),
-        ("CREDIT", TranTypeListCommitted::Nothing)
-    );
-    assert_eq!(
-        (entered.message, entered.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    let (status, confirmed) = api
-        .act(&action(ListAid::Pf10, &entered.state, ("", "REFUND"), &[]))
-        .await?;
-    // audit: COTRTLIC-030
-    // audit: COTRTLIC-035
-    // audit: COTRTLIC-036
-    // audit: COTRTLIC-037
-    assert_eq!(
-        (status, codes(&confirmed.rows)),
-        (StatusCode::OK, first_only("05"))
-    );
-    assert_eq!(
-        (confirmed.state.desc_filter.as_str(), confirmed.committed),
-        ("REFUND", TranTypeListCommitted::Nothing)
-    );
+#[test]
+fn cotrtlic_list_actions_case_changed_description_filter() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let (status, entered) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("", "CREDIT"), &[]))
+            .await?;
+        // audit: COTRTLIC-030
+        // audit: COTRTLIC-035
+        assert_eq!(
+            (status, codes(&entered.rows), entered.page_no),
+            (StatusCode::OK, first_only("03"), 1)
+        );
+        assert_eq!(
+            (entered.state.desc_filter.as_str(), entered.committed),
+            ("CREDIT", TranTypeListCommitted::Nothing)
+        );
+        assert_eq!(
+            (entered.message, entered.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        let (status, confirmed) = api
+            .act(&action(ListAid::Pf10, &entered.state, ("", "REFUND"), &[]))
+            .await?;
+        // audit: COTRTLIC-030
+        // audit: COTRTLIC-035
+        // audit: COTRTLIC-036
+        // audit: COTRTLIC-037
+        assert_eq!(
+            (status, codes(&confirmed.rows)),
+            (StatusCode::OK, first_only("05"))
+        );
+        assert_eq!(
+            (confirmed.state.desc_filter.as_str(), confirmed.committed),
+            ("REFUND", TranTypeListCommitted::Nothing)
+        );
 
-    // The description of a `U` is enterable only after the ENTER that selects it.
-    let (_, opened) = api
-        .act(&action(
+        // The description of a `U` is enterable only after the ENTER that selects it.
+        let (_, opened) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("", ""),
+                &[(1, "U", "")],
+            ))
+            .await?;
+        assert_eq!(opened.state.description_entry, Some(1));
+        let body = action(
             ListAid::Enter,
-            &loaded.state,
-            ("", ""),
-            &[(1, "U", "")],
-        ))
-        .await?;
-    assert_eq!(opened.state.description_entry, Some(1));
-    let body = action(
-        ListAid::Enter,
-        &opened.state,
-        ("", "PAYMENT"),
-        &[(1, "U", "PAYMENT due")],
-    );
-    let (status, moved) = api.act(&body).await?;
-    // audit: COTRTLIC-018
-    // audit: COTRTLIC-019
-    // audit: COTRTLIC-030
-    // audit: COTRTLIC-041
-    assert_eq!(
-        (status, codes(&moved.rows), moved.page_no),
-        (StatusCode::OK, first_only("02"), 1)
-    );
-    assert_eq!(
-        (
-            shown_descriptions(&moved.rows)[0].as_str(),
-            selections(&moved.rows)[0].as_str()
-        ),
-        ("PAYMENT due", "U")
-    );
-    assert_eq!(
-        (moved.state.pending_action, moved.state.description_entry),
-        (TranTypeListPendingAction::Update, Some(1))
-    );
-    assert_eq!((moved.message, moved.info_message), (None, None));
-    assert_eq!(harness.stored("02").await?.as_deref(), Some("PAYMENT"));
-    let body = action(
-        ListAid::Pf10,
-        &moved.state,
-        ("", "PAYMENT"),
-        &[(1, "U", "  PAYMENT due  ")],
-    );
-    let (status, saved) = api.act(&body).await?;
-    // audit: COTRTLIC-042
-    // audit: COTRTLIC-044
-    // audit: COTRTLIC-045
-    assert_eq!(
-        (status, saved.committed),
-        (StatusCode::OK, TranTypeListCommitted::Updated)
-    );
-    assert_eq!(
-        (saved.message, saved.info_message.as_deref()),
-        (None, Some(ROW_UPDATED))
-    );
-    assert_eq!(
-        (codes(&saved.rows), selections(&saved.rows)[0].as_str()),
-        (first_only("02"), "")
-    );
-    assert_eq!(shown_descriptions(&saved.rows)[0], "PAYMENT due");
-    assert_eq!(saved.state.pending_action, TranTypeListPendingAction::None);
-    // Trimmed, in the case typed, padded to 50; the row first selected is untouched.
-    assert_eq!(harness.stored("02").await?, Some(padded("PAYMENT due")));
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    Ok(())
+            &opened.state,
+            ("", "PAYMENT"),
+            &[(1, "U", "PAYMENT due")],
+        );
+        let (status, moved) = api.act(&body).await?;
+        // audit: COTRTLIC-018
+        // audit: COTRTLIC-019
+        // audit: COTRTLIC-030
+        // audit: COTRTLIC-041
+        assert_eq!(
+            (status, codes(&moved.rows), moved.page_no),
+            (StatusCode::OK, first_only("02"), 1)
+        );
+        assert_eq!(
+            (
+                shown_descriptions(&moved.rows)[0].as_str(),
+                selections(&moved.rows)[0].as_str()
+            ),
+            ("PAYMENT due", "U")
+        );
+        assert_eq!(
+            (moved.state.pending_action, moved.state.description_entry),
+            (TranTypeListPendingAction::Update, Some(1))
+        );
+        assert_eq!((moved.message, moved.info_message), (None, None));
+        assert_eq!(harness.stored("02").await?.as_deref(), Some("PAYMENT"));
+        let body = action(
+            ListAid::Pf10,
+            &moved.state,
+            ("", "PAYMENT"),
+            &[(1, "U", "  PAYMENT due  ")],
+        );
+        let (status, saved) = api.act(&body).await?;
+        // audit: COTRTLIC-042
+        // audit: COTRTLIC-044
+        // audit: COTRTLIC-045
+        assert_eq!(
+            (status, saved.committed),
+            (StatusCode::OK, TranTypeListCommitted::Updated)
+        );
+        assert_eq!(
+            (saved.message, saved.info_message.as_deref()),
+            (None, Some(ROW_UPDATED))
+        );
+        assert_eq!(
+            (codes(&saved.rows), selections(&saved.rows)[0].as_str()),
+            (first_only("02"), "")
+        );
+        assert_eq!(shown_descriptions(&saved.rows)[0], "PAYMENT due");
+        assert_eq!(saved.state.pending_action, TranTypeListPendingAction::None);
+        // Trimmed, in the case typed, padded to 50; the row first selected is untouched.
+        assert_eq!(harness.stored("02").await?, Some(padded("PAYMENT due")));
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP cases 11 and 5: F10 with nothing pending, and F10 with a pending action and
 // a changed filter, each processed as ENTER.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_f10_processed_as_enter() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("08", "OBSOLETE").await?;
-    let (_, loaded) = api.load().await?;
-    let (status, refreshed) = api
-        .act(&action(ListAid::Pf10, &loaded.state, ("", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-006
-    // audit: COTRTLIC-037
-    assert_eq!(
-        (status, codes(&refreshed.rows), refreshed.committed),
-        (StatusCode::OK, seed_page(), TranTypeListCommitted::Nothing)
-    );
-    assert_eq!(
-        (refreshed.message, refreshed.info_message.as_deref()),
-        (None, Some(RECORD_ACTIONS))
-    );
-    let (status, prompted) = api
-        .act(&action(
-            ListAid::Pf10,
-            &loaded.state,
-            ("", ""),
-            &[(4, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-037
-    // audit: COTRTLIC-039
-    assert_eq!(
-        (status, prompted.info_message.as_deref()),
-        (StatusCode::OK, Some(DELETE_PROMPT))
-    );
-    assert_eq!(
-        (prompted.state.pending_action, prompted.state.selected_row),
-        (TranTypeListPendingAction::Delete, Some(4))
-    );
-    assert_eq!(
-        (prompted.committed, selections(&prompted.rows)[3].as_str()),
-        (TranTypeListCommitted::Nothing, "D")
-    );
-    assert!(
-        prompted
-            .rows
-            .get(3)
-            .and_then(Option::as_ref)
-            .is_some_and(|row| row.highlighted)
-    );
-    assert_eq!(
-        harness.stored("04").await?.as_deref(),
-        Some("AUTHORIZATION")
-    );
+#[test]
+fn cotrtlic_list_actions_case_f10_processed_as_enter() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("08", "OBSOLETE").await?;
+        let (_, loaded) = api.load().await?;
+        let (status, refreshed) = api
+            .act(&action(ListAid::Pf10, &loaded.state, ("", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-006
+        // audit: COTRTLIC-037
+        assert_eq!(
+            (status, codes(&refreshed.rows), refreshed.committed),
+            (StatusCode::OK, seed_page(), TranTypeListCommitted::Nothing)
+        );
+        assert_eq!(
+            (refreshed.message, refreshed.info_message.as_deref()),
+            (None, Some(RECORD_ACTIONS))
+        );
+        let (status, prompted) = api
+            .act(&action(
+                ListAid::Pf10,
+                &loaded.state,
+                ("", ""),
+                &[(4, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-037
+        // audit: COTRTLIC-039
+        assert_eq!(
+            (status, prompted.info_message.as_deref()),
+            (StatusCode::OK, Some(DELETE_PROMPT))
+        );
+        assert_eq!(
+            (prompted.state.pending_action, prompted.state.selected_row),
+            (TranTypeListPendingAction::Delete, Some(4))
+        );
+        assert_eq!(
+            (prompted.committed, selections(&prompted.rows)[3].as_str()),
+            (TranTypeListCommitted::Nothing, "D")
+        );
+        assert!(
+            prompted
+                .rows
+                .get(3)
+                .and_then(Option::as_ref)
+                .is_some_and(|row| row.highlighted)
+        );
+        assert_eq!(
+            harness.stored("04").await?.as_deref(),
+            Some("AUTHORIZATION")
+        );
 
-    // A pending delete of 08, then F10 with the type filter changed back to blank.
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
-        .await?;
-    let (_, pending) = api
-        .act(&action(
-            ListAid::Enter,
-            &by_type.state,
-            ("08", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    assert_eq!(
-        (
-            pending.info_message.as_deref(),
-            pending.state.pending_action
-        ),
-        (Some(DELETE_PROMPT), TranTypeListPendingAction::Delete)
-    );
-    let (status, downgraded) = api
-        .act(&action(
-            ListAid::Pf10,
-            &pending.state,
-            ("", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-038
-    // audit: COTRTLIC-041
-    assert_eq!(
-        (status, codes(&downgraded.rows), downgraded.committed),
-        (StatusCode::OK, seed_page(), TranTypeListCommitted::Nothing)
-    );
-    assert_eq!(
-        (
-            selections(&downgraded.rows)[0].as_str(),
-            downgraded.info_message
-        ),
-        ("D", None)
-    );
-    assert_eq!(
-        downgraded.state.pending_action,
-        TranTypeListPendingAction::Delete
-    );
-    assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
+        // A pending delete of 08, then F10 with the type filter changed back to blank.
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
+            .await?;
+        let (_, pending) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("08", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        assert_eq!(
+            (
+                pending.info_message.as_deref(),
+                pending.state.pending_action
+            ),
+            (Some(DELETE_PROMPT), TranTypeListPendingAction::Delete)
+        );
+        let (status, downgraded) = api
+            .act(&action(
+                ListAid::Pf10,
+                &pending.state,
+                ("", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-038
+        // audit: COTRTLIC-041
+        assert_eq!(
+            (status, codes(&downgraded.rows), downgraded.committed),
+            (StatusCode::OK, seed_page(), TranTypeListCommitted::Nothing)
+        );
+        assert_eq!(
+            (
+                selections(&downgraded.rows)[0].as_str(),
+                downgraded.info_message
+            ),
+            ("D", None)
+        );
+        assert_eq!(
+            downgraded.state.pending_action,
+            TranTypeListPendingAction::Delete
+        );
+        assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP case 6: a changed filter with an invalid action code, and a valid changed
 // filter that matches no rows, whose protected selectors make the next F10 an ENTER.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_changed_filter_input_errors() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    // A changed filter with an invalid action code re-reads page 1 of the new filter.
-    let (status, invalid) = api
-        .act(&action(
-            ListAid::Enter,
-            &loaded.state,
-            ("03", ""),
-            &[(1, "X", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-021
-    // audit: COTRTLIC-034
-    assert_eq!(
-        (status, invalid.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(INVALID_ACTION))
-    );
-    assert_eq!(
-        (codes(&invalid.rows), selections(&invalid.rows)[0].as_str()),
-        (first_only("03"), "X")
-    );
-    assert_eq!(
-        (invalid.state.type_filter.as_str(), invalid.page_no),
-        ("03", 1)
-    );
-    // A valid changed filter matching no rows protects the selectors, so the next F10 is ENTER.
-    let (status, nothing) = api
-        .act(&action(
-            ListAid::Enter,
-            &loaded.state,
-            ("09", ""),
-            &[(2, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-031
-    assert_eq!(
-        (status, nothing.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
-    );
-    let (status, after) = api
-        .act(&action(
-            ListAid::Pf10,
-            &nothing.state,
-            ("09", ""),
-            &[(2, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-018
-    // audit: COTRTLIC-031
-    assert_eq!(
-        (status, after.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
-    );
-    assert_eq!(after.committed, TranTypeListCommitted::Nothing);
-    Ok(())
+#[test]
+fn cotrtlic_list_actions_case_changed_filter_input_errors() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        // A changed filter with an invalid action code re-reads page 1 of the new filter.
+        let (status, invalid) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("03", ""),
+                &[(1, "X", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-021
+        // audit: COTRTLIC-034
+        assert_eq!(
+            (status, invalid.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(INVALID_ACTION))
+        );
+        assert_eq!(
+            (codes(&invalid.rows), selections(&invalid.rows)[0].as_str()),
+            (first_only("03"), "X")
+        );
+        assert_eq!(
+            (invalid.state.type_filter.as_str(), invalid.page_no),
+            ("03", 1)
+        );
+        // A valid changed filter matching no rows protects the selectors, so the next F10 is ENTER.
+        let (status, nothing) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("09", ""),
+                &[(2, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-031
+        assert_eq!(
+            (status, nothing.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
+        );
+        let (status, after) = api
+            .act(&action(
+                ListAid::Pf10,
+                &nothing.state,
+                ("09", ""),
+                &[(2, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-018
+        // audit: COTRTLIC-031
+        assert_eq!(
+            (status, after.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
+        );
+        assert_eq!(after.committed, TranTypeListCommitted::Nothing);
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP case 10, the update: a confirmed `U` with the filters unchanged, and an
 // unchanged description rewritten.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_confirmed_update() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let (_, opened) = api
-        .act(&action(
-            ListAid::Enter,
-            &loaded.state,
-            ("", ""),
-            &[(2, "U", "")],
-        ))
-        .await?;
-    let (status, edited) = api
-        .act(&action(
-            ListAid::Enter,
-            &opened.state,
-            ("", ""),
-            &[(2, "U", "Paid out")],
-        ))
-        .await?;
-    // audit: COTRTLIC-040
-    assert_eq!(
-        (status, edited.message, edited.info_message.as_deref()),
-        (StatusCode::OK, None, Some(UPDATE_PROMPT))
-    );
-    assert_eq!(shown_descriptions(&edited.rows)[1], "Paid out");
-    assert_eq!(harness.stored("02").await?.as_deref(), Some("PAYMENT"));
-    let (status, saved) = api
-        .act(&action(
-            ListAid::Pf10,
-            &edited.state,
-            ("", ""),
-            &[(2, "U", "Paid out")],
-        ))
-        .await?;
-    // audit: COTRTLIC-036
-    // audit: COTRTLIC-044
-    // audit: COTRTLIC-045
-    assert_eq!(
-        (status, saved.committed, saved.info_message.as_deref()),
-        (
-            StatusCode::OK,
-            TranTypeListCommitted::Updated,
-            Some(ROW_UPDATED)
-        )
-    );
-    assert_eq!(
-        (
-            shown_descriptions(&saved.rows)[1].as_str(),
-            selections(&saved.rows)[1].as_str()
-        ),
-        ("Paid out", "")
-    );
-    assert_eq!(
-        (saved.state.pending_action, saved.page_no),
-        (TranTypeListPendingAction::None, 1)
-    );
-    assert_eq!(harness.stored("02").await?, Some(padded("Paid out")));
+#[test]
+fn cotrtlic_list_actions_case_confirmed_update() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let (_, opened) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("", ""),
+                &[(2, "U", "")],
+            ))
+            .await?;
+        let (status, edited) = api
+            .act(&action(
+                ListAid::Enter,
+                &opened.state,
+                ("", ""),
+                &[(2, "U", "Paid out")],
+            ))
+            .await?;
+        // audit: COTRTLIC-040
+        assert_eq!(
+            (status, edited.message, edited.info_message.as_deref()),
+            (StatusCode::OK, None, Some(UPDATE_PROMPT))
+        );
+        assert_eq!(shown_descriptions(&edited.rows)[1], "Paid out");
+        assert_eq!(harness.stored("02").await?.as_deref(), Some("PAYMENT"));
+        let (status, saved) = api
+            .act(&action(
+                ListAid::Pf10,
+                &edited.state,
+                ("", ""),
+                &[(2, "U", "Paid out")],
+            ))
+            .await?;
+        // audit: COTRTLIC-036
+        // audit: COTRTLIC-044
+        // audit: COTRTLIC-045
+        assert_eq!(
+            (status, saved.committed, saved.info_message.as_deref()),
+            (
+                StatusCode::OK,
+                TranTypeListCommitted::Updated,
+                Some(ROW_UPDATED)
+            )
+        );
+        assert_eq!(
+            (
+                shown_descriptions(&saved.rows)[1].as_str(),
+                selections(&saved.rows)[1].as_str()
+            ),
+            ("Paid out", "")
+        );
+        assert_eq!(
+            (saved.state.pending_action, saved.page_no),
+            (TranTypeListPendingAction::None, 1)
+        );
+        assert_eq!(harness.stored("02").await?, Some(padded("Paid out")));
 
-    // An unchanged description is still written, at 50 bytes, beside the no-change message.
-    let (_, credit) = api
-        .act(&action(
-            ListAid::Enter,
-            &saved.state,
-            ("", ""),
-            &[(3, "U", "")],
-        ))
-        .await?;
-    let (status, rewritten) = api
-        .act(&action(
-            ListAid::Pf10,
-            &credit.state,
-            ("", ""),
-            &[(3, "U", "CREDIT")],
-        ))
-        .await?;
-    // audit: COTRTLIC-024
-    // audit: COTRTLIC-045
-    assert_eq!(
-        (status, rewritten.committed),
-        (StatusCode::OK, TranTypeListCommitted::Updated)
-    );
-    assert_eq!(
-        (
-            rewritten.message.as_deref(),
-            rewritten.info_message.as_deref()
-        ),
-        (Some(NO_CHANGE_DB), Some(ROW_UPDATED))
-    );
-    assert_eq!(harness.stored("03").await?, Some(padded("CREDIT")));
+        // An unchanged description is still written, at 50 bytes, beside the no-change message.
+        let (_, credit) = api
+            .act(&action(
+                ListAid::Enter,
+                &saved.state,
+                ("", ""),
+                &[(3, "U", "")],
+            ))
+            .await?;
+        let (status, rewritten) = api
+            .act(&action(
+                ListAid::Pf10,
+                &credit.state,
+                ("", ""),
+                &[(3, "U", "CREDIT")],
+            ))
+            .await?;
+        // audit: COTRTLIC-024
+        // audit: COTRTLIC-045
+        assert_eq!(
+            (status, rewritten.committed),
+            (StatusCode::OK, TranTypeListCommitted::Updated)
+        );
+        assert_eq!(
+            (
+                rewritten.message.as_deref(),
+                rewritten.info_message.as_deref()
+            ),
+            (Some(NO_CHANGE_DB), Some(ROW_UPDATED))
+        );
+        assert_eq!(harness.stored("03").await?, Some(padded("CREDIT")));
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP case 10, the delete: a confirmed `D` with the filters unchanged, and a pending
 // update overtaken by a `D` at the same row.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_confirmed_delete() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("08", "OBSOLETE").await?;
-    harness.insert("09", "RETIRED").await?;
-    let (_, loaded) = api.load().await?;
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("09", ""), &[]))
-        .await?;
-    let (status, prompted) = api
-        .act(&action(
-            ListAid::Enter,
-            &by_type.state,
-            ("09", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-039
-    assert_eq!(
-        (status, prompted.info_message.as_deref()),
-        (StatusCode::OK, Some(DELETE_PROMPT))
-    );
-    assert_eq!(
-        (prompted.state.pending_action, prompted.committed),
-        (
-            TranTypeListPendingAction::Delete,
-            TranTypeListCommitted::Nothing
-        )
-    );
-    assert_eq!(harness.stored("09").await?.as_deref(), Some("RETIRED"));
-    let (status, deleted) = api
-        .act(&action(
-            ListAid::Pf10,
-            &prompted.state,
-            ("09", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-036
-    // audit: COTRTLIC-049
-    assert_eq!(
-        (status, deleted.committed, deleted.info_message.as_deref()),
-        (
-            StatusCode::OK,
-            TranTypeListCommitted::Deleted,
-            Some(ROW_DELETED)
-        )
-    );
-    assert_eq!(harness.stored("09").await?, None);
+#[test]
+fn cotrtlic_list_actions_case_confirmed_delete() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("08", "OBSOLETE").await?;
+        harness.insert("09", "RETIRED").await?;
+        let (_, loaded) = api.load().await?;
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("09", ""), &[]))
+            .await?;
+        let (status, prompted) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("09", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-039
+        assert_eq!(
+            (status, prompted.info_message.as_deref()),
+            (StatusCode::OK, Some(DELETE_PROMPT))
+        );
+        assert_eq!(
+            (prompted.state.pending_action, prompted.committed),
+            (
+                TranTypeListPendingAction::Delete,
+                TranTypeListCommitted::Nothing
+            )
+        );
+        assert_eq!(harness.stored("09").await?.as_deref(), Some("RETIRED"));
+        let (status, deleted) = api
+            .act(&action(
+                ListAid::Pf10,
+                &prompted.state,
+                ("09", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-036
+        // audit: COTRTLIC-049
+        assert_eq!(
+            (status, deleted.committed, deleted.info_message.as_deref()),
+            (
+                StatusCode::OK,
+                TranTypeListCommitted::Deleted,
+                Some(ROW_DELETED)
+            )
+        );
+        assert_eq!(harness.stored("09").await?, None);
 
-    // The F10 gate compares the selected position only: a `D` typed over a pending `U` deletes.
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
-        .await?;
-    let (_, update) = api
-        .act(&action(
-            ListAid::Enter,
-            &by_type.state,
-            ("08", ""),
-            &[(1, "U", "")],
-        ))
-        .await?;
-    assert_eq!(
-        update.state.pending_action,
-        TranTypeListPendingAction::Update
-    );
-    let (status, swapped) = api
-        .act(&action(
-            ListAid::Pf10,
-            &update.state,
-            ("08", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    // audit: COTRTLIC-023
-    // audit: COTRTLIC-043
-    assert_eq!(
-        (status, swapped.committed, swapped.info_message.as_deref()),
-        (
-            StatusCode::OK,
-            TranTypeListCommitted::Deleted,
-            Some(ROW_DELETED)
-        )
-    );
-    assert_eq!(harness.stored("08").await?, None);
-    Ok(())
+        // The F10 gate compares the selected position only: a `D` typed over a pending `U` deletes.
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
+            .await?;
+        let (_, update) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("08", ""),
+                &[(1, "U", "")],
+            ))
+            .await?;
+        assert_eq!(
+            update.state.pending_action,
+            TranTypeListPendingAction::Update
+        );
+        let (status, swapped) = api
+            .act(&action(
+                ListAid::Pf10,
+                &update.state,
+                ("08", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        // audit: COTRTLIC-023
+        // audit: COTRTLIC-043
+        assert_eq!(
+            (status, swapped.committed, swapped.info_message.as_deref()),
+            (
+                StatusCode::OK,
+                TranTypeListCommitted::Deleted,
+                Some(ROW_DELETED)
+            )
+        );
+        assert_eq!(harness.stored("08").await?, None);
+        Ok(())
+    })
 }
 
 // Endpoint 25, AAP case 12: a delete the categories' `ON DELETE RESTRICT` refuses, tried again
 // by a repeated F10.
-#[tokio::test]
-async fn cotrtlic_list_actions_case_restricted_delete() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let (_, prompted) = api
-        .act(&action(
-            ListAid::Enter,
-            &loaded.state,
-            ("", ""),
-            &[(5, "D", "")],
-        ))
-        .await?;
-    let mut state = prompted.state;
-    for attempt in 1..=2 {
-        let (status, refused_delete) = api
-            .act(&action(ListAid::Pf10, &state, ("", ""), &[(5, "D", "")]))
+#[test]
+fn cotrtlic_list_actions_case_restricted_delete() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let (_, prompted) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("", ""),
+                &[(5, "D", "")],
+            ))
             .await?;
-        // audit: COTRTLIC-050
-        // audit: COTRTLIC-054
-        assert_eq!(status, StatusCode::BAD_REQUEST, "F10 {attempt}");
-        assert_db2_prefix(refused_delete.message.as_deref(), LIST_DELETE_RESTRICTED);
-        assert_eq!(
-            (
-                refused_delete.info_message.as_deref(),
-                refused_delete.committed
-            ),
-            (Some(RECORD_ACTIONS), TranTypeListCommitted::Nothing)
-        );
-        assert_eq!(
-            (
-                codes(&refused_delete.rows),
-                selections(&refused_delete.rows)[4].as_str()
-            ),
-            (seed_page(), "D")
-        );
-        assert_eq!(
-            refused_delete.state.pending_action,
-            TranTypeListPendingAction::Delete
-        );
-        assert_eq!(harness.stored("05").await?.as_deref(), Some("REFUND"));
-        assert_eq!(harness.categories("05").await?, 1);
-        state = refused_delete.state;
-    }
+        let mut state = prompted.state;
+        for attempt in 1..=2 {
+            let (status, refused_delete) = api
+                .act(&action(ListAid::Pf10, &state, ("", ""), &[(5, "D", "")]))
+                .await?;
+            // audit: COTRTLIC-050
+            // audit: COTRTLIC-054
+            assert_eq!(status, StatusCode::BAD_REQUEST, "F10 {attempt}");
+            assert_db2_prefix(refused_delete.message.as_deref(), LIST_DELETE_RESTRICTED);
+            assert_eq!(
+                (
+                    refused_delete.info_message.as_deref(),
+                    refused_delete.committed
+                ),
+                (Some(RECORD_ACTIONS), TranTypeListCommitted::Nothing)
+            );
+            assert_eq!(
+                (
+                    codes(&refused_delete.rows),
+                    selections(&refused_delete.rows)[4].as_str()
+                ),
+                (seed_page(), "D")
+            );
+            assert_eq!(
+                refused_delete.state.pending_action,
+                TranTypeListPendingAction::Delete
+            );
+            assert_eq!(harness.stored("05").await?.as_deref(), Some("REFUND"));
+            assert_eq!(harness.categories("05").await?, 1);
+            state = refused_delete.state;
+        }
 
-    Ok(())
+        Ok(())
+    })
 }
 
 // Endpoint 25 commits on rows another user removed between ENTER and F10: the update and the
 // delete each find no row (+100).
-#[tokio::test]
-async fn cotrtlic_commits_on_rows_another_user_removed() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    // 00 sorts first: the page re-read after the failed update still has rows.
-    harness.insert("00", "TEMPORARY").await?;
-    let (_, reloaded) = api.load().await?;
-    let (_, opened) = api
-        .act(&action(
-            ListAid::Enter,
-            &reloaded.state,
-            ("", ""),
-            &[(1, "U", "")],
-        ))
-        .await?;
-    let (_, edited) = api
-        .act(&action(
-            ListAid::Enter,
-            &opened.state,
-            ("", ""),
-            &[(1, "U", "Kept")],
-        ))
-        .await?;
-    assert!(harness.remove("00").await?);
-    let (status, gone) = api
-        .act(&action(
-            ListAid::Pf10,
-            &edited.state,
-            ("", ""),
-            &[(1, "U", "Kept")],
-        ))
-        .await?;
-    // audit: COTRTLIC-046
-    // audit: COTRTLIC-054
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_db2_prefix(gone.message.as_deref(), LIST_UPDATE_NOT_FOUND);
-    assert_eq!(
-        (gone.committed, gone.state.pending_action),
-        (
-            TranTypeListCommitted::Nothing,
-            TranTypeListPendingAction::Update
-        )
-    );
-    assert_eq!(
-        (
-            codes(&gone.rows),
-            shown_descriptions(&gone.rows)[0].as_str()
-        ),
-        (seed_page(), "Kept")
-    );
-    assert_eq!(harness.stored("00").await?, None);
-
-    // Under a type filter the cross edit runs first: the filter matches nothing any more, an
-    // input error, so no commit is tried.
-    harness.insert("09", "RETIRED").await?;
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("09", ""), &[]))
-        .await?;
-    let delete = [(1, "D", "")];
-    let (_, prompted) = api
-        .act(&action(ListAid::Enter, &by_type.state, ("09", ""), &delete))
-        .await?;
-    assert!(harness.remove("09").await?);
-    let (status, unmatched) = api
-        .act(&action(ListAid::Pf10, &prompted.state, ("09", ""), &delete))
-        .await?;
-    // audit: COTRTLIC-031
-    // audit: COTRTLIC-034
-    assert_eq!(
-        (status, unmatched.message.as_deref()),
-        (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
-    );
-    assert_eq!(unmatched.committed, TranTypeListCommitted::Nothing);
-
-    // Unfiltered, the delete itself finds no row; nothing is re-read.
-    harness.insert("00", "RETIRED").await?;
-    let (_, reloaded) = api.load().await?;
-    let (_, prompted) = api
-        .act(&action(ListAid::Enter, &reloaded.state, ("", ""), &delete))
-        .await?;
-    assert_eq!(
-        prompted.state.pending_action,
-        TranTypeListPendingAction::Delete
-    );
-    assert!(harness.remove("00").await?);
-    let (status, vanished) = api
-        .act(&action(ListAid::Pf10, &prompted.state, ("", ""), &delete))
-        .await?;
-    // audit: COTRTLIC-051
-    // audit: COTRTLIC-054
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_db2_prefix(vanished.message.as_deref(), LIST_DELETE_FAILED);
-    assert_eq!(
-        (vanished.committed, vanished.state.pending_action),
-        (
-            TranTypeListCommitted::Nothing,
-            TranTypeListPendingAction::Delete
-        )
-    );
-    assert_eq!(
-        codes(&vanished.rows),
-        listed(&["00", "01", "02", "03", "04", "05", "06"])
-    );
-    Ok(())
-}
-
-// Endpoint 25 commits whose statement fails while another transaction holds the row: a lock
-// timeout is the -911 class, a cancelled statement any other failure.
-#[tokio::test]
-async fn cotrtlic_commits_that_fail_on_a_held_row() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("08", "OBSOLETE").await?;
-    let locking = harness.client_with("lock_timeout", "500ms").await?;
-    let timing = harness.client_with("statement_timeout", "500ms").await?;
-    let (_, loaded) = api.load().await?;
-    let (_, by_type) = api
-        .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
-        .await?;
-    let (_, opened) = api
-        .act(&action(
-            ListAid::Enter,
-            &by_type.state,
-            ("08", ""),
-            &[(1, "U", "")],
-        ))
-        .await?;
-    let (_, edited) = api
-        .act(&action(
-            ListAid::Enter,
-            &opened.state,
-            ("08", ""),
-            &[(1, "U", "Locked out")],
-        ))
-        .await?;
-    let save = action(
-        ListAid::Pf10,
-        &edited.state,
-        ("08", ""),
-        &[(1, "U", "Locked out")],
-    );
-    for (client, prefix) in [(&locking, LIST_DEADLOCK), (&timing, LIST_UPDATE_FAILED)] {
-        let holder = harness.hold_update("08").await?;
-        let (status, failed) = client.act(&save).await?;
-        holder.rollback().await?;
-        // audit: COTRTLIC-047
-        // audit: COTRTLIC-048
+#[test]
+fn cotrtlic_commits_on_rows_another_user_removed() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        // 00 sorts first: the page re-read after the failed update still has rows.
+        harness.insert("00", "TEMPORARY").await?;
+        let (_, reloaded) = api.load().await?;
+        let (_, opened) = api
+            .act(&action(
+                ListAid::Enter,
+                &reloaded.state,
+                ("", ""),
+                &[(1, "U", "")],
+            ))
+            .await?;
+        let (_, edited) = api
+            .act(&action(
+                ListAid::Enter,
+                &opened.state,
+                ("", ""),
+                &[(1, "U", "Kept")],
+            ))
+            .await?;
+        assert!(harness.remove("00").await?);
+        let (status, gone) = api
+            .act(&action(
+                ListAid::Pf10,
+                &edited.state,
+                ("", ""),
+                &[(1, "U", "Kept")],
+            ))
+            .await?;
+        // audit: COTRTLIC-046
         // audit: COTRTLIC-054
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_db2_prefix(failed.message.as_deref(), prefix);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_db2_prefix(gone.message.as_deref(), LIST_UPDATE_NOT_FOUND);
         assert_eq!(
-            (failed.committed, failed.state.pending_action),
+            (gone.committed, gone.state.pending_action),
             (
                 TranTypeListCommitted::Nothing,
                 TranTypeListPendingAction::Update
             )
         );
-        assert_eq!(codes(&failed.rows), first_only("08"));
-        assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
-    }
-    let (_, prompted) = api
-        .act(&action(
-            ListAid::Enter,
-            &by_type.state,
-            ("08", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    let holder = harness.hold_update("08").await?;
-    let (status, failed) = timing
-        .act(&action(
-            ListAid::Pf10,
-            &prompted.state,
-            ("08", ""),
-            &[(1, "D", "")],
-        ))
-        .await?;
-    holder.rollback().await?;
-    // audit: COTRTLIC-051
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_db2_prefix(failed.message.as_deref(), LIST_DELETE_FAILED);
-    assert_eq!(
-        (failed.committed, failed.state.pending_action),
-        (
-            TranTypeListCommitted::Nothing,
+        assert_eq!(
+            (
+                codes(&gone.rows),
+                shown_descriptions(&gone.rows)[0].as_str()
+            ),
+            (seed_page(), "Kept")
+        );
+        assert_eq!(harness.stored("00").await?, None);
+
+        // Under a type filter the cross edit runs first: the filter matches nothing any more, an
+        // input error, so no commit is tried.
+        harness.insert("09", "RETIRED").await?;
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("09", ""), &[]))
+            .await?;
+        let delete = [(1, "D", "")];
+        let (_, prompted) = api
+            .act(&action(ListAid::Enter, &by_type.state, ("09", ""), &delete))
+            .await?;
+        assert!(harness.remove("09").await?);
+        let (status, unmatched) = api
+            .act(&action(ListAid::Pf10, &prompted.state, ("09", ""), &delete))
+            .await?;
+        // audit: COTRTLIC-031
+        // audit: COTRTLIC-034
+        assert_eq!(
+            (status, unmatched.message.as_deref()),
+            (StatusCode::BAD_REQUEST, Some(NO_RECORDS_FOR_FILTERS))
+        );
+        assert_eq!(unmatched.committed, TranTypeListCommitted::Nothing);
+
+        // Unfiltered, the delete itself finds no row; nothing is re-read.
+        harness.insert("00", "RETIRED").await?;
+        let (_, reloaded) = api.load().await?;
+        let (_, prompted) = api
+            .act(&action(ListAid::Enter, &reloaded.state, ("", ""), &delete))
+            .await?;
+        assert_eq!(
+            prompted.state.pending_action,
             TranTypeListPendingAction::Delete
-        )
-    );
-    assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
-    Ok(())
+        );
+        assert!(harness.remove("00").await?);
+        let (status, vanished) = api
+            .act(&action(ListAid::Pf10, &prompted.state, ("", ""), &delete))
+            .await?;
+        // audit: COTRTLIC-051
+        // audit: COTRTLIC-054
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_db2_prefix(vanished.message.as_deref(), LIST_DELETE_FAILED);
+        assert_eq!(
+            (vanished.committed, vanished.state.pending_action),
+            (
+                TranTypeListCommitted::Nothing,
+                TranTypeListPendingAction::Delete
+            )
+        );
+        assert_eq!(
+            codes(&vanished.rows),
+            listed(&["00", "01", "02", "03", "04", "05", "06"])
+        );
+        Ok(())
+    })
+}
+
+// Endpoint 25 commits whose statement fails while another transaction holds the row: a lock
+// timeout is the -911 class, a cancelled statement any other failure.
+#[test]
+fn cotrtlic_commits_that_fail_on_a_held_row() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("08", "OBSOLETE").await?;
+        let locking = harness.client_with("lock_timeout", "500ms").await?;
+        let timing = harness.client_with("statement_timeout", "500ms").await?;
+        let (_, loaded) = api.load().await?;
+        let (_, by_type) = api
+            .act(&action(ListAid::Enter, &loaded.state, ("08", ""), &[]))
+            .await?;
+        let (_, opened) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("08", ""),
+                &[(1, "U", "")],
+            ))
+            .await?;
+        let (_, edited) = api
+            .act(&action(
+                ListAid::Enter,
+                &opened.state,
+                ("08", ""),
+                &[(1, "U", "Locked out")],
+            ))
+            .await?;
+        let save = action(
+            ListAid::Pf10,
+            &edited.state,
+            ("08", ""),
+            &[(1, "U", "Locked out")],
+        );
+        for (client, prefix) in [(&locking, LIST_DEADLOCK), (&timing, LIST_UPDATE_FAILED)] {
+            let holder = harness.hold_update("08").await?;
+            let (status, failed) = client.act(&save).await?;
+            holder.rollback().await?;
+            // audit: COTRTLIC-047
+            // audit: COTRTLIC-048
+            // audit: COTRTLIC-054
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_db2_prefix(failed.message.as_deref(), prefix);
+            assert_eq!(
+                (failed.committed, failed.state.pending_action),
+                (
+                    TranTypeListCommitted::Nothing,
+                    TranTypeListPendingAction::Update
+                )
+            );
+            assert_eq!(codes(&failed.rows), first_only("08"));
+            assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
+        }
+        let (_, prompted) = api
+            .act(&action(
+                ListAid::Enter,
+                &by_type.state,
+                ("08", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        let holder = harness.hold_update("08").await?;
+        let (status, failed) = timing
+            .act(&action(
+                ListAid::Pf10,
+                &prompted.state,
+                ("08", ""),
+                &[(1, "D", "")],
+            ))
+            .await?;
+        holder.rollback().await?;
+        // audit: COTRTLIC-051
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_db2_prefix(failed.message.as_deref(), LIST_DELETE_FAILED);
+        assert_eq!(
+            (failed.committed, failed.state.pending_action),
+            (
+                TranTypeListCommitted::Nothing,
+                TranTypeListPendingAction::Delete
+            )
+        );
+        assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
+        Ok(())
+    })
 }
 
 // Endpoints 24 and 25 over a database the API reaches but cannot read: the session runs as
 // `pg_monitor`, which holds no privilege on schema `db2`, so the count and the page reads fail
 // with SQLSTATE 42501 while the priming query would succeed.
-#[tokio::test]
-async fn cotrtlic_reads_that_fail_on_a_reachable_database() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert_codes(8, 15, "EXTRA TYPE").await?;
-    let (_, loaded) = api.load().await?;
-    let (_, second) = api.page(&loaded.page_key, "forward", ("", "")).await?;
-    let (_, third) = api.page(&second.page_key, "forward", ("", "")).await?;
-    assert_eq!(third.page_no, 3);
-    let unprivileged = harness.client_with("role", "pg_monitor").await?;
+#[test]
+fn cotrtlic_reads_that_fail_on_a_reachable_database() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert_codes(8, 15, "EXTRA TYPE").await?;
+        let (_, loaded) = api.load().await?;
+        let (_, second) = api.page(&loaded.page_key, "forward", ("", "")).await?;
+        let (_, third) = api.page(&second.page_key, "forward", ("", "")).await?;
+        assert_eq!(third.page_no, 3);
+        let unprivileged = harness.client_with("role", "pg_monitor").await?;
 
-    let (status, unread) = unprivileged.load().await?;
-    // audit: COTRTLIC-052
-    // audit: COTRTLIC-054
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_db2_prefix(unread.message.as_deref(), FORWARD_OPEN);
-    assert_eq!(codes(&unread.rows), listed(&[""; 7]));
-    let (status, back) = unprivileged
-        .page(&third.page_key, "backward", ("", ""))
-        .await?;
-    // audit: COTRTLIC-052
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_db2_prefix(back.message.as_deref(), BACKWARD_OPEN);
-    // Onto page 1 the paging message overwrites the Db2 one; the status stays 500.
-    let (status, top) = unprivileged
-        .page(&second.page_key, "backward", ("", ""))
-        .await?;
-    // audit: COTRTLIC-033
-    // audit: COTRTLIC-052
-    assert_eq!(
-        (status, top.message.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some(NO_PREVIOUS_PAGES))
-    );
-    // The failed count: its message is halt candidate X-COTRTLIC-H2, so only the status and the
-    // absence of a commit are asserted.
-    let (status, counted) = unprivileged
-        .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
-        .await?;
-    // audit: COTRTLIC-032
-    assert_eq!(
-        (status, counted.committed),
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            TranTypeListCommitted::Nothing
-        )
-    );
-    Ok(())
+        let (status, unread) = unprivileged.load().await?;
+        // audit: COTRTLIC-052
+        // audit: COTRTLIC-054
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_db2_prefix(unread.message.as_deref(), FORWARD_OPEN);
+        assert_eq!(codes(&unread.rows), listed(&[""; 7]));
+        let (status, back) = unprivileged
+            .page(&third.page_key, "backward", ("", ""))
+            .await?;
+        // audit: COTRTLIC-052
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_db2_prefix(back.message.as_deref(), BACKWARD_OPEN);
+        // Onto page 1 the paging message overwrites the Db2 one; the status stays 500.
+        let (status, top) = unprivileged
+            .page(&second.page_key, "backward", ("", ""))
+            .await?;
+        // audit: COTRTLIC-033
+        // audit: COTRTLIC-052
+        assert_eq!(
+            (status, top.message.as_deref()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some(NO_PREVIOUS_PAGES))
+        );
+        // The failed count: its message is halt candidate X-COTRTLIC-H2, so only the status and the
+        // absence of a commit are asserted.
+        let (status, counted) = unprivileged
+            .act(&action(ListAid::Enter, &loaded.state, ("03", ""), &[]))
+            .await?;
+        // audit: COTRTLIC-032
+        assert_eq!(
+            (status, counted.committed),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                TranTypeListCommitted::Nothing
+            )
+        );
+        Ok(())
+    })
 }
 
 // A database the service cannot reach, a closed pool: COTRTLIC's failed `9998-PRIMING-QUERY`
 // sends no screen, and COTRTUPC's reads fail with their own messages.
-#[tokio::test]
-async fn store_unreachable_answers_500_and_commits_nothing() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let (_, prompted) = api
-        .act(&action(
-            ListAid::Enter,
-            &loaded.state,
+#[test]
+fn store_unreachable_answers_500_and_commits_nothing() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let (_, prompted) = api
+            .act(&action(
+                ListAid::Enter,
+                &loaded.state,
+                ("", ""),
+                &[(3, "D", "")],
+            ))
+            .await?;
+        assert_eq!(
+            prompted.state.pending_action,
+            TranTypeListPendingAction::Delete
+        );
+        harness.guard.pool().close().await;
+
+        let refresh = json_of(&action(ListAid::Enter, &prompted.state, ("", ""), &[]))?;
+        let confirm = json_of(&action(
+            ListAid::Pf10,
+            &prompted.state,
             ("", ""),
             &[(3, "D", "")],
-        ))
-        .await?;
-    assert_eq!(
-        prompted.state.pending_action,
-        TranTypeListPendingAction::Delete
-    );
-    harness.guard.pool().close().await;
+        ))?;
+        for (method, uri, body) in [
+            ("GET", LIST, None),
+            ("POST", LIST_ACTIONS, Some(&refresh)),
+            ("POST", LIST_ACTIONS, Some(&confirm)),
+        ] {
+            let (status, bytes) = api.raw(method, uri, body).await?;
+            let shown: Value = serde_json::from_slice(&bytes)?;
+            let (status, message, field) = refused((status, bytes))?;
+            // audit: COTRTLIC-053
+            // audit: COTRTLIC-054
+            assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+            assert_db2_prefix(Some(message.as_str()), ACCESS_FAILURE);
+            // audit: COTRTLIC-053
+            assert!(shown.get("rows").is_none() && shown.get("state").is_none());
+        }
 
-    let refresh = json_of(&action(ListAid::Enter, &prompted.state, ("", ""), &[]))?;
-    let confirm = json_of(&action(
-        ListAid::Pf10,
-        &prompted.state,
-        ("", ""),
-        &[(3, "D", "")],
-    ))?;
-    for (method, uri, body) in [
-        ("GET", LIST, None),
-        ("POST", LIST_ACTIONS, Some(&refresh)),
-        ("POST", LIST_ACTIONS, Some(&confirm)),
-    ] {
-        let (status, bytes) = api.raw(method, uri, body).await?;
-        let shown: Value = serde_json::from_slice(&bytes)?;
-        let (status, message, field) = refused((status, bytes))?;
-        // audit: COTRTLIC-053
-        // audit: COTRTLIC-054
+        let (status, message, field) = refused(api.fetch("01").await?)?;
+        // audit: COTRTUPC-011
+        assert_eq!(
+            (status, field.as_deref()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
+        );
+        assert_db2_prefix(Some(message.as_str()), FETCH_ERROR);
+        // The re-read endpoint 27 makes in place of the COMMAREA fails: a 500 naming no field. The
+        // COBOL's abend data carries no text of its own, so none is asserted.
+        let (status, _, field) = refused(api.maintain("01", "PF5", Some("PURCHASES")).await?)?;
+        // audit: COTRTUPC-038
         assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
-        assert_db2_prefix(Some(message.as_str()), ACCESS_FAILURE);
+
         // audit: COTRTLIC-053
-        assert!(shown.get("rows").is_none() && shown.get("state").is_none());
-    }
-
-    let (status, message, field) = refused(api.fetch("01").await?)?;
-    // audit: COTRTUPC-011
-    assert_eq!(
-        (status, field.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
-    );
-    assert_db2_prefix(Some(message.as_str()), FETCH_ERROR);
-    // The re-read endpoint 27 makes in place of the COMMAREA fails: a 500 naming no field. The
-    // COBOL's abend data carries no text of its own, so none is asserted.
-    let (status, _, field) = refused(api.maintain("01", "PF5", Some("PURCHASES")).await?)?;
-    // audit: COTRTUPC-038
-    assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
-
-    // audit: COTRTLIC-053
-    // audit: COTRTUPC-038
-    let store = harness.reopened().await?;
-    assert_eq!(stored_in(&store, "03").await?.as_deref(), Some("CREDIT"));
-    assert_eq!(stored_in(&store, "01").await?.as_deref(), Some("PURCHASE"));
-    Ok(())
+        // audit: COTRTUPC-038
+        let store = harness.reopened().await?;
+        assert_eq!(stored_in(&store, "03").await?.as_deref(), Some("CREDIT"));
+        assert_eq!(stored_in(&store, "01").await?.as_deref(), Some("PURCHASE"));
+        Ok(())
+    })
 }
 
 // The map `LENGTH` of every field the two screens send, revalidated by the request DTOs: 400
 // naming the field.
-#[tokio::test]
-async fn map_lengths_are_revalidated_by_the_request_dtos() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let (_, loaded) = api.load().await?;
-    let long = "X".repeat(51);
-    let too_long =
-        |field: &str| refusal(StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field));
-    for (field, value) in [("type_filter", "123"), ("desc_filter", long.as_str())] {
-        let answer = api
-            .raw("GET", &format!("{LIST}?{field}={}", encoded(value)), None)
-            .await?;
-        // audit: COTRTLI-015
-        // audit: COTRTLI-018
-        assert_eq!(refused(answer)?, too_long(field));
-    }
-    let mut bodies = vec![
-        (
-            action(ListAid::Enter, &loaded.state, ("123", ""), &[]),
-            "type_filter".to_owned(),
-        ),
-        (
-            action(ListAid::Enter, &loaded.state, ("", long.as_str()), &[]),
-            "desc_filter".to_owned(),
-        ),
-    ];
-    for row in 1..=7 {
-        let index = row - 1;
-        let selection = action(ListAid::Enter, &loaded.state, ("", ""), &[(row, "UU", "")]);
-        bodies.push((selection, format!("rows[{index}].selection")));
-        let description = action(
-            ListAid::Enter,
-            &loaded.state,
-            ("", ""),
-            &[(row, "", long.as_str())],
-        );
-        bodies.push((description, format!("rows[{index}].description")));
-    }
-    for (body, field) in bodies {
-        let answer = api
-            .raw("POST", LIST_ACTIONS, Some(&json_of(&body)?))
-            .await?;
-        // audit: COTRTLI-015
-        // audit: COTRTLI-018
-        // audit: COTRTLI-026
-        // audit: COTRTLI-030
-        // audit: COTRTLI-032
-        // audit: COTRTLI-036
-        // audit: COTRTLI-038
-        // audit: COTRTLI-042
-        // audit: COTRTLI-044
-        // audit: COTRTLI-048
-        // audit: COTRTLI-050
-        // audit: COTRTLI-054
-        // audit: COTRTLI-056
-        // audit: COTRTLI-060
-        // audit: COTRTLI-062
-        // audit: COTRTLI-066
-        assert_eq!(refused(answer)?, too_long(&field));
-    }
-    for answer in [
-        api.fetch("123").await?,
-        api.maintain("123", "ENTER", Some("NEW")).await?,
-    ] {
-        // audit: COTRTUP-013
-        assert_eq!(refused(answer)?, too_long("type_code"));
-    }
-    let answer = api.maintain("01", "PF5", Some(long.as_str())).await?;
-    // audit: COTRTUP-016
-    assert_eq!(refused(answer)?, too_long("description"));
-    // Fifty characters fit: the program's own edits answer them.
-    let fits: TranTypeActionResult =
-        ok(api.maintain("01", "ENTER", Some(&"A".repeat(50))).await?)?;
-    // audit: COTRTUP-016
-    assert_eq!(fits.state, TranTypeMaintState::ChangesOkNotConfirmed);
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    Ok(())
+#[test]
+fn map_lengths_are_revalidated_by_the_request_dtos() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let (_, loaded) = api.load().await?;
+        let long = "X".repeat(51);
+        let too_long =
+            |field: &str| refusal(StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field));
+        for (field, value) in [("type_filter", "123"), ("desc_filter", long.as_str())] {
+            let answer = api
+                .raw("GET", &format!("{LIST}?{field}={}", encoded(value)), None)
+                .await?;
+            // audit: COTRTLI-015
+            // audit: COTRTLI-018
+            assert_eq!(refused(answer)?, too_long(field));
+        }
+        let mut bodies = vec![
+            (
+                action(ListAid::Enter, &loaded.state, ("123", ""), &[]),
+                "type_filter".to_owned(),
+            ),
+            (
+                action(ListAid::Enter, &loaded.state, ("", long.as_str()), &[]),
+                "desc_filter".to_owned(),
+            ),
+        ];
+        for row in 1..=7 {
+            let index = row - 1;
+            let selection = action(ListAid::Enter, &loaded.state, ("", ""), &[(row, "UU", "")]);
+            bodies.push((selection, format!("rows[{index}].selection")));
+            let description = action(
+                ListAid::Enter,
+                &loaded.state,
+                ("", ""),
+                &[(row, "", long.as_str())],
+            );
+            bodies.push((description, format!("rows[{index}].description")));
+        }
+        for (body, field) in bodies {
+            let answer = api
+                .raw("POST", LIST_ACTIONS, Some(&json_of(&body)?))
+                .await?;
+            // audit: COTRTLI-015
+            // audit: COTRTLI-018
+            // audit: COTRTLI-026
+            // audit: COTRTLI-030
+            // audit: COTRTLI-032
+            // audit: COTRTLI-036
+            // audit: COTRTLI-038
+            // audit: COTRTLI-042
+            // audit: COTRTLI-044
+            // audit: COTRTLI-048
+            // audit: COTRTLI-050
+            // audit: COTRTLI-054
+            // audit: COTRTLI-056
+            // audit: COTRTLI-060
+            // audit: COTRTLI-062
+            // audit: COTRTLI-066
+            assert_eq!(refused(answer)?, too_long(&field));
+        }
+        for answer in [
+            api.fetch("123").await?,
+            api.maintain("123", "ENTER", Some("NEW")).await?,
+        ] {
+            // audit: COTRTUP-013
+            assert_eq!(refused(answer)?, too_long("type_code"));
+        }
+        let answer = api.maintain("01", "PF5", Some(long.as_str())).await?;
+        // audit: COTRTUP-016
+        assert_eq!(refused(answer)?, too_long("description"));
+        // Fifty characters fit: the program's own edits answer them.
+        let fits: TranTypeActionResult =
+            ok(api.maintain("01", "ENTER", Some(&"A".repeat(50))).await?)?;
+        // audit: COTRTUP-016
+        assert_eq!(fits.state, TranTypeMaintState::ChangesOkNotConfirmed);
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        Ok(())
+    })
 }
 
 // Endpoint 26: the key edits, the normalised key, a type shown and a type no row holds.
-#[tokio::test]
-async fn cotrtupc_fetch_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let found: TranTypeView = ok(api.fetch("01").await?)?;
-    // audit: COTRTUPC-009
-    let purchase = TranTypeView {
-        type_code: "01".to_owned(),
-        description: Some("PURCHASE".to_owned()),
-        message: None,
-        info_message: SEARCH_PROMPT.to_owned(),
-        state: TranTypeMaintState::ShowDetails,
-    };
-    assert_eq!(found, purchase);
-    // Stored trimmed and left-justified, then the two digits of the absolute integer part.
-    for raw in [" 1", "1", "1 ", "+1", "-1", "1-", "1."] {
-        let view: TranTypeView = ok(api.fetch(raw).await?)?;
-        // audit: COTRTUPC-004
-        // audit: COTRTUPC-008
-        assert_eq!(view, purchase, "{raw:?}");
-    }
-    // A valid code no row holds offers the add path: a 200, never a 404.
-    for (raw, code) in [("09", "09"), (".5", "00")] {
-        let view: TranTypeView = ok(api.fetch(raw).await?)?;
-        // audit: COTRTUPC-008
-        // audit: COTRTUPC-010
-        let add = TranTypeView {
-            type_code: code.to_owned(),
-            description: None,
-            message: Some(NOT_FOUND_KEY.to_owned()),
-            info_message: ADD_PROMPT.to_owned(),
-            state: TranTypeMaintState::DetailsNotFound,
+#[test]
+fn cotrtupc_fetch_rows() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let found: TranTypeView = ok(api.fetch("01").await?)?;
+        // audit: COTRTUPC-009
+        let purchase = TranTypeView {
+            type_code: "01".to_owned(),
+            description: Some("PURCHASE".to_owned()),
+            message: None,
+            info_message: SEARCH_PROMPT.to_owned(),
+            state: TranTypeMaintState::ShowDetails,
         };
-        assert_eq!(view, add, "{raw:?}");
-    }
-    // The key edits refuse a blank, non-numeric or zero code before any read. COTRTUPC-012's
-    // skip of these edits in state X is not asserted: the request carries no state-X marker yet
-    // (X-COTRTUPC-1), so its blank-code case alone is proved here.
-    let refused_codes: [(&[&str], &str); 3] = [
-        (&["*", "  ", "* "], CODE_SUPPLIED),
-        (&["AB", "1A", "-", ".", "CR"], CODE_NUMERIC),
-        (&["00", "0", "-0", "0.", ".0"], CODE_NOT_ZERO),
-    ];
-    for (raws, message) in refused_codes {
-        for raw in raws {
-            let answer = refused(api.fetch(raw).await?)?;
+        assert_eq!(found, purchase);
+        // Stored trimmed and left-justified, then the two digits of the absolute integer part.
+        for raw in [" 1", "1", "1 ", "+1", "-1", "1-", "1."] {
+            let view: TranTypeView = ok(api.fetch(raw).await?)?;
             // audit: COTRTUPC-004
-            // audit: COTRTUPC-005
-            // audit: COTRTUPC-006
-            // audit: COTRTUPC-007
-            // audit: COTRTUPC-012
-            assert_eq!(
-                answer,
-                refusal(StatusCode::BAD_REQUEST, message, Some("type_code")),
-                "{raw:?}"
-            );
+            // audit: COTRTUPC-008
+            assert_eq!(view, purchase, "{raw:?}");
         }
-    }
-    Ok(())
+        // A valid code no row holds offers the add path: a 200, never a 404.
+        for (raw, code) in [("09", "09"), (".5", "00")] {
+            let view: TranTypeView = ok(api.fetch(raw).await?)?;
+            // audit: COTRTUPC-008
+            // audit: COTRTUPC-010
+            let add = TranTypeView {
+                type_code: code.to_owned(),
+                description: None,
+                message: Some(NOT_FOUND_KEY.to_owned()),
+                info_message: ADD_PROMPT.to_owned(),
+                state: TranTypeMaintState::DetailsNotFound,
+            };
+            assert_eq!(view, add, "{raw:?}");
+        }
+        // The key edits refuse a blank, non-numeric or zero code before any read. COTRTUPC-012's
+        // skip of these edits in state X is not asserted: the request carries no state-X marker
+        // (X-COTRTUPC-1), so its blank-code case alone is proved here.
+        let refused_codes: [(&[&str], &str); 3] = [
+            (&["*", "  ", "* "], CODE_SUPPLIED),
+            (&["AB", "1A", "-", ".", "CR"], CODE_NUMERIC),
+            (&["00", "0", "-0", "0.", ".0"], CODE_NOT_ZERO),
+        ];
+        for (raws, message) in refused_codes {
+            for raw in raws {
+                let answer = refused(api.fetch(raw).await?)?;
+                // audit: COTRTUPC-004
+                // audit: COTRTUPC-005
+                // audit: COTRTUPC-006
+                // audit: COTRTUPC-007
+                // audit: COTRTUPC-012
+                assert_eq!(
+                    answer,
+                    refusal(StatusCode::BAD_REQUEST, message, Some("type_code")),
+                    "{raw:?}"
+                );
+            }
+        }
+        Ok(())
+    })
 }
 
 // Endpoint 27 ENTER and PF5 on a type a row holds: the no-change and description edits, the
 // validated change, the save and the keys the endpoint does not serve.
-#[tokio::test]
-async fn cotrtupc_maintenance_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    for typed in ["purchase", " PURCHASE "] {
-        let answer = refused(api.maintain("01", "ENTER", Some(typed)).await?)?;
-        // audit: COTRTUPC-017
-        assert_eq!(
-            answer,
-            refusal(
-                StatusCode::BAD_REQUEST,
-                NO_CHANGE_FETCHED,
-                Some("description")
-            )
-        );
-    }
-    let edits = [
-        (None, DESC_REQUIRED),
-        (Some(""), DESC_REQUIRED),
-        (Some("*"), DESC_REQUIRED),
-        (Some("Buy-now"), DESC_ALPHANUM),
-    ];
-    for (typed, message) in edits {
-        let answer = refused(api.maintain("01", "ENTER", typed).await?)?;
-        // audit: COTRTUPC-004
-        // audit: COTRTUPC-018
-        // audit: COTRTUPC-019
-        assert_eq!(
-            answer,
-            refusal(StatusCode::BAD_REQUEST, message, Some("description")),
-            "{typed:?}"
-        );
-    }
-    let validated: TranTypeActionResult =
-        ok(api.maintain("01", "ENTER", Some(" Purchases 2 ")).await?)?;
-    // audit: COTRTUPC-016
-    // audit: COTRTUPC-020
-    let pending = TranTypeActionResult {
-        type_code: "01".to_owned(),
-        description: Some(padded("Purchases 2")),
-        message: None,
-        info_message: VALIDATED.to_owned(),
-        state: TranTypeMaintState::ChangesOkNotConfirmed,
-        committed: false,
-        deleted: false,
-    };
-    assert_eq!(validated, pending);
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    // PF5 edits the received code and description again before it writes.
-    let resent = [
-        ("*", Some("Other"), CODE_SUPPLIED, "type_code"),
-        ("01", Some(""), DESC_REQUIRED, "description"),
-        ("01", Some("Buy-now"), DESC_ALPHANUM, "description"),
-    ];
-    for (code, typed, message, field) in resent {
-        let answer = refused(api.maintain(code, "PF5", typed).await?)?;
+#[test]
+fn cotrtupc_maintenance_rows() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        for typed in ["purchase", " PURCHASE "] {
+            let answer = refused(api.maintain("01", "ENTER", Some(typed)).await?)?;
+            // audit: COTRTUPC-017
+            assert_eq!(
+                answer,
+                refusal(
+                    StatusCode::BAD_REQUEST,
+                    NO_CHANGE_FETCHED,
+                    Some("description")
+                )
+            );
+        }
+        let edits = [
+            (None, DESC_REQUIRED),
+            (Some(""), DESC_REQUIRED),
+            (Some("*"), DESC_REQUIRED),
+            (Some("Buy-now"), DESC_ALPHANUM),
+        ];
+        for (typed, message) in edits {
+            let answer = refused(api.maintain("01", "ENTER", typed).await?)?;
+            // audit: COTRTUPC-004
+            // audit: COTRTUPC-018
+            // audit: COTRTUPC-019
+            assert_eq!(
+                answer,
+                refusal(StatusCode::BAD_REQUEST, message, Some("description")),
+                "{typed:?}"
+            );
+        }
+        let validated: TranTypeActionResult =
+            ok(api.maintain("01", "ENTER", Some(" Purchases 2 ")).await?)?;
+        // audit: COTRTUPC-016
+        // audit: COTRTUPC-020
+        let pending = TranTypeActionResult {
+            type_code: "01".to_owned(),
+            description: Some(padded("Purchases 2")),
+            message: None,
+            info_message: VALIDATED.to_owned(),
+            state: TranTypeMaintState::ChangesOkNotConfirmed,
+            committed: false,
+            deleted: false,
+        };
+        assert_eq!(validated, pending);
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        // PF5 edits the received code and description again before it writes.
+        let resent = [
+            ("*", Some("Other"), CODE_SUPPLIED, "type_code"),
+            ("01", Some(""), DESC_REQUIRED, "description"),
+            ("01", Some("Buy-now"), DESC_ALPHANUM, "description"),
+        ];
+        for (code, typed, message, field) in resent {
+            let answer = refused(api.maintain(code, "PF5", typed).await?)?;
+            // audit: COTRTUPC-024
+            assert_eq!(
+                answer,
+                refusal(StatusCode::BAD_REQUEST, message, Some(field)),
+                "{code} {typed:?}"
+            );
+        }
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        let saved: TranTypeActionResult =
+            ok(api.maintain("01", "PF5", Some(" Purchases 2 ")).await?)?;
+        // audit: COTRTUPC-023
         // audit: COTRTUPC-024
+        let done = TranTypeActionResult {
+            info_message: COMMITTED.to_owned(),
+            state: TranTypeMaintState::ChangesOkayedAndDone,
+            committed: true,
+            ..pending
+        };
+        assert_eq!(saved, done);
+        assert_eq!(harness.stored("01").await?, Some(padded("Purchases 2")));
+        let shown: TranTypeView = ok(api.fetch("01").await?)?;
+        // audit: COTRTUPC-009
+        assert_eq!(shown.description, Some(padded("Purchases 2")));
+        for aid in ["PF12", "PF3", "PF10", "enter"] {
+            let answer = refused(api.maintain("01", aid, Some("Other")).await?)?;
+            // audit: COTRTUPC-043
+            assert_eq!(
+                answer,
+                refusal(StatusCode::BAD_REQUEST, INVALID_KEY, None),
+                "{aid}"
+            );
+        }
+        // A stored code the key edits refuse, as an add in state X can store, is refused while its
+        // row exists.
+        harness.insert("AB", "ODD CODE").await?;
+        let odd = refused(api.maintain("AB", "ENTER", Some("Other")).await?)?;
+        // audit: COTRTUPC-016
         assert_eq!(
-            answer,
-            refusal(StatusCode::BAD_REQUEST, message, Some(field)),
-            "{code} {typed:?}"
+            odd,
+            refusal(StatusCode::BAD_REQUEST, CODE_NUMERIC, Some("type_code"))
         );
-    }
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    let saved: TranTypeActionResult = ok(api.maintain("01", "PF5", Some(" Purchases 2 ")).await?)?;
-    // audit: COTRTUPC-023
-    // audit: COTRTUPC-024
-    let done = TranTypeActionResult {
-        info_message: COMMITTED.to_owned(),
-        state: TranTypeMaintState::ChangesOkayedAndDone,
-        committed: true,
-        ..pending
-    };
-    assert_eq!(saved, done);
-    assert_eq!(harness.stored("01").await?, Some(padded("Purchases 2")));
-    let shown: TranTypeView = ok(api.fetch("01").await?)?;
-    // audit: COTRTUPC-009
-    assert_eq!(shown.description, Some(padded("Purchases 2")));
-    for aid in ["PF12", "PF3", "PF10", "enter"] {
-        let answer = refused(api.maintain("01", aid, Some("Other")).await?)?;
-        // audit: COTRTUPC-043
-        assert_eq!(
-            answer,
-            refusal(StatusCode::BAD_REQUEST, INVALID_KEY, None),
-            "{aid}"
-        );
-    }
-    // A stored code the key edits refuse, as an add in state X can store, is refused while its
-    // row exists.
-    harness.insert("AB", "ODD CODE").await?;
-    let odd = refused(api.maintain("AB", "ENTER", Some("Other")).await?)?;
-    // audit: COTRTUPC-016
-    assert_eq!(
-        odd,
-        refusal(StatusCode::BAD_REQUEST, CODE_NUMERIC, Some("type_code"))
-    );
-    assert_eq!(harness.stored("01").await?, Some(padded("Purchases 2")));
-    Ok(())
+        assert_eq!(harness.stored("01").await?, Some(padded("Purchases 2")));
+        Ok(())
+    })
 }
 
 // Endpoint 27 on a type no row holds, and saves that compare nothing with the values fetched;
 // the VSAM version of the types never changes.
-#[tokio::test]
-async fn cotrtupc_add_path_and_unguarded_saves() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    let mut vsam = harness.store.clone();
-    let before = TransactionTypeRepository::find_all(&mut vsam).await?;
-    let validated: TranTypeActionResult =
-        ok(api.maintain("09", "ENTER", Some("New type")).await?)?;
-    // audit: COTRTUPC-021
-    assert_eq!(
-        (validated.type_code.as_str(), validated.state),
-        ("09", TranTypeMaintState::ChangesOkNotConfirmed)
-    );
-    assert_eq!(
-        (validated.info_message.as_str(), validated.committed),
-        (VALIDATED, false)
-    );
-    let blank = refused(api.maintain("09", "ENTER", None).await?)?;
-    // audit: COTRTUPC-021
-    assert_eq!(
-        blank,
-        refusal(StatusCode::BAD_REQUEST, DESC_REQUIRED, Some("description"))
-    );
-    assert_eq!(harness.stored("09").await?, None);
-    let added: TranTypeActionResult = ok(api.maintain("09", "PF5", Some("New type")).await?)?;
-    // audit: COTRTUPC-026
-    assert_eq!(
-        (added.state, added.info_message.as_str()),
-        (TranTypeMaintState::ChangesOkayedAndDone, COMMITTED)
-    );
-    assert_eq!((added.committed, added.deleted), (true, false));
-    assert_eq!(harness.stored("09").await?, Some(padded("New type")));
+#[test]
+fn cotrtupc_add_path_and_unguarded_saves() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        let mut vsam = harness.store.clone();
+        let before = TransactionTypeRepository::find_all(&mut vsam).await?;
+        let validated: TranTypeActionResult =
+            ok(api.maintain("09", "ENTER", Some("New type")).await?)?;
+        // audit: COTRTUPC-021
+        assert_eq!(
+            (validated.type_code.as_str(), validated.state),
+            ("09", TranTypeMaintState::ChangesOkNotConfirmed)
+        );
+        assert_eq!(
+            (validated.info_message.as_str(), validated.committed),
+            (VALIDATED, false)
+        );
+        let blank = refused(api.maintain("09", "ENTER", None).await?)?;
+        // audit: COTRTUPC-021
+        assert_eq!(
+            blank,
+            refusal(StatusCode::BAD_REQUEST, DESC_REQUIRED, Some("description"))
+        );
+        assert_eq!(harness.stored("09").await?, None);
+        let added: TranTypeActionResult = ok(api.maintain("09", "PF5", Some("New type")).await?)?;
+        // audit: COTRTUPC-026
+        assert_eq!(
+            (added.state, added.info_message.as_str()),
+            (TranTypeMaintState::ChangesOkayedAndDone, COMMITTED)
+        );
+        assert_eq!((added.committed, added.deleted), (true, false));
+        assert_eq!(harness.stored("09").await?, Some(padded("New type")));
 
-    // Another user changes the row after the fetch: PF5 overwrites it, and never answers 409.
-    let fetched: TranTypeView = ok(api.fetch("09").await?)?;
-    assert_eq!(fetched.state, TranTypeMaintState::ShowDetails);
-    harness.rename("09", "CHANGED ELSEWHERE").await?;
-    let overwritten: TranTypeActionResult = ok(api.maintain("09", "PF5", Some("Mine")).await?)?;
-    // audit: COTRTUPC-025
-    assert!(overwritten.committed);
-    assert_eq!(harness.stored("09").await?, Some(padded("Mine")));
-    // Another user deletes it: PF5 inserts it again.
-    assert!(harness.remove("09").await?);
-    let reinserted: TranTypeActionResult = ok(api.maintain("09", "PF5", Some("Again")).await?)?;
-    // audit: COTRTUPC-025
-    // audit: COTRTUPC-026
-    assert_eq!(
-        (reinserted.state, reinserted.committed),
-        (TranTypeMaintState::ChangesOkayedAndDone, true)
-    );
-    assert_eq!(harness.stored("09").await?, Some(padded("Again")));
+        // Another user changes the row after the fetch: PF5 overwrites it, and never answers 409.
+        let fetched: TranTypeView = ok(api.fetch("09").await?)?;
+        assert_eq!(fetched.state, TranTypeMaintState::ShowDetails);
+        harness.rename("09", "CHANGED ELSEWHERE").await?;
+        let overwritten: TranTypeActionResult =
+            ok(api.maintain("09", "PF5", Some("Mine")).await?)?;
+        // audit: COTRTUPC-025
+        assert!(overwritten.committed);
+        assert_eq!(harness.stored("09").await?, Some(padded("Mine")));
+        // Another user deletes it: PF5 inserts it again.
+        assert!(harness.remove("09").await?);
+        let reinserted: TranTypeActionResult =
+            ok(api.maintain("09", "PF5", Some("Again")).await?)?;
+        // audit: COTRTUPC-025
+        // audit: COTRTUPC-026
+        assert_eq!(
+            (reinserted.state, reinserted.committed),
+            (TranTypeMaintState::ChangesOkayedAndDone, true)
+        );
+        assert_eq!(harness.stored("09").await?, Some(padded("Again")));
 
-    let saved: TranTypeActionResult = ok(api.maintain("01", "PF5", Some("Purchases")).await?)?;
-    assert!(saved.committed);
-    // audit: COTRTUPC-002
-    assert_eq!(
-        TransactionTypeRepository::find_all(&mut vsam).await?,
-        before
-    );
-    assert_eq!(harness.stored("01").await?, Some(padded("Purchases")));
-    Ok(())
+        let saved: TranTypeActionResult = ok(api.maintain("01", "PF5", Some("Purchases")).await?)?;
+        assert!(saved.committed);
+        // audit: COTRTUPC-002
+        assert_eq!(
+            TransactionTypeRepository::find_all(&mut vsam).await?,
+            before
+        );
+        assert_eq!(harness.stored("01").await?, Some(padded("Purchases")));
+        Ok(())
+    })
 }
 
 // Endpoint 27 PF4, the second F4: a type without categories is deleted, a gone one fails, and
 // the categories' `ON DELETE RESTRICT` keeps a seeded one.
-#[tokio::test]
-async fn cotrtupc_delete_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    let api = &harness.admin;
-    harness.insert("09", "RETIRED").await?;
-    let deleted: TranTypeActionResult = ok(api.maintain("09", "PF4", None).await?)?;
-    // audit: COTRTUPC-032
-    let done = TranTypeActionResult {
-        type_code: "09".to_owned(),
-        description: None,
-        message: None,
-        info_message: DELETE_DONE.to_owned(),
-        state: TranTypeMaintState::DeleteDone,
-        committed: true,
-        deleted: true,
-    };
-    assert_eq!(deleted, done);
-    assert_eq!(harness.stored("09").await?, None);
-    let (status, message, field) = refused(api.maintain("09", "PF4", None).await?)?;
-    // audit: COTRTUPC-034
-    assert_eq!(
-        (status, field.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
-    );
-    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
-    let (status, message, field) = refused(api.maintain("01", "PF4", None).await?)?;
-    // audit: COTRTUPC-033
-    assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
-    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_RESTRICTED);
-    assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    assert_eq!(harness.categories("01").await?, 5);
-    Ok(())
+#[test]
+fn cotrtupc_delete_rows() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let api = &harness.admin;
+        harness.insert("09", "RETIRED").await?;
+        let deleted: TranTypeActionResult = ok(api.maintain("09", "PF4", None).await?)?;
+        // audit: COTRTUPC-032
+        let done = TranTypeActionResult {
+            type_code: "09".to_owned(),
+            description: None,
+            message: None,
+            info_message: DELETE_DONE.to_owned(),
+            state: TranTypeMaintState::DeleteDone,
+            committed: true,
+            deleted: true,
+        };
+        assert_eq!(deleted, done);
+        assert_eq!(harness.stored("09").await?, None);
+        let (status, message, field) = refused(api.maintain("09", "PF4", None).await?)?;
+        // audit: COTRTUPC-034
+        assert_eq!(
+            (status, field.as_deref()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
+        );
+        assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
+        let (status, message, field) = refused(api.maintain("01", "PF4", None).await?)?;
+        // audit: COTRTUPC-033
+        assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+        assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_RESTRICTED);
+        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
+        assert_eq!(harness.categories("01").await?, 5);
+        Ok(())
+    })
 }
 
 // Endpoint 27 writes whose statement fails while another transaction holds the row or an
 // uncommitted insert of the same code.
-#[tokio::test]
-async fn cotrtupc_writes_that_fail_on_a_held_row() -> TestResult {
-    let harness = Harness::start().await?;
-    let locking = harness.client_with("lock_timeout", "500ms").await?;
-    let timing = harness.client_with("statement_timeout", "500ms").await?;
-    // The -911 class answers a full literal; any other failure a Db2 message whose text after its
-    // prefix is halt H3.
-    for (client, expected, halted) in [
-        (&locking, COULD_NOT_LOCK, false),
-        (&timing, UPDATE_ERROR, true),
-    ] {
-        let holder = harness.hold_update("01").await?;
-        let (status, message, field) =
-            refused(client.maintain("01", "PF5", Some("Locked out")).await?)?;
-        holder.rollback().await?;
-        // audit: COTRTUPC-028
-        // audit: COTRTUPC-029
-        assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
-        if halted {
-            assert_db2_prefix(Some(message.as_str()), expected);
-        } else {
-            assert_eq!(message, expected);
+#[test]
+fn cotrtupc_writes_that_fail_on_a_held_row() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let locking = harness.client_with("lock_timeout", "500ms").await?;
+        let timing = harness.client_with("statement_timeout", "500ms").await?;
+        // The -911 class answers a full literal; any other failure a Db2 message whose text after
+        // its prefix is halt H3.
+        for (client, expected, halted) in [
+            (&locking, COULD_NOT_LOCK, false),
+            (&timing, UPDATE_ERROR, true),
+        ] {
+            let holder = harness.hold_update("01").await?;
+            let (status, message, field) =
+                refused(client.maintain("01", "PF5", Some("Locked out")).await?)?;
+            holder.rollback().await?;
+            // audit: COTRTUPC-028
+            // audit: COTRTUPC-029
+            assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+            if halted {
+                assert_db2_prefix(Some(message.as_str()), expected);
+            } else {
+                assert_eq!(message, expected);
+            }
+            assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
         }
-        assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
-    }
-    // The update finds no committed 09, and the insert then meets another user's insert of it.
-    let holder = harness.hold_insert("09").await?;
-    let (status, message, field) = refused(locking.maintain("09", "PF5", Some("Racing")).await?)?;
-    holder.rollback().await?;
-    // audit: COTRTUPC-027
-    assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
-    assert_db2_prefix(Some(message.as_str()), INSERT_ERROR);
-    assert_eq!(harness.stored("09").await?, None);
-    harness.insert("08", "OBSOLETE").await?;
-    let holder = harness.hold_update("08").await?;
-    let (status, message, field) = refused(timing.maintain("08", "PF4", None).await?)?;
-    holder.rollback().await?;
-    // audit: COTRTUPC-034
-    assert_eq!(
-        (status, field.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
-    );
-    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
-    assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
-    Ok(())
+        // The update finds no committed 09, and the insert then meets another user's insert of it.
+        let holder = harness.hold_insert("09").await?;
+        let (status, message, field) =
+            refused(locking.maintain("09", "PF5", Some("Racing")).await?)?;
+        holder.rollback().await?;
+        // audit: COTRTUPC-027
+        assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+        assert_db2_prefix(Some(message.as_str()), INSERT_ERROR);
+        assert_eq!(harness.stored("09").await?, None);
+        harness.insert("08", "OBSOLETE").await?;
+        let holder = harness.hold_update("08").await?;
+        let (status, message, field) = refused(timing.maintain("08", "PF4", None).await?)?;
+        holder.rollback().await?;
+        // audit: COTRTUPC-034
+        assert_eq!(
+            (status, field.as_deref()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
+        );
+        assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
+        assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
+        Ok(())
+    })
 }
 
 // audit: COTRTLIC-055

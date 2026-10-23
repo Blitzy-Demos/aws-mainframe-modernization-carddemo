@@ -20,9 +20,13 @@
 //! verdict (halt H5) with a deserialisation error. No part is trimmed, padded or case-folded
 //! here; the program reads each as a `MOVE` into its `PIC X(n)` field (CORPT00C-017).
 
+use serde::de::{self, Deserializer, MapAccess};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
+
+use super::{Member, ObjectMembers, field_if_present, read_object, skip_member};
 
 /// The ten inputs of `CORPT0A` exactly as the screen sends them (CORPT00C-042). An absent
 /// member is the empty text, which the program treats as blank.
@@ -42,7 +46,7 @@ use validator::Validate;
 // The schema name `ReportRequest` is the frontend's `components["schemas"]["ReportRequest"]`
 // (Generated API Types Only). The domain's own `ReportRequest`, the edited report, is a different
 // type, so `api::services::corpt00c` imports this one under an alias.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, ToSchema, Validate)]
 #[schema(example = json!({
     "monthly": "",
     "yearly": "",
@@ -152,6 +156,95 @@ pub struct ReportRequest {
     pub confirm: String,
 }
 
+/// The ten inputs in map order.
+impl Serialize for ReportRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("ReportRequest", 10)?;
+        state.serialize_field("monthly", &self.monthly)?;
+        state.serialize_field("yearly", &self.yearly)?;
+        state.serialize_field("custom", &self.custom)?;
+        state.serialize_field("start_month", &self.start_month)?;
+        state.serialize_field("start_day", &self.start_day)?;
+        state.serialize_field("start_year", &self.start_year)?;
+        state.serialize_field("end_month", &self.end_month)?;
+        state.serialize_field("end_day", &self.end_day)?;
+        state.serialize_field("end_year", &self.end_year)?;
+        state.serialize_field("confirm", &self.confirm)?;
+        state.end()
+    }
+}
+
+/// A JSON object whose absent members are the empty text. An unknown member is skipped; a
+/// repeated one is an error.
+impl<'de> Deserialize<'de> for ReportRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, ReportRequestMembers>(deserializer)
+    }
+}
+
+/// The members of a [`ReportRequest`] being read.
+#[derive(Default)]
+struct ReportRequestMembers {
+    monthly: Member<String>,
+    yearly: Member<String>,
+    custom: Member<String>,
+    start_month: Member<String>,
+    start_day: Member<String>,
+    start_year: Member<String>,
+    end_month: Member<String>,
+    end_day: Member<String>,
+    end_year: Member<String>,
+    confirm: Member<String>,
+}
+
+impl ObjectMembers for ReportRequestMembers {
+    type Object = ReportRequest;
+    const NAME: &'static str = "ReportRequest";
+    const FIELDS: &'static [&'static str] = &[
+        "monthly",
+        "yearly",
+        "custom",
+        "start_month",
+        "start_day",
+        "start_year",
+        "end_month",
+        "end_day",
+        "end_year",
+        "confirm",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "monthly" => self.monthly.read(map, "monthly"),
+            "yearly" => self.yearly.read(map, "yearly"),
+            "custom" => self.custom.read(map, "custom"),
+            "start_month" => self.start_month.read(map, "start_month"),
+            "start_day" => self.start_day.read(map, "start_day"),
+            "start_year" => self.start_year.read(map, "start_year"),
+            "end_month" => self.end_month.read(map, "end_month"),
+            "end_day" => self.end_day.read(map, "end_day"),
+            "end_year" => self.end_year.read(map, "end_year"),
+            "confirm" => self.confirm.read(map, "confirm"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<ReportRequest, E> {
+        Ok(ReportRequest {
+            monthly: self.monthly.or_default(),
+            yearly: self.yearly.or_default(),
+            custom: self.custom.or_default(),
+            start_month: self.start_month.or_default(),
+            start_day: self.start_day.or_default(),
+            start_year: self.start_year.or_default(),
+            end_month: self.end_month.or_default(),
+            end_day: self.end_day.or_default(),
+            end_year: self.end_year.or_default(),
+            confirm: self.confirm.or_default(),
+        })
+    }
+}
+
 /// The 200 of endpoint 14: the message row and, when the job deck was written, its file name.
 ///
 /// - Written deck: `message` is the report name and ` report submitted for printing ...`, such
@@ -164,7 +257,7 @@ pub struct ReportRequest {
 /// status its CORPT00C row assigns (CORPT00C-029 to CORPT00C-033, CORPT00C-037).
 // The schema name `ReportResult` is the frontend's `components["schemas"]["ReportResult"]`
 // (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "message": "Monthly report submitted for printing ...",
     "job_deck": "TRNRPT00.G0001"
@@ -179,6 +272,53 @@ pub struct ReportResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "TRNRPT00.G0001")]
     pub job_deck: Option<String>,
+}
+
+/// `message`, and `job_deck` when a deck was written.
+impl Serialize for ReportResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let len = 1 + usize::from(self.job_deck.is_some());
+        let mut state = serializer.serialize_struct("ReportResult", len)?;
+        state.serialize_field("message", &self.message)?;
+        field_if_present(&mut state, "job_deck", self.job_deck.as_ref())?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `message` is required and whose `job_deck` may be absent or `null`. An
+/// unknown member is skipped; a repeated one is an error.
+impl<'de> Deserialize<'de> for ReportResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, ReportResultMembers>(deserializer)
+    }
+}
+
+/// The members of a [`ReportResult`] being read.
+#[derive(Default)]
+struct ReportResultMembers {
+    message: Member<String>,
+    job_deck: Member<Option<String>>,
+}
+
+impl ObjectMembers for ReportResultMembers {
+    type Object = ReportResult;
+    const NAME: &'static str = "ReportResult";
+    const FIELDS: &'static [&'static str] = &["message", "job_deck"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "message" => self.message.read(map, "message"),
+            "job_deck" => self.job_deck.read(map, "job_deck"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<ReportResult, E> {
+        Ok(ReportResult {
+            message: self.message.required("message")?,
+            job_deck: self.job_deck.optional(),
+        })
+    }
 }
 
 /// `(message, written file name)`, as `api::services::corpt00c::submit` returns them: the
@@ -263,241 +403,260 @@ mod tests {
             .ok_or("invalid test instant")
     }
 
-    #[tokio::test]
-    async fn members_travel_under_their_rust_names_and_default_to_empty() -> TestResult {
-        let wire = serde_json::to_value(ReportRequest::default())?;
-        let keys: Vec<&str> = wire
-            .as_object()
-            .ok_or("not an object")?
-            .keys()
-            .map(String::as_str)
-            .collect();
-        let mut expected = MEMBERS.to_vec();
-        expected.sort_unstable();
-        assert_eq!(keys, expected);
-
-        assert_eq!(extract("{}").await??, ReportRequest::default());
-
-        // audit: CORPT00C-042
-        let typed = extract(r#"{"monthly":"n","start_month":"  ","confirm":"y"}"#).await??;
-        assert_eq!(
-            (
-                typed.monthly.as_str(),
-                typed.start_month.as_str(),
-                typed.confirm.as_str()
-            ),
-            ("n", "  ", "y")
-        );
-        Ok(())
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
-    #[tokio::test]
-    async fn map_length_and_num_are_revalidated_naming_the_member() -> TestResult {
-        let cases = [
-            ("monthly", "XX", FIELD_LENGTH_MESSAGE),
-            ("yearly", "XX", FIELD_LENGTH_MESSAGE),
-            ("custom", "XX", FIELD_LENGTH_MESSAGE),
-            ("confirm", "YY", FIELD_LENGTH_MESSAGE),
-            ("start_month", "123", FIELD_LENGTH_MESSAGE),
-            ("end_year", "20225", FIELD_LENGTH_MESSAGE),
-            ("start_month", "AB", FIELD_NUMERIC_MESSAGE),
-            ("start_day", "1A", FIELD_NUMERIC_MESSAGE),
-            ("start_year", "20X2", FIELD_NUMERIC_MESSAGE),
-            ("end_month", "-3", FIELD_NUMERIC_MESSAGE),
-            ("end_day", "1.", FIELD_NUMERIC_MESSAGE),
-            ("end_year", "22.0", FIELD_NUMERIC_MESSAGE),
-            // A space between digits is not one of the spaces NUMVAL-C reads around them.
-            ("start_year", "20 2", FIELD_NUMERIC_MESSAGE),
-            ("end_year", " 2 2", FIELD_NUMERIC_MESSAGE),
-            // `LOW-VALUES` fits the field but is not digits.
-            ("start_month", "\0\0", FIELD_NUMERIC_MESSAGE),
-        ];
-        for (member, value, message) in cases {
-            let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
-            let error = extract(&body)
-                .await?
-                .err()
-                .ok_or_else(|| format!("{member} = {value:?} accepted"))?;
+    #[test]
+    fn members_travel_under_their_rust_names_and_default_to_empty() -> TestResult {
+        block_on(async {
+            let wire = serde_json::to_value(ReportRequest::default())?;
+            let keys: Vec<&str> = wire
+                .as_object()
+                .ok_or("not an object")?
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = MEMBERS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected);
+
+            assert_eq!(extract("{}").await??, ReportRequest::default());
+
+            // audit: CORPT00C-042
+            let typed = extract(r#"{"monthly":"n","start_month":"  ","confirm":"y"}"#).await??;
             assert_eq!(
-                parts(&error),
-                (StatusCode::BAD_REQUEST, message, Some(member)),
-                "{member} = {value:?}"
+                (
+                    typed.monthly.as_str(),
+                    typed.start_month.as_str(),
+                    typed.confirm.as_str()
+                ),
+                ("n", "  ", "y")
             );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn text_the_pic_x_field_cannot_hold_is_a_400_naming_the_member() -> TestResult {
-        // Within `length` in characters, but not printable ASCII that fits the field byte for
-        // byte: a character outside ASCII, a control byte, or NUL that does not fill the field.
-        // The date parts answer the field-length message, not the digits-only one, because the
-        // field cannot hold the value at all.
-        let mut cases: Vec<(&str, &str)> = MEMBERS
-            .iter()
-            .flat_map(|&member| ["é", "\t", "\u{7f}", "\u{1F600}"].map(|value| (member, value)))
-            .collect();
-        cases.extend([
-            ("start_day", "\t5"),
-            ("start_year", "20é"),
-            ("end_month", "\0"),
-            ("end_day", "5\u{7f}"),
-            ("end_year", "ééé"),
-        ]);
-        for (member, value) in cases {
-            let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
-            let error = extract(&body)
-                .await?
-                .err()
-                .ok_or_else(|| format!("{member} = {value:?} accepted"))?;
-            assert_eq!(
-                parts(&error),
-                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
-                "{member} = {value:?}"
-            );
-        }
-        Ok(())
+    #[test]
+    fn map_length_and_num_are_revalidated_naming_the_member() -> TestResult {
+        block_on(async {
+            let cases = [
+                ("monthly", "XX", FIELD_LENGTH_MESSAGE),
+                ("yearly", "XX", FIELD_LENGTH_MESSAGE),
+                ("custom", "XX", FIELD_LENGTH_MESSAGE),
+                ("confirm", "YY", FIELD_LENGTH_MESSAGE),
+                ("start_month", "123", FIELD_LENGTH_MESSAGE),
+                ("end_year", "20225", FIELD_LENGTH_MESSAGE),
+                ("start_month", "AB", FIELD_NUMERIC_MESSAGE),
+                ("start_day", "1A", FIELD_NUMERIC_MESSAGE),
+                ("start_year", "20X2", FIELD_NUMERIC_MESSAGE),
+                ("end_month", "-3", FIELD_NUMERIC_MESSAGE),
+                ("end_day", "1.", FIELD_NUMERIC_MESSAGE),
+                ("end_year", "22.0", FIELD_NUMERIC_MESSAGE),
+                // A space between digits is not one of the spaces NUMVAL-C reads around them.
+                ("start_year", "20 2", FIELD_NUMERIC_MESSAGE),
+                ("end_year", " 2 2", FIELD_NUMERIC_MESSAGE),
+                // `LOW-VALUES` fits the field but is not digits.
+                ("start_month", "\0\0", FIELD_NUMERIC_MESSAGE),
+            ];
+            for (member, value, message) in cases {
+                let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
+                let error = extract(&body)
+                    .await?
+                    .err()
+                    .ok_or_else(|| format!("{member} = {value:?} accepted"))?;
+                assert_eq!(
+                    parts(&error),
+                    (StatusCode::BAD_REQUEST, message, Some(member)),
+                    "{member} = {value:?}"
+                );
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn values_the_map_admits_reach_the_program_edits() -> TestResult {
-        for (member, value) in [
-            ("monthly", "N"),
-            ("monthly", "\0"),
-            ("start_month", "13"),
-            ("start_month", "00"),
-            ("start_day", "  "),
-            ("start_year", "0000"),
-            ("start_year", "    "),
-            ("end_year", "9999"),
-            ("end_day", ""),
-            ("confirm", "x"),
-            ("confirm", " "),
-        ] {
-            let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
-            assert!(extract(&body).await?.is_ok(), "{member} = {value:?}");
-        }
+    #[test]
+    fn text_the_pic_x_field_cannot_hold_is_a_400_naming_the_member() -> TestResult {
+        block_on(async {
+            // Within `length` in characters, but not printable ASCII that fits the field byte for
+            // byte: a character outside ASCII, a control byte, or NUL that does not fill the field.
+            // The date parts answer the field-length message, not the digits-only one, because the
+            // field cannot hold the value at all.
+            let mut cases: Vec<(&str, &str)> = MEMBERS
+                .iter()
+                .flat_map(|&member| ["é", "\t", "\u{7f}", "\u{1F600}"].map(|value| (member, value)))
+                .collect();
+            cases.extend([
+                ("start_day", "\t5"),
+                ("start_year", "20é"),
+                ("end_month", "\0"),
+                ("end_day", "5\u{7f}"),
+                ("end_year", "ééé"),
+            ]);
+            for (member, value) in cases {
+                let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
+                let error = extract(&body)
+                    .await?
+                    .err()
+                    .ok_or_else(|| format!("{member} = {value:?} accepted"))?;
+                assert_eq!(
+                    parts(&error),
+                    (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
+                    "{member} = {value:?}"
+                );
+            }
+            Ok(())
+        })
+    }
 
-        // Digits with spaces before or after them are admitted and reach the program as typed,
-        // untrimmed; NUMVAL-C, not this DTO, reads each as the value of its digits.
-        let padded = extract(
-            r#"{"custom":"X","start_month":" 5","start_day":"5 ","start_year":"  22",
-                "end_month":"7 ","end_day":" 6","end_year":"22  "}"#,
-        )
-        .await??;
-        assert_eq!(
-            [
-                padded.start_month.as_str(),
-                padded.start_day.as_str(),
-                padded.start_year.as_str(),
-                padded.end_month.as_str(),
-                padded.end_day.as_str(),
-                padded.end_year.as_str(),
-            ],
-            [" 5", "5 ", "  22", "7 ", " 6", "22  "]
-        );
-        // The space-padded month `5 ` is `05` and passes the month edit, which its text, above
-        // `12`, would fail; the day `99` is then the first part rejected.
-        // audit: CORPT00C-017
-        let month_passed = extract(
-            r#"{"custom":"X","start_month":"5 ","start_day":"99","start_year":"2022",
-                "end_month":"07","end_day":"06","end_year":"2022"}"#,
-        )
-        .await??;
-        let failure = rules::edit(&input(&month_passed), &clock()?)
-            .err()
-            .ok_or("day 99 passed the day edit")?;
-        assert_eq!(
-            parts(&ScreenError::from(failure)),
-            (
-                StatusCode::BAD_REQUEST,
-                "Start Date - Not a valid Day...",
-                Some("start_day")
+    #[test]
+    fn values_the_map_admits_reach_the_program_edits() -> TestResult {
+        block_on(async {
+            for (member, value) in [
+                ("monthly", "N"),
+                ("monthly", "\0"),
+                ("start_month", "13"),
+                ("start_month", "00"),
+                ("start_day", "  "),
+                ("start_year", "0000"),
+                ("start_year", "    "),
+                ("end_year", "9999"),
+                ("end_day", ""),
+                ("confirm", "x"),
+                ("confirm", " "),
+            ] {
+                let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
+                assert!(extract(&body).await?.is_ok(), "{member} = {value:?}");
+            }
+
+            // Digits with spaces before or after them are admitted and reach the program as typed,
+            // untrimmed; NUMVAL-C, not this DTO, reads each as the value of its digits.
+            let padded = extract(
+                r#"{"custom":"X","start_month":" 5","start_day":"5 ","start_year":"  22",
+                    "end_month":"7 ","end_day":" 6","end_year":"22  "}"#,
             )
-        );
-
-        // audit: CORPT00C-018
-        let request = extract(
-            r#"{"custom":"X","start_month":"13","start_day":"01","start_year":"2022",
-                "end_month":"07","end_day":"06","end_year":"2022"}"#,
-        )
-        .await??;
-        let failure = rules::edit(&input(&request), &clock()?)
-            .err()
-            .ok_or("month 13 passed the month edit")?;
-        assert_eq!(
-            parts(&ScreenError::from(failure)),
-            (
-                StatusCode::BAD_REQUEST,
-                "Start Date - Not a valid Month...",
-                Some("start_month")
+            .await??;
+            assert_eq!(
+                [
+                    padded.start_month.as_str(),
+                    padded.start_day.as_str(),
+                    padded.start_year.as_str(),
+                    padded.end_month.as_str(),
+                    padded.end_day.as_str(),
+                    padded.end_year.as_str(),
+                ],
+                [" 5", "5 ", "  22", "7 ", " 6", "22  "]
+            );
+            // The space-padded month `5 ` is `05` and passes the month edit, which its text, above
+            // `12`, would fail; the day `99` is then the first part rejected.
+            // audit: CORPT00C-017
+            let month_passed = extract(
+                r#"{"custom":"X","start_month":"5 ","start_day":"99","start_year":"2022",
+                    "end_month":"07","end_day":"06","end_year":"2022"}"#,
             )
-        );
-        Ok(())
+            .await??;
+            let failure = rules::edit(&input(&month_passed), &clock()?)
+                .err()
+                .ok_or("day 99 passed the day edit")?;
+            assert_eq!(
+                parts(&ScreenError::from(failure)),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Start Date - Not a valid Day...",
+                    Some("start_day")
+                )
+            );
+
+            // audit: CORPT00C-018
+            let request = extract(
+                r#"{"custom":"X","start_month":"13","start_day":"01","start_year":"2022",
+                    "end_month":"07","end_day":"06","end_year":"2022"}"#,
+            )
+            .await??;
+            let failure = rules::edit(&input(&request), &clock()?)
+                .err()
+                .ok_or("month 13 passed the month edit")?;
+            assert_eq!(
+                parts(&ScreenError::from(failure)),
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Start Date - Not a valid Month...",
+                    Some("start_month")
+                )
+            );
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn every_report_failure_names_a_request_member() -> TestResult {
-        let clock = clock()?;
-        // The first edit that fails names the member: CORPT00C-029, then the blank-part edits
-        // CORPT00C-011 to CORPT00C-016 in program order.
-        let steps = [
-            ("monthly", "{}"),
-            ("start_month", r#"{"custom":"X"}"#),
-            ("start_day", r#"{"custom":"X","start_month":"01"}"#),
-            (
-                "start_year",
-                r#"{"custom":"X","start_month":"01","start_day":"01"}"#,
-            ),
-            (
-                "end_month",
-                r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022"}"#,
-            ),
-            (
-                "end_day",
-                r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022",
-                    "end_month":"07"}"#,
-            ),
-            (
-                "end_year",
-                r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022",
-                    "end_month":"07","end_day":"06"}"#,
-            ),
-        ];
-        let mut failures = Vec::new();
-        for (member, body) in steps {
-            let request = extract(body).await??;
-            failures.push((member, rules::edit(&input(&request), &clock).err()));
-        }
-        // audit: CORPT00C-030
-        let monthly = extract(r#"{"monthly":"X"}"#).await??;
-        let edited = rules::edit(&input(&monthly), &clock)?;
-        failures.push(("confirm", rules::confirm(edited, &monthly.confirm).err()));
+    #[test]
+    fn every_report_failure_names_a_request_member() -> TestResult {
+        block_on(async {
+            let clock = clock()?;
+            // The first edit that fails names the member: CORPT00C-029, then the blank-part edits
+            // CORPT00C-011 to CORPT00C-016 in program order.
+            let steps = [
+                ("monthly", "{}"),
+                ("start_month", r#"{"custom":"X"}"#),
+                ("start_day", r#"{"custom":"X","start_month":"01"}"#),
+                (
+                    "start_year",
+                    r#"{"custom":"X","start_month":"01","start_day":"01"}"#,
+                ),
+                (
+                    "end_month",
+                    r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022"}"#,
+                ),
+                (
+                    "end_day",
+                    r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022",
+                        "end_month":"07"}"#,
+                ),
+                (
+                    "end_year",
+                    r#"{"custom":"X","start_month":"01","start_day":"01","start_year":"2022",
+                        "end_month":"07","end_day":"06"}"#,
+                ),
+            ];
+            let mut failures = Vec::new();
+            for (member, body) in steps {
+                let request = extract(body).await??;
+                failures.push((member, rules::edit(&input(&request), &clock).err()));
+            }
+            // audit: CORPT00C-030
+            let monthly = extract(r#"{"monthly":"X"}"#).await??;
+            let edited = rules::edit(&input(&monthly), &clock)?;
+            failures.push(("confirm", rules::confirm(edited, &monthly.confirm).err()));
 
-        for (member, failure) in failures {
-            let error = ScreenError::from(failure.ok_or_else(|| format!("{member} passed"))?);
-            assert!(MEMBERS.contains(&member));
+            for (member, failure) in failures {
+                let error = ScreenError::from(failure.ok_or_else(|| format!("{member} passed"))?);
+                assert!(MEMBERS.contains(&member));
+                assert_eq!(
+                    (error.status(), error.field()),
+                    (StatusCode::BAD_REQUEST, Some(member))
+                );
+            }
+
+            // audit: CORPT00C-037
+            let write = ScreenError::from(rules::tdq_write_failure());
             assert_eq!(
-                (error.status(), error.field()),
-                (StatusCode::BAD_REQUEST, Some(member))
+                (write.status(), write.field()),
+                (StatusCode::INTERNAL_SERVER_ERROR, Some("monthly"))
             );
-        }
 
-        // audit: CORPT00C-037
-        let write = ScreenError::from(rules::tdq_write_failure());
-        assert_eq!(
-            (write.status(), write.field()),
-            (StatusCode::INTERNAL_SERVER_ERROR, Some("monthly"))
-        );
-
-        // audit: CORPT00C-032
-        let cleared = extract(r#"{"monthly":"X","confirm":"n"}"#).await??;
-        let edited = rules::edit(&input(&cleared), &clock)?;
-        assert_eq!(
-            rules::confirm(edited, &cleared.confirm)?,
-            ConfirmOutcome::Cleared
-        );
-        Ok(())
+            // audit: CORPT00C-032
+            let cleared = extract(r#"{"monthly":"X","confirm":"n"}"#).await??;
+            let edited = rules::edit(&input(&cleared), &clock)?;
+            assert_eq!(
+                rules::confirm(edited, &cleared.confirm)?,
+                ConfirmOutcome::Cleared
+            );
+            Ok(())
+        })
     }
 
     #[test]

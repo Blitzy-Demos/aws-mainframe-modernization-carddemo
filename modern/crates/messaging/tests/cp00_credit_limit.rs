@@ -195,55 +195,71 @@ impl Settled {
 // audit: COPAUA0C-049
 // audit: COPAUA0C-050
 // audit: COPAUA0C-132
-#[tokio::test]
-async fn two_processes_and_redelivery_never_commit_past_the_credit_limit() -> TestResult {
-    let rabbit = start_rabbitmq().await?;
-    let pg = start_loaded_postgres().await?;
-    let mut store = PgStore::new(pg.pool().clone());
-    let (account, xref) = account_under_test(&mut store).await?;
-    let amount = Decimal::new(AMOUNT_CENTS, 2);
-    let headroom = account.credit_limit.as_decimal() - account.curr_bal.as_decimal();
-    assert!(
-        Decimal::from(REQUESTS) * amount > headroom,
-        "precondition: 50 · A > L − B"
-    );
-    let k = (headroom / amount)
-        .floor()
-        .to_usize()
-        .ok_or("k = ⌊(L − B) / A⌋ is not a count")?;
+#[test]
+fn two_processes_and_redelivery_never_commit_past_the_credit_limit() -> TestResult {
+    block_on(async {
+        let rabbit = start_rabbitmq().await?;
+        let pg = start_loaded_postgres().await?;
+        let mut store = PgStore::new(pg.pool().clone());
+        let (account, xref) = account_under_test(&mut store).await?;
+        let amount = Decimal::new(AMOUNT_CENTS, 2);
+        let headroom = account.credit_limit.as_decimal() - account.curr_bal.as_decimal();
+        assert!(
+            Decimal::from(REQUESTS) * amount > headroom,
+            "precondition: 50 · A > L − B"
+        );
+        // TRUNCATION: checked, never lossy. `floor` leaves a whole number, which the
+        // precondition above keeps below 50 and `usize` holds; a negative quotient, which
+        // `to_usize` refuses, fails the test through `?`, never wraps.
+        let k = (headroom / amount)
+            .floor()
+            .to_usize()
+            .ok_or("k = ⌊(L − B) / A⌋ is not a count")?;
 
-    let (_connection, channel) = open_channel(&rabbit).await?;
-    let reply_queue = rabbitmq::declare_reply_queue(&channel).await?;
-    let correlation_ids =
-        publish_requests(&channel, &reply_queue, &xref, &amount.to_string()).await?;
-    let first_request = correlation_ids.first().ok_or("no request was published")?;
+        let (_connection, channel) = open_channel(&rabbit).await?;
+        let reply_queue = rabbitmq::declare_reply_queue(&channel).await?;
+        let correlation_ids =
+            publish_requests(&channel, &reply_queue, &xref, &amount.to_string()).await?;
+        let first_request = correlation_ids.first().ok_or("no request was published")?;
 
-    // Declared before the workers, so that a failure while it is held kills the processes first
-    // and then drops the gate, which rolls it back.
-    let gate = close_gate(&store, &xref).await?;
-    let mut workers = spawn_workers(pg.database_url(), rabbit.amqp_url())?;
-    await_gated_deliveries(&channel, &reply_queue, &mut workers).await?;
-    gate.rollback().await?;
-    let processes = workers.ids();
-    let replies = collect_replies(&channel, &reply_queue, &mut workers).await?;
-    assert!(
-        rabbitmq::get(&channel, &reply_queue, QUIET_WAIT)
-            .await?
-            .is_none(),
-        "a reply beyond one per delivery arrived (COPAUA0C-132)"
-    );
-    let settled = settle(&mut store, PicS::from(account.id)).await?;
-    drop(workers);
-    for queue in [REQUEST_QUEUE, DEAD_LETTER_QUEUE] {
-        let left = rabbitmq::message_count(&channel, queue).await?;
-        assert_eq!(left, 0, "{queue} still holds messages");
-    }
+        // Declared before the workers, so that a failure while it is held kills the processes first
+        // and then drops the gate, which rolls it back.
+        let gate = close_gate(&store, &xref).await?;
+        let mut workers = spawn_workers(pg.database_url(), rabbit.amqp_url())?;
+        await_gated_deliveries(&channel, &reply_queue, &mut workers).await?;
+        gate.rollback().await?;
+        let processes = workers.ids();
+        let replies = collect_replies(&channel, &reply_queue, &mut workers).await?;
+        assert!(
+            rabbitmq::get(&channel, &reply_queue, QUIET_WAIT)
+                .await?
+                .is_none(),
+            "a reply beyond one per delivery arrived (COPAUA0C-132)"
+        );
+        let settled = settle(&mut store, PicS::from(account.id)).await?;
+        drop(workers);
+        for queue in [REQUEST_QUEUE, DEAD_LETTER_QUEUE] {
+            let left = rabbitmq::message_count(&channel, queue).await?;
+            assert_eq!(left, 0, "{queue} still holds messages");
+        }
 
-    assert_participation(&replies, &processes, first_request);
-    assert_replies(&replies, &correlation_ids, k);
-    assert_committed(&mut store, &account, k, amount).await?;
-    assert_details(&settled, k);
-    Ok(())
+        assert_participation(&replies, &processes, first_request);
+        assert_replies(&replies, &correlation_ids, k);
+        assert_committed(&mut store, &account, k, amount).await?;
+        assert_details(&settled, k);
+        Ok(())
+    })
+}
+
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
 }
 
 /// The fixture account and its cross-reference, read from the loaded database, after checking
@@ -391,6 +407,9 @@ async fn await_gated_deliveries(
     reply_queue: &str,
     workers: &mut ProcessGuard,
 ) -> TestResult {
+    // TRUNCATION: checked, never lossy. DELIVERIES is 100 and the gated count 98, one fewer for
+    // each of the two processes, and `u32` holds both; a refused conversion fails the test
+    // through `?`, never wraps.
     let published = u32::try_from(DELIVERIES)?;
     let gated = u32::try_from(DELIVERIES - WORKER_PROCESSES)?;
     let deadline = time::Instant::now() + READY_WAIT;
@@ -578,14 +597,19 @@ async fn assert_committed(
     let account = AccountRepository::find_by_id(&mut *store, before.id)
         .await?
         .ok_or("the fixture account is gone")?;
+    // TRUNCATION: checked, never lossy. The test's precondition 50 · A > L − B makes k at most
+    // 49, so the approved count k and the declined count 100 − k both lie within 0 to 100, which
+    // `i16` holds; a refused conversion fails the test through `?`, never wraps.
+    let approved_count = i16::try_from(k)?;
+    let declined_count = i16::try_from(DELIVERIES - k)?;
     assert_eq!(
         summary.approved_auth_cnt.get(),
-        i16::try_from(k)?,
+        approved_count,
         "approved count"
     );
     assert_eq!(
         summary.declined_auth_cnt.get(),
-        i16::try_from(DELIVERIES - k)?,
+        declined_count,
         "declined count"
     );
     let approved_amt = summary.approved_auth_amt.as_decimal();

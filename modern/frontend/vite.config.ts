@@ -11,6 +11,56 @@ import { defineConfig } from "vitest/config";
  * (`set -a; . ./.env; set +a`); nothing here loads it. No variable is exposed to the client.
  */
 
+/**
+ * Fails a Vitest run whose `Object.prototype` is already polluted, then makes
+ * `Object.prototype` non-extensible, so that no later pollution can choose the module the test
+ * worker pool loads (GHSA-85c8-ppgw-ccpr).
+ *
+ * Vitest 3.2.7 starts every test file through `pool.run`, with run options such as
+ * `{ name, channel }` that have no `filename` of its own. tinypool 1.1.1 reads `filename` from
+ * them through the prototype chain and, when it finds one, has the worker import that path in
+ * place of Vitest's worker module, so a `filename` added to `Object.prototype` runs any
+ * module. The fix is tinypool 2.1.2, a major that Vitest 3.2.7's `^1.1.1` range does not
+ * admit, and the exact Vitest pin and the committed lockfile stay; this guard stands in for the
+ * fix.
+ *
+ * Locking the prototype cannot undo earlier pollution, so the run is refused first, naming the
+ * keys and never their values, when the prototype carries any enumerable string key (it has
+ * none of its own) or a `filename` of any kind. The lock then lasts for the whole main process,
+ * and Vitest creates its pool only after it has loaded this file. Evaluating the file again
+ * finds the prototype locked and clean, and locking it again changes nothing.
+ *
+ * The prototype is made non-extensible rather than frozen. Either refuses a new `filename`, but
+ * freezing also makes the built-in methods read-only, and then an assignment to a method such
+ * as `SomeClass.prototype.toString` throws a TypeError. magicast, which the coverage provider
+ * loads after this file, makes exactly that assignment, so a frozen prototype stops the run.
+ *
+ * Vitest sets `VITEST` to `"true"` before it loads this file. `vite` and `vite build` start no
+ * worker pool, so they skip the guard and keep an ordinary prototype.
+ *
+ * Remove the guard once a Vitest release that depends on tinypool 2.1.2 or later is pinned.
+ * Logged as escalation E48 in `audit/ESCALATIONS.md`.
+ */
+function guardObjectPrototype(): void {
+  const prototype = Object.prototype;
+  const pollutedKeys = Object.keys(prototype);
+  if (Object.hasOwn(prototype, "filename") && !pollutedKeys.includes("filename")) {
+    pollutedKeys.push("filename");
+  }
+  if (pollutedKeys.length > 0) {
+    const names = pollutedKeys.map((key) => JSON.stringify(key)).join(", ");
+    throw new Error(
+      `Vitest refuses to start: Object.prototype is polluted with ${names}, which could make ` +
+        "tinypool load a foreign worker module (GHSA-85c8-ppgw-ccpr; see vite.config.ts)",
+    );
+  }
+  Object.preventExtensions(prototype);
+}
+
+if (process.env.VITEST === "true") {
+  guardObjectPrototype();
+}
+
 /** Address the API binds; an unset or empty value falls back to the API's own default. */
 const apiBind = process.env.CARDDEMO_API_BIND || "127.0.0.1:8080";
 
@@ -74,10 +124,15 @@ function withoutApiQuery(message: string): string {
 }
 
 /**
- * Vite's default logger with every message passed through `withoutApiQuery` before it prints,
- * so that no line the dev server logs, its proxy error line included, carries a query value.
- * The methods are replaced on Vite's own logger object, so its `hasWarned` flag still tracks
- * what was printed.
+ * Vite's default logger with every string message passed to its `info`, `warn`, `warnOnce` and
+ * `error` methods run through `withoutApiQuery` before it prints, so that no line Vite logs
+ * through this logger, its proxy error line included, carries an `/api` query value. The methods
+ * are replaced on Vite's own logger object, so its `hasWarned` flag still tracks what was printed.
+ *
+ * Output Vite writes without its logger keeps the query. The `debug` package's `vite:*` lines,
+ * which `DEBUG` turns on (`DEBUG=vite:proxy`, or `vite --debug` for all of `vite:*`), go straight
+ * to stderr, and `vite:proxy` and `vite:time` print each request URL whole, query included. Those
+ * namespaces stay disabled whenever card numbers may be in a query string.
  */
 function redactingLogger(): Logger {
   const logger = createLogger();

@@ -77,7 +77,7 @@ const VIEW: &str = "/api/v1/cards/view";
 const EDIT: &str = "/api/v1/cards/edit";
 
 /// The HS256 secret of the test API: a local-only value.
-const SECRET: &str = "endpoints-cards-local-secret";
+const SECRET: &str = "endpoints-cards-local-only-test-secret";
 
 /// The password of every `DUSRSECJ` user (`README.md:203-204`).
 const PASSWORD: &str = "PASSWORD";
@@ -873,6 +873,8 @@ async fn list_last_page(h: &Harness, third: &Reply) -> Outcome<()> {
 
 /// `page` as the page number a response carries.
 fn page_number(page: usize) -> Outcome<i64> {
+    // TRUNCATION: checked, never lossy. Callers pass page numbers 1 to 9 of the walked card
+    // lists, which `i64` holds; a refusal is a test failure, never a wrapped page number.
     Ok(i64::try_from(page)?)
 }
 

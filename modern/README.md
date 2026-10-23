@@ -26,7 +26,7 @@ Install commands and platform notes are in [docs/SETUP.md](docs/SETUP.md#1-prere
 
 Every command runs from `modern/`.
 
-1. Create the local configuration, then set `CARDDEMO_JWT_SECRET` in `.env` to any local value; the API refuses to start while it is empty:
+1. Create the local configuration, then set `CARDDEMO_JWT_SECRET` in `.env` to a local value of at least 32 bytes ([docs/SETUP.md](docs/SETUP.md#2-configuration) shows how to generate one); the API refuses to start while it is empty, blank or shorter:
 
    ```bash
    cp .env.example .env

@@ -118,8 +118,8 @@
 //!   answer as when no row has the key. A skipped statement sends no SQL.
 //! - Production code never installs a probe: `carddemo-api`, the `carddemo-mq` workers and
 //!   `carddemo-batch` build their store with [`PgStore::new`].
-//! - A store without a probe behaves exactly as before: no extra statement, one `Option` check
-//!   per probed call.
+//! - Without a probe, the verdict at each [`ProbePoint`] is `None` and the statement runs: the
+//!   seam adds no SQL, only `Option` checks.
 //! - [`PgStore::begin`] and [`PgTx::savepoint`] hand the probe on, so every unit of work answers
 //!   to the probe of the store that opened it. A [`PgSession`] is never probed, nor is a
 //!   transaction opened on one.
@@ -776,8 +776,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-    /// without the lint attributes that macro's expansion carries.
+    /// Runs `test` to completion on a current-thread runtime, the flavour Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
     fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -876,64 +876,72 @@ mod tests {
 
     /// Cardholder Data Redaction: neither the store nor a clone of it prints the pool, its
     /// options or the credentials it connects with.
-    #[tokio::test]
-    async fn store_debug_is_the_type_name_alone() {
-        let store = lazy_store();
-        for text in [format!("{store:?}"), format!("{:?}", store.clone())] {
-            assert_eq!(text, "PgStore");
-        }
-        assert!(format!("{:?}", store.pool().connect_options()).contains(PASSWORD));
+    #[test]
+    fn store_debug_is_the_type_name_alone() -> TestResult {
+        block_on(async {
+            let store = lazy_store();
+            for text in [format!("{store:?}"), format!("{:?}", store.clone())] {
+                assert_eq!(text, "PgStore");
+            }
+            assert!(format!("{:?}", store.pool().connect_options()).contains(PASSWORD));
+            Ok(())
+        })
     }
 
     /// Clones share one pool, and `begin` on a closed pool reports the database unavailable.
-    #[tokio::test]
-    async fn clones_share_the_pool_and_a_closed_pool_is_unavailable() {
-        let store = lazy_store();
-        let copy = store.clone();
-        store.pool().close().await;
-        assert!(copy.pool().is_closed());
-        assert_eq!(
-            copy.begin().await.map(drop),
-            Err(PersistenceError::Unavailable)
-        );
+    #[test]
+    fn clones_share_the_pool_and_a_closed_pool_is_unavailable() -> TestResult {
+        block_on(async {
+            let store = lazy_store();
+            let copy = store.clone();
+            store.pool().close().await;
+            assert!(copy.pool().is_closed());
+            assert_eq!(
+                copy.begin().await.map(drop),
+                Err(PersistenceError::Unavailable)
+            );
+            Ok(())
+        })
     }
 
     /// `begin` opens a transaction and `savepoint` nests one on the same connection; each ends
     /// by commit, rollback or drop and leaves the enclosing transaction usable. Observed through
     /// the connection's nesting depth, so the test runs no SQL text of its own.
-    #[tokio::test]
-    async fn transactions_nest_savepoints_and_end_by_commit_rollback_or_drop() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn transactions_nest_savepoints_and_end_by_commit_rollback_or_drop() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
 
-        let mut tx = store.begin().await?;
-        assert_eq!(format!("{tx:?}"), "PgTx");
-        assert_eq!(depth(&mut tx), 1);
+            let mut tx = store.begin().await?;
+            assert_eq!(format!("{tx:?}"), "PgTx");
+            assert_eq!(depth(&mut tx), 1);
 
-        let mut nested = tx.savepoint().await?;
-        assert_eq!(format!("{nested:?}"), "PgTx");
-        assert_eq!(depth(&mut nested), 2);
-        nested.rollback().await?;
-        assert_eq!(depth(&mut tx), 1);
+            let mut nested = tx.savepoint().await?;
+            assert_eq!(format!("{nested:?}"), "PgTx");
+            assert_eq!(depth(&mut nested), 2);
+            nested.rollback().await?;
+            assert_eq!(depth(&mut tx), 1);
 
-        let mut nested = tx.savepoint().await?;
-        let mut inner = nested.savepoint().await?;
-        assert_eq!(depth(&mut inner), 3);
-        inner.commit().await?;
-        assert_eq!(depth(&mut nested), 2);
-        nested.commit().await?;
-        assert_eq!(depth(&mut tx), 1);
+            let mut nested = tx.savepoint().await?;
+            let mut inner = nested.savepoint().await?;
+            assert_eq!(depth(&mut inner), 3);
+            inner.commit().await?;
+            assert_eq!(depth(&mut nested), 2);
+            nested.commit().await?;
+            assert_eq!(depth(&mut tx), 1);
 
-        drop(tx.savepoint().await?);
-        assert_eq!(depth(&mut tx), 1);
-        tx.commit().await?;
+            drop(tx.savepoint().await?);
+            assert_eq!(depth(&mut tx), 1);
+            tx.commit().await?;
 
-        store.begin().await?.rollback().await?;
-        drop(store.begin().await?);
-        let mut after_drop = store.begin().await?;
-        assert_eq!(depth(&mut after_drop), 1);
-        after_drop.commit().await?;
-        Ok(())
+            store.begin().await?.rollback().await?;
+            drop(store.begin().await?);
+            let mut after_drop = store.begin().await?;
+            assert_eq!(depth(&mut after_drop), 1);
+            after_drop.commit().await?;
+            Ok(())
+        })
     }
 
     /// Each data set's lock key is the documented big-endian reading of its DD name, and no two
@@ -974,14 +982,17 @@ mod tests {
 
     /// A session on a closed pool is the database unavailable, so no claim can be refused or
     /// granted on it.
-    #[tokio::test]
-    async fn a_session_on_a_closed_pool_is_unavailable() {
-        let store = lazy_store();
-        store.pool().close().await;
-        assert_eq!(
-            store.session().await.map(drop),
-            Err(PersistenceError::Unavailable)
-        );
+    #[test]
+    fn a_session_on_a_closed_pool_is_unavailable() -> TestResult {
+        block_on(async {
+            let store = lazy_store();
+            store.pool().close().await;
+            assert_eq!(
+                store.session().await.map(drop),
+                Err(PersistenceError::Unavailable)
+            );
+            Ok(())
+        })
     }
 
     /// A store with a fail-fast gate, as `carddemo-api` builds its own: while the gate is shut,
@@ -1038,65 +1049,67 @@ mod tests {
     /// open, is refused alike.
     // audit: CBTRN02C-046
     // audit: CBACT04C-039
-    #[tokio::test]
-    async fn a_claim_is_held_by_one_session_until_closed_or_dropped() -> TestResult {
-        let guard = start_postgres().await?;
-        let connect = || {
-            PgPoolOptions::new()
-                .max_connections(1)
-                .connect(guard.database_url())
-        };
-        let store = PgStore::new(connect().await?);
-        let other_process = PgStore::new(connect().await?);
+    #[test]
+    fn a_claim_is_held_by_one_session_until_closed_or_dropped() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let connect = || {
+                PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(guard.database_url())
+            };
+            let store = PgStore::new(connect().await?);
+            let other_process = PgStore::new(connect().await?);
 
-        for dataset in DATASETS {
-            let mut holder = store.session().await?;
-            assert_eq!(format!("{holder:?}"), "PgSession");
-            assert!(holder.claim_writer(dataset).await?, "a free {dataset:?}");
-            for contender in [&store, &other_process] {
-                let mut contender = contender.session().await?;
-                assert!(
-                    !contender.claim_writer(dataset).await?,
-                    "{dataset:?} is claimed twice"
-                );
-                // The other data sets stay free: each is claimed beside this claim.
-                for other in DATASETS.into_iter().filter(|other| *other != dataset) {
+            for dataset in DATASETS {
+                let mut holder = store.session().await?;
+                assert_eq!(format!("{holder:?}"), "PgSession");
+                assert!(holder.claim_writer(dataset).await?, "a free {dataset:?}");
+                for contender in [&store, &other_process] {
+                    let mut contender = contender.session().await?;
                     assert!(
-                        contender.claim_writer(other).await?,
-                        "{other:?} beside {dataset:?}"
+                        !contender.claim_writer(dataset).await?,
+                        "{dataset:?} is claimed twice"
                     );
+                    // The other data sets stay free: each is claimed beside this claim.
+                    for other in DATASETS.into_iter().filter(|other| *other != dataset) {
+                        assert!(
+                            contender.claim_writer(other).await?,
+                            "{other:?} beside {dataset:?}"
+                        );
+                    }
+                    contender.close().await?;
                 }
-                contender.close().await?;
+                holder.close().await?;
+
+                let mut again = other_process.session().await?;
+                assert!(
+                    again.claim_writer(dataset).await?,
+                    "{dataset:?} is free as soon as its holder is closed"
+                );
+                let mut refused = store.session().await?;
+                assert!(!refused.claim_writer(dataset).await?, "{dataset:?}");
+                refused.close().await?;
+                drop(again);
+                claim_once_free(&store, dataset).await?.close().await?;
             }
-            holder.close().await?;
 
-            let mut again = other_process.session().await?;
-            assert!(
-                again.claim_writer(dataset).await?,
-                "{dataset:?} is free as soon as its holder is closed"
-            );
-            let mut refused = store.session().await?;
-            assert!(!refused.claim_writer(dataset).await?, "{dataset:?}");
-            refused.close().await?;
-            drop(again);
-            claim_once_free(&store, dataset).await?.close().await?;
-        }
-
-        let mut all = store.session().await?;
-        let mut contender = other_process.session().await?;
-        for dataset in DATASETS {
-            assert!(all.claim_writer(dataset).await?, "{dataset:?}");
-            assert!(!contender.claim_writer(dataset).await?, "{dataset:?}");
-        }
-        all.close().await?;
-        for dataset in DATASETS {
-            assert!(
-                contender.claim_writer(dataset).await?,
-                "{dataset:?} once the session holding all three is closed"
-            );
-        }
-        contender.close().await?;
-        Ok(())
+            let mut all = store.session().await?;
+            let mut contender = other_process.session().await?;
+            for dataset in DATASETS {
+                assert!(all.claim_writer(dataset).await?, "{dataset:?}");
+                assert!(!contender.claim_writer(dataset).await?, "{dataset:?}");
+            }
+            all.close().await?;
+            for dataset in DATASETS {
+                assert!(
+                    contender.claim_writer(dataset).await?,
+                    "{dataset:?} once the session holding all three is closed"
+                );
+            }
+            contender.close().await?;
+            Ok(())
+        })
     }
 
     /// A session the server ends while it holds claims, as `pg_terminate_backend`,
@@ -1106,102 +1119,106 @@ mod tests {
     /// run can claim its data sets.
     // audit: CBTRN02C-046
     // audit: CBACT04C-039
-    #[tokio::test]
-    async fn a_lost_session_fails_every_later_statement_and_frees_its_claims() -> TestResult {
-        let guard = start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let mut lost = store.session().await?;
-        for dataset in DATASETS {
-            assert!(lost.claim_writer(dataset).await?, "{dataset:?}");
-        }
-        let pid = sqlx::query_scalar!(r#"SELECT pg_backend_pid() AS "pid!""#)
-            .fetch_one(lost.conn())
-            .await?;
-        let terminated =
-            sqlx::query_scalar!(r#"SELECT pg_terminate_backend($1) AS "terminated!""#, pid)
-                .fetch_one(store.pool())
+    #[test]
+    fn a_lost_session_fails_every_later_statement_and_frees_its_claims() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let mut lost = store.session().await?;
+            for dataset in DATASETS {
+                assert!(lost.claim_writer(dataset).await?, "{dataset:?}");
+            }
+            let pid = sqlx::query_scalar!(r#"SELECT pg_backend_pid() AS "pid!""#)
+                .fetch_one(lost.conn())
                 .await?;
-        assert!(terminated, "the session's backend is told to end");
+            let terminated =
+                sqlx::query_scalar!(r#"SELECT pg_terminate_backend($1) AS "terminated!""#, pid)
+                    .fetch_one(store.pool())
+                    .await?;
+            assert!(terminated, "the session's backend is told to end");
 
-        assert!(
-            AccountRepository::find_all(&mut lost).await.is_err(),
-            "a read after the loss"
-        );
-        assert!(
-            TranCatBalanceRepository::insert(&mut lost, &balance(1)?)
-                .await
-                .is_err(),
-            "a write after the loss"
-        );
-        assert!(
-            lost.claim_writer(Dataset::Accounts).await.is_err(),
-            "a claim after the loss"
-        );
-        assert!(lost.close().await.is_err(), "the close after the loss");
+            assert!(
+                AccountRepository::find_all(&mut lost).await.is_err(),
+                "a read after the loss"
+            );
+            assert!(
+                TranCatBalanceRepository::insert(&mut lost, &balance(1)?)
+                    .await
+                    .is_err(),
+                "a write after the loss"
+            );
+            assert!(
+                lost.claim_writer(Dataset::Accounts).await.is_err(),
+                "a claim after the loss"
+            );
+            assert!(lost.close().await.is_err(), "the close after the loss");
 
-        for dataset in DATASETS {
-            claim_once_free(&store, dataset).await?.close().await?;
-        }
-        let mut reads = store.clone();
-        assert!(
-            TranCatBalanceRepository::find_all(&mut reads)
-                .await?
-                .is_empty(),
-            "the write after the loss reached the table"
-        );
-        Ok(())
+            for dataset in DATASETS {
+                claim_once_free(&store, dataset).await?.close().await?;
+            }
+            let mut reads = store.clone();
+            assert!(
+                TranCatBalanceRepository::find_all(&mut reads)
+                    .await?
+                    .is_empty(),
+                "the write after the loss reached the table"
+            );
+            Ok(())
+        })
     }
 
     /// `replace_all` on a session runs in a transaction of its own on the session's connection,
     /// while every other statement there commits on its own: a replacement that fails leaves the
     /// table as the session's last committed write left it and the session usable with its claim
     /// held, and one that succeeds is committed when the call returns.
-    #[tokio::test]
-    async fn a_session_replaces_a_table_in_a_transaction_of_its_own() -> TestResult {
-        let guard = start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let mut reads = store.clone();
-        let mut session = store.session().await?;
-        assert!(session.claim_writer(Dataset::TranCatBalances).await?);
+    #[test]
+    fn a_session_replaces_a_table_in_a_transaction_of_its_own() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let mut reads = store.clone();
+            let mut session = store.session().await?;
+            assert!(session.claim_writer(Dataset::TranCatBalances).await?);
 
-        let kept = balance(1)?;
-        let replacement = balance(2)?;
-        TranCatBalanceRepository::insert(&mut session, &kept).await?;
-        assert_eq!(
-            TranCatBalanceRepository::find_all(&mut reads).await?,
-            [kept.clone()],
-            "an insert on the session commits on its own"
-        );
-        let duplicate = TranCatBalanceRepository::replace_all(
-            &mut session,
-            &[replacement.clone(), replacement.clone()],
-        )
-        .await;
-        assert!(
-            matches!(duplicate, Err(PersistenceError::Duplicate { .. })),
-            "{duplicate:?}"
-        );
-        assert_eq!(
-            TranCatBalanceRepository::find_all(&mut reads).await?,
-            [kept],
-            "a failed replacement rolls back"
-        );
-        assert_eq!(
-            TranCatBalanceRepository::replace_all(&mut session, &[replacement.clone()]).await?,
-            1
-        );
-        assert_eq!(
-            TranCatBalanceRepository::find_all(&mut reads).await?,
-            [replacement]
-        );
-        let mut contender = store.session().await?;
-        assert!(
-            !contender.claim_writer(Dataset::TranCatBalances).await?,
-            "the claim outlasts the session's transactions"
-        );
-        contender.close().await?;
-        session.close().await?;
-        Ok(())
+            let kept = balance(1)?;
+            let replacement = balance(2)?;
+            TranCatBalanceRepository::insert(&mut session, &kept).await?;
+            assert_eq!(
+                TranCatBalanceRepository::find_all(&mut reads).await?,
+                [kept.clone()],
+                "an insert on the session commits on its own"
+            );
+            let duplicate = TranCatBalanceRepository::replace_all(
+                &mut session,
+                &[replacement.clone(), replacement.clone()],
+            )
+            .await;
+            assert!(
+                matches!(duplicate, Err(PersistenceError::Duplicate { .. })),
+                "{duplicate:?}"
+            );
+            assert_eq!(
+                TranCatBalanceRepository::find_all(&mut reads).await?,
+                [kept],
+                "a failed replacement rolls back"
+            );
+            assert_eq!(
+                TranCatBalanceRepository::replace_all(&mut session, &[replacement.clone()]).await?,
+                1
+            );
+            assert_eq!(
+                TranCatBalanceRepository::find_all(&mut reads).await?,
+                [replacement]
+            );
+            let mut contender = store.session().await?;
+            assert!(
+                !contender.claim_writer(Dataset::TranCatBalances).await?,
+                "the claim outlasts the session's transactions"
+            );
+            contender.close().await?;
+            session.close().await?;
+            Ok(())
+        })
     }
 
     /// The records of `app/data/ASCII/<file>`, read in place and decoded by codec A.

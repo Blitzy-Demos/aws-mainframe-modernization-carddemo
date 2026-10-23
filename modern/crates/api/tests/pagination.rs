@@ -58,6 +58,15 @@ use tower::ServiceExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// An endpoint number and a request that endpoint must refuse.
 type Refused = (u8, Request<Body>);
 
@@ -66,7 +75,7 @@ type Refused = (u8, Request<Body>);
 type Unreadable = (u8, Request<Body>, &'static str);
 
 /// The HS256 secret of the test state: a local-only value.
-const SECRET: &str = "pagination-test-secret";
+const SECRET: &str = "pagination-local-only-test-signing-secret";
 
 /// The `dailytran.txt` records seeded into `transactions`: more than COTRN00C's ten rows.
 const SEEDED_TRANSACTIONS: usize = 12;
@@ -377,6 +386,8 @@ async fn seed_authorizations(store: &mut PgStore) -> TestResult {
     let account = PicS::new(AUTH_ACCOUNT)?;
     let amount = Decimal::new(1_000, 2);
     let mut summary = PendingAuthSummaryRecord::initialized(account, PicU::new(AUTH_CUSTOMER)?);
+    // TRUNCATION: checked, never lossy. `SEEDED_DETAILS` is 6, which `i16` holds; a refusal is
+    // a test failure, never a wrapped count.
     summary.approved_auth_cnt = Count::new(i16::try_from(SEEDED_DETAILS)?);
     summary.approved_auth_amt = Money::new(amount * Decimal::from(SEEDED_DETAILS))?;
     PendingAuthSummaryRepository::insert(store, &summary).await?;
@@ -431,132 +442,138 @@ fn approved_detail(
 /// program. Endpoint 25 receives each as a JSON number where the text is one (`1.5` and the
 /// integers beyond `i64` included) and as a JSON string otherwise, and also, as raw body text,
 /// an unquoted integer of 310 digits either way, beyond the range the JSON parser represents.
-#[tokio::test]
-async fn out_of_range_page_size_is_422() -> TestResult {
-    let harness = Harness::start().await?;
-    for endpoint in &COLLECTIONS {
-        for size in [
-            "101",
-            "0",
-            "-1",
-            "9223372036854775807",
-            "9223372036854775808",
-            "99999999999999999999",
-            "-9223372036854775809",
-            "abc",
-            "",
-            "1.5",
-        ] {
-            let (status, body) = harness.collection(endpoint, Some(size)).await?;
-            let number = endpoint.number;
+#[test]
+fn out_of_range_page_size_is_422() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        for endpoint in &COLLECTIONS {
+            for size in [
+                "101",
+                "0",
+                "-1",
+                "9223372036854775807",
+                "9223372036854775808",
+                "99999999999999999999",
+                "-9223372036854775809",
+                "abc",
+                "",
+                "1.5",
+            ] {
+                let (status, body) = harness.collection(endpoint, Some(size)).await?;
+                let number = endpoint.number;
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "endpoint {number}, page_size {size}"
+                );
+                let message = body.get("message").and_then(Value::as_str);
+                assert!(
+                    message.is_some_and(|text| !text.is_empty()),
+                    "endpoint {number}, page_size {size}: no message"
+                );
+                assert_eq!(
+                    message,
+                    Some(PAGE_SIZE_MESSAGE),
+                    "endpoint {number}, page_size {size}"
+                );
+                assert_eq!(
+                    body.get("field").and_then(Value::as_str),
+                    Some(PAGE_SIZE_FIELD),
+                    "endpoint {number}, page_size {size}"
+                );
+            }
+        }
+        let nines = "9".repeat(310);
+        for (sign, size) in [("+", nines.clone()), ("-", format!("-{nines}"))] {
+            let (status, body) = harness.send(harness.raw_list_action(&size)?).await?;
             assert_eq!(
-                status,
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "endpoint {number}, page_size {size}"
-            );
-            let message = body.get("message").and_then(Value::as_str);
-            assert!(
-                message.is_some_and(|text| !text.is_empty()),
-                "endpoint {number}, page_size {size}: no message"
-            );
-            assert_eq!(
-                message,
-                Some(PAGE_SIZE_MESSAGE),
-                "endpoint {number}, page_size {size}"
-            );
-            assert_eq!(
-                body.get("field").and_then(Value::as_str),
-                Some(PAGE_SIZE_FIELD),
-                "endpoint {number}, page_size {size}"
+                (
+                    status,
+                    body.get("message").and_then(Value::as_str),
+                    body.get("field").and_then(Value::as_str)
+                ),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Some(PAGE_SIZE_MESSAGE),
+                    Some(PAGE_SIZE_FIELD)
+                ),
+                "endpoint 25, page_size {sign} 310 nines unquoted"
             );
         }
-    }
-    let nines = "9".repeat(310);
-    for (sign, size) in [("+", nines.clone()), ("-", format!("-{nines}"))] {
-        let (status, body) = harness.send(harness.raw_list_action(&size)?).await?;
-        assert_eq!(
-            (
-                status,
-                body.get("message").and_then(Value::as_str),
-                body.get("field").and_then(Value::as_str)
-            ),
-            (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Some(PAGE_SIZE_MESSAGE),
-                Some(PAGE_SIZE_FIELD)
-            ),
-            "endpoint 25, page_size {sign} 310 nines unquoted"
-        );
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// 100 and 1, the bounds, and the request without `page_size`, the only one a screen sends: 200,
 /// and a page of the smaller of the size and the rows stored, within the map's positions. The
 /// request without the member reads the screen size, so cards, transactions, users and
 /// authorizations, which store more rows than one screen shows, return exactly one screen.
-#[tokio::test]
-async fn in_range_and_default_page_sizes_succeed() -> TestResult {
-    let harness = Harness::start().await?;
-    for endpoint in &COLLECTIONS {
-        let number = endpoint.number;
-        assert!(
-            endpoint.stored >= endpoint.screen_rows,
-            "endpoint {number}: the test database must fill one screen"
-        );
-        for (page_size, requested) in [
-            (Some("100"), MAX_ROWS),
-            (Some("1"), 1),
-            (None, endpoint.screen_rows),
-        ] {
-            let (status, body) = harness.collection(endpoint, page_size).await?;
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "endpoint {number}, page_size {page_size:?}"
+#[test]
+fn in_range_and_default_page_sizes_succeed() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        for endpoint in &COLLECTIONS {
+            let number = endpoint.number;
+            assert!(
+                endpoint.stored >= endpoint.screen_rows,
+                "endpoint {number}: the test database must fill one screen"
             );
-            assert_eq!(
-                filled_rows(&body),
-                Some(endpoint.expected_rows(requested)),
-                "endpoint {number}, page_size {page_size:?}: rows on the page"
-            );
+            for (page_size, requested) in [
+                (Some("100"), MAX_ROWS),
+                (Some("1"), 1),
+                (None, endpoint.screen_rows),
+            ] {
+                let (status, body) = harness.collection(endpoint, page_size).await?;
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "endpoint {number}, page_size {page_size:?}"
+                );
+                assert_eq!(
+                    filled_rows(&body),
+                    Some(endpoint.expected_rows(requested)),
+                    "endpoint {number}, page_size {page_size:?}: rows on the page"
+                );
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// No other refusal is a 422. On a collection endpoint, with a valid `page_size`, another member
 /// that does not deserialise is the request layer's 400 with no field, and a program edit or a
 /// member rule is the program's 400; and the endpoints that are no collection, 4, 12 and 18,
 /// ignore a `page_size` and refuse bad keys with 400 or 404.
-#[tokio::test]
-async fn status_422_is_used_for_nothing_else() -> TestResult {
-    let harness = Harness::start().await?;
-    for (number, request, refusal) in unreadable_requests(&harness)? {
-        let (status, body) = harness.send(request).await?;
-        assert_eq!(
-            (
+#[test]
+fn status_422_is_used_for_nothing_else() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        for (number, request, refusal) in unreadable_requests(&harness)? {
+            let (status, body) = harness.send(request).await?;
+            assert_eq!(
+                (
+                    status,
+                    body.get("message").and_then(Value::as_str),
+                    body.get("field")
+                ),
+                (StatusCode::BAD_REQUEST, Some(refusal), None),
+                "endpoint {number}: unreadable member"
+            );
+        }
+        for (number, request) in edit_failures(&harness)? {
+            let (status, _) = harness.send(request).await?;
+            assert_eq!(
                 status,
-                body.get("message").and_then(Value::as_str),
-                body.get("field")
-            ),
-            (StatusCode::BAD_REQUEST, Some(refusal), None),
-            "endpoint {number}: unreadable member"
-        );
-    }
-    for (number, request) in edit_failures(&harness)? {
-        let (status, _) = harness.send(request).await?;
-        assert_eq!(
-            status,
-            StatusCode::BAD_REQUEST,
-            "endpoint {number}: edit failure"
-        );
-    }
-    for (number, uri, expected) in non_collection_requests(&harness) {
-        let (status, _) = harness.send(harness.get(&uri)?).await?;
-        assert_eq!(status, expected, "endpoint {number}: {uri}");
-    }
-    Ok(())
+                StatusCode::BAD_REQUEST,
+                "endpoint {number}: edit failure"
+            );
+        }
+        for (number, uri, expected) in non_collection_requests(&harness) {
+            let (status, _) = harness.send(harness.get(&uri)?).await?;
+            assert_eq!(status, expected, "endpoint {number}: {uri}");
+        }
+        Ok(())
+    })
 }
 
 /// One request per collection endpoint whose query or body does not deserialise, each with an

@@ -49,6 +49,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgQueryResult;
 use test_support::fixtures::{fixture_path, load_fixtures};
 use test_support::postgres::start_postgres;
+use tokio::runtime::Builder;
 
 use Ty::{
     Char, Date, Identity, Numeric, Serial, Signed, SmallInt, Text, Timestamp, Unsigned, Varchar,
@@ -1864,21 +1865,23 @@ async fn db2_version_is_seeded_and_restricted(pool: &PgPool, store: &mut PgStore
 // audit: PIC-017
 // audit: PIC-023
 // audit: PIC-024
-#[tokio::test]
-async fn columns_follow_the_copybook_rules() {
-    let guard = start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let pool = guard.pool();
-    let mut failures = Vec::new();
-    check_inventory(pool, &mut failures).await;
-    check_columns(pool, &mut failures).await;
-    check_no_float_columns(pool, &mut failures).await;
-    assert!(
-        failures.is_empty(),
-        "the schema departs from the copybook column rules:\n{}",
-        failures.join("\n")
-    );
+#[test]
+fn columns_follow_the_copybook_rules() {
+    block_on(async {
+        let guard = start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let pool = guard.pool();
+        let mut failures = Vec::new();
+        check_inventory(pool, &mut failures).await;
+        check_columns(pool, &mut failures).await;
+        check_no_float_columns(pool, &mut failures).await;
+        assert!(
+            failures.is_empty(),
+            "the schema departs from the copybook column rules:\n{}",
+            failures.join("\n")
+        );
+    });
 }
 
 /// Keys, indexes and foreign keys follow the KSDS keys, the alternate indexes, the IMS hierarchy
@@ -1889,22 +1892,24 @@ async fn columns_follow_the_copybook_rules() {
 // audit: PIC-018
 // audit: PIC-019
 // audit: PIC-020
-#[tokio::test]
-async fn keys_indexes_and_checks_follow_the_sources() {
-    let guard = start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let pool = guard.pool();
-    let constraints = fetch_constraints(pool).await;
-    let mut failures = Vec::new();
-    check_keys(&constraints, &mut failures);
-    check_constraints(&constraints, &mut failures);
-    check_indexes(pool, &mut failures).await;
-    assert!(
-        failures.is_empty(),
-        "the keys and constraints depart from their sources:\n{}",
-        failures.join("\n")
-    );
+#[test]
+fn keys_indexes_and_checks_follow_the_sources() {
+    block_on(async {
+        let guard = start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let pool = guard.pool();
+        let constraints = fetch_constraints(pool).await;
+        let mut failures = Vec::new();
+        check_keys(&constraints, &mut failures);
+        check_constraints(&constraints, &mut failures);
+        check_indexes(pool, &mut failures).await;
+        assert!(
+            failures.is_empty(),
+            "the keys and constraints depart from their sources:\n{}",
+            failures.join("\n")
+        );
+    });
 }
 
 /// The declared constraints refuse what their pictures and sources refuse, through the
@@ -1916,18 +1921,20 @@ async fn keys_indexes_and_checks_follow_the_sources() {
 // audit: PIC-020
 // audit: CIPAUDTY-029
 // audit: CVTRA03Y-002
-#[tokio::test]
-async fn constraints_behave_as_declared() {
-    let guard = start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let pool = guard.pool();
-    let mut store = PgStore::new(pool.clone());
-    account_key_range_is_enforced(pool, &mut store).await;
-    summary_key_range_is_enforced(pool, &mut store).await;
-    detail_hierarchy_is_enforced(&mut store).await;
-    timestamp_layout_codes_are_enforced(pool).await;
-    db2_version_is_seeded_and_restricted(pool, &mut store).await;
+#[test]
+fn constraints_behave_as_declared() {
+    block_on(async {
+        let guard = start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let pool = guard.pool();
+        let mut store = PgStore::new(pool.clone());
+        account_key_range_is_enforced(pool, &mut store).await;
+        summary_key_range_is_enforced(pool, &mut store).await;
+        detail_hierarchy_is_enforced(&mut store).await;
+        timestamp_layout_codes_are_enforced(pool).await;
+        db2_version_is_seeded_and_restricted(pool, &mut store).await;
+    });
 }
 
 /// The nine loads, run through the harness, which issues the load subcommands' statements (each
@@ -1939,34 +1946,47 @@ async fn constraints_behave_as_declared() {
 /// `db2` holds exactly the migration 0006 seed.
 // audit: LOADS-020
 // audit: FIXLOAD-011
-#[tokio::test]
-async fn loads_issue_no_ddl_and_leave_the_other_tables_as_migrated() {
-    let guard = start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let pool = guard.pool();
-    let migrated = catalog_snapshot(pool).await;
-    let mut failures = Vec::new();
-    for run in [
-        "the loads on the migrated database",
-        "the loads on the loaded database",
-    ] {
-        load_fixtures(pool)
+#[test]
+fn loads_issue_no_ddl_and_leave_the_other_tables_as_migrated() {
+    block_on(async {
+        let guard = start_postgres()
             .await
-            .unwrap_or_else(|err| panic!("{run}: {err}"));
-        let loaded = catalog_snapshot(pool).await;
-        compare_sets(
-            &format!("{run}: catalog item"),
-            &migrated,
-            &loaded,
-            &mut failures,
+            .expect("start a migrated postgres:16 container");
+        let pool = guard.pool();
+        let migrated = catalog_snapshot(pool).await;
+        let mut failures = Vec::new();
+        for run in [
+            "the loads on the migrated database",
+            "the loads on the loaded database",
+        ] {
+            load_fixtures(pool)
+                .await
+                .unwrap_or_else(|err| panic!("{run}: {err}"));
+            let loaded = catalog_snapshot(pool).await;
+            compare_sets(
+                &format!("{run}: catalog item"),
+                &migrated,
+                &loaded,
+                &mut failures,
+            );
+            check_unloaded_tables(pool, run, &mut failures).await;
+            check_db2_seed(pool, run, &mut failures).await;
+        }
+        assert!(
+            failures.is_empty(),
+            "the loads changed the catalog or a table they do not load:\n{}",
+            failures.join("\n")
         );
-        check_unloaded_tables(pool, run, &mut failures).await;
-        check_db2_seed(pool, run, &mut failures).await;
-    }
-    assert!(
-        failures.is_empty(),
-        "the loads changed the catalog or a table they do not load:\n{}",
-        failures.join("\n")
-    );
+    });
+}
+
+/// Runs `test` to completion on a current-thread Tokio runtime of its own with every driver
+/// enabled, which stays current while the body's values drop, on unwinding too. The tests call it
+/// rather than take Tokio's test attribute, whose expansion suppresses lints.
+fn block_on<F: Future>(test: F) -> F::Output {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a current-thread Tokio runtime")
+        .block_on(test)
 }

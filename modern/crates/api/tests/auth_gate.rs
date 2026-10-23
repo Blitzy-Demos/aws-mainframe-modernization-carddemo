@@ -48,7 +48,7 @@ use tower::ServiceExt as _;
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
 /// The local-only signing secret of these tests.
-const SECRET: &str = "auth-gate-local-test-secret";
+const SECRET: &str = "auth-gate-local-only-test-signing-secret";
 
 /// The token lifetime the API is configured with: the default `CARDDEMO_JWT_TTL_SECONDS`.
 const TTL: u64 = 3_600;
@@ -1013,6 +1013,65 @@ fn undecodable_path_segments_are_a_json_400_after_the_gate() -> TestResult {
                 json!({ "message": INVALID_PATH }),
                 "{case}"
             );
+        }
+        Ok(())
+    })
+}
+
+/// A token signed with [`SECRET`] for `ADMIN001`, type `A`, issued now and valid for [`TTL`]
+/// seconds, whose `nbf` claim is `not_before`: a claim set sign-on never issues.
+fn not_before_token(not_before: u64) -> TestResult<String> {
+    let iat = jsonwebtoken::get_current_timestamp();
+    let exp = iat.checked_add(TTL).ok_or("a token lifetime beyond u64")?;
+    let claims = json!({
+        "sub": "ADMIN001",
+        "usr_type": "A",
+        "iat": iat,
+        "exp": exp,
+        "nbf": not_before,
+    });
+    Ok(jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(SECRET.as_bytes()),
+    )?)
+}
+
+/// n5, the not-before time: a correctly signed `A` token whose `nbf` is an hour ahead is refused
+/// by a `SignedOnUser` and an `AdminUser` operation with 401 and the sign-on text, and the same
+/// claims with an `nbf` a minute ago are served.
+#[test]
+fn a_token_before_its_not_before_time_is_401() -> TestResult {
+    block_on(async {
+        let pg = start_loaded_postgres().await?;
+        let api = api(&pg)?;
+        let now = jsonwebtoken::get_current_timestamp();
+        let ahead = now.checked_add(3_600).ok_or("an nbf beyond u64")?;
+        let ago = now.checked_sub(60).ok_or("an nbf before the epoch")?;
+        let not_yet_valid = bearer(&not_before_token(ahead)?);
+        let valid = bearer(&not_before_token(ago)?);
+        let uris = [
+            // audit: COMEN01C-002
+            "/api/v1/menus/main",
+            // audit: COADM01C-001
+            "/api/v1/menus/admin",
+        ];
+        for uri in uris {
+            let (status, response) =
+                call(&api, Method::GET, uri, None, Some(&not_yet_valid)).await?;
+            assert_eq!(status, 401, "GET {uri} with an nbf an hour ahead");
+            assert_eq!(
+                member(&response, "message"),
+                Some(SIGNON_REQUIRED),
+                "GET {uri} with an nbf an hour ahead"
+            );
+            assert_eq!(
+                response.get("field"),
+                None,
+                "GET {uri} with an nbf an hour ahead: no field"
+            );
+            let (status, _) = call(&api, Method::GET, uri, None, Some(&valid)).await?;
+            assert_eq!(status, 200, "GET {uri} with an nbf a minute ago");
         }
         Ok(())
     })

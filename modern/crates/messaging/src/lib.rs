@@ -22,6 +22,9 @@
 //!   and [`workers::cp00`].
 //! - [`error_body`]: the `MQ-ERR-DISPLAY` body that CDRD and CDRA publish to `CARD.DEMO.ERROR`.
 //! - [`ids`]: the new `message_id` of every CP00 reply.
+//! - `EventSite`, `event_metadata`, `event_metadata_with_target` and `emit`, crate-private at
+//!   the crate root: the events of every module, each written out as a static callsite and
+//!   emitted without a `tracing` event macro, whose expansion holds a lint suppression.
 //!
 //! # Layering
 //!
@@ -79,14 +82,22 @@ pub mod workers;
 
 use std::error::Error;
 use std::fmt;
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use domain::Clock;
 use lapin::Connection;
 use persistence::PgStore;
 use runtime::config::Config;
+use runtime::telemetry::event_enabled;
 use tokio::sync::watch;
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{self, FieldSet, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::broker::{AmqpError, Backoff, Session};
 use crate::workers::{Step, cdra, cdrd, cp00};
@@ -167,11 +178,18 @@ impl Stop {
         if self.is_requested() {
             return None;
         }
-        tokio::select! {
-            biased;
-            () = self.requested() => None,
-            output = wait => Some(output),
-        }
+        // Both futures are pinned on the heap, the pin that needs no pinning macro, and the stop
+        // is polled first at every wake-up, so a stop and an output that are ready together
+        // end the wait as the stop.
+        let mut requested = Box::pin(self.requested());
+        let mut wait = Box::pin(wait);
+        poll_fn(|cx| {
+            if requested.as_mut().poll(cx).is_ready() {
+                return Poll::Ready(None);
+            }
+            wait.as_mut().poll(cx).map(Some)
+        })
+        .await
     }
 }
 
@@ -280,22 +298,12 @@ pub async fn run(
                 // The reconnect delay grows only over consecutive failed attempts: a session
                 // whose workers opened starts the next outage from the poll interval again.
                 backoff.reset();
-                tracing::info!(
-                    cdrd = %config.queue_request_date,
-                    cdra = %config.queue_request_acct,
-                    cp00 = %config.queue_request_pauth,
-                    "the CDRD, CDRA and CP00 workers consume their request queues"
-                );
-                // Boxed: the three workers' futures together exceed the stack budget that
-                // `clippy::large_futures` allows, and would make every caller of `run` hold them.
-                Box::pin(workers.serve(&session, poll_interval, &stop)).await;
+                workers_consuming(config);
+                workers.serve(&session, poll_interval, &stop).await;
                 let reason = if stop.is_requested() {
                     STOP_CLOSE_TEXT
                 } else {
-                    tracing::error!(
-                        outcome = "connection lost",
-                        "the workers stopped because the AMQP connection is lost; reconnecting"
-                    );
+                    workers_connection_lost();
                     SESSION_CLOSE_TEXT
                 };
                 // Closed while the workers still hold their channels: the client closes a
@@ -312,22 +320,14 @@ pub async fn run(
                 error,
                 connection_lost: true,
             }) => {
-                tracing::error!(
-                    outcome = "connection lost",
-                    error = %error,
-                    "opening the workers failed because the AMQP connection is lost; reconnecting"
-                );
+                open_connection_lost(&error);
             }
             // A missing queue (404) or a refused channel on a live connection: the operator can
             // load the definitions or the broker free a channel, so the session is replaced
             // after the backoff, which keeps growing until the workers open. No queue is ever
             // declared here: the queues come only from `rabbitmq/definitions.json`.
             Err(OpenFailure { error, .. }) => {
-                tracing::error!(
-                    outcome = "open failed",
-                    error = %error,
-                    "opening the workers failed on the AMQP connection; reconnecting after backoff"
-                );
+                open_failed(&error);
             }
         }
         if stop.is_requested() {
@@ -366,11 +366,7 @@ async fn connect_first(
         Some(Ok(session)) => Ok(Some(session)),
         Some(Err(error)) if error.is_configuration() => Err(StartupError::Connect(error)),
         Some(Err(error)) => {
-            tracing::error!(
-                outcome = "connect failed",
-                error = %error,
-                "connecting to the AMQP broker failed; retrying after backoff"
-            );
+            connect_failed(&error);
             reconnect(amqp_url, backoff, stop).await
         }
     }
@@ -397,17 +393,13 @@ async fn reconnect(
         match stop.unless_requested(broker::connect(amqp_url)).await {
             None => return Ok(None),
             Some(Ok(session)) => {
-                tracing::info!("reconnected to the AMQP broker");
+                reconnected();
                 return Ok(Some(session));
             }
             Some(Err(error)) if error.is_configuration() => {
                 return Err(StartupError::Connect(error));
             }
-            Some(Err(error)) => tracing::error!(
-                outcome = "reconnect failed",
-                error = %error,
-                "reconnecting to the AMQP broker failed; retrying after backoff"
-            ),
+            Some(Err(error)) => reconnect_failed(&error),
         }
     }
 }
@@ -460,15 +452,61 @@ impl Workers {
     /// have stopped, each with its own copy of `stop`. The workers, and with them their
     /// channels, stay with the caller, which closes the session before it drops them.
     ///
-    /// `tokio::join!` polls every worker to its own end: a worker is never dropped while it
-    /// holds a request, as racing them would drop the losers wherever they stood.
+    /// Each worker's future is pinned on the heap with `Box::pin`, the pin that needs no pinning
+    /// macro, and one hand-written future polls every worker that has not yet ended at each
+    /// wake-up, all three before it decides, and ends only once all three have. A worker is
+    /// therefore polled to its own end and never dropped while it holds a request, as racing
+    /// them would drop the losers wherever they stood.
     async fn serve(&mut self, session: &Session, poll_interval: Duration, stop: &Stop) {
         let Self { cdrd, cdra, cp00 } = self;
-        tokio::join!(
-            serve_until_stopped(cdrd, session, poll_interval, stop.clone()),
-            serve_until_stopped(cdra, session, poll_interval, stop.clone()),
-            serve_until_stopped(cp00, session, poll_interval, stop.clone()),
-        );
+        let mut date = Some(Box::pin(serve_until_stopped(
+            cdrd,
+            session,
+            poll_interval,
+            stop.clone(),
+        )));
+        let mut account = Some(Box::pin(serve_until_stopped(
+            cdra,
+            session,
+            poll_interval,
+            stop.clone(),
+        )));
+        let mut authorization = Some(Box::pin(serve_until_stopped(
+            cp00,
+            session,
+            poll_interval,
+            stop.clone(),
+        )));
+        poll_fn(|cx| {
+            // Every result is computed before they are combined, so no worker misses a poll
+            // because another one is still running.
+            let date_ended = poll_to_end(&mut date, cx);
+            let account_ended = poll_to_end(&mut account, cx);
+            let authorization_ended = poll_to_end(&mut authorization, cx);
+            if date_ended && account_ended && authorization_ended {
+                Poll::Ready(())
+            } else {
+                Poll::Pending
+            }
+        })
+        .await;
+    }
+}
+
+/// Polls the future in `slot`, unless it has already ended, and empties the slot once it ends,
+/// so that an ended future is never polled again. Returns whether it has ended.
+fn poll_to_end<F: Future<Output = ()>>(
+    slot: &mut Option<Pin<Box<F>>>,
+    cx: &mut Context<'_>,
+) -> bool {
+    let Some(future) = slot.as_mut() else {
+        return true;
+    };
+    if future.as_mut().poll(cx).is_ready() {
+        *slot = None;
+        true
+    } else {
+        false
     }
 }
 
@@ -534,6 +572,228 @@ async fn serve_until_stopped<W: Step>(
     }
 }
 
+/// `INFO` once the workers of a session have opened, with the request queue each of them
+/// consumes, as `config` names it.
+fn workers_consuming(config: &Config) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "workers_consuming",
+        module_path!(),
+        Level::INFO,
+        &["message", "cdrd", "cdra", "cp00"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the CDRD, CDRA and CP00 workers consume their request queues"),
+            Some(&field::display(&config.queue_request_date)),
+            Some(&field::display(&config.queue_request_acct)),
+            Some(&field::display(&config.queue_request_pauth)),
+        ],
+    );
+}
+
+/// `ERROR` when the workers of a session stopped because its AMQP connection is lost.
+fn workers_connection_lost() {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "workers_connection_lost",
+        module_path!(),
+        Level::ERROR,
+        &["message", "outcome"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the workers stopped because the AMQP connection is lost; reconnecting"),
+            Some(&"connection lost"),
+        ],
+    );
+}
+
+/// `ERROR` when the workers cannot be opened because the AMQP connection is lost, with the
+/// `error`.
+fn open_connection_lost(error: &AmqpError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "open_connection_lost",
+        module_path!(),
+        Level::ERROR,
+        &["message", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"opening the workers failed because the AMQP connection is lost; reconnecting"),
+            Some(&"connection lost"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when the workers cannot be opened on a live AMQP connection, with the `error`.
+fn open_failed(error: &AmqpError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "open_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"opening the workers failed on the AMQP connection; reconnecting after backoff"),
+            Some(&"open failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when the first connection attempt failed, with the `error`.
+fn connect_failed(error: &AmqpError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "connect_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"connecting to the AMQP broker failed; retrying after backoff"),
+            Some(&"connect failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `INFO` when a reconnection attempt succeeded.
+fn reconnected() {
+    static SITE: EventSite<1> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reconnected",
+        module_path!(),
+        Level::INFO,
+        &["message"],
+        &SITE,
+    );
+    emit(&SITE, [Some(&"reconnected to the AMQP broker")]);
+}
+
+/// `ERROR` when a reconnection attempt failed, with the `error`.
+fn reconnect_failed(error: &AmqpError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reconnect_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"reconnecting to the AMQP broker failed; retrying after backoff"),
+            Some(&"reconnect failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// The callsite of one event of this crate, whose metadata names `N` fields, `message` first.
+///
+/// Every `tracing` event macro expands to an attribute that allows `unused_imports`, and no
+/// source of this workspace, generated source included, holds a lint suppression. An event of
+/// this crate is therefore written out as two statics, an `EventSite` and the
+/// [`event_metadata`] or [`event_metadata_with_target`] it holds, and emitted with [`emit`].
+/// All of them take the same `N`, so an event always carries exactly one value, or `None`, per
+/// field it declares.
+pub(crate) struct EventSite<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> EventSite<N> {
+    /// The callsite of the event that `metadata` describes.
+    pub(crate) const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the event `name` at `level`, with the field `names`, for the callsite `site`
+/// in the module `module_path`.
+///
+/// The target and the module path are both `module_path`, which a caller passes as
+/// `module_path!()` written in the emitting module: the target a `tracing` event macro gives an
+/// event, so `RUST_LOG` directives select the event exactly as they would select a macro's.
+pub(crate) const fn event_metadata<const N: usize>(
+    name: &'static str,
+    module_path: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    event_metadata_with_target(name, module_path, module_path, level, names, site)
+}
+
+/// [`event_metadata`] with the explicit `target` in place of the module path, which stays
+/// `module_path`: for an event that names its own target, such as an alert with
+/// `runtime::telemetry::ALERT_TARGET`.
+///
+/// No source file or line is given: the JSON output and the span export print neither.
+pub(crate) const fn event_metadata_with_target<const N: usize>(
+    name: &'static str,
+    target: &'static str,
+    module_path: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        target,
+        level,
+        None,
+        None,
+        Some(module_path),
+        FieldSet::new(names, Identifier(&site.0)),
+        Kind::EVENT,
+    )
+}
+
+/// Emits one event of `site` in the current span with `values`, one per field the site names
+/// and in that order, a `None` leaving its field out, when the current subscriber enables it.
+///
+/// The decision is `runtime::telemetry::event_enabled`, which takes the steps an event macro
+/// takes, so the level filters, the JSON layer and the span export treat the event exactly as
+/// they treat a macro's.
+pub(crate) fn emit<const N: usize>(site: &'static EventSite<N>, values: [Option<&dyn Value>; N]) {
+    let callsite = &site.0;
+    if !event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+}
+
+/// A current-thread runtime with every driver enabled, the runtime an async test attribute
+/// would build, made here so that no test macro expands into a lint suppression or an
+/// unchecked pin. Every async unit test of the crate runs its body on one with `block_on`.
+#[cfg(test)]
+fn current_thread() -> tokio::runtime::Runtime {
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => panic!("a current-thread runtime does not build: {error}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
@@ -545,11 +805,13 @@ mod tests {
     use lapin::types::ShortString;
     use persistence::PgStore;
     use runtime::config::Config;
+    use test_support::trace_capture;
 
-    use super::{StartupError, Stop, StopHandle, run};
+    use super::{StartupError, Stop, StopHandle, reconnect_failed, run};
     use crate::broker::{
         AmqpError, DEAD_LETTER_QUEUE, Fault, PublishFailure, QueueCheck, QueueLabel,
     };
+    use crate::current_thread;
     use crate::workers::StepError;
 
     /// Accepts only a value whose type is `Send`.
@@ -563,35 +825,62 @@ mod tests {
         };
     }
 
-    #[tokio::test]
-    async fn a_stop_ends_only_the_waits_that_may_be_abandoned() {
-        let handle = StopHandle::new();
-        let mut stop = handle.subscribe();
-        assert!(!stop.is_requested());
-        assert_eq!(stop.unless_requested(async { 7 }).await, Some(7));
+    #[test]
+    fn a_stop_ends_only_the_waits_that_may_be_abandoned() {
+        current_thread().block_on(async {
+            let handle = StopHandle::new();
+            let mut stop = handle.subscribe();
+            assert!(!stop.is_requested());
+            assert_eq!(stop.unless_requested(async { 7 }).await, Some(7));
 
-        let mut waiting = stop.clone();
-        let forever = std::future::pending::<()>();
-        let pending = tokio::spawn(async move { waiting.unless_requested(forever).await });
-        handle.request();
-        let ended = pending.await.ok();
-        assert_eq!(ended, Some(None), "a pending wait ends at the stop");
-        assert!(stop.is_requested());
-        assert_eq!(stop.unless_requested(async { 7 }).await, None);
-        handle.request();
-        assert!(stop.is_requested(), "requesting again changes nothing");
+            let mut waiting = stop.clone();
+            let forever = std::future::pending::<()>();
+            let pending = tokio::spawn(async move { waiting.unless_requested(forever).await });
+            handle.request();
+            let ended = pending.await.ok();
+            assert_eq!(ended, Some(None), "a pending wait ends at the stop");
+            assert!(stop.is_requested());
+            assert_eq!(stop.unless_requested(async { 7 }).await, None);
+            handle.request();
+            assert!(stop.is_requested(), "requesting again changes nothing");
+        });
     }
 
-    #[tokio::test]
-    async fn dropping_every_stop_handle_requests_the_stop() {
-        let handle = StopHandle::default();
-        let mut stop = handle.subscribe();
-        let copy = stop.clone();
-        drop(handle);
-        assert!(stop.is_requested());
-        assert!(copy.is_requested());
-        stop.requested().await;
-        assert_eq!(stop.unless_requested(async { 7 }).await, None);
+    #[test]
+    fn dropping_every_stop_handle_requests_the_stop() {
+        current_thread().block_on(async {
+            let handle = StopHandle::default();
+            let mut stop = handle.subscribe();
+            let copy = stop.clone();
+            drop(handle);
+            assert!(stop.is_requested());
+            assert!(copy.is_requested());
+            stop.requested().await;
+            assert_eq!(stop.unless_requested(async { 7 }).await, None);
+        });
+    }
+
+    #[test]
+    fn an_emitted_event_has_its_module_as_target_and_its_fields_in_declared_order() {
+        let capture = trace_capture::capture();
+        reconnect_failed(&AmqpError::InvalidUrl);
+
+        let lines = capture.lines();
+        let [line] = lines.as_slice() else {
+            panic!("expected exactly one event line, got {lines:?}");
+        };
+        // The target a `tracing` event macro in this module would have given the event.
+        for member in [
+            r#""level":"ERROR""#,
+            r#""target":"messaging""#,
+            concat!(
+                r#""fields":{"message":"reconnecting to the AMQP broker failed; retrying after "#,
+                r#"backoff","outcome":"reconnect failed","error":"the AMQP URL "#,
+                r#"(CARDDEMO_AMQP_URL) is not valid"}"#
+            ),
+        ] {
+            assert!(line.contains(member), "{member} missing from {line}");
+        }
     }
 
     #[test]

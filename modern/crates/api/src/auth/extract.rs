@@ -5,8 +5,14 @@
 //! `CDEMO-USER-ID PIC X(08)` and `CDEMO-USER-TYPE PIC X(01)`, with the 88-levels
 //! `CDEMO-USRTYP-ADMIN VALUE 'A'` and `CDEMO-USRTYP-USER VALUE 'U'` (COCOM01Y-005,
 //! COCOM01Y-006). COSGN00C sets it after the password check (COSGN00C-014), and no program takes
-//! it from screen input. A menu started without a COMMAREA (`EIBCALEN = 0`) returns to the
-//! sign-on screen with no message of its own (`COMEN01C.cbl:82-84`, `COADM01C.cbl:86-88`).
+//! it from screen input. A menu started without a COMMAREA (`EIBCALEN = 0`) has no single
+//! result: `MAIN-PARA` moves `'COSGN00C'` into `CDEMO-FROM-PROGRAM`, while
+//! `RETURN-TO-SIGNON-SCREEN` tests and transfers to `CDEMO-TO-PROGRAM`, which nothing on that
+//! path sets. The target is COSGN00C only when that field's initial storage is low-values or
+//! spaces, and otherwise whatever program its bytes name (`COMEN01C.cbl:82-84,196-203`,
+//! `COADM01C.cbl:86-88,163-170`). That transfer is halted, COMEN01C-003 as
+//! HALTED(X-COMEN01C-2) and COADM01C-002 as HALTED(X-COADM01C-H1), and this module reproduces
+//! none of it.
 //!
 //! The replacement:
 //!
@@ -48,10 +54,13 @@ use crate::error::ScreenError;
 
 /// The message of the 401 every endpoint except sign-on answers when the request carries no
 /// valid token: no `Authorization` header, a malformed one, a bad signature, another algorithm,
-/// an expired token or claims that hold no user ID and user type.
+/// an expired token, a token that is not yet valid (its `nbf` in the future) or claims that hold
+/// no user ID and user type.
 ///
-/// A fixed text of this crate, not a COBOL literal: a program started without a COMMAREA returns
-/// to the sign-on screen without a message (COMEN01C-002). It names no token, header or claim.
+/// A fixed text of this crate, not a COBOL literal. The 401 and this text are this replacement's
+/// identity gate (AAP 0.5.1, n5; COMEN01C-002), not a reproduction of a program started without
+/// a COMMAREA, whose transfer target is halted (X-COMEN01C-2, X-COADM01C-H1). It names no
+/// token, header or claim.
 pub const SIGNON_REQUIRED: &str = "Sign-on required. Please sign on ...";
 
 /// The message of the 403 every admin endpoint answers to a valid token whose user type is not
@@ -190,6 +199,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as StdError;
+
     use axum::Router;
     use axum::body::Body;
     use axum::extract::{FromRef, FromRequestParts};
@@ -206,6 +217,8 @@ mod tests {
     use super::{ADMIN_REQUIRED, AdminUser, SIGNON_REQUIRED, SignedOnUser};
     use crate::auth::jwt::{Claims, JwtKeys};
     use crate::error::ScreenError;
+
+    type TestResult = Result<(), Box<dyn StdError>>;
 
     /// A test-only signing secret.
     const SECRET: &str = "extract-unit-test-key";
@@ -291,74 +304,94 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_valid_token_yields_its_commarea_identity() {
-        // audit: COSGN00C-014
-        let admin_user = signed_on(&[bearer(&token("ADMIN001", &UserType::ADMIN))])
-            .await
-            .expect("a signed-on admin");
-        assert_eq!(admin_user.user_id, PicX::from_array(*b"ADMIN001"));
-        assert_eq!(admin_user.user_type, UserType::ADMIN);
-        assert!(admin_user.is_admin());
-
-        let user = signed_on(&[bearer(&token("USER0001", &UserType::USER))])
-            .await
-            .expect("a signed-on user");
-        assert_eq!(user.user_id, user_id("USER0001"));
-        assert_eq!(user.user_type, UserType::USER);
-        assert!(!user.is_admin());
-
-        // A short user ID loses its pad spaces in `sub` and gets them back here.
-        let short = signed_on(&[bearer(&token("USER1", &UserType::USER))])
-            .await
-            .expect("a signed-on user");
-        assert_eq!(short.user_id, PicX::from_array(*b"USER1   "));
+    /// Runs `test` to completion on a current-thread runtime with I/O and time enabled, the
+    /// runtime tokio's test attribute builds. It is built here because that attribute's expansion
+    /// carries lint-suppression attributes, an `expect` and unchecked pinning, which R15 admits
+    /// nowhere; a runtime that cannot be built fails the test with its error, never a panic.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
-    #[tokio::test]
-    async fn the_scheme_matches_in_any_ascii_case() {
-        let token = token("ADMIN001", &UserType::ADMIN);
-        for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
-            let value = HeaderValue::from_str(&format!("{scheme} {token}")).expect("a header");
-            let user = signed_on(&[value]).await.expect(scheme);
-            assert_eq!(user.user_id, user_id("ADMIN001"), "{scheme}");
-        }
-    }
+    #[test]
+    fn a_valid_token_yields_its_commarea_identity() -> TestResult {
+        block_on(async {
+            // audit: COSGN00C-014
+            let admin_user = signed_on(&[bearer(&token("ADMIN001", &UserType::ADMIN))])
+                .await
+                .expect("a signed-on admin");
+            assert_eq!(admin_user.user_id, PicX::from_array(*b"ADMIN001"));
+            assert_eq!(admin_user.user_type, UserType::ADMIN);
+            assert!(admin_user.is_admin());
 
-    #[tokio::test]
-    async fn the_admin_gate_passes_type_a_only() {
-        // audit: COADM01C-001
-        let passed = admin(&[bearer(&token("ADMIN001", &UserType::ADMIN))])
-            .await
-            .expect("an admin");
-        assert_eq!(
-            passed,
-            AdminUser(SignedOnUser {
-                user_id: user_id("ADMIN001"),
-                user_type: UserType::ADMIN,
-            })
-        );
-
-        // `U`, and every other stored type, is signed on but is no administrator.
-        for code in [b'U', b' ', b'a', b'X'] {
-            let kind = user_type(code);
-            let sent = token("USER0001", &kind);
-            let user = signed_on(&[bearer(&sent)]).await.expect("a signed-on user");
-            assert_eq!(user.user_type, kind);
+            let user = signed_on(&[bearer(&token("USER0001", &UserType::USER))])
+                .await
+                .expect("a signed-on user");
+            assert_eq!(user.user_id, user_id("USER0001"));
+            assert_eq!(user.user_type, UserType::USER);
             assert!(!user.is_admin());
 
-            let rejection = admin(&[bearer(&sent)])
+            // A short user ID loses its pad spaces in `sub` and gets them back here.
+            let short = signed_on(&[bearer(&token("USER1", &UserType::USER))])
                 .await
-                .expect_err("refused by the gate");
-            assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
-            assert_eq!(rejection.message(), ADMIN_REQUIRED);
-            assert_eq!(rejection.field(), None);
-            assert!(!rejection.to_string().contains(&sent));
-        }
+                .expect("a signed-on user");
+            assert_eq!(short.user_id, PicX::from_array(*b"USER1   "));
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn every_request_without_a_valid_token_is_401_on_both_extractors() {
+    #[test]
+    fn the_scheme_matches_in_any_ascii_case() -> TestResult {
+        block_on(async {
+            let token = token("ADMIN001", &UserType::ADMIN);
+            for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
+                let value = HeaderValue::from_str(&format!("{scheme} {token}")).expect("a header");
+                let user = signed_on(&[value]).await.expect(scheme);
+                assert_eq!(user.user_id, user_id("ADMIN001"), "{scheme}");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn the_admin_gate_passes_type_a_only() -> TestResult {
+        block_on(async {
+            // audit: COADM01C-001
+            let passed = admin(&[bearer(&token("ADMIN001", &UserType::ADMIN))])
+                .await
+                .expect("an admin");
+            assert_eq!(
+                passed,
+                AdminUser(SignedOnUser {
+                    user_id: user_id("ADMIN001"),
+                    user_type: UserType::ADMIN,
+                })
+            );
+
+            // `U`, and every other stored type, is signed on but is no administrator.
+            for code in [b'U', b' ', b'a', b'X'] {
+                let kind = user_type(code);
+                let sent = token("USER0001", &kind);
+                let user = signed_on(&[bearer(&sent)]).await.expect("a signed-on user");
+                assert_eq!(user.user_type, kind);
+                assert!(!user.is_admin());
+
+                let rejection = admin(&[bearer(&sent)])
+                    .await
+                    .expect_err("refused by the gate");
+                assert_eq!(rejection.status(), StatusCode::FORBIDDEN);
+                assert_eq!(rejection.message(), ADMIN_REQUIRED);
+                assert_eq!(rejection.field(), None);
+                assert!(!rejection.to_string().contains(&sent));
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn every_request_without_a_valid_token_is_401_on_both_extractors() -> TestResult {
         let valid = token("ADMIN001", &UserType::ADMIN);
         let expired_at = now()
             .checked_sub(TTL.checked_add(1).expect("a small offset"))
@@ -451,12 +484,15 @@ mod tests {
             (case, vec![bearer(&sent)], sent)
         }));
 
-        for (case, values, sent) in &cases {
-            let rejection = signed_on(values).await.expect_err(case);
-            assert_signon_required(&rejection, sent, case);
-            let rejection = admin(values).await.expect_err(case);
-            assert_signon_required(&rejection, sent, case);
-        }
+        block_on(async {
+            for (case, values, sent) in &cases {
+                let rejection = signed_on(values).await.expect_err(case);
+                assert_signon_required(&rejection, sent, case);
+                let rejection = admin(values).await.expect_err(case);
+                assert_signon_required(&rejection, sent, case);
+            }
+            Ok(())
+        })
     }
 
     /// An application state other than `JwtKeys` itself, as `api::app::AppState` is.
@@ -505,38 +541,41 @@ mod tests {
         serde_json::from_slice(body).expect("a JSON body")
     }
 
-    #[tokio::test]
-    async fn the_rejections_become_screen_error_responses() {
-        let admin_token = token("ADMIN001", &UserType::ADMIN);
-        let user_token = token("USER0001", &UserType::USER);
+    #[test]
+    fn the_rejections_become_screen_error_responses() -> TestResult {
+        block_on(async {
+            let admin_token = token("ADMIN001", &UserType::ADMIN);
+            let user_token = token("USER0001", &UserType::USER);
 
-        let (status, body) = call("/admin", Some(bearer(&admin_token))).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, b"ADMIN001");
-        let (status, body) = call("/menu", Some(bearer(&user_token))).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, b"USER0001");
+            let (status, body) = call("/admin", Some(bearer(&admin_token))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"ADMIN001");
+            let (status, body) = call("/menu", Some(bearer(&user_token))).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, b"USER0001");
 
-        let (status, body) = call("/admin", Some(bearer(&user_token))).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert_eq!(json_body(&body), json!({ "message": ADMIN_REQUIRED }));
+            let (status, body) = call("/admin", Some(bearer(&user_token))).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(json_body(&body), json!({ "message": ADMIN_REQUIRED }));
 
-        for path in ["/admin", "/menu"] {
-            let (status, body) = call(path, None).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-            assert_eq!(
-                json_body(&body),
-                json!({ "message": SIGNON_REQUIRED }),
-                "{path}"
-            );
+            for path in ["/admin", "/menu"] {
+                let (status, body) = call(path, None).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+                assert_eq!(
+                    json_body(&body),
+                    json!({ "message": SIGNON_REQUIRED }),
+                    "{path}"
+                );
 
-            let (status, body) = call(path, Some(bearer(ALG_NONE))).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-            assert_eq!(
-                json_body(&body),
-                json!({ "message": SIGNON_REQUIRED }),
-                "{path}"
-            );
-        }
+                let (status, body) = call(path, Some(bearer(ALG_NONE))).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
+                assert_eq!(
+                    json_body(&body),
+                    json!({ "message": SIGNON_REQUIRED }),
+                    "{path}"
+                );
+            }
+            Ok(())
+        })
     }
 }

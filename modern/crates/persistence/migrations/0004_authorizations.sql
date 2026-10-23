@@ -122,8 +122,12 @@ CREATE TABLE pending_auth_details (
     fraud_rpt_date         CHAR(8)       COLLATE "C" NOT NULL,
     filler                 CHAR(17)      COLLATE "C" NOT NULL,
     PRIMARY KEY (acct_id, auth_date_9c, auth_time_9c),
-    -- IMS deletes child segments with their parent, and CBPAUP0C deletes a summary left without
-    -- authorizations [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:156-157,328-338]. The
+    -- IMS deletes child segments with their parent. CBPAUP0C deletes a summary whose approved
+    -- count as read, less one for each expired approval it deletes in that run, is 0 or less; the
+    -- test names the approved count twice and the declined count never (CBPAUP0C-016,
+    -- X-CBPAUP0J-2), and every detail still under the summary, declined or approved and however
+    -- recent, goes with it
+    -- [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:156-158,284-293,328-338]. The
     -- primary key's leading acct_id serves this key, so no further index exists.
     CONSTRAINT pending_auth_details_summary_fk FOREIGN KEY (acct_id)
         REFERENCES pending_auth_summaries (acct_id) ON DELETE CASCADE

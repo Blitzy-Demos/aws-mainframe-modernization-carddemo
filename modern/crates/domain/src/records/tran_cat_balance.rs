@@ -17,7 +17,9 @@ use crate::money::Money;
 const _: () = assert!(11 + 2 + 4 + 11 + 22 == TranCatBalanceRecord::WIDTH);
 
 /// One balance per account, transaction type and transaction category: `TRAN-CAT-BAL-RECORD`
-/// of `CVTRA01Y`, read and rewritten by CBTRN02C and CBACT04C.
+/// of `CVTRA01Y`. CBTRN02C (POSTTRAN) reads, creates and rewrites these balances
+/// (`CBTRN02C.cbl:474,510,528`); CBACT04C (INTCALC) only reads them, as the input of its
+/// interest calculation (`CBACT04C.cbl:236,326`).
 ///
 /// The group `TRAN-CAT-KEY` is the first three fields, the leading 17 bytes: the KSDS key
 /// `KEYS(17 0)` (`TCATBALF.jcl:40`) and the primary key (`acct_id`, `tran_type_cd`,

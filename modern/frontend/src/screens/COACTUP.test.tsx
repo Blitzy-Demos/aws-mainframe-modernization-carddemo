@@ -1,3 +1,4 @@
+import process from "node:process";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
@@ -1816,6 +1817,101 @@ describe("COACTUP in the route table: a 401 ends the session", { timeout: TEST_T
       router.dispose();
     },
   );
+});
+
+/**
+ * Renders the screen at its route in a data router, as the application mounts every screen
+ * (`createBrowserRouter`), with `state` as the route state the caller set. A data router refuses
+ * a target off the application's origin by rejecting the promise `navigate` returns, where
+ * `MemoryRouter` throws instead. A path no route names reaches the catch-all stub. Returns the
+ * router, whose location the test reads.
+ */
+function renderInDataRouter(state: { from: string }): ReturnType<typeof createMemoryRouter> {
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const router = createMemoryRouter(
+    [
+      { path: PATHS.COACTUP, element: <COACTUP /> },
+      { path: PATHS.COMEN01, element: <Arrived name="COMEN01" /> },
+      { path: PATHS.COACTVW, element: <Arrived name="COACTVW" /> },
+      { path: "*", element: <Arrived name="no screen" /> },
+    ],
+    { initialEntries: [{ pathname: PATHS.COACTUP, state }] },
+  );
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/**
+ * The rejections no handler took while `run` ran, and in the macrotask after it, by which time
+ * Node has reported every promise that settled rejected during `run`.
+ */
+async function unhandledRejectionsOf(run: () => Promise<void>): Promise<unknown[]> {
+  const rejections: unknown[] = [];
+  const collect = (reason: unknown): void => {
+    rejections.push(reason);
+  };
+  process.on("unhandledRejection", collect);
+  try {
+    await run();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    process.off("unhandledRejection", collect);
+  }
+  return rejections;
+}
+
+// The route state `from` is whatever the previous history entry holds, so F3 follows it only when
+// it names a screen. Any other value counts as no caller, and F3 opens the main menu, the only
+// screen that transfers here.
+describe("COACTUP F3 in a data router", { timeout: TEST_TIMEOUT_MS }, () => {
+  it.each([
+    { title: "the main menu's path", from: PATHS.COMEN01 },
+    { title: "a protocol-relative URL", from: "//evil.example.com/" },
+    { title: "a slash and a backslash", from: "/\\evil.example.com" },
+    { title: "a slash and two backslashes", from: "/\\\\evil.example.com" },
+    { title: "a javascript: URL", from: "javascript:alert(1)" },
+    { title: "a path no screen has", from: "/nowhere" },
+  ])(
+    "F3 with $title as route state from opens the main menu, with no unhandled rejection",
+    async ({ from }) => {
+      // audit: COACTUPC-005
+      stubApi();
+      const router = renderInDataRouter({ from });
+      const rejections = await unhandledRejectionsOf(async () => {
+        fireEvent.click(await screen.findByRole("button", { name: "F3=Exit" }));
+        expect(await screen.findByText("Arrived at COMEN01 from /accounts/update")).toBeDefined();
+      });
+
+      expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+      expect(rejections).toEqual([]);
+      expect(sent).toEqual([]);
+      router.dispose();
+    },
+  );
+
+  it("F3 opens the main menu when the router refuses the transfer to the caller", async () => {
+    // audit: COACTUPC-005
+    stubApi();
+    const router = renderInDataRouter({ from: PATHS.COACTVW });
+    const navigate = vi.spyOn(router, "navigate");
+    navigate.mockRejectedValueOnce(new Error("navigation refused"));
+    const rejections = await unhandledRejectionsOf(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "F3=Exit" }));
+      expect(await screen.findByText("Arrived at COMEN01 from /accounts/update")).toBeDefined();
+    });
+
+    expect(navigate.mock.calls.map(([to]) => to)).toEqual([PATHS.COACTVW, PATHS.COMEN01]);
+    expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+    expect(rejections).toEqual([]);
+    expect(sent).toEqual([]);
+    router.dispose();
+  });
 });
 
 /** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */

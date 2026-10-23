@@ -509,6 +509,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The fixture of the TCATBALF load, read in place (AAP 0.2.2).
     const TCATBAL: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -539,9 +548,10 @@ mod tests {
         })
     }
 
-    /// Code page 037 places the space below every other printable character, then the
-    /// specials, lower case, upper case and the digits last; every printable character has its
-    /// own weight, and any other byte weighs most.
+    /// The sampled bytes carry their code page 037 codes: the space, `-`, letters at the run
+    /// boundaries and digits. Punctuation sits between and among the letter runs (`~` at `0xA1`,
+    /// `{` at `0xC0`, `}` at `0xD0`, `\` at `0xE0`); the 95 printable characters weigh distinctly
+    /// below `0xFF`, the fallback weight of NUL, tab, DEL and every other non-printable byte.
     #[test]
     fn bytes_weigh_their_code_page_037_codes() {
         let cases = [
@@ -603,67 +613,71 @@ mod tests {
     // audit: CBTRN02C-016
     // audit: CBTRN02C-017
     // audit: CBTRN02C-019
-    #[tokio::test]
-    async fn keyed_read_write_and_rewrite_follow_2700_update_tcatbal() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let first = record(50, *b"01", 1, "-12.34")?;
-        let key = (first.acct_id, first.type_cd.clone(), first.cd);
+    #[test]
+    fn keyed_read_write_and_rewrite_follow_2700_update_tcatbal() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let first = record(50, *b"01", 1, "-12.34")?;
+            let key = (first.acct_id, first.type_cd.clone(), first.cd);
 
-        assert_eq!(store.find_by_id(key.0, &key.1, key.2).await?, None);
-        store.insert(&first).await?;
-        assert_eq!(
-            store.find_by_id(key.0, &key.1, key.2).await?,
-            Some(first.clone())
-        );
-        assert_eq!(store.insert(&first).await, Err(duplicate()));
+            assert_eq!(store.find_by_id(key.0, &key.1, key.2).await?, None);
+            store.insert(&first).await?;
+            assert_eq!(
+                store.find_by_id(key.0, &key.1, key.2).await?,
+                Some(first.clone())
+            );
+            assert_eq!(store.insert(&first).await, Err(duplicate()));
 
-        let mut rewritten = first.clone();
-        rewritten.bal = Money::new("999999999.99".parse::<Decimal>()?)?;
-        rewritten.filler = PicX::from_array(*b"FILLER BYTES KEPT 0000");
-        assert!(store.update(&rewritten).await?);
-        assert_eq!(
-            store.find_by_id(key.0, &key.1, key.2).await?,
-            Some(rewritten.clone())
-        );
-        let absent = record(50, *b"01", 2, "1.00")?;
-        assert!(!store.update(&absent).await?);
-        assert_eq!(
-            store
-                .find_by_id(absent.acct_id, &absent.type_cd, absent.cd)
-                .await?,
-            None
-        );
+            let mut rewritten = first.clone();
+            rewritten.bal = Money::new("999999999.99".parse::<Decimal>()?)?;
+            rewritten.filler = PicX::from_array(*b"FILLER BYTES KEPT 0000");
+            assert!(store.update(&rewritten).await?);
+            assert_eq!(
+                store.find_by_id(key.0, &key.1, key.2).await?,
+                Some(rewritten.clone())
+            );
+            let absent = record(50, *b"01", 2, "1.00")?;
+            assert!(!store.update(&absent).await?);
+            assert_eq!(
+                store
+                    .find_by_id(absent.acct_id, &absent.type_cd, absent.cd)
+                    .await?,
+                None
+            );
 
-        // Inside the caller's transaction: visible there, gone with its rollback.
-        let mut tx = store.begin().await?;
-        tx.insert(&absent).await?;
-        let mut updated = absent.clone();
-        updated.bal = Money::new("-999999999.99".parse::<Decimal>()?)?;
-        assert!(tx.update(&updated).await?);
-        assert_eq!(
-            tx.find_by_id(absent.acct_id, &absent.type_cd, absent.cd)
-                .await?,
-            Some(updated.clone())
-        );
-        assert_eq!(tx.find_all().await?, vec![rewritten.clone(), updated]);
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, vec![rewritten]);
-        Ok(())
+            // Inside the caller's transaction: visible there, gone with its rollback.
+            let mut tx = store.begin().await?;
+            tx.insert(&absent).await?;
+            let mut updated = absent.clone();
+            updated.bal = Money::new("-999999999.99".parse::<Decimal>()?)?;
+            assert!(tx.update(&updated).await?);
+            assert_eq!(
+                tx.find_by_id(absent.acct_id, &absent.type_cd, absent.cd)
+                    .await?,
+                Some(updated.clone())
+            );
+            assert_eq!(tx.find_all().await?, vec![rewritten.clone(), updated]);
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, vec![rewritten]);
+            Ok(())
+        })
     }
 
     // audit: CBACT04C-003
-    #[tokio::test]
-    async fn find_all_reads_in_ksds_key_order() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let expected = ksds_ordered()?;
-        for index in [3, 6, 0, 5, 2, 4, 1] {
-            let record = expected.get(index).ok_or("no such record")?;
-            store.insert(record).await?;
-        }
-        assert_eq!(store.find_all().await?, expected);
-        Ok(())
+    #[test]
+    fn find_all_reads_in_ksds_key_order() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let expected = ksds_ordered()?;
+            for index in [3, 6, 0, 5, 2, 4, 1] {
+                let record = expected.get(index).ok_or("no such record")?;
+                store.insert(record).await?;
+            }
+            assert_eq!(store.find_all().await?, expected);
+            Ok(())
+        })
     }
 
     // audit: LOADS-006
@@ -671,92 +685,96 @@ mod tests {
     // audit: LOADS-015
     // audit: LOADS-018
     // audit: LOADS-032
-    #[tokio::test]
-    async fn replace_all_loads_tcatbal_and_replaces_in_one_transaction() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let fixture: Vec<TranCatBalanceRecord> = decode_all(&std::fs::read(TCATBAL)?)?
-            .into_iter()
-            .map(|framed| framed.record)
-            .collect();
-        assert_eq!(fixture.len(), 50);
+    #[test]
+    fn replace_all_loads_tcatbal_and_replaces_in_one_transaction() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let fixture: Vec<TranCatBalanceRecord> = decode_all(&std::fs::read(TCATBAL)?)?
+                .into_iter()
+                .map(|framed| framed.record)
+                .collect();
+            assert_eq!(fixture.len(), 50);
 
-        // Freshly migrated, then loaded: the table holds the input set, FILLER kept.
-        for _ in 0..2 {
-            assert_eq!(store.replace_all(&fixture).await?, 50);
-            assert_eq!(store.find_all().await?, fixture);
-        }
+            // Freshly migrated, then loaded: the table holds the input set, FILLER kept.
+            for _ in 0..2 {
+                assert_eq!(store.replace_all(&fixture).await?, 50);
+                assert_eq!(store.find_all().await?, fixture);
+            }
 
-        let replacement = vec![
-            record(7, *b"02", 3, "0.01")?,
-            record(8, *b"01", 1, "-0.01")?,
-        ];
-        assert_eq!(store.replace_all(&replacement).await?, 2);
-        assert_eq!(store.find_all().await?, replacement);
+            let replacement = vec![
+                record(7, *b"02", 3, "0.01")?,
+                record(8, *b"01", 1, "-0.01")?,
+            ];
+            assert_eq!(store.replace_all(&replacement).await?, 2);
+            assert_eq!(store.find_all().await?, replacement);
 
-        // A failing insert rolls the delete back with it.
-        let twice = [fixture.clone(), fixture.clone()].concat();
-        assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
-        assert_eq!(store.find_all().await?, replacement);
+            // A failing insert rolls the delete back with it.
+            let twice = [fixture.clone(), fixture.clone()].concat();
+            assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
+            assert_eq!(store.find_all().await?, replacement);
 
-        // On a `PgTx` the caller's transaction decides.
-        let head = fixture.get(..3).ok_or("fixture too short")?;
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(head).await?, 3);
-        assert_eq!(tx.find_all().await?, head);
-        assert_eq!(store.find_all().await?, replacement);
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, replacement);
+            // On a `PgTx` the caller's transaction decides.
+            let head = fixture.get(..3).ok_or("fixture too short")?;
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(head).await?, 3);
+            assert_eq!(tx.find_all().await?, head);
+            assert_eq!(store.find_all().await?, replacement);
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, replacement);
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[]).await?, 0);
-        tx.commit().await?;
-        assert_eq!(store.find_all().await?, Vec::new());
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[]).await?, 0);
+            tx.commit().await?;
+            assert_eq!(store.find_all().await?, Vec::new());
+            Ok(())
+        })
     }
 
     /// A record codec B cannot store, after one it can, fails the replacement before the delete:
     /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
     /// so committing it after the error keeps the previous contents.
     // audit: LOADS-018
-    #[tokio::test]
-    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let original = vec![
-            record(7, *b"02", 3, "0.01")?,
-            record(8, *b"01", 1, "-0.01")?,
-        ];
-        assert_eq!(store.replace_all(&original).await?, 2);
-        let input = [
-            record(9, *b"01", 1, "1.00")?,
-            record(9, [b'0', 0xFF], 2, "2.00")?,
-        ];
-        let invalid = Err(PersistenceError::decode(
-            "tran_type_cd",
-            DecodeKind::InvalidByte,
-        ));
+    #[test]
+    fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let original = vec![
+                record(7, *b"02", 3, "0.01")?,
+                record(8, *b"01", 1, "-0.01")?,
+            ];
+            assert_eq!(store.replace_all(&original).await?, 2);
+            let input = [
+                record(9, *b"01", 1, "1.00")?,
+                record(9, [b'0', 0xFF], 2, "2.00")?,
+            ];
+            let invalid = Err(PersistenceError::decode(
+                "tran_type_cd",
+                DecodeKind::InvalidByte,
+            ));
 
-        assert_eq!(store.replace_all(&input).await, invalid);
-        assert_eq!(
-            store.find_all().await?,
-            original,
-            "a failed load through the pool leaves the previous contents"
-        );
+            assert_eq!(store.replace_all(&input).await, invalid);
+            assert_eq!(
+                store.find_all().await?,
+                original,
+                "a failed load through the pool leaves the previous contents"
+            );
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&input).await, invalid);
-        assert_eq!(
-            tx.find_all().await?,
-            original,
-            "the transaction deleted nothing and is not aborted"
-        );
-        tx.commit().await?;
-        assert_eq!(
-            store.find_all().await?,
-            original,
-            "committing after the error keeps the previous contents"
-        );
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&input).await, invalid);
+            assert_eq!(
+                tx.find_all().await?,
+                original,
+                "the transaction deleted nothing and is not aborted"
+            );
+            tx.commit().await?;
+            assert_eq!(
+                store.find_all().await?,
+                original,
+                "committing after the error keeps the previous contents"
+            );
+            Ok(())
+        })
     }
 }

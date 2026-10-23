@@ -563,8 +563,10 @@ impl Count {
     ///
     /// # Errors
     ///
-    /// [`ErrorKind::OutOfRange`] when the result exceeds [`Count::MAX`]; the count never wraps
-    /// or truncates.
+    /// [`ErrorKind::OutOfRange`] when the result falls beyond either end of
+    /// `−Count::MAX..=Count::MAX` (`−9999..=9999`), as it does from any count above 9998 or
+    /// below −10000, or when the `i16` addition overflows (from `i16::MAX`); the count never
+    /// wraps or truncates.
     pub fn add_one(self) -> Result<Self, ErrorKind> {
         self.step(1)
     }
@@ -573,8 +575,10 @@ impl Count {
     ///
     /// # Errors
     ///
-    /// [`ErrorKind::OutOfRange`] when the result is below `−Count::MAX`; the count never wraps
-    /// or truncates.
+    /// [`ErrorKind::OutOfRange`] when the result falls beyond either end of
+    /// `−Count::MAX..=Count::MAX` (`−9999..=9999`), as it does from any count below −9998 or
+    /// above 10000, or when the `i16` subtraction overflows (from `i16::MIN`); the count never
+    /// wraps or truncates.
     pub fn sub_one(self) -> Result<Self, ErrorKind> {
         self.step(-1)
     }
@@ -1238,6 +1242,25 @@ mod tests {
         assert_eq!(i16::from(Count::from(i16::MIN)), i16::MIN);
         assert_eq!(Count::default(), Count::ZERO);
         Ok(())
+    }
+
+    #[test]
+    fn count_steps_fail_beyond_either_end_of_four_digits() {
+        let out_of_range = Err(ErrorKind::OutOfRange);
+        for (start, added, subtracted) in [
+            (i16::MIN, out_of_range, out_of_range),
+            (-20_000, out_of_range, out_of_range),
+            (-10_001, out_of_range, out_of_range),
+            (-10_000, Ok(-9_999), out_of_range),
+            (-9_998, Ok(-9_997), Ok(-9_999)),
+            (10_000, out_of_range, Ok(9_999)),
+            (10_001, out_of_range, out_of_range),
+            (i16::MAX, out_of_range, out_of_range),
+        ] {
+            let count = Count::new(start);
+            assert_eq!(count.add_one().map(Count::get), added, "{start} + 1");
+            assert_eq!(count.sub_one().map(Count::get), subtracted, "{start} - 1");
+        }
     }
 
     #[test]

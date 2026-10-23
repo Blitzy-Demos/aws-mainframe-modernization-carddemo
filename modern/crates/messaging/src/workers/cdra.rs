@@ -66,15 +66,19 @@
 use std::fmt;
 
 use copybook::PicX;
-use domain::messaging::coacct01::{self, AccountLookup, CdraAction, CdraResponse};
+use domain::messaging::coacct01::{
+    self, AccountLookup, CdraAction, CdraRequestError, CdraResponse,
+};
 use lapin::Connection;
-use persistence::{AccountRepository, PgStore};
+use persistence::{AccountRepository, PersistenceError, PgStore};
 use runtime::config::Config;
 use runtime::telemetry::IdKey;
+use tracing::{Level, Metadata, field};
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{Acknowledger, AmqpError, Consumer, QueueCheck};
 use crate::error_body::Flow;
+use crate::{EventSite, emit, event_metadata};
 
 /// The environment variable of the request queue, which the start-up refusal (X-COACCT01-8) and
 /// a failed passive declare of the request queue name in place of the configured value.
@@ -229,10 +233,7 @@ async fn answer<R: AccountRepository>(
         // HALTED(X-COACCT01-H1), HALTED(X-COACCT01-H2): a short body or a non-digit key has no
         // single COBOL result; the masked reply is interim handling, never a parity result.
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "the request does not decode; the masked bad-parameter reply answers it"
-            );
+            request_undecoded(&error);
             return CdraResponse::Reply(coacct01::undecoded_reply());
         }
     };
@@ -245,14 +246,51 @@ async fn answer<R: AccountRepository>(
         Ok(Some(account)) => AccountLookup::Found(account),
         Ok(None) => AccountLookup::NotFound,
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "the account read failed; the error message goes to the error queue"
-            );
+            account_read_failed(error);
             AccountLookup::ReadFailed
         }
     };
     coacct01::respond(lookup, request_queue)
+}
+
+/// `WARN` when a request body does not decode, with the decoding `error`, before the masked
+/// bad-parameter reply.
+fn request_undecoded(error: &CdraRequestError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "request_undecoded",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the request does not decode; the masked bad-parameter reply answers it"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when the account read failed, with the value-free store `error`, before the error
+/// message.
+fn account_read_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "account_read_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the account read failed; the error message goes to the error queue"),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -266,6 +304,7 @@ mod tests {
 
     use super::{QUEUE_NAME_LEN, REQUEST_QUEUE_VARIABLE, answer};
     use crate::broker::AmqpError;
+    use crate::current_thread;
     use crate::workers::check_request_queue;
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -475,14 +514,16 @@ mod tests {
     // audit: COACCT01-005
     // audit: COACCT01-021
     // audit: COACCT01-028
-    #[tokio::test]
-    async fn each_request_is_answered_from_at_most_one_read_by_its_key() -> TestResult {
-        for mut case in cases()? {
-            let response = answer(&mut case.store, REQUEST_QUEUE, &case.body).await;
-            assert_eq!(response, case.expected, "{}", case.name);
-            assert_eq!(case.store.reads, case.reads, "{}", case.name);
-        }
-        Ok(())
+    #[test]
+    fn each_request_is_answered_from_at_most_one_read_by_its_key() -> TestResult {
+        current_thread().block_on(async {
+            for mut case in cases()? {
+                let response = answer(&mut case.store, REQUEST_QUEUE, &case.body).await;
+                assert_eq!(response, case.expected, "{}", case.name);
+                assert_eq!(case.store.reads, case.reads, "{}", case.name);
+            }
+            Ok(())
+        })
     }
 
     #[test]

@@ -21,6 +21,15 @@
 //! - **A DTO field keeps its Rust name on the wire.** `validator` reports a failing field under
 //!   its Rust name, so no DTO field is renamed through `serde`; the `field` of a rejection is
 //!   then the name the client sent.
+//! - **Serialisation is written by hand.** serde's derive macros wrap every impl they generate in
+//!   lint suppressions, which the workspace admits nowhere, so each DTO implements
+//!   `serde::Serialize` and `serde::Deserialize` itself: members in declaration order, an absent
+//!   optional member left out where the schema says `skip_serializing_if`, an unknown member
+//!   skipped, a repeated one refused and a missing one defaulted or refused as the schema states.
+//!   `read_object`, `ObjectMembers` and `Member` are the shared parts of those readers. The
+//!   `#[serde(..)]` attributes that remain are read by `utoipa::ToSchema` alone, which takes
+//!   `rename`, `rename_all`, `default`, `skip`, `skip_serializing_if` and `flatten` from them
+//!   for the schema.
 //!
 //! # Extractors
 //!
@@ -33,6 +42,10 @@
 //!
 //! Every rejection is a [`ScreenError`]:
 //!
+//! - A body that cannot be read whole: 400 with no field, before anything else is checked. A
+//!   body over the route's body limit (`app::MAX_BODY_BYTES`) or whose connection ends before it
+//!   does gets [`INVALID_BODY`]; one still incomplete [`BODY_READ_DEADLINE`] after its read
+//!   began gets [`BODY_TIMEOUT`].
 //! - A body, query string or path that does not deserialise into `T`: 400 with
 //!   [`INVALID_BODY`], [`INVALID_QUERY`] or [`INVALID_PATH`] and no field. That covers malformed
 //!   JSON, a missing JSON content type, a body whose top-level value is not a JSON object (an
@@ -67,8 +80,8 @@
 //! Every collection DTO (`CardListQuery`, `TranListQuery`, `UserListQuery`, `AuthSummaryQuery`,
 //! `TranTypeListQuery` and `TranTypeListActionRequest`) declares `page_size: Option<i64>` with
 //! `#[validate(range(min = 1, max = 100))]` and `#[schema(minimum = 1, maximum = 100)]` or
-//! `#[param(minimum = 1, maximum = 100)]`, and reads it with `#[serde(default, deserialize_with
-//! = ..)]` through `page_size_from_query` on a query string or `page_size_from_json` on
+//! `#[param(minimum = 1, maximum = 100)]`. An omitted member is `None`, and a present one is read
+//! through `page_size_from_query` on a query string or `page_size_from_json` on
 //! endpoint 25's body. Neither refuses a value, so every `page_size` that is not an integer from
 //! 1 to 100 reaches the range rule as an `i64` outside it, which answers 422: `0`, a negative
 //! value and `101` as themselves, and an integer beyond `i64` and anything else that is no
@@ -127,6 +140,7 @@ pub mod cotrtupc; // endpoints 26 and 27
 
 use std::fmt;
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -135,7 +149,10 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
 use domain::copybook::{PicU, PicX};
 use serde::de::value::MapAccessDeserializer;
-use serde::de::{DeserializeOwned, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::de::{
+    self, DeserializeOwned, Deserializer, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor,
+};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
 use utoipa::ToSchema;
@@ -147,13 +164,54 @@ use crate::error::ScreenError;
 /// update (endpoint 19, COUSR02C) and user delete (endpoint 20, COUSR03C).
 // The schema name `ScreenResult` is the frontend's `components["schemas"]["ScreenResult"]`
 // (Generated API Types Only); `api::openapi::ApiDoc` registers it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({"message": "User NEWUSR01 has been added ..."}))]
 pub struct ScreenResult {
     /// The message row exactly as the program words it, such as `User NEWUSR01 has been added
     /// ...` (COUSR01C-021), `User USER0001 has been updated ...` (COUSR02C-029) or
     /// `User USER0001 has been deleted ...` (COUSR03C-019).
     pub message: String,
+}
+
+/// `{"message": …}`.
+impl Serialize for ScreenResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("ScreenResult", 1)?;
+        state.serialize_field("message", &self.message)?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `message` is required.
+impl<'de> Deserialize<'de> for ScreenResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, ScreenResultMembers>(deserializer)
+    }
+}
+
+/// The members of a [`ScreenResult`] being read.
+#[derive(Default)]
+struct ScreenResultMembers {
+    message: Member<String>,
+}
+
+impl ObjectMembers for ScreenResultMembers {
+    type Object = ScreenResult;
+    const NAME: &'static str = "ScreenResult";
+    const FIELDS: &'static [&'static str] = &["message"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "message" => self.message.read(map, "message"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<ScreenResult, E> {
+        Ok(ScreenResult {
+            message: self.message.required("message")?,
+        })
+    }
 }
 
 /// The program's success message, as `cousr01c::added_message`, `cousr02c::updated_message`
@@ -167,14 +225,59 @@ impl From<String> for ScreenResult {
 /// The paging key of a collection request: `forward` (F8) or `backward` (F7). Absent, the
 /// request is ENTER or a first entry.
 // The schema name `PageDirection` is fixed (Generated API Types Only); each program's own
-// `Direction` comes from it through the conversions below.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+// `Direction` comes from it through the conversions below. `rename_all` gives the schema its
+// lowercase `enum` values, the texts the hand-written `Serialize` and `Deserialize` below use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum PageDirection {
     /// `forward`: F8, the page after the one shown.
     Forward,
     /// `backward`: F7, the page before the one shown.
     Backward,
+}
+
+/// The wire texts of [`PageDirection`]'s variants, in declaration order.
+const PAGE_DIRECTIONS: &[&str] = &["forward", "backward"];
+
+/// `"forward"` or `"backward"`.
+impl Serialize for PageDirection {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, text) = match self {
+            Self::Forward => (0, "forward"),
+            Self::Backward => (1, "backward"),
+        };
+        serializer.serialize_unit_variant("PageDirection", index, text)
+    }
+}
+
+/// `forward` or `backward`, from a JSON string, a query-string value or the map form
+/// `{"forward": null}`; any other text is serde's unknown-variant error.
+impl<'de> Deserialize<'de> for PageDirection {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_enum("PageDirection", PAGE_DIRECTIONS, PageDirectionVisitor)
+    }
+}
+
+/// The visitor of [`PageDirection`]'s `Deserialize`: a unit variant named by its text.
+struct PageDirectionVisitor;
+
+impl<'de> Visitor<'de> for PageDirectionVisitor {
+    type Value = PageDirection;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("enum PageDirection")
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<PageDirection, A::Error> {
+        let (text, variant) = data.variant::<String>()?;
+        let direction = match text.as_str() {
+            "forward" => PageDirection::Forward,
+            "backward" => PageDirection::Backward,
+            _ => return Err(de::Error::unknown_variant(&text, PAGE_DIRECTIONS)),
+        };
+        variant.unit_variant()?;
+        Ok(direction)
+    }
 }
 
 /// One `From<PageDirection>` per program direction type: each program declares its own
@@ -226,8 +329,9 @@ pub fn resolve_page_size(requested: Option<i64>, default: u32) -> u32 {
 /// so that the range rule answers it with the same 422 as every other size outside the range.
 const NON_INTEGER_PAGE_SIZE: i64 = MIN_PAGE_SIZE - 1;
 
-/// `page_size` from a query string, for `#[serde(default, deserialize_with =
-/// "super::page_size_from_query")]` on the member of a collection query.
+/// `page_size` from a query string: the reader of a present `page_size` member of a collection
+/// query, called from that query's hand-written `Deserialize` through the `QueryPageSize`
+/// wrapper its module reads the member as. An omitted member is `None` and never reaches it.
 ///
 /// It never fails, so that every value reaches the range rule, which answers anything outside
 /// [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`] with the 422 of Bounded Pagination rather than the 400
@@ -253,8 +357,9 @@ fn page_size_from_text(text: &str) -> i64 {
         })
 }
 
-/// `page_size` from a JSON body, for `#[serde(default, deserialize_with =
-/// "super::page_size_from_json")]` on the member of endpoint 25's request.
+/// `page_size` from a JSON body: the reader of a present `page_size` member of endpoint 25's
+/// request, called from that request's hand-written `Deserialize` through the `BodyPageSize`
+/// wrapper `cotrtlic` reads the member as. An omitted member is `None` and never reaches it.
 ///
 /// It fails only where `serde_json` cannot read the member's value at all, so that every value
 /// reaches the range rule and its 422, as in [`page_size_from_query`]. A number beyond the range
@@ -289,6 +394,32 @@ where
 /// A fixed text of this crate: it never includes the deserialiser's error, which quotes the
 /// offending value, or any other part of the request.
 pub const INVALID_BODY: &str = "Invalid request body...";
+
+/// The message of a body not received in full within [`BODY_READ_DEADLINE`].
+///
+/// A fixed text of this crate: it never includes the bytes that did arrive or any other part of
+/// the request.
+pub const BODY_TIMEOUT: &str = "Request body not received in time...";
+
+/// How long [`ValidJson`] waits for the whole body of a request, from the moment it starts
+/// reading it; a body still incomplete then is answered 400 with [`BODY_TIMEOUT`] and no field.
+///
+/// A request keeps its place of the in-flight limit
+/// ([`MAX_IN_FLIGHT`](crate::app::MAX_IN_FLIGHT)) while its body is read, so a client that sends
+/// the headers and then withholds the body would otherwise keep that place for as long as it
+/// keeps the connection open, and as many such clients as there are places would leave every
+/// other request to wait out its admission wait and be refused. The deadline bounds the read
+/// alone: once the body is in, the handler, the services and the store run without one.
+///
+/// The same 5 seconds as the admission wait ([`ADMISSION_WAIT`](crate::app::ADMISSION_WAIT))
+/// and the store's wait for one of the request pool's connections
+/// (`runtime::db::ACQUIRE_TIMEOUT`). A body of the largest size admitted
+/// ([`MAX_BODY_BYTES`](crate::app::MAX_BODY_BYTES)) arrives within them at 13 KiB a second, and
+/// the largest one a screen sends, about 2 KB, at under 1 KiB a second. A body still being read
+/// at a stop signal is answered before the 8-second drain deadline of `carddemo-api` passes, and
+/// a request that waited the whole admission wait and then the whole deadline is still answered
+/// far within the frontend's 30-second request deadline.
+pub const BODY_READ_DEADLINE: Duration = Duration::from_secs(5);
 
 /// The message of a query string that does not deserialise into its DTO.
 ///
@@ -352,10 +483,19 @@ const RANGE_CODE: &str = "range";
 /// order, and `null` stays an empty position where the list admits one), otherwise the error of
 /// the first failing rule, or the 422 of an out-of-range `page_size`.
 ///
+/// The body is first read whole, under the route's body limit
+/// ([`MAX_BODY_BYTES`](crate::app::MAX_BODY_BYTES) on every route of `app::app`) and within
+/// [`BODY_READ_DEADLINE`], before its content type or any member is looked at. A body over the
+/// limit, whether its `Content-Length` announces it or its chunks pass it, and one whose
+/// connection ends before it does are the 400 with [`INVALID_BODY`]; one still incomplete when
+/// the deadline passes is the 400 with [`BODY_TIMEOUT`]. Neither has a field. Either way the
+/// read stops there, so the request gives up its place of the in-flight limit as soon as that
+/// answer is returned.
+///
 /// A top-level `page_size` that holds a JSON number beyond the range the JSON parser represents,
 /// such as an integer of 310 digits or `1e400`, is read as a size outside the range too, so it
 /// gets the same 422. `serde_json` refuses such a number while parsing it, before any rule or
-/// `deserialize_with` function sees it, so the body is buffered under the route's body limit
+/// the member's reader sees it, so the body is buffered under the route's body limit
 /// and read again, as `read_past_unrepresentable_page_size` sets out. A body that does not
 /// deserialise for any other reason, beside that number or without it, stays the 400.
 #[derive(Debug, Clone)]
@@ -369,12 +509,16 @@ where
     type Rejection = ScreenError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // Buffered once, under the route's body limit, so that a body can be read a second time
-        // below; axum's own extractor then reads the copy, its content-type rule included.
+        // Buffered once, under the route's body limit and within `BODY_READ_DEADLINE`, so that a
+        // body can be read a second time below; axum's own extractor then reads the copy, its
+        // content-type rule included.
         let (parts, body) = req.into_parts();
-        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
-            .await
-            .map_err(|_| ScreenError::input(INVALID_BODY, None))?;
+        let bytes = body_within(
+            Request::from_parts(parts.clone(), body),
+            state,
+            BODY_READ_DEADLINE,
+        )
+        .await?;
         let read = Json::<ObjectBody<T>>::from_request(
             Request::from_parts(parts, Body::from(bytes.clone())),
             state,
@@ -393,6 +537,29 @@ where
             .validate()
             .map_err(|errors| validation_error(&errors))?;
         Ok(Self(value))
+    }
+}
+
+/// The whole body of `request`, read under the body limit its extensions carry and within
+/// `deadline`.
+///
+/// A body that cannot be read, because it passes the limit, its connection ended before it did
+/// or its framing is malformed, is the 400 with [`INVALID_BODY`]; one still incomplete when
+/// `deadline` passes is the 400 with [`BODY_TIMEOUT`]. The read is then abandoned, and with it
+/// whatever part of the body had arrived.
+async fn body_within<S>(
+    request: Request,
+    state: &S,
+    deadline: Duration,
+) -> Result<Bytes, ScreenError>
+where
+    S: Send + Sync,
+{
+    match tokio::time::timeout(deadline, Bytes::from_request(request, state)).await {
+        Ok(Ok(bytes)) => Ok(bytes),
+        // The rejection's own text can name what failed, so it is dropped unread.
+        Ok(Err(_)) => Err(ScreenError::input(INVALID_BODY, None)),
+        Err(_elapsed) => Err(ScreenError::input(BODY_TIMEOUT, None)),
     }
 }
 
@@ -527,18 +694,20 @@ fn is_number_byte(byte: u8) -> bool {
     byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E')
 }
 
-/// A JSON object deserialised into `T`: a request body, or through [`object`], [`objects`] and
-/// [`objects_or_null`] a request member or list item whose schema is an object.
+/// A JSON object deserialised into `T`: a request body, or a request member or list item whose
+/// schema is an object, read as a `Member<ObjectBody<T>>` or through [`object`], [`objects`] and
+/// [`objects_or_null`].
 ///
-/// serde's derived `Deserialize` of a struct also reads a JSON array, element by element in
-/// member order, so `["ADMIN001","PASSWORD"]` would read as a sign-on request, `[]` as `{}`, and
+/// `serde_json` answers a struct's `deserialize_struct` with a JSON array as well as an object,
+/// and a visitor that reads a sequence would take the array element by element in member order,
+/// so that `["ADMIN001","PASSWORD"]` read as a sign-on request, `[]` as `{}`, and
 /// `"fields":["Y","2014"]` as an account update's fields. Every request body is a `type: object`
 /// schema, and so is every struct it nests, so this wrapper asks the deserialiser for a map and
 /// nothing else: an array, a string, a number, a boolean or `null` in its place fails to
 /// deserialise, at the top level and at every depth whose member reads through these helpers.
-/// The object's members then reach `T`'s own derived visitor exactly as they arrive, which keeps
-/// its rejection of a duplicate member, its defaults for omitted members, its reading of unknown
-/// ones and the `deserialize_with` rules of its own members.
+/// The object's members then reach `T`'s own `Deserialize` exactly as they arrive, which keeps
+/// its rejection of a duplicate member, its defaults for omitted members, its skipping of unknown
+/// ones and the readers of its own members.
 struct ObjectBody<T>(T);
 
 impl<'de, T> Deserialize<'de> for ObjectBody<T>
@@ -553,8 +722,10 @@ where
     }
 }
 
-/// A request member whose schema is an object, for `#[serde(deserialize_with =
-/// "super::object")]` on a struct-typed member of a request DTO.
+/// A request member whose schema is an object: the reader of a struct-typed member of a request
+/// DTO, called from that DTO's hand-written `Deserialize` through the wrapper it reads the member
+/// as: [`ObjectBody`], the `Object` of `cocrdupc` and `cotrn02c`, or the `EchoedState` of
+/// `cotrtlic`.
 ///
 /// # Errors
 ///
@@ -570,9 +741,10 @@ where
     deserializer.deserialize_map(ObjectVisitor(PhantomData))
 }
 
-/// A request member whose schema is a list of objects, for `#[serde(deserialize_with =
-/// "super::objects")]` on a `Vec<T>` member of a request DTO, or for a `deserialize_with` rule
-/// that reads the list through it before checking it further.
+/// A request member whose schema is a list of objects: the reader of a `Vec<T>` member of a
+/// request DTO, called from a reader of such a member that reads the list through it before
+/// checking it further: `cotrtlic`'s `at_most_seven`, which the hand-written `Deserialize` of
+/// endpoint 25's request reaches through the `RowInputs` wrapper it reads `rows` as.
 ///
 /// # Errors
 ///
@@ -589,9 +761,10 @@ where
         .collect())
 }
 
-/// A request member whose schema is a list of positions, each an object or `null`, for
-/// `#[serde(deserialize_with = "super::objects_or_null")]` on a `Vec<Option<T>>` member of a
-/// request DTO: `null` is an empty position, as before.
+/// A request member whose schema is a list of positions, each an object or `null`: the reader of
+/// a `Vec<Option<T>>` member of a request DTO, called from that DTO's hand-written `Deserialize`
+/// through the `Positions` wrapper `cotrtlic` reads the member as. `null` is an empty position,
+/// read as `None`.
 ///
 /// # Errors
 ///
@@ -608,8 +781,9 @@ where
         .collect())
 }
 
-/// The visitor of [`ObjectBody`] and [`object`]: it accepts a map alone and hands it to `T`, so
-/// a sequence or a scalar is the deserialiser's invalid-type error.
+/// The visitor of [`ObjectBody`] and [`object`]: it accepts a map alone and hands it to `T`'s
+/// own `Deserialize` through [`MapAccessDeserializer`], so a sequence or a scalar is the
+/// deserialiser's invalid-type error.
 struct ObjectVisitor<T>(PhantomData<T>);
 
 impl<'de, T> Visitor<'de> for ObjectVisitor<T>
@@ -627,6 +801,162 @@ where
         A: MapAccess<'de>,
     {
         T::deserialize(MapAccessDeserializer::new(map))
+    }
+}
+
+/// The members of an object type, read one key at a time: the reading half of a hand-written
+/// `Deserialize`, which [`read_object`] drives. Each implementation is a struct of one
+/// [`Member`] per member of [`ObjectMembers::Object`], all absent at its `Default`.
+pub(crate) trait ObjectMembers: Default {
+    /// The type the members build.
+    type Object;
+
+    /// The type's name, as `deserialize_struct` takes it and the `expecting` text shows it.
+    const NAME: &'static str;
+
+    /// The wire name of every member, in declaration order.
+    const FIELDS: &'static [&'static str];
+
+    /// Reads the value of the member `key` names with [`Member::read`], or skips the value of a
+    /// key that names no member with [`skip_member`].
+    ///
+    /// # Errors
+    ///
+    /// serde's duplicate-field error for a member read before, or the error of its value.
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error>;
+
+    /// The object once its last key is read: an absent member its default where it has one.
+    ///
+    /// # Errors
+    ///
+    /// serde's missing-field error for an absent member that has no default.
+    fn finish<E: de::Error>(self) -> Result<Self::Object, E>;
+}
+
+/// `M::Object` read from a JSON object through `M`, for the `Deserialize` of a DTO.
+///
+/// Only a map is accepted, so an array, even one whose elements would fill the members in order,
+/// or a scalar is the deserialiser's invalid-type error. Keys are read as text and handed to
+/// [`ObjectMembers::read`] in the order they arrive.
+///
+/// # Errors
+///
+/// The deserialiser's error for anything but an object, or the error `M` raises for a member.
+pub(crate) fn read_object<'de, D, M>(deserializer: D) -> Result<M::Object, D::Error>
+where
+    D: Deserializer<'de>,
+    M: ObjectMembers,
+{
+    deserializer.deserialize_struct(M::NAME, M::FIELDS, MembersVisitor::<M>(PhantomData))
+}
+
+/// The visitor of [`read_object`]: it accepts a map alone and reads each key through `M`.
+struct MembersVisitor<M>(PhantomData<M>);
+
+impl<'de, M: ObjectMembers> Visitor<'de> for MembersVisitor<M> {
+    type Value = M::Object;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "struct {}", M::NAME)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<M::Object, A::Error> {
+        let mut members = M::default();
+        while let Some(key) = map.next_key::<String>()? {
+            members.read(&key, &mut map)?;
+        }
+        members.finish()
+    }
+}
+
+/// One member of an object being read: absent until its key arrives, then the value it held.
+pub(crate) struct Member<T>(Option<T>);
+
+/// Absent.
+impl<T> Default for Member<T> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<T> Member<T> {
+    /// Reads the member `name` from `map`, whose next value is the member's.
+    ///
+    /// # Errors
+    ///
+    /// serde's duplicate-field error naming `name` when the member was read before, raised before
+    /// its second value is read; otherwise the error of the value.
+    pub(crate) fn read<'de, A>(&mut self, map: &mut A, name: &'static str) -> Result<(), A::Error>
+    where
+        A: MapAccess<'de>,
+        T: Deserialize<'de>,
+    {
+        if self.0.is_some() {
+            return Err(de::Error::duplicate_field(name));
+        }
+        self.0 = Some(map.next_value()?);
+        Ok(())
+    }
+
+    /// The value of a member the object must carry.
+    ///
+    /// # Errors
+    ///
+    /// serde's missing-field error naming `name` when the member is absent.
+    pub(crate) fn required<E: de::Error>(self, name: &'static str) -> Result<T, E> {
+        self.0.ok_or_else(|| E::missing_field(name))
+    }
+
+    /// The value, or `default` when the member is absent: the member of a type whose own
+    /// `Default` supplies every absent member.
+    pub(crate) fn or(self, default: T) -> T {
+        self.0.unwrap_or(default)
+    }
+
+    /// The value, or `T::default()` when the member is absent: a member that defaults alone.
+    pub(crate) fn or_default(self) -> T
+    where
+        T: Default,
+    {
+        self.0.unwrap_or_default()
+    }
+}
+
+impl<T> Member<Option<T>> {
+    /// The value of an optional member: `None` when it is absent or `null`.
+    pub(crate) fn optional(self) -> Option<T> {
+        self.0.flatten()
+    }
+}
+
+/// Skips the value of a key that names no member of the object being read, unread.
+///
+/// # Errors
+///
+/// The deserialiser's error when the value is not well-formed.
+pub(crate) fn skip_member<'de, A: MapAccess<'de>>(map: &mut A) -> Result<(), A::Error> {
+    map.next_value::<IgnoredAny>()?;
+    Ok(())
+}
+
+/// Writes the member `name` of an object being serialised when `value` is present, and skips the
+/// member when it is absent, as the schema's `skip_serializing_if = "Option::is_none"` states.
+///
+/// # Errors
+///
+/// The serialiser's error for the member.
+pub(crate) fn field_if_present<S, T>(
+    state: &mut S,
+    name: &'static str,
+    value: Option<&T>,
+) -> Result<(), S::Error>
+where
+    S: SerializeStruct,
+    T: Serialize,
+{
+    match value {
+        Some(value) => state.serialize_field(name, value),
+        None => state.skip_field(name),
     }
 }
 
@@ -859,38 +1189,45 @@ pub(crate) fn digits<const N: u32>(field: PicU<N>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::error::Error as StdError;
+    use std::io::{self, Read as _, Write as _};
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::{Duration, Instant};
 
     use axum::body::{Body, to_bytes};
     use axum::extract::{FromRequest, FromRequestParts, Request};
     use axum::http::StatusCode;
     use axum::http::header::CONTENT_TYPE;
-    use axum::routing::get;
+    use axum::routing::{get, post};
     use axum::{Json, Router};
     use domain::copybook::{PicU, PicX};
     use domain::online::{coactupc, cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
     use serde::Deserialize;
-    use serde::de::DeserializeOwned;
+    use serde::de::{self, DeserializeOwned, Deserializer, MapAccess};
     use serde_json::{Value, json};
+    use tokio::net::TcpListener;
     use tower::ServiceExt as _;
     use utoipa::ToSchema;
     use validator::{Validate, ValidationError};
 
     use super::coactupc::{AccountUpdateRequest, AccountUpdateSnapshot};
-    use super::cobil00c::BillPaymentRequest;
+    use super::cobil00c::{BillPaymentRequest, BillPaymentResult};
     use super::cocrdupc::CardUpdateRequest;
-    use super::corpt00c::ReportRequest;
-    use super::cosgn00c::SignonRequest;
+    use super::comen01c::{MenuOptionDto, MenuResponse};
+    use super::corpt00c::{ReportRequest, ReportResult};
+    use super::cosgn00c::{SignonRequest, SignonResponse};
     use super::cotrn02c::TranAddRequest;
     use super::cotrtlic::TranTypeListActionRequest;
     use super::cotrtupc::TranTypeActionRequest;
     use super::cousr01c::UserAddRequest;
     use super::cousr02c::UserUpdateRequest;
     use super::{
-        FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE, INVALID_BODY,
-        INVALID_PATH, INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD,
-        PAGE_SIZE_MESSAGE, PIC_X_CODE, PageDirection, RawPath, ScreenResult, ValidJson, ValidQuery,
-        digits, full_text, numeric, pic_x, resolve_page_size, text, validation_error,
+        BODY_TIMEOUT, FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE,
+        INVALID_BODY, INVALID_PATH, INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, Member,
+        ObjectBody, ObjectMembers, PAGE_SIZE_FIELD, PAGE_SIZE_MESSAGE, PIC_X_CODE, PageDirection,
+        RawPath, ScreenResult, ValidJson, ValidQuery, body_within, digits, full_text, numeric,
+        pic_x, read_object, resolve_page_size, skip_member, text, validation_error,
     };
     use crate::error::ScreenError;
 
@@ -902,25 +1239,24 @@ mod tests {
     /// A card number the rejection texts must never echo.
     const CARD: &str = "4111111111111111";
 
-    #[derive(Debug, Default, Deserialize, Validate)]
-    #[serde(default)]
+    /// A list item; an absent member is `Row::default()`'s.
+    #[derive(Debug, Default, Validate)]
     struct Row {
         #[validate(length(max = 50))]
         description: String,
     }
 
-    #[derive(Debug, Default, Deserialize, Validate)]
-    #[serde(default)]
+    /// A nested object; an absent member is `Inner::default()`'s.
+    #[derive(Debug, Default, Validate)]
     struct Inner {
         #[validate(length(max = 2))]
         code: String,
     }
 
-    /// A collection request with every kind of rule the DTO modules declare.
-    #[derive(Debug, Default, Deserialize, Validate)]
-    #[serde(default)]
+    /// A collection request with every kind of rule the DTO modules declare; an absent member is
+    /// `Probe::default()`'s.
+    #[derive(Debug, Default, Validate)]
     struct Probe {
-        #[serde(default, deserialize_with = "super::page_size_from_json")]
         #[validate(range(min = 1, max = 100))]
         page_size: Option<i64>,
         #[validate(range(min = 1))]
@@ -929,24 +1265,196 @@ mod tests {
         user_id: String,
         #[validate(length(max = 2), custom(function = "super::numeric"))]
         start_month: String,
-        #[serde(deserialize_with = "super::object")]
         #[validate(nested)]
         inner: Inner,
-        #[serde(deserialize_with = "super::objects")]
         #[validate(nested)]
         rows: Vec<Row>,
     }
 
-    /// A query-string request: page size, page number and one text filter.
-    #[derive(Debug, Deserialize, Validate)]
+    /// A query-string request: page size, page number and one text filter, each optional.
+    #[derive(Debug, Validate)]
     struct QueryProbe {
-        #[serde(default, deserialize_with = "super::page_size_from_query")]
         #[validate(range(min = 1, max = 100))]
         page_size: Option<i64>,
         #[validate(range(min = 0))]
         page_no: Option<i64>,
         #[validate(length(max = 8))]
         start_user_id: Option<String>,
+    }
+
+    /// The `page_size` of a JSON body, as `page_size_from_json` reads it.
+    #[derive(Default)]
+    struct JsonPageSize(Option<i64>);
+
+    impl<'de> Deserialize<'de> for JsonPageSize {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            super::page_size_from_json(deserializer).map(Self)
+        }
+    }
+
+    /// The `page_size` of a query string, as `page_size_from_query` reads it.
+    #[derive(Default)]
+    struct QueryPageSize(Option<i64>);
+
+    impl<'de> Deserialize<'de> for QueryPageSize {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            super::page_size_from_query(deserializer).map(Self)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Row {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            read_object::<D, RowMembers>(deserializer)
+        }
+    }
+
+    #[derive(Default)]
+    struct RowMembers {
+        description: Member<String>,
+    }
+
+    impl ObjectMembers for RowMembers {
+        type Object = Row;
+        const NAME: &'static str = "Row";
+        const FIELDS: &'static [&'static str] = &["description"];
+
+        fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+            match key {
+                "description" => self.description.read(map, "description"),
+                _ => skip_member(map),
+            }
+        }
+
+        fn finish<E: de::Error>(self) -> Result<Row, E> {
+            let default = Row::default();
+            Ok(Row {
+                description: self.description.or(default.description),
+            })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Inner {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            read_object::<D, InnerMembers>(deserializer)
+        }
+    }
+
+    #[derive(Default)]
+    struct InnerMembers {
+        code: Member<String>,
+    }
+
+    impl ObjectMembers for InnerMembers {
+        type Object = Inner;
+        const NAME: &'static str = "Inner";
+        const FIELDS: &'static [&'static str] = &["code"];
+
+        fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+            match key {
+                "code" => self.code.read(map, "code"),
+                _ => skip_member(map),
+            }
+        }
+
+        fn finish<E: de::Error>(self) -> Result<Inner, E> {
+            let default = Inner::default();
+            Ok(Inner {
+                code: self.code.or(default.code),
+            })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Probe {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            read_object::<D, ProbeMembers>(deserializer)
+        }
+    }
+
+    /// The members of a [`Probe`] being read: `inner` through [`ObjectBody`] and each item of
+    /// `rows` too, so that each must be a JSON object.
+    #[derive(Default)]
+    struct ProbeMembers {
+        page_size: Member<JsonPageSize>,
+        page_no: Member<Option<i64>>,
+        user_id: Member<String>,
+        start_month: Member<String>,
+        inner: Member<ObjectBody<Inner>>,
+        rows: Member<Vec<ObjectBody<Row>>>,
+    }
+
+    impl ObjectMembers for ProbeMembers {
+        type Object = Probe;
+        const NAME: &'static str = "Probe";
+        const FIELDS: &'static [&'static str] = &[
+            "page_size",
+            "page_no",
+            "user_id",
+            "start_month",
+            "inner",
+            "rows",
+        ];
+
+        fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+            match key {
+                "page_size" => self.page_size.read(map, "page_size"),
+                "page_no" => self.page_no.read(map, "page_no"),
+                "user_id" => self.user_id.read(map, "user_id"),
+                "start_month" => self.start_month.read(map, "start_month"),
+                "inner" => self.inner.read(map, "inner"),
+                "rows" => self.rows.read(map, "rows"),
+                _ => skip_member(map),
+            }
+        }
+
+        fn finish<E: de::Error>(self) -> Result<Probe, E> {
+            let default = Probe::default();
+            Ok(Probe {
+                page_size: self.page_size.or_default().0,
+                page_no: self.page_no.or(default.page_no),
+                user_id: self.user_id.or(default.user_id),
+                start_month: self.start_month.or(default.start_month),
+                inner: self.inner.or(ObjectBody(default.inner)).0,
+                rows: self.rows.0.map_or(default.rows, |rows| {
+                    rows.into_iter().map(|ObjectBody(row)| row).collect()
+                }),
+            })
+        }
+    }
+
+    impl<'de> Deserialize<'de> for QueryProbe {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            read_object::<D, QueryProbeMembers>(deserializer)
+        }
+    }
+
+    #[derive(Default)]
+    struct QueryProbeMembers {
+        page_size: Member<QueryPageSize>,
+        page_no: Member<Option<i64>>,
+        start_user_id: Member<Option<String>>,
+    }
+
+    impl ObjectMembers for QueryProbeMembers {
+        type Object = QueryProbe;
+        const NAME: &'static str = "QueryProbe";
+        const FIELDS: &'static [&'static str] = &["page_size", "page_no", "start_user_id"];
+
+        fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+            match key {
+                "page_size" => self.page_size.read(map, "page_size"),
+                "page_no" => self.page_no.read(map, "page_no"),
+                "start_user_id" => self.start_user_id.read(map, "start_user_id"),
+                _ => skip_member(map),
+            }
+        }
+
+        fn finish<E: de::Error>(self) -> Result<QueryProbe, E> {
+            Ok(QueryProbe {
+                page_size: self.page_size.or_default().0,
+                page_no: self.page_no.optional(),
+                start_user_id: self.start_user_id.optional(),
+            })
+        }
     }
 
     /// The status, message and field of `error`.
@@ -1336,6 +1844,380 @@ mod tests {
         assert_maps!(cocrdlic, cotrn00c, cousr00c, copaus0c, cotrtlic);
     }
 
+    /// `PageDirection` from each form a request carries it in, a JSON string, the map form and a
+    /// query-string value; any other text, and any other JSON value, is refused.
+    #[test]
+    fn page_direction_reads_its_two_texts_in_every_form_and_nothing_else() -> TestResult {
+        let bodies = [
+            (r#""forward""#, Some(PageDirection::Forward)),
+            (r#"{"backward":null}"#, Some(PageDirection::Backward)),
+            (r#""Backward""#, None),
+            (r#""sideways""#, None),
+            (r#"{"forward":1}"#, None),
+            (r#"["forward"]"#, None),
+            ("7", None),
+            ("null", None),
+        ];
+        for (body, expected) in bodies {
+            let read = serde_json::from_str::<PageDirection>(body).ok();
+            assert_eq!(read, expected, "{body}");
+        }
+        let queries = [
+            ("/x?direction=forward", Some(PageDirection::Forward)),
+            ("/x?direction=backward", Some(PageDirection::Backward)),
+            ("/x?direction=FORWARD", None),
+            ("/x?direction=", None),
+        ];
+        for (uri, expected) in queries {
+            let read = axum::extract::Query::<BTreeMap<String, PageDirection>>::try_from_uri(
+                &uri.parse()?,
+            );
+            let direction = read
+                .ok()
+                .and_then(|axum::extract::Query(mut query)| query.remove("direction"));
+            assert_eq!(direction, expected, "{uri}");
+        }
+        Ok(())
+    }
+
+    /// A menu option of program `COACTVWC` with `user_type` and `unavailable`, admin-only when it
+    /// states no user type.
+    fn option(user_type: Option<&str>, unavailable: Option<&str>) -> MenuOptionDto {
+        MenuOptionDto {
+            number: "01".to_owned(),
+            name: "N".to_owned(),
+            text: "T".to_owned(),
+            program: "COACTVWC".to_owned(),
+            user_type: user_type.map(str::to_owned),
+            admin_only: user_type.is_none(),
+            installed: true,
+            unavailable_message: unavailable.map(str::to_owned),
+        }
+    }
+
+    /// A menu of one [`option`] stating `user_type`, with `admin_only` as its admin-only text.
+    fn menu(user_type: Option<&str>, admin_only: Option<&str>) -> MenuResponse {
+        MenuResponse {
+            options: vec![option(user_type, None)],
+            user_type: user_type.map(str::to_owned),
+            invalid_option_message: "I".to_owned(),
+            admin_only_message: admin_only.map(str::to_owned),
+        }
+    }
+
+    /// A bill payment result for account 1, cleared when it carries a transaction ID.
+    fn bill(
+        balance: Option<&str>,
+        message: Option<&str>,
+        tran_id: Option<&str>,
+    ) -> BillPaymentResult {
+        BillPaymentResult {
+            acct_id: "00000000001".to_owned(),
+            current_balance: balance.map(str::to_owned),
+            message: message.map(str::to_owned),
+            new_tran_id: tran_id.map(str::to_owned),
+            cleared: tran_id.is_some(),
+        }
+    }
+
+    /// The bytes of the bodies these modules write: members in declaration order, an absent
+    /// optional member left out, the sign-on password never written and each enum as its text.
+    #[test]
+    fn bodies_are_written_member_by_member_in_declaration_order() -> TestResult {
+        let main_menu = format!(
+            r#"{{"options":[{}],"user_type":"U","invalid_option_message":"I","admin_only_message":"A"}}"#,
+            serde_json::to_string(&option(Some("U"), None))?
+        );
+        let admin_menu = format!(
+            r#"{{"options":[{}],"invalid_option_message":"I"}}"#,
+            serde_json::to_string(&option(None, None))?
+        );
+        let cases = [
+            (
+                serde_json::to_string(&ScreenResult::from(
+                    "User U1 has been added ...".to_owned(),
+                ))?,
+                r#"{"message":"User U1 has been added ..."}"#,
+            ),
+            (
+                serde_json::to_string(&SignonRequest {
+                    user_id: "ADMIN001".to_owned(),
+                    password: "PASSWORD".to_owned(),
+                })?,
+                r#"{"user_id":"ADMIN001"}"#,
+            ),
+            (
+                serde_json::to_string(&SignonResponse {
+                    token: "t".to_owned(),
+                    user_id: "ADMIN001".to_owned(),
+                    user_type: "A".to_owned(),
+                    next_route: "/admin".to_owned(),
+                })?,
+                r#"{"token":"t","user_id":"ADMIN001","user_type":"A","next_route":"/admin"}"#,
+            ),
+            (
+                serde_json::to_string(&option(Some("U"), None))?,
+                r#"{"number":"01","name":"N","text":"T","program":"COACTVWC","user_type":"U","admin_only":false,"installed":true}"#,
+            ),
+            (
+                serde_json::to_string(&option(None, Some("X")))?,
+                r#"{"number":"01","name":"N","text":"T","program":"COACTVWC","admin_only":true,"installed":true,"unavailable_message":"X"}"#,
+            ),
+            (
+                serde_json::to_string(&menu(Some("U"), Some("A")))?,
+                main_menu.as_str(),
+            ),
+            (
+                serde_json::to_string(&menu(None, None))?,
+                admin_menu.as_str(),
+            ),
+            (
+                serde_json::to_string(&ReportRequest {
+                    custom: "X".to_owned(),
+                    start_month: "01".to_owned(),
+                    confirm: "Y".to_owned(),
+                    ..ReportRequest::default()
+                })?,
+                r#"{"monthly":"","yearly":"","custom":"X","start_month":"01","start_day":"","start_year":"","end_month":"","end_day":"","end_year":"","confirm":"Y"}"#,
+            ),
+            (
+                serde_json::to_string(&ReportResult::from((
+                    "Monthly report submitted for printing ...".to_owned(),
+                    Some("TRNRPT00.G0001".to_owned()),
+                )))?,
+                r#"{"message":"Monthly report submitted for printing ...","job_deck":"TRNRPT00.G0001"}"#,
+            ),
+            (
+                serde_json::to_string(&ReportResult::from((String::new(), None)))?,
+                r#"{"message":""}"#,
+            ),
+            (
+                serde_json::to_string(&BillPaymentRequest {
+                    acct_id: "00000000001".to_owned(),
+                    confirm: "Y".to_owned(),
+                })?,
+                r#"{"acct_id":"00000000001","confirm":"Y"}"#,
+            ),
+            (
+                serde_json::to_string(&bill(Some("+0000000843.00"), Some("M"), None))?,
+                r#"{"acct_id":"00000000001","current_balance":"+0000000843.00","message":"M","cleared":false}"#,
+            ),
+            (
+                serde_json::to_string(&bill(None, Some("M"), Some("0000000000000001")))?,
+                r#"{"acct_id":"00000000001","message":"M","new_tran_id":"0000000000000001","cleared":true}"#,
+            ),
+            (
+                serde_json::to_string(&bill(None, None, None))?,
+                r#"{"acct_id":"00000000001","cleared":false}"#,
+            ),
+            (
+                serde_json::to_string(&[PageDirection::Forward, PageDirection::Backward])?,
+                r#"["forward","backward"]"#,
+            ),
+        ];
+        for (case, (written, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(written, expected, "case {case}");
+        }
+        Ok(())
+    }
+
+    /// One type's JSON reader, so that one table holds several types.
+    type Reader = fn(&str) -> bool;
+
+    /// Whether `body` reads as a `T`.
+    fn reads<T: DeserializeOwned>(body: &str) -> bool {
+        serde_json::from_str::<T>(body).is_ok()
+    }
+
+    /// The bodies of the 200s read back from JSON objects as their schemas state: an unknown
+    /// member skipped and an optional member absent or `null`; a repeated member, a missing
+    /// required one, a value of the wrong type and anything but an object refused, at every
+    /// depth.
+    #[test]
+    fn response_bodies_read_back_as_their_schemas_state() {
+        let option_body = r#"{"number":"01","name":"N","text":"T","program":"P","admin_only":false,"installed":true}"#;
+        let menu_with =
+            |options: &str| format!(r#"{{"options":{options},"invalid_option_message":"I"}}"#);
+        let menu_body = menu_with(&format!("[{option_body}]"));
+        let empty_menu = menu_with("[]");
+        let positional_option = menu_with(r#"[["01"]]"#);
+        let partial_option = menu_with(r#"[{"number":"01"}]"#);
+        // (reader, body, whether it reads)
+        let cases: [(Reader, &str, bool); 24] = [
+            (reads::<ScreenResult>, r#"{"message":"M","x":[1]}"#, true),
+            (reads::<ScreenResult>, "{}", false),
+            (
+                reads::<ScreenResult>,
+                r#"{"message":"M","message":"N"}"#,
+                false,
+            ),
+            (reads::<ScreenResult>, r#"["M"]"#, false),
+            (
+                reads::<SignonResponse>,
+                r#"{"token":"t","user_id":"U","user_type":"U","next_route":"/menu","x":1}"#,
+                true,
+            ),
+            (
+                reads::<SignonResponse>,
+                r#"{"user_id":"U","user_type":"U","next_route":"/menu"}"#,
+                false,
+            ),
+            (
+                reads::<SignonResponse>,
+                r#"{"token":"t","token":"t","user_id":"U","user_type":"U","next_route":"/menu"}"#,
+                false,
+            ),
+            (
+                reads::<ReportResult>,
+                r#"{"message":"","job_deck":null}"#,
+                true,
+            ),
+            (
+                reads::<ReportResult>,
+                r#"{"job_deck":"TRNRPT00.G0001"}"#,
+                false,
+            ),
+            (
+                reads::<ReportResult>,
+                r#"{"message":"","job_deck":1}"#,
+                false,
+            ),
+            (
+                reads::<BillPaymentResult>,
+                r#"{"acct_id":"","message":null,"cleared":true}"#,
+                true,
+            ),
+            (reads::<BillPaymentResult>, r#"{"acct_id":""}"#, false),
+            (
+                reads::<BillPaymentResult>,
+                r#"{"acct_id":"","cleared":"true"}"#,
+                false,
+            ),
+            (
+                reads::<BillPaymentResult>,
+                r#"["","+0000000843.00","M",null,false]"#,
+                false,
+            ),
+            (reads::<MenuOptionDto>, option_body, true),
+            (
+                reads::<MenuOptionDto>,
+                r#"{"number":"01","name":"N","text":"T","program":"P"}"#,
+                false,
+            ),
+            (reads::<MenuResponse>, &menu_body, true),
+            (reads::<MenuResponse>, &empty_menu, true),
+            (reads::<MenuResponse>, &positional_option, false),
+            (reads::<MenuResponse>, &partial_option, false),
+            (
+                reads::<MenuResponse>,
+                r#"{"invalid_option_message":"I"}"#,
+                false,
+            ),
+            (
+                reads::<BillPaymentRequest>,
+                r#"{"acct_id":"1","unknown":{"a":[]}}"#,
+                true,
+            ),
+            (
+                reads::<ReportRequest>,
+                r#"{"monthly":"X","monthly":"X"}"#,
+                false,
+            ),
+            (
+                reads::<SignonRequest>,
+                r#"{"user_id":"ADMIN001","password":null}"#,
+                false,
+            ),
+        ];
+        for (case, (reads, body, expected)) in cases.into_iter().enumerate() {
+            assert_eq!(reads(body), expected, "case {case}: {body}");
+        }
+    }
+
+    /// The request readers through the extractor: a member given twice, at the top level or in
+    /// a nested object, a missing required member and a value of the wrong type are each the 400
+    /// of a body that does not deserialise; an unknown member is skipped, and an absent or `null`
+    /// optional member and an absent defaulted one take their defaults, at every depth.
+    #[test]
+    fn request_bodies_refuse_repeated_missing_and_mistyped_members() -> TestResult {
+        let [account, ..] = nested_object_bodies();
+        let snapshot = account.get("snapshot").ok_or("no snapshot")?.to_string();
+        // The endpoint 6 body with the member at `pointer` set to `value`, or removed for `None`.
+        let with = |pointer: &str, value: Option<Value>| -> Result<String, Box<dyn StdError>> {
+            let (parent, member) = pointer.rsplit_once('/').ok_or("no member in the pointer")?;
+            let mut body = account.clone();
+            let object = body
+                .pointer_mut(parent)
+                .and_then(Value::as_object_mut)
+                .ok_or("no object at the pointer's parent")?;
+            match value {
+                Some(value) => object.insert(member.to_owned(), value),
+                None => object.remove(member),
+            };
+            Ok(body.to_string())
+        };
+        let unreadable_account_updates = [
+            with("/aid", None)?,
+            with("/fields", None)?,
+            with("/snapshot", None)?,
+            with("/aid", Some(json!(5)))?,
+            with("/aid", Some(json!({"PF5": 1})))?,
+            with("/fields/zip", Some(json!(7)))?,
+            with("/fields/ssn_part1", Some(json!(123)))?,
+            with("/snapshot/state", None)?,
+            with("/snapshot/open_date", Some(json!("2014-13-45")))?,
+            members_around(r#""aid":"PF5""#, &account, "")?,
+            format!(r#"{{"aid":"ENTER","fields":{{"zip":"1","zip":"2"}},"snapshot":{snapshot}}}"#),
+            format!(
+                r#"{{"aid":"ENTER","fields":{{}},"snapshot":{snapshot},"snapshot":{snapshot}}}"#
+            ),
+        ];
+        let readable_account_updates = [
+            with("/unknown", Some(json!([1])))?,
+            with("/fields/unknown", Some(json!({"a": 1})))?,
+            with("/snapshot/unknown", Some(Value::Null))?,
+            with("/snapshot/open_date", None)?,
+            with("/snapshot/dob", Some(Value::Null))?,
+            with("/fields/ssn_part1", Some(Value::Null))?,
+            with("/fields", Some(json!({})))?,
+        ];
+        block_on(async {
+            for body in [
+                r#"{"user_id":"ADMIN001","user_id":"ADMIN002"}"#,
+                r#"{"password":"A","password":"B"}"#,
+                r#"{"user_id":7}"#,
+                r#"{"password":null}"#,
+            ] {
+                assert_unreadable::<SignonRequest>(body).await?;
+            }
+            for body in [
+                r#"{"acct_id":"1","acct_id":"2"}"#,
+                r#"{"confirm":true}"#,
+                r#"{"acct_id":null}"#,
+            ] {
+                assert_unreadable::<BillPaymentRequest>(body).await?;
+            }
+            for body in [
+                r#"{"confirm":"Y","confirm":"N"}"#,
+                r#"{"monthly":1}"#,
+                r#"{"end_year":["2022"]}"#,
+            ] {
+                assert_unreadable::<ReportRequest>(body).await?;
+            }
+            for body in &unreadable_account_updates {
+                assert_unreadable::<AccountUpdateRequest>(body).await?;
+            }
+            for body in &readable_account_updates {
+                let ValidJson(request) =
+                    ValidJson::<AccountUpdateRequest>::from_request(json_request(body)?, &())
+                        .await
+                        .map_err(|error| format!("{body}: {error}"))?;
+                assert!(request.fields.input("").ssn.is_none(), "{body}");
+            }
+            Ok(())
+        })
+    }
+
     #[test]
     fn screen_result_carries_the_message_only() -> TestResult {
         let result = ScreenResult::from("User NEWUSR01 has been added ...".to_owned());
@@ -1347,119 +2229,125 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn json_bodies_are_deserialised_then_validated() -> TestResult {
-        let ValidJson(probe) =
-            ValidJson::<Probe>::from_request(json_request(r#"{"user_id":"USER0001"}"#)?, &())
-                .await
-                .map_err(|error| error.to_string())?;
-        assert_eq!(probe.user_id, "USER0001");
+    #[test]
+    fn json_bodies_are_deserialised_then_validated() -> TestResult {
+        block_on(async {
+            let ValidJson(probe) =
+                ValidJson::<Probe>::from_request(json_request(r#"{"user_id":"USER0001"}"#)?, &())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(probe.user_id, "USER0001");
 
-        let too_long =
-            ValidJson::<Probe>::from_request(json_request(r#"{"user_id":"USER00010"}"#)?, &())
-                .await
-                .err()
-                .ok_or("over-long user ID accepted")?;
-        assert_eq!(
-            parts(&too_long),
-            (
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("user_id")
-            )
-        );
-
-        // Out of range, beyond `i64` or no integer at all: the 422, which echoes nothing.
-        for size in [
-            "101".to_owned(),
-            format!("{CARD}{CARD}"),
-            format!("\"{CARD}\""),
-            "1.5".to_owned(),
-            "true".to_owned(),
-            format!("[{CARD}]"),
-        ] {
-            let body = format!(r#"{{"page_size":{size},"user_id":"USER00010"}}"#);
-            let error = ValidJson::<Probe>::from_request(json_request(&body)?, &())
-                .await
-                .err()
-                .ok_or("page_size accepted")?;
+            let too_long =
+                ValidJson::<Probe>::from_request(json_request(r#"{"user_id":"USER00010"}"#)?, &())
+                    .await
+                    .err()
+                    .ok_or("over-long user ID accepted")?;
             assert_eq!(
-                parts(&error),
+                parts(&too_long),
                 (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    PAGE_SIZE_MESSAGE,
-                    Some(PAGE_SIZE_FIELD)
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("user_id")
                 )
             );
-            assert!(!serde_json::to_string(&error)?.contains("4111"));
-        }
-        Ok(())
+
+            // Out of range, beyond `i64` or no integer at all: the 422, which echoes nothing.
+            for size in [
+                "101".to_owned(),
+                format!("{CARD}{CARD}"),
+                format!("\"{CARD}\""),
+                "1.5".to_owned(),
+                "true".to_owned(),
+                format!("[{CARD}]"),
+            ] {
+                let body = format!(r#"{{"page_size":{size},"user_id":"USER00010"}}"#);
+                let error = ValidJson::<Probe>::from_request(json_request(&body)?, &())
+                    .await
+                    .err()
+                    .ok_or("page_size accepted")?;
+                assert_eq!(
+                    parts(&error),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        PAGE_SIZE_MESSAGE,
+                        Some(PAGE_SIZE_FIELD)
+                    )
+                );
+                assert!(!serde_json::to_string(&error)?.contains("4111"));
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn unreadable_bodies_are_a_400_that_echoes_nothing() -> TestResult {
-        let mut requests = vec![
-            json_request(&format!(r#"{{"page_no":"{CARD}"}}"#))?,
-            json_request(&format!(r#"{{"user_id":{CARD}}}"#))?,
-            json_request(&format!(r#"{{"user_id":"{CARD}""#))?,
-        ];
-        requests.push(
-            Request::builder()
-                .method("POST")
-                .uri("/probe")
-                .body(Body::from(format!(r#"{{"user_id":"{CARD}"}}"#)))?,
-        );
-        for request in requests {
-            let error = ValidJson::<Probe>::from_request(request, &())
-                .await
-                .err()
-                .ok_or("unreadable body accepted")?;
-            assert_eq!(parts(&error), (StatusCode::BAD_REQUEST, INVALID_BODY, None));
-            assert!(!error.message().contains("4111"));
-        }
+    #[test]
+    fn unreadable_bodies_are_a_400_that_echoes_nothing() -> TestResult {
+        block_on(async {
+            let mut requests = vec![
+                json_request(&format!(r#"{{"page_no":"{CARD}"}}"#))?,
+                json_request(&format!(r#"{{"user_id":{CARD}}}"#))?,
+                json_request(&format!(r#"{{"user_id":"{CARD}""#))?,
+            ];
+            requests.push(
+                Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(Body::from(format!(r#"{{"user_id":"{CARD}"}}"#)))?,
+            );
+            for request in requests {
+                let error = ValidJson::<Probe>::from_request(request, &())
+                    .await
+                    .err()
+                    .ok_or("unreadable body accepted")?;
+                assert_eq!(parts(&error), (StatusCode::BAD_REQUEST, INVALID_BODY, None));
+                assert!(!error.message().contains("4111"));
+            }
 
-        // A value that deserialises but breaks a rule is not echoed either.
-        let error = ValidJson::<Probe>::from_request(
-            json_request(&format!(r#"{{"user_id":"{CARD}"}}"#))?,
-            &(),
-        )
-        .await
-        .err()
-        .ok_or("over-long card number accepted")?;
-        let body = serde_json::to_string(&error)?;
-        assert!(!body.contains("4111"), "{body}");
-        Ok(())
+            // A value that deserialises but breaks a rule is not echoed either.
+            let error = ValidJson::<Probe>::from_request(
+                json_request(&format!(r#"{{"user_id":"{CARD}"}}"#))?,
+                &(),
+            )
+            .await
+            .err()
+            .ok_or("over-long card number accepted")?;
+            let body = serde_json::to_string(&error)?;
+            assert!(!body.contains("4111"), "{body}");
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_body_that_is_not_a_json_object_is_a_400_before_any_rule() -> TestResult {
-        let bodies = [
-            "[]",
-            // Positional arrays that would fill the members in order: a sign-on, the same with a
-            // user ID too long for its rule, a bill payment and a confirmed Monthly report.
-            r#"["ADMIN001","PASSWORD"]"#,
-            r#"["USER00010","PASSWORD"]"#,
-            r#"["00000000033","Y"]"#,
-            r#"["X","","","","","","","","","Y"]"#,
-            "null",
-            r#""x""#,
-            "1",
-            "true",
-        ];
-        for body in bodies {
-            assert_unreadable::<Probe>(body).await?;
-            assert_unreadable::<SignonRequest>(body).await?;
-            assert_unreadable::<AccountUpdateRequest>(body).await?;
-            assert_unreadable::<CardUpdateRequest>(body).await?;
-            assert_unreadable::<TranAddRequest>(body).await?;
-            assert_unreadable::<ReportRequest>(body).await?;
-            assert_unreadable::<BillPaymentRequest>(body).await?;
-            assert_unreadable::<UserAddRequest>(body).await?;
-            assert_unreadable::<UserUpdateRequest>(body).await?;
-            assert_unreadable::<TranTypeListActionRequest>(body).await?;
-            assert_unreadable::<TranTypeActionRequest>(body).await?;
-        }
-        Ok(())
+    #[test]
+    fn a_body_that_is_not_a_json_object_is_a_400_before_any_rule() -> TestResult {
+        block_on(async {
+            let bodies = [
+                "[]",
+                // Positional arrays that would fill the members in order: a sign-on, the same with a
+                // user ID too long for its rule, a bill payment and a confirmed Monthly report.
+                r#"["ADMIN001","PASSWORD"]"#,
+                r#"["USER00010","PASSWORD"]"#,
+                r#"["00000000033","Y"]"#,
+                r#"["X","","","","","","","","","Y"]"#,
+                "null",
+                r#""x""#,
+                "1",
+                "true",
+            ];
+            for body in bodies {
+                assert_unreadable::<Probe>(body).await?;
+                assert_unreadable::<SignonRequest>(body).await?;
+                assert_unreadable::<AccountUpdateRequest>(body).await?;
+                assert_unreadable::<CardUpdateRequest>(body).await?;
+                assert_unreadable::<TranAddRequest>(body).await?;
+                assert_unreadable::<ReportRequest>(body).await?;
+                assert_unreadable::<BillPaymentRequest>(body).await?;
+                assert_unreadable::<UserAddRequest>(body).await?;
+                assert_unreadable::<UserUpdateRequest>(body).await?;
+                assert_unreadable::<TranTypeListActionRequest>(body).await?;
+                assert_unreadable::<TranTypeActionRequest>(body).await?;
+            }
+            Ok(())
+        })
     }
 
     /// Object bodies of endpoints 6, 10, 13 and 25, in that order, that read and pass every rule,
@@ -1519,140 +2407,144 @@ mod tests {
         ]
     }
 
-    #[tokio::test]
-    async fn a_nested_member_whose_schema_is_an_object_refuses_anything_else() -> TestResult {
-        let [account, card, transaction, list_action] = nested_object_bodies();
-        // `AccountUpdateSnapshot`'s members in declaration order: six texts, three dates,
-        // seventeen texts, the date of birth and three texts.
-        let texts = |count| std::iter::repeat_n(json!(""), count);
-        let positional_snapshot: Vec<Value> = texts(6)
-            .chain(std::iter::repeat_n(Value::Null, 3))
-            .chain(texts(17))
-            .chain([Value::Null])
-            .chain(texts(3))
-            .collect();
-        // Each nested object with the array that fills its members in declaration order.
-        let mut accepted = object_members_accepted::<AccountUpdateRequest>(
-            &account,
-            &[
-                ("/fields", json!(["Y", "2014"])),
-                ("/snapshot", Value::Array(positional_snapshot)),
-            ],
-        )
-        .await?;
-        accepted.extend(
-            object_members_accepted::<CardUpdateRequest>(
-                &card,
+    #[test]
+    fn a_nested_member_whose_schema_is_an_object_refuses_anything_else() -> TestResult {
+        block_on(async {
+            let [account, card, transaction, list_action] = nested_object_bodies();
+            // `AccountUpdateSnapshot`'s members in declaration order: six texts, three dates,
+            // seventeen texts, the date of birth and three texts.
+            let texts = |count| std::iter::repeat_n(json!(""), count);
+            let positional_snapshot: Vec<Value> = texts(6)
+                .chain(std::iter::repeat_n(Value::Null, 3))
+                .chain(texts(17))
+                .chain([Value::Null])
+                .chain(texts(3))
+                .collect();
+            // Each nested object with the array that fills its members in declaration order.
+            let mut accepted = object_members_accepted::<AccountUpdateRequest>(
+                &account,
                 &[
-                    ("/fields", json!(["TEST HOLDER", "N", "06", "2030"])),
-                    (
-                        "/snapshot",
-                        json!([
-                            "show_details",
-                            "00000000050",
-                            "TEST HOLDER",
-                            "2025-04-30",
-                            "Y"
-                        ]),
-                    ),
+                    ("/fields", json!(["Y", "2014"])),
+                    ("/snapshot", Value::Array(positional_snapshot)),
                 ],
             )
-            .await?,
-        );
-        accepted.extend(
-            object_members_accepted::<TranAddRequest>(
-                &transaction,
-                &[("/fields", json!(["01", "0001"]))],
-            )
-            .await?,
-        );
-        accepted.extend(
-            object_members_accepted::<TranTypeListActionRequest>(
-                &list_action,
-                &[
-                    ("/rows/0", json!(["U", "NEW"])),
-                    (
-                        "/state",
-                        json!([
-                            "",
-                            "",
-                            [],
-                            null,
-                            null,
-                            null,
-                            1,
-                            false,
-                            false,
-                            "none",
-                            [],
-                            "open",
-                            null
-                        ]),
-                    ),
-                    ("/state/rows/0", json!(["01", "PURCHASE"])),
-                    ("/state/screen_rows/0", json!(["01", "PURCHASE"])),
-                ],
-            )
-            .await?,
-        );
-        assert!(
-            accepted.is_empty(),
-            "read in place of an object: {accepted:#?}"
-        );
-        Ok(())
+            .await?;
+            accepted.extend(
+                object_members_accepted::<CardUpdateRequest>(
+                    &card,
+                    &[
+                        ("/fields", json!(["TEST HOLDER", "N", "06", "2030"])),
+                        (
+                            "/snapshot",
+                            json!([
+                                "show_details",
+                                "00000000050",
+                                "TEST HOLDER",
+                                "2025-04-30",
+                                "Y"
+                            ]),
+                        ),
+                    ],
+                )
+                .await?,
+            );
+            accepted.extend(
+                object_members_accepted::<TranAddRequest>(
+                    &transaction,
+                    &[("/fields", json!(["01", "0001"]))],
+                )
+                .await?,
+            );
+            accepted.extend(
+                object_members_accepted::<TranTypeListActionRequest>(
+                    &list_action,
+                    &[
+                        ("/rows/0", json!(["U", "NEW"])),
+                        (
+                            "/state",
+                            json!([
+                                "",
+                                "",
+                                [],
+                                null,
+                                null,
+                                null,
+                                1,
+                                false,
+                                false,
+                                "none",
+                                [],
+                                "open",
+                                null
+                            ]),
+                        ),
+                        ("/state/rows/0", json!(["01", "PURCHASE"])),
+                        ("/state/screen_rows/0", json!(["01", "PURCHASE"])),
+                    ],
+                )
+                .await?,
+            );
+            assert!(
+                accepted.is_empty(),
+                "read in place of an object: {accepted:#?}"
+            );
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn an_object_body_reads_as_it_always_has() -> TestResult {
-        // Unknown members are skipped and omitted ones take their defaults.
-        let body = r#" {"rows":[{"description":"X"}],"unknown":[1],"user_id":"USER0001"} "#;
-        let ValidJson(probe) = ValidJson::<Probe>::from_request(json_request(body)?, &())
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            (
-                probe.user_id.as_str(),
-                probe.rows.len(),
-                probe.inner.code.as_str()
-            ),
-            ("USER0001", 1, "")
-        );
-        // The same in a nested object and in each object of a list, which keep their own rules.
-        let body =
-            r#"{"inner":{"code":"ABC","unknown":[1]},"rows":[{},{"description":"X","x":[]}]}"#;
-        let probe = serde_json::from_str::<Probe>(body)?;
-        assert_eq!(
-            (
-                probe.inner.code.as_str(),
-                probe.rows.first().map(|row| row.description.as_str()),
-                probe.rows.get(1).map(|row| row.description.as_str())
-            ),
-            ("ABC", Some(""), Some("X"))
-        );
-        let error = ValidJson::<Probe>::from_request(json_request(body)?, &())
-            .await
-            .err()
-            .ok_or("over-long nested code accepted")?;
-        assert_eq!(
-            parts(&error),
-            (
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("inner.code")
-            )
-        );
-        // A duplicate member at any depth and text after the object are still unreadable,
-        // before any rule.
-        for body in [
-            r#"{"user_id":"USER0001","user_id":"USER0002"}"#,
-            r#"{"user_id":"USER00010","user_id":"USER0001"}"#,
-            r#"{"inner":{"code":"A","code":"B"}}"#,
-            r#"{"rows":[{"description":"A","description":"B"}]}"#,
-            r#"{"user_id":"USER0001"} []"#,
-        ] {
-            assert_unreadable::<Probe>(body).await?;
-        }
-        Ok(())
+    #[test]
+    fn an_object_body_skips_unknown_members_and_defaults_omitted_ones() -> TestResult {
+        block_on(async {
+            // Unknown members are skipped and omitted ones take their defaults.
+            let body = r#" {"rows":[{"description":"X"}],"unknown":[1],"user_id":"USER0001"} "#;
+            let ValidJson(probe) = ValidJson::<Probe>::from_request(json_request(body)?, &())
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                (
+                    probe.user_id.as_str(),
+                    probe.rows.len(),
+                    probe.inner.code.as_str()
+                ),
+                ("USER0001", 1, "")
+            );
+            // The same in a nested object and in each object of a list, which keep their own rules.
+            let body =
+                r#"{"inner":{"code":"ABC","unknown":[1]},"rows":[{},{"description":"X","x":[]}]}"#;
+            let probe = serde_json::from_str::<Probe>(body)?;
+            assert_eq!(
+                (
+                    probe.inner.code.as_str(),
+                    probe.rows.first().map(|row| row.description.as_str()),
+                    probe.rows.get(1).map(|row| row.description.as_str())
+                ),
+                ("ABC", Some(""), Some("X"))
+            );
+            let error = ValidJson::<Probe>::from_request(json_request(body)?, &())
+                .await
+                .err()
+                .ok_or("over-long nested code accepted")?;
+            assert_eq!(
+                parts(&error),
+                (
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("inner.code")
+                )
+            );
+            // A duplicate member at any depth and text after the object are still unreadable,
+            // before any rule.
+            for body in [
+                r#"{"user_id":"USER0001","user_id":"USER0002"}"#,
+                r#"{"user_id":"USER00010","user_id":"USER0001"}"#,
+                r#"{"inner":{"code":"A","code":"B"}}"#,
+                r#"{"rows":[{"description":"A","description":"B"}]}"#,
+                r#"{"user_id":"USER0001"} []"#,
+            ] {
+                assert_unreadable::<Probe>(body).await?;
+            }
+            Ok(())
+        })
     }
 
     /// The JSON object text of `object` with `first` as its first member and `last` as its last,
@@ -1703,218 +2595,230 @@ mod tests {
     /// A top-level `page_size` holding a JSON number beyond the range `serde_json` represents is
     /// the 422 of every size outside the range, wherever the member stands and however the body
     /// is laid out: on the probe, whose user ID also breaks its rule, and on endpoint 25's body.
-    #[tokio::test]
-    async fn a_page_size_beyond_the_parsers_range_is_the_422() -> TestResult {
-        let nines = "9".repeat(310);
-        let sizes = [
-            nines.clone(),
-            format!("-{nines}"),
-            "1e400".to_owned(),
-            "-1e400".to_owned(),
-            // 400 digits, which the rejection must not echo.
-            CARD.repeat(25),
-            // The exponent overflows, so the parser stops inside it.
-            "1E99999999999999999999".to_owned(),
-            format!("{nines}.5e3"),
-            // An array is outside the range whatever it holds.
-            format!("[7,{nines}]"),
-        ];
-        let probe = json!({"user_id": "USER00010"});
-        let [.., list_action] = nested_object_bodies();
-        // A failure names the case by its indexes: some bodies hold card numbers.
-        for (size, value) in sizes.iter().enumerate() {
-            for (layout, body) in page_size_layouts(&probe, value)?.iter().enumerate() {
-                let error = json_rejection::<Probe>(body).await?;
-                assert_eq!(
-                    parts(&error),
-                    (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        PAGE_SIZE_MESSAGE,
-                        Some(PAGE_SIZE_FIELD)
-                    ),
-                    "probe, size {size}, layout {layout}"
-                );
-                assert!(
-                    !serde_json::to_string(&error)?.contains("4111"),
-                    "probe, size {size}, layout {layout}"
-                );
+    #[test]
+    fn a_page_size_beyond_the_parsers_range_is_the_422() -> TestResult {
+        block_on(async {
+            let nines = "9".repeat(310);
+            let sizes = [
+                nines.clone(),
+                format!("-{nines}"),
+                "1e400".to_owned(),
+                "-1e400".to_owned(),
+                // 400 digits, which the rejection must not echo.
+                CARD.repeat(25),
+                // The exponent overflows, so the parser stops inside it.
+                "1E99999999999999999999".to_owned(),
+                format!("{nines}.5e3"),
+                // An array is outside the range whatever it holds.
+                format!("[7,{nines}]"),
+            ];
+            let probe = json!({"user_id": "USER00010"});
+            let [.., list_action] = nested_object_bodies();
+            // A failure names the case by its indexes: some bodies hold card numbers.
+            for (size, value) in sizes.iter().enumerate() {
+                for (layout, body) in page_size_layouts(&probe, value)?.iter().enumerate() {
+                    let error = json_rejection::<Probe>(body).await?;
+                    assert_eq!(
+                        parts(&error),
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            PAGE_SIZE_MESSAGE,
+                            Some(PAGE_SIZE_FIELD)
+                        ),
+                        "probe, size {size}, layout {layout}"
+                    );
+                    assert!(
+                        !serde_json::to_string(&error)?.contains("4111"),
+                        "probe, size {size}, layout {layout}"
+                    );
+                }
+                for (layout, body) in page_size_layouts(&list_action, value)?.iter().enumerate() {
+                    let error = json_rejection::<TranTypeListActionRequest>(body).await?;
+                    assert_eq!(
+                        parts(&error),
+                        (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            PAGE_SIZE_MESSAGE,
+                            Some(PAGE_SIZE_FIELD)
+                        ),
+                        "endpoint 25, size {size}, layout {layout}"
+                    );
+                    assert!(
+                        !serde_json::to_string(&error)?.contains("4111"),
+                        "endpoint 25, size {size}, layout {layout}"
+                    );
+                }
             }
-            for (layout, body) in page_size_layouts(&list_action, value)?.iter().enumerate() {
-                let error = json_rejection::<TranTypeListActionRequest>(body).await?;
-                assert_eq!(
-                    parts(&error),
-                    (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        PAGE_SIZE_MESSAGE,
-                        Some(PAGE_SIZE_FIELD)
-                    ),
-                    "endpoint 25, size {size}, layout {layout}"
-                );
-                assert!(
-                    !serde_json::to_string(&error)?.contains("4111"),
-                    "endpoint 25, size {size}, layout {layout}"
-                );
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// A body that does not deserialise for any other reason stays the 400, beside a
     /// `page_size` beyond the parser's range or in its place: a malformed number, a truncated
     /// body, text after the object, and a member that does not deserialise or holds such a
     /// number itself, before `page_size` or after it, at the top level or nested.
-    #[tokio::test]
-    async fn a_body_unreadable_beside_a_page_size_beyond_the_parsers_range_is_a_400() -> TestResult
-    {
-        let nines = "9".repeat(310);
-        let huge = format!(r#""page_size":{nines}"#);
-        let huge_page_no = format!(r#""page_no":{nines}"#);
-        let probe = json!({"user_id": "USER0001"});
-        let probe_last = members_around("", &probe, &huge)?;
-        for body in [
-            members_around("", &probe, r#""page_size":1.e5"#)?,
-            members_around("", &probe, r#""page_size":01"#)?,
-            members_around("", &probe, r#""page_size":-"#)?,
-            probe_last.trim_end_matches('}').to_owned(),
-            members_around(&huge, &probe, "")?
-                .trim_end_matches('}')
-                .to_owned(),
-            format!("{probe_last} x"),
-            members_around(r#""page_no":"x""#, &probe, &huge)?,
-            members_around(&huge, &probe, r#""page_no":"x""#)?,
-            members_around(&huge_page_no, &probe, &huge)?,
-            members_around(&huge, &probe, &huge_page_no)?,
-            members_around(&huge_page_no, &probe, "")?,
-        ] {
-            assert_unreadable::<Probe>(&body).await?;
-        }
+    #[test]
+    fn a_body_unreadable_beside_a_page_size_beyond_the_parsers_range_is_a_400() -> TestResult {
+        block_on(async {
+            let nines = "9".repeat(310);
+            let huge = format!(r#""page_size":{nines}"#);
+            let huge_page_no = format!(r#""page_no":{nines}"#);
+            let probe = json!({"user_id": "USER0001"});
+            let probe_last = members_around("", &probe, &huge)?;
+            for body in [
+                members_around("", &probe, r#""page_size":1.e5"#)?,
+                members_around("", &probe, r#""page_size":01"#)?,
+                members_around("", &probe, r#""page_size":-"#)?,
+                probe_last.trim_end_matches('}').to_owned(),
+                members_around(&huge, &probe, "")?
+                    .trim_end_matches('}')
+                    .to_owned(),
+                format!("{probe_last} x"),
+                members_around(r#""page_no":"x""#, &probe, &huge)?,
+                members_around(&huge, &probe, r#""page_no":"x""#)?,
+                members_around(&huge_page_no, &probe, &huge)?,
+                members_around(&huge, &probe, &huge_page_no)?,
+                members_around(&huge_page_no, &probe, "")?,
+            ] {
+                assert_unreadable::<Probe>(&body).await?;
+            }
 
-        let [.., list_action] = nested_object_bodies();
-        let mut without_aid = list_action.clone();
-        without_aid
-            .as_object_mut()
-            .ok_or("the endpoint 25 body is not an object")?
-            .remove("aid");
-        // `state.page_no`, nested, holds the number as well.
-        let nested = |text: String| {
-            let nested = text.replacen(r#""page_no":1"#, &huge_page_no, 1);
-            (nested != text)
-                .then_some(nested)
-                .ok_or("no state.page_no to replace")
-        };
-        for body in [
-            members_around(r#""aid":"PF7""#, &without_aid, &huge)?,
-            members_around(&huge, &without_aid, r#""aid":"PF7""#)?,
-            nested(members_around("", &list_action, &huge)?)?,
-            nested(members_around(&huge, &list_action, "")?)?,
-            members_around("", &list_action, r#""page_size":1.e5"#)?,
-            members_around("", &list_action, &huge)?
-                .trim_end_matches('}')
-                .to_owned(),
-        ] {
-            assert_unreadable::<TranTypeListActionRequest>(&body).await?;
-        }
-        Ok(())
+            let [.., list_action] = nested_object_bodies();
+            let mut without_aid = list_action.clone();
+            without_aid
+                .as_object_mut()
+                .ok_or("the endpoint 25 body is not an object")?
+                .remove("aid");
+            // `state.page_no`, nested, holds the number as well.
+            let nested = |text: String| {
+                let nested = text.replacen(r#""page_no":1"#, &huge_page_no, 1);
+                (nested != text)
+                    .then_some(nested)
+                    .ok_or("no state.page_no to replace")
+            };
+            for body in [
+                members_around(r#""aid":"PF7""#, &without_aid, &huge)?,
+                members_around(&huge, &without_aid, r#""aid":"PF7""#)?,
+                nested(members_around("", &list_action, &huge)?)?,
+                nested(members_around(&huge, &list_action, "")?)?,
+                members_around("", &list_action, r#""page_size":1.e5"#)?,
+                members_around("", &list_action, &huge)?
+                    .trim_end_matches('}')
+                    .to_owned(),
+            ] {
+                assert_unreadable::<TranTypeListActionRequest>(&body).await?;
+            }
+            Ok(())
+        })
     }
 
-    /// A DTO without a `page_size` member skips an unknown one unread, as it always has, whatever
-    /// number it holds; a malformed number there is still unreadable.
-    #[tokio::test]
-    async fn an_unknown_page_size_beyond_the_parsers_range_is_skipped_as_before() -> TestResult {
-        let nines = "9".repeat(310);
-        let sign_on = json!({"user_id": "ADMIN001", "password": "PASSWORD"});
-        for body in [
-            members_around("", &sign_on, &format!(r#""page_size":{nines}"#))?,
-            members_around(&format!(r#""page_size":-{nines}"#), &sign_on, "")?,
-            members_around("", &sign_on, r#""page_size":1e400"#)?,
-        ] {
-            let ValidJson(request) =
-                ValidJson::<SignonRequest>::from_request(json_request(&body)?, &())
-                    .await
-                    .map_err(|error| error.to_string())?;
-            assert_eq!(request.user_id, "ADMIN001");
-        }
-        assert_unreadable::<SignonRequest>(&members_around("", &sign_on, r#""page_size":1.e5"#)?)
+    /// A DTO without a `page_size` member skips an unknown `page_size` unread, whatever number it
+    /// holds, one beyond the parser's range included; a malformed number there makes the body
+    /// unreadable, the 400 of [`INVALID_BODY`] with no field.
+    #[test]
+    fn an_unknown_page_size_beyond_the_parsers_range_is_skipped_unread() -> TestResult {
+        block_on(async {
+            let nines = "9".repeat(310);
+            let sign_on = json!({"user_id": "ADMIN001", "password": "PASSWORD"});
+            for body in [
+                members_around("", &sign_on, &format!(r#""page_size":{nines}"#))?,
+                members_around(&format!(r#""page_size":-{nines}"#), &sign_on, "")?,
+                members_around("", &sign_on, r#""page_size":1e400"#)?,
+            ] {
+                let ValidJson(request) =
+                    ValidJson::<SignonRequest>::from_request(json_request(&body)?, &())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                assert_eq!(request.user_id, "ADMIN001");
+            }
+            assert_unreadable::<SignonRequest>(&members_around(
+                "",
+                &sign_on,
+                r#""page_size":1.e5"#,
+            )?)
             .await
+        })
     }
 
-    #[tokio::test]
-    async fn query_strings_are_deserialised_then_validated() -> TestResult {
-        let probe = query("/users?page_size=7&start_user_id=USER0001")
-            .await?
-            .map_err(|error| error.to_string())?;
-        assert_eq!(probe.page_size, Some(7));
-        assert_eq!(probe.start_user_id.as_deref(), Some("USER0001"));
+    #[test]
+    fn query_strings_are_deserialised_then_validated() -> TestResult {
+        block_on(async {
+            let probe = query("/users?page_size=7&start_user_id=USER0001")
+                .await?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(probe.page_size, Some(7));
+            assert_eq!(probe.start_user_id.as_deref(), Some("USER0001"));
 
-        let probe = query("/users").await?.map_err(|error| error.to_string())?;
-        assert_eq!(probe.page_size, None);
+            let probe = query("/users").await?.map_err(|error| error.to_string())?;
+            assert_eq!(probe.page_size, None);
 
-        // Out of range, beyond `i64` or no integer at all, whatever other rule fails: the 422,
-        // which echoes nothing. A failure names the case by its index: two of the URIs hold a
-        // card number.
-        for (case, uri) in [
-            "/users?page_size=101".to_owned(),
-            "/users?page_size=0".to_owned(),
-            "/users?page_size=-1".to_owned(),
-            "/users?page_size=101&start_user_id=USER00010".to_owned(),
-            format!("/users?page_size={CARD}{CARD}"),
-            format!("/users?page_size={CARD}x"),
-            "/users?page_size=7.5".to_owned(),
-            "/users?page_size=".to_owned(),
-            "/users?page_size=abc&start_user_id=USER00010".to_owned(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let error = query(&uri)
+            // Out of range, beyond `i64` or no integer at all, whatever other rule fails: the 422,
+            // which echoes nothing. A failure names the case by its index: two of the URIs hold a
+            // card number.
+            for (case, uri) in [
+                "/users?page_size=101".to_owned(),
+                "/users?page_size=0".to_owned(),
+                "/users?page_size=-1".to_owned(),
+                "/users?page_size=101&start_user_id=USER00010".to_owned(),
+                format!("/users?page_size={CARD}{CARD}"),
+                format!("/users?page_size={CARD}x"),
+                "/users?page_size=7.5".to_owned(),
+                "/users?page_size=".to_owned(),
+                "/users?page_size=abc&start_user_id=USER00010".to_owned(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let error = query(&uri)
+                    .await?
+                    .err()
+                    .ok_or("out-of-range page_size accepted")?;
+                assert_eq!(
+                    parts(&error),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        PAGE_SIZE_MESSAGE,
+                        Some(PAGE_SIZE_FIELD)
+                    ),
+                    "case {case}"
+                );
+                assert!(
+                    !serde_json::to_string(&error)?.contains("4111"),
+                    "case {case}"
+                );
+            }
+
+            let error = query("/users?start_user_id=USER00010")
                 .await?
                 .err()
-                .ok_or("out-of-range page_size accepted")?;
+                .ok_or("over-long filter accepted")?;
             assert_eq!(
                 parts(&error),
                 (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    PAGE_SIZE_MESSAGE,
-                    Some(PAGE_SIZE_FIELD)
-                ),
-                "case {case}"
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("start_user_id")
+                )
             );
-            assert!(
-                !serde_json::to_string(&error)?.contains("4111"),
-                "case {case}"
-            );
-        }
 
-        let error = query("/users?start_user_id=USER00010")
-            .await?
-            .err()
-            .ok_or("over-long filter accepted")?;
-        assert_eq!(
-            parts(&error),
-            (
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("start_user_id")
-            )
-        );
-
-        // Another member that does not deserialise, beside a valid `page_size`.
-        for uri in [
-            format!("/users?page_size=7&page_no={CARD}x"),
-            format!("/users?page_size=7&page_no={CARD}{CARD}"),
-            "/users?page_size=7&page_no=7.5".to_owned(),
-        ] {
-            let error = query(&uri)
-                .await?
-                .err()
-                .ok_or("unreadable query accepted")?;
-            assert_eq!(
-                parts(&error),
-                (StatusCode::BAD_REQUEST, INVALID_QUERY, None)
-            );
-            assert!(!error.message().contains("4111"));
-        }
-        Ok(())
+            // Another member that does not deserialise, beside a valid `page_size`.
+            for uri in [
+                format!("/users?page_size=7&page_no={CARD}x"),
+                format!("/users?page_size=7&page_no={CARD}{CARD}"),
+                "/users?page_size=7&page_no=7.5".to_owned(),
+            ] {
+                let error = query(&uri)
+                    .await?
+                    .err()
+                    .ok_or("unreadable query accepted")?;
+                assert_eq!(
+                    parts(&error),
+                    (StatusCode::BAD_REQUEST, INVALID_QUERY, None)
+                );
+                assert!(!error.message().contains("4111"));
+            }
+            Ok(())
+        })
     }
 
     /// Every `page_size` value as the two forms read it: an integer `i64` holds as itself, one
@@ -2037,5 +2941,113 @@ mod tests {
         assert_eq!(digits(PicU::<11>::new(50)?), "00000000050");
         assert_eq!(digits(PicU::<9>::ZERO), "000000000");
         Ok(())
+    }
+
+    /// How long the body-deadline test lets a body arrive: short, so that the test finishes
+    /// quickly, and far longer than a local connection takes to deliver a body sent at once.
+    const BODY_TEST_DEADLINE: Duration = Duration::from_millis(300);
+
+    /// How long a raw client waits for the server to answer and close the connection, so that a
+    /// server that never answers fails the test rather than hanging it.
+    const ANSWER_WAIT: Duration = Duration::from_secs(30);
+
+    /// Serves `router` on an ephemeral local port until the test's runtime ends, and returns the
+    /// address it listens on.
+    async fn serve(router: Router) -> Result<SocketAddr, Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(axum::serve(listener, router).into_future());
+        Ok(address)
+    }
+
+    /// The bytes the server at `address` answers with when `request` is written to it, as it is,
+    /// over a new connection that then sends nothing more; read until the server closes the
+    /// connection. It blocks, so a test runs it on Tokio's blocking pool.
+    fn raw_exchange(address: SocketAddr, request: &[u8]) -> io::Result<Vec<u8>> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(ANSWER_WAIT))?;
+        stream.write_all(request)?;
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer)?;
+        Ok(answer)
+    }
+
+    /// The status code and the JSON body of `answer`, an HTTP/1.1 response whose whole body
+    /// follows its head.
+    fn status_and_json(answer: &[u8]) -> Result<(u16, Value), Box<dyn StdError>> {
+        let text = std::str::from_utf8(answer)?;
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .ok_or("the answer has no end of head")?;
+        let status = head
+            .split(' ')
+            .nth(1)
+            .ok_or("the answer has no status code")?
+            .parse()?;
+        Ok((status, serde_json::from_str(body)?))
+    }
+
+    #[test]
+    fn a_body_still_incomplete_at_its_deadline_is_a_400_and_a_whole_one_is_read() -> TestResult {
+        block_on(async {
+            let router = Router::new().route(
+                "/probe",
+                post(|request: Request| async move {
+                    body_within(request, &(), BODY_TEST_DEADLINE)
+                        .await
+                        .map(|bytes| Json(json!({ "length": bytes.len() })))
+                }),
+            );
+            let address = serve(router).await?;
+            let whole = format!(r#"{{"user_id":"{CARD}"}}"#);
+            let partial = format!(r#"{{"user_id":"{CARD}"#);
+            let timed_out = (400, json!({ "message": BODY_TIMEOUT }));
+            // The header that frames the body, the bytes of it sent before the client stops
+            // sending, and the status and body of the answer.
+            let cases = [
+                (
+                    format!("content-length: {}", whole.len()),
+                    whole.clone(),
+                    (200, json!({ "length": whole.len() })),
+                ),
+                // Fewer bytes than the length announces, then nothing more.
+                ("content-length: 100".to_owned(), partial, timed_out.clone()),
+                (
+                    "content-length: 100".to_owned(),
+                    String::new(),
+                    timed_out.clone(),
+                ),
+                // A chunked body whose last chunk never comes.
+                (
+                    "transfer-encoding: chunked".to_owned(),
+                    format!("{:x}\r\n{whole}\r\n", whole.len()),
+                    timed_out,
+                ),
+            ];
+            // A failure names the case by its index: the bodies hold a card number.
+            for (case, (framing, sent, expected)) in cases.into_iter().enumerate() {
+                let request = format!(
+                    "POST /probe HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+                     {framing}\r\nconnection: close\r\n\r\n{sent}"
+                );
+                let started = Instant::now();
+                let answer =
+                    tokio::task::spawn_blocking(move || raw_exchange(address, request.as_bytes()))
+                        .await??;
+                let waited = started.elapsed();
+                assert_eq!(status_and_json(&answer)?, expected, "case {case}");
+                if expected.0 == 400 {
+                    assert!(
+                        waited >= BODY_TEST_DEADLINE,
+                        "case {case}: after {waited:?}"
+                    );
+                }
+                assert!(
+                    !String::from_utf8_lossy(&answer).contains("4111"),
+                    "case {case}"
+                );
+            }
+            Ok(())
+        })
     }
 }

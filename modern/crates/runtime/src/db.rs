@@ -220,7 +220,7 @@ pub async fn connect(config: &Config) -> Result<PgPool, sqlx::Error> {
 /// Opens the request pool of `carddemo-api`: [`connect`], with every check, setting and error
 /// of it, and the pool's refusal watch, whose [`Refusals`] handle it returns beside the pool
 /// (see "Unreachable servers" above). The pool also counts the server's answers for the watch
-/// ([`request_pool_options`]). Its sessions add no server setting either, so they run with the
+/// (`request_pool_options`). Its sessions add no server setting either, so they run with the
 /// server options `DATABASE_URL` names and the server's own settings otherwise (see "Lock
 /// waits" above).
 ///
@@ -352,10 +352,10 @@ async fn refusal_watch(pool: PgPool, answers: Arc<AtomicU64>, report: Weak<Atomi
 /// connection that the server has not shown it can give, that is when some of the pool's
 /// `size` connections, those being opened included, are not among its `idle` ones and the
 /// server has not `answered` since the previous tick.
-///
-/// The pool has no more idle connections than connections, so an `idle` count beyond `u32`
-/// leaves none in use.
 fn probes(refusing: bool, size: u32, idle: usize, answered: bool) -> bool {
+    // TRUNCATION: checked; an `idle` count that does not fit `u32` fails the conversion and is
+    // read as no connection in use, which is exact: the pool holds no more idle connections than
+    // its `size`, itself a `u32`.
     let in_use = u32::try_from(idle).is_ok_and(|idle| size > idle);
     refusing || (in_use && !answered)
 }
@@ -879,6 +879,10 @@ mod tests {
     use sqlx::error::{DatabaseError, ErrorKind as DatabaseErrorKind};
     use sqlx::migrate::MigrateError;
     use sqlx::postgres::{PgConnectOptions, PgPool, PgSslMode};
+    use tracing::callsite::{DefaultCallsite, Identifier};
+    use tracing::field::{FieldSet, Value};
+    use tracing::metadata::Kind;
+    use tracing::{Event, Level, Metadata};
     use tracing_subscriber::fmt::MakeWriter;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -889,7 +893,7 @@ mod tests {
         request_pool_options, server_refuses, socket_path, watch_refusals,
     };
     use crate::config::Config;
-    use crate::telemetry::json_layer;
+    use crate::telemetry::{event_enabled, json_layer};
 
     /// Stand-in for a credential that a mistyped `DATABASE_URL` carries.
     const SECRET: &str = "s3cr3t-db-credential-7Q";
@@ -990,14 +994,14 @@ mod tests {
     /// Awaits `future` and returns its output and everything logged meanwhile.
     ///
     /// The capture is a subscriber made of [`json_layer`] alone, with no level filter, installed
-    /// on this thread only; the current-thread runtime of `#[tokio::test]` polls every task of
-    /// the test, those `sqlx` spawns included, on this thread. A probe event emitted first must
-    /// appear in the output, so that an empty capture cannot pass.
+    /// on this thread only; the runtime of [`current_thread`], on which every async test of this
+    /// module runs, polls every task of the test, those `sqlx` spawns included, on this thread. A
+    /// probe event emitted first must appear in the output, so that an empty capture cannot pass.
     async fn logged_while<T>(future: impl Future<Output = T>) -> (T, String) {
         let captured = Captured::default();
         let subscriber = tracing_subscriber::registry().with(json_layer(captured.clone()));
         let guard = tracing::subscriber::set_default(subscriber);
-        tracing::warn!(probe = CAPTURE_PROBE, "capture probe");
+        capture_probe();
         let value = future.await;
         drop(guard);
         let output = captured.text();
@@ -1006,6 +1010,33 @@ mod tests {
             "the capture recorded nothing: {output}"
         );
         (value, output)
+    }
+
+    // Written out: `tracing::warn!` expands to an `allow(unused_imports)` lint.
+    /// The callsite of the `WARN` capture probe event, whose fields are its `message` and
+    /// `probe`.
+    static CAPTURE_PROBE_SITE: DefaultCallsite = DefaultCallsite::new(&CAPTURE_PROBE_METADATA);
+
+    static CAPTURE_PROBE_METADATA: Metadata<'static> = Metadata::new(
+        "capture probe",
+        module_path!(),
+        Level::WARN,
+        None,
+        None,
+        Some(module_path!()),
+        FieldSet::new(&["message", "probe"], Identifier(&CAPTURE_PROBE_SITE)),
+        Kind::EVENT,
+    );
+
+    /// Emits the capture probe event, whose `probe` is [`CAPTURE_PROBE`], in the current span
+    /// when [`event_enabled`] says so.
+    fn capture_probe() {
+        if !event_enabled(&CAPTURE_PROBE_SITE) {
+            return;
+        }
+        let values: [Option<&dyn Value>; 2] = [Some(&"capture probe"), Some(&CAPTURE_PROBE)];
+        let fields = CAPTURE_PROBE_METADATA.fields();
+        Event::dispatch(&CAPTURE_PROBE_METADATA, &fields.value_set_all(&values));
     }
 
     fn assert_free_of(text: &str, secrets: &[&str]) {
@@ -1208,81 +1239,86 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn refuses_a_url_before_sqlx_can_quote_its_values() {
-        let refused = [
-            // An unrecognized parameter, which `sqlx` would log with its value.
-            (
-                format!("?application_name=carddemo&token={SECRET}"),
-                UrlError::UnrecognizedParameter(2),
-            ),
-            (
-                format!("?passwrod={SECRET}"),
-                UrlError::UnrecognizedParameter(1),
-            ),
-            // Recognized parameters with values `sqlx` rejects, quoting an unknown `sslmode`.
-            (format!("?sslmode={SECRET}"), UrlError::Invalid),
-            (
-                format!("?statement-cache-capacity={SECRET}"),
-                UrlError::Invalid,
-            ),
-        ];
-        for ((query, reason), entry) in refused
-            .iter()
-            .flat_map(|case| ENTRIES.map(|entry| (case, entry)))
-        {
-            let url = format!("postgres://carddemo:{OTHER_SECRET}@127.0.0.1:5432/carddemo{query}");
-            let (result, output) = connect_captured(&url, entry).await;
-            assert!(!output.contains(SQLX_UNRECOGNIZED), "{output}");
-            assert_free_of(&output, &[SECRET, OTHER_SECRET]);
-            let error = match result {
-                Err(error @ sqlx::Error::Configuration(_)) => error,
-                Err(other) => {
-                    panic!("{entry:?}: expected a configuration error for {query}, got {other}")
+    #[test]
+    fn refuses_a_url_before_sqlx_can_quote_its_values() {
+        current_thread().block_on(async {
+            let refused = [
+                // An unrecognized parameter, which `sqlx` would log with its value.
+                (
+                    format!("?application_name=carddemo&token={SECRET}"),
+                    UrlError::UnrecognizedParameter(2),
+                ),
+                (
+                    format!("?passwrod={SECRET}"),
+                    UrlError::UnrecognizedParameter(1),
+                ),
+                // Recognized parameters with values `sqlx` rejects, quoting an unknown `sslmode`.
+                (format!("?sslmode={SECRET}"), UrlError::Invalid),
+                (
+                    format!("?statement-cache-capacity={SECRET}"),
+                    UrlError::Invalid,
+                ),
+            ];
+            for ((query, reason), entry) in refused
+                .iter()
+                .flat_map(|case| ENTRIES.map(|entry| (case, entry)))
+            {
+                let url =
+                    format!("postgres://carddemo:{OTHER_SECRET}@127.0.0.1:5432/carddemo{query}");
+                let (result, output) = connect_captured(&url, entry).await;
+                assert!(!output.contains(SQLX_UNRECOGNIZED), "{output}");
+                assert_free_of(&output, &[SECRET, OTHER_SECRET]);
+                let error = match result {
+                    Err(error @ sqlx::Error::Configuration(_)) => error,
+                    Err(other) => {
+                        panic!("{entry:?}: expected a configuration error for {query}, got {other}")
+                    }
+                    Ok(_) => panic!("{entry:?}: {query} must not yield a pool"),
+                };
+                assert_eq!(
+                    error.to_string(),
+                    format!("error with configuration: {reason}")
+                );
+                let summary = ErrorSummary::from(&error).to_string();
+                assert_eq!(summary, format!("configuration: {reason}"));
+                for text in [error.to_string(), format!("{error:?}"), summary] {
+                    assert_free_of(&text, &[SECRET, OTHER_SECRET]);
                 }
-                Ok(_) => panic!("{entry:?}: {query} must not yield a pool"),
-            };
-            assert_eq!(
-                error.to_string(),
-                format!("error with configuration: {reason}")
-            );
-            let summary = ErrorSummary::from(&error).to_string();
-            assert_eq!(summary, format!("configuration: {reason}"));
-            for text in [error.to_string(), format!("{error:?}"), summary] {
-                assert_free_of(&text, &[SECRET, OTHER_SECRET]);
             }
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn a_failed_connection_setup_logs_and_returns_no_credential() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
-        let port = listener.local_addr().expect("listener address").port();
-        // The peer accepts and closes without answering, once per entry point, so each first
-        // connection fails on its first read. A refused, unresolved or silent server is the
-        // subject of `an_unreachable_server_is_reported_by_its_cause`.
-        let peer =
-            thread::spawn(move || ENTRIES.iter().try_for_each(|_| listener.accept().map(drop)));
-        let url = format!(
-            "postgres://carddemo:{SECRET}@127.0.0.1:{port}/carddemo\
-             ?application_name=carddemo&password={OTHER_SECRET}"
-        );
-        for entry in ENTRIES {
-            let (result, output) = connect_captured(&url, entry).await;
-            let error = match result {
-                Err(error @ sqlx::Error::Io(_)) => error,
-                Err(other) => panic!("{entry:?}: expected an I/O error, got {other}"),
-                Ok(_) => panic!("{entry:?}: a peer that closes at once must not yield a pool"),
-            };
-            let summary = ErrorSummary::from(&error).to_string();
-            assert!(summary.starts_with("io ("), "{entry:?}: {summary}");
-            for text in [error.to_string(), format!("{error:?}"), summary, output] {
-                assert_free_of(&text, &[SECRET, OTHER_SECRET]);
+    #[test]
+    fn a_failed_connection_setup_logs_and_returns_no_credential() {
+        current_thread().block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
+            let port = listener.local_addr().expect("listener address").port();
+            // The peer accepts and closes without answering, once per entry point, so each first
+            // connection fails on its first read. A refused, unresolved or silent server is the
+            // subject of `an_unreachable_server_is_reported_by_its_cause`.
+            let peer =
+                thread::spawn(move || ENTRIES.iter().try_for_each(|_| listener.accept().map(drop)));
+            let url = format!(
+                "postgres://carddemo:{SECRET}@127.0.0.1:{port}/carddemo\
+                 ?application_name=carddemo&password={OTHER_SECRET}"
+            );
+            for entry in ENTRIES {
+                let (result, output) = connect_captured(&url, entry).await;
+                let error = match result {
+                    Err(error @ sqlx::Error::Io(_)) => error,
+                    Err(other) => panic!("{entry:?}: expected an I/O error, got {other}"),
+                    Ok(_) => panic!("{entry:?}: a peer that closes at once must not yield a pool"),
+                };
+                let summary = ErrorSummary::from(&error).to_string();
+                assert!(summary.starts_with("io ("), "{entry:?}: {summary}");
+                for text in [error.to_string(), format!("{error:?}"), summary, output] {
+                    assert_free_of(&text, &[SECRET, OTHER_SECRET]);
+                }
             }
-        }
-        peer.join()
-            .expect("the peer thread ends")
-            .expect("the peer accepted every connection");
+            peer.join()
+                .expect("the peer thread ends")
+                .expect("the peer accepted every connection");
+        });
     }
 
     #[test]
@@ -1431,117 +1467,121 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn rejects_invalid_url() {
-        let config = Config {
-            database_url: "not-a-url".to_owned(),
-            ..Config::default()
-        };
-        match connect(&config).await {
-            Err(error @ sqlx::Error::Configuration(_)) => {
-                assert!(
-                    !error.to_string().contains("not-a-url"),
-                    "the error must not quote the URL: {error}"
-                );
+    #[test]
+    fn rejects_invalid_url() {
+        current_thread().block_on(async {
+            let config = Config {
+                database_url: "not-a-url".to_owned(),
+                ..Config::default()
+            };
+            match connect(&config).await {
+                Err(error @ sqlx::Error::Configuration(_)) => {
+                    assert!(
+                        !error.to_string().contains("not-a-url"),
+                        "the error must not quote the URL: {error}"
+                    );
+                }
+                Err(other) => panic!("expected a configuration error, got {other}"),
+                Ok(_) => panic!("an invalid URL must not yield a pool"),
             }
-            Err(other) => panic!("expected a configuration error, got {other}"),
-            Ok(_) => panic!("an invalid URL must not yield a pool"),
-        }
+        });
     }
 
-    #[tokio::test]
-    async fn refuses_a_url_that_leaves_a_setting_to_the_environment() {
-        let refused = [
-            // No host, user or password, which `sqlx` would take from the libpq environment,
-            // and the password from the pgpass file.
-            ("postgres:///carddemo".to_owned(), UrlError::NoHost),
-            (
-                format!("postgres://carddemo:{SECRET}@/carddemo"),
-                UrlError::NoHost,
-            ),
-            (
-                format!("postgres:carddemo?user=carddemo&password={SECRET}"),
-                UrlError::NoHost,
-            ),
-            (
-                format!("postgres://:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::NoUser,
-            ),
-            (
-                format!("postgres://127.0.0.1/carddemo?password={SECRET}"),
-                UrlError::NoUser,
-            ),
-            (
-                "postgres://carddemo@127.0.0.1:5432/carddemo".to_owned(),
-                UrlError::NoPassword,
-            ),
-            (
-                "postgres://carddemo:@127.0.0.1:5432/carddemo".to_owned(),
-                UrlError::NoPassword,
-            ),
-            (
-                "postgres://127.0.0.1/carddemo?user=carddemo".to_owned(),
-                UrlError::NoPassword,
-            ),
-            // Parts the URL standard removes before `sqlx` reads them: a password or a database
-            // that `sqlx` would then take from the environment.
-            (
-                "postgres://carddemo:\t@127.0.0.1/carddemo".to_owned(),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1/\n"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1/ "),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1/%2E%2e"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo/.."),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1/./carddemo"),
-                UrlError::Invalid,
-            ),
-            // No scheme.
-            (
-                format!("1postgres://carddemo:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("postgres//carddemo:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::Invalid,
-            ),
-            // A scheme other than `postgres` or `postgresql`. In this `http` URL, `\` ends the
-            // authority, so `sqlx` would find no password and read the pgpass file.
-            (pgpass_bypass_url(), UrlError::Invalid),
-            // The `http` default port is dropped, so `sqlx` would take the port from `PGPORT`.
-            (
-                format!("http://carddemo:{SECRET}@127.0.0.1:80/carddemo"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("https://carddemo:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("file://carddemo:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::Invalid,
-            ),
-            (
-                format!("mysql://carddemo:{SECRET}@127.0.0.1/carddemo"),
-                UrlError::Invalid,
-            ),
-        ];
-        for (url, reason) in refused {
-            assert_refused(&url, reason, &[SECRET]).await;
-        }
+    #[test]
+    fn refuses_a_url_that_leaves_a_setting_to_the_environment() {
+        current_thread().block_on(async {
+            let refused = [
+                // No host, user or password, which `sqlx` would take from the libpq environment,
+                // and the password from the pgpass file.
+                ("postgres:///carddemo".to_owned(), UrlError::NoHost),
+                (
+                    format!("postgres://carddemo:{SECRET}@/carddemo"),
+                    UrlError::NoHost,
+                ),
+                (
+                    format!("postgres:carddemo?user=carddemo&password={SECRET}"),
+                    UrlError::NoHost,
+                ),
+                (
+                    format!("postgres://:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::NoUser,
+                ),
+                (
+                    format!("postgres://127.0.0.1/carddemo?password={SECRET}"),
+                    UrlError::NoUser,
+                ),
+                (
+                    "postgres://carddemo@127.0.0.1:5432/carddemo".to_owned(),
+                    UrlError::NoPassword,
+                ),
+                (
+                    "postgres://carddemo:@127.0.0.1:5432/carddemo".to_owned(),
+                    UrlError::NoPassword,
+                ),
+                (
+                    "postgres://127.0.0.1/carddemo?user=carddemo".to_owned(),
+                    UrlError::NoPassword,
+                ),
+                // Parts the URL standard removes before `sqlx` reads them: a password or a database
+                // that `sqlx` would then take from the environment.
+                (
+                    "postgres://carddemo:\t@127.0.0.1/carddemo".to_owned(),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1/\n"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1/ "),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1/%2E%2e"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo/.."),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1/./carddemo"),
+                    UrlError::Invalid,
+                ),
+                // No scheme.
+                (
+                    format!("1postgres://carddemo:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("postgres//carddemo:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::Invalid,
+                ),
+                // A scheme other than `postgres` or `postgresql`. In this `http` URL, `\` ends the
+                // authority, so `sqlx` would find no password and read the pgpass file.
+                (pgpass_bypass_url(), UrlError::Invalid),
+                // The `http` default port is dropped, so `sqlx` would take the port from `PGPORT`.
+                (
+                    format!("http://carddemo:{SECRET}@127.0.0.1:80/carddemo"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("https://carddemo:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("file://carddemo:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::Invalid,
+                ),
+                (
+                    format!("mysql://carddemo:{SECRET}@127.0.0.1/carddemo"),
+                    UrlError::Invalid,
+                ),
+            ];
+            for (url, reason) in refused {
+                assert_refused(&url, reason, &[SECRET]).await;
+            }
+        });
     }
 
     #[test]
@@ -1651,129 +1691,133 @@ mod tests {
     /// The child of [`the_libpq_environment_and_the_pgpass_file_change_nothing`]: asserts in
     /// the environment it is given that the connection settings take nothing from it. Without
     /// [`CHILD_MODE`] it returns at once.
-    #[tokio::test]
-    async fn libpq_environment_child() {
-        let Ok(mode) = std::env::var(CHILD_MODE) else {
-            return;
-        };
-        let secrets = [SECRET, ENV_SECRET, PGPASS_SECRET];
-        let without_password = "postgres://carddemo@127.0.0.1:5432/carddemo";
-        // Control: `sqlx` alone takes this environment, and the password from `PGPASSWORD` or,
-        // without it, from the pgpass file, whose malformed line it logs verbatim into this
-        // capture.
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::registry().with(json_layer(captured.clone()));
-        let parsed = tracing::subscriber::with_default(subscriber, || {
-            without_password.parse::<PgConnectOptions>()
-        });
-        let options = parsed.expect("sqlx parses a URL without a password");
-        assert_eq!(options.get_application_name(), Some("env-app"));
-        let pgpass_logged = captured.text().contains(PGPASS_SECRET);
-        let pgpassword_taken = format!("{options:?}").contains(ENV_SECRET);
-        assert_eq!(
-            (pgpass_logged, pgpassword_taken),
-            (mode == "pgpass", mode != "pgpass"),
-            "control of mode {mode}"
-        );
+    #[test]
+    fn libpq_environment_child() {
+        current_thread().block_on(async {
+            let Ok(mode) = std::env::var(CHILD_MODE) else {
+                return;
+            };
+            let secrets = [SECRET, ENV_SECRET, PGPASS_SECRET];
+            let without_password = "postgres://carddemo@127.0.0.1:5432/carddemo";
+            // Control: `sqlx` alone takes this environment, and the password from `PGPASSWORD` or,
+            // without it, from the pgpass file, whose malformed line it logs verbatim into this
+            // capture.
+            let captured = Captured::default();
+            let subscriber = tracing_subscriber::registry().with(json_layer(captured.clone()));
+            let parsed = tracing::subscriber::with_default(subscriber, || {
+                without_password.parse::<PgConnectOptions>()
+            });
+            let options = parsed.expect("sqlx parses a URL without a password");
+            assert_eq!(options.get_application_name(), Some("env-app"));
+            let pgpass_logged = captured.text().contains(PGPASS_SECRET);
+            let pgpassword_taken = format!("{options:?}").contains(ENV_SECRET);
+            assert_eq!(
+                (pgpass_logged, pgpassword_taken),
+                (mode == "pgpass", mode != "pgpass"),
+                "control of mode {mode}"
+            );
 
-        match mode.as_str() {
-            "pgpass" | "pgpassword" => {
-                assert_settings_come_from_the_url();
-                assert_refused("postgres:///carddemo", UrlError::NoHost, &secrets).await;
-                let without_user = format!("postgres://:{SECRET}@127.0.0.1/carddemo");
-                assert_refused(&without_user, UrlError::NoUser, &secrets).await;
-                assert_refused(without_password, UrlError::NoPassword, &secrets).await;
-                if mode == "pgpass" {
-                    // Control: `sqlx` alone reads the pgpass file for this URL and logs its
-                    // malformed line into this capture.
-                    let bypass = pgpass_bypass_url();
-                    let captured = Captured::default();
-                    let subscriber =
-                        tracing_subscriber::registry().with(json_layer(captured.clone()));
-                    let parsed = tracing::subscriber::with_default(subscriber, || {
-                        bypass.parse::<PgConnectOptions>()
-                    });
-                    assert!(parsed.is_ok(), "sqlx parses the http URL");
-                    assert!(
-                        captured.text().contains(PGPASS_SECRET),
-                        "control of the http URL"
-                    );
-                    assert_refused(&bypass, UrlError::Invalid, &secrets).await;
+            match mode.as_str() {
+                "pgpass" | "pgpassword" => {
+                    assert_settings_come_from_the_url();
+                    assert_refused("postgres:///carddemo", UrlError::NoHost, &secrets).await;
+                    let without_user = format!("postgres://:{SECRET}@127.0.0.1/carddemo");
+                    assert_refused(&without_user, UrlError::NoUser, &secrets).await;
+                    assert_refused(without_password, UrlError::NoPassword, &secrets).await;
+                    if mode == "pgpass" {
+                        // Control: `sqlx` alone reads the pgpass file for this URL and logs its
+                        // malformed line into this capture.
+                        let bypass = pgpass_bypass_url();
+                        let captured = Captured::default();
+                        let subscriber =
+                            tracing_subscriber::registry().with(json_layer(captured.clone()));
+                        let parsed = tracing::subscriber::with_default(subscriber, || {
+                            bypass.parse::<PgConnectOptions>()
+                        });
+                        assert!(parsed.is_ok(), "sqlx parses the http URL");
+                        assert!(
+                            captured.text().contains(PGPASS_SECRET),
+                            "control of the http URL"
+                        );
+                        assert_refused(&bypass, UrlError::Invalid, &secrets).await;
+                    }
                 }
+                "pgoptions" => {
+                    let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
+                    assert_refused(&url, UrlError::EnvironmentOptions, &secrets).await;
+                }
+                "pgoptions-blank" => {
+                    let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
+                    let options = connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"));
+                    // Only the whitespace, which the server skips, reaches it as server options.
+                    assert_eq!(options.get_options(), Some(BLANK_PGOPTIONS));
+                }
+                other => panic!("unknown child mode {other}"),
             }
-            "pgoptions" => {
-                let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
-                assert_refused(&url, UrlError::EnvironmentOptions, &secrets).await;
-            }
-            "pgoptions-blank" => {
-                let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
-                let options = connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"));
-                // Only the whitespace, which the server skips, reaches it as server options.
-                assert_eq!(options.get_options(), Some(BLANK_PGOPTIONS));
-            }
-            other => panic!("unknown child mode {other}"),
-        }
-        println!("{CHILD_PASSED} {mode}");
+            println!("{CHILD_PASSED} {mode}");
+        });
     }
 
-    #[tokio::test]
-    async fn an_unreachable_server_is_reported_by_its_cause() {
-        // Nothing listens on the port of a dropped listener, so a connection to it is refused.
-        let refused_port = TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("a free local port")
-            .port();
-        // This peer accepts once and never answers, reading until the client goes away.
-        let silent = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
-        let silent_port = silent.local_addr().expect("listener address").port();
-        let peer = thread::spawn(move || {
-            silent
-                .accept()
-                .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
-                .map(drop)
-        });
-        let cases = [
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1:{refused_port}/carddemo"),
-                CONNECT_TIMEOUT,
-                "io (connection refused)",
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@no-such-host.invalid/carddemo"),
-                CONNECT_TIMEOUT,
-                "io (host name not resolved)",
-            ),
-            (
-                format!("postgres://carddemo:{SECRET}@127.0.0.1:{silent_port}/carddemo"),
-                Duration::from_millis(200),
-                "io (timed out)",
-            ),
-        ];
-        for (url, timeout, expected) in &cases {
-            let config = Config {
-                database_url: url.clone(),
-                ..Config::default()
-            };
-            let started = Instant::now();
-            let (result, output) =
-                logged_while(connect_within(&config, *timeout, pool_options())).await;
-            let elapsed = started.elapsed();
-            let error = match result {
-                Err(error @ sqlx::Error::Io(_)) => error,
-                Err(other) => panic!("expected {expected}, got {other}"),
-                Ok(_) => panic!("an unreachable server must not yield a pool ({expected})"),
-            };
-            let summary = ErrorSummary::from(&error).to_string();
-            assert_eq!(summary, *expected);
-            // Reported by the first connection, not after the pool's acquire timeout.
-            assert!(elapsed < CONNECT_TIMEOUT / 2, "{expected} took {elapsed:?}");
-            for text in [error.to_string(), format!("{error:?}"), summary, output] {
-                assert_free_of(&text, &[SECRET]);
+    #[test]
+    fn an_unreachable_server_is_reported_by_its_cause() {
+        current_thread().block_on(async {
+            // Nothing listens on the port of a dropped listener, so a connection to it is refused.
+            let refused_port = TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free local port")
+                .port();
+            // This peer accepts once and never answers, reading until the client goes away.
+            let silent = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
+            let silent_port = silent.local_addr().expect("listener address").port();
+            let peer = thread::spawn(move || {
+                silent
+                    .accept()
+                    .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
+                    .map(drop)
+            });
+            let cases = [
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1:{refused_port}/carddemo"),
+                    CONNECT_TIMEOUT,
+                    "io (connection refused)",
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@no-such-host.invalid/carddemo"),
+                    CONNECT_TIMEOUT,
+                    "io (host name not resolved)",
+                ),
+                (
+                    format!("postgres://carddemo:{SECRET}@127.0.0.1:{silent_port}/carddemo"),
+                    Duration::from_millis(200),
+                    "io (timed out)",
+                ),
+            ];
+            for (url, timeout, expected) in &cases {
+                let config = Config {
+                    database_url: url.clone(),
+                    ..Config::default()
+                };
+                let started = Instant::now();
+                let (result, output) =
+                    logged_while(connect_within(&config, *timeout, pool_options())).await;
+                let elapsed = started.elapsed();
+                let error = match result {
+                    Err(error @ sqlx::Error::Io(_)) => error,
+                    Err(other) => panic!("expected {expected}, got {other}"),
+                    Ok(_) => panic!("an unreachable server must not yield a pool ({expected})"),
+                };
+                let summary = ErrorSummary::from(&error).to_string();
+                assert_eq!(summary, *expected);
+                // Reported by the first connection, not after the pool's acquire timeout.
+                assert!(elapsed < CONNECT_TIMEOUT / 2, "{expected} took {elapsed:?}");
+                for text in [error.to_string(), format!("{error:?}"), summary, output] {
+                    assert_free_of(&text, &[SECRET]);
+                }
             }
-        }
-        peer.join()
-            .expect("the peer thread ends")
-            .expect("the peer read until the client went away");
+            peer.join()
+                .expect("the peer thread ends")
+                .expect("the peer read until the client went away");
+        });
     }
 
     /// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made

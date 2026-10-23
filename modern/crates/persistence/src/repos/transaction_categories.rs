@@ -22,8 +22,11 @@
 //! Records reach the table only through codec B ([`TransactionCategoryRow`]), which keeps every
 //! byte of the three `PIC X` fields: the description's padding (PIC-001) and the `FILLER`, the
 //! `0000` of every `trancatg.txt` record included (LOADS-032, PIC-012, E05). The CRLF ending each
-//! fixture line is framing and is never stored (LOADS-031, PIC-014, E06). The key columns carry
-//! the `C` collation, so key order is byte order, the KSDS's.
+//! fixture line is framing and is never stored (LOADS-031, PIC-014, E06). The type-code key
+//! column carries the `C` collation and the category code is a `BIGINT`, so key order is the
+//! ASCII byte order of the type code, then the category's numeric order. That is the order the
+//! KSDS gave its EBCDIC keys for the digit-only type and category codes of the corpus, as digits
+//! order alike in both codes.
 //!
 //! # Transactions
 //!
@@ -322,6 +325,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     // Four fixture bodies are quoted rather than the file read: this crate reaches fixture paths
     // only through `test_support`, and the whole-file load is covered by the batch `loads` test.
 
@@ -370,160 +382,164 @@ mod tests {
     // audit: LOADS-015
     // audit: LOADS-018
     // audit: LOADS-032
-    #[tokio::test]
-    async fn store_replaces_reads_by_key_and_keeps_previous_rows_on_failure() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn store_replaces_reads_by_key_and_keeps_previous_rows_on_failure() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
 
-        // A freshly migrated table: nothing to delete is no error, every record is inserted,
-        // and the rows come back in key order whatever the slice order was.
-        assert_eq!(store.find_all().await?, Vec::new());
-        assert_eq!(
-            store
-                .replace_all(&decode_all(&[LINE_18, LINE_9, LINE_5, LINE_1])?)
-                .await?,
-            4
-        );
-        let fixtures = decode_all(&[LINE_1, LINE_5, LINE_9, LINE_18])?;
-        assert_eq!(store.find_all().await?, fixtures);
+            // A freshly migrated table: nothing to delete is no error, every record is inserted,
+            // and the rows come back in key order whatever the slice order was.
+            assert_eq!(store.find_all().await?, Vec::new());
+            assert_eq!(
+                store
+                    .replace_all(&decode_all(&[LINE_18, LINE_9, LINE_5, LINE_1])?)
+                    .await?,
+                4
+            );
+            let fixtures = decode_all(&[LINE_1, LINE_5, LINE_9, LINE_18])?;
+            assert_eq!(store.find_all().await?, fixtures);
 
-        // The random read needs both key parts; a missing pair is `INVALID KEY`, not an error.
-        let three_one = decode(LINE_9)?;
-        let found = store
-            .find_by_id(&three_one.type_cd, three_one.cat_cd)
-            .await?;
-        assert_eq!(found, Some(three_one));
-        let one = PicX::from_array(*b"01");
-        assert_eq!(store.find_by_id(&one, PicU::new(9)?).await?, None);
-        assert_eq!(
-            store
-                .find_by_id(&PicX::from_array(*b"09"), PicU::new(1)?)
-                .await?,
-            None
-        );
+            // The random read needs both key parts; a missing pair is `INVALID KEY`, not an error.
+            let three_one = decode(LINE_9)?;
+            let found = store
+                .find_by_id(&three_one.type_cd, three_one.cat_cd)
+                .await?;
+            assert_eq!(found, Some(three_one));
+            let one = PicX::from_array(*b"01");
+            assert_eq!(store.find_by_id(&one, PicU::new(9)?).await?, None);
+            assert_eq!(
+                store
+                    .find_by_id(&PicX::from_array(*b"09"), PicU::new(1)?)
+                    .await?,
+                None
+            );
 
-        // On a loaded table the replacement holds exactly the new set, every byte kept, and a
-        // rerun leaves identical contents.
-        let lower = synthetic(*b"a1", 9_999)?;
-        let upper = synthetic(*b"Z1", 0)?;
-        let next = vec![lower.clone(), decode(LINE_1)?, upper.clone()];
-        let ordered = vec![decode(LINE_1)?, upper.clone(), lower.clone()];
-        for _ in 0..2 {
-            assert_eq!(store.replace_all(&next).await?, 3);
-            assert_eq!(store.find_all().await?, ordered);
-        }
-        assert_eq!(
-            store.find_by_id(&lower.type_cd, lower.cat_cd).await?,
-            Some(lower.clone())
-        );
-        assert_eq!(store.find_by_id(&one, PicU::new(5)?).await?, None);
+            // On a loaded table the replacement holds exactly the new set, every byte kept, and a
+            // rerun leaves identical contents.
+            let lower = synthetic(*b"a1", 9_999)?;
+            let upper = synthetic(*b"Z1", 0)?;
+            let next = vec![lower.clone(), decode(LINE_1)?, upper.clone()];
+            let ordered = vec![decode(LINE_1)?, upper.clone(), lower.clone()];
+            for _ in 0..2 {
+                assert_eq!(store.replace_all(&next).await?, 3);
+                assert_eq!(store.find_all().await?, ordered);
+            }
+            assert_eq!(
+                store.find_by_id(&lower.type_cd, lower.cat_cd).await?,
+                Some(lower.clone())
+            );
+            assert_eq!(store.find_by_id(&one, PicU::new(5)?).await?, None);
 
-        // One insert adds one row; a stored key is refused by the primary key.
-        let added = decode(LINE_18)?;
-        store.insert(&added).await?;
-        assert_eq!(
-            store.find_by_id(&added.type_cd, added.cat_cd).await?,
-            Some(added.clone())
-        );
-        assert_eq!(store.insert(&added).await, Err(duplicate()));
-        let loaded = vec![decode(LINE_1)?, decode(LINE_18)?, upper, lower];
-        assert_eq!(store.find_all().await?, loaded);
+            // One insert adds one row; a stored key is refused by the primary key.
+            let added = decode(LINE_18)?;
+            store.insert(&added).await?;
+            assert_eq!(
+                store.find_by_id(&added.type_cd, added.cat_cd).await?,
+                Some(added.clone())
+            );
+            assert_eq!(store.insert(&added).await, Err(duplicate()));
+            let loaded = vec![decode(LINE_1)?, decode(LINE_18)?, upper, lower];
+            assert_eq!(store.find_all().await?, loaded);
 
-        // A failed replacement leaves the previous contents: a duplicate key fails an insert
-        // after the delete, and a record codec B cannot store fails before it.
-        let twice = decode_all(&[LINE_9, LINE_9])?;
-        assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
-        assert_eq!(store.find_all().await?, loaded);
-        let unstorable = TransactionCategoryRecord {
-            filler: PicX::from_array([b'0', 0, b'0', b'0']),
-            ..decode(LINE_5)?
-        };
-        assert_eq!(
-            store
-                .replace_all(&[decode(LINE_9)?, unstorable.clone()])
-                .await,
-            Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
-        );
-        assert_eq!(
-            store.insert(&unstorable).await,
-            Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
-        );
-        assert_eq!(store.find_all().await?, loaded);
+            // A failed replacement leaves the previous contents: a duplicate key fails an insert
+            // after the delete, and a record codec B cannot store fails before it.
+            let twice = decode_all(&[LINE_9, LINE_9])?;
+            assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
+            assert_eq!(store.find_all().await?, loaded);
+            let unstorable = TransactionCategoryRecord {
+                filler: PicX::from_array([b'0', 0, b'0', b'0']),
+                ..decode(LINE_5)?
+            };
+            assert_eq!(
+                store
+                    .replace_all(&[decode(LINE_9)?, unstorable.clone()])
+                    .await,
+                Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
+            );
+            assert_eq!(
+                store.insert(&unstorable).await,
+                Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
+            );
+            assert_eq!(store.find_all().await?, loaded);
 
-        // A key no `CHAR(2)` column can hold is a typed error, never normalised into a miss.
-        assert_eq!(
-            store
-                .find_by_id(&PicX::from_array([0, b'1']), PicU::new(1)?)
-                .await,
-            Err(PersistenceError::decode(
-                TRAN_TYPE_CD,
-                DecodeKind::InvalidByte
-            ))
-        );
-        Ok(())
+            // A key no `CHAR(2)` column can hold is a typed error, never normalised into a miss.
+            assert_eq!(
+                store
+                    .find_by_id(&PicX::from_array([0, b'1']), PicU::new(1)?)
+                    .await,
+                Err(PersistenceError::decode(
+                    TRAN_TYPE_CD,
+                    DecodeKind::InvalidByte
+                ))
+            );
+            Ok(())
+        })
     }
 
     // audit: LOADS-014
     // audit: LOADS-018
-    #[tokio::test]
-    async fn transaction_runs_every_method_in_the_callers_unit_of_work() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let before = decode_all(&[LINE_1])?;
-        assert_eq!(store.replace_all(&before).await?, 1);
+    #[test]
+    fn transaction_runs_every_method_in_the_callers_unit_of_work() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let before = decode_all(&[LINE_1])?;
+            assert_eq!(store.replace_all(&before).await?, 1);
 
-        // Uncommitted work is visible inside the transaction only, and a rollback undoes it.
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&decode_all(&[LINE_9, LINE_5])?).await?, 2);
-        assert_eq!(tx.find_all().await?, decode_all(&[LINE_5, LINE_9])?);
-        let five = decode(LINE_5)?;
-        assert_eq!(
-            tx.find_by_id(&five.type_cd, five.cat_cd).await?,
-            Some(five.clone())
-        );
-        assert_eq!(store.find_all().await?, before);
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, before);
+            // Uncommitted work is visible inside the transaction only, and a rollback undoes it.
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&decode_all(&[LINE_9, LINE_5])?).await?, 2);
+            assert_eq!(tx.find_all().await?, decode_all(&[LINE_5, LINE_9])?);
+            let five = decode(LINE_5)?;
+            assert_eq!(
+                tx.find_by_id(&five.type_cd, five.cat_cd).await?,
+                Some(five.clone())
+            );
+            assert_eq!(store.find_all().await?, before);
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, before);
 
-        // A replacement and an insert in one transaction commit together.
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[five.clone()]).await?, 1);
-        tx.insert(&decode(LINE_18)?).await?;
-        tx.commit().await?;
-        assert_eq!(store.find_all().await?, decode_all(&[LINE_5, LINE_18])?);
+            // A replacement and an insert in one transaction commit together.
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[five.clone()]).await?, 1);
+            tx.insert(&decode(LINE_18)?).await?;
+            tx.commit().await?;
+            assert_eq!(store.find_all().await?, decode_all(&[LINE_5, LINE_18])?);
 
-        // A refused insert inside a savepoint is undone alone, and the transaction goes on.
-        let mut tx = store.begin().await?;
-        let mut nested = tx.savepoint().await?;
-        assert_eq!(nested.insert(&five).await, Err(duplicate()));
-        nested.rollback().await?;
-        tx.insert(&decode(LINE_9)?).await?;
-        tx.commit().await?;
-        let after = decode_all(&[LINE_5, LINE_9, LINE_18])?;
-        assert_eq!(store.find_all().await?, after);
+            // A refused insert inside a savepoint is undone alone, and the transaction goes on.
+            let mut tx = store.begin().await?;
+            let mut nested = tx.savepoint().await?;
+            assert_eq!(nested.insert(&five).await, Err(duplicate()));
+            nested.rollback().await?;
+            tx.insert(&decode(LINE_9)?).await?;
+            tx.commit().await?;
+            let after = decode_all(&[LINE_5, LINE_9, LINE_18])?;
+            assert_eq!(store.find_all().await?, after);
 
-        // A record codec B cannot store fails before any statement, so the transaction stays
-        // usable; the missing key reads as `None` inside it too.
-        let mut tx = store.begin().await?;
-        let unstorable = TransactionCategoryRecord {
-            type_cd: PicX::from_array([b'0', 0x80]),
-            ..decode(LINE_1)?
-        };
-        assert_eq!(
-            tx.replace_all(&[unstorable]).await,
-            Err(PersistenceError::decode(
-                TRAN_TYPE_CD,
-                DecodeKind::InvalidByte
-            ))
-        );
-        assert_eq!(tx.find_all().await?, after);
-        assert_eq!(
-            tx.find_by_id(&PicX::from_array(*b"01"), PicU::new(1)?)
-                .await?,
-            None
-        );
-        tx.commit().await?;
-        assert_eq!(store.find_all().await?, after);
-        Ok(())
+            // A record codec B cannot store fails before any statement, so the transaction stays
+            // usable; the missing key reads as `None` inside it too.
+            let mut tx = store.begin().await?;
+            let unstorable = TransactionCategoryRecord {
+                type_cd: PicX::from_array([b'0', 0x80]),
+                ..decode(LINE_1)?
+            };
+            assert_eq!(
+                tx.replace_all(&[unstorable]).await,
+                Err(PersistenceError::decode(
+                    TRAN_TYPE_CD,
+                    DecodeKind::InvalidByte
+                ))
+            );
+            assert_eq!(tx.find_all().await?, after);
+            assert_eq!(
+                tx.find_by_id(&PicX::from_array(*b"01"), PicU::new(1)?)
+                    .await?,
+                None
+            );
+            tx.commit().await?;
+            assert_eq!(store.find_all().await?, after);
+            Ok(())
+        })
     }
 }

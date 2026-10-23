@@ -40,6 +40,10 @@
 
 use domain::online::cotrn00c::{self, Browse, Direction, Plan, TranListFailure, TranPage};
 use persistence::TransactionRepository;
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -114,10 +118,29 @@ async fn read_page<R: TransactionRepository>(
             cotrn00c::page(browse, rows).map_err(ServiceError::Rule)
         }
         Err(error) => {
+            // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint
+            // suppression.
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message", "error"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
             // The COBOL DISPLAYs `RESP` and `REAS` to the CICS log before it moves its message
             // (COTRN00C-027); the replacement logs the store error, which names an SQLSTATE and a
             // constraint at most and never a stored value.
-            tracing::error!(error = %error, "transaction page read failed");
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[
+                        Some(&"transaction page read failed" as &dyn Value),
+                        Some(&display(&error) as &dyn Value),
+                    ]),
+                );
+            }
             Err(ServiceError::Rule(cotrn00c::lookup_failure()))
         }
     }
@@ -142,6 +165,17 @@ mod tests {
     use crate::error::{ScreenError, ServiceError};
 
     type TestResult = Result<(), String>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries; a runtime that cannot be built
+    /// fails the test with the builder's error text.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(test)
+    }
 
     /// A synthetic card number, in no fixture, that every record carries; no response may.
     const CARD: &str = "4000001234567899";
@@ -379,19 +413,21 @@ mod tests {
     // audit: COTRN00C-011
     // audit: COTRN00C-014
     // audit: COTRN00C-016
-    #[tokio::test]
-    async fn enter_with_a_blank_search_reads_the_first_page_from_the_lowest_key() -> TestResult {
-        let mut table = Table::of(25)?;
-        let page = ok(&mut table, TranListQuery::default()).await?;
-        assert_eq!(table.calls, vec![Call::After(lowest(), 11)]);
-        assert_eq!(ids_on(&page), shown_ids(1..=10, 0));
-        assert!(!page.rows_kept);
-        assert_eq!(page.first_key, Some(id(1)));
-        assert_eq!(page.last_key, Some(id(10)));
-        assert_eq!(page.page_no, 1);
-        assert!(page.has_next_page);
-        assert_eq!(page.message, None);
-        Ok(())
+    #[test]
+    fn enter_with_a_blank_search_reads_the_first_page_from_the_lowest_key() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let page = ok(&mut table, TranListQuery::default()).await?;
+            assert_eq!(table.calls, vec![Call::After(lowest(), 11)]);
+            assert_eq!(ids_on(&page), shown_ids(1..=10, 0));
+            assert!(!page.rows_kept);
+            assert_eq!(page.first_key, Some(id(1)));
+            assert_eq!(page.last_key, Some(id(10)));
+            assert_eq!(page.page_no, 1);
+            assert!(page.has_next_page);
+            assert_eq!(page.message, None);
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-015
@@ -399,191 +435,205 @@ mod tests {
     // audit: COTRN00C-023
     // audit: COTRN00C-024
     // audit: COTRN00C-025
-    #[tokio::test]
-    async fn pf8_and_pf7_browse_from_the_echoed_keys_with_a_skip_read() -> TestResult {
-        let mut table = Table::of(25)?;
-        let first = ok(&mut table, TranListQuery::default()).await?;
-        let second = ok(&mut table, echo(&first, Some(PageDirection::Forward))).await?;
-        assert_eq!(ids_on(&second), shown_ids(11..=20, 0));
-        assert_eq!((second.page_no, second.has_next_page), (2, true));
+    #[test]
+    fn pf8_and_pf7_browse_from_the_echoed_keys_with_a_skip_read() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let first = ok(&mut table, TranListQuery::default()).await?;
+            let second = ok(&mut table, echo(&first, Some(PageDirection::Forward))).await?;
+            assert_eq!(ids_on(&second), shown_ids(11..=20, 0));
+            assert_eq!((second.page_no, second.has_next_page), (2, true));
 
-        let third = ok(&mut table, echo(&second, Some(PageDirection::Forward))).await?;
-        assert_eq!(ids_on(&third), shown_ids(21..=25, 5));
-        assert_eq!((third.page_no, third.has_next_page), (3, false));
-        assert_eq!(third.first_key, Some(id(21)));
-        assert_eq!(third.last_key, Some(id(20)));
-        assert_eq!(
-            third.message.as_deref(),
-            Some("You have reached the bottom of the page...")
-        );
+            let third = ok(&mut table, echo(&second, Some(PageDirection::Forward))).await?;
+            assert_eq!(ids_on(&third), shown_ids(21..=25, 5));
+            assert_eq!((third.page_no, third.has_next_page), (3, false));
+            assert_eq!(third.first_key, Some(id(21)));
+            assert_eq!(third.last_key, Some(id(20)));
+            assert_eq!(
+                third.message.as_deref(),
+                Some("You have reached the bottom of the page...")
+            );
 
-        let back = ok(&mut table, echo(&third, Some(PageDirection::Backward))).await?;
-        assert_eq!(ids_on(&back), shown_ids(11..=20, 0));
-        assert_eq!((back.page_no, back.message.as_deref()), (2, None));
+            let back = ok(&mut table, echo(&third, Some(PageDirection::Backward))).await?;
+            assert_eq!(ids_on(&back), shown_ids(11..=20, 0));
+            assert_eq!((back.page_no, back.message.as_deref()), (2, None));
 
-        let top = ok(&mut table, echo(&back, Some(PageDirection::Backward))).await?;
-        assert_eq!(ids_on(&top), shown_ids(1..=10, 0));
-        assert_eq!(top.page_no, 1);
-        assert_eq!(
-            top.message.as_deref(),
-            Some("You have reached the top of the page...")
-        );
+            let top = ok(&mut table, echo(&back, Some(PageDirection::Backward))).await?;
+            assert_eq!(ids_on(&top), shown_ids(1..=10, 0));
+            assert_eq!(top.page_no, 1);
+            assert_eq!(
+                top.message.as_deref(),
+                Some("You have reached the top of the page...")
+            );
 
-        assert_eq!(
-            table.calls,
-            vec![
-                Call::After(lowest(), 11),
-                Call::After(id(10), 12),
-                Call::After(id(20), 12),
-                Call::Before(id(21), 12),
-                Call::Before(id(11), 12),
-            ]
-        );
-        Ok(())
+            assert_eq!(
+                table.calls,
+                vec![
+                    Call::After(lowest(), 11),
+                    Call::After(id(10), 12),
+                    Call::After(id(20), 12),
+                    Call::Before(id(21), 12),
+                    Call::Before(id(11), 12),
+                ]
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-012
     // audit: COTRN00C-018
-    #[tokio::test]
-    async fn a_numeric_search_starts_the_page_at_or_above_it() -> TestResult {
-        let mut table = Table::of(25)?;
-        let query = TranListQuery {
-            start_tran_id: Some(id(20)),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, query).await?;
-        assert_eq!(table.calls, vec![Call::After(id(20), 11)]);
-        assert_eq!(ids_on(&page), shown_ids(20..=25, 4));
-        assert_eq!((page.page_no, page.has_next_page), (1, false));
-        Ok(())
+    #[test]
+    fn a_numeric_search_starts_the_page_at_or_above_it() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let query = TranListQuery {
+                start_tran_id: Some(id(20)),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, query).await?;
+            assert_eq!(table.calls, vec![Call::After(id(20), 11)]);
+            assert_eq!(ids_on(&page), shown_ids(20..=25, 4));
+            assert_eq!((page.page_no, page.has_next_page), (1, false));
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-013
-    #[tokio::test]
-    async fn a_non_numeric_search_is_refused_before_any_read() -> TestResult {
-        let mut table = Table::of(25)?;
-        let query = TranListQuery {
-            start_tran_id: Some("12AB".to_owned()),
-            ..TranListQuery::default()
-        };
-        let Err(ServiceError::Rule(failure)) = send(&mut table, query).await else {
-            return Err("a non-numeric search must fail its edit".to_owned());
-        };
-        let error = ScreenError::from(failure);
-        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(error.message(), rules::TRAN_ID_NOT_NUMERIC);
-        assert_eq!(error.field(), Some("start_tran_id"));
-        assert_eq!(table.calls, Vec::new());
-        Ok(())
+    #[test]
+    fn a_non_numeric_search_is_refused_before_any_read() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let query = TranListQuery {
+                start_tran_id: Some("12AB".to_owned()),
+                ..TranListQuery::default()
+            };
+            let Err(ServiceError::Rule(failure)) = send(&mut table, query).await else {
+                return Err("a non-numeric search must fail its edit".to_owned());
+            };
+            let error = ScreenError::from(failure);
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(error.message(), rules::TRAN_ID_NOT_NUMERIC);
+            assert_eq!(error.field(), Some("start_tran_id"));
+            assert_eq!(table.calls, Vec::new());
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-021
     // audit: COTRN00C-022
-    #[tokio::test]
-    async fn the_boundary_keys_answer_without_a_read() -> TestResult {
-        let mut table = Table::of(25)?;
-        let bottom = TranListQuery {
-            direction: Some(PageDirection::Forward),
-            has_next_page: Some(false),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, bottom).await?;
-        assert!(page.rows_kept);
-        assert_eq!(page.message.as_deref(), Some(rules::ALREADY_AT_BOTTOM));
+    #[test]
+    fn the_boundary_keys_answer_without_a_read() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let bottom = TranListQuery {
+                direction: Some(PageDirection::Forward),
+                has_next_page: Some(false),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, bottom).await?;
+            assert!(page.rows_kept);
+            assert_eq!(page.message.as_deref(), Some(rules::ALREADY_AT_BOTTOM));
 
-        let top = TranListQuery {
-            direction: Some(PageDirection::Backward),
-            page_no: Some(1),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, top).await?;
-        assert!(page.rows_kept);
-        assert!(page.has_next_page);
-        assert_eq!(page.message.as_deref(), Some(rules::ALREADY_AT_TOP));
-        assert_eq!(table.calls, Vec::new());
-        Ok(())
+            let top = TranListQuery {
+                direction: Some(PageDirection::Backward),
+                page_no: Some(1),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, top).await?;
+            assert!(page.rows_kept);
+            assert!(page.has_next_page);
+            assert_eq!(page.message.as_deref(), Some(rules::ALREADY_AT_TOP));
+            assert_eq!(table.calls, Vec::new());
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-027
-    #[tokio::test]
-    async fn a_failed_page_read_is_the_lookup_failure() -> TestResult {
-        let mut table = Table::of(25)?;
-        table.fail = true;
-        let backward = TranListQuery {
-            direction: Some(PageDirection::Backward),
-            first_key: Some(id(11)),
-            page_no: Some(2),
-            ..TranListQuery::default()
-        };
-        for query in [TranListQuery::default(), backward] {
-            let Err(ServiceError::Rule(failure)) = send(&mut table, query).await else {
-                return Err("a failed read must answer the lookup failure".to_owned());
+    #[test]
+    fn a_failed_page_read_is_the_lookup_failure() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            table.fail = true;
+            let backward = TranListQuery {
+                direction: Some(PageDirection::Backward),
+                first_key: Some(id(11)),
+                page_no: Some(2),
+                ..TranListQuery::default()
             };
-            assert_eq!(failure, rules::lookup_failure());
-            let error = ScreenError::from(failure);
-            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(error.message(), rules::LOOKUP_FAILED);
-            assert_eq!(error.field(), None);
-        }
-        assert_eq!(
-            table.calls,
-            vec![Call::After(lowest(), 11), Call::Before(id(11), 12)]
-        );
-        Ok(())
+            for query in [TranListQuery::default(), backward] {
+                let Err(ServiceError::Rule(failure)) = send(&mut table, query).await else {
+                    return Err("a failed read must answer the lookup failure".to_owned());
+                };
+                assert_eq!(failure, rules::lookup_failure());
+                let error = ScreenError::from(failure);
+                assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(error.message(), rules::LOOKUP_FAILED);
+                assert_eq!(error.field(), None);
+            }
+            assert_eq!(
+                table.calls,
+                vec![Call::After(lowest(), 11), Call::Before(id(11), 12)]
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-004
     // audit: COTRN00C-014
-    #[tokio::test]
-    async fn the_query_limit_follows_the_page_size_and_the_skip_read() -> TestResult {
-        let mut table = Table::of(25)?;
-        let small = TranListQuery {
-            page_size: Some(3),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, small).await?;
-        assert_eq!(ids_on(&page), shown_ids(1..=3, 0));
-        let next = TranListQuery {
-            page_size: Some(3),
-            ..echo(&page, Some(PageDirection::Forward))
-        };
-        let page = ok(&mut table, next).await?;
-        assert_eq!(ids_on(&page), shown_ids(4..=6, 0));
+    #[test]
+    fn the_query_limit_follows_the_page_size_and_the_skip_read() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let small = TranListQuery {
+                page_size: Some(3),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, small).await?;
+            assert_eq!(ids_on(&page), shown_ids(1..=3, 0));
+            let next = TranListQuery {
+                page_size: Some(3),
+                ..echo(&page, Some(PageDirection::Forward))
+            };
+            let page = ok(&mut table, next).await?;
+            assert_eq!(ids_on(&page), shown_ids(4..=6, 0));
 
-        let largest = TranListQuery {
-            page_size: Some(100),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, largest).await?;
-        assert_eq!(page.rows.len(), 100);
+            let largest = TranListQuery {
+                page_size: Some(100),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, largest).await?;
+            assert_eq!(page.rows.len(), 100);
 
-        let by_pf5 = TranListQuery {
-            entry_key: Some(TranListEntryKey::Pf5),
-            ..TranListQuery::default()
-        };
-        let page = ok(&mut table, by_pf5).await?;
-        assert_eq!(ids_on(&page), shown_ids(2..=11, 0));
+            let by_pf5 = TranListQuery {
+                entry_key: Some(TranListEntryKey::Pf5),
+                ..TranListQuery::default()
+            };
+            let page = ok(&mut table, by_pf5).await?;
+            assert_eq!(ids_on(&page), shown_ids(2..=11, 0));
 
-        assert_eq!(
-            table.calls,
-            vec![
-                Call::After(lowest(), 4),
-                Call::After(id(3), 5),
-                Call::After(lowest(), 101),
-                Call::After(lowest(), 12),
-            ]
-        );
-        Ok(())
+            assert_eq!(
+                table.calls,
+                vec![
+                    Call::After(lowest(), 4),
+                    Call::After(id(3), 5),
+                    Call::After(lowest(), 101),
+                    Call::After(lowest(), 12),
+                ]
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-034
-    #[tokio::test]
-    async fn no_row_carries_the_card_number() -> TestResult {
-        let mut table = Table::of(25)?;
-        let page = ok(&mut table, TranListQuery::default()).await?;
-        let body = serde_json::to_string(&page).map_err(shown)?;
-        assert!(!body.contains(CARD), "the list must not show a card number");
-        assert!(!body.contains("7899"), "nor its last four digits");
-        Ok(())
+    #[test]
+    fn no_row_carries_the_card_number() -> TestResult {
+        block_on(async {
+            let mut table = Table::of(25)?;
+            let page = ok(&mut table, TranListQuery::default()).await?;
+            let body = serde_json::to_string(&page).map_err(shown)?;
+            assert!(!body.contains(CARD), "the list must not show a card number");
+            assert!(!body.contains("7899"), "nor its last four digits");
+            Ok(())
+        })
     }
 }

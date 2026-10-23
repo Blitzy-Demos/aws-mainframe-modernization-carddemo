@@ -38,8 +38,9 @@ use core::fmt;
 
 use domain::CardNumber;
 use domain::online::cocrdlic as rules;
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
@@ -49,6 +50,53 @@ use super::{PageDirection, digits, full_text};
 /// its length.
 const CARD_FILTER_MASK: &str = "****************";
 
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// A `page_size` as [`super::page_size_from_query`] reads it from a query string.
+struct QueryPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for QueryPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_query(deserializer).map(Self)
+    }
+}
+
 /// The query of endpoint 7: the two filters as typed, the key pressed, and the paging state of
 /// the previous response, echoed unchanged.
 ///
@@ -57,7 +105,7 @@ const CARD_FILTER_MASK: &str = "****************";
 // The schema name `CardListQuery` is the frontend's `components["schemas"]["CardListQuery"]`
 // (Generated API Types Only); `api::openapi::ApiDoc` registers it, and the handler declares
 // `params(CardListQuery)` because utoipa cannot see through `ValidQuery`.
-#[derive(Clone, Default, PartialEq, Eq, Deserialize, ToSchema, IntoParams, Validate)]
+#[derive(Clone, Default, PartialEq, Eq, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct CardListQuery {
     /// `ACCTSID`, the account filter, as typed (map `LENGTH` 11). Blank, or eleven `0` digits,
@@ -120,7 +168,6 @@ pub struct CardListQuery {
 
     /// Rows per page, 1 to 100 (Bounded Pagination); any other value is 422. Absent, 7, the
     /// program's screen size. The screen never sends it.
-    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]
@@ -146,6 +193,88 @@ impl Serialize for CardListQuery {
         out.serialize_field("reread", &self.reread)?;
         out.serialize_field("page_size", &self.page_size)?;
         out.end()
+    }
+}
+
+/// The members of [`CardListQuery`], in declaration order.
+const CARD_LIST_QUERY_MEMBERS: &[&str] = &[
+    "acct_id",
+    "card_num",
+    "direction",
+    "page_no",
+    "first_key",
+    "last_key",
+    "has_next_page",
+    "last_page_shown",
+    "reread",
+    "page_size",
+];
+
+/// Every member, the card filter included: an absent member is `None`, `page_size` is read as
+/// `super::page_size_from_query` reads it, a repeated member is refused and an unknown one is
+/// skipped.
+impl<'de> Deserialize<'de> for CardListQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "CardListQuery",
+            CARD_LIST_QUERY_MEMBERS,
+            CardListQueryVisitor,
+        )
+    }
+}
+
+/// The visitor of [`CardListQuery`]'s members.
+struct CardListQueryVisitor;
+
+impl<'de> Visitor<'de> for CardListQueryVisitor {
+    type Value = CardListQuery;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct CardListQuery")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CardListQuery, A::Error> {
+        let mut acct_id = None;
+        let mut card_num = None;
+        let mut direction = None;
+        let mut page_no = None;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut has_next_page = None;
+        let mut last_page_shown = None;
+        let mut reread = None;
+        let mut page_size = None;
+        while let Some(name) = map.next_key_seed(WireName(CARD_LIST_QUERY_MEMBERS))? {
+            match name {
+                Some("acct_id") => member(&mut map, &mut acct_id, "acct_id")?,
+                Some("card_num") => member(&mut map, &mut card_num, "card_num")?,
+                Some("direction") => member(&mut map, &mut direction, "direction")?,
+                Some("page_no") => member(&mut map, &mut page_no, "page_no")?,
+                Some("first_key") => member(&mut map, &mut first_key, "first_key")?,
+                Some("last_key") => member(&mut map, &mut last_key, "last_key")?,
+                Some("has_next_page") => member(&mut map, &mut has_next_page, "has_next_page")?,
+                Some("last_page_shown") => {
+                    member(&mut map, &mut last_page_shown, "last_page_shown")?;
+                }
+                Some("reread") => member(&mut map, &mut reread, "reread")?,
+                Some("page_size") => member(&mut map, &mut page_size, "page_size")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(CardListQuery {
+            acct_id: acct_id.flatten(),
+            card_num: card_num.flatten(),
+            direction: direction.flatten(),
+            page_no: page_no.flatten(),
+            first_key: first_key.flatten(),
+            last_key: last_key.flatten(),
+            has_next_page: has_next_page.flatten(),
+            last_page_shown: last_page_shown.flatten(),
+            reread: reread.flatten(),
+            page_size: page_size.and_then(|QueryPageSize(size)| size),
+        })
     }
 }
 
@@ -208,7 +337,7 @@ impl From<&CardListQuery> for rules::ListState {
 ///
 /// No card verification code, embossed name or expiry date is listed.
 // No `Deserialize`: `card_num` is a `CardNumber`, which serialises only its redacted form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct CardListRow {
     /// The card's handle, the `cards.card_ref` identity, which a selection carries to
     /// `/cards/view` or `/cards/update` and which endpoints 8 to 10 accept.
@@ -230,6 +359,18 @@ pub struct CardListRow {
     pub status: String,
 }
 
+/// Every member in declaration order, the card number in its redacted form.
+impl Serialize for CardListRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("CardListRow", 4)?;
+        out.serialize_field("card_ref", &self.card_ref)?;
+        out.serialize_field("card_num", &self.card_num)?;
+        out.serialize_field("acct_id", &self.acct_id)?;
+        out.serialize_field("status", &self.status)?;
+        out.end()
+    }
+}
+
 impl From<rules::CardListRow> for CardListRow {
     fn from(row: rules::CardListRow) -> Self {
         Self {
@@ -247,7 +388,7 @@ impl From<rules::CardListRow> for CardListRow {
 /// Always a 200, the empty page of `NO RECORDS FOUND FOR THIS SEARCH CONDITION.` included
 /// (COCRDLIC-021).
 // The schema names `CardListResponse` and `CardListRow` are fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct CardListResponse {
     /// The listed cards in screen order, ascending by card number, at most the page size.
     pub rows: Vec<CardListRow>,
@@ -284,6 +425,23 @@ pub struct CardListResponse {
 
     /// `INFOMSG`: `TYPE S FOR DETAIL, U TO UPDATE ANY RECORD`, or `null` (COCRDLIC-033).
     pub info_message: Option<String>,
+}
+
+/// Every member in declaration order; an absent key or message is a JSON `null`.
+impl Serialize for CardListResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("CardListResponse", 9)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("blank_rows_above", &self.blank_rows_above)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("last_page_shown", &self.last_page_shown)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.end()
+    }
 }
 
 impl From<rules::CardPage> for CardListResponse {
@@ -441,6 +599,15 @@ mod tests {
             error.message().to_owned(),
             error.field().map(str::to_owned),
         ))
+    }
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
     #[test]
@@ -657,90 +824,126 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn the_query_string_carries_the_filters_the_key_and_the_echo() -> TestResult {
-        let query = extract(
-            "/api/v1/cards?acct_id=00000000050&card_num=0000000000000000&direction=forward\
-             &page_no=0&first_key=1&last_key=8&has_next_page=true&last_page_shown=false\
-             &reread=false&page_size=100",
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
-        assert_eq!(
-            query,
-            CardListQuery {
-                acct_id: Some("00000000050".to_owned()),
-                card_num: Some("0000000000000000".to_owned()),
-                direction: Some(PageDirection::Forward),
-                page_no: Some(0),
-                first_key: Some(1),
-                last_key: Some(8),
-                has_next_page: Some(true),
-                last_page_shown: Some(false),
-                reread: Some(false),
-                page_size: Some(100),
-            }
-        );
-        let empty = extract("/api/v1/cards")
+    #[test]
+    fn the_query_string_carries_the_filters_the_key_and_the_echo() -> TestResult {
+        block_on(async {
+            let query = extract(
+                "/api/v1/cards?acct_id=00000000050&card_num=0000000000000000&direction=forward\
+                 &page_no=0&first_key=1&last_key=8&has_next_page=true&last_page_shown=false\
+                 &reread=false&page_size=100",
+            )
             .await?
             .map_err(|error| error.to_string())?;
-        assert_eq!(empty, CardListQuery::default());
-        Ok(())
+            assert_eq!(
+                query,
+                CardListQuery {
+                    acct_id: Some("00000000050".to_owned()),
+                    card_num: Some("0000000000000000".to_owned()),
+                    direction: Some(PageDirection::Forward),
+                    page_no: Some(0),
+                    first_key: Some(1),
+                    last_key: Some(8),
+                    has_next_page: Some(true),
+                    last_page_shown: Some(false),
+                    reread: Some(false),
+                    page_size: Some(100),
+                }
+            );
+            let empty = extract("/api/v1/cards")
+                .await?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(empty, CardListQuery::default());
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn the_query_string_is_validated_before_any_read() -> TestResult {
-        let page_size = (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            PAGE_SIZE_MESSAGE.to_owned(),
-            Some(PAGE_SIZE_FIELD.to_owned()),
-        );
-        for uri in [
-            "/api/v1/cards?page_size=101",
-            "/api/v1/cards?page_size=0",
-            "/api/v1/cards?page_size=101&page_no=10&acct_id=000000000500",
-        ] {
-            assert_eq!(rejection(uri).await?, page_size, "{uri}");
-        }
-        let input = |message: &str, field: &str| {
-            (
-                StatusCode::BAD_REQUEST,
-                message.to_owned(),
-                Some(field.to_owned()),
-            )
-        };
-        for (uri, expected) in [
-            (
-                "/api/v1/cards?page_no=10",
-                input(FIELD_RANGE_MESSAGE, "page_no"),
-            ),
-            (
-                "/api/v1/cards?page_no=-1",
-                input(FIELD_RANGE_MESSAGE, "page_no"),
-            ),
-            (
-                "/api/v1/cards?acct_id=000000000500",
-                input(FIELD_LENGTH_MESSAGE, "acct_id"),
-            ),
-            (
-                "/api/v1/cards?card_num=40000000000000010",
-                input(FIELD_LENGTH_MESSAGE, "card_num"),
-            ),
-        ] {
-            assert_eq!(rejection(uri).await?, expected, "{uri}");
-        }
-        for uri in [
-            "/api/v1/cards?direction=sideways",
-            "/api/v1/cards?first_key=card",
-            "/api/v1/cards?has_next_page=Y",
-        ] {
-            assert_eq!(
-                rejection(uri).await?,
-                (StatusCode::BAD_REQUEST, INVALID_QUERY.to_owned(), None),
-                "{uri}"
+    #[test]
+    fn the_query_string_is_validated_before_any_read() -> TestResult {
+        block_on(async {
+            let page_size = (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                PAGE_SIZE_MESSAGE.to_owned(),
+                Some(PAGE_SIZE_FIELD.to_owned()),
             );
-        }
-        Ok(())
+            for uri in [
+                "/api/v1/cards?page_size=101",
+                "/api/v1/cards?page_size=0",
+                "/api/v1/cards?page_size=101&page_no=10&acct_id=000000000500",
+            ] {
+                assert_eq!(rejection(uri).await?, page_size, "{uri}");
+            }
+            let input = |message: &str, field: &str| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    message.to_owned(),
+                    Some(field.to_owned()),
+                )
+            };
+            for (uri, expected) in [
+                (
+                    "/api/v1/cards?page_no=10",
+                    input(FIELD_RANGE_MESSAGE, "page_no"),
+                ),
+                (
+                    "/api/v1/cards?page_no=-1",
+                    input(FIELD_RANGE_MESSAGE, "page_no"),
+                ),
+                (
+                    "/api/v1/cards?acct_id=000000000500",
+                    input(FIELD_LENGTH_MESSAGE, "acct_id"),
+                ),
+                (
+                    "/api/v1/cards?card_num=40000000000000010",
+                    input(FIELD_LENGTH_MESSAGE, "card_num"),
+                ),
+            ] {
+                assert_eq!(rejection(uri).await?, expected, "{uri}");
+            }
+            for uri in [
+                "/api/v1/cards?direction=sideways",
+                "/api/v1/cards?first_key=card",
+                "/api/v1/cards?has_next_page=Y",
+            ] {
+                assert_eq!(
+                    rejection(uri).await?,
+                    (StatusCode::BAD_REQUEST, INVALID_QUERY.to_owned(), None),
+                    "{uri}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_repeated_member_is_refused_and_an_unknown_one_is_skipped() -> TestResult {
+        let refused = || (StatusCode::BAD_REQUEST, INVALID_QUERY.to_owned(), None);
+        block_on(async {
+            for (uri, expected) in [
+                (
+                    "/api/v1/cards?colour=red&acct_id=00000000050&page=2",
+                    Ok(CardListQuery {
+                        acct_id: Some("00000000050".to_owned()),
+                        ..CardListQuery::default()
+                    }),
+                ),
+                ("/api/v1/cards?page_no=1&page_no=2", Err(refused())),
+                (
+                    "/api/v1/cards?card_num=0000000000000000&card_num=0000000000000000",
+                    Err(refused()),
+                ),
+                ("/api/v1/cards?page_size=7&page_size=7", Err(refused())),
+            ] {
+                let outcome = extract(uri).await?.map_err(|error| {
+                    (
+                        error.status(),
+                        error.message().to_owned(),
+                        error.field().map(str::to_owned),
+                    )
+                });
+                assert_eq!(outcome, expected, "{uri}");
+            }
+            Ok(())
+        })
     }
 
     #[test]

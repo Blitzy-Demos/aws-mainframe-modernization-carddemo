@@ -78,6 +78,7 @@ use domain::records::{
 use domain::sensitive::{CardNumber, Password, Ssn};
 use proptest::prelude::*;
 use proptest::sample::Index;
+use proptest::strategy::Union;
 
 /// Longest generated input, in bytes.
 const MAX_LEN: usize = 1_024;
@@ -1060,7 +1061,10 @@ const TERMINATORS: [&[u8]; 3] = [b"\n", b"\r\n", b""];
 
 /// A byte written over a template: any byte, or one the parsers give meaning to.
 fn mutation_byte() -> impl Strategy<Value = u8> {
-    prop_oneof![any::<u8>(), prop::sample::select(RECORD_TEXT)]
+    Union::new([
+        any::<u8>().boxed(),
+        prop::sample::select(RECORD_TEXT).boxed(),
+    ])
 }
 
 /// One of [`templates`] with one to eight [`mutation_byte`]s written over it.
@@ -1084,27 +1088,33 @@ fn record_shaped() -> impl Strategy<Value = Vec<u8>> {
 
 /// A CP00 field: mostly printable text, sometimes CR, LF, commas or any byte.
 fn cp00_text_field() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        8 => prop::collection::vec(prop::sample::select(FIELD_TEXT), 0..=24),
-        1 => prop::collection::vec(prop::sample::select(RECORD_TEXT), 0..=24),
-        1 => prop::collection::vec(any::<u8>(), 0..=4),
-    ]
+    Union::new_weighted(vec![
+        (
+            8,
+            prop::collection::vec(prop::sample::select(FIELD_TEXT), 0..=24).boxed(),
+        ),
+        (
+            1,
+            prop::collection::vec(prop::sample::select(RECORD_TEXT), 0..=24).boxed(),
+        ),
+        (1, prop::collection::vec(any::<u8>(), 0..=4).boxed()),
+    ])
 }
 
 /// A CP00 `PIC 9(n)` field, 8 or 12: mostly digits.
 fn cp00_digit_field() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        3 => prop::collection::vec(b'0'..=b'9', 0..=8),
-        1 => cp00_text_field(),
-    ]
+    Union::new_weighted(vec![
+        (3, prop::collection::vec(b'0'..=b'9', 0..=8).boxed()),
+        (1, cp00_text_field().boxed()),
+    ])
 }
 
 /// CP00 field 3: mostly 16 digits, so the parse passes the card check.
 fn cp00_card_field() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        3 => prop::collection::vec(b'0'..=b'9', CARD_LEN),
-        1 => cp00_text_field(),
-    ]
+    Union::new_weighted(vec![
+        (3, prop::collection::vec(b'0'..=b'9', CARD_LEN).boxed()),
+        (1, cp00_text_field().boxed()),
+    ])
 }
 
 /// CP00 field 9: mostly `NUMVAL`-shaped text, valid or not (two signs, a bare point).
@@ -1125,7 +1135,7 @@ fn cp00_amount_field() -> impl Strategy<Value = Vec<u8>> {
             amount.extend_from_slice(trail);
             amount
         });
-    prop_oneof![3 => numeric, 1 => cp00_text_field()]
+    Union::new_weighted(vec![(3, numeric.boxed()), (1, cp00_text_field().boxed())])
 }
 
 /// A CP00 body of 18 fields in wire order, sometimes cut to fewer, followed by up to two extra
@@ -1141,7 +1151,10 @@ fn cp00_body() -> impl Strategy<Value = Vec<u8>> {
         cp00_digit_field(),
         prop::collection::vec(cp00_text_field(), 6),
         prop::collection::vec(cp00_text_field(), 0..=2),
-        prop_oneof![4 => Just(usize::MAX), 1 => 0..=CP00_FIELDS],
+        Union::new_weighted(vec![
+            (4, Just(usize::MAX).boxed()),
+            (1, (0..=CP00_FIELDS).boxed()),
+        ]),
         any::<bool>(),
     )
         .prop_map(
@@ -1182,11 +1195,17 @@ fn cp00_body() -> impl Strategy<Value = Vec<u8>> {
 /// any trailing bytes.
 fn cdra_body() -> impl Strategy<Value = Vec<u8>> {
     (
-        prop_oneof![
-            Just(b"INQA".to_vec()),
-            prop::collection::vec(prop::sample::select(FIELD_TEXT), 0..=CDRA_FUNCTION_LEN),
-        ],
-        prop::collection::vec(prop_oneof![9 => b'0'..=b'9', 1 => mutation_byte()], 0..=11),
+        Union::new([
+            Just(b"INQA".to_vec()).boxed(),
+            prop::collection::vec(prop::sample::select(FIELD_TEXT), 0..=CDRA_FUNCTION_LEN).boxed(),
+        ]),
+        prop::collection::vec(
+            Union::new_weighted(vec![
+                (9, (b'0'..=b'9').boxed()),
+                (1, mutation_byte().boxed()),
+            ]),
+            0..=11,
+        ),
         prop::collection::vec(any::<u8>(), 0..=24),
     )
         .prop_map(|(function, key, rest)| [function, key, rest].concat())
@@ -1216,28 +1235,42 @@ fn phc_free(max: usize) -> impl Strategy<Value = Vec<u8>> {
 /// and encoding errors.
 fn phc_b64(max: usize) -> impl Strategy<Value = Vec<u8>> {
     let groups = (0..=max / 4).prop_map(|count| count.saturating_mul(4));
-    prop_oneof![groups, 0..=max]
+    Union::new([groups.boxed(), (0..=max).boxed()])
         .prop_flat_map(|len| prop::collection::vec(prop::sample::select(PHC_B64), len))
 }
 
 /// A PHC version field: one of [`PHC_VERSIONS`], or free-form text with or without the `v=`
 /// that marks a version.
 fn phc_version() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        3 => prop::sample::select(PHC_VERSIONS.to_vec()).prop_map(<[u8]>::to_vec),
-        1 => phc_free(12),
-        1 => phc_free(12).prop_map(|value| [b"v=".as_slice(), &value].concat()),
-    ]
+    Union::new_weighted(vec![
+        (
+            3,
+            prop::sample::select(PHC_VERSIONS.to_vec())
+                .prop_map(<[u8]>::to_vec)
+                .boxed(),
+        ),
+        (1, phc_free(12).boxed()),
+        (
+            1,
+            phc_free(12)
+                .prop_map(|value| [b"v=".as_slice(), &value].concat())
+                .boxed(),
+        ),
+    ])
 }
 
 /// A PHC parameter field: `m`, `t` and `p` of at most 64 KiB, 3 passes and 3 lanes, on both
 /// sides of argon2's minimums, or free-form text running past the parser's 127-byte limit.
 fn phc_params() -> impl Strategy<Value = Vec<u8>> {
-    prop_oneof![
-        4 => (0_u32..=64, 0_u32..=3, 0_u32..=3)
-            .prop_map(|(m, t, p)| format!("m={m},t={t},p={p}").into_bytes()),
-        1 => phc_free(130),
-    ]
+    Union::new_weighted(vec![
+        (
+            4,
+            (0_u32..=64, 0_u32..=3, 0_u32..=3)
+                .prop_map(|(m, t, p)| format!("m={m},t={t},p={p}").into_bytes())
+                .boxed(),
+        ),
+        (1, phc_free(130).boxed()),
+    ])
 }
 
 /// Text shaped like the PHC string `users.password_hash` stores: `$` and an algorithm, then an
@@ -1255,18 +1288,37 @@ fn phc_params() -> impl Strategy<Value = Vec<u8>> {
 /// most 374 bytes, within [`MAX_LEN`].
 fn phc_text() -> impl Strategy<Value = Vec<u8>> {
     (
-        prop_oneof![
-            4 => prop::sample::select(PHC_ALGORITHMS.to_vec()).prop_map(<[u8]>::to_vec),
-            1 => phc_free(40),
-        ],
-        prop_oneof![4 => phc_version().prop_map(Some), 1 => Just(None)],
-        prop_oneof![39 => phc_params().prop_map(Some), 1 => Just(None)],
-        prop_oneof![
-            4 => (phc_b64(70), phc_b64(90)).prop_map(|(salt, hash)| vec![salt, hash]),
-            1 => phc_b64(70).prop_map(|salt| vec![salt]),
-            1 => Just(Vec::new()),
-        ],
-        prop_oneof![3 => Just(None), 1 => phc_free(24).prop_map(Some)],
+        Union::new_weighted(vec![
+            (
+                4,
+                prop::sample::select(PHC_ALGORITHMS.to_vec())
+                    .prop_map(<[u8]>::to_vec)
+                    .boxed(),
+            ),
+            (1, phc_free(40).boxed()),
+        ]),
+        Union::new_weighted(vec![
+            (4, phc_version().prop_map(Some).boxed()),
+            (1, Just(None).boxed()),
+        ]),
+        Union::new_weighted(vec![
+            (39, phc_params().prop_map(Some).boxed()),
+            (1, Just(None).boxed()),
+        ]),
+        Union::new_weighted(vec![
+            (
+                4,
+                (phc_b64(70), phc_b64(90))
+                    .prop_map(|(salt, hash)| vec![salt, hash])
+                    .boxed(),
+            ),
+            (1, phc_b64(70).prop_map(|salt| vec![salt]).boxed()),
+            (1, Just(Vec::new()).boxed()),
+        ]),
+        Union::new_weighted(vec![
+            (3, Just(None).boxed()),
+            (1, phc_free(24).prop_map(Some).boxed()),
+        ]),
     )
         .prop_map(|(algorithm, version, params, salt_and_hash, tail)| {
             let fields = iter::once(algorithm)
@@ -1289,7 +1341,10 @@ fn phc_text() -> impl Strategy<Value = Vec<u8>> {
 fn fixture_file() -> impl Strategy<Value = Vec<u8>> {
     let line = (
         prop::collection::vec((any::<Index>(), mutation_byte()), 0..=2),
-        prop_oneof![3 => Just(None), 1 => any::<Index>().prop_map(Some)],
+        Union::new_weighted(vec![
+            (3, Just(None).boxed()),
+            (1, any::<Index>().prop_map(Some).boxed()),
+        ]),
         prop::sample::select(TERMINATORS.to_vec()),
     );
     (

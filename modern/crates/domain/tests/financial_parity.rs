@@ -1464,10 +1464,12 @@ fn intcalc_skips_a_zero_rate_and_applies_each_total_at_the_next_break() -> TestR
         .cloned()
         .ok_or("the first account is not in acctdata.txt")?;
     let run = run_intcalc(accounts, &records, &masters)?;
-    // ARITH-016: `1400-COMPUTE-FEES` computes no fee. A record at a non-zero rate returns its
-    // SYSTRAN record of the monthly interest alone, the zero-rate record returns nothing, and the
-    // break adds only the rewrite of the previous account. Every fixture group is blank, so each
-    // record's lookup falls back to `DEFAULT` before its rate is used (E07, CBACT04C-010).
+    // Every fixture group is blank, so each record's lookup records its `DEFAULT` fallback before
+    // its rate is used (E07, CBACT04C-010). ARITH-016: `1400-COMPUTE-FEES` computes no fee, so a
+    // record at a non-zero rate then adds one SYSTRAN record of its monthly interest and no fee
+    // effect. The zero-rate record adds no interest and no SYSTRAN record, leaving only its
+    // fallback. The break adds only the rewrite of the previous account, ahead of the third
+    // record's fallback.
     assert_eq!(
         run.effects,
         [

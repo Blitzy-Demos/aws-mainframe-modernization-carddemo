@@ -50,7 +50,11 @@ use domain::online::cocrdupc::{
     self as rules, CardKey, CardLookup, CardSaveEffects, CardSnapshot, CardUpdateFailure,
     CardUpdateOutcome, CardUpdateView, Decision,
 };
-use persistence::{CardRepository, PgStore};
+use persistence::{CardRepository, PersistenceError, PgStore};
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -110,7 +114,22 @@ async fn read_card<R: CardRepository>(
         },
         Ok(None) => CardLookup::NotFound,
         Err(error) => {
-            tracing::error!(%error, "CARDDAT read failed; answering the COCRDUPC file error");
+            // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint
+            // suppression.
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: STORE_FAILED_FIELDS,
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            store_failed(
+                &EVENT,
+                "CARDDAT read failed; answering the COCRDUPC file error",
+                error,
+            );
             CardLookup::Error
         }
     };
@@ -221,7 +240,20 @@ async fn rewrite<R: CardRepository>(
         Ok(Some((_, record))) => record.num,
         Ok(None) => return Err(CardUpdateFailure::lock_failed()),
         Err(error) => {
-            tracing::error!(%error, "CARDDAT handle read failed; answering the lock error");
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: STORE_FAILED_FIELDS,
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            store_failed(
+                &EVENT,
+                "CARDDAT handle read failed; answering the lock error",
+                &error,
+            );
             return Err(CardUpdateFailure::lock_failed());
         }
     };
@@ -229,7 +261,20 @@ async fn rewrite<R: CardRepository>(
         Ok(Some((_, record))) => record,
         Ok(None) => return Err(CardUpdateFailure::lock_failed()),
         Err(error) => {
-            tracing::error!(%error, "CARDDAT read for update failed; answering the lock error");
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: STORE_FAILED_FIELDS,
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            store_failed(
+                &EVENT,
+                "CARDDAT read for update failed; answering the lock error",
+                &error,
+            );
             return Err(CardUpdateFailure::lock_failed());
         }
     };
@@ -239,9 +284,46 @@ async fn rewrite<R: CardRepository>(
         Ok(true) => Ok(()),
         Ok(false) => Err(CardUpdateFailure::rewrite_failed()),
         Err(error) => {
-            tracing::error!(%error, "CARDDAT rewrite failed; answering the update error");
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: STORE_FAILED_FIELDS,
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            store_failed(
+                &EVENT,
+                "CARDDAT rewrite failed; answering the update error",
+                &error,
+            );
             Err(CardUpdateFailure::rewrite_failed())
         }
+    }
+}
+
+/// The fields of the `ERROR` event of a failed `CARDDAT` statement, in the order
+/// [`store_failed`] gives their values.
+const STORE_FAILED_FIELDS: &[&str] = &["message", "error"];
+
+/// Emits the event of `callsite`, a failed `CARDDAT` statement's, in the current span when
+/// `runtime::telemetry::event_enabled` says so: `message` and the error's `Display`, which holds
+/// an SQLSTATE, a constraint name or a column name and never a value.
+fn store_failed(
+    callsite: &'static DefaultCallsite,
+    message: &'static str,
+    error: &PersistenceError,
+) {
+    if runtime::telemetry::event_enabled(callsite) {
+        let metadata = callsite.metadata();
+        Event::dispatch(
+            metadata,
+            &metadata.fields().value_set_all(&[
+                Some(&message as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
     }
 }
 
@@ -269,6 +351,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A synthetic card number, in no fixture.
     const CARD: &str = "1111222233334444";
@@ -516,232 +607,250 @@ mod tests {
     // audit: COCRDUPC-017
     // audit: COCRDUPC-042
     // audit: COCRDUPC-044
-    #[tokio::test]
-    async fn handle_and_number_read_the_card_alone_shown_redacted_under_the_account_entered()
-    -> TestResult {
-        let mut cards = table()?;
+    #[test]
+    fn handle_and_number_read_the_card_alone_shown_redacted_under_the_account_entered() -> TestResult
+    {
+        block_on(async {
+            let mut cards = table()?;
 
-        let by_handle = read_card(&mut cards, query(ACCT, None, Some(HANDLE))).await?;
-        let by_number = read_card(&mut cards, query(ACCT, Some(CARD), None)).await?;
+            let by_handle = read_card(&mut cards, query(ACCT, None, Some(HANDLE))).await?;
+            let by_number = read_card(&mut cards, query(ACCT, Some(CARD), None)).await?;
 
-        assert_eq!(
-            cards.calls,
-            Calls {
-                by_id: 1,
-                by_ref: 1,
-                ..Calls::default()
+            assert_eq!(
+                cards.calls,
+                Calls {
+                    by_id: 1,
+                    by_ref: 1,
+                    ..Calls::default()
+                }
+            );
+            for view in [&by_handle, &by_number] {
+                let CardUpdateView {
+                    card_ref,
+                    card_num,
+                    acct_id,
+                    embossed_name,
+                    expiration_date,
+                    status,
+                    snapshot,
+                    info_message,
+                } = view;
+                assert_eq!(*card_ref, CardRef::new(HANDLE));
+                assert_eq!(card_num.redacted(), REDACTED);
+                assert_eq!(*acct_id, PicU::new(50)?);
+                assert_eq!(*embossed_name, PicX::from_text("TEST HOLDER")?);
+                assert_eq!(*expiration_date, date(2025, 4, 30)?.value());
+                assert_eq!(*status, PicX::from_text("Y")?);
+                assert_eq!(snapshot.state(), CardUpdateState::ShowDetails);
+                assert_eq!(snapshot.acct_id(), Some(PicU::new(50)?));
+                assert_eq!(*info_message, FOUND_CARDS_FOR_ACCOUNT);
             }
-        );
-        for view in [&by_handle, &by_number] {
-            let CardUpdateView {
-                card_ref,
-                card_num,
-                acct_id,
-                embossed_name,
-                expiration_date,
-                status,
-                snapshot,
-                info_message,
-            } = view;
-            assert_eq!(*card_ref, CardRef::new(HANDLE));
-            assert_eq!(card_num.redacted(), REDACTED);
-            assert_eq!(*acct_id, PicU::new(50)?);
-            assert_eq!(*embossed_name, PicX::from_text("TEST HOLDER")?);
-            assert_eq!(*expiration_date, date(2025, 4, 30)?.value());
-            assert_eq!(*status, PicX::from_text("Y")?);
-            assert_eq!(snapshot.state(), CardUpdateState::ShowDetails);
-            assert_eq!(snapshot.acct_id(), Some(PicU::new(50)?));
-            assert_eq!(*info_message, FOUND_CARDS_FOR_ACCOUNT);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-003
     // audit: COCRDUPC-018
-    #[tokio::test]
-    async fn an_unknown_handle_or_number_is_not_found() -> TestResult {
-        let mut cards = table()?;
+    #[test]
+    fn an_unknown_handle_or_number_is_not_found() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
 
-        for (request, state) in [
-            (
-                query(ACCT, None, Some(HANDLE + 1)),
-                CardUpdateState::ShowDetails,
-            ),
-            (
-                query(ACCT, Some("9999888877776666"), None),
-                CardUpdateState::NotFetched,
-            ),
-        ] {
-            let failure = rule(read_card(&mut cards, request).await)?;
-            assert_eq!(failure.message(), DID_NOT_FIND_ACCTCARD_COMBO);
-            assert_eq!(failure.class(), FailureClass::NotFound);
-            assert_eq!(failure.state(), state);
-        }
-        Ok(())
+            for (request, state) in [
+                (
+                    query(ACCT, None, Some(HANDLE + 1)),
+                    CardUpdateState::ShowDetails,
+                ),
+                (
+                    query(ACCT, Some("9999888877776666"), None),
+                    CardUpdateState::NotFetched,
+                ),
+            ] {
+                let failure = rule(read_card(&mut cards, request).await)?;
+                assert_eq!(failure.message(), DID_NOT_FIND_ACCTCARD_COMBO);
+                assert_eq!(failure.class(), FailureClass::NotFound);
+                assert_eq!(failure.state(), state);
+            }
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-019
-    #[tokio::test]
-    async fn a_failed_read_is_the_file_error_not_a_store_error() -> TestResult {
-        let mut cards = table()?;
-        cards.fault = Fault::Read;
+    #[test]
+    fn a_failed_read_is_the_file_error_not_a_store_error() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
+            cards.fault = Fault::Read;
 
-        for request in [
-            query(ACCT, None, Some(HANDLE)),
-            query(ACCT, Some(CARD), None),
-        ] {
-            let failure = rule(read_card(&mut cards, request).await)?;
-            assert_eq!(failure.message(), FILE_ERROR);
-            assert_eq!(failure.class(), FailureClass::Store);
-        }
-        assert_eq!(cards.calls.other, 0);
-        Ok(())
+            for request in [
+                query(ACCT, None, Some(HANDLE)),
+                query(ACCT, Some(CARD), None),
+            ] {
+                let failure = rule(read_card(&mut cards, request).await)?;
+                assert_eq!(failure.message(), FILE_ERROR);
+                assert_eq!(failure.class(), FailureClass::Store);
+            }
+            assert_eq!(cards.calls.other, 0);
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-010
-    #[tokio::test]
-    async fn a_key_edit_failure_reads_no_card() -> TestResult {
-        let mut cards = table()?;
+    #[test]
+    fn a_key_edit_failure_reads_no_card() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
 
-        let failure = rule(read_card(&mut cards, query("", None, None)).await)?;
+            let failure = rule(read_card(&mut cards, query("", None, None)).await)?;
 
-        assert_eq!(failure.message(), NO_SEARCH_CRITERIA_RECEIVED);
-        assert_eq!(failure.class(), FailureClass::Input);
-        assert_eq!(cards.calls, Calls::default());
-        Ok(())
+            assert_eq!(failure.message(), NO_SEARCH_CRITERIA_RECEIVED);
+            assert_eq!(failure.class(), FailureClass::Input);
+            assert_eq!(cards.calls, Calls::default());
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-007
     // audit: COCRDUPC-034
-    #[tokio::test]
-    async fn enter_and_f5_before_confirmation_validate_without_saving() -> TestResult {
-        let mut cards = table()?;
+    #[test]
+    fn enter_and_f5_before_confirmation_validate_without_saving() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
 
-        for (aid, state) in [
-            (Aid::Enter, CardUpdateState::ShowDetails),
-            (Aid::Pf5, CardUpdateState::ShowDetails),
-            (Aid::Pf5, CardUpdateState::ChangesNotOk),
-        ] {
-            let request = request_after_fetch(&mut cards, aid, state).await?;
-            let Decision::Respond(outcome) = decision(request)? else {
-                return Err(format!("{aid:?} in state {state:?} asked for a save").into());
-            };
-            assert_eq!(outcome.state(), CardUpdateState::ChangesOkNotConfirmed);
-            assert_eq!(outcome.info_message(), PROMPT_FOR_CONFIRMATION);
-            assert!(outcome.confirmation_keys_shown());
-        }
-        assert_eq!(cards.calls.lock + cards.calls.update + cards.calls.other, 0);
-        Ok(())
+            for (aid, state) in [
+                (Aid::Enter, CardUpdateState::ShowDetails),
+                (Aid::Pf5, CardUpdateState::ShowDetails),
+                (Aid::Pf5, CardUpdateState::ChangesNotOk),
+            ] {
+                let request = request_after_fetch(&mut cards, aid, state).await?;
+                let Decision::Respond(outcome) = decision(request)? else {
+                    return Err(format!("{aid:?} in state {state:?} asked for a save").into());
+                };
+                assert_eq!(outcome.state(), CardUpdateState::ChangesOkNotConfirmed);
+                assert_eq!(outcome.info_message(), PROMPT_FOR_CONFIRMATION);
+                assert!(outcome.confirmation_keys_shown());
+            }
+            assert_eq!(cards.calls.lock + cards.calls.update + cards.calls.other, 0);
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-038
     // audit: COCRDUPC-039
     // audit: COCRDUPC-043
-    #[tokio::test]
-    async fn a_confirmed_save_rewrites_the_held_card_keeping_its_number_and_cvv() -> TestResult {
-        let mut cards = table()?;
-        let effects = confirmed_save(&mut cards).await?;
+    #[test]
+    fn a_confirmed_save_rewrites_the_held_card_keeping_its_number_and_cvv() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
+            let effects = confirmed_save(&mut cards).await?;
 
-        rewrite(&mut cards, CardRef::new(HANDLE), &effects).await?;
+            rewrite(&mut cards, CardRef::new(HANDLE), &effects).await?;
 
-        assert_eq!(
-            cards.calls,
-            Calls {
-                by_ref: 1,
-                lock: 1,
-                update: 1,
-                ..Calls::default()
-            }
-        );
-        let stored = cards.stored()?;
-        assert_eq!(stored.num, CardNumber::parse(CARD)?);
-        assert_eq!(stored.cvv_cd, Cvv::new(PicU::new(CVV)?));
-        assert_eq!(stored.acct_id, PicU::new(50)?);
-        assert_eq!(stored.embossed_name, PicX::from_text("New Holder")?);
-        assert_eq!(stored.expiraion_date, date(2030, 6, 30)?);
-        assert_eq!(stored.active_status, PicX::from_text("N")?);
-        assert_eq!(stored.filler, PicX::spaces());
+            assert_eq!(
+                cards.calls,
+                Calls {
+                    by_ref: 1,
+                    lock: 1,
+                    update: 1,
+                    ..Calls::default()
+                }
+            );
+            let stored = cards.stored()?;
+            assert_eq!(stored.num, CardNumber::parse(CARD)?);
+            assert_eq!(stored.cvv_cd, Cvv::new(PicU::new(CVV)?));
+            assert_eq!(stored.acct_id, PicU::new(50)?);
+            assert_eq!(stored.embossed_name, PicX::from_text("New Holder")?);
+            assert_eq!(stored.expiraion_date, date(2030, 6, 30)?);
+            assert_eq!(stored.active_status, PicX::from_text("N")?);
+            assert_eq!(stored.filler, PicX::spaces());
 
-        let committed = effects.committed();
-        assert!(matches!(committed, CardUpdateOutcome::Committed { .. }));
-        assert_eq!(committed.state(), CardUpdateState::ChangesOkayedAndDone);
-        assert_eq!(committed.info_message(), CONFIRM_UPDATE_SUCCESS);
-        Ok(())
+            let committed = effects.committed();
+            assert!(matches!(committed, CardUpdateOutcome::Committed { .. }));
+            assert_eq!(committed.state(), CardUpdateState::ChangesOkayedAndDone);
+            assert_eq!(committed.info_message(), CONFIRM_UPDATE_SUCCESS);
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-036
-    #[tokio::test]
-    async fn a_card_that_cannot_be_read_for_update_is_not_locked_and_not_written() -> TestResult {
-        for (fault, handle, locks) in [
-            (Fault::None, HANDLE + 1, 0),
-            (Fault::Read, HANDLE, 0),
-            (Fault::Lock, HANDLE, 1),
-        ] {
-            let mut cards = table()?;
-            let effects = confirmed_save(&mut cards).await?;
-            let before = cards.stored()?.clone();
-            cards.fault = fault;
+    #[test]
+    fn a_card_that_cannot_be_read_for_update_is_not_locked_and_not_written() -> TestResult {
+        block_on(async {
+            for (fault, handle, locks) in [
+                (Fault::None, HANDLE + 1, 0),
+                (Fault::Read, HANDLE, 0),
+                (Fault::Lock, HANDLE, 1),
+            ] {
+                let mut cards = table()?;
+                let effects = confirmed_save(&mut cards).await?;
+                let before = cards.stored()?.clone();
+                cards.fault = fault;
 
-            let failure = rewrite(&mut cards, CardRef::new(handle), &effects)
-                .await
-                .err()
-                .ok_or("the save succeeded")?;
+                let failure = rewrite(&mut cards, CardRef::new(handle), &effects)
+                    .await
+                    .err()
+                    .ok_or("the save succeeded")?;
 
-            assert_eq!(failure.message(), COULD_NOT_LOCK_FOR_UPDATE);
-            assert_eq!(failure.class(), FailureClass::Store);
-            assert_eq!(failure.state(), CardUpdateState::LockError);
-            assert_eq!(cards.calls.lock, locks);
-            assert_eq!(cards.calls.update, 0);
-            assert_eq!(*cards.stored()?, before);
-        }
-        Ok(())
+                assert_eq!(failure.message(), COULD_NOT_LOCK_FOR_UPDATE);
+                assert_eq!(failure.class(), FailureClass::Store);
+                assert_eq!(failure.state(), CardUpdateState::LockError);
+                assert_eq!(cards.calls.lock, locks);
+                assert_eq!(cards.calls.update, 0);
+                assert_eq!(*cards.stored()?, before);
+            }
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-037
-    #[tokio::test]
-    async fn a_card_changed_since_the_fetch_is_a_conflict_and_is_not_rewritten() -> TestResult {
-        let mut cards = table()?;
-        let effects = confirmed_save(&mut cards).await?;
-        // Another user deactivates the card between the fetch and the save.
-        let changed = CardRecord {
-            active_status: PicX::from_text("N")?,
-            ..cards.stored()?.clone()
-        };
-        cards.table = vec![(CardRef::new(HANDLE), changed.clone())];
-
-        let failure = rewrite(&mut cards, CardRef::new(HANDLE), &effects)
-            .await
-            .err()
-            .ok_or("the save succeeded")?;
-
-        assert_eq!(failure.message(), DATA_WAS_CHANGED_BEFORE_UPDATE);
-        assert_eq!(failure.class(), FailureClass::Conflict);
-        assert_eq!(failure.state(), CardUpdateState::ShowDetails);
-        assert_eq!(cards.calls.lock, 1);
-        assert_eq!(cards.calls.update, 0);
-        assert_eq!(*cards.stored()?, changed);
-        Ok(())
-    }
-
-    // audit: COCRDUPC-040
-    #[tokio::test]
-    async fn a_failed_rewrite_is_the_update_failure() -> TestResult {
-        for fault in [Fault::Update, Fault::UpdateMisses] {
+    #[test]
+    fn a_card_changed_since_the_fetch_is_a_conflict_and_is_not_rewritten() -> TestResult {
+        block_on(async {
             let mut cards = table()?;
             let effects = confirmed_save(&mut cards).await?;
-            cards.fault = fault;
+            // Another user deactivates the card between the fetch and the save.
+            let changed = CardRecord {
+                active_status: PicX::from_text("N")?,
+                ..cards.stored()?.clone()
+            };
+            cards.table = vec![(CardRef::new(HANDLE), changed.clone())];
 
             let failure = rewrite(&mut cards, CardRef::new(HANDLE), &effects)
                 .await
                 .err()
                 .ok_or("the save succeeded")?;
 
-            assert_eq!(failure.message(), LOCKED_BUT_UPDATE_FAILED);
-            assert_eq!(failure.class(), FailureClass::Store);
-            assert_eq!(failure.state(), CardUpdateState::UpdateFailed);
-            assert_eq!(cards.calls.update, 1);
-        }
-        Ok(())
+            assert_eq!(failure.message(), DATA_WAS_CHANGED_BEFORE_UPDATE);
+            assert_eq!(failure.class(), FailureClass::Conflict);
+            assert_eq!(failure.state(), CardUpdateState::ShowDetails);
+            assert_eq!(cards.calls.lock, 1);
+            assert_eq!(cards.calls.update, 0);
+            assert_eq!(*cards.stored()?, changed);
+            Ok(())
+        })
+    }
+
+    // audit: COCRDUPC-040
+    #[test]
+    fn a_failed_rewrite_is_the_update_failure() -> TestResult {
+        block_on(async {
+            for fault in [Fault::Update, Fault::UpdateMisses] {
+                let mut cards = table()?;
+                let effects = confirmed_save(&mut cards).await?;
+                cards.fault = fault;
+
+                let failure = rewrite(&mut cards, CardRef::new(HANDLE), &effects)
+                    .await
+                    .err()
+                    .ok_or("the save succeeded")?;
+
+                assert_eq!(failure.message(), LOCKED_BUT_UPDATE_FAILED);
+                assert_eq!(failure.class(), FailureClass::Store);
+                assert_eq!(failure.state(), CardUpdateState::UpdateFailed);
+                assert_eq!(cards.calls.update, 1);
+            }
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-043

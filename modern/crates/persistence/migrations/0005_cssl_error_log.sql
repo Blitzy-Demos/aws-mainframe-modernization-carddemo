@@ -13,9 +13,11 @@
 --   err_application            the CICS transaction ID, CP00 [COPAUA0C.cbl:34,996]
 --   err_program                COPAUA0C [COPAUA0C.cbl:33,997]
 --   err_location               the log location code, for example M004, I003, I004
---   err_level, err_subsystem   the 88-level codes of CCPAUERY.cpy:25-36; no CHECK lists them,
---                              because domain::records::error_log::{ErrorLevel, ErrorSubsystem}
---                              types them
+--   err_level, err_subsystem   whatever one byte the COBOL field holds, kept as the lossless
+--                              codecs keep it; domain::records::error_log::{ErrorLevel,
+--                              ErrorSubsystem} only interpret the 88-level codes of
+--                              CCPAUERY.cpy:25-36, giving None for any other byte, so no CHECK
+--                              lists them
 --   err_code_1, err_code_2     CICS, MQ and IMS status codes (halt H4)
 --
 -- A TDQ record has no key, so the table carries the surrogate key id, which is not a copybook

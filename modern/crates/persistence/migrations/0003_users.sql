@@ -11,8 +11,13 @@
 -- but the hash is stored (Cardholder Data Redaction).
 --
 -- Every character column is COLLATE "C", as in migration 0001: the KSDS orders keys by their
--- bytes, the COUSR00C browse (endpoint 16) pages on users_pkey in that order, and the server's
--- default locale must not change it.
+-- bytes, and the server's default locale must not change the order in which the COUSR00C browse
+-- (endpoint 16) pages on users_pkey. That order is ASCII byte order; the USRSEC KSDS ordered
+-- EBCDIC bytes. The two agree for the fixture user IDs, ADMIN001 to ADMIN005 and USER0001 to
+-- USER0005: upper-case letters then digits, so where two of them first differ, a letter meets a
+-- letter or a digit meets a digit. They need not agree for arbitrary IDs, where a digit can meet a
+-- letter or lower case meet upper case at that byte (escalation candidate X-COUSR00C-2 in
+-- modern/audit/online/COUSR00C.md).
 --
 -- dusrsecj replaces the table's contents inside one transaction, as the IDCAMS DELETE, DEFINE
 -- and REPRO of DUSRSECJ do. No foreign key references the table. Only runtime::migrate applies

@@ -32,13 +32,42 @@
 //!   message alike, waits for it and then decides against committed state. A concurrent first
 //!   authorization waits on the uncommitted insert and then finds the committed row
 //!   (COPAUA0C-026). The CP00 worker always calls it on its authorization transaction, which
-//!   also covers the decision, the reply and the writes after the acknowledgement (E29).
+//!   also covers the decision, the reply and the writes after the acknowledgement, in the order
+//!   [Reply before write (E29)](self#reply-before-write-e29) explains.
 //! - On a [`PgStore`] the call runs in a short transaction of its own, committed before it
 //!   returns, so its lock ends with the call and serialises nothing after it.
 //! - No process-local lock guards authorization state: a second process could not see one.
 //! - A row that a concurrent purge deletes after the insert saw it, and before the lock is
 //!   granted, is not returned by the locking read. The insert and the read then run once more,
 //!   and a second miss is [`PersistenceError::NotFound`].
+//!
+//! # Reply before write (E29)
+//!
+//! The CP00 worker, inside the transaction that holds this summary's lock, decides, publishes
+//! the reply, waits for the broker's confirmation and acknowledges the request. Only after the
+//! acknowledgement does it run `update`, then the detail `insert` on a savepoint, then the
+//! commit (COPAUA0C-081).
+//!
+//! That is COPAUA0C's own order (COPAUA0C-080). `7100-SEND-RESPONSE` puts the reply with
+//! `MQPUT1` under `MQPMO-NO-SYNCPOINT`, outside the unit of work (`COPAUA0C.cbl:753-758`),
+//! before `8000-WRITE-AUTH-TO-DB` (`COPAUA0C.cbl:459-465`). Its IMS writes commit only at the
+//! `SYNCPOINT` after each message (`COPAUA0C.cbl:334-336`), and its `MQGMO-NO-SYNCPOINT` get has
+//! already removed the request (`COPAUA0C.cbl:389`). Parity keeps that order deliberately:
+//! writing and committing before the reply would tie the reply to its writes and change what a
+//! requester receives when a write fails.
+//!
+//! The order keeps the COBOL's exposure too: a requester can hold a delivered decision that is
+//! never recorded. When the summary write fails (`I003`, COPAUA0C-119), or the commit fails or
+//! the process or connection is lost after the acknowledgement (COPAUA0C-121), the transaction
+//! rolls back and the lock is released with the summary unchanged. The approval is not counted in
+//! `approved_auth_amt`, so the account's real exposure can exceed the committed figure the
+//! credit-limit lock guards, and nothing is redelivered, as the request was acknowledged. A
+//! failed detail insert (`I004`, COPAUA0C-120) commits the summary without its detail.
+//!
+//! The order stands only with the named reviewer's dated signature in the
+//! `E29 — CP00 reply before write` row of `modern/audit/README.md`; until then
+//! `modern/audit/ESCALATIONS.md` holds E29 as `AWAITING SIGNATURE`. A `Rejected` signature
+//! reopens the ordering decision; nothing else moves the writes ahead of the reply.
 //!
 //! # The purge's read (CBPAUP0C-009)
 //!
@@ -167,7 +196,9 @@ pub trait PendingAuthSummaryRepository: Send {
     /// Rewrites every field of the summary of `record.acct_id` other than the key, and returns
     /// whether exactly one row changed; `false` means the account has no summary. This is CP00's
     /// summary write after the acknowledgement, `REPL` or `ISRT` of `8400-UPDATE-SUMMARY`; the
-    /// order of that write is the worker's (COPAUA0C-097, E29).
+    /// order of that write is the worker's (COPAUA0C-097), and
+    /// [Reply before write (E29)](crate::repos::pending_auth_summaries#reply-before-write-e29)
+    /// gives the reason it follows the reply.
     ///
     /// # Errors
     ///
@@ -394,7 +425,6 @@ async fn find_all_in(
         .collect()
 }
 
-/// `insert` on `conn`.
 async fn insert_in(
     conn: &mut PgConnection,
     record: &PendingAuthSummaryRecord,
@@ -402,7 +432,6 @@ async fn insert_in(
     insert_row(conn, &PendingAuthSummaryRow::from_record(record)?).await
 }
 
-/// `update` on `conn`.
 async fn update_in(
     conn: &mut PgConnection,
     record: &PendingAuthSummaryRecord,
@@ -410,7 +439,6 @@ async fn update_in(
     update_row(conn, &PendingAuthSummaryRow::from_record(record)?).await
 }
 
-/// `delete` on `conn`.
 async fn delete_in(conn: &mut PgConnection, acct_id: PicS<11>) -> Result<bool, PersistenceError> {
     delete_row(conn, pic_s_to_i64(acct_id)).await
 }
@@ -649,6 +677,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// What a `lock_or_create` running in a task of its own returns.
     type Locked = Result<(PendingAuthSummaryRecord, bool), PersistenceError>;
 
@@ -785,33 +822,35 @@ mod tests {
     // audit: COPAUA0C-025
     // audit: COPAUA0C-092
     // audit: COPAUA0C-097
-    #[tokio::test]
-    async fn lock_or_create_creates_once_then_locks_the_stored_row() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let new = template(50, 50)?;
+    #[test]
+    fn lock_or_create_creates_once_then_locks_the_stored_row() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let new = template(50, 50)?;
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.lock_or_create(&new).await?, (new.clone(), true));
-        assert_eq!(tx.find_by_id(new.acct_id).await?, Some(new.clone()));
-        let written = charged(&new)?;
-        assert!(tx.update(&written).await?);
-        tx.commit().await?;
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.lock_or_create(&new).await?, (new.clone(), true));
+            assert_eq!(tx.find_by_id(new.acct_id).await?, Some(new.clone()));
+            let written = charged(&new)?;
+            assert!(tx.update(&written).await?);
+            tx.commit().await?;
 
-        let mut tx = store.begin().await?;
-        let other_customer = template(50, 77)?;
-        assert_eq!(
-            tx.lock_or_create(&other_customer).await?,
-            (written.clone(), false)
-        );
-        tx.rollback().await?;
-        assert_eq!(store.find_by_id(new.acct_id).await?, Some(written));
+            let mut tx = store.begin().await?;
+            let other_customer = template(50, 77)?;
+            assert_eq!(
+                tx.lock_or_create(&other_customer).await?,
+                (written.clone(), false)
+            );
+            tx.rollback().await?;
+            assert_eq!(store.find_by_id(new.acct_id).await?, Some(written));
 
-        let fresh = template(51, 51)?;
-        assert_eq!(store.lock_or_create(&fresh).await?, (fresh.clone(), true));
-        assert_eq!(store.lock_or_create(&fresh).await?, (fresh.clone(), false));
-        assert_eq!(store.find_by_id(fresh.acct_id).await?, Some(fresh));
-        Ok(())
+            let fresh = template(51, 51)?;
+            assert_eq!(store.lock_or_create(&fresh).await?, (fresh.clone(), true));
+            assert_eq!(store.lock_or_create(&fresh).await?, (fresh.clone(), false));
+            assert_eq!(store.find_by_id(fresh.acct_id).await?, Some(fresh));
+            Ok(())
+        })
     }
 
     /// A second decision for the account waits for the transaction holding the lock, a first
@@ -820,36 +859,38 @@ mod tests {
     // audit: COPAUA0C-026
     // audit: COPAUA0C-049
     // audit: CBPAUP0C-016
-    #[tokio::test]
-    async fn a_second_decision_waits_for_the_lock_and_reads_committed_state() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let new = template(60, 60)?;
+    #[test]
+    fn a_second_decision_waits_for_the_lock_and_reads_committed_state() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let new = template(60, 60)?;
 
-        let mut first = store.begin().await?;
-        let (row, created) = first.lock_or_create(&new).await?;
-        assert!(created);
-        let mut second = lock_elsewhere(&store, &new);
-        assert!(
-            time::timeout(LOCK_WAIT, &mut second).await.is_err(),
-            "the second decision runs only after the first commits"
-        );
-        let written = charged(&row)?;
-        assert!(first.update(&written).await?);
-        first.commit().await?;
-        assert_eq!(second.await??, (written, false));
+            let mut first = store.begin().await?;
+            let (row, created) = first.lock_or_create(&new).await?;
+            assert!(created);
+            let mut second = lock_elsewhere(&store, &new);
+            assert!(
+                time::timeout(LOCK_WAIT, &mut second).await.is_err(),
+                "the second decision runs only after the first commits"
+            );
+            let written = charged(&row)?;
+            assert!(first.update(&written).await?);
+            first.commit().await?;
+            assert_eq!(second.await??, (written, false));
 
-        let mut purge = store.begin().await?;
-        assert!(!purge.lock_or_create(&new).await?.1);
-        let mut waiting = lock_elsewhere(&store, &new);
-        assert!(
-            time::timeout(LOCK_WAIT, &mut waiting).await.is_err(),
-            "the decision waits while the purge holds the lock"
-        );
-        assert!(purge.delete(new.acct_id).await?);
-        purge.commit().await?;
-        assert_eq!(waiting.await??, (new, true));
-        Ok(())
+            let mut purge = store.begin().await?;
+            assert!(!purge.lock_or_create(&new).await?.1);
+            let mut waiting = lock_elsewhere(&store, &new);
+            assert!(
+                time::timeout(LOCK_WAIT, &mut waiting).await.is_err(),
+                "the decision waits while the purge holds the lock"
+            );
+            assert!(purge.delete(new.acct_id).await?);
+            purge.commit().await?;
+            assert_eq!(waiting.await??, (new, true));
+            Ok(())
+        })
     }
 
     /// The purge's read returns the summaries one at a time in key order, then `None`. It waits
@@ -857,58 +898,60 @@ mod tests {
     /// skips a row the lock holder deleted, and on a transaction holds its own lock, through a
     /// released savepoint, until the commit.
     // audit: CBPAUP0C-009
-    #[tokio::test]
-    async fn lock_next_reads_each_summary_as_last_committed_in_key_order() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        assert_eq!(store.lock_next(None).await?, None);
-        for acct in [30, 10, 20] {
-            store.insert(&template(acct, 1)?).await?;
-        }
-        assert_eq!(walk(&mut store).await?, [10, 20, 30]);
-        let between = Some(PicS::new(15)?);
-        assert_eq!(store.lock_next(between).await?, Some(template(20, 1)?));
-        let mut tx = store.begin().await?;
-        assert_eq!(walk(&mut tx).await?, [10, 20, 30]);
-        tx.rollback().await?;
+    #[test]
+    fn lock_next_reads_each_summary_as_last_committed_in_key_order() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            assert_eq!(store.lock_next(None).await?, None);
+            for acct in [30, 10, 20] {
+                store.insert(&template(acct, 1)?).await?;
+            }
+            assert_eq!(walk(&mut store).await?, [10, 20, 30]);
+            let between = Some(PicS::new(15)?);
+            assert_eq!(store.lock_next(between).await?, Some(template(20, 1)?));
+            let mut tx = store.begin().await?;
+            assert_eq!(walk(&mut tx).await?, [10, 20, 30]);
+            tx.rollback().await?;
 
-        let after_first = Some(PicS::new(10)?);
-        let mut cp00 = store.begin().await?;
-        let (row, created) = cp00.lock_or_create(&template(20, 1)?).await?;
-        assert!(!created);
-        let mut next = next_elsewhere(&store, after_first);
-        assert!(
-            time::timeout(LOCK_WAIT, &mut next).await.is_err(),
-            "the read waits for the decision that holds the row"
-        );
-        let written = charged(&row)?;
-        assert!(cp00.update(&written).await?);
-        cp00.commit().await?;
-        assert_eq!(next.await??, Some(written));
+            let after_first = Some(PicS::new(10)?);
+            let mut cp00 = store.begin().await?;
+            let (row, created) = cp00.lock_or_create(&template(20, 1)?).await?;
+            assert!(!created);
+            let mut next = next_elsewhere(&store, after_first);
+            assert!(
+                time::timeout(LOCK_WAIT, &mut next).await.is_err(),
+                "the read waits for the decision that holds the row"
+            );
+            let written = charged(&row)?;
+            assert!(cp00.update(&written).await?);
+            cp00.commit().await?;
+            assert_eq!(next.await??, Some(written));
 
-        let mut holder = store.begin().await?;
-        assert!(!holder.lock_or_create(&template(20, 1)?).await?.1);
-        let mut skipping = next_elsewhere(&store, after_first);
-        assert!(
-            time::timeout(LOCK_WAIT, &mut skipping).await.is_err(),
-            "the read waits for the transaction that deletes the row"
-        );
-        assert!(holder.delete(PicS::new(20)?).await?);
-        holder.commit().await?;
-        assert_eq!(skipping.await??, Some(template(30, 1)?));
+            let mut holder = store.begin().await?;
+            assert!(!holder.lock_or_create(&template(20, 1)?).await?.1);
+            let mut skipping = next_elsewhere(&store, after_first);
+            assert!(
+                time::timeout(LOCK_WAIT, &mut skipping).await.is_err(),
+                "the read waits for the transaction that deletes the row"
+            );
+            assert!(holder.delete(PicS::new(20)?).await?);
+            holder.commit().await?;
+            assert_eq!(skipping.await??, Some(template(30, 1)?));
 
-        let mut purge = store.begin().await?;
-        let mut point = purge.savepoint().await?;
-        assert_eq!(point.lock_next(None).await?, Some(template(10, 1)?));
-        point.commit().await?;
-        let mut decision = lock_elsewhere(&store, &template(10, 1)?);
-        assert!(
-            time::timeout(LOCK_WAIT, &mut decision).await.is_err(),
-            "a decision waits for the commit of the transaction that read the row"
-        );
-        purge.commit().await?;
-        assert_eq!(decision.await??, (template(10, 1)?, false));
-        Ok(())
+            let mut purge = store.begin().await?;
+            let mut point = purge.savepoint().await?;
+            assert_eq!(point.lock_next(None).await?, Some(template(10, 1)?));
+            point.commit().await?;
+            let mut decision = lock_elsewhere(&store, &template(10, 1)?);
+            assert!(
+                time::timeout(LOCK_WAIT, &mut decision).await.is_err(),
+                "a decision waits for the commit of the transaction that read the row"
+            );
+            purge.commit().await?;
+            assert_eq!(decision.await??, (template(10, 1)?, false));
+            Ok(())
+        })
     }
 
     /// Reads, inserts, updates and deletes on both executors, the cascade to the details and
@@ -917,61 +960,63 @@ mod tests {
     // audit: COPAUS0C-029
     // audit: COPAUA0C-097
     // audit: CBPAUP0C-016
-    #[tokio::test]
-    async fn statements_report_their_outcome_and_deletes_cascade() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let summary = sample(70)?;
-        let key = summary.acct_id;
+    #[test]
+    fn statements_report_their_outcome_and_deletes_cascade() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let summary = sample(70)?;
+            let key = summary.acct_id;
 
-        assert_eq!(store.find_by_id(key).await?, None);
-        assert!(!store.update(&summary).await?);
-        assert!(!store.delete(key).await?);
-        store.insert(&summary).await?;
-        assert_eq!(store.find_by_id(key).await?, Some(summary.clone()));
-        assert_eq!(
-            store.insert(&summary).await,
-            Err(PersistenceError::Duplicate {
-                constraint: Some("pending_auth_summaries_pkey".to_owned()),
-            })
-        );
+            assert_eq!(store.find_by_id(key).await?, None);
+            assert!(!store.update(&summary).await?);
+            assert!(!store.delete(key).await?);
+            store.insert(&summary).await?;
+            assert_eq!(store.find_by_id(key).await?, Some(summary.clone()));
+            assert_eq!(
+                store.insert(&summary).await,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some("pending_auth_summaries_pkey".to_owned()),
+                })
+            );
 
-        let mut changed = template(70, 71)?;
-        changed.declined_auth_cnt = Count::new(3);
-        assert!(store.update(&changed).await?);
-        assert_eq!(store.find_by_id(key).await?, Some(changed));
+            let mut changed = template(70, 71)?;
+            changed.declined_auth_cnt = Count::new(3);
+            assert!(store.update(&changed).await?);
+            assert_eq!(store.find_by_id(key).await?, Some(changed));
 
-        insert_detail(guard.pool(), 70).await?;
-        assert_eq!(details(guard.pool(), 70).await?, 1);
-        assert!(store.delete(key).await?);
-        assert_eq!(store.find_by_id(key).await?, None);
-        assert_eq!(details(guard.pool(), 70).await?, 0);
+            insert_detail(guard.pool(), 70).await?;
+            assert_eq!(details(guard.pool(), 70).await?, 1);
+            assert!(store.delete(key).await?);
+            assert_eq!(store.find_by_id(key).await?, None);
+            assert_eq!(details(guard.pool(), 70).await?, 0);
 
-        for acct in [30, -5, 7] {
-            store.insert(&template(acct, 1)?).await?;
-        }
-        assert_eq!(keys(&mut store).await?, [-5, 7, 30]);
+            for acct in [30, -5, 7] {
+                store.insert(&template(acct, 1)?).await?;
+            }
+            assert_eq!(keys(&mut store).await?, [-5, 7, 30]);
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.find_all().await?.len(), 3);
-        // A failed insert inside a savepoint leaves the enclosing transaction usable.
-        let mut savepoint = tx.savepoint().await?;
-        assert!(matches!(
-            savepoint.insert(&template(7, 1)?).await,
-            Err(PersistenceError::Duplicate { .. })
-        ));
-        savepoint.rollback().await?;
-        tx.insert(&template(8, 1)?).await?;
-        let moved = template(30, 2)?;
-        assert!(tx.update(&moved).await?);
-        assert!(tx.delete(PicS::new(-5)?).await?);
-        assert_eq!(tx.find_by_id(PicS::new(30)?).await?, Some(moved));
-        tx.rollback().await?;
-        assert_eq!(keys(&mut store).await?, [-5, 7, 30]);
-        assert_eq!(
-            store.find_by_id(PicS::new(30)?).await?,
-            Some(template(30, 1)?)
-        );
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.find_all().await?.len(), 3);
+            // A failed insert inside a savepoint leaves the enclosing transaction usable.
+            let mut savepoint = tx.savepoint().await?;
+            assert!(matches!(
+                savepoint.insert(&template(7, 1)?).await,
+                Err(PersistenceError::Duplicate { .. })
+            ));
+            savepoint.rollback().await?;
+            tx.insert(&template(8, 1)?).await?;
+            let moved = template(30, 2)?;
+            assert!(tx.update(&moved).await?);
+            assert!(tx.delete(PicS::new(-5)?).await?);
+            assert_eq!(tx.find_by_id(PicS::new(30)?).await?, Some(moved));
+            tx.rollback().await?;
+            assert_eq!(keys(&mut store).await?, [-5, 7, 30]);
+            assert_eq!(
+                store.find_by_id(PicS::new(30)?).await?,
+                Some(template(30, 1)?)
+            );
+            Ok(())
+        })
     }
 }

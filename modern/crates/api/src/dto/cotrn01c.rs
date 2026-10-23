@@ -31,11 +31,15 @@
 //!   when the stored field is blank. Their layout code is a storage detail and is not sent
 //!   (COTRN01C-023, COTRN01C-024, E33, Typed Dates and Timestamps).
 
+use core::fmt;
+
 use chrono::NaiveDateTime;
 use domain::CardNumber;
 use domain::copybook::PicX;
 use domain::online::cotrn01c as rules;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
@@ -51,7 +55,7 @@ use validator::Validate;
 /// `Transaction ID NOT found...` when no row has it (COTRN01C-012). No `PIC X` rule
 /// ([`super::pic_x`]) applies: sixteen `\0` must reach the blank edit, and a key holding a byte
 /// no stored key holds is the domain's not-found outcome.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, IntoParams, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, IntoParams, Validate)]
 #[into_params(parameter_in = Path)]
 pub struct TranIdPath {
     /// Transaction ID as typed on the screen: at most 16 characters, neither trimmed nor
@@ -59,6 +63,79 @@ pub struct TranIdPath {
     #[validate(length(max = 16))]
     #[param(max_length = 16)]
     pub tran_id: String,
+}
+
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// The members of [`TranIdPath`], in declaration order.
+const TRAN_ID_PATH_MEMBERS: &[&str] = &["tran_id"];
+
+impl<'de> Deserialize<'de> for TranIdPath {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("TranIdPath", TRAN_ID_PATH_MEMBERS, TranIdPathVisitor)
+    }
+}
+
+/// The visitor of [`TranIdPath`]'s members.
+struct TranIdPathVisitor;
+
+impl<'de> Visitor<'de> for TranIdPathVisitor {
+    type Value = TranIdPath;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct TranIdPath")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TranIdPath, A::Error> {
+        let mut tran_id = None;
+        while let Some(name) = map.next_key_seed(WireName(TRAN_ID_PATH_MEMBERS))? {
+            match name {
+                Some("tran_id") => member(&mut map, &mut tran_id, "tran_id")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(TranIdPath {
+            tran_id: tran_id.ok_or_else(|| de::Error::missing_field("tran_id"))?,
+        })
+    }
 }
 
 /// The transaction as the `COTRN1A` map shows it after a successful read: the 200 body of
@@ -69,7 +146,7 @@ pub struct TranIdPath {
 /// carry back.
 // The schema name `TranViewResponse` is the frontend's `components["schemas"]["TranViewResponse"]`
 // (Generated API Types Only); renaming the type changes the contract.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct TranViewResponse {
     /// `TRNID`, from `TRAN-ID PIC X(16)`: the record's 16-byte key as stored (COTRN01C-016).
     pub tran_id: String,
@@ -111,6 +188,29 @@ pub struct TranViewResponse {
     /// `ERRMSG`, the message row: always `null`, because every pass clears `WS-MESSAGE` and a
     /// successful read moves no message into it (COTRN01C-015).
     pub message: Option<String>,
+}
+
+/// Every member under its Rust name, in declaration order: the card number through its own
+/// redacted `Serialize`, the timestamps through `NaiveDateTime`'s, and each `None` as `null`.
+impl Serialize for TranViewResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("TranViewResponse", 14)?;
+        out.serialize_field("tran_id", &self.tran_id)?;
+        out.serialize_field("card_num", &self.card_num)?;
+        out.serialize_field("type_cd", &self.type_cd)?;
+        out.serialize_field("cat_cd", &self.cat_cd)?;
+        out.serialize_field("source", &self.source)?;
+        out.serialize_field("description", &self.description)?;
+        out.serialize_field("amount", &self.amount)?;
+        out.serialize_field("orig_ts", &self.orig_ts)?;
+        out.serialize_field("proc_ts", &self.proc_ts)?;
+        out.serialize_field("merchant_id", &self.merchant_id)?;
+        out.serialize_field("merchant_name", &self.merchant_name)?;
+        out.serialize_field("merchant_city", &self.merchant_city)?;
+        out.serialize_field("merchant_zip", &self.merchant_zip)?;
+        out.serialize_field("message", &self.message)?;
+        out.end()
+    }
 }
 
 /// The view `rules::view` returns for a found record, field for field. The card number stays a
@@ -166,6 +266,15 @@ mod tests {
     use crate::dto::{FIELD_LENGTH_MESSAGE, INVALID_PATH, ValidPath};
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// `TRAN-CARD-NUM` of the test view and its redacted form (PIC-024).
     const CARD: &str = "4859452612877065";
@@ -341,45 +450,47 @@ mod tests {
     }
 
     // audit: COTRN01-013
-    #[tokio::test]
-    async fn the_path_tran_id_is_revalidated_against_its_map_length_alone() -> TestResult {
-        let passed = |tran_id: &str| (StatusCode::OK, json!({ "tran_id": tran_id }));
-        let rejected = |message: &str, field: Option<&str>| {
-            let body = match field {
-                Some(field) => json!({ "message": message, "field": field }),
-                None => json!({ "message": message }),
+    #[test]
+    fn the_path_tran_id_is_revalidated_against_its_map_length_alone() -> TestResult {
+        block_on(async {
+            let passed = |tran_id: &str| (StatusCode::OK, json!({ "tran_id": tran_id }));
+            let rejected = |message: &str, field: Option<&str>| {
+                let body = match field {
+                    Some(field) => json!({ "message": message, "field": field }),
+                    None => json!({ "message": message }),
+                };
+                (StatusCode::BAD_REQUEST, body)
             };
-            (StatusCode::BAD_REQUEST, body)
-        };
-        let low_values = "%00".repeat(16);
-        let spaces_17 = "%20".repeat(17);
-        let nuls = "\0".repeat(16);
-        for (segment, expected) in [
-            // Within the map `LENGTH` the text passes as typed to the program's own edits:
-            // sixteen characters, and the blank, low-value, short, leading-space and non-ASCII
-            // keys the domain answers itself (COTRN01C-009, COTRN01C-010, COTRN01C-012).
-            ("0000000000683580", passed("0000000000683580")),
-            ("%20", passed(" ")),
-            (low_values.as_str(), passed(&nuls)),
-            ("1", passed("1")),
-            ("%20000000000000001", passed(" 000000000000001")),
-            ("%C3%A9", passed("\u{e9}")),
-            // Beyond 16 characters, blank or not: rejected naming the segment, never read.
-            (
-                "00000000006835801",
-                rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
-            ),
-            (
-                spaces_17.as_str(),
-                rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
-            ),
-            // A segment that is not UTF-8 does not deserialise.
-            ("%FF", rejected(INVALID_PATH, None)),
-        ] {
-            let uri = format!("/api/v1/transactions/{segment}");
-            assert_eq!(through_path(&uri).await?, expected, "{uri}");
-        }
-        Ok(())
+            let low_values = "%00".repeat(16);
+            let spaces_17 = "%20".repeat(17);
+            let nuls = "\0".repeat(16);
+            for (segment, expected) in [
+                // Within the map `LENGTH` the text passes as typed to the program's own edits:
+                // sixteen characters, and the blank, low-value, short, leading-space and non-ASCII
+                // keys the domain answers itself (COTRN01C-009, COTRN01C-010, COTRN01C-012).
+                ("0000000000683580", passed("0000000000683580")),
+                ("%20", passed(" ")),
+                (low_values.as_str(), passed(&nuls)),
+                ("1", passed("1")),
+                ("%20000000000000001", passed(" 000000000000001")),
+                ("%C3%A9", passed("\u{e9}")),
+                // Beyond 16 characters, blank or not: rejected naming the segment, never read.
+                (
+                    "00000000006835801",
+                    rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
+                ),
+                (
+                    spaces_17.as_str(),
+                    rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
+                ),
+                // A segment that is not UTF-8 does not deserialise.
+                ("%FF", rejected(INVALID_PATH, None)),
+            ] {
+                let uri = format!("/api/v1/transactions/{segment}");
+                assert_eq!(through_path(&uri).await?, expected, "{uri}");
+            }
+            Ok(())
+        })
     }
 
     // audit: COTRN01-013
@@ -397,5 +508,40 @@ mod tests {
             assert_eq!(parameters.pointer(pointer), Some(&expected), "{parameters}");
         }
         Ok(())
+    }
+
+    /// A [`TranIdPath`] read from JSON: `tran_id` is required once as a string, every other
+    /// member is skipped, and anything but an object is refused.
+    #[test]
+    fn the_path_requires_its_one_member_once_and_skips_the_rest() {
+        for (text, expected) in [
+            (r#"{"tran_id":"0000000000683580"}"#, Ok("0000000000683580")),
+            (r#"{"page":2,"tran_id":" ","extra":{"a":[1]}}"#, Ok(" ")),
+            ("{}", Err("missing field `tran_id`")),
+            (r#"{"page":2}"#, Err("missing field `tran_id`")),
+            (
+                r#"{"tran_id":"1","tran_id":"2"}"#,
+                Err("duplicate field `tran_id`"),
+            ),
+            (
+                r#"{"tran_id":1}"#,
+                Err("invalid type: integer `1`, expected a string"),
+            ),
+            (
+                r#""0000000000683580""#,
+                Err(r#"invalid type: string "0000000000683580", expected struct TranIdPath"#),
+            ),
+        ] {
+            match serde_json::from_str::<TranIdPath>(text) {
+                Ok(path) => assert_eq!(Ok(path.tran_id.as_str()), expected, "{text}"),
+                Err(error) => {
+                    let message = error.to_string();
+                    assert!(
+                        expected.is_err_and(|start| message.starts_with(start)),
+                        "{text}: {message}, expected {expected:?}"
+                    );
+                }
+            }
+        }
     }
 }

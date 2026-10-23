@@ -37,9 +37,15 @@
 -- binary byte comparisons, while the postgres:16 image's default locale (en_US.utf8) would order
 -- mixed-case or space-bearing keys differently and make browse and paging order depend on the
 -- server. The data type stays CHAR(n), whose comparison ignores trailing spaces as a COBOL
--- comparison pads the shorter operand with spaces. A 9(n) key part is zero-padded to its width in
--- the record, so its BIGINT order equals the byte order of its digits, and every composite
--- primary key orders as its KSDS key does.
+-- comparison pads the shorter operand with spaces. The "C" collation orders the stored ASCII
+-- bytes; the KSDS ordered EBCDIC bytes. The two orders agree where, at the first byte in which two
+-- keys differ, both bytes are digits, both are upper-case letters, or one is the space. They
+-- differ where a digit meets a letter, since EBCDIC sorts digits after letters, or where lower
+-- case meets upper case. A 9(n) key part is zero-padded to its width in the record, so its BIGINT
+-- order equals the byte order of its digits in either code. The fixture keys order alike in both
+-- codes: all are digits except the disclosure group IDs, which first differ in an upper-case
+-- letter. A CHAR key part holding letters can order differently in general, which is why
+-- tran_cat_balances re-sorts its type code by its EBCDIC weights (CBACT04C-003).
 --
 -- No table carries a foreign key, because VSAM declares none: each load subcommand replaces one
 -- table inside one transaction, so the loads succeed in any order, on an empty or a loaded

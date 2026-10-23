@@ -95,8 +95,9 @@ const FIELD_COUNT: usize = 18;
 /// (`COPAUA0C.cbl:355,722-727`; COPAUA0C-002, COPAUA0C-060).
 const DELIMITER: u8 = b',';
 
-/// The shortest run the reply screens withhold: an 8-byte password filling `SEC-USR-PWD X(08)`,
-/// the shortest protected value (COPAUA0C-062, COPAUA0C-064, X-COPAUA0C-11).
+/// The run the reply screens withhold at: eight consecutive bytes, the width of a password
+/// filling `SEC-USR-PWD X(08)` (COPAUA0C-062, COPAUA0C-064, X-COPAUA0C-11). A shorter protected
+/// value, such as a three-digit CVV or a password shorter than its field, passes unscreened.
 const SCREEN_RUN: usize = 8;
 
 /// The byte a screen writes over every position of a withheld field (COPAUA0C-062, COPAUA0C-064).
@@ -734,8 +735,12 @@ pub enum CustomerLookup {
 /// The summary row `lock_or_create` locked for the account, and whether this request created it
 /// (COPAUA0C-025).
 ///
-/// Both variants carry the locked, committed row, so the i10 guard reads the authoritative
-/// `approved_auth_amt` (COPAUA0C-049).
+/// Both variants carry the row as the worker's transaction sees it under its `FOR UPDATE` lock,
+/// so the i10 guard reads the authoritative `approved_auth_amt`, which no other transaction can
+/// change before this one commits or rolls back (COPAUA0C-049). `Existing` holds the row as last
+/// committed. `Created` holds the zeroed [`summary_template`] row inserted by this request's
+/// still-open transaction: it is provisional, made durable only by the commit that follows the
+/// reply and the acknowledgement, and discarded by a rollback (E29).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SummaryState<'a> {
     /// The row existed before this request: COBOL `FOUND-PAUT-SMRY-SEG`.

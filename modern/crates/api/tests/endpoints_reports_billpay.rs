@@ -481,21 +481,23 @@ fn expected_deck(start: &str, end: &str) -> Vec<String> {
 
 // Worker threads of its own, so that the requests of `report_concurrent_row` are served in
 // parallel and reach the job-deck directory at once.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn corpt00c_report_rows() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let dir = fresh_dir("corpt00c_report_rows")?;
-    let api = Api::signed_on(&db, dir.clone(), instant(2022, 7, 18)?).await?;
-    report_token_rows(&api, &dir).await?;
-    report_selection_rows(&api, &dir).await?;
-    report_confirmation_rows(&api, &dir).await?;
-    report_map_rows(&api, &dir).await?;
-    report_non_object_rows(&api, &dir).await?;
-    report_submission_rows(&api, &dir).await?;
-    report_concurrent_row(&api).await?;
-    report_month_end_rows(&api).await?;
-    report_write_failure_row(&api).await?;
-    assert_no_card_number(&api)
+#[test]
+fn corpt00c_report_rows() -> TestResult {
+    multi_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let dir = fresh_dir("corpt00c_report_rows")?;
+        let api = Api::signed_on(&db, dir.clone(), instant(2022, 7, 18)?).await?;
+        report_token_rows(&api, &dir).await?;
+        report_selection_rows(&api, &dir).await?;
+        report_confirmation_rows(&api, &dir).await?;
+        report_map_rows(&api, &dir).await?;
+        report_non_object_rows(&api, &dir).await?;
+        report_submission_rows(&api, &dir).await?;
+        report_concurrent_row(&api).await?;
+        report_month_end_rows(&api).await?;
+        report_write_failure_row(&api).await?;
+        assert_no_card_number(&api)
+    })
 }
 
 /// CORPT00C-043: without a valid token endpoint 14 answers the extractor's 401 before any edit,
@@ -843,18 +845,20 @@ async fn report_write_failure_row(api: &Api) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn corpt00c_custom_date_rows() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let dir = fresh_dir("corpt00c_custom_date_rows")?;
-    let api = Api::signed_on(&db, dir.clone(), instant(2022, 7, 18)?).await?;
-    custom_blank_part_rows(&api, &dir).await?;
-    custom_part_edit_rows(&api, &dir).await?;
-    custom_date_edit_rows(&api, &dir).await?;
-    custom_submission_row(&api, &dir).await?;
-    custom_padded_part_rows(&api).await?;
-    assert_no_result_text(&api);
-    assert_no_card_number(&api)
+#[test]
+fn corpt00c_custom_date_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let dir = fresh_dir("corpt00c_custom_date_rows")?;
+        let api = Api::signed_on(&db, dir.clone(), instant(2022, 7, 18)?).await?;
+        custom_blank_part_rows(&api, &dir).await?;
+        custom_part_edit_rows(&api, &dir).await?;
+        custom_date_edit_rows(&api, &dir).await?;
+        custom_submission_row(&api, &dir).await?;
+        custom_padded_part_rows(&api).await?;
+        assert_no_result_text(&api);
+        assert_no_card_number(&api)
+    })
 }
 
 /// CORPT00C-006 and CORPT00C-011 to CORPT00C-016: the six emptiness tests of the custom path in
@@ -1346,22 +1350,24 @@ async fn assert_unwritten(
     Ok(())
 }
 
-#[tokio::test]
-async fn cobil00c_bill_payment_rows() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let at = instant(2022, 7, 18)?;
-    let api = Api::signed_on(&db, fresh_dir("cobil00c_bill_payment_rows")?, at).await?;
-    let seed = seed_transaction(&api.store).await?;
-    let before = account(&api.store, 1).await?;
-    pay_token_rows(&api, &before, &seed).await?;
-    pay_edit_rows(&api, &before, &seed).await?;
-    pay_map_rows(&api, &before, &seed).await?;
-    pay_non_object_rows(&api, &before, &seed).await?;
-    pay_balance_row(&api, &before, &seed).await?;
-    let paid = pay_rows(&api, &before, &seed).await?;
-    pay_nothing_rows(&api, &paid).await?;
-    pay_truncation_rows(&api).await?;
-    assert_no_card_number(&api)
+#[test]
+fn cobil00c_bill_payment_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let api = Api::signed_on(&db, fresh_dir("cobil00c_bill_payment_rows")?, at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        let before = account(&api.store, 1).await?;
+        pay_token_rows(&api, &before, &seed).await?;
+        pay_edit_rows(&api, &before, &seed).await?;
+        pay_map_rows(&api, &before, &seed).await?;
+        pay_non_object_rows(&api, &before, &seed).await?;
+        pay_balance_row(&api, &before, &seed).await?;
+        let paid = pay_rows(&api, &before, &seed).await?;
+        pay_nothing_rows(&api, &paid).await?;
+        pay_truncation_rows(&api).await?;
+        assert_no_card_number(&api)
+    })
 }
 
 /// COBIL00C-038: without a valid token endpoint 15 answers the extractor's 401 before any edit,
@@ -1670,16 +1676,18 @@ async fn pay_truncation_rows(api: &Api) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn cobil00c_store_rows() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let at = instant(2022, 7, 18)?;
-    let api = Api::signed_on(&db, fresh_dir("cobil00c_store_rows")?, at).await?;
-    let seed = seed_transaction(&api.store).await?;
-    pay_without_xref_row(&api, &seed).await?;
-    pay_concurrent_row(&api).await?;
-    pay_wrapped_id_rows(&api, &seed).await?;
-    assert_no_card_number(&api)
+#[test]
+fn cobil00c_store_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let db = start_loaded_postgres().await?;
+        let at = instant(2022, 7, 18)?;
+        let api = Api::signed_on(&db, fresh_dir("cobil00c_store_rows")?, at).await?;
+        let seed = seed_transaction(&api.store).await?;
+        pay_without_xref_row(&api, &seed).await?;
+        pay_concurrent_row(&api).await?;
+        pay_wrapped_id_rows(&api, &seed).await?;
+        assert_no_card_number(&api)
+    })
 }
 
 /// COBIL00C-021 and COBIL00C-034: an account that no cross-reference names. The payment block
@@ -1729,11 +1737,7 @@ async fn pay_concurrent_row(api: &Api) -> TestResult {
     let mut store = api.store.clone();
     let next = TransactionRepository::next_id(&mut store).await?;
     let body = pay("00000000003", "Y");
-    let (first, second) = tokio::join!(
-        api.post(BILL_PAYMENTS, &body),
-        api.post(BILL_PAYMENTS, &body)
-    );
-    let replies = [first?, second?];
+    let replies = api.post_concurrently(BILL_PAYMENTS, &body, 2).await?;
     let next_text = next.to_text();
     let paid = replies
         .iter()
@@ -2102,10 +2106,20 @@ async fn request_store(database_url: String) -> Outcome<PgStore> {
         .await)
 }
 
-/// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made here so
-/// that no test macro expands into a lint suppression or an unchecked pin.
+/// A current-thread runtime with every driver, the one Tokio's test attribute would build, made
+/// here so that no test macro expands into a lint suppression or an unchecked pin.
 fn current_thread() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+/// A runtime of four worker threads with every driver, the one Tokio's test attribute would build
+/// for `flavor = "multi_thread", worker_threads = 4`, made here so that no test macro expands
+/// into a lint suppression or an unchecked pin.
+fn multi_thread() -> io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .build()
 }
@@ -2349,6 +2363,8 @@ async fn eventually(within: Duration, condition: impl Fn() -> bool) -> bool {
 /// balance and hands its connection back.
 async fn hold_idle_connections(api: &Api, holder: &PgStore, count: usize) -> TestResult {
     let pool = api.store.pool();
+    // TRUNCATION: checked, never lossy. The only caller passes `IDLE_CONNECTIONS`, 4
+    // connections, which `u32` holds; a refusal is a test failure, never a wrapped count.
     let opened = u32::try_from(count)?;
     let mut lock = holder.begin().await?;
     AccountRepository::lock_by_id(&mut lock, PicU::new(1)?)

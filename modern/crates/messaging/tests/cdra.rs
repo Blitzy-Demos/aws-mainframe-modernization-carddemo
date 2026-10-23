@@ -50,12 +50,15 @@
 //! request's override, never as a parity result. Parity tests assume single delivery.
 
 use std::error::Error;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use domain::messaging::coacct01::{ACCT_RESPONSE_LEN, ERROR_QUEUE, REPLY_QUEUE, REQUEST_LEN};
 use domain::messaging::codate01::BUFFER_LEN;
+use insta::internals::SnapshotContents;
 use lapin::message::BasicGetMessage;
 use lapin::options::{ConfirmSelectOptions, QueueDeleteOptions};
 use lapin::types::ShortString;
@@ -174,7 +177,7 @@ impl Harness {
         let (rabbit, pg) = bounded(
             "start the broker and the loaded database",
             START_WAIT,
-            Box::pin(async { tokio::try_join!(start_rabbitmq(), start_loaded_postgres()) }),
+            Box::pin(try_join(start_rabbitmq(), start_loaded_postgres())),
         )
         .await?;
         let config = Config {
@@ -343,6 +346,86 @@ where
         Ok(outcome) => outcome.map_err(Into::into),
         Err(_) => Err(format!("{what} did not finish within {} ms", limit.as_millis()).into()),
     }
+}
+
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
+}
+
+/// Drives `first` and `second` concurrently on the calling task until both have finished, and
+/// returns both outputs. Every poll polls each future that has not finished yet, and a finished
+/// one is never polled again. Both are boxed, so that they never move once polled.
+async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_output = None;
+    let mut second_output = None;
+    std::future::poll_fn(|context| {
+        if first_output.is_none() {
+            if let Poll::Ready(output) = first.as_mut().poll(context) {
+                first_output = Some(output);
+            }
+        }
+        if second_output.is_none() {
+            if let Poll::Ready(output) = second.as_mut().poll(context) {
+                second_output = Some(output);
+            }
+        }
+        match (first_output.take(), second_output.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready((first_done, second_done)),
+            (first_left, second_left) => {
+                first_output = first_left;
+                second_output = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// Drives `first` and `second` concurrently on the calling task, as [`join`] does, until both
+/// have succeeded, and returns both values. The first error is returned at once, and the other
+/// future is dropped unfinished.
+async fn try_join<T, U, E>(
+    first: impl Future<Output = Result<T, E>>,
+    second: impl Future<Output = Result<U, E>>,
+) -> Result<(T, U), E> {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_value = None;
+    let mut second_value = None;
+    std::future::poll_fn(|context| {
+        if first_value.is_none() {
+            match first.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => first_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if second_value.is_none() {
+            match second.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => second_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (first_value.take(), second_value.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready(Ok((first_done, second_done))),
+            (first_left, second_left) => {
+                first_value = first_left;
+                second_value = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
 }
 
 /// Runs `worker` until it has taken and settled one request.
@@ -548,6 +631,43 @@ fn snapshot_text(reply: &[u8]) -> Result<String, BoxError> {
     ))
 }
 
+/// Fails unless `rendered` matches this file's committed snapshot `name`,
+/// `tests/snapshots/cdra__<name>.snap`, as insta matches a named file snapshot: both texts with
+/// their leading line breaks and trailing whitespace trimmed and every CRLF read as LF. The
+/// snapshot is only read, never written or refreshed. A mismatch names the snapshot, both lengths
+/// and the first differing byte offset, never the text.
+fn compare_snapshot(name: &str, rendered: &str) -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join(format!("cdra__{name}.snap"));
+    let snapshot = insta::Snapshot::from_file(&path)
+        .map_err(|error| format!("the committed snapshot {name} cannot be read: {error}"))?;
+    let SnapshotContents::Text(committed) = snapshot.contents() else {
+        return Err(format!("the committed snapshot {name} is not a text snapshot").into());
+    };
+    let expected = committed.to_string();
+    let actual = rendered
+        .trim_start_matches(['\r', '\n'])
+        .trim_end()
+        .replace("\r\n", "\n");
+    if actual == expected {
+        return Ok(());
+    }
+    let differs_at = actual
+        .bytes()
+        .zip(expected.bytes())
+        .position(|(got, want)| got != want)
+        .unwrap_or_else(|| actual.len().min(expected.len()));
+    Err(format!(
+        "the rendering differs from the committed snapshot {name} at byte {differs_at}: {} \
+         bytes rendered, {} committed",
+        actual.len(),
+        expected.len()
+    )
+    .into())
+}
+
 // audit: COACCT01-001
 // audit: COACCT01-004
 // audit: COACCT01-020
@@ -555,48 +675,50 @@ fn snapshot_text(reply: &[u8]) -> Result<String, BoxError> {
 // audit: COACCT01-024
 // audit: COACCT01-025
 // audit: COACCT01-026
-#[tokio::test]
-async fn inqa_known_account_replies_ws_acct_response() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.open_worker(harness.store()).await?;
-    for (index, record) in fixture_accounts()?.iter().enumerate() {
-        let key = account_key(record)?;
-        let mut body = request(b"INQA", key);
-        if index == 0 {
-            // Bytes 15-999 are never read, whatever they hold (COACCT01-001).
-            body.resize(BUFFER_LEN, b'Z');
-        }
-        let message_id = format!("CDRA-FOUND-{index:02}");
-        let correlation_id = format!("CDRA-CORREL-{index:02}");
-        harness
-            .send(&body, with_ids(&message_id, &correlation_id))
-            .await?;
+#[test]
+fn inqa_known_account_replies_ws_acct_response() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.open_worker(harness.store()).await?;
+        for (index, record) in fixture_accounts()?.iter().enumerate() {
+            let key = account_key(record)?;
+            let mut body = request(b"INQA", key);
+            if index == 0 {
+                // Bytes 15-999 are never read, whatever they hold (COACCT01-001).
+                body.resize(BUFFER_LEN, b'Z');
+            }
+            let message_id = format!("CDRA-FOUND-{index:02}");
+            let correlation_id = format!("CDRA-CORREL-{index:02}");
+            harness
+                .send(&body, with_ids(&message_id, &correlation_id))
+                .await?;
 
-        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-        assert_eq!(processed, Processed::Replied, "account {index}");
-        let reply = harness.take(REPLY_QUEUE).await?;
-        let data = reply.delivery.data.as_slice();
-        assert_eq!(data.len(), BUFFER_LEN, "account {index}: published length");
-        let expected = expected_found_reply(record)?;
-        assert_body(data, &expected, &format!("account {index}: found reply"));
-        let padding = data.get(ACCT_RESPONSE_LEN..).unwrap_or_default();
-        assert!(
-            padding.iter().all(|&byte| byte == b' '),
-            "account {index}: bytes 252-999 are spaces"
-        );
-        assert_copied_properties(
-            &reply.delivery.properties,
-            Some(&message_id),
-            Some(&correlation_id),
-            &format!("account {index}"),
-        );
-        if index == 0 {
-            insta::assert_snapshot!("inqa_account_00000000001_reply", snapshot_text(data)?);
+            let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+            assert_eq!(processed, Processed::Replied, "account {index}");
+            let reply = harness.take(REPLY_QUEUE).await?;
+            let data = reply.delivery.data.as_slice();
+            assert_eq!(data.len(), BUFFER_LEN, "account {index}: published length");
+            let expected = expected_found_reply(record)?;
+            assert_body(data, &expected, &format!("account {index}: found reply"));
+            let padding = data.get(ACCT_RESPONSE_LEN..).unwrap_or_default();
+            assert!(
+                padding.iter().all(|&byte| byte == b' '),
+                "account {index}: bytes 252-999 are spaces"
+            );
+            assert_copied_properties(
+                &reply.delivery.properties,
+                Some(&message_id),
+                Some(&correlation_id),
+                &format!("account {index}"),
+            );
+            if index == 0 {
+                compare_snapshot("inqa_account_00000000001_reply", &snapshot_text(data)?)?;
+            }
         }
-    }
 
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 // audit: COACCT01-004
@@ -604,196 +726,207 @@ async fn inqa_known_account_replies_ws_acct_response() -> TestResult {
 // audit: COACCT01-023
 // audit: COACCT01-024
 // audit: COACCT01-025
-#[tokio::test]
-async fn inqa_unknown_account_replies_invalid_parameters() -> TestResult {
-    let unknown: &[u8] = b"99999999999";
-    let accounts = fixture_accounts()?;
-    for record in &accounts {
-        assert_ne!(
-            account_key(record)?,
-            unknown,
-            "the key must be absent from acctdata.txt"
+#[test]
+fn inqa_unknown_account_replies_invalid_parameters() -> TestResult {
+    block_on(async {
+        let unknown: &[u8] = b"99999999999";
+        let accounts = fixture_accounts()?;
+        for record in &accounts {
+            assert_ne!(
+                account_key(record)?,
+                unknown,
+                "the key must be absent from acctdata.txt"
+            );
+        }
+        let harness = Harness::start().await?;
+        let mut worker = harness.open_worker(harness.store()).await?;
+        // No IDs, and a reply_to naming another queue: both are ignored (COACCT01-023,
+        // COACCT01-024).
+        let properties =
+            BasicProperties::default().with_reply_to(ShortString::from(OTHER_REPLY_QUEUE));
+        harness.send(&request(b"INQA", unknown), properties).await?;
+
+        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+        assert_eq!(processed, Processed::Replied);
+        let reply = harness.take(REPLY_QUEUE).await?;
+        assert_body(
+            &reply.delivery.data,
+            &expected_invalid_parameters(None),
+            "not-found reply",
         );
-    }
-    let harness = Harness::start().await?;
-    let mut worker = harness.open_worker(harness.store()).await?;
-    // No IDs, and a reply_to naming another queue: both are ignored (COACCT01-023,
-    // COACCT01-024).
-    let properties = BasicProperties::default().with_reply_to(ShortString::from(OTHER_REPLY_QUEUE));
-    harness.send(&request(b"INQA", unknown), properties).await?;
+        assert_copied_properties(&reply.delivery.properties, None, None, "not-found reply");
+        harness.assert_empty(OTHER_REPLY_QUEUE).await?;
 
-    let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::Replied);
-    let reply = harness.take(REPLY_QUEUE).await?;
-    assert_body(
-        &reply.delivery.data,
-        &expected_invalid_parameters(None),
-        "not-found reply",
-    );
-    assert_copied_properties(&reply.delivery.properties, None, None, "not-found reply");
-    harness.assert_empty(OTHER_REPLY_QUEUE).await?;
-
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 // audit: COACCT01-005
 // audit: COACCT01-022
 // audit: COACCT01-023
-#[tokio::test]
-async fn bad_function_or_zero_key_replies_function_text() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.open_worker(harness.store()).await?;
-    // A function other than INQA with a stored key, INQA with a zero key, and INQA in lower case:
-    // `WS-FUNC = 'INQA' AND WS-KEY > ZEROES` fails for each, so no account is read.
-    let cases: [(&[u8], &[u8]); 3] = [
-        (b"XXXX", b"00000000001"),
-        (b"INQA", b"00000000000"),
-        (b"inqa", b"00000000001"),
-    ];
-    for (index, (function, key)) in cases.into_iter().enumerate() {
-        let message_id = format!("CDRA-BAD-{index}");
-        let correlation_id = format!("CDRA-BAD-CORREL-{index}");
-        harness
-            .send(
-                &request(function, key),
-                with_ids(&message_id, &correlation_id),
-            )
-            .await?;
+#[test]
+fn bad_function_or_zero_key_replies_function_text() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.open_worker(harness.store()).await?;
+        // A function other than INQA with a stored key, INQA with a zero key, and INQA in lower case:
+        // `WS-FUNC = 'INQA' AND WS-KEY > ZEROES` fails for each, so no account is read.
+        let cases: [(&[u8], &[u8]); 3] = [
+            (b"XXXX", b"00000000001"),
+            (b"INQA", b"00000000000"),
+            (b"inqa", b"00000000001"),
+        ];
+        for (index, (function, key)) in cases.into_iter().enumerate() {
+            let message_id = format!("CDRA-BAD-{index}");
+            let correlation_id = format!("CDRA-BAD-CORREL-{index}");
+            harness
+                .send(
+                    &request(function, key),
+                    with_ids(&message_id, &correlation_id),
+                )
+                .await?;
 
-        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-        assert_eq!(processed, Processed::Replied, "case {index}");
-        let reply = harness.take(REPLY_QUEUE).await?;
-        assert_body(
-            &reply.delivery.data,
-            &expected_invalid_parameters(Some(function)),
-            &format!("case {index}: bad-parameter reply"),
-        );
-        assert_copied_properties(
-            &reply.delivery.properties,
-            Some(&message_id),
-            Some(&correlation_id),
-            &format!("case {index}"),
-        );
-    }
+            let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+            assert_eq!(processed, Processed::Replied, "case {index}");
+            let reply = harness.take(REPLY_QUEUE).await?;
+            assert_body(
+                &reply.delivery.data,
+                &expected_invalid_parameters(Some(function)),
+                &format!("case {index}: bad-parameter reply"),
+            );
+            assert_copied_properties(
+                &reply.delivery.properties,
+                Some(&message_id),
+                Some(&correlation_id),
+                &format!("case {index}"),
+            );
+        }
 
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 // audit: COACCT01-028
 // audit: COACCT01-032
-#[tokio::test]
-async fn account_read_failure_routes_error_body() -> TestResult {
-    let harness = Harness::start().await?;
-    // A pool closed before the worker reads through it: every account read is a store error,
-    // the replacement's `WHEN OTHER` of the CICS READ (COACCT01-028).
-    let closed = bounded(
-        "open a second pool",
-        WAIT,
-        runtime::db::connect(&harness.config),
-    )
-    .await?;
-    bounded("close the second pool", WAIT, async {
-        closed.close().await;
-        Ok::<(), BoxError>(())
-    })
-    .await?;
-    let mut worker = harness.open_worker(PgStore::new(closed)).await?;
-    harness
-        .send(
-            &request(b"INQA", b"00000000001"),
-            with_ids("CDRA-READ-FAILURE", "CDRA-READ-FAILURE-CORREL"),
+#[test]
+fn account_read_failure_routes_error_body() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // A pool closed before the worker reads through it: every account read is a store error,
+        // the replacement's `WHEN OTHER` of the CICS READ (COACCT01-028).
+        let closed = bounded(
+            "open a second pool",
+            WAIT,
+            runtime::db::connect(&harness.config),
         )
         .await?;
+        bounded("close the second pool", WAIT, async {
+            closed.close().await;
+            Ok::<(), BoxError>(())
+        })
+        .await?;
+        let mut worker = harness.open_worker(PgStore::new(closed)).await?;
+        harness
+            .send(
+                &request(b"INQA", b"00000000001"),
+                with_ids("CDRA-READ-FAILURE", "CDRA-READ-FAILURE-CORREL"),
+            )
+            .await?;
 
-    let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::ErrorRouted);
-    let error = harness.take(ERROR_QUEUE).await?;
-    assert_error_body(&error.delivery.data, READ_FAILURE_MESSAGE, REQUEST_QUEUE);
-    // Bytes 54-55 and 58-62 hold the CICS RESP and RESP2 of the failed READ.
-    println!("BLOCKED COACCT01-030 (H4)");
-    println!("BLOCKED COACCT01-031 (H4)");
-    assert_copied_properties(
-        &error.delivery.properties,
-        Some("CDRA-READ-FAILURE"),
-        Some("CDRA-READ-FAILURE-CORREL"),
-        "read-failure error message",
-    );
-    harness.assert_empty(REPLY_QUEUE).await?;
+        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+        assert_eq!(processed, Processed::ErrorRouted);
+        let error = harness.take(ERROR_QUEUE).await?;
+        assert_error_body(&error.delivery.data, READ_FAILURE_MESSAGE, REQUEST_QUEUE);
+        // Bytes 54-55 and 58-62 hold the CICS RESP and RESP2 of the failed READ.
+        println!("BLOCKED COACCT01-030 (H4)");
+        println!("BLOCKED COACCT01-031 (H4)");
+        assert_copied_properties(
+            &error.delivery.properties,
+            Some("CDRA-READ-FAILURE"),
+            Some("CDRA-READ-FAILURE-CORREL"),
+            "read-failure error message",
+        );
+        harness.assert_empty(REPLY_QUEUE).await?;
 
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 // audit: COACCT01-033
 // audit: COACCT01-032
-#[tokio::test]
-async fn unconfirmed_reply_routes_mqput_err_to_the_error_queue() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.open_worker(harness.store()).await?;
-    // Deleted after the worker's passive declare: the mandatory reply is returned unrouted.
-    harness.delete_queue(REPLY_QUEUE).await?;
-    harness
-        .send(
-            &request(b"INQA", b"00000000001"),
-            with_ids("CDRA-UNROUTED", "CDRA-UNROUTED-CORREL"),
-        )
-        .await?;
+#[test]
+fn unconfirmed_reply_routes_mqput_err_to_the_error_queue() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.open_worker(harness.store()).await?;
+        // Deleted after the worker's passive declare: the mandatory reply is returned unrouted.
+        harness.delete_queue(REPLY_QUEUE).await?;
+        harness
+            .send(
+                &request(b"INQA", b"00000000001"),
+                with_ids("CDRA-UNROUTED", "CDRA-UNROUTED-CORREL"),
+            )
+            .await?;
 
-    let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::ErrorRouted);
-    let error = harness.take(ERROR_QUEUE).await?;
-    assert_error_body(&error.delivery.data, MQPUT_ERR, REPLY_QUEUE);
-    assert_copied_properties(
-        &error.delivery.properties,
-        Some("CDRA-UNROUTED"),
-        Some("CDRA-UNROUTED-CORREL"),
-        "MQPUT ERR error message",
-    );
+        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+        assert_eq!(processed, Processed::ErrorRouted);
+        let error = harness.take(ERROR_QUEUE).await?;
+        assert_error_body(&error.delivery.data, MQPUT_ERR, REPLY_QUEUE);
+        assert_copied_properties(
+            &error.delivery.properties,
+            Some("CDRA-UNROUTED"),
+            Some("CDRA-UNROUTED-CORREL"),
+            "MQPUT ERR error message",
+        );
 
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 // audit: COACCT01-034
-#[tokio::test]
-async fn unconfirmed_error_discards_the_request_with_one_error_event() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.open_worker(harness.store()).await?;
-    // Both destinations deleted after the worker's passive declare: the reply and then its
-    // MQPUT ERR message are returned unrouted.
-    harness.delete_queue(REPLY_QUEUE).await?;
-    harness.delete_queue(ERROR_QUEUE).await?;
-    harness
-        .send(
-            &request(b"INQA", b"00000000001"),
-            with_ids("CDRA-DISCARDED", "CDRA-DISCARDED-CORREL"),
-        )
-        .await?;
+#[test]
+fn unconfirmed_error_discards_the_request_with_one_error_event() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.open_worker(harness.store()).await?;
+        // Both destinations deleted after the worker's passive declare: the reply and then its
+        // MQPUT ERR message are returned unrouted.
+        harness.delete_queue(REPLY_QUEUE).await?;
+        harness.delete_queue(ERROR_QUEUE).await?;
+        harness
+            .send(
+                &request(b"INQA", b"00000000001"),
+                with_ids("CDRA-DISCARDED", "CDRA-DISCARDED-CORREL"),
+            )
+            .await?;
 
-    let capture = trace_capture::capture();
-    let processed = settle_one(&mut worker, &harness.worker_connection).await?;
-    let lines = capture.lines();
-    drop(capture);
-    assert_eq!(processed, Processed::Discarded);
-    let return_message = format!(
-        r#""return_message":"{}""#,
-        String::from_utf8_lossy(MQPUT_ERR)
-    );
-    let events: Vec<&String> = lines
-        .iter()
-        .filter(|line| line.contains(r#""level":"ERROR""#) && line.contains(&return_message))
-        .collect();
-    let [event] = events.as_slice() else {
-        panic!("expected one MQ-ERR-DISPLAY error event, got {events:?}");
-    };
-    let queue_name = format!(r#""queue_name":"{ERROR_QUEUE}""#);
-    assert!(event.contains(&queue_name), "{event}");
+        let capture = trace_capture::capture();
+        let processed = settle_one(&mut worker, &harness.worker_connection).await?;
+        let lines = capture.lines();
+        drop(capture);
+        assert_eq!(processed, Processed::Discarded);
+        let return_message = format!(
+            r#""return_message":"{}""#,
+            String::from_utf8_lossy(MQPUT_ERR)
+        );
+        let events: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(r#""level":"ERROR""#) && line.contains(&return_message))
+            .collect();
+        let [event] = events.as_slice() else {
+            panic!("expected one MQ-ERR-DISPLAY error event, got {events:?}");
+        };
+        let queue_name = format!(r#""queue_name":"{ERROR_QUEUE}""#);
+        assert!(event.contains(&queue_name), "{event}");
 
-    // Rejected without requeue: the request is gone and is not redelivered.
-    harness.close_worker_connection().await?;
-    harness.assert_empty(REQUEST_QUEUE).await
+        // Rejected without requeue: the request is gone and is not redelivered.
+        harness.close_worker_connection().await?;
+        harness.assert_empty(REQUEST_QUEUE).await
+    })
 }
 
 /// What [`RecordingAcknowledger`] saw.
@@ -867,136 +1000,140 @@ async fn close_gated(connection: &Connection) -> TestResult {
 }
 
 // audit: COACCT01-026
-#[tokio::test]
-async fn ack_follows_confirmed_reply() -> TestResult {
-    let harness = Harness::start().await?;
-    let record = Arc::new(Record::default());
-    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
-    let accounts = fixture_accounts()?;
-    let account = accounts.first().ok_or("acctdata.txt holds no account")?;
-    harness
-        .send(
-            &request(b"INQA", account_key(account)?),
-            with_ids("CDRA-ACK", "CDRA-ACK-CORREL"),
-        )
-        .await?;
+#[test]
+fn ack_follows_confirmed_reply() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let record = Arc::new(Record::default());
+        let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
+        let accounts = fixture_accounts()?;
+        let account = accounts.first().ok_or("acctdata.txt holds no account")?;
+        harness
+            .send(
+                &request(b"INQA", account_key(account)?),
+                with_ids("CDRA-ACK", "CDRA-ACK-CORREL"),
+            )
+            .await?;
 
-    // The worker answers while the test holds the reply's confirmation, then releases it.
-    let held = harness.hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::release);
-    let (processed, held) = tokio::join!(settle_one(&mut worker, &gated), held);
-    // Queue presence is not confirmation: the reply was on its queue throughout the hold.
-    assert_eq!(
-        held?,
-        Held::unsettled(1, 0),
-        "while the reply's confirmation was held: the reply queued, the request unsettled"
-    );
-    assert_eq!(processed?, Processed::Replied);
-    assert_eq!(
-        record.acks.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged once"
-    );
-    assert_eq!(
-        record.passed_at_ack.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged before the reply's confirmation reached the worker"
-    );
-    assert!(
-        !record.rejected.load(Ordering::SeqCst),
-        "the request was rejected"
-    );
-    let reply = harness.take(REPLY_QUEUE).await?;
-    assert_body(
-        &reply.delivery.data,
-        &expected_found_reply(account)?,
-        "found reply",
-    );
+        // The worker answers while the test holds the reply's confirmation, then releases it.
+        let held = harness.hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::release);
+        let (processed, held) = join(settle_one(&mut worker, &gated), held).await;
+        // Queue presence is not confirmation: the reply was on its queue throughout the hold.
+        assert_eq!(
+            held?,
+            Held::unsettled(1, 0),
+            "while the reply's confirmation was held: the reply queued, the request unsettled"
+        );
+        assert_eq!(processed?, Processed::Replied);
+        assert_eq!(
+            record.acks.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged once"
+        );
+        assert_eq!(
+            record.passed_at_ack.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged before the reply's confirmation reached the worker"
+        );
+        assert!(
+            !record.rejected.load(Ordering::SeqCst),
+            "the request was rejected"
+        );
+        let reply = harness.take(REPLY_QUEUE).await?;
+        assert_body(
+            &reply.delivery.data,
+            &expected_found_reply(account)?,
+            "found reply",
+        );
 
-    // The double settled nothing on the broker, so closing the worker's connection returns
-    // the request: the acknowledgement went through the double alone.
-    close_gated(&gated).await?;
-    let returned = harness.take(REQUEST_QUEUE).await?;
-    assert!(
-        returned.delivery.redelivered,
-        "the request comes back redelivered"
-    );
-    Ok(())
+        // The double settled nothing on the broker, so closing the worker's connection returns
+        // the request: the acknowledgement went through the double alone.
+        close_gated(&gated).await?;
+        let returned = harness.take(REQUEST_QUEUE).await?;
+        assert!(
+            returned.delivery.redelivered,
+            "the request comes back redelivered"
+        );
+        Ok(())
+    })
 }
 
 // audit: COACCT01-026
 // audit: COACCT01-032
 // audit: COACCT01-033
-#[tokio::test]
-async fn refused_reply_confirmation_acks_only_after_the_confirmed_mqput_err() -> TestResult {
-    let harness = Harness::start().await?;
-    let record = Arc::new(Record::default());
-    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
-    harness
-        .send(
-            &request(b"INQA", b"00000000001"),
-            with_ids("CDRA-REFUSED", "CDRA-REFUSED-CORREL"),
-        )
-        .await?;
-
-    // The reply's confirmation is held, then refused; the MQPUT ERR message's is held, then
-    // released.
-    let holds = async {
-        let reply = harness
-            .hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::refuse)
+#[test]
+fn refused_reply_confirmation_acks_only_after_the_confirmed_mqput_err() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let record = Arc::new(Record::default());
+        let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
+        harness
+            .send(
+                &request(b"INQA", b"00000000001"),
+                with_ids("CDRA-REFUSED", "CDRA-REFUSED-CORREL"),
+            )
             .await?;
-        let error = harness
-            .hold(&gate, &record, 2, ERROR_QUEUE, ConfirmGate::release)
-            .await?;
-        Ok::<_, BoxError>((reply, error))
-    };
-    let (processed, holds) = tokio::join!(settle_one(&mut worker, &gated), holds);
-    let (reply_hold, error_hold) = holds?;
-    // The broker queued the reply and only the worker was told Nack, so the reply is on
-    // CARD.DEMO.REPLY.ACCT: a refused confirmation, not an unroutable reply.
-    assert_eq!(
-        reply_hold,
-        Held::unsettled(1, 0),
-        "while the reply's confirmation was held"
-    );
-    assert_eq!(
-        error_hold,
-        Held::unsettled(1, 1),
-        "while the error message's confirmation was held"
-    );
-    // Only Ack(None) is a confirmed put: the refused reply took the MQPUT ERR path.
-    assert_eq!(processed?, Processed::ErrorRouted);
-    assert_eq!(
-        record.acks.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged once"
-    );
-    assert_eq!(
-        record.passed_at_ack.load(Ordering::SeqCst),
-        2,
-        "the request was acknowledged before the error message's confirmation reached the worker"
-    );
-    assert!(
-        !record.rejected.load(Ordering::SeqCst),
-        "the request was rejected"
-    );
-    let error = harness.take(ERROR_QUEUE).await?;
-    assert_error_body(&error.delivery.data, MQPUT_ERR, REPLY_QUEUE);
-    assert_copied_properties(
-        &error.delivery.properties,
-        Some("CDRA-REFUSED"),
-        Some("CDRA-REFUSED-CORREL"),
-        "MQPUT ERR error message",
-    );
 
-    // The double settled nothing on the broker, so closing the worker's connection returns
-    // the request: the acknowledgement went through the double alone.
-    close_gated(&gated).await?;
-    let returned = harness.take(REQUEST_QUEUE).await?;
-    assert!(
-        returned.delivery.redelivered,
-        "the request comes back redelivered"
-    );
-    Ok(())
+        // The reply's confirmation is held, then refused; the MQPUT ERR message's is held, then
+        // released.
+        let holds = async {
+            let reply = harness
+                .hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::refuse)
+                .await?;
+            let error = harness
+                .hold(&gate, &record, 2, ERROR_QUEUE, ConfirmGate::release)
+                .await?;
+            Ok::<_, BoxError>((reply, error))
+        };
+        let (processed, holds) = join(settle_one(&mut worker, &gated), holds).await;
+        let (reply_hold, error_hold) = holds?;
+        // The broker queued the reply and only the worker was told Nack, so the reply is on
+        // CARD.DEMO.REPLY.ACCT: a refused confirmation, not an unroutable reply.
+        assert_eq!(
+            reply_hold,
+            Held::unsettled(1, 0),
+            "while the reply's confirmation was held"
+        );
+        assert_eq!(
+            error_hold,
+            Held::unsettled(1, 1),
+            "while the error message's confirmation was held"
+        );
+        // Only Ack(None) is a confirmed put: the refused reply took the MQPUT ERR path.
+        assert_eq!(processed?, Processed::ErrorRouted);
+        assert_eq!(
+            record.acks.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged once"
+        );
+        assert_eq!(
+            record.passed_at_ack.load(Ordering::SeqCst),
+            2,
+            "the request was acknowledged before the error message's confirmation reached the worker"
+        );
+        assert!(
+            !record.rejected.load(Ordering::SeqCst),
+            "the request was rejected"
+        );
+        let error = harness.take(ERROR_QUEUE).await?;
+        assert_error_body(&error.delivery.data, MQPUT_ERR, REPLY_QUEUE);
+        assert_copied_properties(
+            &error.delivery.properties,
+            Some("CDRA-REFUSED"),
+            Some("CDRA-REFUSED-CORREL"),
+            "MQPUT ERR error message",
+        );
+
+        // The double settled nothing on the broker, so closing the worker's connection returns
+        // the request: the acknowledgement went through the double alone.
+        close_gated(&gated).await?;
+        let returned = harness.take(REQUEST_QUEUE).await?;
+        assert!(
+            returned.delivery.redelivered,
+            "the request comes back redelivered"
+        );
+        Ok(())
+    })
 }
 
 // audit: COACCT01-030

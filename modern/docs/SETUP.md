@@ -56,7 +56,7 @@ Create the local configuration from the committed template, [`.env.example`](../
 cp .env.example .env
 ```
 
-Then edit `.env` and replace the placeholder of `CARDDEMO_JWT_SECRET` with any local value. The API refuses to start when this variable is empty or unset. `.env` is git-ignored; never commit it.
+Then edit `.env` and replace the placeholder of `CARDDEMO_JWT_SECRET` with a local value of at least 32 bytes, such as the output of `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"`. The API refuses to start when this variable is empty, unset, only whitespace or shorter than 32 bytes. `.env` is git-ignored; never commit it.
 
 No program loads `.env` by itself. The scripts in [`scripts/`](../scripts/) export it before their first command. In every shell where you run a binary, Vite or Playwright by hand, export it first:
 
@@ -75,7 +75,7 @@ Every variable the code reads, with the value `.env.example` gives it:
 | `CARDDEMO_QUEUE_REQUEST_PAUTH` | `CARD.DEMO.REQUEST.PAUTH` | messaging (CP00) |
 | `CARDDEMO_MQ_POLL_MS` | `250` (1 to 5000; a larger value is refused at startup) | messaging |
 | `CARDDEMO_API_BIND` | `127.0.0.1:8080` | api (listen address); the Vite dev server's `/api` proxy target |
-| `CARDDEMO_JWT_SECRET` | none in code; `.env.example` carries a local-only placeholder | api |
+| `CARDDEMO_JWT_SECRET` | none in code; `.env.example` carries a local-only placeholder (at least 32 bytes; an empty, blank or shorter value is refused at startup) | api |
 | `CARDDEMO_JWT_TTL_SECONDS` | `3600` (1 to 9223372036854775807, which is `i64::MAX`; a larger value is refused at startup) | api |
 | `CARDDEMO_VAR_DIR` | `./var` | batch (`dalyrejs/`, `systran/`, `reports/` under it); api, as the base of `CARDDEMO_INTRDR_DIR` when that is unset |
 | `CARDDEMO_STATEMENT_DIR` | `./var/statements/` | batch (`creastmt`) |
@@ -88,9 +88,9 @@ Notes on these values:
 
 - An empty value counts as unset and takes the default. When `CARDDEMO_STATEMENT_DIR` or `CARDDEMO_INTRDR_DIR` is unset, it becomes `statements` or `jobs` under `CARDDEMO_VAR_DIR`. `.env.example` sets both explicitly, so changing `CARDDEMO_VAR_DIR` alone does not move statements or job decks.
 - Relative paths resolve against `modern/`, the working directory of every binary.
-- The database and broker credentials (`carddemo`/`carddemo`) are local-only values that match `compose.yaml` and [`rabbitmq/definitions.json`](../rabbitmq/definitions.json). The URLs must carry them: the libpq variables (`PGHOST`, `PGUSER`, `PGPASSWORD` and the others) are not read.
+- The database and broker credentials (`carddemo`/`carddemo`) are local-only values that match `compose.yaml` and [`rabbitmq/definitions.json`](../rabbitmq/definitions.json). The URLs must carry them: the libpq variables (`PGHOST`, `PGUSER`, `PGPASSWORD` and the others) and the pgpass file supply no setting. `PGOPTIONS` is the exception, because `sqlx` reads it and would send it to the server as session options: while it holds anything other than ASCII whitespace, every program that connects (`carddemo-migrate`, `carddemo-api`, `carddemo-mq` and `carddemo-batch`, and so the scripts that run them) refuses to start and logs `PGOPTIONS is not blank: server options come only from DATABASE_URL`. Clear it with `unset PGOPTIONS` in that shell, or for one command with `env -u PGOPTIONS <command>`. A server setting you want belongs in `DATABASE_URL`, as an `options[<name>]` parameter or inside the `options` parameter, for example `postgres://carddemo:carddemo@localhost:5432/carddemo?options[lock_timeout]=5000` or `…/carddemo?options=-c%20lock_timeout%3D5000`; a query parameter that `sqlx` does not recognize is refused.
 - `CARDDEMO_OTEL_EXPORT=stdout` prints each finished span as a multi-line text block between the JSON event lines. Leave it unset when anything reads standard output line by line as JSON. Any other non-empty value is a configuration error.
-- `carddemo-mq` records a request's `message_id` and `correlation_id` in its message spans and the CP00 alert as their base64url HMAC-SHA256 keyed by its `CARDDEMO_AMQP_URL`, never as their text, and a CP00 reply's generated `message_id` verbatim as `reply_message_id`. Whoever holds the broker credentials in that URL can already read every request from the broker, so the digest is exactly as protected as the messages it identifies; the URL itself is never logged. To find the lines of a request whose ID you know, compute its digest in a shell whose `CARDDEMO_AMQP_URL` holds the URL `carddemo-mq` ran with (export `.env`, or set the default above if it ran with the variable unset) and search for it: `python3 -c 'import base64,hashlib,hmac,os,sys; print(base64.urlsafe_b64encode(hmac.new(os.environ["CARDDEMO_AMQP_URL"].encode(), sys.argv[1].encode(), hashlib.sha256).digest()).rstrip(b"=").decode())' "$ID"`.
+- `carddemo-mq` records a request's `message_id` and `correlation_id` in its message spans and the CP00 alert as their base64url HMAC-SHA256 keyed by its `CARDDEMO_AMQP_URL`, never as their text, and a CP00 reply's generated `message_id` verbatim as `reply_message_id`. Whoever holds the broker credentials in that URL can already read every request from the broker, so the digest is exactly as protected as the messages it identifies; the URL itself is never logged. To find the lines of a request whose ID you know, compute its digest in a shell whose `CARDDEMO_AMQP_URL` holds the URL `carddemo-mq` ran with (export `.env`, or set the default above if it ran with the variable unset) and search for it. Node.js 22 (section 1) computes it with no other tool: `node -e 'const { createHmac } = require("node:crypto"); console.log(createHmac("sha256", process.env.CARDDEMO_AMQP_URL).update(process.argv[1]).digest("base64url"))' -- "$ID"`. The `--` keeps an ID that begins with `-` from being read as a Node option.
 
 Variables that tools read, outside the table above:
 
@@ -147,7 +147,7 @@ cargo run -p api --bin carddemo-api
 
 The server listens on `CARDDEMO_API_BIND` (default `127.0.0.1:8080`), serves the 27 operations under `/api/v1`, and serves its OpenAPI document at `GET /api-docs/openapi.json`. It writes JSON log events to standard output and stops gracefully on Ctrl-C or SIGTERM: the requests in flight get 8 seconds to finish and the server exits 0, or, when that deadline passes first, they are abandoned, an `ERROR` event says so and it exits 1, in either case within about 9 seconds of the signal. It connects to PostgreSQL only; no online transaction sends a broker message.
 
-The server works on at most 256 requests at once (`MAX_IN_FLIGHT` in [`crates/api/src/app.rs`](../crates/api/src/app.rs), compiled in; no variable sets it). A request that arrives while 256 are in flight, on any route, waits for a place, in arrival order, for up to 5 seconds (`ADMISSION_WAIT`, also compiled in), and is served as soon as one frees, so a burst beyond the limit is served a little later rather than refused. Only when no place frees within those 5 seconds is it answered `503 Service Unavailable` with `Retry-After: 1` and a `ScreenError` whose message is `SERVER_BUSY` ([API.md, section 4](API.md#4-error-model)); nothing of it has been read or written, and it can be sent again. The 5 seconds match the request pool's wait for a connection, are under the 8-second drain deadline above and far under the frontend's 30-second request deadline. Idle connections hold no place, and the number of connections is not limited. Expect memory to follow the work in flight rather than the number of clients: each open connection costs tens of kilobytes, because the OpenAPI document is held once for the whole process rather than copied per connection, and each request in flight buffers at most its body, which axum caps at 2 MiB, so 512 MiB at the limit. After a burst the resident memory stays near its high-water mark, since glibc keeps freed heap for reuse; the allocator settings of section 2 make it return memory sooner.
+The server works on at most 256 requests at once (`MAX_IN_FLIGHT` in [`crates/api/src/app.rs`](../crates/api/src/app.rs), compiled in; no variable sets it). A request that arrives while 256 are in flight, on any route, waits for a place, in arrival order, for up to 5 seconds (`ADMISSION_WAIT`, also compiled in), and is served as soon as one frees, so a burst beyond the limit is served a little later rather than refused. Only when no place frees within those 5 seconds is it answered `503 Service Unavailable` with `Retry-After: 1` and a `ScreenError` whose message is `SERVER_BUSY` ([API.md, section 4](API.md#4-error-model)); nothing of it has been read or written, and it can be sent again. The 5 seconds match the request pool's wait for a connection, are under the 8-second drain deadline above and far under the frontend's 30-second request deadline. An admitted request's body must arrive whole within 5 seconds of the API starting to read it (`BODY_READ_DEADLINE` in [`crates/api/src/dto/mod.rs`](../crates/api/src/dto/mod.rs), compiled in); a body still incomplete then is answered `400 Bad Request` with `BODY_TIMEOUT`, so a client that sends its headers and withholds the body keeps its place for at most those 5 seconds, and one that disconnects first gives its place up at once. Only the body read has this deadline; the handler and its database work run without one. Idle connections hold no place, and the number of connections is not limited. Expect memory to follow the work in flight rather than the number of clients: each open connection costs tens of kilobytes, because the OpenAPI document is held once for the whole process rather than copied per connection, and each request in flight buffers at most its body, which the API caps at 64 KiB on every route (`MAX_BODY_BYTES`, compiled in; a larger body, announced by `Content-Length` or sent in chunks, is answered `400 Bad Request` with `INVALID_BODY`), so 16 MiB at the limit. The largest body a screen sends is about 2 KB. After a burst the resident memory stays near its high-water mark, since glibc keeps freed heap for reuse; the allocator settings of section 2 make it return memory sooner.
 
 After `dusrsecj` has loaded the users, sign on as `ADMIN001` (user type `A`, admin menu) or `USER0001` (user type `U`, main menu), both with the password `PASSWORD`, the local users of the root [README.md:203-204](../../README.md):
 
@@ -179,18 +179,28 @@ One process runs the three workers on one broker connection: CDRD (CODATE01) on 
 
 Two or more `carddemo-mq` processes may run at once. CP00 serialises its decisions for an account with a row lock in PostgreSQL, not inside the process, so the credit-limit guarantee holds across processes and redeliveries; [ARCHITECTURE.md](ARCHITECTURE.md#10-messaging-flows) describes the three flows, their replies and failure paths.
 
-To check the CDRD flow by hand, publish any message to its request queue through the management API, then read the reply. CODATE01 ignores the request content and replies with the system date and time:
+To check the CDRD flow by hand, publish any message to its request queue through the management API, then poll the reply queue until the reply arrives. CODATE01 ignores the request content and replies with the system date and time:
 
 ```bash
 curl -s -u carddemo:carddemo -H 'content-type: application/json' \
   -X POST http://localhost:15672/api/exchanges/%2f/amq.default/publish \
   -d '{"properties":{},"routing_key":"CARD.DEMO.REQUEST.DATE","payload":"DATE","payload_encoding":"string"}'
-curl -s -u carddemo:carddemo -H 'content-type: application/json' \
-  -X POST http://localhost:15672/api/queues/%2f/CARD.DEMO.REPLY.DATE/get \
-  -d '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto"}'
+echo
+for try in 1 2 3 4 5 6 7 8 9 10; do
+  reply=$(curl -s -u carddemo:carddemo -H 'content-type: application/json' \
+    -X POST http://localhost:15672/api/queues/%2f/CARD.DEMO.REPLY.DATE/get \
+    -d '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto"}')
+  [[ $reply == '[{'* ]] && break
+  sleep 1
+done
+if [[ $reply == '[{'* ]]; then
+  echo "$reply"
+else
+  echo "no reply after 10 reads (last answer: ${reply:-none}); check that carddemo-mq is running" >&2
+fi
 ```
 
-The first command answers `{"routed":true}`; the second returns the reply, whose payload begins `SYSTEM DATE : `.
+The publish answers `{"routed":true}`. The management API's `/get` does not wait: it answers `[]` at once while the reply queue is empty, and the worker takes the request only at its next poll, up to `CARDDEMO_MQ_POLL_MS` milliseconds after its last empty one. The loop therefore reads once a second and prints the reply, whose payload begins `SYSTEM DATE : `, as soon as it arrives; its ten reads outlast the 5000 ms maximum poll interval. If all ten find nothing, it reports its last answer: `[]` means `carddemo-mq` is not running or not consuming `CARD.DEMO.REQUEST.DATE`, `none` means the management API did not answer, and anything else is that API's error.
 
 ## 6. Batch jobs
 
@@ -323,8 +333,8 @@ cargo sqlx prepare --workspace -- --all-targets
 ## 9. Troubleshooting
 
 - **A binary fails at its first query:** the schema has not been applied. Run `cargo run -p runtime --bin carddemo-migrate`, or `scripts/dev-up.sh`.
-- **`carddemo-api` exits at start:** `CARDDEMO_JWT_SECRET` is empty, or `.env` was not exported in that shell (`set -a; . ./.env; set +a`). A configuration error names its variable, never its value.
-- **A port is already in use** (5432, 5672, 15672, 8080 or 5173): stop the process that holds it, or move the service. The API and the dev server move with `CARDDEMO_API_BIND` and `CARDDEMO_WEB_PORT`. The Compose ports are fixed in `compose.yaml`; to remap them, keep an override file outside the checkout, add `COMPOSE_FILE=compose.yaml:/path/to/override.yaml` to `.env`, and change the ports in `DATABASE_URL` and `CARDDEMO_AMQP_URL` to match. Such a file replaces the port lists with the `!override` tag (Compose 2.24 or later); the management console then answers on the third port:
+- **`carddemo-api` exits at start:** `CARDDEMO_JWT_SECRET` is empty, blank (only whitespace) or shorter than 32 bytes, or `.env` was not exported in that shell (`set -a; . ./.env; set +a`). A configuration error names its variable and the rule the value breaks, never the value.
+- **A port is already in use** (5432, 5672, 15672, 8080 or 5173): stop the process that holds it, or move the service. The API and the dev server move with `CARDDEMO_API_BIND` and `CARDDEMO_WEB_PORT`. The Compose ports are fixed in `compose.yaml`; to remap them, keep an override file outside the checkout, add `COMPOSE_FILE=compose.yaml:/path/to/override.yaml` to `.env`, and change the ports in `DATABASE_URL` and `CARDDEMO_AMQP_URL` to match. Such a file replaces the port lists with the `!override` tag (Compose 2.24.4 or later); the management console then answers on the third port:
 
   ```yaml
   services:

@@ -170,6 +170,9 @@ fn record_text(index: usize, record: &[u8; 80]) -> Result<&str, RenderError> {
 /// Where the record at `index` goes: whether it opens a page after the first, and its baseline
 /// in whole millimetres from the bottom edge.
 fn place(index: usize) -> Result<(bool, u16), RenderError> {
+    // TRUNCATION: none survives. The conversion is checked: the value is the remainder of a
+    // division by `LINES_PER_PAGE` (60), so it lies in 0–59 and always fits `u16`, and a failure
+    // would be the typed `RenderError::Layout`, never a wrapped row.
     let row =
         u16::try_from(index % usize::from(LINES_PER_PAGE)).map_err(|_| RenderError::Layout)?;
     let baseline = row

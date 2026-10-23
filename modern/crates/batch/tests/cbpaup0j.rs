@@ -62,6 +62,16 @@ use test_support::postgres::start_postgres;
 type Outcome<T> = Result<T, Box<dyn Error>>;
 type TestResult = Outcome<()>;
 
+/// Runs `test` to completion on a multi-thread runtime with every driver enabled and the default
+/// worker count, the one Tokio's test attribute builds for its `multi_thread` flavour, without the
+/// lint attributes, `expect` and unchecked pin that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// The default `--sysin`, the in-stream card of `CBPAUP0J.jcl:36-37`: expiry `00`, checkpoint
 /// and display frequency `00001`, debug `Y` (CBPAUP0C-002).
 const DEFAULT_CARD: &str = "00,00001,00001,Y";
@@ -571,185 +581,193 @@ const DEFAULT_RUN_DEBUG: [&str; 27] = [
 /// summary whose approved count, less its expired approvals, is 0 or less is deleted with its
 /// details, and every other summary keeps each stored count and amount. The run shows the debug
 /// lines and the totals, writes no file and returns 0.
-#[tokio::test(flavor = "multi_thread")]
-async fn default_sysin_purges_expired_and_keeps_amounts() -> TestResult {
-    let guard = start_postgres().await?;
-    let store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("default")?;
-    let before = today();
-    let keys = DateKeys::around(before)?;
-    let seeded = seed(&store, keys).await?;
+#[test]
+fn default_sysin_purges_expired_and_keeps_amounts() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("default")?;
+        let before = today();
+        let keys = DateKeys::around(before)?;
+        let seeded = seed(&store, keys).await?;
 
-    let run = run_batch(guard.database_url(), &scratch, &["cbpaup0j"]).await?;
-    let held = day_held(before);
+        let run = run_batch(guard.database_url(), &scratch, &["cbpaup0j"]).await?;
+        let held = day_held(before);
 
-    // audit: CBPAUP0C-022
-    assert_eq!(run.status, NORMAL_END, "{}", run.stderr);
-    assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
-    // The approved count 1 less its expired approval is 0: the detail and the summary go.
-    // audit: CBPAUP0C-011
-    // audit: CBPAUP0C-012
-    // audit: CBPAUP0C-013
-    // audit: CBPAUP0C-015
-    // audit: CBPAUP0C-016
-    assert_left(&store, &seeded.lone_approval, Left::Nothing).await?;
-    // The approved count 2 less one expired approval is 1: the summary stays exactly as seeded,
-    // with the approval dated ahead (E30).
-    // audit: CBPAUP0C-017
-    assert_left(&store, &seeded.partly_expired, Left::Summary(&[keys.kept])).await?;
-    // An expired decline moves only the declined pair in memory: the approved count 1 keeps the
-    // summary, unchanged, while the decline is deleted.
-    // audit: CBPAUP0C-014
-    assert_left(&store, &seeded.expired_decline, Left::Summary(&[])).await?;
-    // A stored approved count of 0 deletes the summary on every run, with no detail or with a
-    // decline dated ahead, which goes with it (X-CBPAUP0J-2).
-    assert_left(&store, &seeded.empty, Left::Nothing).await?;
-    assert_left(&store, &seeded.declines_only, Left::Nothing).await?;
-    // Under expiry 0 a detail dated today or earlier qualifies, so today's approval goes, and its
-    // summary with it, whether or not the day changed during the run.
-    // audit: CBPAUP0C-004
-    assert_left(&store, &seeded.todays_approval, Left::Nothing).await?;
-    // The final checkpoint committed every delete: the test's own connections see them.
-    // audit: CBPAUP0C-019
-    assert_survivors(&store, &[&seeded.partly_expired, &seeded.expired_decline]).await?;
+        // audit: CBPAUP0C-022
+        assert_eq!(run.status, NORMAL_END, "{}", run.stderr);
+        assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
+        // The approved count 1 less its expired approval is 0: the detail and the summary go.
+        // audit: CBPAUP0C-011
+        // audit: CBPAUP0C-012
+        // audit: CBPAUP0C-013
+        // audit: CBPAUP0C-015
+        // audit: CBPAUP0C-016
+        assert_left(&store, &seeded.lone_approval, Left::Nothing).await?;
+        // The approved count 2 less one expired approval is 1: the summary stays exactly as seeded,
+        // with the approval dated ahead (E30).
+        // audit: CBPAUP0C-017
+        assert_left(&store, &seeded.partly_expired, Left::Summary(&[keys.kept])).await?;
+        // An expired decline moves only the declined pair in memory: the approved count 1 keeps the
+        // summary, unchanged, while the decline is deleted.
+        // audit: CBPAUP0C-014
+        assert_left(&store, &seeded.expired_decline, Left::Summary(&[])).await?;
+        // A stored approved count of 0 deletes the summary on every run, with no detail or with a
+        // decline dated ahead, which goes with it (X-CBPAUP0J-2).
+        assert_left(&store, &seeded.empty, Left::Nothing).await?;
+        assert_left(&store, &seeded.declines_only, Left::Nothing).await?;
+        // Under expiry 0 a detail dated today or earlier qualifies, so today's approval goes, and
+        // its summary with it, whether or not the day changed during the run.
+        // audit: CBPAUP0C-004
+        assert_left(&store, &seeded.todays_approval, Left::Nothing).await?;
+        // The final checkpoint committed every delete: the test's own connections see them.
+        // audit: CBPAUP0C-019
+        assert_survivors(&store, &[&seeded.partly_expired, &seeded.expired_decline]).await?;
 
-    if held {
-        let mut expected = opening(DEFAULT_RECEIVED, before);
-        expected.extend(DEFAULT_RUN_DEBUG.map(String::from));
-        expected.extend(totals(6, 4, 6, 4));
-        // The summaries come in ascending account order and each one's details in key order;
-        // six summaries are far below the 1000 at which the count first compares above `00001`
-        // as text, so no checkpoint is taken in the loop and no CHKP SUCCESS line is shown. The
-        // decline removed with account 66 is read, not counted as deleted.
-        // audit: CBPAUP0C-001
-        // audit: CBPAUP0C-002
-        // audit: CBPAUP0C-003
-        // audit: CBPAUP0C-007
-        // audit: CBPAUP0C-008
-        // audit: CBPAUP0C-009
-        // audit: CBPAUP0C-010
-        // audit: CBPAUP0C-018
-        // audit: CBPAUP0C-020
-        // audit: CBPAUP0C-021
-        assert_eq!(run.sysout(), expected);
-    }
-    Ok(())
+        if held {
+            let mut expected = opening(DEFAULT_RECEIVED, before);
+            expected.extend(DEFAULT_RUN_DEBUG.map(String::from));
+            expected.extend(totals(6, 4, 6, 4));
+            // The summaries come in ascending account order and each one's details in key order;
+            // six summaries are far below the 1000 at which the count first compares above `00001`
+            // as text, so no checkpoint is taken in the loop and no CHKP SUCCESS line is shown. The
+            // decline removed with account 66 is read, not counted as deleted.
+            // audit: CBPAUP0C-001
+            // audit: CBPAUP0C-002
+            // audit: CBPAUP0C-003
+            // audit: CBPAUP0C-007
+            // audit: CBPAUP0C-008
+            // audit: CBPAUP0C-009
+            // audit: CBPAUP0C-010
+            // audit: CBPAUP0C-018
+            // audit: CBPAUP0C-020
+            // audit: CBPAUP0C-021
+            assert_eq!(run.sysout(), expected);
+        }
+        Ok(())
+    })
 }
 
 /// A five-day card, debug off: the expired details and the summaries they empty go as under
 /// the default card, while today's approval, a day difference of 0, is below the expiry and
 /// keeps its summary. `PARM RECEIVED` masks a card other than the default one, and only the
 /// opening and end lines are shown.
-#[tokio::test(flavor = "multi_thread")]
-async fn explicit_sysin_expiry_keeps_recent() -> TestResult {
-    let guard = start_postgres().await?;
-    let store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("five-days")?;
-    let before = today();
-    let keys = DateKeys::around(before)?;
-    let seeded = seed(&store, keys).await?;
+#[test]
+fn explicit_sysin_expiry_keeps_recent() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("five-days")?;
+        let before = today();
+        let keys = DateKeys::around(before)?;
+        let seeded = seed(&store, keys).await?;
 
-    let args = ["cbpaup0j", "--sysin", FIVE_DAY_CARD];
-    let run = run_batch(guard.database_url(), &scratch, &args).await?;
-    let held = day_held(before);
+        let args = ["cbpaup0j", "--sysin", FIVE_DAY_CARD];
+        let run = run_batch(guard.database_url(), &scratch, &args).await?;
+        let held = day_held(before);
 
-    // audit: CBPAUP0C-022
-    assert_eq!(run.status, NORMAL_END, "{}", run.stderr);
-    assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
-    // A day difference of +1000 is above five days and −1000 below it.
-    // audit: CBPAUP0C-012
-    // audit: CBPAUP0C-015
-    // audit: CBPAUP0C-016
-    // audit: CBPAUP0C-017
-    assert_left(&store, &seeded.lone_approval, Left::Nothing).await?;
-    assert_left(&store, &seeded.partly_expired, Left::Summary(&[keys.kept])).await?;
-    assert_left(&store, &seeded.expired_decline, Left::Summary(&[])).await?;
-    assert_left(&store, &seeded.empty, Left::Nothing).await?;
-    assert_left(&store, &seeded.declines_only, Left::Nothing).await?;
-    if !held {
-        return Ok(());
-    }
-    // Expiry `05` is five days: today's approval, a difference of 0, is kept, and the approved
-    // count 1 keeps its summary unchanged.
-    // audit: CBPAUP0C-004
-    assert_left(
-        &store,
-        &seeded.todays_approval,
-        Left::Summary(&[keys.today]),
-    )
-    .await?;
-    let survivors = [
-        &seeded.partly_expired,
-        &seeded.expired_decline,
-        &seeded.todays_approval,
-    ];
-    assert_survivors(&store, &survivors).await?;
-    let mut expected = opening(MASKED_RECEIVED, before);
-    expected.extend(totals(6, 3, 6, 3));
-    // audit: CBPAUP0C-002
-    // audit: CBPAUP0C-003
-    // audit: CBPAUP0C-007
-    // audit: CBPAUP0C-021
-    assert_eq!(run.sysout(), expected);
-    Ok(())
+        // audit: CBPAUP0C-022
+        assert_eq!(run.status, NORMAL_END, "{}", run.stderr);
+        assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
+        // A day difference of +1000 is above five days and −1000 below it.
+        // audit: CBPAUP0C-012
+        // audit: CBPAUP0C-015
+        // audit: CBPAUP0C-016
+        // audit: CBPAUP0C-017
+        assert_left(&store, &seeded.lone_approval, Left::Nothing).await?;
+        assert_left(&store, &seeded.partly_expired, Left::Summary(&[keys.kept])).await?;
+        assert_left(&store, &seeded.expired_decline, Left::Summary(&[])).await?;
+        assert_left(&store, &seeded.empty, Left::Nothing).await?;
+        assert_left(&store, &seeded.declines_only, Left::Nothing).await?;
+        if !held {
+            return Ok(());
+        }
+        // Expiry `05` is five days: today's approval, a difference of 0, is kept, and the approved
+        // count 1 keeps its summary unchanged.
+        // audit: CBPAUP0C-004
+        assert_left(
+            &store,
+            &seeded.todays_approval,
+            Left::Summary(&[keys.today]),
+        )
+        .await?;
+        let survivors = [
+            &seeded.partly_expired,
+            &seeded.expired_decline,
+            &seeded.todays_approval,
+        ];
+        assert_survivors(&store, &survivors).await?;
+        let mut expected = opening(MASKED_RECEIVED, before);
+        expected.extend(totals(6, 3, 6, 3));
+        // audit: CBPAUP0C-002
+        // audit: CBPAUP0C-003
+        // audit: CBPAUP0C-007
+        // audit: CBPAUP0C-021
+        assert_eq!(run.sysout(), expected);
+        Ok(())
+    })
 }
 
 /// A summary read that fails, here against the container's `postgres` database, which holds no
 /// schema: the failure lines, `CBPAUP0C ABENDING ...` and return code 16, with no end lines. The
 /// default card typed out is shown as received, as when `--sysin` is left out.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unreadable_summary_table_abends_with_return_code_16() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::new("abend")?;
-    let unmigrated = guard
-        .database_url()
-        .strip_suffix("/carddemo")
-        .map(|server| format!("{server}/postgres"))
-        .ok_or("the harness URL names the database carddemo")?;
-    let before = today();
+#[test]
+fn an_unreadable_summary_table_abends_with_return_code_16() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::new("abend")?;
+        let unmigrated = guard
+            .database_url()
+            .strip_suffix("/carddemo")
+            .map(|server| format!("{server}/postgres"))
+            .ok_or("the harness URL names the database carddemo")?;
+        let before = today();
 
-    let args = ["cbpaup0j", "--sysin", DEFAULT_CARD];
-    let run = run_batch(&unmigrated, &scratch, &args).await?;
-    let held = day_held(before);
+        let args = ["cbpaup0j", "--sysin", DEFAULT_CARD];
+        let run = run_batch(&unmigrated, &scratch, &args).await?;
+        let held = day_held(before);
 
-    // audit: CBPAUP0C-028
-    assert_eq!(run.status, ABEND_END, "{}", run.stderr);
-    assert!(
-        run.stderr
-            .starts_with("carddemo-batch cbpaup0j: ABEND: CBPAUP0C ABENDING ..."),
-        "{}",
-        run.stderr
-    );
-    assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
-    let sysout = run.sysout();
-    let (shown, after) = sysout
-        .split_at_checked(6)
-        .ok_or("six lines before the failure")?;
-    if held {
-        let mut expected = opening(DEFAULT_RECEIVED, before);
-        expected.push("DEBUG: AUTH SMRY READ : 00000000".to_owned());
-        // audit: CBPAUP0C-001
-        // audit: CBPAUP0C-002
-        // audit: CBPAUP0C-003
-        // audit: CBPAUP0C-008
-        assert_eq!(shown, expected);
-    }
-    let (failure, rest) = after.split_first().ok_or("the failure line")?;
-    // The two characters after the label are the DL/I status, BLOCKED by halt H4: only the label
-    // is compared.
-    // audit: CBPAUP0C-029
-    eprintln!("BLOCKED (H4): the status characters of the summary read failure are not asserted");
-    // audit: CBPAUP0C-023
-    assert!(
-        failure.starts_with("AUTH SUMMARY READ FAILED  :"),
-        "{failure}"
-    );
-    assert_eq!(
-        rest,
-        [
-            "SUMMARY READ BEFORE ABEND :00000000",
-            "CBPAUP0C ABENDING ..."
-        ]
-    );
-    Ok(())
+        // audit: CBPAUP0C-028
+        assert_eq!(run.status, ABEND_END, "{}", run.stderr);
+        assert!(
+            run.stderr
+                .starts_with("carddemo-batch cbpaup0j: ABEND: CBPAUP0C ABENDING ..."),
+            "{}",
+            run.stderr
+        );
+        assert!(run.written_paths().is_empty(), "cbpaup0j writes no file");
+        let sysout = run.sysout();
+        let (shown, after) = sysout
+            .split_at_checked(6)
+            .ok_or("six lines before the failure")?;
+        if held {
+            let mut expected = opening(DEFAULT_RECEIVED, before);
+            expected.push("DEBUG: AUTH SMRY READ : 00000000".to_owned());
+            // audit: CBPAUP0C-001
+            // audit: CBPAUP0C-002
+            // audit: CBPAUP0C-003
+            // audit: CBPAUP0C-008
+            assert_eq!(shown, expected);
+        }
+        let (failure, rest) = after.split_first().ok_or("the failure line")?;
+        // The two characters after the label are the DL/I status, BLOCKED by halt H4: only the
+        // label is compared.
+        // audit: CBPAUP0C-029
+        eprintln!(
+            "BLOCKED (H4): the status characters of the summary read failure are not asserted"
+        );
+        // audit: CBPAUP0C-023
+        assert!(
+            failure.starts_with("AUTH SUMMARY READ FAILED  :"),
+            "{failure}"
+        );
+        assert_eq!(
+            rest,
+            [
+                "SUMMARY READ BEFORE ABEND :00000000",
+                "CBPAUP0C ABENDING ..."
+            ]
+        );
+        Ok(())
+    })
 }

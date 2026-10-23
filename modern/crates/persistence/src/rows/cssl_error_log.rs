@@ -27,12 +27,13 @@
 //! # Event key and redaction
 //!
 //! The COBOL moves full card numbers into `ERR-EVENT-KEY`
-//! (`COPAUA0C.cbl:428,499,511,638,777,845,930`). Under Cardholder Data Redaction the key reaches
-//! this module already in the 16-character redacted form, twelve `*` and the last four digits
-//! padded with spaces to 20, which `domain::records::error_log::card_event_key` builds (E32;
-//! PIC-024). The key is stored and read back exactly as given: nothing here derives, widens or
-//! unmasks it. Neither struct derives `Debug`, `Clone` or `Serialize`, so no row value reaches a
-//! log line or a payload by accident.
+//! (`COPAUA0C.cbl:428,499,511,638,777,845,930`). Under Cardholder Data Redaction a card-number
+//! key reaches this module already in the 16-character redacted form, twelve `*` and the last
+//! four digits padded with spaces to 20, which `domain::records::error_log::card_event_key`
+//! builds (E32; PIC-024). Account-ID and customer-ID keys (`COPAUA0C.cbl:546,559,594,607`) hold
+//! no card number and arrive as written (CCPAUERY-011). Either kind is stored and read back
+//! exactly as given: nothing here derives, widens or unmasks it. Neither struct derives `Debug`,
+//! `Clone` or `Serialize`, so no row value reaches a log line or a payload by accident.
 //!
 //! # Status codes
 //!

@@ -35,12 +35,11 @@
 //!    selection's own, no selected row reaches it.
 //! 4. The records each pass gives are taken with `Tranrept::take_records` and written at once,
 //!    and those `Tranrept::finish` gives after the loop are written last, each as its 133 bytes
-//!    and LF (CBTRN03C-032). Neither the selection nor the report is ever held whole
-//!    (W011-F06): the selection is the repository's one statement over the window, whose rows
-//!    are decoded one at a time as they are read. The last amount counted twice at end of file
-//!    and the missing account total of the last card are the domain's, reproduced as audited
-//!    and never corrected here (CBTRN03C-030, CBTRN03C-031, X-TRANREPT-7; Behaviour
-//!    constraint).
+//!    and LF (CBTRN03C-032). Neither the selection nor the report is ever held whole: the
+//!    selection is the repository's one statement over the window, whose rows are decoded one
+//!    at a time as they are read. The last amount counted twice at end of file and the missing
+//!    account total of the last card are the domain's, reproduced as audited and never
+//!    corrected here (CBTRN03C-030, CBTRN03C-031, X-TRANREPT-7; Behaviour constraint).
 //! 5. A normal end shows the end line once the generation is complete and returns code 0 and the
 //!    generation path, which `main` prints after it (CBTRN03C-032, CBTRN03C-034).
 //!
@@ -119,6 +118,7 @@
 //! a full card number, an SSN or a password (CBTRN03C-039; Cardholder Data Redaction).
 
 use std::collections::HashSet;
+use std::fmt;
 
 use copybook::PicX;
 use domain::batch::cbtrn03c::{
@@ -136,6 +136,10 @@ use persistence::{
     TransactionRows, TransactionTypeRepository,
 };
 use runtime::telemetry::JobCounter;
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{self, Field, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use super::{JobContext, JobError, JobOutcome, OutputFile, REPORTS_DIR_SETTING, count};
 use crate::cli::TranreptArgs;
@@ -204,7 +208,7 @@ const CLOSE_REPTFILE_OP: &str = "CLOSE REPTFILE";
 /// After any error the generation file is removed and no end line is shown (CBTRN03C-035).
 pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<JobOutcome, JobError> {
     let parm = args.date_parm().map_err(window_error)?;
-    tracing::info!("{START_LINE}");
+    show(&JOB_LOG_INFO, || START_LINE);
     // Each store is a handle on the shared pool, cloned for the `&mut self` repository calls.
     // The selection's rows borrow theirs, and hold one pooled connection, until the loop ends,
     // so the lookup tables are read through a second handle, on other connections.
@@ -239,7 +243,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<Job
         .map_err(|error| database_failure(OPEN_TRANCATG_OP, OPEN_TRANCATG_ERROR, &error))?;
     // `0550-DATEPARM-READ`: the record built from the window always exists, so the read ends
     // with status `00` and shows the window (CBTRN03C-008, CBTRN03C-009).
-    tracing::info!("{}", parm.reporting_line());
+    show(&JOB_LOG_INFO, || parm.reporting_line());
     let (read, report_lines) = report(
         parm,
         first,
@@ -257,7 +261,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<Job
         .finish()
         .await
         .map_err(|error| file_failure(CLOSE_REPTFILE_OP, CLOSE_REPTFILE_ERROR, &error))?;
-    tracing::info!("{END_LINE}");
+    show(&JOB_LOG_INFO, || END_LINE);
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
@@ -274,8 +278,8 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &TranreptArgs) -> Result<Job
 /// which reads no further row (CBTRN03C-011), and the records each pass gives are written to
 /// `output` at once, as the program writes them; then the records `Tranrept::finish` gives are
 /// written (CBTRN03C-032). No more of the selection than one row, and of the report than one
-/// pass's records, is held (W011-F06). Returns the number of rows passed, the stopping one
-/// included, and the number of records written.
+/// pass's records, is held. Returns the number of rows passed, the stopping one included, and
+/// the number of records written.
 ///
 /// A row the window selects shows its `TRAN-RECORD` line before it is reported, as the program
 /// displays it after the window test and before the lookups (CBTRN03C-012); a row outside the
@@ -307,7 +311,7 @@ async fn report(
     while let Some(row) = next {
         read += 1;
         if selects(&row, &parm) {
-            tracing::info!("{}", record_line(&row, &held));
+            show(&JOB_LOG_INFO, || record_line(&row, &held));
         }
         let flow = run.process(&row).map_err(lookup_abend)?;
         written += write_records(output, run.take_records()).await?;
@@ -321,7 +325,7 @@ async fn report(
     }
     if let Some(lines) = run.end_of_file_display() {
         for line in lines {
-            tracing::info!("{line}");
+            show(&JOB_LOG_INFO, || line);
         }
     }
     written += write_records(output, run.finish().map_err(lookup_abend)?).await?;
@@ -393,7 +397,7 @@ fn database_failure(
     line: &'static str,
     error: &PersistenceError,
 ) -> JobError {
-    tracing::error!(operation, error = %error, "CBTRN03C database call failed");
+    call_failed(DATABASE_CALL_FAILED, operation, error);
     abend(line)
 }
 
@@ -401,8 +405,66 @@ fn database_failure(
 /// carrying the error, whose text is a static step and the I/O error kind, or the generation
 /// limit and the `TRANREPT` base, never the path; then the path's lines and the abend.
 fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -> JobError {
-    tracing::error!(operation, error = %error, "CBTRN03C file operation failed");
+    call_failed(FILE_CALL_FAILED, operation, error);
     abend(line)
+}
+
+/// The message of the event of a failed database call.
+const DATABASE_CALL_FAILED: &str = "CBTRN03C database call failed";
+
+/// The message of the event of a failed local-file call.
+const FILE_CALL_FAILED: &str = "CBTRN03C file operation failed";
+
+/// The name of the callsite of the [`DATABASE_CALL_FAILED`] and [`FILE_CALL_FAILED`] events.
+const CALL_FAILED: &str = "CBTRN03C call failed";
+
+/// The fields of a failed call's event, in the order [`call_failed`] gives their values.
+const CALL_FAILED_FIELDS: &[&str] = &["message", "operation", "error"];
+
+// Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+/// The `ERROR` callsite of the events of a failed database or file call, which differ only in
+/// their message.
+static CALL_FAILED_SITE: DefaultCallsite = DefaultCallsite::new(&CALL_FAILED_METADATA);
+
+/// The metadata of [`CALL_FAILED_SITE`].
+static CALL_FAILED_METADATA: Metadata<'static> = tracing::metadata! {
+    name: CALL_FAILED,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: CALL_FAILED_FIELDS,
+    callsite: &CALL_FAILED_SITE,
+    kind: Kind::EVENT,
+};
+
+/// Reports the failed call `operation`: one `ERROR` event in the current span, with target
+/// `carddemo_batch::jobs::tranrept` and, in this order, the fields `message`, which is `message`
+/// ([`DATABASE_CALL_FAILED`] or [`FILE_CALL_FAILED`]), `operation` and `error`, the text of
+/// `error`. It decides through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s
+/// event macros do, so the event is the line a macro would write.
+fn call_failed(message: &'static str, operation: &'static str, error: &dyn fmt::Display) {
+    if !runtime::telemetry::event_enabled(&CALL_FAILED_SITE) {
+        return;
+    }
+    let metadata = CALL_FAILED_SITE.metadata();
+    let fields = metadata.fields();
+    // The callsite declares every name of `CALL_FAILED_FIELDS`, so each lookup finds its field.
+    let (Some(message_field), Some(operation_field), Some(error_field)) = (
+        fields.field("message"),
+        fields.field("operation"),
+        fields.field("error"),
+    ) else {
+        return;
+    };
+    // The message and the error are recorded through their `Display`, as the macro records its
+    // formatted message and a `%` field.
+    let message = field::display(message);
+    let error = field::display(error);
+    let values: [(&Field, Option<&dyn Value>); 3] = [
+        (&message_field, Some(&message)),
+        (&operation_field, Some(&operation)),
+        (&error_field, Some(&error)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 /// `9999-ABEND-PROGRAM` after the failure line `line`: `line`, the status line of
@@ -410,8 +472,10 @@ fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -
 /// `ABENDING PROGRAM` and the abend, with no return code (CBTRN03C-035, X-TRANREPT-4). The caller
 /// returns the error at once, which drops the unfinished generation and so removes it.
 fn abend(line: &'static str) -> JobError {
-    tracing::error!("{line}");
-    tracing::error!("{FILE_STATUS_LABEL}{STAND_IN_STATUS}");
+    show(&JOB_LOG_ERROR, || line);
+    show(&JOB_LOG_ERROR, || {
+        format!("{FILE_STATUS_LABEL}{STAND_IN_STATUS}")
+    });
     show_abend();
     JobError::Abend {
         code: None,
@@ -427,17 +491,112 @@ fn abend(line: &'static str) -> JobError {
 fn lookup_abend(error: ReportError) -> JobError {
     if let Some(lines) = error.job_log_lines() {
         for line in lines {
-            tracing::error!("{line}");
+            show(&JOB_LOG_ERROR, || line);
         }
     }
     show_abend();
     JobError::Report(error)
 }
 
+/// The fields of the `ABENDING PROGRAM` event, in the order [`show_abend`] gives their values.
+const ABEND_FIELDS: &[&str] = &["message", "abend_code"];
+
+// Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+/// The `ERROR` callsite of the `ABENDING PROGRAM` event.
+static ABEND_SITE: DefaultCallsite = DefaultCallsite::new(&ABEND_METADATA);
+
+/// The metadata of [`ABEND_SITE`].
+static ABEND_METADATA: Metadata<'static> = tracing::metadata! {
+    name: ABEND_LINE,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: ABEND_FIELDS,
+    callsite: &ABEND_SITE,
+    kind: Kind::EVENT,
+};
+
 /// `DISPLAY 'ABENDING PROGRAM'`, the last job-log line of every failure path, carrying the
 /// abend code `CEE3ABD` is called with (CBTRN03C-035, X-TRANREPT-4).
+///
+/// The line is one `ERROR` event in the current span, with target
+/// `carddemo_batch::jobs::tranrept` and, in this order, the fields `message` ([`ABEND_LINE`])
+/// and `abend_code` ([`ABEND_CODE`]), a number. It decides through
+/// `runtime::telemetry::event_enabled` and dispatches as `tracing`'s event macros do, so the
+/// event is the line a macro would write.
 fn show_abend() {
-    tracing::error!(abend_code = ABEND_CODE, "{ABEND_LINE}");
+    if !runtime::telemetry::event_enabled(&ABEND_SITE) {
+        return;
+    }
+    let metadata = ABEND_SITE.metadata();
+    let fields = metadata.fields();
+    // The callsite declares every name of `ABEND_FIELDS`, so each lookup finds its field.
+    let (Some(message_field), Some(abend_code_field)) =
+        (fields.field("message"), fields.field("abend_code"))
+    else {
+        return;
+    };
+    // The message is recorded through its `Display`, as the macro records its formatted message.
+    let message = field::display(ABEND_LINE);
+    let values: [(&Field, Option<&dyn Value>); 2] = [
+        (&message_field, Some(&message)),
+        (&abend_code_field, Some(&ABEND_CODE)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
+}
+
+/// The name of the callsites of the job-log line events.
+const JOB_LOG_LINE: &str = "CBTRN03C job-log line";
+
+/// The field of a job-log line's event: its message alone, the line's text.
+const JOB_LOG_LINE_FIELDS: &[&str] = &["message"];
+
+// Written out: `tracing`'s `info!` and `error!` expand to an `allow(unused_imports)` lint
+// suppression.
+/// The `INFO` callsite of the job-log lines of a run.
+static JOB_LOG_INFO: DefaultCallsite = DefaultCallsite::new(&JOB_LOG_INFO_METADATA);
+
+/// The metadata of [`JOB_LOG_INFO`].
+static JOB_LOG_INFO_METADATA: Metadata<'static> = tracing::metadata! {
+    name: JOB_LOG_LINE,
+    target: module_path!(),
+    level: Level::INFO,
+    fields: JOB_LOG_LINE_FIELDS,
+    callsite: &JOB_LOG_INFO,
+    kind: Kind::EVENT,
+};
+
+/// The `ERROR` callsite of the job-log lines a failure path adds.
+static JOB_LOG_ERROR: DefaultCallsite = DefaultCallsite::new(&JOB_LOG_ERROR_METADATA);
+
+/// The metadata of [`JOB_LOG_ERROR`].
+static JOB_LOG_ERROR_METADATA: Metadata<'static> = tracing::metadata! {
+    name: JOB_LOG_LINE,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: JOB_LOG_LINE_FIELDS,
+    callsite: &JOB_LOG_ERROR,
+    kind: Kind::EVENT,
+};
+
+/// Emits the job-log line `line` builds as one event of `callsite` in the current span, with
+/// target `carddemo_batch::jobs::tranrept` and the field `message` alone, the line's text
+/// exactly. `line` is called only when the event is enabled, as a macro formats its message only
+/// then. It decides through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s
+/// event macros do, so the event is the line a macro would write.
+fn show<L: fmt::Display>(callsite: &'static DefaultCallsite, line: impl FnOnce() -> L) {
+    if !runtime::telemetry::event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    let fields = metadata.fields();
+    // Both callsites declare `message`, so the lookup finds it.
+    let Some(message_field) = fields.field("message") else {
+        return;
+    };
+    // The line is recorded through its `Display`, as the macro records its formatted message.
+    let message = field::display(line());
+    let values: [(&Field, Option<&dyn Value>); 1] = [(&message_field, Some(&message))];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 /// The [`JobError`] of a window the domain refuses (CBTRN03C-002). `JobError` has no variant of
@@ -475,6 +634,16 @@ mod tests {
     use super::{OutputFile, REPORT_BASE, record_line, report, window_error};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Runs `test` to completion on a current-thread runtime with every driver enabled, the one
+    /// Tokio's test attribute builds by default, without the lint attributes, `expect` and
+    /// unchecked pin that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// Tells apart the scratch directories of the tests of one process.
     static SCRATCH_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -600,95 +769,99 @@ mod tests {
     // audit: CBTRN03C-011
     // audit: CBTRN03C-030
     // audit: CBTRN03C-032
-    #[tokio::test]
-    async fn rows_are_read_until_the_loop_is_left() -> TestResult {
-        let cases = [
-            Case {
-                stamps: &[INSIDE, INSIDE],
-                read: 2,
-                records: 9,
-                last_prefix: b"Grand Total",
-            },
-            Case {
-                stamps: &[INSIDE, OUTSIDE, INSIDE],
-                read: 2,
-                records: 5,
-                last_prefix: b"0000000000000001 00000000050 01-Purchase",
-            },
-        ];
-        for case in cases {
-            let stamps = case.stamps.len();
-            let mut rows = TransactionRows::from_records(
-                case.stamps
-                    .iter()
-                    .zip(1..)
-                    .map(|(stamp, n)| purchase(n, stamp))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-            let first = rows.next().await?;
-            let Lookups {
-                xrefs,
-                types,
-                categories,
-            } = lookups()?;
-            let scratch = Scratch::new()?;
-            let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
-            let (read, written) = report(
-                DateParm::DEFAULT,
-                first,
-                &mut rows,
-                xrefs,
-                types,
-                categories,
-                &mut output,
-            )
-            .await?;
-            let bytes = fs::read(output.finish().await?)?;
-            let records = report_records(&bytes)?;
-            assert_eq!(read, case.read, "{stamps} rows");
-            assert_eq!(written, case.records, "{stamps} rows");
-            assert_eq!(records.len(), case.records, "{stamps} rows");
-            let last = records.last().ok_or("no report record")?;
-            assert!(last.starts_with(case.last_prefix), "{stamps} rows");
-        }
-        Ok(())
+    #[test]
+    fn rows_are_read_until_the_loop_is_left() -> TestResult {
+        block_on(async {
+            let cases = [
+                Case {
+                    stamps: &[INSIDE, INSIDE],
+                    read: 2,
+                    records: 9,
+                    last_prefix: b"Grand Total",
+                },
+                Case {
+                    stamps: &[INSIDE, OUTSIDE, INSIDE],
+                    read: 2,
+                    records: 5,
+                    last_prefix: b"0000000000000001 00000000050 01-Purchase",
+                },
+            ];
+            for case in cases {
+                let stamps = case.stamps.len();
+                let mut rows = TransactionRows::from_records(
+                    case.stamps
+                        .iter()
+                        .zip(1..)
+                        .map(|(stamp, n)| purchase(n, stamp))
+                        .collect::<Result<Vec<_>, _>>()?,
+                );
+                let first = rows.next().await?;
+                let Lookups {
+                    xrefs,
+                    types,
+                    categories,
+                } = lookups()?;
+                let scratch = Scratch::new()?;
+                let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
+                let (read, written) = report(
+                    DateParm::DEFAULT,
+                    first,
+                    &mut rows,
+                    xrefs,
+                    types,
+                    categories,
+                    &mut output,
+                )
+                .await?;
+                let bytes = fs::read(output.finish().await?)?;
+                let records = report_records(&bytes)?;
+                assert_eq!(read, case.read, "{stamps} rows");
+                assert_eq!(written, case.records, "{stamps} rows");
+                assert_eq!(records.len(), case.records, "{stamps} rows");
+                let last = records.last().ok_or("no report record")?;
+                assert!(last.starts_with(case.last_prefix), "{stamps} rows");
+            }
+            Ok(())
+        })
     }
 
     /// A missing cross-reference ends the run with the domain's error, whose job text names the
     /// failed lookup only, and the generation is removed once the run drops it.
     // audit: CBTRN03C-014
     // audit: CBTRN03C-035
-    #[tokio::test]
-    async fn a_missing_cross_reference_abends_the_run() -> TestResult {
-        let mut rows = TransactionRows::from_records(Vec::new());
-        let Lookups {
-            types, categories, ..
-        } = lookups()?;
-        let scratch = Scratch::new()?;
-        let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
-        let error = report(
-            DateParm::DEFAULT,
-            Some(purchase(1, INSIDE)?),
-            &mut rows,
-            Vec::new(),
-            types,
-            categories,
-            &mut output,
-        )
-        .await
-        .err()
-        .ok_or("a card with no cross-reference was reported")?;
-        assert_eq!(
-            error.to_string(),
-            "CBTRN03C: card number not in the card cross-reference"
-        );
-        drop(output);
-        assert_eq!(
-            fs::read_dir(scratch.path())?.count(),
-            0,
-            "the generation remains"
-        );
-        Ok(())
+    #[test]
+    fn a_missing_cross_reference_abends_the_run() -> TestResult {
+        block_on(async {
+            let mut rows = TransactionRows::from_records(Vec::new());
+            let Lookups {
+                types, categories, ..
+            } = lookups()?;
+            let scratch = Scratch::new()?;
+            let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
+            let error = report(
+                DateParm::DEFAULT,
+                Some(purchase(1, INSIDE)?),
+                &mut rows,
+                Vec::new(),
+                types,
+                categories,
+                &mut output,
+            )
+            .await
+            .err()
+            .ok_or("a card with no cross-reference was reported")?;
+            assert_eq!(
+                error.to_string(),
+                "CBTRN03C: card number not in the card cross-reference"
+            );
+            drop(output);
+            assert_eq!(
+                fs::read_dir(scratch.path())?.count(),
+                0,
+                "the generation remains"
+            );
+            Ok(())
+        })
     }
 
     /// A row that cannot be fetched after the first ends the run on the abend path of
@@ -697,46 +870,48 @@ mod tests {
     /// it.
     // audit: CBTRN03C-010
     // audit: CBTRN03C-035
-    #[tokio::test]
-    async fn a_row_that_cannot_be_fetched_abends_the_run() -> TestResult {
-        let mut rows = TransactionRows::from_results(vec![
-            Ok(purchase(1, INSIDE)?),
-            Err(PersistenceError::Unavailable),
-            Ok(purchase(3, INSIDE)?),
-        ]);
-        let first = rows.next().await?;
-        let Lookups {
-            xrefs,
-            types,
-            categories,
-        } = lookups()?;
-        let scratch = Scratch::new()?;
-        let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
-        let error = report(
-            DateParm::DEFAULT,
-            first,
-            &mut rows,
-            xrefs,
-            types,
-            categories,
-            &mut output,
-        )
-        .await
-        .err()
-        .ok_or("a failed fetch was reported")?;
-        assert_eq!(error.to_string(), "ABEND: ERROR READING TRANSACTION FILE");
-        assert_eq!(error.exit_code(), None);
-        assert!(
-            rows.next().await?.is_none(),
-            "a row after the failure was read"
-        );
-        drop(output);
-        assert_eq!(
-            fs::read_dir(scratch.path())?.count(),
-            0,
-            "the generation remains"
-        );
-        Ok(())
+    #[test]
+    fn a_row_that_cannot_be_fetched_abends_the_run() -> TestResult {
+        block_on(async {
+            let mut rows = TransactionRows::from_results(vec![
+                Ok(purchase(1, INSIDE)?),
+                Err(PersistenceError::Unavailable),
+                Ok(purchase(3, INSIDE)?),
+            ]);
+            let first = rows.next().await?;
+            let Lookups {
+                xrefs,
+                types,
+                categories,
+            } = lookups()?;
+            let scratch = Scratch::new()?;
+            let mut output = OutputFile::next_generation(scratch.path(), REPORT_BASE).await?;
+            let error = report(
+                DateParm::DEFAULT,
+                first,
+                &mut rows,
+                xrefs,
+                types,
+                categories,
+                &mut output,
+            )
+            .await
+            .err()
+            .ok_or("a failed fetch was reported")?;
+            assert_eq!(error.to_string(), "ABEND: ERROR READING TRANSACTION FILE");
+            assert_eq!(error.exit_code(), None);
+            assert!(
+                rows.next().await?.is_none(),
+                "a row after the failure was read"
+            );
+            drop(output);
+            assert_eq!(
+                fs::read_dir(scratch.path())?.count(),
+                0,
+                "the generation remains"
+            );
+            Ok(())
+        })
     }
 
     /// A refused window ends the job on the abend path with no return code of its own and a

@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COUSR00C PROCESS-PAGE-FORWARD (app/cbl/COUSR00C.cbl:282-331): STARTBR (default GTEQ, 586-614)\n-- + READNEXT (619-648) over USRSEC by SEC-USR-ID (KEYS(8,0), app/jcl/DUSRSECJ.jcl:65), in\n-- ascending key byte order. The \"C\" collation migration 0003 gives usr_id orders the stored ASCII\n-- bytes, whereas the KSDS ordered EBCDIC bytes. The two orders agree for the fixture user IDs,\n-- ADMIN001 to ADMIN005 and USER0001 to USER0005, which first differ letter against letter or\n-- digit against digit. They need not agree for arbitrary IDs, which can first differ digit\n-- against letter or lower case against upper case (escalation candidate X-COUSR00C-2 in\n-- modern/audit/online/COUSR00C.md). Audit rows COUSR00C-013 to COUSR00C-018. Only the four\n-- columns POPULATE-USER-DATA shows are read, and no credential column. Endpoint 16\n-- GET /api/v1/users [A]. Rule: Bounded Pagination (users_pkey).\n-- Parameters: 1 start user ID, inclusive (empty for the LOW-VALUES first page), 2 row limit.\nSELECT\n    usr_id,\n    usr_fname,\n    usr_lname,\n    usr_type\nFROM users\nWHERE usr_id >= $1::bpchar\nORDER BY usr_id ASC\nLIMIT $2::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "usr_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "usr_fname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "usr_lname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "usr_type",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "4080877d452ef777c111adcac159d41ac05fa37080ee949538e827dc1921800c"
+}

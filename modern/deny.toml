@@ -7,9 +7,11 @@ all-features = false
 
 [advisories]
 yanked = "deny"
-# Each entry is one advisory against a version the pinned stack cannot leave, accepted by the
-# ESCALATIONS.md row its reason cites. Ignores are by advisory ID only, never by crate, so a new
-# advisory against the same crate still fails the check.
+# Each entry is one advisory against a version the pinned stack cannot leave, documented and
+# proposed as an exception in the audit/ESCALATIONS.md row its reason cites. The entry applies the
+# proposal and is not its acceptance, which is the reviewer's AGREED status in that row's Status
+# column, the review ledger. Ignores are by advisory ID only, never by crate, so a new advisory
+# against the same crate still fails the check.
 ignore = [
     { id = "RUSTSEC-2024-0384", reason = "instant@0.1.13 fixed by pin (lapin 2.5.5, the last 2.x, via async-io 1); see ESCALATIONS E35" },
     { id = "RUSTSEC-2024-0436", reason = "paste@1.0.15 fixed by pin (utoipa-axum 0.2.0, the only 0.2.x); see ESCALATIONS E36" },

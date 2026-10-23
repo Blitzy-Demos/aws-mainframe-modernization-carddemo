@@ -57,6 +57,10 @@ use persistence::{
     AccountCustomerChain, AccountRepository, ChainLink, PendingAuthDetailRepository,
     PendingAuthSummaryRepository, PersistenceError,
 };
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -184,13 +188,28 @@ fn detail_read_failed(
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        statement,
-        error = %error,
-        "read failed; answering the program's system error"
-    );
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "program", "paragraph", "statement", "error"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"read failed; answering the program's system error" as &dyn Value),
+                Some(&PROGRAM as &dyn Value),
+                Some(&paragraph as &dyn Value),
+                Some(&statement as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
 }
 
 /// One link of the `find_with_customer` chain as the read outcome the domain judges: a record

@@ -58,6 +58,10 @@ use domain::online::cotrn02c::{
 };
 use domain::records::CardXrefRecord;
 use persistence::{CardXrefRepository, PersistenceError, PgStore, PgTx, TransactionRepository};
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -300,7 +304,26 @@ async fn browse_highest(tx: &mut PgTx<'_>) -> Result<(PicX<16>, PicX<20>), Persi
 /// `condition` is a store error, which renders only its SQLSTATE and constraint name, or the
 /// CICS condition the replacement detects itself; no key or field is recorded.
 fn region_log(paragraph: &'static str, condition: &dyn fmt::Display) {
-    tracing::error!(paragraph, condition = %condition, "COTRN02C file statement failed");
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "paragraph", "condition"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"COTRN02C file statement failed" as &dyn Value),
+                Some(&paragraph as &dyn Value),
+                Some(&display(condition) as &dyn Value),
+            ]),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -325,6 +348,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// A local-only signing secret for these tests.
     const SECRET: &str = "services-cotrn02c-test-secret";
 
@@ -340,36 +372,38 @@ mod tests {
     }
 
     // audit: COTRN02C-007
-    #[tokio::test]
-    async fn an_unserved_key_is_answered_before_the_store_is_touched() -> TestResult {
-        let guard = start_postgres().await?;
-        // A closed pool fails every statement, so a request that read or wrote anything shows it.
-        guard.pool().close().await;
-        let state = AppState::new(
-            PgStore::new(guard.pool().clone()),
-            JwtKeys::new(SECRET, 3600),
-            Arc::new(SystemClock),
-            PathBuf::from("var/jobs"),
-        );
-        let user = SignedOnUser {
-            user_id: PicX::from_text("USER0001")?,
-            user_type: UserType::USER,
-        };
+    #[test]
+    fn an_unserved_key_is_answered_before_the_store_is_touched() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            // A closed pool fails every statement, so a request that read or wrote anything shows it.
+            guard.pool().close().await;
+            let state = AppState::new(
+                PgStore::new(guard.pool().clone()),
+                JwtKeys::new(SECRET, 3600),
+                Arc::new(SystemClock),
+                PathBuf::from("var/jobs"),
+            );
+            let user = SignedOnUser {
+                user_id: PicX::from_text("USER0001")?,
+                user_type: UserType::USER,
+            };
 
-        // A served key reaches the store: ENTER's account read fails on the closed pool.
-        match add(&state, &user, request(Aid::Enter)).await {
-            Err(ServiceError::Rule(failure)) => assert_eq!(
-                (failure.message(), failure.class().http_status()),
-                ("Unable to lookup Acct in XREF AIX file...", 500)
-            ),
-            other => return Err(format!("ENTER on a closed pool gave {other:?}").into()),
-        }
+            // A served key reaches the store: ENTER's account read fails on the closed pool.
+            match add(&state, &user, request(Aid::Enter)).await {
+                Err(ServiceError::Rule(failure)) => assert_eq!(
+                    (failure.message(), failure.class().http_status()),
+                    ("Unable to lookup Acct in XREF AIX file...", 500)
+                ),
+                other => return Err(format!("ENTER on a closed pool gave {other:?}").into()),
+            }
 
-        let refused = add(&state, &user, request(Aid::Unserved)).await;
-        assert_eq!(
-            refused.err(),
-            Some(ServiceError::Rule(AddFailure::invalid_key()))
-        );
-        Ok(())
+            let refused = add(&state, &user, request(Aid::Unserved)).await;
+            assert_eq!(
+                refused.err(),
+                Some(ServiceError::Rule(AddFailure::invalid_key()))
+            );
+            Ok(())
+        })
     }
 }

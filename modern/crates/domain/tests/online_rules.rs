@@ -6257,6 +6257,9 @@ mod cotrtlic {
             if query.direction() == ReadDirection::Backward {
                 rows.reverse();
             }
+            // TRUNCATION: `PageSize::limit` gives 1 to 8 (a page of 1 to 7 rows, plus the forward
+            // lookahead row), so the limit converts into `usize` exactly; the fallback of 0,
+            // reading nothing, is never taken.
             rows.truncate(usize::try_from(query.limit()).unwrap_or(0));
             rows
         }
@@ -6327,6 +6330,9 @@ mod cotrtlic {
                         .iter()
                         .filter(|row| Table::matches(row, step.query()))
                         .count();
+                    // TRUNCATION: the table holds at most 255 rows (`Table::numbered` takes a
+                    // `u8`, the seed has 7, and a commit never adds a row), so the count converts
+                    // into `i64` exactly; the saturating fallback is never taken.
                     step.finish(Ok(i64::try_from(count).unwrap_or(i64::MAX)))
                 }
                 Progress::Verify(step) => {

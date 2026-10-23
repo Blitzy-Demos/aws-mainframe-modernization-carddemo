@@ -49,12 +49,16 @@
 //! constructs either. The union is `anyOf`, not `oneOf`, because a page with its message also
 //! satisfies [`ScreenError`]'s schema, which requires only a string `message`.
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use domain::copybook::PicX;
 use domain::online::cotrtlic as rules;
-use serde::de::Error as _;
+use serde::de::{self, EnumAccess, Error as _, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::openapi::RefOr;
 use utoipa::openapi::schema::{AnyOfBuilder, Ref, Schema};
@@ -83,9 +87,8 @@ const PAGE_KEY_CODE: &str = "page_key";
 /// (COTRTLIC-036).
 // The schema name `CotrtlicAid` keeps it apart from COTRTUPC's own `Aid` (Generated API Types
 // Only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[schema(as = CotrtlicAid)]
-#[serde(rename_all = "UPPERCASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(as = CotrtlicAid, rename_all = "UPPERCASE")]
 pub enum Aid {
     /// `ENTER`: edit the request, then refresh the page or prompt for the confirmation.
     Enter,
@@ -104,8 +107,8 @@ impl From<Aid> for rules::ListAid {
 
 /// The pending flags of the state, `WS-CA-DELETE-FLAG` and `WS-CA-UPDATE-FLAG`, which can be
 /// set together (COTRTLIC-043).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum TranTypeListPendingAction {
     /// `none`: neither flag is set.
     None,
@@ -141,8 +144,8 @@ impl From<TranTypeListPendingAction> for rules::PendingAction {
 }
 
 /// Whether the previous response left the selectors enterable (COTRTLIC-018).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum TranTypeListSelectors {
     /// `open`: enterable at every row that holds a type.
     Open,
@@ -172,7 +175,7 @@ impl From<TranTypeListSelectors> for rules::SelectorAccess {
 /// One row of the state: a type code and its description, either as the last read returned
 /// them (`WS-CA-EACH-ROW-OUT`, the description as stored) or as the previous response showed
 /// them (`TRTTYPn`, `TRTYPDn`, without trailing spaces).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 #[schema(example = json!({"type_code": "01", "description": "PURCHASE"}))]
 pub struct TranTypeListRow {
     /// The two-character type code, `WS-CA-ROW-TR-CODE-OUT PIC X(02)`; empty for a blank code.
@@ -199,7 +202,7 @@ impl<'a> From<&'a TranTypeListRow> for rules::RowParts<'a> {
 /// The server returns it with every response of endpoints 24 and 25, and the screen sends it
 /// back unchanged with every ENTER and F10. It carries no authority: the domain rebuilds it
 /// through its total constructor, re-runs every edit and re-reads the row of every commit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 pub struct TranTypeListState {
     /// `WS-CA-TYPE-CD PIC X(02)`: the type filter of the displayed page, as typed.
     #[validate(length(max = 2))]
@@ -211,7 +214,6 @@ pub struct TranTypeListState {
     pub desc_filter: String,
     /// The seven rows as the last read returned them, top to bottom; `null` is a position the
     /// read left empty (COTRTLIC-004, COTRTLIC-012).
-    #[serde(deserialize_with = "super::objects_or_null")]
     #[validate(length(max = 7), custom(function = "rows_fit"))]
     #[schema(max_items = 7)]
     pub rows: Vec<Option<TranTypeListRow>>,
@@ -244,7 +246,6 @@ pub struct TranTypeListState {
     /// The seven rows the previous response showed, top to bottom; `null` is a position it
     /// left empty. The 3270 returns these protected fields as displayed (COTRTLIC-017,
     /// COTRTLIC-018).
-    #[serde(deserialize_with = "super::objects_or_null")]
     #[validate(length(max = 7), custom(function = "rows_fit"))]
     #[schema(max_items = 7)]
     pub screen_rows: Vec<Option<TranTypeListRow>>,
@@ -383,9 +384,7 @@ fn row_number(index: rules::RowIndex) -> i64 {
 /// with the filter edits run on `type_filter` and `desc_filter` as on ENTER, so a changed filter
 /// moves to page 1 of it (COTRTLIC-007 to COTRTLIC-013, X-COTRTLIC-6). Without either it is the
 /// screen load, a first entry that ignores every other member (COTRTLIC-002).
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoParams, Validate,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct TranTypeListQuery {
     /// The type filter on the screen when F7 or F8 is pressed, `TRTYPEI PIC X(2)`, as typed:
@@ -409,7 +408,6 @@ pub struct TranTypeListQuery {
     /// Rows per page, 1 to 100, 7 when absent; a page never holds more than the seven
     /// positions of the map. Outside 1 to 100 the request is rejected with 422 (Bounded
     /// Pagination).
-    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[param(minimum = 1, maximum = 100)]
     #[schema(minimum = 1, maximum = 100)]
@@ -497,7 +495,7 @@ fn nibble(digit: u8) -> Option<u8> {
 
 /// One row of a response as `2200-SETUP-ARRAY-ATTRIBS` and `2300-SCREEN-ARRAY-INIT` show it
 /// (COTRTLIC-056).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct TranTypeListShownRow {
     /// The type code, `TRTTYPO`.
     pub type_code: String,
@@ -536,8 +534,8 @@ impl From<&rules::ShownRow> for TranTypeListShownRow {
 
 /// Whether a filter of the response adds a predicate, and whether it is in error, red with the
 /// focus (COTRTLIC-028, COTRTLIC-031, COTRTLIC-057).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum TranTypeListFilterStatus {
     /// `blank`: no predicate; a type filter `00` is blank (COTRTLIC-027).
     Blank,
@@ -559,7 +557,7 @@ impl From<rules::FilterStatus> for TranTypeListFilterStatus {
 }
 
 /// A filter as `2400-SETUP-SCREEN-ATTRS` shows it (COTRTLIC-057).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct TranTypeListShownFilter {
     /// The text shown, without trailing spaces: as received while a selection is non-blank or
     /// the filter is valid or in error, empty otherwise and on the screen load.
@@ -578,8 +576,8 @@ impl From<&rules::ShownFilter> for TranTypeListShownFilter {
 }
 
 /// What an endpoint 25 request committed (`FLG-UPDATE-COMPLETED`, `FLG-DELETED-YES`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum TranTypeListCommitted {
     /// `nothing`.
     Nothing,
@@ -603,7 +601,7 @@ impl From<rules::Committed> for TranTypeListCommitted {
 ///
 /// Answer with the value itself: its `IntoResponse` sends the audited status of the outcome,
 /// 200, 400 for a filter in error or 500 for a store failure, with this body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct TranTypeListResponse {
     /// The seven positions of the page, top to bottom; `null` is an empty position.
     #[schema(max_items = 7)]
@@ -627,7 +625,6 @@ pub struct TranTypeListResponse {
     /// The state as the opaque key the screen echoes with F7 and F8.
     pub page_key: String,
     /// The audited status, which travels as the response status and is no part of the body.
-    #[serde(skip, default = "status_not_carried")]
     #[schema(ignore)]
     status: StatusCode,
 }
@@ -671,19 +668,17 @@ impl IntoResponse for TranTypeListResponse {
 ///
 /// The type code is no input: the 3270 returns the protected code field as displayed, so the
 /// codes are the state's (COTRTLIC-017).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, ToSchema, Validate)]
 pub struct TranTypeListRowInput {
     /// `TRTSELn PIC X(1)`: `U` update, `D` delete, blank for none. Codes are case-sensitive,
     /// and any other value is the domain's invalid action code (COTRTLIC-021).
-    #[serde(default)]
     #[validate(length(max = 1))]
-    #[schema(max_length = 1)]
+    #[schema(max_length = 1, required = false)]
     pub selection: String,
     /// `TRTYPDn PIC X(50)`: read only at the row the previous response left enterable
     /// (COTRTLIC-018).
-    #[serde(default)]
     #[validate(length(max = 50))]
-    #[schema(max_length = 50)]
+    #[schema(max_length = 50, required = false)]
     pub description: String,
 }
 
@@ -697,37 +692,32 @@ impl<'a> From<&'a TranTypeListRowInput> for rules::RowInput<'a> {
 }
 
 /// The body of endpoint 25: the key, the map input and the echoed state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 pub struct TranTypeListActionRequest {
     /// `ENTER` or `PF10`.
     pub aid: Aid,
     /// `TRTYPEI PIC X(2)`, as typed: the domain's type-filter edit owns its message
     /// (COTRTLIC-027, COTRTLIC-028).
-    #[serde(default)]
     #[validate(length(max = 2))]
-    #[schema(max_length = 2)]
+    #[schema(max_length = 2, required = false)]
     pub type_filter: String,
     /// `TRDESCI PIC X(50)`, as typed (COTRTLIC-030).
-    #[serde(default)]
     #[validate(length(max = 50))]
-    #[schema(max_length = 50)]
+    #[schema(max_length = 50, required = false)]
     pub desc_filter: String,
     /// The seven rows, top to bottom; missing rows are blank. More than seven do not
     /// deserialise, since the map has no field for them.
     // The seven-row bound is a deserialisation rule rather than a `length` rule because
     // `validator` panics when a `length` and a `nested` rule on one field both fail.
-    #[serde(default, deserialize_with = "at_most_seven")]
     #[validate(nested)]
-    #[schema(max_items = 7)]
+    #[schema(max_items = 7, required = false)]
     pub rows: Vec<TranTypeListRowInput>,
     /// The `state` of the previous response, echoed unchanged.
-    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub state: TranTypeListState,
     /// Rows per page, 1 to 100, 7 when absent; a page never holds more than the seven
     /// positions of the map. Outside 1 to 100 the request is rejected with 422 (Bounded
     /// Pagination).
-    #[serde(default, deserialize_with = "super::page_size_from_json")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     pub page_size: Option<i64>,
@@ -749,7 +739,7 @@ where
 
 /// A field of one row that the response flags in error, red with the focus (COTRTLIC-021,
 /// COTRTLIC-022, COTRTLIC-025, COTRTLIC-026).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({"row": 3, "field": "selection", "message": "Action code selected is invalid"}))]
 pub struct TranTypeListRowError {
     /// The screen row, 1 to 7.
@@ -767,7 +757,7 @@ pub struct TranTypeListRowError {
 ///
 /// Answer with the value itself: its `IntoResponse` sends the audited status of the outcome,
 /// 200, 400, 404 or 500 (COTRTLIC.md, "Reading the table"), with this body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct TranTypeListActionResult {
     /// The seven positions shown, top to bottom; `null` is an empty position.
     #[schema(max_items = 7)]
@@ -796,7 +786,6 @@ pub struct TranTypeListActionResult {
     /// The new state as the opaque key the screen echoes with F7 and F8.
     pub page_key: String,
     /// The audited status, which travels as the response status and is no part of the body.
-    #[serde(skip, default = "status_not_carried")]
     #[schema(ignore)]
     status: StatusCode,
 }
@@ -957,9 +946,880 @@ const fn status_not_carried() -> StatusCode {
     StatusCode::OK
 }
 
+// Wire forms, written by hand: serde_derive wraps every implementation it generates in a block
+// carrying `allow` lint suppressions, and no source of this workspace, generated or written,
+// carries one. Each keeps the form the derive gave, so a `page_key` issued before reads
+// as the same state. A struct is a map of its members under their Rust names, in declaration
+// order, an absent `Option` written as `null` and a response's `status` never written; it reads
+// its members in any order, refuses one sent twice or a required one missing, takes `None` for
+// an absent `Option` and the default for an absent request text or row list, and skips an
+// unknown member unread as `IgnoredAny`, which is how `api::dto` reads past a number its parser
+// cannot represent. A member whose schema is an object, a list of objects or `page_size` reads
+// through the parent module's reader for it. A unit variant is its wire name.
+
+/// A state's `rows` or `screen_rows`: positions, each an object or `null`, as
+/// `super::objects_or_null` reads them.
+struct Positions(Vec<Option<TranTypeListRow>>);
+
+impl<'de> Deserialize<'de> for Positions {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::objects_or_null(deserializer).map(Self)
+    }
+}
+
+/// An endpoint 25 body's `rows`, as [`at_most_seven`] reads them.
+struct RowInputs(Vec<TranTypeListRowInput>);
+
+impl<'de> Deserialize<'de> for RowInputs {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        at_most_seven(deserializer).map(Self)
+    }
+}
+
+/// An endpoint 25 body's `state`, a JSON object as `super::object` reads it.
+struct EchoedState(TranTypeListState);
+
+impl<'de> Deserialize<'de> for EchoedState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::object(deserializer).map(Self)
+    }
+}
+
+/// The query string's `page_size`, as `super::page_size_from_query` reads it.
+struct QueryPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for QueryPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_query(deserializer).map(Self)
+    }
+}
+
+/// An endpoint 25 body's `page_size`, as `super::page_size_from_json` reads it.
+struct BodyPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for BodyPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_json(deserializer).map(Self)
+    }
+}
+
+impl Serialize for Aid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Enter => (0, "ENTER"),
+            Self::Pf10 => (1, "PF10"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for Aid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for Aid {
+    const NAME: &'static str = "Aid";
+    const VARIANTS: &'static [&'static str] = &["ENTER", "PF10"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "ENTER" => Some(Self::Enter),
+            "PF10" => Some(Self::Pf10),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TranTypeListPendingAction {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::None => (0, "none"),
+            Self::Update => (1, "update"),
+            Self::Delete => (2, "delete"),
+            Self::UpdateAndDelete => (3, "update_and_delete"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListPendingAction {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for TranTypeListPendingAction {
+    const NAME: &'static str = "TranTypeListPendingAction";
+    const VARIANTS: &'static [&'static str] = &["none", "update", "delete", "update_and_delete"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "none" => Some(Self::None),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            "update_and_delete" => Some(Self::UpdateAndDelete),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TranTypeListSelectors {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Open => (0, "open"),
+            Self::Protected => (1, "protected"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListSelectors {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for TranTypeListSelectors {
+    const NAME: &'static str = "TranTypeListSelectors";
+    const VARIANTS: &'static [&'static str] = &["open", "protected"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "open" => Some(Self::Open),
+            "protected" => Some(Self::Protected),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TranTypeListFilterStatus {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Blank => (0, "blank"),
+            Self::Valid => (1, "valid"),
+            Self::InError => (2, "in_error"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListFilterStatus {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for TranTypeListFilterStatus {
+    const NAME: &'static str = "TranTypeListFilterStatus";
+    const VARIANTS: &'static [&'static str] = &["blank", "valid", "in_error"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "blank" => Some(Self::Blank),
+            "valid" => Some(Self::Valid),
+            "in_error" => Some(Self::InError),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TranTypeListCommitted {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Nothing => (0, "nothing"),
+            Self::Updated => (1, "updated"),
+            Self::Deleted => (2, "deleted"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListCommitted {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for TranTypeListCommitted {
+    const NAME: &'static str = "TranTypeListCommitted";
+    const VARIANTS: &'static [&'static str] = &["nothing", "updated", "deleted"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        match name {
+            "nothing" => Some(Self::Nothing),
+            "updated" => Some(Self::Updated),
+            "deleted" => Some(Self::Deleted),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for TranTypeListRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 2)?;
+        out.serialize_field("type_code", &self.type_code)?;
+        out.serialize_field("description", &self.description)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListRow {
+    const NAME: &'static str = "TranTypeListRow";
+    const FIELDS: &'static [&'static str] = &["type_code", "description"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_code, mut description) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_code" => member(&mut map, &mut type_code, "type_code")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_code: required(type_code, "type_code")?,
+            description: required(description, "description")?,
+        })
+    }
+}
+
+impl Serialize for TranTypeListState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 13)?;
+        out.serialize_field("type_filter", &self.type_filter)?;
+        out.serialize_field("desc_filter", &self.desc_filter)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("selected_row", &self.selected_row)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("next_page_exists", &self.next_page_exists)?;
+        out.serialize_field("last_page_shown", &self.last_page_shown)?;
+        out.serialize_field("pending_action", &self.pending_action)?;
+        out.serialize_field("screen_rows", &self.screen_rows)?;
+        out.serialize_field("selectors", &self.selectors)?;
+        out.serialize_field("description_entry", &self.description_entry)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListState {
+    const NAME: &'static str = "TranTypeListState";
+    const FIELDS: &'static [&'static str] = &[
+        "type_filter",
+        "desc_filter",
+        "rows",
+        "selected_row",
+        "first_key",
+        "last_key",
+        "page_no",
+        "next_page_exists",
+        "last_page_shown",
+        "pending_action",
+        "screen_rows",
+        "selectors",
+        "description_entry",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_filter, mut desc_filter, mut rows) = (None, None, None);
+        let (mut selected_row, mut first_key, mut last_key) = (None, None, None);
+        let (mut page_no, mut next_page_exists, mut last_page_shown) = (None, None, None);
+        let (mut pending_action, mut screen_rows) = (None, None);
+        let (mut selectors, mut description_entry) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_filter" => member(&mut map, &mut type_filter, "type_filter")?,
+                "desc_filter" => member(&mut map, &mut desc_filter, "desc_filter")?,
+                "rows" => member::<_, Positions>(&mut map, &mut rows, "rows")?,
+                "selected_row" => member(&mut map, &mut selected_row, "selected_row")?,
+                "first_key" => member(&mut map, &mut first_key, "first_key")?,
+                "last_key" => member(&mut map, &mut last_key, "last_key")?,
+                "page_no" => member(&mut map, &mut page_no, "page_no")?,
+                "next_page_exists" => {
+                    member(&mut map, &mut next_page_exists, "next_page_exists")?;
+                }
+                "last_page_shown" => member(&mut map, &mut last_page_shown, "last_page_shown")?,
+                "pending_action" => member(&mut map, &mut pending_action, "pending_action")?,
+                "screen_rows" => {
+                    member::<_, Positions>(&mut map, &mut screen_rows, "screen_rows")?;
+                }
+                "selectors" => member(&mut map, &mut selectors, "selectors")?,
+                "description_entry" => {
+                    member(&mut map, &mut description_entry, "description_entry")?;
+                }
+                _ => skip(&mut map)?,
+            }
+        }
+        let Positions(rows) = required(rows, "rows")?;
+        let Positions(screen_rows) = required(screen_rows, "screen_rows")?;
+        Ok(Self {
+            type_filter: required(type_filter, "type_filter")?,
+            desc_filter: required(desc_filter, "desc_filter")?,
+            rows,
+            selected_row: selected_row.unwrap_or_default(),
+            first_key: first_key.unwrap_or_default(),
+            last_key: last_key.unwrap_or_default(),
+            page_no: required(page_no, "page_no")?,
+            next_page_exists: required(next_page_exists, "next_page_exists")?,
+            last_page_shown: required(last_page_shown, "last_page_shown")?,
+            pending_action: required(pending_action, "pending_action")?,
+            screen_rows,
+            selectors: required(selectors, "selectors")?,
+            description_entry: description_entry.unwrap_or_default(),
+        })
+    }
+}
+
+impl Serialize for TranTypeListQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 5)?;
+        out.serialize_field("type_filter", &self.type_filter)?;
+        out.serialize_field("desc_filter", &self.desc_filter)?;
+        out.serialize_field("page_key", &self.page_key)?;
+        out.serialize_field("direction", &self.direction)?;
+        out.serialize_field("page_size", &self.page_size)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListQuery {
+    const NAME: &'static str = "TranTypeListQuery";
+    const FIELDS: &'static [&'static str] = &[
+        "type_filter",
+        "desc_filter",
+        "page_key",
+        "direction",
+        "page_size",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_filter, mut desc_filter, mut page_key) = (None, None, None);
+        let (mut direction, mut page_size) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_filter" => member(&mut map, &mut type_filter, "type_filter")?,
+                "desc_filter" => member(&mut map, &mut desc_filter, "desc_filter")?,
+                "page_key" => member(&mut map, &mut page_key, "page_key")?,
+                "direction" => member(&mut map, &mut direction, "direction")?,
+                "page_size" => member::<_, QueryPageSize>(&mut map, &mut page_size, "page_size")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_filter: type_filter.unwrap_or_default(),
+            desc_filter: desc_filter.unwrap_or_default(),
+            page_key: page_key.unwrap_or_default(),
+            direction: direction.unwrap_or_default(),
+            page_size: page_size.and_then(|QueryPageSize(size)| size),
+        })
+    }
+}
+
+impl Serialize for TranTypeListShownRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 6)?;
+        out.serialize_field("type_code", &self.type_code)?;
+        out.serialize_field("description", &self.description)?;
+        out.serialize_field("selection", &self.selection)?;
+        out.serialize_field("highlighted", &self.highlighted)?;
+        out.serialize_field("selector_enterable", &self.selector_enterable)?;
+        out.serialize_field("description_enterable", &self.description_enterable)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListShownRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListShownRow {
+    const NAME: &'static str = "TranTypeListShownRow";
+    const FIELDS: &'static [&'static str] = &[
+        "type_code",
+        "description",
+        "selection",
+        "highlighted",
+        "selector_enterable",
+        "description_enterable",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_code, mut description, mut selection) = (None, None, None);
+        let (mut highlighted, mut selector_enterable, mut description_enterable) =
+            (None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_code" => member(&mut map, &mut type_code, "type_code")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                "selection" => member(&mut map, &mut selection, "selection")?,
+                "highlighted" => member(&mut map, &mut highlighted, "highlighted")?,
+                "selector_enterable" => {
+                    member(&mut map, &mut selector_enterable, "selector_enterable")?;
+                }
+                "description_enterable" => {
+                    member(
+                        &mut map,
+                        &mut description_enterable,
+                        "description_enterable",
+                    )?;
+                }
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_code: required(type_code, "type_code")?,
+            description: required(description, "description")?,
+            selection: required(selection, "selection")?,
+            highlighted: required(highlighted, "highlighted")?,
+            selector_enterable: required(selector_enterable, "selector_enterable")?,
+            description_enterable: required(description_enterable, "description_enterable")?,
+        })
+    }
+}
+
+impl Serialize for TranTypeListShownFilter {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 2)?;
+        out.serialize_field("text", &self.text)?;
+        out.serialize_field("status", &self.status)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListShownFilter {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListShownFilter {
+    const NAME: &'static str = "TranTypeListShownFilter";
+    const FIELDS: &'static [&'static str] = &["text", "status"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut text, mut status) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "text" => member(&mut map, &mut text, "text")?,
+                "status" => member(&mut map, &mut status, "status")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            text: required(text, "text")?,
+            status: required(status, "status")?,
+        })
+    }
+}
+
+impl Serialize for TranTypeListResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 9)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("type_filter", &self.type_filter)?;
+        out.serialize_field("desc_filter", &self.desc_filter)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.serialize_field("state", &self.state)?;
+        out.serialize_field("page_key", &self.page_key)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListResponse {
+    const NAME: &'static str = "TranTypeListResponse";
+    const FIELDS: &'static [&'static str] = &[
+        "rows",
+        "type_filter",
+        "desc_filter",
+        "page_no",
+        "has_next_page",
+        "message",
+        "info_message",
+        "state",
+        "page_key",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut rows, mut type_filter, mut desc_filter) = (None, None, None);
+        let (mut page_no, mut has_next_page, mut message) = (None, None, None);
+        let (mut info_message, mut state, mut page_key) = (None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "rows" => member(&mut map, &mut rows, "rows")?,
+                "type_filter" => member(&mut map, &mut type_filter, "type_filter")?,
+                "desc_filter" => member(&mut map, &mut desc_filter, "desc_filter")?,
+                "page_no" => member(&mut map, &mut page_no, "page_no")?,
+                "has_next_page" => member(&mut map, &mut has_next_page, "has_next_page")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                "info_message" => member(&mut map, &mut info_message, "info_message")?,
+                "state" => member(&mut map, &mut state, "state")?,
+                "page_key" => member(&mut map, &mut page_key, "page_key")?,
+                // `status` among them: no member of the body.
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            rows: required(rows, "rows")?,
+            type_filter: required(type_filter, "type_filter")?,
+            desc_filter: required(desc_filter, "desc_filter")?,
+            page_no: required(page_no, "page_no")?,
+            has_next_page: required(has_next_page, "has_next_page")?,
+            message: message.unwrap_or_default(),
+            info_message: info_message.unwrap_or_default(),
+            state: required(state, "state")?,
+            page_key: required(page_key, "page_key")?,
+            status: status_not_carried(),
+        })
+    }
+}
+
+impl Serialize for TranTypeListRowInput {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 2)?;
+        out.serialize_field("selection", &self.selection)?;
+        out.serialize_field("description", &self.description)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListRowInput {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListRowInput {
+    const NAME: &'static str = "TranTypeListRowInput";
+    const FIELDS: &'static [&'static str] = &["selection", "description"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut selection, mut description) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "selection" => member(&mut map, &mut selection, "selection")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            selection: selection.unwrap_or_default(),
+            description: description.unwrap_or_default(),
+        })
+    }
+}
+
+impl Serialize for TranTypeListActionRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 6)?;
+        out.serialize_field("aid", &self.aid)?;
+        out.serialize_field("type_filter", &self.type_filter)?;
+        out.serialize_field("desc_filter", &self.desc_filter)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("state", &self.state)?;
+        out.serialize_field("page_size", &self.page_size)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListActionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListActionRequest {
+    const NAME: &'static str = "TranTypeListActionRequest";
+    const FIELDS: &'static [&'static str] = &[
+        "aid",
+        "type_filter",
+        "desc_filter",
+        "rows",
+        "state",
+        "page_size",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut aid, mut type_filter, mut desc_filter) = (None, None, None);
+        let (mut rows, mut state, mut page_size) = (None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "aid" => member(&mut map, &mut aid, "aid")?,
+                "type_filter" => member(&mut map, &mut type_filter, "type_filter")?,
+                "desc_filter" => member(&mut map, &mut desc_filter, "desc_filter")?,
+                "rows" => member::<_, RowInputs>(&mut map, &mut rows, "rows")?,
+                "state" => member::<_, EchoedState>(&mut map, &mut state, "state")?,
+                "page_size" => member::<_, BodyPageSize>(&mut map, &mut page_size, "page_size")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        let EchoedState(state) = required(state, "state")?;
+        Ok(Self {
+            aid: required(aid, "aid")?,
+            type_filter: type_filter.unwrap_or_default(),
+            desc_filter: desc_filter.unwrap_or_default(),
+            rows: rows.map(|RowInputs(rows)| rows).unwrap_or_default(),
+            state,
+            page_size: page_size.and_then(|BodyPageSize(size)| size),
+        })
+    }
+}
+
+impl Serialize for TranTypeListRowError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 3)?;
+        out.serialize_field("row", &self.row)?;
+        out.serialize_field("field", &self.field)?;
+        out.serialize_field("message", &self.message)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListRowError {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListRowError {
+    const NAME: &'static str = "TranTypeListRowError";
+    const FIELDS: &'static [&'static str] = &["row", "field", "message"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut row, mut field, mut message) = (None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "row" => member(&mut map, &mut row, "row")?,
+                "field" => member(&mut map, &mut field, "field")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            row: required(row, "row")?,
+            field: required(field, "field")?,
+            message: required(message, "message")?,
+        })
+    }
+}
+
+impl Serialize for TranTypeListActionResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 11)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("row_errors", &self.row_errors)?;
+        out.serialize_field("type_filter", &self.type_filter)?;
+        out.serialize_field("desc_filter", &self.desc_filter)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.serialize_field("committed", &self.committed)?;
+        out.serialize_field("state", &self.state)?;
+        out.serialize_field("page_key", &self.page_key)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeListActionResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeListActionResult {
+    const NAME: &'static str = "TranTypeListActionResult";
+    const FIELDS: &'static [&'static str] = &[
+        "rows",
+        "row_errors",
+        "type_filter",
+        "desc_filter",
+        "page_no",
+        "has_next_page",
+        "message",
+        "info_message",
+        "committed",
+        "state",
+        "page_key",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut rows, mut row_errors, mut type_filter) = (None, None, None);
+        let (mut desc_filter, mut page_no, mut has_next_page) = (None, None, None);
+        let (mut message, mut info_message, mut committed) = (None, None, None);
+        let (mut state, mut page_key) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "rows" => member(&mut map, &mut rows, "rows")?,
+                "row_errors" => member(&mut map, &mut row_errors, "row_errors")?,
+                "type_filter" => member(&mut map, &mut type_filter, "type_filter")?,
+                "desc_filter" => member(&mut map, &mut desc_filter, "desc_filter")?,
+                "page_no" => member(&mut map, &mut page_no, "page_no")?,
+                "has_next_page" => member(&mut map, &mut has_next_page, "has_next_page")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                "info_message" => member(&mut map, &mut info_message, "info_message")?,
+                "committed" => member(&mut map, &mut committed, "committed")?,
+                "state" => member(&mut map, &mut state, "state")?,
+                "page_key" => member(&mut map, &mut page_key, "page_key")?,
+                // `status` among them: no member of the body.
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            rows: required(rows, "rows")?,
+            row_errors: required(row_errors, "row_errors")?,
+            type_filter: required(type_filter, "type_filter")?,
+            desc_filter: required(desc_filter, "desc_filter")?,
+            page_no: required(page_no, "page_no")?,
+            has_next_page: required(has_next_page, "has_next_page")?,
+            message: message.unwrap_or_default(),
+            info_message: info_message.unwrap_or_default(),
+            committed: required(committed, "committed")?,
+            state: required(state, "state")?,
+            page_key: required(page_key, "page_key")?,
+            status: status_not_carried(),
+        })
+    }
+}
+
+/// A struct of this module read from the members of a map.
+trait FromMembers<'de>: Sized {
+    /// The Rust name, which a format may record.
+    const NAME: &'static str;
+    /// The members' wire names, in declaration order.
+    const FIELDS: &'static [&'static str];
+
+    /// The struct from `map`'s members.
+    ///
+    /// # Errors
+    ///
+    /// A member sent twice, a required member missing, or a value that does not deserialise.
+    fn from_members<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error>;
+}
+
+/// `T` read from `deserializer` as a struct: a map, through [`MembersVisitor`].
+fn read_struct<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromMembers<'de>,
+{
+    deserializer.deserialize_struct(T::NAME, T::FIELDS, MembersVisitor(PhantomData))
+}
+
+/// The visitor of [`read_struct`]: it accepts a map alone and hands its members to `T`.
+struct MembersVisitor<T>(PhantomData<T>);
+
+impl<'de, T: FromMembers<'de>> Visitor<'de> for MembersVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "struct {}", T::NAME)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        T::from_members(map)
+    }
+}
+
+/// Reads the value of the member `name` into `slot`. A second occurrence is the duplicate-field
+/// error, raised before its value is read.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(A::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// Skips the value of a member no struct of this module names, unread.
+fn skip<'de, A: MapAccess<'de>>(map: &mut A) -> Result<(), A::Error> {
+    map.next_value::<IgnoredAny>().map(|IgnoredAny| ())
+}
+
+/// The value read for the required member `name`, or the missing-field error.
+fn required<T, E: de::Error>(slot: Option<T>, name: &'static str) -> Result<T, E> {
+    slot.ok_or_else(|| E::missing_field(name))
+}
+
+/// A unit enum of this module and its wire names.
+trait UnitEnum: Sized {
+    /// The Rust name, which a format may record.
+    const NAME: &'static str;
+    /// The wire names, in declaration order.
+    const VARIANTS: &'static [&'static str];
+
+    /// The variant the wire name `name` reads as; `None` for a name the enum refuses.
+    fn from_wire(name: &str) -> Option<Self>;
+}
+
+/// `T` read from `deserializer` as a unit variant, through [`VariantVisitor`].
+fn read_unit_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: UnitEnum,
+{
+    deserializer.deserialize_enum(T::NAME, T::VARIANTS, VariantVisitor(PhantomData))
+}
+
+/// The visitor of [`read_unit_enum`]: a variant name `T` admits, carrying no value. A name it
+/// refuses is the unknown-variant error.
+struct VariantVisitor<T>(PhantomData<T>);
+
+impl<'de, T: UnitEnum> Visitor<'de> for VariantVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "enum {}", T::NAME)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
+        let (name, variant) = data.variant::<String>()?;
+        let value =
+            T::from_wire(&name).ok_or_else(|| A::Error::unknown_variant(&name, T::VARIANTS))?;
+        variant.unit_variant()?;
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
+    use std::fmt::Debug;
 
     use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
@@ -967,15 +1827,19 @@ mod tests {
     use domain::copybook::PicX;
     use domain::online::cotrtlic as rules;
     use domain::records::db2_transaction_type::Db2TransactionType;
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
+    use serde_json::json;
     use utoipa::openapi::path::ParameterIn;
-    use utoipa::{IntoParams, ToSchema};
+    use utoipa::{IntoParams, PartialSchema, ToSchema};
     use validator::Validate;
 
     use super::{
         Aid, TranTypeListActionRequest, TranTypeListActionResult, TranTypeListCommitted,
         TranTypeListFilterStatus, TranTypeListPendingAction, TranTypeListQuery,
         TranTypeListResponse, TranTypeListRow, TranTypeListRowError, TranTypeListRowInput,
-        TranTypeListSelectors, TranTypeListState, hex, unhex,
+        TranTypeListSelectors, TranTypeListShownFilter, TranTypeListShownRow, TranTypeListState,
+        decode_page_key, hex, page_key, unhex,
     };
     use crate::dto::{PAGE_SIZE_FIELD, PageDirection, resolve_page_size, validation_error};
 
@@ -1728,6 +2592,297 @@ mod tests {
         let Query(query) = Query::<TranTypeListQuery>::try_from_uri(&too_long)?;
         let errors = query.validate().err().ok_or("over-long filter accepted")?;
         assert_eq!(validation_error(&errors).field(), Some("type_filter"));
+        Ok(())
+    }
+
+    /// The state of [`STATE_WIRE`].
+    fn wire_state() -> TranTypeListState {
+        TranTypeListState {
+            type_filter: "A".to_owned(),
+            desc_filter: "  FUND".to_owned(),
+            rows: vec![
+                None,
+                Some(TranTypeListRow {
+                    type_code: "05".to_owned(),
+                    description: "REFUND".to_owned(),
+                }),
+            ],
+            selected_row: Some(2),
+            first_key: Some("05".to_owned()),
+            last_key: None,
+            page_no: 0,
+            next_page_exists: false,
+            last_page_shown: true,
+            pending_action: TranTypeListPendingAction::UpdateAndDelete,
+            screen_rows: vec![None],
+            selectors: TranTypeListSelectors::Protected,
+            description_entry: Some(2),
+        }
+    }
+
+    /// The JSON of [`wire_state`]: every member in declaration order, an absent value `null`.
+    const STATE_WIRE: &str = r#"{"type_filter":"A","desc_filter":"  FUND","rows":[null,{"type_code":"05","description":"REFUND"}],"selected_row":2,"first_key":"05","last_key":null,"page_no":0,"next_page_exists":false,"last_page_shown":true,"pending_action":"update_and_delete","screen_rows":[null],"selectors":"protected","description_entry":2}"#;
+
+    /// Asserts `value` serialises to `wire` exactly and reads back from it as itself.
+    fn assert_wire<T>(value: &T, wire: &str) -> TestResult
+    where
+        T: Serialize + DeserializeOwned + PartialEq + Debug,
+    {
+        assert_eq!(serde_json::to_string(value)?, wire);
+        assert_eq!(&serde_json::from_str::<T>(wire)?, value, "{wire}");
+        Ok(())
+    }
+
+    /// Asserts each unit variant travels as its wire name, both ways, and that the schema's
+    /// `enum` lists exactly those names in declaration order.
+    fn assert_variants<T>(variants: &[(T, &str)]) -> TestResult
+    where
+        T: Serialize + DeserializeOwned + PartialEq + Debug + PartialSchema,
+    {
+        for (variant, name) in variants {
+            assert_wire(variant, &format!("\"{name}\""))?;
+        }
+        let names: Vec<&str> = variants.iter().map(|&(_, name)| name).collect();
+        assert_eq!(serde_json::to_value(T::schema())?["enum"], json!(names));
+        Ok(())
+    }
+
+    /// A reading case: whether a type reads the JSON text, the text, and the expected answer.
+    type ReadCase = (fn(&str) -> bool, String, bool);
+
+    /// Whether `json` deserialises into `T`.
+    fn reads<T: DeserializeOwned>(json: &str) -> bool {
+        serde_json::from_str::<T>(json).is_ok()
+    }
+
+    #[test]
+    fn every_unit_enum_travels_as_its_wire_names() -> TestResult {
+        assert_variants(&[(Aid::Enter, "ENTER"), (Aid::Pf10, "PF10")])?;
+        assert_variants(&[
+            (TranTypeListPendingAction::None, "none"),
+            (TranTypeListPendingAction::Update, "update"),
+            (TranTypeListPendingAction::Delete, "delete"),
+            (
+                TranTypeListPendingAction::UpdateAndDelete,
+                "update_and_delete",
+            ),
+        ])?;
+        assert_variants(&[
+            (TranTypeListSelectors::Open, "open"),
+            (TranTypeListSelectors::Protected, "protected"),
+        ])?;
+        assert_variants(&[
+            (TranTypeListFilterStatus::Blank, "blank"),
+            (TranTypeListFilterStatus::Valid, "valid"),
+            (TranTypeListFilterStatus::InError, "in_error"),
+        ])?;
+        assert_variants(&[
+            (TranTypeListCommitted::Nothing, "nothing"),
+            (TranTypeListCommitted::Updated, "updated"),
+            (TranTypeListCommitted::Deleted, "deleted"),
+        ])
+    }
+
+    #[test]
+    fn every_body_keeps_its_wire_form_byte_for_byte() -> TestResult {
+        let state = wire_state();
+        assert_wire(&state, STATE_WIRE)?;
+        // The page key is the hexadecimal of exactly that JSON, and reads back as the state.
+        assert_eq!(page_key(&state), hex(STATE_WIRE.as_bytes()));
+        assert_eq!(decode_page_key(&page_key(&state)), Some(state.clone()));
+
+        let row = r#"{"type_code":"05","description":"REFUND","selection":"U","highlighted":true,"selector_enterable":true,"description_enterable":true}"#;
+        let shown = TranTypeListShownRow {
+            type_code: "05".to_owned(),
+            description: "REFUND".to_owned(),
+            selection: "U".to_owned(),
+            highlighted: true,
+            selector_enterable: true,
+            description_enterable: true,
+        };
+        let filters = (
+            TranTypeListShownFilter {
+                text: "A".to_owned(),
+                status: TranTypeListFilterStatus::InError,
+            },
+            TranTypeListShownFilter {
+                text: String::new(),
+                status: TranTypeListFilterStatus::Blank,
+            },
+        );
+        let filters_wire = r#""type_filter":{"text":"A","status":"in_error"},"desc_filter":{"text":"","status":"blank"}"#;
+        // The status is no member: a body read back answers 200, so the round trip is at 200.
+        let mut page = TranTypeListResponse {
+            rows: vec![Some(shown.clone()), None],
+            type_filter: filters.0.clone(),
+            desc_filter: filters.1.clone(),
+            page_no: 0,
+            has_next_page: false,
+            message: Some("Tran Type code must be a number".to_owned()),
+            info_message: None,
+            state: state.clone(),
+            page_key: "7b7d".to_owned(),
+            status: StatusCode::OK,
+        };
+        let page_wire = format!(
+            r#"{{"rows":[{row},null],{filters_wire},"page_no":0,"has_next_page":false,"message":"Tran Type code must be a number","info_message":null,"state":{STATE_WIRE},"page_key":"7b7d"}}"#
+        );
+        assert_wire(&page, &page_wire)?;
+        page.status = StatusCode::BAD_REQUEST;
+        assert_eq!(serde_json::to_string(&page)?, page_wire);
+
+        let mut result = TranTypeListActionResult {
+            rows: vec![None, Some(shown)],
+            row_errors: vec![TranTypeListRowError {
+                row: 2,
+                field: "selection".to_owned(),
+                message: "Action code selected is invalid".to_owned(),
+            }],
+            type_filter: filters.0,
+            desc_filter: filters.1,
+            page_no: 3,
+            has_next_page: true,
+            message: None,
+            info_message: Some("HIGHLIGHTED row was updated".to_owned()),
+            committed: TranTypeListCommitted::Updated,
+            state: state.clone(),
+            page_key: String::new(),
+            status: StatusCode::OK,
+        };
+        let result_wire = format!(
+            r#"{{"rows":[null,{row}],"row_errors":[{{"row":2,"field":"selection","message":"Action code selected is invalid"}}],{filters_wire},"page_no":3,"has_next_page":true,"message":null,"info_message":"HIGHLIGHTED row was updated","committed":"updated","state":{STATE_WIRE},"page_key":""}}"#
+        );
+        assert_wire(&result, &result_wire)?;
+        result.status = StatusCode::NOT_FOUND;
+        assert_eq!(serde_json::to_string(&result)?, result_wire);
+
+        assert_wire(
+            &TranTypeListActionRequest {
+                aid: Aid::Pf10,
+                type_filter: "03".to_owned(),
+                desc_filter: String::new(),
+                rows: vec![TranTypeListRowInput {
+                    selection: "D".to_owned(),
+                    description: String::new(),
+                }],
+                state,
+                page_size: Some(7),
+            },
+            &format!(
+                r#"{{"aid":"PF10","type_filter":"03","desc_filter":"","rows":[{{"selection":"D","description":""}}],"state":{STATE_WIRE},"page_size":7}}"#
+            ),
+        )?;
+
+        // A query reads its `page_size` as query-string text, so its JSON reads back only
+        // without one.
+        let query = TranTypeListQuery {
+            direction: Some(PageDirection::Forward),
+            page_key: Some("7b7d".to_owned()),
+            ..TranTypeListQuery::default()
+        };
+        assert_wire(
+            &query,
+            r#"{"type_filter":null,"desc_filter":null,"page_key":"7b7d","direction":"forward","page_size":null}"#,
+        )?;
+        assert_eq!(
+            serde_json::to_string(&TranTypeListQuery {
+                page_size: Some(7),
+                ..query
+            })?,
+            r#"{"type_filter":null,"desc_filter":null,"page_key":"7b7d","direction":"forward","page_size":7}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_sent_twice_is_refused_and_an_unknown_one_skipped() -> TestResult {
+        let body = |members: &str| format!(r#"{{"aid":"ENTER",{members}"state":{STATE_WIRE}}}"#);
+        let cases: [ReadCase; 14] = [
+            (reads::<TranTypeListState>, STATE_WIRE.to_owned(), true),
+            (
+                reads::<TranTypeListState>,
+                STATE_WIRE.replacen(r#""page_no":0"#, r#""page_no":0,"page_no":1"#, 1),
+                false,
+            ),
+            (
+                reads::<TranTypeListState>,
+                STATE_WIRE.replacen(
+                    r#""rows":[null,"#,
+                    r#""unknown":{"n":1e400},"rows":[null,"#,
+                    1,
+                ),
+                true,
+            ),
+            // `rows` and `screen_rows` have no default: absent, the state does not read.
+            (
+                reads::<TranTypeListState>,
+                STATE_WIRE.replacen(r#""screen_rows":[null],"#, "", 1),
+                false,
+            ),
+            (
+                reads::<TranTypeListState>,
+                STATE_WIRE.replacen(r#""first_key":"05","#, "", 1),
+                true,
+            ),
+            (reads::<TranTypeListActionRequest>, body(""), true),
+            (
+                reads::<TranTypeListActionRequest>,
+                body(r#""type_filter":"01","type_filter":"02","#),
+                false,
+            ),
+            (
+                reads::<TranTypeListActionRequest>,
+                body(&format!(r#""state":{STATE_WIRE},"#)),
+                false,
+            ),
+            (
+                reads::<TranTypeListActionRequest>,
+                body(r#""page_size":5,"page_size":5,"#),
+                false,
+            ),
+            (
+                reads::<TranTypeListActionRequest>,
+                format!(r#"{{"state":{STATE_WIRE}}}"#),
+                false,
+            ),
+            (
+                reads::<TranTypeListActionRequest>,
+                r#"{"aid":"ENTER"}"#.to_owned(),
+                false,
+            ),
+            (
+                reads::<TranTypeListRowInput>,
+                r#"{"selection":"U","selection":"D"}"#.to_owned(),
+                false,
+            ),
+            (
+                reads::<TranTypeListRowError>,
+                r#"{"row":1,"field":"selection","message":"M","row":2}"#.to_owned(),
+                false,
+            ),
+            (
+                reads::<TranTypeListShownFilter>,
+                r#"{"status":"valid","text":"01","other":[]}"#.to_owned(),
+                true,
+            ),
+        ];
+        for (read, json, accepted) in cases {
+            assert_eq!(read(&json), accepted, "{json}");
+        }
+
+        // A query string: a parameter given twice does not deserialise, an unknown one is
+        // skipped.
+        let twice: Uri = "/api/v1/transaction-types?type_filter=01&type_filter=02".parse()?;
+        assert!(Query::<TranTypeListQuery>::try_from_uri(&twice).is_err());
+        let unknown: Uri = "/api/v1/transaction-types?unknown=1&page_size=x".parse()?;
+        let Query(query) = Query::<TranTypeListQuery>::try_from_uri(&unknown)?;
+        assert_eq!(
+            query,
+            TranTypeListQuery {
+                page_size: Some(0),
+                ..TranTypeListQuery::default()
+            }
+        );
         Ok(())
     }
 }

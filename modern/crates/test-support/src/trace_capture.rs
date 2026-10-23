@@ -116,8 +116,8 @@ impl fmt::Debug for TraceCapture {
 /// makes it; no global subscriber is installed, so tests running in parallel threads of one test
 /// binary each capture only their own output. It therefore sees only what runs on this thread:
 ///
-/// - Async tests use the current-thread `#[tokio::test]` flavour, under which every task the test
-///   spawns runs on the test's thread. Work on any other thread is captured only when it carries
+/// - Async tests run on a current-thread Tokio runtime, under which every task the test spawns
+///   runs on the test's thread. Work on any other thread is captured only when it carries
 ///   [`TraceCapture::dispatch`]: a future through
 ///   `tracing::instrument::WithSubscriber::with_subscriber`, a closure inside
 ///   `tracing::dispatcher::with_default`.
@@ -211,12 +211,154 @@ mod tests {
     use std::time::Duration;
 
     use runtime::telemetry::{
-        ALERT_TARGET, ScreenedText, message_span, record_response, request_span,
+        ALERT_TARGET, ScreenedText, event_enabled, message_span, record_response, request_span,
     };
+    use tracing::callsite::{Callsite as _, DefaultCallsite};
+    use tracing::field::{Field, Value};
     use tracing::instrument::WithSubscriber as _;
     use tracing::level_filters::LevelFilter;
+    use tracing::metadata::Kind;
+    use tracing::{Event, Level, Metadata};
 
     use super::capture;
+    use crate::HarnessError;
+    use crate::tests::{block_on, block_on_multi_thread};
+
+    // Written out: the `tracing` event macros expand to an `allow(unused_imports)` lint.
+    /// The callsite of the `INFO` probe events, whose one field is their `message`.
+    static INFO_PROBE: DefaultCallsite = DefaultCallsite::new(&INFO_PROBE_METADATA);
+    static INFO_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "info probe",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["message"],
+        callsite: &INFO_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of an `INFO` probe event with a `queue` field besides its `message`.
+    static QUEUE_PROBE: DefaultCallsite = DefaultCallsite::new(&QUEUE_PROBE_METADATA);
+    static QUEUE_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "queue probe",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["message", "queue"],
+        callsite: &QUEUE_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of an `INFO` probe event with a `note` field besides its `message`.
+    static NOTE_PROBE: DefaultCallsite = DefaultCallsite::new(&NOTE_PROBE_METADATA);
+    static NOTE_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "note probe",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["message", "note"],
+        callsite: &NOTE_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of an `INFO` probe event with a `value` field besides its `message`.
+    static VALUE_PROBE: DefaultCallsite = DefaultCallsite::new(&VALUE_PROBE_METADATA);
+    static VALUE_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "value probe",
+        target: module_path!(),
+        level: Level::INFO,
+        fields: &["message", "value"],
+        callsite: &VALUE_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of a `TRACE` probe event with a `depth` field besides its `message`.
+    static TRACE_PROBE: DefaultCallsite = DefaultCallsite::new(&TRACE_PROBE_METADATA);
+    static TRACE_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "trace probe",
+        target: module_path!(),
+        level: Level::TRACE,
+        fields: &["message", "depth"],
+        callsite: &TRACE_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of a `DEBUG` probe event, whose one field is its `message`.
+    static DEBUG_PROBE: DefaultCallsite = DefaultCallsite::new(&DEBUG_PROBE_METADATA);
+    static DEBUG_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "debug probe",
+        target: module_path!(),
+        level: Level::DEBUG,
+        fields: &["message"],
+        callsite: &DEBUG_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of an `ERROR` event of the silenced dependency target `lapin::channels`.
+    static DEPENDENCY_PROBE: DefaultCallsite = DefaultCallsite::new(&DEPENDENCY_PROBE_METADATA);
+    static DEPENDENCY_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "dependency probe",
+        target: "lapin::channels",
+        level: Level::ERROR,
+        fields: &["message"],
+        callsite: &DEPENDENCY_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of a `TRACE` event of the application target `messaging::workers`.
+    static APPLICATION_PROBE: DefaultCallsite = DefaultCallsite::new(&APPLICATION_PROBE_METADATA);
+    static APPLICATION_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "application probe",
+        target: "messaging::workers",
+        level: Level::TRACE,
+        fields: &["message"],
+        callsite: &APPLICATION_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// The callsite of an `ERROR` event of [`ALERT_TARGET`] with an `alert` field besides its
+    /// `message`.
+    static ALERT_PROBE: DefaultCallsite = DefaultCallsite::new(&ALERT_PROBE_METADATA);
+    static ALERT_PROBE_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "alert probe",
+        target: ALERT_TARGET,
+        level: Level::ERROR,
+        fields: &["message", "alert"],
+        callsite: &ALERT_PROBE,
+        kind: Kind::EVENT,
+    };
+
+    /// Emits an event of `callsite` through the current dispatcher when [`event_enabled`] says
+    /// so, with `message` as its `message` field and, when `extra` names another field of the
+    /// callsite, that field set to its text. A field the callsite does not declare fails the
+    /// test.
+    fn emit(callsite: &'static DefaultCallsite, message: &str, extra: Option<(&str, &str)>) {
+        if !event_enabled(callsite) {
+            return;
+        }
+        let metadata = callsite.metadata();
+        let fields = metadata.fields();
+        let declared = |name: &str| {
+            let Some(field) = fields.field(name) else {
+                panic!("{} declares no `{name}` field", metadata.name());
+            };
+            field
+        };
+        let message_field = declared("message");
+        if let Some((name, text)) = extra {
+            let extra_field = declared(name);
+            let values: [(&Field, Option<&dyn Value>); 2] = [
+                (&message_field, Some(&message)),
+                (&extra_field, Some(&text)),
+            ];
+            Event::dispatch(metadata, &fields.value_set(&values));
+        } else {
+            let values: [(&Field, Option<&dyn Value>); 1] = [(&message_field, Some(&message))];
+            Event::dispatch(metadata, &fields.value_set(&values));
+        }
+    }
+
+    /// Emits an [`INFO_PROBE`] event with `message`.
+    fn info(message: &str) {
+        emit(&INFO_PROBE, message, None);
+    }
 
     #[test]
     fn spans_write_their_fields_when_they_open_and_when_they_close() {
@@ -282,8 +424,8 @@ mod tests {
     #[test]
     fn every_level_is_recorded() {
         let capture = capture();
-        tracing::trace!(depth = "deepest", "trace probe");
-        tracing::debug!("debug probe");
+        emit(&TRACE_PROBE, "trace probe", Some(("depth", "deepest")));
+        emit(&DEBUG_PROBE, "debug probe", None);
 
         let lines = capture.lines();
         let [trace, debug] = lines.as_slice() else {
@@ -297,8 +439,8 @@ mod tests {
     #[test]
     fn silenced_dependency_targets_are_not_recorded() {
         let capture = capture();
-        tracing::error!(target: "lapin::channels", "dependency probe");
-        tracing::trace!(target: "messaging::workers", "application probe");
+        emit(&DEPENDENCY_PROBE, "dependency probe", None);
+        emit(&APPLICATION_PROBE, "application probe", None);
 
         let lines = capture.lines();
         let [line] = lines.as_slice() else {
@@ -311,9 +453,17 @@ mod tests {
     #[test]
     fn lines_with_target_selects_the_alert_events_only() {
         let capture = capture();
-        tracing::info!("routine");
-        tracing::error!(target: ALERT_TARGET, alert = "CP00_CARD_UNPARSEABLE", "alert probe");
-        tracing::info!(note = r#""target":"carddemo::alert""#, "quoting the member");
+        info("routine");
+        emit(
+            &ALERT_PROBE,
+            "alert probe",
+            Some(("alert", "CP00_CARD_UNPARSEABLE")),
+        );
+        emit(
+            &NOTE_PROBE,
+            "quoting the member",
+            Some(("note", r#""target":"carddemo::alert""#)),
+        );
 
         let alerts = capture.lines_with_target(ALERT_TARGET);
         let [alert] = alerts.as_slice() else {
@@ -331,7 +481,11 @@ mod tests {
     #[test]
     fn clear_discards_the_output_so_far_and_keeps_capturing() {
         let capture = capture();
-        tracing::info!(queue = "CARD.DEMO.REQUEST.ACCT", "before clear");
+        emit(
+            &QUEUE_PROBE,
+            "before clear",
+            Some(("queue", "CARD.DEMO.REQUEST.ACCT")),
+        );
         assert!(capture.contains("CARD.DEMO.REQUEST.ACCT"));
 
         capture.clear();
@@ -339,7 +493,7 @@ mod tests {
         assert!(capture.lines().is_empty());
         assert!(!capture.contains("CARD.DEMO.REQUEST.ACCT"));
 
-        tracing::info!("after clear");
+        info("after clear");
         let lines = capture.lines();
         let [line] = lines.as_slice() else {
             panic!("expected one line after clear, got {lines:?}");
@@ -350,12 +504,12 @@ mod tests {
     #[test]
     fn other_threads_are_captured_only_when_they_carry_the_dispatch() {
         let capture = capture();
-        let outside = thread::spawn(|| tracing::info!("outside probe"));
+        let outside = thread::spawn(|| info("outside probe"));
         assert!(outside.join().is_ok());
 
         let dispatch = capture.dispatch();
         let carried = thread::spawn(move || {
-            tracing::dispatcher::with_default(&dispatch, || tracing::info!("carried probe"));
+            tracing::dispatcher::with_default(&dispatch, || info("carried probe"));
         });
         assert!(carried.join().is_ok());
 
@@ -365,8 +519,21 @@ mod tests {
 
     // The one callsite of the test below: no other code reaches it, so its interest is first
     // cached by whichever thread of that test reaches it first.
+    /// The callsite of [`first_reached_without_a_capture`], a `WARN` event whose one field is its
+    /// `message`.
+    static FIRST_REACHED: DefaultCallsite = DefaultCallsite::new(&FIRST_REACHED_METADATA);
+    static FIRST_REACHED_METADATA: Metadata<'static> = tracing::metadata! {
+        name: "first reached without a capture",
+        target: module_path!(),
+        level: Level::WARN,
+        fields: &["message"],
+        callsite: &FIRST_REACHED,
+        kind: Kind::EVENT,
+    };
+
+    /// Emits the one event of [`FIRST_REACHED`].
     fn first_reached_without_a_capture() {
-        tracing::warn!("first reached without a capture");
+        emit(&FIRST_REACHED, "first reached without a capture", None);
     }
 
     #[test]
@@ -386,23 +553,25 @@ mod tests {
         assert!(line.contains("first reached without a capture"), "{line}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn futures_on_worker_threads_are_captured_with_the_dispatch() {
-        let capture = capture();
-        let task = async { tracing::info!("worker probe") }.with_subscriber(capture.dispatch());
-        assert!(tokio::spawn(task).await.is_ok());
-        assert!(capture.contains("worker probe"), "{}", capture.text());
+    #[test]
+    fn futures_on_worker_threads_are_captured_with_the_dispatch() -> Result<(), HarnessError> {
+        block_on_multi_thread(Some(2), async {
+            let capture = capture();
+            let task = async { info("worker probe") }.with_subscriber(capture.dispatch());
+            assert!(tokio::spawn(task).await.is_ok());
+            assert!(capture.contains("worker probe"), "{}", capture.text());
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn current_thread_tasks_are_captured() {
-        let capture = capture();
-        assert!(
-            tokio::spawn(async { tracing::info!("task probe") })
-                .await
-                .is_ok()
-        );
-        assert!(capture.contains("task probe"), "{}", capture.text());
+    #[test]
+    fn current_thread_tasks_are_captured() -> Result<(), HarnessError> {
+        block_on(async {
+            let capture = capture();
+            assert!(tokio::spawn(async { info("task probe") }).await.is_ok());
+            assert!(capture.contains("task probe"), "{}", capture.text());
+            Ok(())
+        })
     }
 
     #[test]
@@ -410,10 +579,10 @@ mod tests {
         let outer = capture();
         {
             let inner = capture();
-            tracing::info!("inner probe");
+            info("inner probe");
             assert!(inner.contains("inner probe"));
         }
-        tracing::info!("outer probe");
+        info("outer probe");
         assert!(outer.contains("outer probe"), "{}", outer.text());
         assert!(!outer.contains("inner probe"), "{}", outer.text());
     }
@@ -421,7 +590,11 @@ mod tests {
     #[test]
     fn debug_never_prints_the_captured_text() {
         let capture = capture();
-        tracing::info!(value = "captured-secret-probe", "probe");
+        emit(
+            &VALUE_PROBE,
+            "probe",
+            Some(("value", "captured-secret-probe")),
+        );
         let debug = format!("{capture:?}");
         assert!(debug.starts_with("TraceCapture {"), "{debug}");
         assert!(debug.contains("captured_bytes"), "{debug}");

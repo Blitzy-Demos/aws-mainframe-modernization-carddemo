@@ -154,6 +154,11 @@ step 3 "warning-free clippy (g2, R1)"
 SQLX_OFFLINE=true cargo clippy --workspace --all-targets --locked
 # 4 floating point (pdf.rs is the only exclusion, and only one file may carry that name)
 step 4 "floating-point scan (R1)"
+# crates/batch/src/pdf.rs is outside the f32/f64 scan because printpdf 0.7 takes f32 lengths (Mm
+# coordinates and the font size). It receives only the statement's text bytes, never a monetary
+# value, computes positions in whole millimetres with checked integer arithmetic and converts them
+# with f32::from. clippy::float_arithmetic, denied workspace-wide, still applies to it in step 3,
+# and the find keeps this base-name exclusion to that one path (AAP 0.3.4.5).
 no_match -rnwE 'f32|f64' crates --include='*.rs' --exclude=pdf.rs
 no_output find crates -name pdf.rs ! -path crates/batch/src/pdf.rs
 no_match -rniwE 'real|float[0-9]*|double precision' crates/persistence/migrations
@@ -348,6 +353,12 @@ for m in crates/*/Cargo.toml; do
   awk '/^\[lints\]/{f=1;next} /^\[/{f=0} f && /^workspace *= *true/{ok=1} END{exit !ok}' "$m" \
     || { echo "MISSING [lints] workspace = true: $m"; exit 1; }
 done
+# crates/persistence/tests/explain.rs is the one exemption from this non-macro SQL scan: it alone
+# runs EXPLAIN (GENERIC_PLAN) over committed query text (queries/*.sql, the .sqlx/ metadata and
+# the previous release's compat/previous/ copies), built at run time with its $n placeholders
+# unbound. The query macros take only literal text and bind every $n, so it goes through the
+# simple-query protocol of sqlx::raw_sql and issues nothing but those EXPLAINs and SET session
+# settings. The find keeps this base-name exemption to that one path (AAP 0.3.3.3).
 no_match -rnE 'sqlx::(query|query_as|query_scalar|raw_sql)\(' crates --include='*.rs' --exclude=explain.rs
 no_output find crates -name explain.rs ! -path crates/persistence/tests/explain.rs
 # 6 integer casts; one schema executor; no process-local lock in CP00; thin handlers

@@ -1287,6 +1287,7 @@ mod tests {
     use chrono::NaiveDate;
     use copybook::{PicDate, PicU, PicX};
     use proptest::prelude::*;
+    use proptest::strategy::Union;
 
     use super::{
         ACCOUNT_FILTER_INVALID, Aid, CARD_EXPIRY_MONTH_NOT_VALID, CARD_EXPIRY_YEAR_NOT_VALID,
@@ -2329,7 +2330,7 @@ mod tests {
     }
 
     fn any_state() -> impl Strategy<Value = CardUpdateState> {
-        prop_oneof![
+        Union::new([
             Just(CardUpdateState::NotFetched),
             Just(CardUpdateState::ShowDetails),
             Just(CardUpdateState::ChangesNotOk),
@@ -2337,7 +2338,7 @@ mod tests {
             Just(CardUpdateState::ChangesOkayedAndDone),
             Just(CardUpdateState::LockError),
             Just(CardUpdateState::UpdateFailed),
-        ]
+        ])
     }
 
     proptest! {
@@ -2346,13 +2347,13 @@ mod tests {
         /// of each detail strategy draws values that pass their edit, so saves are reached too.
         #[test]
         fn every_request_text_gets_an_answer(
-            acct in prop_oneof![".{0,14}", "[0-9]{11}"],
+            acct in Union::new([".{0,14}", "[0-9]{11}"]),
             card_num in proptest::option::of(".{0,20}"),
             handle in proptest::option::of(any::<i64>()),
-            name in prop_oneof![".{0,60}", "[A-Za-z ]{1,50}"],
-            status in prop_oneof![".{0,3}", "[YN]"],
-            month in prop_oneof![".{0,4}", "(0[1-9]|1[0-2])"],
-            year in prop_oneof![".{0,6}", "(19[5-9][0-9]|20[0-9]{2})"],
+            name in Union::new([".{0,60}", "[A-Za-z ]{1,50}"]),
+            status in Union::new([".{0,3}", "[YN]"]),
+            month in Union::new([".{0,4}", "(0[1-9]|1[0-2])"]),
+            year in Union::new([".{0,6}", "(19[5-9][0-9]|20[0-9]{2})"]),
             state in any_state(),
             pf5 in any::<bool>(),
         ) {

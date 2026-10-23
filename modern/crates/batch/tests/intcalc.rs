@@ -1379,137 +1379,151 @@ async fn check_inputs_kept(store: &mut PgStore, before: &Inputs) -> TestResult {
     )
 }
 
+/// Runs `test` to completion on a multi-thread runtime with every driver enabled and the default
+/// number of worker threads, the runtime tokio's multi-thread test attribute builds, without the
+/// lint attributes that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// `INTEREST-RAW`: the loaded fixtures, then `intcalc` with no option. Every category balance is
 /// 0.00, so every interest is 0.00 and every account keeps its loaded balance and cycle fields.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_default_parm_date_matches_audit() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("raw")?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
+#[test]
+fn intcalc_default_parm_date_matches_audit() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("raw")?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
 
-    // No option: `PARM-DATE` is the JCL's PARM. The opens succeed, the run reaches its end and
-    // its return code is 0.
-    // audit: CBACT04C-001
-    // audit: CBACT04C-030
-    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    expect_status(&output, 0, "intcalc")?;
-    // audit: CBACT04C-024
-    // audit: FIXINT-901
-    let systran = first_generation(&output, &scratch)?;
+        // No option: `PARM-DATE` is the JCL's PARM. The opens succeed, the run reaches its end and
+        // its return code is 0.
+        // audit: CBACT04C-001
+        // audit: CBACT04C-030
+        let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        expect_status(&output, 0, "intcalc")?;
+        // audit: CBACT04C-024
+        // audit: FIXINT-901
+        let systran = first_generation(&output, &scratch)?;
 
-    // The whole job log, then the path: the first line, the 50 records of `tcatbal.txt` in key
-    // order, each with its `DEFAULT` fallback pair, and the end line.
-    // audit: CBACT04C-002
-    // audit: CBACT04C-003
-    // audit: CBACT04C-010
-    // audit: CBACT04C-024
-    // audit: CBACT04C-030
-    // audit: FIXINT-902
-    // audit: FIXINT-903
-    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
+        // The whole job log, then the path: the first line, the 50 records of `tcatbal.txt` in key
+        // order, each with its `DEFAULT` fallback pair, and the end line.
+        // audit: CBACT04C-002
+        // audit: CBACT04C-003
+        // audit: CBACT04C-010
+        // audit: CBACT04C-024
+        // audit: CBACT04C-030
+        // audit: FIXINT-902
+        // audit: FIXINT-903
+        check_normal_log(&output, &tcatbal_lines()?, &systran)?;
 
-    // One record per category balance, in key order, each for the account of its break and
-    // carrying that account's one card; the amount is the 0.00 interest of ARITH-009.
-    // audit: CBACT04C-004
-    // audit: CBACT04C-006
-    // audit: CBACT04C-013
-    // audit: CBACT04C-015
-    // audit: CBACT04C-017
-    // audit: CBACT04C-018
-    // audit: CBACT04C-020
-    // audit: CBACT04C-021
-    // audit: CBACT04C-022
-    // audit: ARITH-009
-    // audit: ARITH-012
-    // audit: CBACT04C-019
-    // audit: CBACT04C-023
-    report_blocked_spans();
-    check_systran(&systran, JCL_PARM, |_| ZERO)?;
+        // One record per category balance, in key order, each for the account of its break and
+        // carrying that account's one card; the amount is the 0.00 interest of ARITH-009.
+        // audit: CBACT04C-004
+        // audit: CBACT04C-006
+        // audit: CBACT04C-013
+        // audit: CBACT04C-015
+        // audit: CBACT04C-017
+        // audit: CBACT04C-018
+        // audit: CBACT04C-020
+        // audit: CBACT04C-021
+        // audit: CBACT04C-022
+        // audit: ARITH-009
+        // audit: ARITH-012
+        // audit: CBACT04C-019
+        // audit: CBACT04C-023
+        report_blocked_spans();
+        check_systran(&systran, JCL_PARM, |_| ZERO)?;
 
-    // Accounts 1 to 49 are rewritten with a total of 0.00 and zeroed cycle fields, which the
-    // load left at 0.00; account 50, the last, is never rewritten (E08).
-    // audit: CBACT04C-014
-    // audit: CBACT04C-026
-    // audit: CBACT04C-027
-    // audit: ARITH-010
-    // audit: ARITH-013
-    // audit: ARITH-014
-    // audit: ARITH-017
-    // audit: FIXINT-903
-    let accounts_after = AccountRepository::find_all(&mut store).await?;
-    check_accounts(&accounts_before, &accounts_after, |row| {
-        [row.raw_bal, ZERO, ZERO]
-    })?;
-    check_last_account_kept(&accounts_before, &accounts_after)?;
+        // Accounts 1 to 49 are rewritten with a total of 0.00 and zeroed cycle fields, which the
+        // load left at 0.00; account 50, the last, is never rewritten (E08).
+        // audit: CBACT04C-014
+        // audit: CBACT04C-026
+        // audit: CBACT04C-027
+        // audit: ARITH-010
+        // audit: ARITH-013
+        // audit: ARITH-014
+        // audit: ARITH-017
+        // audit: FIXINT-903
+        let accounts_after = AccountRepository::find_all(&mut store).await?;
+        check_accounts(&accounts_before, &accounts_after, |row| {
+            [row.raw_bal, ZERO, ZERO]
+        })?;
+        check_last_account_kept(&accounts_before, &accounts_after)?;
 
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await?;
-    ensure(
-        TransactionRepository::find_last(&mut store)
-            .await?
-            .is_none(),
-        "CBACT04C-029: a SYSTRAN record reached transactions",
-    )
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await?;
+        ensure(
+            TransactionRepository::find_last(&mut store)
+                .await?
+                .is_none(),
+            "CBACT04C-029: a SYSTRAN record reached transactions",
+        )
+    })
 }
 
 /// `--parm-date`: a value of fewer than 10 bytes is refused before any table is read or file
 /// created; a longer one contributes its first 10 characters to every `TRAN-ID`, and changes
 /// nothing else of the run (CBACT04C-001, CBACT04C-015).
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_explicit_parm_date() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("parm")?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
+#[test]
+fn intcalc_explicit_parm_date() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("parm")?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
 
-    // The replacement's typed refusal of a short PARM, which is no parity result: a COBOL PARM
-    // of fewer than 10 characters has none (X-INTCALC-H4).
-    // audit: CBACT04C-001
-    let refused = run_batch(&guard, &scratch, &["intcalc", "--parm-date", "20220801"]).await?;
-    expect_status(
-        &refused,
-        USAGE_STATUS,
-        "intcalc --parm-date of 8 characters",
-    )?;
-    ensure(
-        written_paths(&refused.stdout).is_empty(),
-        "a refused PARM printed a path",
-    )?;
-    ensure(
-        events(&refused.stdout).is_empty(),
-        "a refused PARM showed a job-log line",
-    )?;
-    ensure(
-        file_names(scratch.path())?.is_empty(),
-        "a refused PARM created a directory or file",
-    )?;
-    ensure(
-        AccountRepository::find_all(&mut store).await? == accounts_before,
-        "a refused PARM changed an account",
-    )?;
+        // The replacement's typed refusal of a short PARM, which is no parity result: a COBOL PARM
+        // of fewer than 10 characters has none (X-INTCALC-H4).
+        // audit: CBACT04C-001
+        let refused = run_batch(&guard, &scratch, &["intcalc", "--parm-date", "20220801"]).await?;
+        expect_status(
+            &refused,
+            USAGE_STATUS,
+            "intcalc --parm-date of 8 characters",
+        )?;
+        ensure(
+            written_paths(&refused.stdout).is_empty(),
+            "a refused PARM printed a path",
+        )?;
+        ensure(
+            events(&refused.stdout).is_empty(),
+            "a refused PARM showed a job-log line",
+        )?;
+        ensure(
+            file_names(scratch.path())?.is_empty(),
+            "a refused PARM created a directory or file",
+        )?;
+        ensure(
+            AccountRepository::find_all(&mut store).await? == accounts_before,
+            "a refused PARM changed an account",
+        )?;
 
-    // A PARM of 13 characters: its first 10 are `PARM-DATE`, followed in each `TRAN-ID` by the
-    // record's suffix; the record count and every other byte are those of the JCL's PARM.
-    // audit: CBACT04C-001
-    // audit: CBACT04C-015
-    // audit: FIXINT-901
-    let output = run_batch(&guard, &scratch, &["intcalc", "--parm-date", LONG_PARM]).await?;
-    expect_status(&output, 0, "intcalc --parm-date of 13 characters")?;
-    let systran = first_generation(&output, &scratch)?;
-    // The PARM shows in no line: the job log is that of the JCL's PARM.
-    // audit: CBACT04C-002
-    // audit: CBACT04C-003
-    // audit: CBACT04C-010
-    // audit: CBACT04C-030
-    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
-    report_blocked_spans();
-    let records = check_systran(&systran, LONG_PARM_DATE, |_| ZERO)?;
-    ensure(
-        records.len() == SYSTRAN_RECORDS,
-        "the PARM changed the number of SYSTRAN records",
-    )
+        // A PARM of 13 characters: its first 10 are `PARM-DATE`, followed in each `TRAN-ID` by the
+        // record's suffix; the record count and every other byte are those of the JCL's PARM.
+        // audit: CBACT04C-001
+        // audit: CBACT04C-015
+        // audit: FIXINT-901
+        let output = run_batch(&guard, &scratch, &["intcalc", "--parm-date", LONG_PARM]).await?;
+        expect_status(&output, 0, "intcalc --parm-date of 13 characters")?;
+        let systran = first_generation(&output, &scratch)?;
+        // The PARM shows in no line: the job log is that of the JCL's PARM.
+        // audit: CBACT04C-002
+        // audit: CBACT04C-003
+        // audit: CBACT04C-010
+        // audit: CBACT04C-030
+        check_normal_log(&output, &tcatbal_lines()?, &systran)?;
+        report_blocked_spans();
+        let records = check_systran(&systran, LONG_PARM_DATE, |_| ZERO)?;
+        ensure(
+            records.len() == SYSTRAN_RECORDS,
+            "the PARM changed the number of SYSTRAN records",
+        )
+    })
 }
 
 /// The state `posttran` leaves that `INTEREST-POSTED` starts from, checked before `intcalc`
@@ -1548,148 +1562,154 @@ fn check_posted_start(accounts: &[AccountRecord], inputs: &Inputs) -> TestResult
 /// account's group is blank; each (account, `03`, `0001`) balance meets the `DEFAULT` rate 0.00
 /// and writes no record. Accounts 1 to 49 gain their interest and lose their cycle amounts;
 /// account 50 keeps every value `posttran` left (E08).
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_after_posttran_matches_audit() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("posted")?;
-    // `posttran`'s own results are FIXPOST's, asserted by `posttran_i9.rs`; its status 4 is
-    // only the precondition that it ran to its end here.
-    let posted = run_batch(&guard, &scratch, &["posttran"]).await?;
-    expect_status(&posted, POSTTRAN_REJECTED, "posttran")?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
-    check_posted_start(&accounts_before, &inputs_before)?;
+#[test]
+fn intcalc_after_posttran_matches_audit() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("posted")?;
+        // `posttran`'s own results are FIXPOST's, asserted by `posttran_i9.rs`; its status 4 is
+        // only the precondition that it ran to its end here.
+        let posted = run_batch(&guard, &scratch, &["posttran"]).await?;
+        expect_status(&posted, POSTTRAN_REJECTED, "posttran")?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
+        check_posted_start(&accounts_before, &inputs_before)?;
 
-    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    expect_status(&output, 0, "intcalc")?;
-    let systran = first_generation(&output, &scratch)?;
+        let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        expect_status(&output, 0, "intcalc")?;
+        let systran = first_generation(&output, &scratch)?;
 
-    // The whole job log, then the path: the first line, the 100 category balances `posttran`
-    // leaves, in key order, each with its `DEFAULT` fallback pair, the zero-rate ones included,
-    // and the end line.
-    // audit: CBACT04C-002
-    // audit: CBACT04C-003
-    // audit: CBACT04C-010
-    // audit: CBACT04C-024
-    // audit: CBACT04C-030
-    // audit: FIXINT-902
-    // audit: FIXINT-903
-    check_normal_log(&output, &posted_category_balances()?, &systran)?;
+        // The whole job log, then the path: the first line, the 100 category balances `posttran`
+        // leaves, in key order, each with its `DEFAULT` fallback pair, the zero-rate ones included,
+        // and the end line.
+        // audit: CBACT04C-002
+        // audit: CBACT04C-003
+        // audit: CBACT04C-010
+        // audit: CBACT04C-024
+        // audit: CBACT04C-030
+        // audit: FIXINT-902
+        // audit: FIXINT-903
+        check_normal_log(&output, &posted_category_balances()?, &systran)?;
 
-    // 100 category balances read, 50 records written: the rate-0.00 balances are skipped, and
-    // each amount is its balance times the `DEFAULT` rate 15.00, divided by 1200 and truncated,
-    // with no fee added.
-    // audit: CBACT04C-010
-    // audit: CBACT04C-012
-    // audit: CBACT04C-013
-    // audit: CBACT04C-020
-    // audit: CBACT04C-024
-    // audit: CBACT04C-025
-    // audit: ARITH-001
-    // audit: ARITH-012
-    // audit: ARITH-015
-    // audit: ARITH-016
-    // audit: FIXINT-901
-    // audit: FIXINT-902
-    // audit: CBACT04C-019
-    // audit: CBACT04C-023
-    report_blocked_spans();
-    let records = check_systran(&systran, JCL_PARM, |row| row.interest)?;
-    // audit: FIXINT-903
-    let systran_sum: Decimal = records.iter().map(|record| record.amt.as_decimal()).sum();
-    ensure(
-        systran_sum == POSTED_SYSTRAN_SUM.parse::<Decimal>()?,
-        &format!("FIXINT-903: the SYSTRAN amounts sum to {systran_sum}, not {POSTED_SYSTRAN_SUM}"),
-    )?;
+        // 100 category balances read, 50 records written: the rate-0.00 balances are skipped, and
+        // each amount is its balance times the `DEFAULT` rate 15.00, divided by 1200 and truncated,
+        // with no fee added.
+        // audit: CBACT04C-010
+        // audit: CBACT04C-012
+        // audit: CBACT04C-013
+        // audit: CBACT04C-020
+        // audit: CBACT04C-024
+        // audit: CBACT04C-025
+        // audit: ARITH-001
+        // audit: ARITH-012
+        // audit: ARITH-015
+        // audit: ARITH-016
+        // audit: FIXINT-901
+        // audit: FIXINT-902
+        // audit: CBACT04C-019
+        // audit: CBACT04C-023
+        report_blocked_spans();
+        let records = check_systran(&systran, JCL_PARM, |row| row.interest)?;
+        // audit: FIXINT-903
+        let systran_sum: Decimal = records.iter().map(|record| record.amt.as_decimal()).sum();
+        ensure(
+            systran_sum == POSTED_SYSTRAN_SUM.parse::<Decimal>()?,
+            &format!(
+                "FIXINT-903: the SYSTRAN amounts sum to {systran_sum}, not {POSTED_SYSTRAN_SUM}"
+            ),
+        )?;
 
-    // audit: CBACT04C-014
-    // audit: CBACT04C-026
-    // audit: CBACT04C-027
-    // audit: ARITH-010
-    // audit: ARITH-013
-    // audit: ARITH-014
-    // audit: ARITH-017
-    // audit: FIXINT-903
-    let accounts_after = AccountRepository::find_all(&mut store).await?;
-    check_accounts(&accounts_before, &accounts_after, |row| {
-        row.rewritten_bal
-            .map_or(row.posted, |bal| [bal, ZERO, ZERO])
-    })?;
-    check_last_account_kept(&accounts_before, &accounts_after)?;
-    let totals_added: Decimal = accounts_before
-        .iter()
-        .zip(&accounts_after)
-        .map(|(old, new)| new.curr_bal.as_decimal() - old.curr_bal.as_decimal())
-        .sum();
-    ensure(
-        totals_added == POSTED_TOTALS_ADDED.parse::<Decimal>()?,
-        &format!("FIXINT-903: the balances gain {totals_added}, not {POSTED_TOTALS_ADDED}"),
-    )?;
+        // audit: CBACT04C-014
+        // audit: CBACT04C-026
+        // audit: CBACT04C-027
+        // audit: ARITH-010
+        // audit: ARITH-013
+        // audit: ARITH-014
+        // audit: ARITH-017
+        // audit: FIXINT-903
+        let accounts_after = AccountRepository::find_all(&mut store).await?;
+        check_accounts(&accounts_before, &accounts_after, |row| {
+            row.rewritten_bal
+                .map_or(row.posted, |bal| [bal, ZERO, ZERO])
+        })?;
+        check_last_account_kept(&accounts_before, &accounts_after)?;
+        let totals_added: Decimal = accounts_before
+            .iter()
+            .zip(&accounts_after)
+            .map(|(old, new)| new.curr_bal.as_decimal() - old.curr_bal.as_decimal())
+            .sum();
+        ensure(
+            totals_added == POSTED_TOTALS_ADDED.parse::<Decimal>()?,
+            &format!("FIXINT-903: the balances gain {totals_added}, not {POSTED_TOTALS_ADDED}"),
+        )?;
 
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await
+    })
 }
 
 /// `0300-ACCTFILE-OPEN` against another writer: while the test's own session holds the claim on
 /// `accounts`, as a running `posttran` or `intcalc` does, `intcalc` abends at the account file's
 /// open, before it reads a table or creates a generation. Once the claim is given up, the next
 /// run is the only writer and takes the generation the refused run never allocated.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_refuses_a_held_account_claim() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("claim")?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let mut holder = store.session().await?;
-    ensure(
-        holder.claim_writer(Dataset::Accounts).await?,
-        "the test's own claim on accounts was refused",
-    )?;
+#[test]
+fn intcalc_refuses_a_held_account_claim() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("claim")?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let mut holder = store.session().await?;
+        ensure(
+            holder.claim_writer(Dataset::Accounts).await?,
+            "the test's own claim on accounts was refused",
+        )?;
 
-    // audit: CBACT04C-039
-    let refused = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    expect_status(&refused, ABEND_STATUS, "intcalc against a held claim")?;
-    ensure(
-        String::from_utf8_lossy(&refused.stderr) == HELD_CLAIM_STDERR,
-        "intcalc against a held claim: standard error is not the account file's open text",
-    )?;
-    // The first line, then the account file's open failure: no record line, as no table is read.
-    // audit: CBACT04C-002
-    // audit: CBACT04C-034
-    // audit: CBACT04C-038
-    // audit: CBACT04C-039
-    let before = check_abended(&refused, OPEN_ACCOUNT_LINE)?;
-    ensure(
-        messages(&before) == [START_LINE],
-        "intcalc against a held claim: a line other than the first precedes the open's failure",
-    )?;
-    ensure(
-        written_paths(&refused.stdout).is_empty(),
-        "intcalc against a held claim printed a path",
-    )?;
-    ensure(
-        file_names(&scratch.systran_dir())?.is_empty(),
-        "intcalc against a held claim created a SYSTRAN generation",
-    )?;
-    ensure(
-        AccountRepository::find_all(&mut store).await? == accounts_before,
-        "intcalc against a held claim changed an account",
-    )?;
-    // The status characters VSAM would show after the open's text are no parity result.
-    // audit: CBACT04C-037
-    println!("BLOCKED CBACT04C-037 (H4, X-INTCALC-H3): the status of the refused open");
+        // audit: CBACT04C-039
+        let refused = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        expect_status(&refused, ABEND_STATUS, "intcalc against a held claim")?;
+        ensure(
+            String::from_utf8_lossy(&refused.stderr) == HELD_CLAIM_STDERR,
+            "intcalc against a held claim: standard error is not the account file's open text",
+        )?;
+        // The first line, then the account file's open failure: no record line, as no table is read.
+        // audit: CBACT04C-002
+        // audit: CBACT04C-034
+        // audit: CBACT04C-038
+        // audit: CBACT04C-039
+        let before = check_abended(&refused, OPEN_ACCOUNT_LINE)?;
+        ensure(
+            messages(&before) == [START_LINE],
+            "intcalc against a held claim: a line other than the first precedes the open's failure",
+        )?;
+        ensure(
+            written_paths(&refused.stdout).is_empty(),
+            "intcalc against a held claim printed a path",
+        )?;
+        ensure(
+            file_names(&scratch.systran_dir())?.is_empty(),
+            "intcalc against a held claim created a SYSTRAN generation",
+        )?;
+        ensure(
+            AccountRepository::find_all(&mut store).await? == accounts_before,
+            "intcalc against a held claim changed an account",
+        )?;
+        // The status characters VSAM would show after the open's text are no parity result.
+        // audit: CBACT04C-037
+        println!("BLOCKED CBACT04C-037 (H4, X-INTCALC-H3): the status of the refused open");
 
-    holder.close().await?;
-    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    expect_status(&output, 0, "intcalc after the claim was given up")?;
-    let systran = first_generation(&output, &scratch)?;
-    // audit: CBACT04C-002
-    // audit: CBACT04C-030
-    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
-    report_blocked_spans();
-    check_systran(&systran, JCL_PARM, |_| ZERO)?;
-    Ok(())
+        holder.close().await?;
+        let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        expect_status(&output, 0, "intcalc after the claim was given up")?;
+        let systran = first_generation(&output, &scratch)?;
+        // audit: CBACT04C-002
+        // audit: CBACT04C-030
+        check_normal_log(&output, &tcatbal_lines()?, &systran)?;
+        report_blocked_spans();
+        check_systran(&systran, JCL_PARM, |_| ZERO)?;
+        Ok(())
+    })
 }
 
 /// Runs `posttran` over `dailytran.txt` against the database of `guard`, the start of
@@ -1719,40 +1739,42 @@ async fn post_daily_transactions(
 /// of account 1 at the break of account 2, fails with SQLSTATE 25006. The run abends with
 /// `ERROR RE-WRITING ACCOUNT FILE` after the event carrying that SQLSTATE, removes the generation
 /// it created and changes no table.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_abends_on_a_failed_rewrite() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("rewrite")?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
-    let read_only = format!(
-        "{}?options[default_transaction_read_only]=on",
-        guard.database_url()
-    );
+#[test]
+fn intcalc_abends_on_a_failed_rewrite() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("rewrite")?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
+        let read_only = format!(
+            "{}?options[default_transaction_read_only]=on",
+            guard.database_url()
+        );
 
-    let output = run_batch_on(&read_only, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-032
-    // audit: CBACT04C-038
-    let before = check_abended(&output, REWRITE_ACCOUNT_LINE)?;
-    // audit: CBACT04C-032
-    ensure(
-        before
-            .last()
-            .is_some_and(|event| event.contains(READ_ONLY_SQLSTATE)),
-        "the event before the rewrite's failure line does not carry SQLSTATE 25006",
-    )?;
-    // audit: CBACT04C-038
-    check_no_generation(&scratch, REWRITE_ACCOUNT_LINE)?;
-    ensure(
-        AccountRepository::find_all(&mut store).await? == accounts_before,
-        "a run whose first rewrite failed changed an account",
-    )?;
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await?;
-    // audit: CBACT04C-037
-    report_status_blocked(REWRITE_ACCOUNT_LINE);
-    Ok(())
+        let output = run_batch_on(&read_only, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-032
+        // audit: CBACT04C-038
+        let before = check_abended(&output, REWRITE_ACCOUNT_LINE)?;
+        // audit: CBACT04C-032
+        ensure(
+            before
+                .last()
+                .is_some_and(|event| event.contains(READ_ONLY_SQLSTATE)),
+            "the event before the rewrite's failure line does not carry SQLSTATE 25006",
+        )?;
+        // audit: CBACT04C-038
+        check_no_generation(&scratch, REWRITE_ACCOUNT_LINE)?;
+        ensure(
+            AccountRepository::find_all(&mut store).await? == accounts_before,
+            "a run whose first rewrite failed changed an account",
+        )?;
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await?;
+        // audit: CBACT04C-037
+        report_status_blocked(REWRITE_ACCOUNT_LINE);
+        Ok(())
+    })
 }
 
 /// `1100-GET-ACCT-DATA` against a read that fails: the server's `postgres` database has no
@@ -1760,79 +1782,83 @@ async fn intcalc_abends_on_a_failed_rewrite() -> TestResult {
 /// 42P01. The run abends with `ERROR READING ACCOUNT FILE` after the event carrying that
 /// SQLSTATE, with no invalid-key line before it, as no key was looked up, and creates no
 /// generation.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_abends_on_a_failed_read() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::new("read")?;
-    let (server, _) = guard
-        .database_url()
-        .rsplit_once('/')
-        .ok_or("the database URL names no database")?;
-    let unmigrated = format!("{server}/postgres");
+#[test]
+fn intcalc_abends_on_a_failed_read() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::new("read")?;
+        let (server, _) = guard
+            .database_url()
+            .rsplit_once('/')
+            .ok_or("the database URL names no database")?;
+        let unmigrated = format!("{server}/postgres");
 
-    let output = run_batch_on(&unmigrated, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-033
-    let before = check_abended(&output, READ_ACCOUNT_LINE)?;
-    // audit: CBACT04C-033
-    ensure(
-        before
-            .last()
-            .is_some_and(|event| event.contains(UNDEFINED_TABLE_SQLSTATE)),
-        "the event before the read's failure line does not carry SQLSTATE 42P01",
-    )?;
-    // audit: CBACT04C-033
-    ensure(
-        !messages(&before).iter().any(|message| {
-            message.starts_with(ACCOUNT_NOT_FOUND_PREFIX) || *message == DISCLOSURE_MISSING_LINE
-        }),
-        "an invalid-key line precedes the read's failure line",
-    )?;
-    // audit: CBACT04C-038
-    check_no_generation(&scratch, READ_ACCOUNT_LINE)?;
-    // audit: CBACT04C-037
-    report_status_blocked(READ_ACCOUNT_LINE);
-    Ok(())
+        let output = run_batch_on(&unmigrated, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-033
+        let before = check_abended(&output, READ_ACCOUNT_LINE)?;
+        // audit: CBACT04C-033
+        ensure(
+            before
+                .last()
+                .is_some_and(|event| event.contains(UNDEFINED_TABLE_SQLSTATE)),
+            "the event before the read's failure line does not carry SQLSTATE 42P01",
+        )?;
+        // audit: CBACT04C-033
+        ensure(
+            !messages(&before).iter().any(|message| {
+                message.starts_with(ACCOUNT_NOT_FOUND_PREFIX) || *message == DISCLOSURE_MISSING_LINE
+            }),
+            "an invalid-key line precedes the read's failure line",
+        )?;
+        // audit: CBACT04C-038
+        check_no_generation(&scratch, READ_ACCOUNT_LINE)?;
+        // audit: CBACT04C-037
+        report_status_blocked(READ_ACCOUNT_LINE);
+        Ok(())
+    })
 }
 
 /// `0400-TRANFILE-OPEN` against a generation that cannot be created: a regular file stands
 /// where the `systran` directory belongs. The run abends with `ERROR OPENING TRANSACTION FILE`
 /// before it reads a category balance, so it rewrites no account, and leaves the file as it was.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_abends_when_the_generation_cannot_be_created() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("open")?;
-    fs::write(scratch.systran_dir(), NOT_A_DIRECTORY)?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
+#[test]
+fn intcalc_abends_when_the_generation_cannot_be_created() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("open")?;
+        fs::write(scratch.systran_dir(), NOT_A_DIRECTORY)?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
 
-    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-034
-    // audit: CBACT04C-038
-    let before = check_abended(&output, OPEN_TRANSACT_LINE)?;
-    // The event before the failure line names the setting of the directory, never its path.
-    let shown = scratch.systran_dir().display().to_string();
-    ensure(
-        before.last().is_some_and(|event| {
-            event.contains(&format!("({SYSTRAN_DIR_SETTING})")) && !event.contains(&shown)
-        }),
-        "the event before the open's failure line does not name the systran setting alone",
-    )?;
-    // audit: CBACT04C-034
-    ensure(
-        fs::read(scratch.systran_dir())? == NOT_A_DIRECTORY,
-        "the file in place of the systran directory changed",
-    )?;
-    // audit: CBACT04C-034
-    ensure(
-        AccountRepository::find_all(&mut store).await? == accounts_before,
-        "a run that could not create its generation changed an account",
-    )?;
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await?;
-    // audit: CBACT04C-037
-    report_status_blocked(OPEN_TRANSACT_LINE);
-    Ok(())
+        let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-034
+        // audit: CBACT04C-038
+        let before = check_abended(&output, OPEN_TRANSACT_LINE)?;
+        // The event before the failure line names the setting of the directory, never its path.
+        let shown = scratch.systran_dir().display().to_string();
+        ensure(
+            before.last().is_some_and(|event| {
+                event.contains(&format!("({SYSTRAN_DIR_SETTING})")) && !event.contains(&shown)
+            }),
+            "the event before the open's failure line does not name the systran setting alone",
+        )?;
+        // audit: CBACT04C-034
+        ensure(
+            fs::read(scratch.systran_dir())? == NOT_A_DIRECTORY,
+            "the file in place of the systran directory changed",
+        )?;
+        // audit: CBACT04C-034
+        ensure(
+            AccountRepository::find_all(&mut store).await? == accounts_before,
+            "a run that could not create its generation changed an account",
+        )?;
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await?;
+        // audit: CBACT04C-037
+        report_status_blocked(OPEN_TRANSACT_LINE);
+        Ok(())
+    })
 }
 
 /// `0000-TCATBALF-OPEN` against a server that cannot be reached: the one `PostgreSQL`
@@ -1840,57 +1866,59 @@ async fn intcalc_abends_when_the_generation_cannot_be_created() -> TestResult {
 /// event the job log is the first open's failure, and the run exits 1 with `main`'s connection
 /// error before it reads a table or creates a generation (CBACT04C-002, X-INTCALC-7). No
 /// container is started, and no output shows the URL or its password.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestResult {
-    let scratch = Scratch::new("connect")?;
-    let unreachable =
-        format!("postgres://carddemo:{UNREACHABLE_PASSWORD}@{UNREACHABLE_SERVER}/carddemo");
+#[test]
+fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestResult {
+    block_on(async {
+        let scratch = Scratch::new("connect")?;
+        let unreachable =
+            format!("postgres://carddemo:{UNREACHABLE_PASSWORD}@{UNREACHABLE_SERVER}/carddemo");
 
-    let output = run_batch_on(&unreachable, &scratch, &["intcalc"]).await?;
-    // `main`'s status for a failed connection, the same as an abend's (`main.rs`, "Exit status").
-    // audit: CBACT04C-038
-    ensure(
-        output.status.code() == Some(ABEND_STATUS),
-        &format!(
-            "a failed connection: exit status {:?}, expected {ABEND_STATUS}",
-            output.status.code()
-        ),
-    )?;
-    // audit: CBACT04C-034
-    ensure(
-        String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .next()
-            .is_some_and(|first| first.starts_with(CONNECT_STDERR_PREFIX)),
-        "a failed connection: the first standard-error line is not main's connection error",
-    )?;
-    // audit: CBACT04C-034
-    // audit: CBACT04C-038
-    let before = check_abend_log(&output, OPEN_TCATBAL_LINE, &[])?;
-    // The first line comes before the opens, so before the failed connection that stands for the
-    // first of them, whose event carries the cause.
-    // audit: CBACT04C-002
-    // audit: CBACT04C-034
-    ensure(
-        messages(&before) == [START_LINE, CONNECTION_FAILED],
-        "a failed connection: the job log before the first open's failure line is not the first \
-         line, then main's connection event",
-    )?;
-    // audit: CBACT04C-038
-    check_no_generation(&scratch, OPEN_TCATBAL_LINE)?;
-    for (stream, bytes) in [
-        ("standard output", &output.stdout),
-        ("standard error", &output.stderr),
-    ] {
-        let text = String::from_utf8_lossy(bytes);
+        let output = run_batch_on(&unreachable, &scratch, &["intcalc"]).await?;
+        // `main`'s status for a failed connection, the same as an abend's (`main.rs`, "Exit status").
+        // audit: CBACT04C-038
         ensure(
-            !text.contains(UNREACHABLE_PASSWORD) && !text.contains(&unreachable),
-            &format!("a failed connection: {stream} shows the database URL or its password"),
+            output.status.code() == Some(ABEND_STATUS),
+            &format!(
+                "a failed connection: exit status {:?}, expected {ABEND_STATUS}",
+                output.status.code()
+            ),
         )?;
-    }
-    // audit: CBACT04C-037
-    report_status_blocked(OPEN_TCATBAL_LINE);
-    Ok(())
+        // audit: CBACT04C-034
+        ensure(
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .is_some_and(|first| first.starts_with(CONNECT_STDERR_PREFIX)),
+            "a failed connection: the first standard-error line is not main's connection error",
+        )?;
+        // audit: CBACT04C-034
+        // audit: CBACT04C-038
+        let before = check_abend_log(&output, OPEN_TCATBAL_LINE, &[])?;
+        // The first line comes before the opens, so before the failed connection that stands for the
+        // first of them, whose event carries the cause.
+        // audit: CBACT04C-002
+        // audit: CBACT04C-034
+        ensure(
+            messages(&before) == [START_LINE, CONNECTION_FAILED],
+            "a failed connection: the job log before the first open's failure line is not the first \
+             line, then main's connection event",
+        )?;
+        // audit: CBACT04C-038
+        check_no_generation(&scratch, OPEN_TCATBAL_LINE)?;
+        for (stream, bytes) in [
+            ("standard output", &output.stdout),
+            ("standard error", &output.stderr),
+        ] {
+            let text = String::from_utf8_lossy(bytes);
+            ensure(
+                !text.contains(UNREACHABLE_PASSWORD) && !text.contains(&unreachable),
+                &format!("a failed connection: {stream} shows the database URL or its password"),
+            )?;
+        }
+        // audit: CBACT04C-037
+        report_status_blocked(OPEN_TCATBAL_LINE);
+        Ok(())
+    })
 }
 
 /// `1300-B-WRITE-TX` against a write that fails: `INTEREST-POSTED` under a file-size limit of one
@@ -1899,37 +1927,39 @@ async fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestRe
 /// `ERROR WRITING TRANSACTION RECORD`, removes the generation, and the rewrites committed before
 /// the failure stand: accounts 1 to j, for some j of at least 1, hold their FIXINT rewrite, and
 /// every later account, the last included, what `posttran` left.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_abends_on_a_failed_systran_write() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("write")?;
-    post_daily_transactions(&guard, &scratch, &mut store).await?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
+#[test]
+fn intcalc_abends_on_a_failed_systran_write() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("write")?;
+        post_daily_transactions(&guard, &scratch, &mut store).await?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
 
-    let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-031
-    // audit: CBACT04C-038
-    check_abended(&output, WRITE_TRANSACT_LINE)?;
-    // audit: CBACT04C-031
-    // audit: CBACT04C-038
-    check_no_generation(&scratch, WRITE_TRANSACT_LINE)?;
-    // audit: CBACT04C-038
-    let rewritten = posted_rewrites(
-        &accounts_before,
-        &AccountRepository::find_all(&mut store).await?,
-    )?;
-    // audit: CBACT04C-038
-    ensure(
-        rewritten >= 1,
-        "the rewrite of account 1, made before the failed write, does not stand",
-    )?;
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await?;
-    // audit: CBACT04C-037
-    report_status_blocked(WRITE_TRANSACT_LINE);
-    Ok(())
+        let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-031
+        // audit: CBACT04C-038
+        check_abended(&output, WRITE_TRANSACT_LINE)?;
+        // audit: CBACT04C-031
+        // audit: CBACT04C-038
+        check_no_generation(&scratch, WRITE_TRANSACT_LINE)?;
+        // audit: CBACT04C-038
+        let rewritten = posted_rewrites(
+            &accounts_before,
+            &AccountRepository::find_all(&mut store).await?,
+        )?;
+        // audit: CBACT04C-038
+        ensure(
+            rewritten >= 1,
+            "the rewrite of account 1, made before the failed write, does not stand",
+        )?;
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await?;
+        // audit: CBACT04C-037
+        report_status_blocked(WRITE_TRANSACT_LINE);
+        Ok(())
+    })
 }
 
 /// `9400-TRANFILE-CLOSE` against a close that fails: `INTEREST-POSTED` with only the type-`01`
@@ -1939,88 +1969,92 @@ async fn intcalc_abends_on_a_failed_systran_write() -> TestResult {
 /// removes the generation, and the rewrites of accounts 1 and 2 at the breaks before the close
 /// stand, while account 3, the last in key order, is never rewritten (E08) and accounts 4 to 50,
 /// which no category balance names, are never read.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_abends_on_a_failed_systran_close() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("close")?;
-    post_daily_transactions(&guard, &scratch, &mut store).await?;
-    let kept: Vec<TranCatBalanceRecord> = TranCatBalanceRepository::find_all(&mut store)
-        .await?
-        .into_iter()
-        .filter(|balance| balance.type_cd.as_bytes() == INTEREST_TYPE)
-        .take(CLOSE_RUN_ACCOUNTS.len())
-        .collect();
-    ensure(
-        kept.iter()
-            .map(|balance| balance.acct_id.get())
-            .eq(CLOSE_RUN_ACCOUNTS),
-        "POSTED: the first type-01 category balances are not those of accounts 1 to 3",
-    )?;
-    let mut tx = store.begin().await?;
-    TranCatBalanceRepository::replace_all(&mut tx, &kept).await?;
-    tx.commit().await?;
-    let accounts_before = AccountRepository::find_all(&mut store).await?;
-    let inputs_before = read_inputs(&mut store).await?;
+#[test]
+fn intcalc_abends_on_a_failed_systran_close() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("close")?;
+        post_daily_transactions(&guard, &scratch, &mut store).await?;
+        let kept: Vec<TranCatBalanceRecord> = TranCatBalanceRepository::find_all(&mut store)
+            .await?
+            .into_iter()
+            .filter(|balance| balance.type_cd.as_bytes() == INTEREST_TYPE)
+            .take(CLOSE_RUN_ACCOUNTS.len())
+            .collect();
+        ensure(
+            kept.iter()
+                .map(|balance| balance.acct_id.get())
+                .eq(CLOSE_RUN_ACCOUNTS),
+            "POSTED: the first type-01 category balances are not those of accounts 1 to 3",
+        )?;
+        let mut tx = store.begin().await?;
+        TranCatBalanceRepository::replace_all(&mut tx, &kept).await?;
+        tx.commit().await?;
+        let accounts_before = AccountRepository::find_all(&mut store).await?;
+        let inputs_before = read_inputs(&mut store).await?;
 
-    let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-035
-    // audit: CBACT04C-038
-    check_abended(&output, CLOSE_TRANSACT_LINE)?;
-    // audit: CBACT04C-035
-    ensure(
-        !messages(&events(&output.stdout)).contains(&END_LINE),
-        "a run whose close failed shows the END OF EXECUTION line",
-    )?;
-    // audit: CBACT04C-035
-    // audit: CBACT04C-038
-    check_no_generation(&scratch, CLOSE_TRANSACT_LINE)?;
-    // audit: CBACT04C-027
-    // audit: CBACT04C-028
-    // audit: CBACT04C-038
-    let rewritten = posted_rewrites(
-        &accounts_before,
-        &AccountRepository::find_all(&mut store).await?,
-    )?;
-    // audit: CBACT04C-027
-    // audit: CBACT04C-038
-    ensure(
-        rewritten == 2,
-        &format!(
-            "{rewritten} accounts rewritten before the failed close, expected accounts 1 and 2"
-        ),
-    )?;
-    // audit: CBACT04C-029
-    check_inputs_kept(&mut store, &inputs_before).await?;
-    // audit: CBACT04C-037
-    report_status_blocked(CLOSE_TRANSACT_LINE);
-    Ok(())
+        let output = run_batch_with_file_limit(&guard, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-035
+        // audit: CBACT04C-038
+        check_abended(&output, CLOSE_TRANSACT_LINE)?;
+        // audit: CBACT04C-035
+        ensure(
+            !messages(&events(&output.stdout)).contains(&END_LINE),
+            "a run whose close failed shows the END OF EXECUTION line",
+        )?;
+        // audit: CBACT04C-035
+        // audit: CBACT04C-038
+        check_no_generation(&scratch, CLOSE_TRANSACT_LINE)?;
+        // audit: CBACT04C-027
+        // audit: CBACT04C-028
+        // audit: CBACT04C-038
+        let rewritten = posted_rewrites(
+            &accounts_before,
+            &AccountRepository::find_all(&mut store).await?,
+        )?;
+        // audit: CBACT04C-027
+        // audit: CBACT04C-038
+        ensure(
+            rewritten == 2,
+            &format!(
+                "{rewritten} accounts rewritten before the failed close, expected accounts 1 and 2"
+            ),
+        )?;
+        // audit: CBACT04C-029
+        check_inputs_kept(&mut store, &inputs_before).await?;
+        // audit: CBACT04C-037
+        report_status_blocked(CLOSE_TRANSACT_LINE);
+        Ok(())
+    })
 }
 
 /// `1110-GET-XREF-DATA` for an account with two cross-references: the fixture's own and a
 /// second with a scratch card and the same account and customer. No source fixes how the
 /// program reads such an account (X-INTCALC-H5), so what the run did is reported `BLOCKED`,
 /// its exit status and the number of paths it printed, and no value of it is asserted.
-#[tokio::test(flavor = "multi_thread")]
-async fn intcalc_reports_a_duplicated_cross_reference_blocked() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("duplicate")?;
-    let mut second = CardXrefRepository::find_all(&mut store)
-        .await?
-        .into_iter()
-        .find(|xref| xref.acct_id.get() == DUPLICATED_ACCOUNT)
-        .ok_or("card_xref holds no cross-reference of account 1")?;
-    second.card_num = CardNumber::new(PicX::from_array(SCRATCH_CARD));
-    CardXrefRepository::insert(&mut store, &second).await?;
+#[test]
+fn intcalc_reports_a_duplicated_cross_reference_blocked() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("duplicate")?;
+        let mut second = CardXrefRepository::find_all(&mut store)
+            .await?
+            .into_iter()
+            .find(|xref| xref.acct_id.get() == DUPLICATED_ACCOUNT)
+            .ok_or("card_xref holds no cross-reference of account 1")?;
+        second.card_num = CardNumber::new(PicX::from_array(SCRATCH_CARD));
+        CardXrefRepository::insert(&mut store, &second).await?;
 
-    let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
-    // audit: CBACT04C-008
-    println!(
-        "BLOCKED CBACT04C-008 (X-INTCALC-H5): an account with two cross-references; the run \
-         exited with status {:?} and printed {} path(s), neither compared",
-        output.status.code(),
-        written_paths(&output.stdout).len()
-    );
-    Ok(())
+        let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
+        // audit: CBACT04C-008
+        println!(
+            "BLOCKED CBACT04C-008 (X-INTCALC-H5): an account with two cross-references; the run \
+             exited with status {:?} and printed {} path(s), neither compared",
+            output.status.code(),
+            written_paths(&output.stdout).len()
+        );
+        Ok(())
+    })
 }

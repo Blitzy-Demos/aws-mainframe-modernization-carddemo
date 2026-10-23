@@ -24,10 +24,14 @@
 //! A failed edit or read is no part of these types: it reaches the client as a `ScreenError`
 //! through `api::error`.
 
+use std::fmt;
+
 use domain::copybook::PicU;
 use domain::online::copaus0c as rules;
 use domain::sensitive::redact_free_text;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::{Validate, ValidationError};
 
@@ -42,7 +46,7 @@ const PAGE_KEY_CODE: &str = "page_key";
 /// page; `direction` with a `page_key` is F8 or F7 (COPAUS0C-008, COPAUS0C-041, COPAUS0C-047).
 // The schema name `AuthSummaryQuery` is the frontend's `components["schemas"]["AuthSummaryQuery"]`
 // (Generated API Types Only).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, IntoParams, Validate)]
+#[derive(Debug, Clone, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct AuthSummaryQuery {
     /// F8: the `last_key` of the page shown; F7: the `first_key` the screen saved for the page
@@ -67,11 +71,68 @@ pub struct AuthSummaryQuery {
     pub direction: Option<PageDirection>,
     /// Rows per page, 1 to 100; absent, the 5 rows of the map. A value outside that range is
     /// rejected with 422 (Bounded Pagination). The screen never sends it.
-    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]
     pub page_size: Option<i64>,
+}
+
+/// Every member in declaration order, an absent value as `null`.
+impl Serialize for AuthSummaryQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthSummaryQuery", 3)?;
+        out.serialize_field("page_key", &self.page_key)?;
+        out.serialize_field("direction", &self.direction)?;
+        out.serialize_field("page_size", &self.page_size)?;
+        out.end()
+    }
+}
+
+/// The members of [`AuthSummaryQuery`], in declaration order.
+const AUTH_SUMMARY_QUERY_MEMBERS: &[&str] = &["page_key", "direction", "page_size"];
+
+/// Every member optional, absent or `null` as `None`; `page_size` read as `QueryPageSize`
+/// reads it, so that every value reaches the range rule and its 422.
+impl<'de> Deserialize<'de> for AuthSummaryQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AuthSummaryQuery",
+            AUTH_SUMMARY_QUERY_MEMBERS,
+            AuthSummaryQueryVisitor,
+        )
+    }
+}
+
+/// The visitor of [`AuthSummaryQuery`]'s members.
+struct AuthSummaryQueryVisitor;
+
+impl<'de> Visitor<'de> for AuthSummaryQueryVisitor {
+    type Value = AuthSummaryQuery;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct AuthSummaryQuery")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AuthSummaryQuery, A::Error> {
+        let mut page_key = None;
+        let mut direction = None;
+        let mut page_size = None;
+        while let Some(name) = map.next_key_seed(WireName(AUTH_SUMMARY_QUERY_MEMBERS))? {
+            match name {
+                Some("page_key") => member(&mut map, &mut page_key, "page_key")?,
+                Some("direction") => member(&mut map, &mut direction, "direction")?,
+                Some("page_size") => member(&mut map, &mut page_size, "page_size")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(AuthSummaryQuery {
+            page_key: page_key.flatten(),
+            direction: direction.flatten(),
+            page_size: page_size.and_then(|QueryPageSize(size)| size),
+        })
+    }
 }
 
 /// The `page_key` rule: the text [`rules::AuthKey::parse`] accepts, the 16 digits
@@ -115,7 +176,7 @@ impl TryFrom<&AuthSummaryQuery> for rules::PageRequest {
 /// The map's one-byte `Acct Status` field has no member: COPAUS0C never fills it, so it is
 /// always blank and endpoint 21 returns no account status (COPAUS0C-026).
 // The schema name `AuthSummaryBlock` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "customer_id": "000000123",
     "customer_name": "ANN L DOE                ",
@@ -168,6 +229,135 @@ pub struct AuthSummaryBlock {
     pub declined_amount: String,
 }
 
+/// Every member in declaration order.
+impl Serialize for AuthSummaryBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthSummaryBlock", 14)?;
+        out.serialize_field("customer_id", &self.customer_id)?;
+        out.serialize_field("customer_name", &self.customer_name)?;
+        out.serialize_field("address_line_1", &self.address_line_1)?;
+        out.serialize_field("address_line_2", &self.address_line_2)?;
+        out.serialize_field("phone", &self.phone)?;
+        out.serialize_field("credit_limit", &self.credit_limit)?;
+        out.serialize_field("cash_limit", &self.cash_limit)?;
+        out.serialize_field("summary_found", &self.summary_found)?;
+        out.serialize_field("approved_count", &self.approved_count)?;
+        out.serialize_field("declined_count", &self.declined_count)?;
+        out.serialize_field("credit_balance", &self.credit_balance)?;
+        out.serialize_field("cash_balance", &self.cash_balance)?;
+        out.serialize_field("approved_amount", &self.approved_amount)?;
+        out.serialize_field("declined_amount", &self.declined_amount)?;
+        out.end()
+    }
+}
+
+/// The members of [`AuthSummaryBlock`], in declaration order.
+const AUTH_SUMMARY_BLOCK_MEMBERS: &[&str] = &[
+    "customer_id",
+    "customer_name",
+    "address_line_1",
+    "address_line_2",
+    "phone",
+    "credit_limit",
+    "cash_limit",
+    "summary_found",
+    "approved_count",
+    "declined_count",
+    "credit_balance",
+    "cash_balance",
+    "approved_amount",
+    "declined_amount",
+];
+
+/// Every member required.
+impl<'de> Deserialize<'de> for AuthSummaryBlock {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AuthSummaryBlock",
+            AUTH_SUMMARY_BLOCK_MEMBERS,
+            AuthSummaryBlockVisitor,
+        )
+    }
+}
+
+/// The visitor of [`AuthSummaryBlock`]'s members.
+struct AuthSummaryBlockVisitor;
+
+impl<'de> Visitor<'de> for AuthSummaryBlockVisitor {
+    type Value = AuthSummaryBlock;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct AuthSummaryBlock")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AuthSummaryBlock, A::Error> {
+        let mut customer_id = None;
+        let mut customer_name = None;
+        let mut address_line_1 = None;
+        let mut address_line_2 = None;
+        let mut phone = None;
+        let mut credit_limit = None;
+        let mut cash_limit = None;
+        let mut summary_found = None;
+        let mut approved_count = None;
+        let mut declined_count = None;
+        let mut credit_balance = None;
+        let mut cash_balance = None;
+        let mut approved_amount = None;
+        let mut declined_amount = None;
+        while let Some(name) = map.next_key_seed(WireName(AUTH_SUMMARY_BLOCK_MEMBERS))? {
+            match name {
+                Some("customer_id") => member(&mut map, &mut customer_id, "customer_id")?,
+                Some("customer_name") => member(&mut map, &mut customer_name, "customer_name")?,
+                Some("address_line_1") => member(&mut map, &mut address_line_1, "address_line_1")?,
+                Some("address_line_2") => member(&mut map, &mut address_line_2, "address_line_2")?,
+                Some("phone") => member(&mut map, &mut phone, "phone")?,
+                Some("credit_limit") => member(&mut map, &mut credit_limit, "credit_limit")?,
+                Some("cash_limit") => member(&mut map, &mut cash_limit, "cash_limit")?,
+                Some("summary_found") => member(&mut map, &mut summary_found, "summary_found")?,
+                Some("approved_count") => member(&mut map, &mut approved_count, "approved_count")?,
+                Some("declined_count") => member(&mut map, &mut declined_count, "declined_count")?,
+                Some("credit_balance") => member(&mut map, &mut credit_balance, "credit_balance")?,
+                Some("cash_balance") => member(&mut map, &mut cash_balance, "cash_balance")?,
+                Some("approved_amount") => {
+                    member(&mut map, &mut approved_amount, "approved_amount")?;
+                }
+                Some("declined_amount") => {
+                    member(&mut map, &mut declined_amount, "declined_amount")?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(AuthSummaryBlock {
+            customer_id: customer_id.ok_or_else(|| de::Error::missing_field("customer_id"))?,
+            customer_name: customer_name
+                .ok_or_else(|| de::Error::missing_field("customer_name"))?,
+            address_line_1: address_line_1
+                .ok_or_else(|| de::Error::missing_field("address_line_1"))?,
+            address_line_2: address_line_2
+                .ok_or_else(|| de::Error::missing_field("address_line_2"))?,
+            phone: phone.ok_or_else(|| de::Error::missing_field("phone"))?,
+            credit_limit: credit_limit.ok_or_else(|| de::Error::missing_field("credit_limit"))?,
+            cash_limit: cash_limit.ok_or_else(|| de::Error::missing_field("cash_limit"))?,
+            summary_found: summary_found
+                .ok_or_else(|| de::Error::missing_field("summary_found"))?,
+            approved_count: approved_count
+                .ok_or_else(|| de::Error::missing_field("approved_count"))?,
+            declined_count: declined_count
+                .ok_or_else(|| de::Error::missing_field("declined_count"))?,
+            credit_balance: credit_balance
+                .ok_or_else(|| de::Error::missing_field("credit_balance"))?,
+            cash_balance: cash_balance.ok_or_else(|| de::Error::missing_field("cash_balance"))?,
+            approved_amount: approved_amount
+                .ok_or_else(|| de::Error::missing_field("approved_amount"))?,
+            declined_amount: declined_amount
+                .ok_or_else(|| de::Error::missing_field("declined_amount"))?,
+        })
+    }
+}
+
 /// The block exactly as the domain renders it, its summary state as `summary_found`.
 impl From<rules::SummaryBlock> for AuthSummaryBlock {
     fn from(block: rules::SummaryBlock) -> Self {
@@ -200,7 +390,7 @@ impl From<rules::SummaryBlock> for AuthSummaryBlock {
 // The schema name `AuthSummaryRow` is fixed (Generated API Types Only). The example leaves out
 // `auth_key`: a key is sixteen digits, which a card-number scan of the emitted contract cannot
 // tell from a card number (Cardholder Data Redaction).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "transaction_id": "TX*********0001 ",
     "date": "01/31/24",
@@ -238,6 +428,93 @@ pub struct AuthSummaryRow {
     pub amount: String,
 }
 
+/// Every member in declaration order.
+impl Serialize for AuthSummaryRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthSummaryRow", 8)?;
+        out.serialize_field("auth_key", &self.auth_key)?;
+        out.serialize_field("transaction_id", &self.transaction_id)?;
+        out.serialize_field("date", &self.date)?;
+        out.serialize_field("time", &self.time)?;
+        out.serialize_field("auth_type", &self.auth_type)?;
+        out.serialize_field("approval", &self.approval)?;
+        out.serialize_field("match_status", &self.match_status)?;
+        out.serialize_field("amount", &self.amount)?;
+        out.end()
+    }
+}
+
+/// The members of [`AuthSummaryRow`], in declaration order.
+const AUTH_SUMMARY_ROW_MEMBERS: &[&str] = &[
+    "auth_key",
+    "transaction_id",
+    "date",
+    "time",
+    "auth_type",
+    "approval",
+    "match_status",
+    "amount",
+];
+
+/// Every member required.
+impl<'de> Deserialize<'de> for AuthSummaryRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AuthSummaryRow",
+            AUTH_SUMMARY_ROW_MEMBERS,
+            AuthSummaryRowVisitor,
+        )
+    }
+}
+
+/// The visitor of [`AuthSummaryRow`]'s members.
+struct AuthSummaryRowVisitor;
+
+impl<'de> Visitor<'de> for AuthSummaryRowVisitor {
+    type Value = AuthSummaryRow;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct AuthSummaryRow")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AuthSummaryRow, A::Error> {
+        let mut auth_key = None;
+        let mut transaction_id = None;
+        let mut date = None;
+        let mut time = None;
+        let mut auth_type = None;
+        let mut approval = None;
+        let mut match_status = None;
+        let mut amount = None;
+        while let Some(name) = map.next_key_seed(WireName(AUTH_SUMMARY_ROW_MEMBERS))? {
+            match name {
+                Some("auth_key") => member(&mut map, &mut auth_key, "auth_key")?,
+                Some("transaction_id") => member(&mut map, &mut transaction_id, "transaction_id")?,
+                Some("date") => member(&mut map, &mut date, "date")?,
+                Some("time") => member(&mut map, &mut time, "time")?,
+                Some("auth_type") => member(&mut map, &mut auth_type, "auth_type")?,
+                Some("approval") => member(&mut map, &mut approval, "approval")?,
+                Some("match_status") => member(&mut map, &mut match_status, "match_status")?,
+                Some("amount") => member(&mut map, &mut amount, "amount")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(AuthSummaryRow {
+            auth_key: auth_key.ok_or_else(|| de::Error::missing_field("auth_key"))?,
+            transaction_id: transaction_id
+                .ok_or_else(|| de::Error::missing_field("transaction_id"))?,
+            date: date.ok_or_else(|| de::Error::missing_field("date"))?,
+            time: time.ok_or_else(|| de::Error::missing_field("time"))?,
+            auth_type: auth_type.ok_or_else(|| de::Error::missing_field("auth_type"))?,
+            approval: approval.ok_or_else(|| de::Error::missing_field("approval"))?,
+            match_status: match_status.ok_or_else(|| de::Error::missing_field("match_status"))?,
+            amount: amount.ok_or_else(|| de::Error::missing_field("amount"))?,
+        })
+    }
+}
+
 /// The row as the domain renders it, its key through [`rules::AuthKey::render`] and its stored
 /// request text through [`redact_free_text`].
 impl From<rules::AuthRow> for AuthSummaryRow {
@@ -268,7 +545,7 @@ impl From<rules::AuthRow> for AuthSummaryRow {
 /// (COPAUS0C-052).
 // The schema name `AuthSummaryResponse` is the frontend's
 // `components["schemas"]["AuthSummaryResponse"]` (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AuthSummaryResponse {
     /// The account read, 11 digits with their leading zeros, which the account field shows.
     pub acct_id: String,
@@ -289,6 +566,82 @@ pub struct AuthSummaryResponse {
     /// program leaves the flag unset, and the screen keeps the value an earlier page gave it
     /// (COPAUS0C-036).
     pub has_next_page: Option<bool>,
+}
+
+/// Every member in declaration order, an absent key or flag as `null`.
+impl Serialize for AuthSummaryResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthSummaryResponse", 6)?;
+        out.serialize_field("acct_id", &self.acct_id)?;
+        out.serialize_field("summary", &self.summary)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.end()
+    }
+}
+
+/// The members of [`AuthSummaryResponse`], in declaration order.
+const AUTH_SUMMARY_RESPONSE_MEMBERS: &[&str] = &[
+    "acct_id",
+    "summary",
+    "rows",
+    "first_key",
+    "last_key",
+    "has_next_page",
+];
+
+/// `acct_id`, `summary` and `rows` required; the keys and the flag absent or `null` as `None`.
+impl<'de> Deserialize<'de> for AuthSummaryResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AuthSummaryResponse",
+            AUTH_SUMMARY_RESPONSE_MEMBERS,
+            AuthSummaryResponseVisitor,
+        )
+    }
+}
+
+/// The visitor of [`AuthSummaryResponse`]'s members.
+struct AuthSummaryResponseVisitor;
+
+impl<'de> Visitor<'de> for AuthSummaryResponseVisitor {
+    type Value = AuthSummaryResponse;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct AuthSummaryResponse")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AuthSummaryResponse, A::Error> {
+        let mut acct_id = None;
+        let mut summary = None;
+        let mut rows = None;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut has_next_page = None;
+        while let Some(name) = map.next_key_seed(WireName(AUTH_SUMMARY_RESPONSE_MEMBERS))? {
+            match name {
+                Some("acct_id") => member(&mut map, &mut acct_id, "acct_id")?,
+                Some("summary") => member(&mut map, &mut summary, "summary")?,
+                Some("rows") => member(&mut map, &mut rows, "rows")?,
+                Some("first_key") => member(&mut map, &mut first_key, "first_key")?,
+                Some("last_key") => member(&mut map, &mut last_key, "last_key")?,
+                Some("has_next_page") => member(&mut map, &mut has_next_page, "has_next_page")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(AuthSummaryResponse {
+            acct_id: acct_id.ok_or_else(|| de::Error::missing_field("acct_id"))?,
+            summary: summary.ok_or_else(|| de::Error::missing_field("summary"))?,
+            rows: rows.ok_or_else(|| de::Error::missing_field("rows"))?,
+            first_key: first_key.flatten(),
+            last_key: last_key.flatten(),
+            has_next_page: has_next_page.flatten(),
+        })
+    }
 }
 
 /// The response for the edited account, the block [`rules::summary_block`] built and the page
@@ -316,19 +669,70 @@ const fn next_page_flag(next_page: rules::NextPage) -> Option<bool> {
     }
 }
 
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// A `page_size` as [`super::page_size_from_query`] reads it from a query string.
+struct QueryPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for QueryPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_query(deserializer).map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error as StdError;
+    use std::fmt::Debug;
 
     use axum::extract::FromRequestParts;
     use axum::http::{Request, StatusCode};
     use domain::copybook::{PicS, PicU};
     use domain::online::copaus0c as rules;
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use serde_json::Value;
     use utoipa::{IntoParams, PartialSchema, ToSchema};
 
     use super::{
+        AUTH_SUMMARY_BLOCK_MEMBERS, AUTH_SUMMARY_RESPONSE_MEMBERS, AUTH_SUMMARY_ROW_MEMBERS,
         AuthSummaryBlock, AuthSummaryQuery, AuthSummaryResponse, AuthSummaryRow, PageDirection,
     };
     use crate::dto::{
@@ -337,6 +741,15 @@ mod tests {
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// The rendered key of an invented authorization: date part 75968, time part 869490879.
     const KEY: &str = "0759680869490879";
@@ -399,6 +812,73 @@ mod tests {
                 .await
                 .map(|ValidQuery(value)| value),
         )
+    }
+
+    /// Holds the JSON text of `value` to `wire`, its member names in declaration order, and to
+    /// its schema: the members leave in that order and are the schema's properties; read back,
+    /// a member no schema names is skipped, one named twice is refused, one the schema requires
+    /// is refused when absent, and any other reads absent as it reads `null`.
+    fn holds_its_members<T>(value: &T, wire: &[&str]) -> TestResult
+    where
+        T: Serialize + DeserializeOwned + PartialSchema + PartialEq + Debug,
+    {
+        let text = serde_json::to_string(value)?;
+        let object = serde_json::from_str::<Value>(&text)?
+            .as_object()
+            .cloned()
+            .ok_or("not a JSON object")?;
+        let schema = serde_json::to_value(T::schema())?;
+        assert_eq!(
+            members(&schema["properties"]),
+            wire.iter().copied().collect::<BTreeSet<_>>()
+        );
+        let positions = wire
+            .iter()
+            .map(|name| {
+                text.find(&format!("\"{name}\":"))
+                    .ok_or("member not written")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(positions.is_sorted(), "{text}");
+
+        let rest = text.get(1..).ok_or("empty JSON text")?;
+        let unknown = format!("{{\"unknown_member\":{{\"nested\":[1,\"two\",null]}},{rest}");
+        assert_eq!(serde_json::from_str::<T>(&unknown)?, *value);
+
+        let required: BTreeSet<&str> = schema["required"]
+            .as_array()
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        for name in wire {
+            let held = serde_json::to_string(object.get(*name).ok_or("member not written")?)?;
+            let repeated = format!("{{\"{name}\":{held},{rest}");
+            let error = serde_json::from_str::<T>(&repeated)
+                .err()
+                .ok_or("repeated member accepted")?;
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("duplicate field `{name}`")),
+                "{error}"
+            );
+
+            let mut absent = object.clone();
+            absent.remove(*name);
+            let read = serde_json::from_value::<T>(Value::Object(absent));
+            if required.contains(name) {
+                let error = read.err().ok_or("missing member accepted")?;
+                assert_eq!(error.to_string(), format!("missing field `{name}`"));
+            } else {
+                let mut null = object.clone();
+                null.insert((*name).to_owned(), Value::Null);
+                assert_eq!(
+                    read?,
+                    serde_json::from_value::<T>(Value::Object(null))?,
+                    "{name}"
+                );
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -617,79 +1097,138 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn the_query_string_is_parsed_and_validated() -> TestResult {
-        let parsed = query(&format!(
-            "/authorizations?page_key={KEY}&direction=backward&page_size=5"
-        ))
-        .await?
-        .map_err(|error| error.to_string())?;
-        assert_eq!(parsed.page_key.as_deref(), Some(KEY));
-        assert_eq!(parsed.direction, Some(PageDirection::Backward));
-        assert_eq!(parsed.page_size, Some(5));
+    /// The response, its block and a row, each held to [`holds_its_members`].
+    #[test]
+    fn the_response_types_read_their_members_as_their_schemas_declare_them() -> TestResult {
+        let page = rules::AuthPage {
+            rows: vec![
+                row(key(75_968, 869_490_879)?, rules::Approval::Approved),
+                row(key(75_968, 869_490_999)?, rules::Approval::Declined),
+            ],
+            next_page: rules::NextPage::Yes,
+        };
+        let response =
+            AuthSummaryResponse::from((account()?, block(rules::SummaryState::Found), page));
+        holds_its_members(&response, AUTH_SUMMARY_RESPONSE_MEMBERS)?;
+        holds_its_members(&response.summary, AUTH_SUMMARY_BLOCK_MEMBERS)?;
+        let first = response.rows.first().ok_or("no row")?;
+        holds_its_members(first, AUTH_SUMMARY_ROW_MEMBERS)
+    }
 
-        let empty = query("/authorizations")
+    #[test]
+    fn the_query_string_is_parsed_and_validated() -> TestResult {
+        block_on(async {
+            let parsed = query(&format!(
+                "/authorizations?page_key={KEY}&direction=backward&page_size=5"
+            ))
             .await?
             .map_err(|error| error.to_string())?;
-        assert_eq!(
-            (empty.page_key, empty.direction, empty.page_size),
-            (None, None, None)
-        );
+            assert_eq!(parsed.page_key.as_deref(), Some(KEY));
+            assert_eq!(parsed.direction, Some(PageDirection::Backward));
+            assert_eq!(parsed.page_size, Some(5));
 
-        for uri in [
-            "/authorizations?page_size=101",
-            "/authorizations?page_size=0",
-            "/authorizations?page_size=-5",
-            "/authorizations?page_key=x&page_size=101",
-            "/authorizations?page_size=five",
-            "/authorizations?page_size=",
-            "/authorizations?page_size=99999999999999999999",
-        ] {
-            let error = query(uri).await?.err().ok_or("page_size accepted")?;
+            let empty = query("/authorizations")
+                .await?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                (empty.page_key, empty.direction, empty.page_size),
+                (None, None, None)
+            );
+
+            for uri in [
+                "/authorizations?page_size=101",
+                "/authorizations?page_size=0",
+                "/authorizations?page_size=-5",
+                "/authorizations?page_key=x&page_size=101",
+                "/authorizations?page_size=five",
+                "/authorizations?page_size=",
+                "/authorizations?page_size=99999999999999999999",
+            ] {
+                let error = query(uri).await?.err().ok_or("page_size accepted")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        PAGE_SIZE_MESSAGE,
+                        Some(PAGE_SIZE_FIELD)
+                    ),
+                    "{uri}"
+                );
+            }
+
+            // Too short, too long, a letter, a sign digit other than 0 or 1, and a negative zero.
+            for page_key in [
+                "",
+                "075968086949087",
+                "07596808694908790",
+                "075968086949087A",
+                "2759680869490879",
+                "1000000869490879",
+            ] {
+                let error = query(&format!("/authorizations?page_key={page_key}"))
+                    .await?
+                    .err()
+                    .ok_or("malformed page_key accepted")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (
+                        StatusCode::BAD_REQUEST,
+                        FIELD_LENGTH_MESSAGE,
+                        Some("page_key")
+                    ),
+                    "{page_key:?}"
+                );
+                assert!(page_key.is_empty() || !error.message().contains(page_key));
+            }
+
+            let uri = "/authorizations?direction=sideways";
+            let error = query(uri).await?.err().ok_or("unreadable query accepted")?;
             assert_eq!(
                 (error.status(), error.message(), error.field()),
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    PAGE_SIZE_MESSAGE,
-                    Some(PAGE_SIZE_FIELD)
-                ),
+                (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
                 "{uri}"
             );
-        }
+            Ok(())
+        })
+    }
 
-        // Too short, too long, a letter, a sign digit other than 0 or 1, and a negative zero.
-        for page_key in [
-            "",
-            "075968086949087",
-            "07596808694908790",
-            "075968086949087A",
-            "2759680869490879",
-            "1000000869490879",
-        ] {
-            let error = query(&format!("/authorizations?page_key={page_key}"))
-                .await?
-                .err()
-                .ok_or("malformed page_key accepted")?;
+    /// A query member no schema names is skipped, and one named twice is the 400 of a query
+    /// that does not deserialise; the query writes every member, an absent one as `null`.
+    #[test]
+    fn the_query_skips_an_unknown_member_and_refuses_a_repeated_one() -> TestResult {
+        block_on(async {
+            let parsed = query(&format!(
+                "/authorizations?page=2&page_key={KEY}&acct_id=1&page_size=5"
+            ))
+            .await?
+            .map_err(|error| error.to_string())?;
             assert_eq!(
-                (error.status(), error.message(), error.field()),
                 (
-                    StatusCode::BAD_REQUEST,
-                    FIELD_LENGTH_MESSAGE,
-                    Some("page_key")
+                    parsed.page_key.as_deref(),
+                    parsed.direction,
+                    parsed.page_size
                 ),
-                "{page_key:?}"
+                (Some(KEY), None, Some(5))
             );
-            assert!(page_key.is_empty() || !error.message().contains(page_key));
-        }
+            assert_eq!(
+                serde_json::to_string(&parsed)?,
+                format!(r#"{{"page_key":"{KEY}","direction":null,"page_size":5}}"#)
+            );
 
-        let uri = "/authorizations?direction=sideways";
-        let error = query(uri).await?.err().ok_or("unreadable query accepted")?;
-        assert_eq!(
-            (error.status(), error.message(), error.field()),
-            (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
-            "{uri}"
-        );
-        Ok(())
+            for uri in [
+                format!("/authorizations?page_key={KEY}&page_key={NEXT_KEY}"),
+                "/authorizations?direction=forward&direction=forward".to_owned(),
+                "/authorizations?page_size=5&page_size=5".to_owned(),
+            ] {
+                let error = query(&uri).await?.err().ok_or("repeated member accepted")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
+                    "{uri}"
+                );
+            }
+            Ok(())
+        })
     }
 
     #[test]

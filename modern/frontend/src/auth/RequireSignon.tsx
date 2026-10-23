@@ -45,11 +45,13 @@ export function refusedTarget(admin: boolean): "/signon" | "/menu" | null {
  *
  * The route loaders decide the gate once per navigation; this guard decides it again whenever the
  * session changes under a mounted screen. It subscribes to the session store, so a session that
- * `api/client.ts` clears on a 401 re-renders it at once: the mounted screen gives way to `/signon`
- * without waiting for a navigation, as a CICS program started without a COMMAREA transfers to
- * COSGN00C. A page restored from the back/forward cache, whose session a later page of the tab may
- * have ended or replaced, has the guard read the session again as it resumes. The redirect carries
- * no return-to location, because COSGN00C always starts the user at a menu.
+ * `api/client.ts` clears on a 401 answering a request sent with that session's token re-renders it
+ * at once: the mounted screen gives way to `/signon` without waiting for a navigation, as a CICS
+ * program started without a COMMAREA transfers to COSGN00C. A 401 answering an earlier session's
+ * request clears nothing, so the screen stays (COSGN00C-021). A page restored from the
+ * back/forward cache, whose session a later page of the tab may have ended or replaced, has the
+ * guard read the session again as it resumes. The redirect carries no return-to location, because
+ * COSGN00C always starts the user at a menu.
  */
 export function RequireSignon({ admin = false, children }: RequireSignonProps): ReactNode {
   // Subscribes the guard to navigation. A layout route's `element` keeps one reference, so

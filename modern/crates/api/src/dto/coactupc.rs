@@ -47,11 +47,13 @@ use axum::response::{IntoResponse, Response};
 use chrono::NaiveDate;
 use domain::online::coactupc as rules;
 use domain::sensitive::Ssn;
+use serde::de::{self, Deserializer, EnumAccess, MapAccess, VariantAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
-use super::{digits, full_text};
+use super::{Member, ObjectBody, ObjectMembers, digits, full_text, read_object, skip_member};
 use crate::error::{ScreenError, ServiceError};
 
 /// What `Debug` prints for an SSN part that is present.
@@ -63,18 +65,58 @@ const SSN_PART_MASK: &str = "***";
 /// `snapshot.state` is `N`. Any other key text is read as `ENTER`, as `0000-MAIN` processes
 /// every other key, `PF12` included, as ENTER (COACTUPC-004); a value that is not a string is a
 /// 400.
-// `#[serde(other)]` must sit on the last variant, so `Enter` follows `Pf5`. The schema name
-// `CoactupcAid` keeps the program's key enum apart from the other programs' (Generated API Types
-// Only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+// `Enter` follows `Pf5`, the order of the schema's `enum` values, which the `rename`s give. The
+// schema name `CoactupcAid` keeps the program's key enum apart from the other programs'
+// (Generated API Types Only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
 #[schema(as = CoactupcAid)]
 pub enum Aid {
     /// F5: the save of changes validated in state `N`.
     #[serde(rename = "PF5")]
     Pf5,
     /// ENTER, and every key text other than `PF5`.
-    #[serde(rename = "ENTER", other)]
+    #[serde(rename = "ENTER")]
     Enter,
+}
+
+/// The wire texts of [`Aid`]'s variants, in declaration order.
+const AIDS: &[&str] = &["PF5", "ENTER"];
+
+/// `"PF5"` or `"ENTER"`.
+impl Serialize for Aid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, text) = match self {
+            Self::Pf5 => (0, "PF5"),
+            Self::Enter => (1, "ENTER"),
+        };
+        serializer.serialize_unit_variant("Aid", index, text)
+    }
+}
+
+/// `PF5`, and `ENTER` for every other key text, from a JSON string or the map form
+/// `{"PF5": null}`; a value that names no key, such as a number, is an error.
+impl<'de> Deserialize<'de> for Aid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_enum("Aid", AIDS, AidVisitor)
+    }
+}
+
+/// The visitor of [`Aid`]'s `Deserialize`: a unit variant named by its key text.
+struct AidVisitor;
+
+impl<'de> Visitor<'de> for AidVisitor {
+    type Value = Aid;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("enum Aid")
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Aid, A::Error> {
+        let (text, variant) = data.variant::<String>()?;
+        variant.unit_variant()?;
+        // COACTUPC-004: every key other than PF5 is processed as ENTER.
+        Ok(if text == "PF5" { Aid::Pf5 } else { Aid::Enter })
+    }
 }
 
 impl From<Aid> for rules::Aid {
@@ -84,14 +126,6 @@ impl From<Aid> for rules::Aid {
             Aid::Enter => Self::Enter,
         }
     }
-}
-
-/// `serde`'s `skip_serializing_if` predicate of the SSN parts: always skip.
-///
-/// A predicate rather than `skip_serializing`, which would also drop the members from the
-/// `OpenAPI` schema, where they must appear as `writeOnly` request input.
-const fn withheld<T>(_: &T) -> bool {
-    true
 }
 
 /// The raw text of every enterable map field of an endpoint 6 request, each fitting its map
@@ -106,8 +140,10 @@ const fn withheld<T>(_: &T) -> bool {
 // The byte rule is the parent module's `pic_x` beside each `length`, whose rejection text is
 // `FIELD_LENGTH_MESSAGE`, before COACTUPC's edits run. `length` counts characters, and the
 // save writes each value into a `PicX` that holds printable ASCII only, so without `pic_x` a
-// text such as `PASSPORTé` or one holding a TAB would pass the edits and fail every F5.
-#[derive(Clone, Default, Serialize, Deserialize, ToSchema, Validate)]
+// text such as `PASSPORTé` or one holding a TAB would pass the edits and fail every F5. The
+// container `default` tells the schema that no member is required, as the hand-written
+// `Deserialize` below reads it.
+#[derive(Clone, Default, ToSchema, Validate)]
 #[serde(default)]
 pub struct AccountUpdateFields {
     /// `ACSTTUS` (1): the active status.
@@ -179,17 +215,14 @@ pub struct AccountUpdateFields {
     #[validate(length(max = 9), custom(function = "super::pic_x::<9>"))]
     pub customer_id: String,
     /// `ACTSSN1` (3): the first three SSN digits, only when re-entered.
-    #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 3, example = "***")]
     #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub ssn_part1: Option<String>,
     /// `ACTSSN2` (2): the fourth and fifth SSN digits, only when re-entered.
-    #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 2, example = "**")]
     #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub ssn_part2: Option<String>,
     /// `ACTSSN3` (4): the last four SSN digits, only when re-entered.
-    #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 4, example = "****")]
     #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub ssn_part3: Option<String>,
@@ -404,6 +437,258 @@ impl fmt::Debug for AccountUpdateFields {
     }
 }
 
+/// Every member in declaration order but the SSN parts, which are never written.
+impl Serialize for AccountUpdateFields {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateFields", 39)?;
+        state.serialize_field("active_status", &self.active_status)?;
+        state.serialize_field("open_year", &self.open_year)?;
+        state.serialize_field("open_month", &self.open_month)?;
+        state.serialize_field("open_day", &self.open_day)?;
+        state.serialize_field("credit_limit", &self.credit_limit)?;
+        state.serialize_field("expiry_year", &self.expiry_year)?;
+        state.serialize_field("expiry_month", &self.expiry_month)?;
+        state.serialize_field("expiry_day", &self.expiry_day)?;
+        state.serialize_field("cash_credit_limit", &self.cash_credit_limit)?;
+        state.serialize_field("reissue_year", &self.reissue_year)?;
+        state.serialize_field("reissue_month", &self.reissue_month)?;
+        state.serialize_field("reissue_day", &self.reissue_day)?;
+        state.serialize_field("current_balance", &self.current_balance)?;
+        state.serialize_field("current_cycle_credit", &self.current_cycle_credit)?;
+        state.serialize_field("group_id", &self.group_id)?;
+        state.serialize_field("current_cycle_debit", &self.current_cycle_debit)?;
+        state.serialize_field("customer_id", &self.customer_id)?;
+        // Cardholder Data Redaction: the re-entered SSN parts are input only.
+        state.skip_field("ssn_part1")?;
+        state.skip_field("ssn_part2")?;
+        state.skip_field("ssn_part3")?;
+        state.serialize_field("dob_year", &self.dob_year)?;
+        state.serialize_field("dob_month", &self.dob_month)?;
+        state.serialize_field("dob_day", &self.dob_day)?;
+        state.serialize_field("fico_score", &self.fico_score)?;
+        state.serialize_field("first_name", &self.first_name)?;
+        state.serialize_field("middle_name", &self.middle_name)?;
+        state.serialize_field("last_name", &self.last_name)?;
+        state.serialize_field("address_line_1", &self.address_line_1)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("address_line_2", &self.address_line_2)?;
+        state.serialize_field("zip", &self.zip)?;
+        state.serialize_field("city", &self.city)?;
+        state.serialize_field("country", &self.country)?;
+        state.serialize_field("phone_1_area", &self.phone_1_area)?;
+        state.serialize_field("phone_1_prefix", &self.phone_1_prefix)?;
+        state.serialize_field("phone_1_line", &self.phone_1_line)?;
+        state.serialize_field("government_id", &self.government_id)?;
+        state.serialize_field("phone_2_area", &self.phone_2_area)?;
+        state.serialize_field("phone_2_prefix", &self.phone_2_prefix)?;
+        state.serialize_field("phone_2_line", &self.phone_2_line)?;
+        state.serialize_field("eft_account_id", &self.eft_account_id)?;
+        state.serialize_field("primary_card_holder", &self.primary_card_holder)?;
+        state.end()
+    }
+}
+
+/// A JSON object of the map fields: an absent member is `AccountUpdateFields::default()`'s, the
+/// empty text or, for an SSN part, `None`, as is an SSN part that is `null`. An unknown member is
+/// skipped; a repeated one is an error.
+impl<'de> Deserialize<'de> for AccountUpdateFields {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, AccountUpdateFieldsMembers>(deserializer)
+    }
+}
+
+/// The members of an [`AccountUpdateFields`] being read.
+#[derive(Default)]
+struct AccountUpdateFieldsMembers {
+    active_status: Member<String>,
+    open_year: Member<String>,
+    open_month: Member<String>,
+    open_day: Member<String>,
+    credit_limit: Member<String>,
+    expiry_year: Member<String>,
+    expiry_month: Member<String>,
+    expiry_day: Member<String>,
+    cash_credit_limit: Member<String>,
+    reissue_year: Member<String>,
+    reissue_month: Member<String>,
+    reissue_day: Member<String>,
+    current_balance: Member<String>,
+    current_cycle_credit: Member<String>,
+    group_id: Member<String>,
+    current_cycle_debit: Member<String>,
+    customer_id: Member<String>,
+    ssn_part1: Member<Option<String>>,
+    ssn_part2: Member<Option<String>>,
+    ssn_part3: Member<Option<String>>,
+    dob_year: Member<String>,
+    dob_month: Member<String>,
+    dob_day: Member<String>,
+    fico_score: Member<String>,
+    first_name: Member<String>,
+    middle_name: Member<String>,
+    last_name: Member<String>,
+    address_line_1: Member<String>,
+    state: Member<String>,
+    address_line_2: Member<String>,
+    zip: Member<String>,
+    city: Member<String>,
+    country: Member<String>,
+    phone_1_area: Member<String>,
+    phone_1_prefix: Member<String>,
+    phone_1_line: Member<String>,
+    government_id: Member<String>,
+    phone_2_area: Member<String>,
+    phone_2_prefix: Member<String>,
+    phone_2_line: Member<String>,
+    eft_account_id: Member<String>,
+    primary_card_holder: Member<String>,
+}
+
+impl ObjectMembers for AccountUpdateFieldsMembers {
+    type Object = AccountUpdateFields;
+    const NAME: &'static str = "AccountUpdateFields";
+    const FIELDS: &'static [&'static str] = &[
+        "active_status",
+        "open_year",
+        "open_month",
+        "open_day",
+        "credit_limit",
+        "expiry_year",
+        "expiry_month",
+        "expiry_day",
+        "cash_credit_limit",
+        "reissue_year",
+        "reissue_month",
+        "reissue_day",
+        "current_balance",
+        "current_cycle_credit",
+        "group_id",
+        "current_cycle_debit",
+        "customer_id",
+        "ssn_part1",
+        "ssn_part2",
+        "ssn_part3",
+        "dob_year",
+        "dob_month",
+        "dob_day",
+        "fico_score",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "address_line_1",
+        "state",
+        "address_line_2",
+        "zip",
+        "city",
+        "country",
+        "phone_1_area",
+        "phone_1_prefix",
+        "phone_1_line",
+        "government_id",
+        "phone_2_area",
+        "phone_2_prefix",
+        "phone_2_line",
+        "eft_account_id",
+        "primary_card_holder",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "active_status" => self.active_status.read(map, "active_status"),
+            "open_year" => self.open_year.read(map, "open_year"),
+            "open_month" => self.open_month.read(map, "open_month"),
+            "open_day" => self.open_day.read(map, "open_day"),
+            "credit_limit" => self.credit_limit.read(map, "credit_limit"),
+            "expiry_year" => self.expiry_year.read(map, "expiry_year"),
+            "expiry_month" => self.expiry_month.read(map, "expiry_month"),
+            "expiry_day" => self.expiry_day.read(map, "expiry_day"),
+            "cash_credit_limit" => self.cash_credit_limit.read(map, "cash_credit_limit"),
+            "reissue_year" => self.reissue_year.read(map, "reissue_year"),
+            "reissue_month" => self.reissue_month.read(map, "reissue_month"),
+            "reissue_day" => self.reissue_day.read(map, "reissue_day"),
+            "current_balance" => self.current_balance.read(map, "current_balance"),
+            "current_cycle_credit" => self.current_cycle_credit.read(map, "current_cycle_credit"),
+            "group_id" => self.group_id.read(map, "group_id"),
+            "current_cycle_debit" => self.current_cycle_debit.read(map, "current_cycle_debit"),
+            "customer_id" => self.customer_id.read(map, "customer_id"),
+            "ssn_part1" => self.ssn_part1.read(map, "ssn_part1"),
+            "ssn_part2" => self.ssn_part2.read(map, "ssn_part2"),
+            "ssn_part3" => self.ssn_part3.read(map, "ssn_part3"),
+            "dob_year" => self.dob_year.read(map, "dob_year"),
+            "dob_month" => self.dob_month.read(map, "dob_month"),
+            "dob_day" => self.dob_day.read(map, "dob_day"),
+            "fico_score" => self.fico_score.read(map, "fico_score"),
+            "first_name" => self.first_name.read(map, "first_name"),
+            "middle_name" => self.middle_name.read(map, "middle_name"),
+            "last_name" => self.last_name.read(map, "last_name"),
+            "address_line_1" => self.address_line_1.read(map, "address_line_1"),
+            "state" => self.state.read(map, "state"),
+            "address_line_2" => self.address_line_2.read(map, "address_line_2"),
+            "zip" => self.zip.read(map, "zip"),
+            "city" => self.city.read(map, "city"),
+            "country" => self.country.read(map, "country"),
+            "phone_1_area" => self.phone_1_area.read(map, "phone_1_area"),
+            "phone_1_prefix" => self.phone_1_prefix.read(map, "phone_1_prefix"),
+            "phone_1_line" => self.phone_1_line.read(map, "phone_1_line"),
+            "government_id" => self.government_id.read(map, "government_id"),
+            "phone_2_area" => self.phone_2_area.read(map, "phone_2_area"),
+            "phone_2_prefix" => self.phone_2_prefix.read(map, "phone_2_prefix"),
+            "phone_2_line" => self.phone_2_line.read(map, "phone_2_line"),
+            "eft_account_id" => self.eft_account_id.read(map, "eft_account_id"),
+            "primary_card_holder" => self.primary_card_holder.read(map, "primary_card_holder"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<AccountUpdateFields, E> {
+        let default = AccountUpdateFields::default();
+        Ok(AccountUpdateFields {
+            active_status: self.active_status.or(default.active_status),
+            open_year: self.open_year.or(default.open_year),
+            open_month: self.open_month.or(default.open_month),
+            open_day: self.open_day.or(default.open_day),
+            credit_limit: self.credit_limit.or(default.credit_limit),
+            expiry_year: self.expiry_year.or(default.expiry_year),
+            expiry_month: self.expiry_month.or(default.expiry_month),
+            expiry_day: self.expiry_day.or(default.expiry_day),
+            cash_credit_limit: self.cash_credit_limit.or(default.cash_credit_limit),
+            reissue_year: self.reissue_year.or(default.reissue_year),
+            reissue_month: self.reissue_month.or(default.reissue_month),
+            reissue_day: self.reissue_day.or(default.reissue_day),
+            current_balance: self.current_balance.or(default.current_balance),
+            current_cycle_credit: self.current_cycle_credit.or(default.current_cycle_credit),
+            group_id: self.group_id.or(default.group_id),
+            current_cycle_debit: self.current_cycle_debit.or(default.current_cycle_debit),
+            customer_id: self.customer_id.or(default.customer_id),
+            ssn_part1: self.ssn_part1.or(default.ssn_part1),
+            ssn_part2: self.ssn_part2.or(default.ssn_part2),
+            ssn_part3: self.ssn_part3.or(default.ssn_part3),
+            dob_year: self.dob_year.or(default.dob_year),
+            dob_month: self.dob_month.or(default.dob_month),
+            dob_day: self.dob_day.or(default.dob_day),
+            fico_score: self.fico_score.or(default.fico_score),
+            first_name: self.first_name.or(default.first_name),
+            middle_name: self.middle_name.or(default.middle_name),
+            last_name: self.last_name.or(default.last_name),
+            address_line_1: self.address_line_1.or(default.address_line_1),
+            state: self.state.or(default.state),
+            address_line_2: self.address_line_2.or(default.address_line_2),
+            zip: self.zip.or(default.zip),
+            city: self.city.or(default.city),
+            country: self.country.or(default.country),
+            phone_1_area: self.phone_1_area.or(default.phone_1_area),
+            phone_1_prefix: self.phone_1_prefix.or(default.phone_1_prefix),
+            phone_1_line: self.phone_1_line.or(default.phone_1_line),
+            government_id: self.government_id.or(default.government_id),
+            phone_2_area: self.phone_2_area.or(default.phone_2_area),
+            phone_2_prefix: self.phone_2_prefix.or(default.phone_2_prefix),
+            phone_2_line: self.phone_2_line.or(default.phone_2_line),
+            eft_account_id: self.eft_account_id.or(default.eft_account_id),
+            primary_card_holder: self.primary_card_holder.or(default.primary_card_holder),
+        })
+    }
+}
+
 /// `ACUP-OLD-DETAILS` and `ACUP-CHANGE-ACTION`: the values endpoint 5 fetched, which the client
 /// echoes in every endpoint 6 request (COACTUPC-100).
 ///
@@ -412,7 +697,7 @@ impl fmt::Debug for AccountUpdateFields {
 /// `null` for a blank field. The SSN is only its last four digits (E32). A value the client
 /// alters is read as unknown and equals nothing, so it counts as a change and, at a save, as a
 /// record changed by another user: the snapshot grants nothing.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 pub struct AccountUpdateSnapshot {
     /// `ACUP-CHANGE-ACTION`: a space before a fetch, `S` details shown, `E` changes not OK,
     /// `N` changes validated, `C` saved, `L` lock failed, `F` rewrite failed.
@@ -502,6 +787,195 @@ pub struct AccountUpdateSnapshot {
     /// `ACUP-OLD-CUST-FICO-SCORE`, three digits.
     #[validate(length(max = 3))]
     pub fico_score: String,
+}
+
+/// Every member in declaration order, a blank date as `null`.
+impl Serialize for AccountUpdateSnapshot {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateSnapshot", 30)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("account_id", &self.account_id)?;
+        state.serialize_field("active_status", &self.active_status)?;
+        state.serialize_field("current_balance", &self.current_balance)?;
+        state.serialize_field("credit_limit", &self.credit_limit)?;
+        state.serialize_field("cash_credit_limit", &self.cash_credit_limit)?;
+        state.serialize_field("open_date", &self.open_date)?;
+        state.serialize_field("expiry_date", &self.expiry_date)?;
+        state.serialize_field("reissue_date", &self.reissue_date)?;
+        state.serialize_field("current_cycle_credit", &self.current_cycle_credit)?;
+        state.serialize_field("current_cycle_debit", &self.current_cycle_debit)?;
+        state.serialize_field("group_id", &self.group_id)?;
+        state.serialize_field("customer_id", &self.customer_id)?;
+        state.serialize_field("first_name", &self.first_name)?;
+        state.serialize_field("middle_name", &self.middle_name)?;
+        state.serialize_field("last_name", &self.last_name)?;
+        state.serialize_field("address_line_1", &self.address_line_1)?;
+        state.serialize_field("address_line_2", &self.address_line_2)?;
+        state.serialize_field("city", &self.city)?;
+        state.serialize_field("state_code", &self.state_code)?;
+        state.serialize_field("country", &self.country)?;
+        state.serialize_field("zip", &self.zip)?;
+        state.serialize_field("phone_1", &self.phone_1)?;
+        state.serialize_field("phone_2", &self.phone_2)?;
+        state.serialize_field("ssn_last4", &self.ssn_last4)?;
+        state.serialize_field("government_id", &self.government_id)?;
+        state.serialize_field("dob", &self.dob)?;
+        state.serialize_field("eft_account_id", &self.eft_account_id)?;
+        state.serialize_field("primary_card_holder", &self.primary_card_holder)?;
+        state.serialize_field("fico_score", &self.fico_score)?;
+        state.end()
+    }
+}
+
+/// A JSON object of every member; a date may be absent or `null`, a blank date. An unknown member
+/// is skipped; a repeated one, or an absent text, is an error.
+impl<'de> Deserialize<'de> for AccountUpdateSnapshot {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, AccountUpdateSnapshotMembers>(deserializer)
+    }
+}
+
+/// The members of an [`AccountUpdateSnapshot`] being read.
+#[derive(Default)]
+struct AccountUpdateSnapshotMembers {
+    state: Member<String>,
+    account_id: Member<String>,
+    active_status: Member<String>,
+    current_balance: Member<String>,
+    credit_limit: Member<String>,
+    cash_credit_limit: Member<String>,
+    open_date: Member<Option<NaiveDate>>,
+    expiry_date: Member<Option<NaiveDate>>,
+    reissue_date: Member<Option<NaiveDate>>,
+    current_cycle_credit: Member<String>,
+    current_cycle_debit: Member<String>,
+    group_id: Member<String>,
+    customer_id: Member<String>,
+    first_name: Member<String>,
+    middle_name: Member<String>,
+    last_name: Member<String>,
+    address_line_1: Member<String>,
+    address_line_2: Member<String>,
+    city: Member<String>,
+    state_code: Member<String>,
+    country: Member<String>,
+    zip: Member<String>,
+    phone_1: Member<String>,
+    phone_2: Member<String>,
+    ssn_last4: Member<String>,
+    government_id: Member<String>,
+    dob: Member<Option<NaiveDate>>,
+    eft_account_id: Member<String>,
+    primary_card_holder: Member<String>,
+    fico_score: Member<String>,
+}
+
+impl ObjectMembers for AccountUpdateSnapshotMembers {
+    type Object = AccountUpdateSnapshot;
+    const NAME: &'static str = "AccountUpdateSnapshot";
+    const FIELDS: &'static [&'static str] = &[
+        "state",
+        "account_id",
+        "active_status",
+        "current_balance",
+        "credit_limit",
+        "cash_credit_limit",
+        "open_date",
+        "expiry_date",
+        "reissue_date",
+        "current_cycle_credit",
+        "current_cycle_debit",
+        "group_id",
+        "customer_id",
+        "first_name",
+        "middle_name",
+        "last_name",
+        "address_line_1",
+        "address_line_2",
+        "city",
+        "state_code",
+        "country",
+        "zip",
+        "phone_1",
+        "phone_2",
+        "ssn_last4",
+        "government_id",
+        "dob",
+        "eft_account_id",
+        "primary_card_holder",
+        "fico_score",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "state" => self.state.read(map, "state"),
+            "account_id" => self.account_id.read(map, "account_id"),
+            "active_status" => self.active_status.read(map, "active_status"),
+            "current_balance" => self.current_balance.read(map, "current_balance"),
+            "credit_limit" => self.credit_limit.read(map, "credit_limit"),
+            "cash_credit_limit" => self.cash_credit_limit.read(map, "cash_credit_limit"),
+            "open_date" => self.open_date.read(map, "open_date"),
+            "expiry_date" => self.expiry_date.read(map, "expiry_date"),
+            "reissue_date" => self.reissue_date.read(map, "reissue_date"),
+            "current_cycle_credit" => self.current_cycle_credit.read(map, "current_cycle_credit"),
+            "current_cycle_debit" => self.current_cycle_debit.read(map, "current_cycle_debit"),
+            "group_id" => self.group_id.read(map, "group_id"),
+            "customer_id" => self.customer_id.read(map, "customer_id"),
+            "first_name" => self.first_name.read(map, "first_name"),
+            "middle_name" => self.middle_name.read(map, "middle_name"),
+            "last_name" => self.last_name.read(map, "last_name"),
+            "address_line_1" => self.address_line_1.read(map, "address_line_1"),
+            "address_line_2" => self.address_line_2.read(map, "address_line_2"),
+            "city" => self.city.read(map, "city"),
+            "state_code" => self.state_code.read(map, "state_code"),
+            "country" => self.country.read(map, "country"),
+            "zip" => self.zip.read(map, "zip"),
+            "phone_1" => self.phone_1.read(map, "phone_1"),
+            "phone_2" => self.phone_2.read(map, "phone_2"),
+            "ssn_last4" => self.ssn_last4.read(map, "ssn_last4"),
+            "government_id" => self.government_id.read(map, "government_id"),
+            "dob" => self.dob.read(map, "dob"),
+            "eft_account_id" => self.eft_account_id.read(map, "eft_account_id"),
+            "primary_card_holder" => self.primary_card_holder.read(map, "primary_card_holder"),
+            "fico_score" => self.fico_score.read(map, "fico_score"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<AccountUpdateSnapshot, E> {
+        Ok(AccountUpdateSnapshot {
+            state: self.state.required("state")?,
+            account_id: self.account_id.required("account_id")?,
+            active_status: self.active_status.required("active_status")?,
+            current_balance: self.current_balance.required("current_balance")?,
+            credit_limit: self.credit_limit.required("credit_limit")?,
+            cash_credit_limit: self.cash_credit_limit.required("cash_credit_limit")?,
+            open_date: self.open_date.optional(),
+            expiry_date: self.expiry_date.optional(),
+            reissue_date: self.reissue_date.optional(),
+            current_cycle_credit: self.current_cycle_credit.required("current_cycle_credit")?,
+            current_cycle_debit: self.current_cycle_debit.required("current_cycle_debit")?,
+            group_id: self.group_id.required("group_id")?,
+            customer_id: self.customer_id.required("customer_id")?,
+            first_name: self.first_name.required("first_name")?,
+            middle_name: self.middle_name.required("middle_name")?,
+            last_name: self.last_name.required("last_name")?,
+            address_line_1: self.address_line_1.required("address_line_1")?,
+            address_line_2: self.address_line_2.required("address_line_2")?,
+            city: self.city.required("city")?,
+            state_code: self.state_code.required("state_code")?,
+            country: self.country.required("country")?,
+            zip: self.zip.required("zip")?,
+            phone_1: self.phone_1.required("phone_1")?,
+            phone_2: self.phone_2.required("phone_2")?,
+            ssn_last4: self.ssn_last4.required("ssn_last4")?,
+            government_id: self.government_id.required("government_id")?,
+            dob: self.dob.optional(),
+            eft_account_id: self.eft_account_id.required("eft_account_id")?,
+            primary_card_holder: self.primary_card_holder.required("primary_card_holder")?,
+            fico_score: self.fico_score.required("fico_score")?,
+        })
+    }
 }
 
 /// The snapshot as the text the client echoes, from `rules::Snapshot::fields`.
@@ -615,7 +1089,7 @@ impl From<&AccountUpdateSnapshot> for rules::Snapshot {
 
 /// The five amounts as the screen shows them after endpoint 6 validated or saved them: each the
 /// 15-character `+ZZZ,ZZZ,ZZZ.99` string of its value (COACTUPC-078, COACTUPC-109).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountUpdateAmounts {
     /// `ACRDLIM`.
     pub credit_limit: String,
@@ -627,6 +1101,19 @@ pub struct AccountUpdateAmounts {
     pub current_cycle_credit: String,
     /// `ACRCYDB`.
     pub current_cycle_debit: String,
+}
+
+/// Every member in declaration order.
+impl Serialize for AccountUpdateAmounts {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateAmounts", 5)?;
+        state.serialize_field("credit_limit", &self.credit_limit)?;
+        state.serialize_field("cash_credit_limit", &self.cash_credit_limit)?;
+        state.serialize_field("current_balance", &self.current_balance)?;
+        state.serialize_field("current_cycle_credit", &self.current_cycle_credit)?;
+        state.serialize_field("current_cycle_debit", &self.current_cycle_debit)?;
+        state.end()
+    }
 }
 
 impl From<rules::ShownAmounts> for AccountUpdateAmounts {
@@ -661,7 +1148,7 @@ impl From<rules::ShownAmounts> for AccountUpdateAmounts {
 /// is held.
 // No error-message member: a shown view has none (COACTUPC-068), so only the info line travels.
 // No `Deserialize`: `Ssn` serialises redacted only and cannot be read back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountUpdateView {
     /// `ACCTSID`: the account number, eleven digits, read-only once details are shown.
     pub account_id: String,
@@ -736,6 +1223,49 @@ pub struct AccountUpdateView {
     pub info_message: String,
     /// The fetched values and state `S`, echoed in every endpoint 6 request.
     pub snapshot: AccountUpdateSnapshot,
+}
+
+/// Every member in declaration order: the SSN in its redacted form, a blank date as `null`.
+impl Serialize for AccountUpdateView {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateView", 35)?;
+        state.serialize_field("account_id", &self.account_id)?;
+        state.serialize_field("active_status", &self.active_status)?;
+        state.serialize_field("open_date", &self.open_date)?;
+        state.serialize_field("credit_limit", &self.credit_limit)?;
+        state.serialize_field("expiry_date", &self.expiry_date)?;
+        state.serialize_field("cash_credit_limit", &self.cash_credit_limit)?;
+        state.serialize_field("reissue_date", &self.reissue_date)?;
+        state.serialize_field("current_balance", &self.current_balance)?;
+        state.serialize_field("current_cycle_credit", &self.current_cycle_credit)?;
+        state.serialize_field("group_id", &self.group_id)?;
+        state.serialize_field("current_cycle_debit", &self.current_cycle_debit)?;
+        state.serialize_field("customer_id", &self.customer_id)?;
+        state.serialize_field("ssn", &self.ssn)?;
+        state.serialize_field("dob", &self.dob)?;
+        state.serialize_field("fico_score", &self.fico_score)?;
+        state.serialize_field("first_name", &self.first_name)?;
+        state.serialize_field("middle_name", &self.middle_name)?;
+        state.serialize_field("last_name", &self.last_name)?;
+        state.serialize_field("address_line_1", &self.address_line_1)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("address_line_2", &self.address_line_2)?;
+        state.serialize_field("zip", &self.zip)?;
+        state.serialize_field("city", &self.city)?;
+        state.serialize_field("country", &self.country)?;
+        state.serialize_field("phone_1_area", &self.phone_1_area)?;
+        state.serialize_field("phone_1_prefix", &self.phone_1_prefix)?;
+        state.serialize_field("phone_1_line", &self.phone_1_line)?;
+        state.serialize_field("government_id", &self.government_id)?;
+        state.serialize_field("phone_2_area", &self.phone_2_area)?;
+        state.serialize_field("phone_2_prefix", &self.phone_2_prefix)?;
+        state.serialize_field("phone_2_line", &self.phone_2_line)?;
+        state.serialize_field("eft_account_id", &self.eft_account_id)?;
+        state.serialize_field("primary_card_holder", &self.primary_card_holder)?;
+        state.serialize_field("info_message", &self.info_message)?;
+        state.serialize_field("snapshot", &self.snapshot)?;
+        state.end()
+    }
 }
 
 /// The domain's view as `3202-SHOW-ORIGINAL-VALUES` fills the map: each text member all the
@@ -827,7 +1357,7 @@ impl From<rules::AccountUpdateView> for AccountUpdateView {
 // drop the customer block and the state `S` the COBOL shows with these messages, which the
 // parity row COACTUPC-099 requires. The schema is `allOf` `ScreenError` and the two optional
 // members. Endpoint 6 answers its re-read's failures as bare `ScreenError`s.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountUpdateViewError {
     /// The message and its field, as the `ScreenError` whose status the response carries.
     #[serde(flatten)]
@@ -843,6 +1373,21 @@ pub struct AccountUpdateViewError {
     /// candidate X-COACTUPC-H1 that is no parity result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<AccountUpdateView>,
+}
+
+/// The `ScreenError`'s members at the top level, then `state` and `details` when present.
+impl Serialize for AccountUpdateViewError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        self.error.serialize_members(&mut map)?;
+        if let Some(state) = &self.state {
+            map.serialize_entry("state", state)?;
+        }
+        if let Some(details) = &self.details {
+            map.serialize_entry("details", details)?;
+        }
+        map.end()
+    }
 }
 
 /// The program's failure: its `ScreenError`, through `api::error`, and the details and state
@@ -893,18 +1438,67 @@ impl IntoResponse for AccountUpdateViewError {
 /// whose `state` the last response set (COACTUPC-100).
 ///
 /// `Debug` prints the SSN parts as `***`, through [`AccountUpdateFields`].
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, ToSchema, Validate)]
 pub struct AccountUpdateRequest {
     /// `ENTER` validates, `PF5` saves.
     pub aid: Aid,
     /// The raw text of every enterable map field.
-    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub fields: AccountUpdateFields,
     /// The snapshot of the fetch, with the state of the last response.
-    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub snapshot: AccountUpdateSnapshot,
+}
+
+/// `aid`, `fields` and `snapshot`, the SSN parts of `fields` left out.
+impl Serialize for AccountUpdateRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateRequest", 3)?;
+        state.serialize_field("aid", &self.aid)?;
+        state.serialize_field("fields", &self.fields)?;
+        state.serialize_field("snapshot", &self.snapshot)?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `aid`, `fields` and `snapshot` are required, the last two JSON objects
+/// themselves. An unknown member is skipped; a repeated one is an error.
+impl<'de> Deserialize<'de> for AccountUpdateRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, AccountUpdateRequestMembers>(deserializer)
+    }
+}
+
+/// The members of an [`AccountUpdateRequest`] being read: `fields` and `snapshot` through
+/// [`ObjectBody`], so that each must be a JSON object.
+#[derive(Default)]
+struct AccountUpdateRequestMembers {
+    aid: Member<Aid>,
+    fields: Member<ObjectBody<AccountUpdateFields>>,
+    snapshot: Member<ObjectBody<AccountUpdateSnapshot>>,
+}
+
+impl ObjectMembers for AccountUpdateRequestMembers {
+    type Object = AccountUpdateRequest;
+    const NAME: &'static str = "AccountUpdateRequest";
+    const FIELDS: &'static [&'static str] = &["aid", "fields", "snapshot"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "aid" => self.aid.read(map, "aid"),
+            "fields" => self.fields.read(map, "fields"),
+            "snapshot" => self.snapshot.read(map, "snapshot"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<AccountUpdateRequest, E> {
+        Ok(AccountUpdateRequest {
+            aid: self.aid.required("aid")?,
+            fields: self.fields.required("fields")?.0,
+            snapshot: self.snapshot.required("snapshot")?.0,
+        })
+    }
 }
 
 /// The 200 body of endpoint 6: the screen `3000-SEND-MAP` sends after a validation, a save or
@@ -915,7 +1509,7 @@ pub struct AccountUpdateRequest {
 // `rules::UpdateOutcome` carries the shown amounts and the state, never the account's values,
 // so the result holds those and no view: a 200 of endpoint 6 changes no fetched value, and F5
 // saves only once the client echoes `state` `N`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "message": "Changes validated.Press F5 to save",
     "state": "N",
@@ -946,6 +1540,20 @@ pub struct AccountUpdateResult {
     pub committed: bool,
     /// The five amounts as shown after a validation or a save; `null` after a restart.
     pub amounts: Option<AccountUpdateAmounts>,
+}
+
+/// Every member in declaration order, `amounts` as `null` after a restart.
+impl Serialize for AccountUpdateResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AccountUpdateResult", 6)?;
+        state.serialize_field("message", &self.message)?;
+        state.serialize_field("state", &self.state)?;
+        state.serialize_field("save_enabled", &self.save_enabled)?;
+        state.serialize_field("cancel_enabled", &self.cancel_enabled)?;
+        state.serialize_field("committed", &self.committed)?;
+        state.serialize_field("amounts", &self.amounts)?;
+        state.end()
+    }
 }
 
 /// The outcome's state decides the info line, the state code and the keys; its amounts are the
@@ -1121,6 +1729,26 @@ mod tests {
         assert_eq!(rules::Aid::from(Aid::Enter), rules::Aid::Enter);
         assert_eq!(rules::Aid::from(Aid::Pf5), rules::Aid::Pf5);
         Ok(())
+    }
+
+    /// The key from either form it travels in, its text as a JSON string or the map form with a
+    /// `null` value: `PF5` alone is F5 and every other text ENTER (COACTUPC-004); any other JSON
+    /// value is refused.
+    #[test]
+    fn aid_reads_pf5_and_every_other_key_text_as_enter_in_both_forms() {
+        let cases = [
+            (r#"{"PF5":null}"#, Some(Aid::Pf5)),
+            (r#"{"ENTER":null}"#, Some(Aid::Enter)),
+            (r#"{"PF12":null}"#, Some(Aid::Enter)),
+            (r#""pf5""#, Some(Aid::Enter)),
+            (r#"{"PF5":1}"#, None),
+            (r#"["PF5"]"#, None),
+            ("null", None),
+            ("true", None),
+        ];
+        for (body, expected) in cases {
+            assert_eq!(serde_json::from_str::<Aid>(body).ok(), expected, "{body}");
+        }
     }
 
     #[test]
@@ -1811,6 +2439,126 @@ mod tests {
             serde_json::to_value(&bare.error)?
         );
         assert_eq!(shown.into_response().status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// Whether every name of `names` that `text` holds as a member appears in it in that order.
+    fn in_order(text: &str, names: &[&str]) -> Result<bool, String> {
+        let positions = names
+            .iter()
+            .map(|name| {
+                text.find(&format!("\"{name}\":"))
+                    .ok_or_else(|| format!("no member {name}"))
+            })
+            .collect::<Result<Vec<usize>, String>>()?;
+        Ok(positions.windows(2).all(|pair| pair[0] < pair[1]))
+    }
+
+    /// The bytes of endpoint 5's error with details and of endpoint 6's request and result: each
+    /// body's members in declaration order, the `ScreenError`'s first in the error, the SSN parts
+    /// of the fields never written although entered (COACTUPC-064, E32), and the amounts of a
+    /// result an object of their own, or `null` after a restart.
+    #[test]
+    fn bodies_are_written_member_by_member_in_declaration_order() -> TestResult {
+        use crate::dto::ObjectMembers as _;
+
+        let shown = fetch_error(Read::NotFound, Read::Found)?;
+        let details = serde_json::to_string(shown.details.as_ref().ok_or("no details")?)?;
+        let message = serde_json::to_string(shown.error.message())?;
+        assert_eq!(
+            serde_json::to_string(&shown)?,
+            format!(r#"{{"message":{message},"field":"acct_id","state":"S","details":{details}}}"#)
+        );
+        let view_order = [
+            "account_id",
+            "active_status",
+            "open_date",
+            "credit_limit",
+            "expiry_date",
+            "cash_credit_limit",
+            "reissue_date",
+            "current_balance",
+            "current_cycle_credit",
+            "group_id",
+            "current_cycle_debit",
+            "customer_id",
+            "ssn",
+            "dob",
+            "fico_score",
+            "first_name",
+            "middle_name",
+            "last_name",
+            "address_line_1",
+            "state",
+            "address_line_2",
+            "zip",
+            "city",
+            "country",
+            "phone_1_area",
+            "phone_1_prefix",
+            "phone_1_line",
+            "government_id",
+            "phone_2_area",
+            "phone_2_prefix",
+            "phone_2_line",
+            "eft_account_id",
+            "primary_card_holder",
+            "info_message",
+            "snapshot",
+        ];
+        assert!(in_order(&details, &view_order)?, "{details}");
+
+        let (view, _) = fetched()?;
+        let view = AccountUpdateView::from(view);
+        let request = AccountUpdateRequest {
+            aid: Aid::Pf5,
+            fields: AccountUpdateFields {
+                ssn_part1: Some("123".to_owned()),
+                ssn_part2: Some("45".to_owned()),
+                ssn_part3: Some("6789".to_owned()),
+                ..echoed(&view)
+            },
+            snapshot: view.snapshot.clone(),
+        };
+        let fields = serde_json::to_string(&request.fields)?;
+        let snapshot = serde_json::to_string(&request.snapshot)?;
+        assert_eq!(
+            serde_json::to_string(&request)?,
+            format!(r#"{{"aid":"PF5","fields":{fields},"snapshot":{snapshot}}}"#)
+        );
+        assert!(!fields.contains("ssn_part"), "{fields}");
+        let written: Vec<&str> = super::AccountUpdateFieldsMembers::FIELDS
+            .iter()
+            .copied()
+            .filter(|name| !name.starts_with("ssn_part"))
+            .collect();
+        assert_eq!(written.len(), 39);
+        assert!(in_order(&fields, &written)?, "{fields}");
+        assert!(
+            in_order(&snapshot, super::AccountUpdateSnapshotMembers::FIELDS)?,
+            "{snapshot}"
+        );
+
+        let shown = rules::ShownAmounts {
+            current_balance: "a".to_owned(),
+            credit_limit: "b".to_owned(),
+            cash_credit_limit: "c".to_owned(),
+            current_cycle_credit: "d".to_owned(),
+            current_cycle_debit: "e".to_owned(),
+        };
+        let results = [
+            (
+                AccountUpdateResult::from(rules::UpdateOutcome::ChangesValidated { shown }),
+                r#"{"message":"Changes validated.Press F5 to save","state":"N","save_enabled":true,"cancel_enabled":true,"committed":false,"amounts":{"credit_limit":"b","cash_credit_limit":"c","current_balance":"a","current_cycle_credit":"d","current_cycle_debit":"e"}}"#,
+            ),
+            (
+                AccountUpdateResult::from(rules::UpdateOutcome::Restart),
+                r#"{"message":"Enter or update id of account to update","state":" ","save_enabled":false,"cancel_enabled":false,"committed":false,"amounts":null}"#,
+            ),
+        ];
+        for (result, wire) in results {
+            assert_eq!(serde_json::to_string(&result)?, wire);
+        }
         Ok(())
     }
 

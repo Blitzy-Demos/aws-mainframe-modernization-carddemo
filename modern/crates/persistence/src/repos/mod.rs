@@ -212,6 +212,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the flavour Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// How long the later replacement is left running while the earlier one's transaction stays
     /// open; it must still be waiting when this has passed.
     const HELD: Duration = Duration::from_millis(300);
@@ -441,43 +450,45 @@ mod tests {
     /// the input of the one that committed last, never the union of both.
     // audit: LOADS-014
     // audit: LOADS-040
-    #[tokio::test]
-    async fn concurrent_replacements_leave_the_input_committed_last() -> TestResult {
-        let guard = start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        for job in LoadJob::ALL {
-            match job {
-                LoadJob::Acctfile => {
-                    last_writer_wins(&store, job, &fixture::<AccountRecord>(job)?).await?;
+    #[test]
+    fn concurrent_replacements_leave_the_input_committed_last() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            for job in LoadJob::ALL {
+                match job {
+                    LoadJob::Acctfile => {
+                        last_writer_wins(&store, job, &fixture::<AccountRecord>(job)?).await?;
+                    }
+                    LoadJob::Cardfile => {
+                        last_writer_wins(&store, job, &fixture::<CardRecord>(job)?).await?;
+                    }
+                    LoadJob::Xreffile => {
+                        last_writer_wins(&store, job, &fixture::<CardXrefRecord>(job)?).await?;
+                    }
+                    LoadJob::Custfile => {
+                        last_writer_wins(&store, job, &fixture::<CustomerRecord>(job)?).await?;
+                    }
+                    LoadJob::Discgrp => {
+                        let records = fixture::<DisclosureGroupRecord>(job)?;
+                        last_writer_wins(&store, job, &records).await?;
+                    }
+                    LoadJob::Tcatbalf => {
+                        let records = fixture::<TranCatBalanceRecord>(job)?;
+                        last_writer_wins(&store, job, &records).await?;
+                    }
+                    LoadJob::Trancatg => {
+                        let records = fixture::<TransactionCategoryRecord>(job)?;
+                        last_writer_wins(&store, job, &records).await?;
+                    }
+                    LoadJob::Trantype => {
+                        let records = fixture::<TransactionTypeRecord>(job)?;
+                        last_writer_wins(&store, job, &records).await?;
+                    }
+                    LoadJob::Dusrsecj => last_writer_wins(&store, job, &deck()?).await?,
                 }
-                LoadJob::Cardfile => {
-                    last_writer_wins(&store, job, &fixture::<CardRecord>(job)?).await?;
-                }
-                LoadJob::Xreffile => {
-                    last_writer_wins(&store, job, &fixture::<CardXrefRecord>(job)?).await?;
-                }
-                LoadJob::Custfile => {
-                    last_writer_wins(&store, job, &fixture::<CustomerRecord>(job)?).await?;
-                }
-                LoadJob::Discgrp => {
-                    let records = fixture::<DisclosureGroupRecord>(job)?;
-                    last_writer_wins(&store, job, &records).await?;
-                }
-                LoadJob::Tcatbalf => {
-                    let records = fixture::<TranCatBalanceRecord>(job)?;
-                    last_writer_wins(&store, job, &records).await?;
-                }
-                LoadJob::Trancatg => {
-                    let records = fixture::<TransactionCategoryRecord>(job)?;
-                    last_writer_wins(&store, job, &records).await?;
-                }
-                LoadJob::Trantype => {
-                    let records = fixture::<TransactionTypeRecord>(job)?;
-                    last_writer_wins(&store, job, &records).await?;
-                }
-                LoadJob::Dusrsecj => last_writer_wins(&store, job, &deck()?).await?,
             }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }

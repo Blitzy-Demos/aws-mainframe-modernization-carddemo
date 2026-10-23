@@ -1689,6 +1689,7 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
     sessionStorage.clear();
   });
 
+  // audit: COSGN00C-021
   it("ENTER answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
     const requests = stubFetch(() => json(401, signonRequired));
     const router = renderRouteTable();
@@ -1744,6 +1745,7 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
 
   // The session ends on the 401's status, before its body is awaited, so it ends long before the
   // request's 30 s deadline: within `waitFor`'s 1 s default.
+  // audit: COSGN00C-021
   it.each([
     { title: "whose body never finishes", fails: false },
     { title: "whose body fails part-way", fails: true },

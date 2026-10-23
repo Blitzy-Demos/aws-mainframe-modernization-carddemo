@@ -59,8 +59,10 @@
 //! asserted as nothing (AAP 0.8.5).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::convert::Infallible;
 use std::error::Error;
 use std::fs;
+use std::future::poll_fn;
 use std::io::{self, BufReader, Read, Write};
 use std::iter;
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
@@ -68,6 +70,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::task::Poll;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2076,121 +2079,186 @@ fn describes(message: &[u8], column: &str) -> bool {
     false
 }
 
+/// Runs `test` to completion on a multi-thread runtime with the default worker threads, the one
+/// tokio's test attribute builds under `flavor = "multi_thread"`, without the lint attributes
+/// that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
+/// Polls `first` and `second` concurrently on the calling task, `first` then `second` at each
+/// wake, until both succeed, and returns both values. The first error ends the wait at once and
+/// drops the other future. A future that has finished is never polled again. Both futures are
+/// pinned on the heap with `Box::pin`, the pin that needs no pinning macro.
+async fn try_join<T, U, E>(
+    first: impl Future<Output = Result<T, E>>,
+    second: impl Future<Output = Result<U, E>>,
+) -> Result<(T, U), E> {
+    let (mut first, mut second) = (Box::pin(first), Box::pin(second));
+    let (mut first_value, mut second_value) = (None, None);
+    poll_fn(|cx| {
+        if first_value.is_none() {
+            match first.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => first_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if second_value.is_none() {
+            match second.as_mut().poll(cx) {
+                Poll::Ready(Ok(value)) => second_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (first_value.take(), second_value.take()) {
+            (Some(one), Some(other)) => Poll::Ready(Ok((one, other))),
+            (one, other) => {
+                first_value = one;
+                second_value = other;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// Polls `first` and `second` concurrently on the calling task until both finish, as
+/// [`try_join`] polls two futures that cannot fail, and returns both outputs.
+async fn join<T, U>(first: impl Future<Output = T>, second: impl Future<Output = U>) -> (T, U) {
+    let Ok(both) = try_join(
+        async move { Ok::<T, Infallible>(first.await) },
+        async move { Ok::<U, Infallible>(second.await) },
+    )
+    .await;
+    both
+}
+
 /// i9: over `dailytran.txt`, the reject generation equals the audited reject records byte for
 /// byte, record by record and in input order; the run exits with status 4, prints the
 /// generation's path, logs the audited job-log lines, leaves its input unchanged and shows no
 /// card number.
-#[tokio::test(flavor = "multi_thread")]
-async fn posttran_rejects_match_audit_byte_for_byte() -> TestResult {
-    let rows = fixpost_rows()?;
-    let needles = Needles::load()?;
-    let dalytran = fixture_path(DAILYTRAN);
-    let input = fs::read(&dalytran)?;
-    let expected = expected_rejects(&rows, &dailytran_lines(&input)?)?;
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new("rejects")?;
-    let output = run_posttran(&guard, scratch.path(), &dalytran).await?;
-    let status = if expected.is_empty() {
-        0
-    } else {
-        REJECTS_EXIT_STATUS
-    };
-    // audit: FIXPOST-903
-    // audit: CBTRN02C-035
-    assert_eq!(
-        output.status.code(),
-        Some(status),
-        "{}",
-        needles.report(&output)
-    );
-    let rejects = generation(scratch.path(), FIRST_GENERATION);
-    // audit: CBTRN02C-028
-    assert_eq!(written_paths(&output), [rejects.clone()]);
-    // audit: FIXPOST-902
-    // audit: CBTRN02C-007
-    // audit: CBTRN02C-027
-    assert_rejects(&fs::read(&rejects)?, &expected)?;
-    let created = rows
-        .iter()
-        .filter(|row| matches!(&row.outcome, Outcome::Posted(posting) if posting.created))
-        .count();
-    // audit: FIXPOST-903
-    assert_job_log(&output, created, FIXTURE_COUNT_LINES);
-    // audit: CBTRN02C-033
-    assert!(
-        fs::read(&dalytran)? == input,
-        "posttran changed its input file"
-    );
-    // audit: CBTRN02C-037
-    needles.assert_absent(&output);
-    Ok(())
+#[test]
+fn posttran_rejects_match_audit_byte_for_byte() -> TestResult {
+    block_on(async {
+        let rows = fixpost_rows()?;
+        let needles = Needles::load()?;
+        let dalytran = fixture_path(DAILYTRAN);
+        let input = fs::read(&dalytran)?;
+        let expected = expected_rejects(&rows, &dailytran_lines(&input)?)?;
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new("rejects")?;
+        let output = run_posttran(&guard, scratch.path(), &dalytran).await?;
+        let status = if expected.is_empty() {
+            0
+        } else {
+            REJECTS_EXIT_STATUS
+        };
+        // audit: FIXPOST-903
+        // audit: CBTRN02C-035
+        assert_eq!(
+            output.status.code(),
+            Some(status),
+            "{}",
+            needles.report(&output)
+        );
+        let rejects = generation(scratch.path(), FIRST_GENERATION);
+        // audit: CBTRN02C-028
+        assert_eq!(written_paths(&output), [rejects.clone()]);
+        // audit: FIXPOST-902
+        // audit: CBTRN02C-007
+        // audit: CBTRN02C-027
+        assert_rejects(&fs::read(&rejects)?, &expected)?;
+        let created = rows
+            .iter()
+            .filter(|row| matches!(&row.outcome, Outcome::Posted(posting) if posting.created))
+            .count();
+        // audit: FIXPOST-903
+        assert_job_log(&output, created, FIXTURE_COUNT_LINES);
+        // audit: CBTRN02C-033
+        assert!(
+            fs::read(&dalytran)? == input,
+            "posttran changed its input file"
+        );
+        // audit: CBTRN02C-037
+        needles.assert_absent(&output);
+        Ok(())
+    })
 }
 
 /// The table effects of the same run: the 262 posted transactions, the account fields and the
 /// category balances that the `FIXPOST` rows state.
-#[tokio::test(flavor = "multi_thread")]
-async fn posttran_posts_audited_effects() -> TestResult {
-    let rows = fixpost_rows()?;
-    let needles = Needles::load()?;
-    let dalytran = fixture_path(DAILYTRAN);
-    // Codec A, which i8 proves, decodes the input records the postings must equal.
-    let daily: Vec<DailyTransactionRecord> =
-        decode_fixture::<DailyTransactionRecord>(&fs::read(&dalytran)?)?
-            .into_iter()
-            .map(|framed| framed.record)
-            .collect();
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new("effects")?;
-    let output = run_posttran(&guard, scratch.path(), &dalytran).await?;
-    // audit: FIXPOST-903
-    assert_eq!(
-        output.status.code(),
-        Some(REJECTS_EXIT_STATUS),
-        "{}",
-        needles.report(&output)
-    );
-    let mut store = PgStore::new(guard.pool().clone());
-    assert_transactions(&mut store, &rows, &daily).await?;
-    assert_accounts(&mut store, &rows).await?;
-    assert_category_balances(&mut store, &rows).await
+#[test]
+fn posttran_posts_audited_effects() -> TestResult {
+    block_on(async {
+        let rows = fixpost_rows()?;
+        let needles = Needles::load()?;
+        let dalytran = fixture_path(DAILYTRAN);
+        // Codec A, which i8 proves, decodes the input records the postings must equal.
+        let daily: Vec<DailyTransactionRecord> =
+            decode_fixture::<DailyTransactionRecord>(&fs::read(&dalytran)?)?
+                .into_iter()
+                .map(|framed| framed.record)
+                .collect();
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new("effects")?;
+        let output = run_posttran(&guard, scratch.path(), &dalytran).await?;
+        // audit: FIXPOST-903
+        assert_eq!(
+            output.status.code(),
+            Some(REJECTS_EXIT_STATUS),
+            "{}",
+            needles.report(&output)
+        );
+        let mut store = PgStore::new(guard.pool().clone());
+        assert_transactions(&mut store, &rows, &daily).await?;
+        assert_accounts(&mut store, &rows).await?;
+        assert_category_balances(&mut store, &rows).await
+    })
 }
 
 /// GDG `(+1)`: a second run, over a freshly loaded database but into the directory that holds
 /// the first run's `DALYREJS.G0001`, writes `DALYREJS.G0002` with the same records and exits
 /// with the same status, and `DALYREJS.G0001` is kept.
-#[tokio::test(flavor = "multi_thread")]
-async fn second_run_writes_next_generation() -> TestResult {
-    let needles = Needles::load()?;
-    // Each run needs a database of its own: a rerun meets the rows the first run posted.
-    let (first_db, second_db) = tokio::try_join!(start_loaded_postgres(), start_loaded_postgres())?;
-    let scratch = Scratch::new("generations")?;
-    let dalytran = fixture_path(DAILYTRAN);
-    let first = run_posttran(&first_db, scratch.path(), &dalytran).await?;
-    let second = run_posttran(&second_db, scratch.path(), &dalytran).await?;
-    // audit: CBTRN02C-035
-    assert_eq!(
-        first.status.code(),
-        Some(REJECTS_EXIT_STATUS),
-        "{}",
-        needles.report(&first)
-    );
-    assert_eq!(
-        second.status.code(),
-        first.status.code(),
-        "{}",
-        needles.report(&second)
-    );
-    let older = generation(scratch.path(), FIRST_GENERATION);
-    let newer = generation(scratch.path(), SECOND_GENERATION);
-    // audit: CBTRN02C-028
-    assert_eq!(written_paths(&first), [older.clone()]);
-    assert_eq!(written_paths(&second), [newer.clone()]);
-    let offset = first_difference(&fs::read(&newer)?, &fs::read(&older)?);
-    assert!(
-        offset.is_none(),
-        "DALYREJS.G0002 differs from DALYREJS.G0001 at byte offset {offset:?}"
-    );
-    Ok(())
+#[test]
+fn second_run_writes_next_generation() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        // Each run needs a database of its own: a rerun meets the rows the first run posted.
+        let (first_db, second_db) =
+            try_join(start_loaded_postgres(), start_loaded_postgres()).await?;
+        let scratch = Scratch::new("generations")?;
+        let dalytran = fixture_path(DAILYTRAN);
+        let first = run_posttran(&first_db, scratch.path(), &dalytran).await?;
+        let second = run_posttran(&second_db, scratch.path(), &dalytran).await?;
+        // audit: CBTRN02C-035
+        assert_eq!(
+            first.status.code(),
+            Some(REJECTS_EXIT_STATUS),
+            "{}",
+            needles.report(&first)
+        );
+        assert_eq!(
+            second.status.code(),
+            first.status.code(),
+            "{}",
+            needles.report(&second)
+        );
+        let older = generation(scratch.path(), FIRST_GENERATION);
+        let newer = generation(scratch.path(), SECOND_GENERATION);
+        // audit: CBTRN02C-028
+        assert_eq!(written_paths(&first), [older.clone()]);
+        assert_eq!(written_paths(&second), [newer.clone()]);
+        let offset = first_difference(&fs::read(&newer)?, &fs::read(&older)?);
+        assert!(
+            offset.is_none(),
+            "DALYREJS.G0002 differs from DALYREJS.G0001 at byte offset {offset:?}"
+        );
+        Ok(())
+    })
 }
 
 /// Input the job cannot take ends it before any effect: an input it cannot open and a reject
@@ -2198,183 +2266,194 @@ async fn second_run_writes_next_generation() -> TestResult {
 /// short of the 350-byte record (CBTRN02C-045). An empty input then runs to its end, into the
 /// directory the refused runs left without a generation, and writes an empty `DALYREJS.G0001`
 /// (CBTRN02C-029).
-#[tokio::test(flavor = "multi_thread")]
-async fn posttran_abends_before_any_effect_on_input_it_cannot_take() -> TestResult {
-    let needles = Needles::load()?;
-    let record = scratch_record(&first_daily_record()?, *b"01", 1_000)?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let loaded = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("refused")?;
-    let var_dir = scratch.path().join("var");
+#[test]
+fn posttran_abends_before_any_effect_on_input_it_cannot_take() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let record = scratch_record(&first_daily_record()?, *b"01", 1_000)?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let loaded = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("refused")?;
+        let var_dir = scratch.path().join("var");
 
-    let absent = scratch.path().join("absent.txt");
-    let refused = run_posttran(&guard, &var_dir, &absent).await?;
-    // audit: CBTRN02C-031
-    status_blocked(assert_abended(&refused, &var_dir, Some(OPEN_DALYTRAN), &needles).as_deref());
+        let absent = scratch.path().join("absent.txt");
+        let refused = run_posttran(&guard, &var_dir, &absent).await?;
+        // audit: CBTRN02C-031
+        status_blocked(
+            assert_abended(&refused, &var_dir, Some(OPEN_DALYTRAN), &needles).as_deref(),
+        );
 
-    let mut malformed = record.clone();
-    let amount = malformed
-        .get_mut(AMT_OFFSET)
-        .ok_or("the scratch record has no amount")?;
-    *amount = b'X';
-    let input = scratch.write("malformed.txt", &lines_of(&[&record, &malformed]))?;
-    let refused = run_posttran(&guard, &var_dir, &input).await?;
-    // audit: CBTRN02C-032
-    assert_abended(&refused, &var_dir, None, &needles);
-    assert_event(
-        &refused,
-        &[("file", r#""DALYTRAN""#), ("line", "2")],
-        &needles,
-    );
+        let mut malformed = record.clone();
+        let amount = malformed
+            .get_mut(AMT_OFFSET)
+            .ok_or("the scratch record has no amount")?;
+        *amount = b'X';
+        let input = scratch.write("malformed.txt", &lines_of(&[&record, &malformed]))?;
+        let refused = run_posttran(&guard, &var_dir, &input).await?;
+        // audit: CBTRN02C-032
+        assert_abended(&refused, &var_dir, None, &needles);
+        assert_event(
+            &refused,
+            &[("file", r#""DALYTRAN""#), ("line", "2")],
+            &needles,
+        );
 
-    let short = record
-        .get(..SHORT_BODY_LEN)
-        .ok_or("the scratch record is short")?;
-    let input = scratch.write("short.txt", &lines_of(&[short]))?;
-    let refused = run_posttran(&guard, &var_dir, &input).await?;
-    // audit: CBTRN02C-045
-    assert_abended(&refused, &var_dir, None, &needles);
-    // `DailyTransactionRecord` declares no trailing filler codec A may supply (FIXFRM-011), so
-    // codec A itself refuses the body and the event is that of CBTRN02C-032, its rule text
-    // giving the body length against the record's; either way the event names the line.
-    assert_event(
-        &refused,
-        &[("file", r#""DALYTRAN""#), ("line", "1")],
-        &needles,
-    );
+        let short = record
+            .get(..SHORT_BODY_LEN)
+            .ok_or("the scratch record is short")?;
+        let input = scratch.write("short.txt", &lines_of(&[short]))?;
+        let refused = run_posttran(&guard, &var_dir, &input).await?;
+        // audit: CBTRN02C-045
+        assert_abended(&refused, &var_dir, None, &needles);
+        // `DailyTransactionRecord` declares no trailing filler codec A may supply (FIXFRM-011), so
+        // codec A itself refuses the body and the event is that of CBTRN02C-032, its rule text
+        // giving the body length against the record's; either way the event names the line.
+        assert_event(
+            &refused,
+            &[("file", r#""DALYTRAN""#), ("line", "1")],
+            &needles,
+        );
 
-    // A file where the reject directory must be created.
-    let unwritable = scratch.path().join("unwritable");
-    fs::create_dir_all(&unwritable)?;
-    fs::write(unwritable.join("dalyrejs"), b"")?;
-    let refused = run_posttran(&guard, &unwritable, &fixture_path(DAILYTRAN)).await?;
-    // audit: CBTRN02C-031
-    status_blocked(assert_abended(&refused, &unwritable, Some(OPEN_DALYREJS), &needles).as_deref());
-    assert!(
-        Tables::read(&mut store).await? == loaded,
-        "a refused run changed a table"
-    );
+        // A file where the reject directory must be created.
+        let unwritable = scratch.path().join("unwritable");
+        fs::create_dir_all(&unwritable)?;
+        fs::write(unwritable.join("dalyrejs"), b"")?;
+        let refused = run_posttran(&guard, &unwritable, &fixture_path(DAILYTRAN)).await?;
+        // audit: CBTRN02C-031
+        status_blocked(
+            assert_abended(&refused, &unwritable, Some(OPEN_DALYREJS), &needles).as_deref(),
+        );
+        assert!(
+            Tables::read(&mut store).await? == loaded,
+            "a refused run changed a table"
+        );
 
-    let empty = run_posttran(&guard, &var_dir, &scratch.write("empty.txt", b"")?).await?;
-    // audit: CBTRN02C-029
-    assert_eq!(empty.status.code(), Some(0), "{}", needles.report(&empty));
-    let rejects = generation(&var_dir, FIRST_GENERATION);
-    // audit: CBTRN02C-028
-    assert_eq!(written_paths(&empty), [rejects.clone()]);
-    assert!(
-        fs::read(&rejects)?.is_empty(),
-        "the generation of an empty input holds records"
-    );
-    assert_job_log(&empty, 0, EMPTY_COUNT_LINES);
-    assert!(
-        Tables::read(&mut store).await? == loaded,
-        "an empty input changed a table"
-    );
-    Ok(())
+        let empty = run_posttran(&guard, &var_dir, &scratch.write("empty.txt", b"")?).await?;
+        // audit: CBTRN02C-029
+        assert_eq!(empty.status.code(), Some(0), "{}", needles.report(&empty));
+        let rejects = generation(&var_dir, FIRST_GENERATION);
+        // audit: CBTRN02C-028
+        assert_eq!(written_paths(&empty), [rejects.clone()]);
+        assert!(
+            fs::read(&rejects)?.is_empty(),
+            "the generation of an empty input holds records"
+        );
+        assert_job_log(&empty, 0, EMPTY_COUNT_LINES);
+        assert!(
+            Tables::read(&mut store).await? == loaded,
+            "an empty input changed a table"
+        );
+        Ok(())
+    })
 }
 
 /// One writer at a time: a run that meets the claim on `accounts` another session holds abends
 /// at that open with no table changed and no generation kept, and of two runs started together
 /// exactly one posts.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_second_writer_is_refused() -> TestResult {
-    let needles = Needles::load()?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let loaded = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("writers")?;
-    let dalytran = fixture_path(DAILYTRAN);
+#[test]
+fn a_second_writer_is_refused() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let loaded = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("writers")?;
+        let dalytran = fixture_path(DAILYTRAN);
 
-    let held = scratch.path().join("held");
-    let mut session = store.session().await?;
-    assert!(
-        session.claim_writer(Dataset::Accounts).await?,
-        "the test could not claim accounts"
-    );
-    let refused = run_posttran(&guard, &held, &dalytran).await;
-    session.close().await?;
-    let refused = refused?;
-    // audit: CBTRN02C-046
-    status_blocked(assert_abended(&refused, &held, Some(OPEN_ACCTFILE), &needles).as_deref());
-    assert!(
-        Tables::read(&mut store).await? == loaded,
-        "the refused run changed a table"
-    );
+        let held = scratch.path().join("held");
+        let mut session = store.session().await?;
+        assert!(
+            session.claim_writer(Dataset::Accounts).await?,
+            "the test could not claim accounts"
+        );
+        let refused = run_posttran(&guard, &held, &dalytran).await;
+        session.close().await?;
+        let refused = refused?;
+        // audit: CBTRN02C-046
+        status_blocked(assert_abended(&refused, &held, Some(OPEN_ACCTFILE), &needles).as_deref());
+        assert!(
+            Tables::read(&mut store).await? == loaded,
+            "the refused run changed a table"
+        );
 
-    let (left, right) = (scratch.path().join("left"), scratch.path().join("right"));
-    let (one, other) = tokio::try_join!(
-        run_posttran(&guard, &left, &dalytran),
-        run_posttran(&guard, &right, &dalytran)
-    )?;
-    let mut runs = [(one, left), (other, right)];
-    runs.sort_by_key(|(output, _)| output.status.code() != Some(REJECTS_EXIT_STATUS));
-    let [(winner, winner_dir), (loser, loser_dir)] = &runs;
-    // audit: CBTRN02C-046
-    assert_eq!(
-        winner.status.code(),
-        Some(REJECTS_EXIT_STATUS),
-        "{}",
-        needles.report(winner)
-    );
-    assert_eq!(
-        written_paths(winner),
-        [generation(winner_dir, FIRST_GENERATION)]
-    );
-    assert_abended(loser, loser_dir, None, &needles);
-    // audit: CBTRN02C-030
-    blocked(
-        "CBTRN02C-030",
-        "X-POSTTRAN-H1",
-        "which refusal the second run meets: the first run's claim, or the rows it posted",
-    );
-    // audit: FIXPOST-901
-    assert_eq!(
-        TransactionRepository::find_all_in_card_order(&mut store)
-            .await?
-            .len(),
-        POSTED_COUNT,
-        "transactions rows after two runs"
-    );
-    Ok(())
+        let (left, right) = (scratch.path().join("left"), scratch.path().join("right"));
+        let (one, other) = try_join(
+            run_posttran(&guard, &left, &dalytran),
+            run_posttran(&guard, &right, &dalytran),
+        )
+        .await?;
+        let mut runs = [(one, left), (other, right)];
+        runs.sort_by_key(|(output, _)| output.status.code() != Some(REJECTS_EXIT_STATUS));
+        let [(winner, winner_dir), (loser, loser_dir)] = &runs;
+        // audit: CBTRN02C-046
+        assert_eq!(
+            winner.status.code(),
+            Some(REJECTS_EXIT_STATUS),
+            "{}",
+            needles.report(winner)
+        );
+        assert_eq!(
+            written_paths(winner),
+            [generation(winner_dir, FIRST_GENERATION)]
+        );
+        assert_abended(loser, loser_dir, None, &needles);
+        // audit: CBTRN02C-030
+        blocked(
+            "CBTRN02C-030",
+            "X-POSTTRAN-H1",
+            "which refusal the second run meets: the first run's claim, or the rows it posted",
+        );
+        // audit: FIXPOST-901
+        assert_eq!(
+            TransactionRepository::find_all_in_card_order(&mut store)
+                .await?
+                .len(),
+            POSTED_COUNT,
+            "transactions rows after two runs"
+        );
+        Ok(())
+    })
 }
 
 /// A record whose `DALYTRAN-ID` an earlier record of the run posted abends at its transaction
 /// write with the duplicate-key status, after its category balance and account writes, which
 /// stand with the earlier record's effects; the reject generation is removed.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_duplicate_transaction_id_abends_after_its_balances_are_written() -> TestResult {
-    let needles = Needles::load()?;
-    let template = first_daily_record()?;
-    // Two credits under one ID: the first creates the category balance, the second updates it.
-    let (first_cents, second_cents) = (-1_000, -2_000);
-    let first = scratch_record(&template, SCRATCH_TYPE, first_cents)?;
-    let second = scratch_record(&template, SCRATCH_TYPE, second_cents)?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
-    let before = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("duplicate")?;
-    let input = scratch.write("duplicate.txt", &lines_of(&[&first, &second]))?;
-    let output = run_posttran(&guard, scratch.path(), &input).await?;
-    let status = assert_abended(&output, scratch.path(), Some(WRITE_TRANFILE), &needles);
-    // audit: CBTRN02C-025
-    // audit: CBTRN02C-041
-    assert_eq!(
-        status.as_deref(),
-        Some(DUPLICATE_KEY_STATUS),
-        "the status line"
-    );
-    let after = Tables::read(&mut store).await?;
-    // audit: CBTRN02C-025
-    let [transaction] = after.transactions.as_slice() else {
-        panic!(
-            "{} transactions, not the first scratch record alone",
-            after.transactions.len()
+#[test]
+fn a_duplicate_transaction_id_abends_after_its_balances_are_written() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let template = first_daily_record()?;
+        // Two credits under one ID: the first creates the category balance, the second updates it.
+        let (first_cents, second_cents) = (-1_000, -2_000);
+        let first = scratch_record(&template, SCRATCH_TYPE, first_cents)?;
+        let second = scratch_record(&template, SCRATCH_TYPE, second_cents)?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+        let before = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("duplicate")?;
+        let input = scratch.write("duplicate.txt", &lines_of(&[&first, &second]))?;
+        let output = run_posttran(&guard, scratch.path(), &input).await?;
+        let status = assert_abended(&output, scratch.path(), Some(WRITE_TRANFILE), &needles);
+        // audit: CBTRN02C-025
+        // audit: CBTRN02C-041
+        assert_eq!(
+            status.as_deref(),
+            Some(DUPLICATE_KEY_STATUS),
+            "the status line"
         );
-    };
-    assert_posted(transaction, &DailyTransactionRecord::decode(&first)?, 1);
-    assert_both_postings_stand(&before, &after, Decimal::new(first_cents + second_cents, 2))
+        let after = Tables::read(&mut store).await?;
+        // audit: CBTRN02C-025
+        let [transaction] = after.transactions.as_slice() else {
+            panic!(
+                "{} transactions, not the first scratch record alone",
+                after.transactions.len()
+            );
+        };
+        assert_posted(transaction, &DailyTransactionRecord::decode(&first)?, 1);
+        assert_both_postings_stand(&before, &after, Decimal::new(first_cents + second_cents, 2))
+    })
 }
 
 /// A category balance write, a category balance rewrite, a read of the input or a reject write
@@ -2384,114 +2463,116 @@ async fn a_duplicate_transaction_id_abends_after_its_balances_are_written() -> T
 /// first write of its run, so neither run changes a table; nor does a run whose input opens and
 /// then cannot be read. Under a file-size limit of one shell block the fixture run's first reject
 /// bytes cannot reach the file, after the postings of the records before.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_category_balance_or_reject_write_abends_at_that_write() -> TestResult {
-    let needles = Needles::load()?;
-    let template = first_daily_record()?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
-    let before = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("write-failures")?;
-    let read_only = session_url(&guard, READ_ONLY_SESSION);
+#[test]
+fn a_failed_category_balance_or_reject_write_abends_at_that_write() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let template = first_daily_record()?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+        let before = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("write-failures")?;
+        let read_only = session_url(&guard, READ_ONLY_SESSION);
 
-    // The rewrite of a loaded category balance, then the write of a new one, which its
-    // not-found line announces first (CBTRN02C-016).
-    for (name, type_cd, line, operation, creates) in [
-        (
-            "rewrite",
-            LOADED_TYPE,
-            REWRITE_TCATBALF,
-            REWRITE_TCATBALF_OP,
-            false,
-        ),
-        (
-            "write",
-            SCRATCH_TYPE,
-            WRITE_TCATBALF,
-            WRITE_TCATBALF_OP,
-            true,
-        ),
-    ] {
-        let record = scratch_record(&template, type_cd, SCRATCH_CENTS)?;
-        let input = scratch.write(&format!("{name}.txt"), &lines_of(&[&record]))?;
-        let var_dir = scratch.path().join(name);
-        let output = run_posttran_with(&read_only, &var_dir, &input, Launch::Direct).await?;
-        // audit: CBTRN02C-038
-        let status = assert_abended(&output, &var_dir, Some(line), &needles);
-        status_blocked(status.as_deref());
-        // audit: CBTRN02C-038
-        assert_event(
-            &output,
-            &[
-                ("operation", operation),
-                ("error", database_error(READ_ONLY_SQLSTATE).as_str()),
-            ],
-            &needles,
-        );
-        if creates {
-            let messages = messages(&output);
-            let announced = messages.iter().position(|message| {
-                message.starts_with(NOT_FOUND_PREFIX) && message.ends_with(NOT_FOUND_SUFFIX)
-            });
-            let failed = messages.iter().position(|message| message == line);
-            // audit: CBTRN02C-016
-            assert!(
-                announced
-                    .zip(failed)
-                    .is_some_and(|(announced, failed)| announced < failed),
-                "no `{NOT_FOUND_PREFIX}` line precedes `{line}`"
+        // The rewrite of a loaded category balance, then the write of a new one, which its
+        // not-found line announces first (CBTRN02C-016).
+        for (name, type_cd, line, operation, creates) in [
+            (
+                "rewrite",
+                LOADED_TYPE,
+                REWRITE_TCATBALF,
+                REWRITE_TCATBALF_OP,
+                false,
+            ),
+            (
+                "write",
+                SCRATCH_TYPE,
+                WRITE_TCATBALF,
+                WRITE_TCATBALF_OP,
+                true,
+            ),
+        ] {
+            let record = scratch_record(&template, type_cd, SCRATCH_CENTS)?;
+            let input = scratch.write(&format!("{name}.txt"), &lines_of(&[&record]))?;
+            let var_dir = scratch.path().join(name);
+            let output = run_posttran_with(&read_only, &var_dir, &input, Launch::Direct).await?;
+            // audit: CBTRN02C-038
+            let status = assert_abended(&output, &var_dir, Some(line), &needles);
+            status_blocked(status.as_deref());
+            // audit: CBTRN02C-038
+            assert_event(
+                &output,
+                &[
+                    ("operation", operation),
+                    ("error", database_error(READ_ONLY_SQLSTATE).as_str()),
+                ],
+                &needles,
             );
-            blocked(
-                "CBTRN02C-016",
-                "X-POSTTRAN-H2",
-                "the 17 key bytes of the not-found line",
+            if creates {
+                let messages = messages(&output);
+                let announced = messages.iter().position(|message| {
+                    message.starts_with(NOT_FOUND_PREFIX) && message.ends_with(NOT_FOUND_SUFFIX)
+                });
+                let failed = messages.iter().position(|message| message == line);
+                // audit: CBTRN02C-016
+                assert!(
+                    announced
+                        .zip(failed)
+                        .is_some_and(|(announced, failed)| announced < failed),
+                    "no `{NOT_FOUND_PREFIX}` line precedes `{line}`"
+                );
+                blocked(
+                    "CBTRN02C-016",
+                    "X-POSTTRAN-H2",
+                    "the 17 key bytes of the not-found line",
+                );
+            }
+            // audit: CBTRN02C-038
+            assert!(
+                Tables::read(&mut store).await? == before,
+                "the run whose category balance {name} failed changed a table"
             );
         }
+
+        // A directory opens for reading, and its read then fails (`EISDIR`): the input is read
+        // whole at its open, before any other effect, so nothing has changed (CBTRN02C-032).
+        let directory = scratch.path().join("dalytran-directory");
+        fs::create_dir_all(&directory)?;
+        let var_dir = scratch.path().join("read");
+        let output = run_posttran(&guard, &var_dir, &directory).await?;
+        // audit: CBTRN02C-038
+        let status = assert_abended(&output, &var_dir, Some(READ_DALYTRAN), &needles);
+        status_blocked(status.as_deref());
+        assert_event(&output, &[("operation", READ_DALYTRAN_OP)], &needles);
         // audit: CBTRN02C-038
         assert!(
             Tables::read(&mut store).await? == before,
-            "the run whose category balance {name} failed changed a table"
+            "the run whose input read failed changed a table"
         );
-    }
 
-    // A directory opens for reading, and its read then fails (`EISDIR`): the input is read
-    // whole at its open, before any other effect, so nothing has changed (CBTRN02C-032).
-    let directory = scratch.path().join("dalytran-directory");
-    fs::create_dir_all(&directory)?;
-    let var_dir = scratch.path().join("read");
-    let output = run_posttran(&guard, &var_dir, &directory).await?;
-    // audit: CBTRN02C-038
-    let status = assert_abended(&output, &var_dir, Some(READ_DALYTRAN), &needles);
-    status_blocked(status.as_deref());
-    assert_event(&output, &[("operation", READ_DALYTRAN_OP)], &needles);
-    // audit: CBTRN02C-038
-    assert!(
-        Tables::read(&mut store).await? == before,
-        "the run whose input read failed changed a table"
-    );
-
-    let rows = fixpost_rows()?;
-    let dalytran = fixture_path(DAILYTRAN);
-    let daily: Vec<DailyTransactionRecord> =
-        decode_fixture::<DailyTransactionRecord>(&fs::read(&dalytran)?)?
-            .into_iter()
-            .map(|framed| framed.record)
-            .collect();
-    let var_dir = scratch.path().join("rejects");
-    let output = run_posttran_with(
-        guard.database_url(),
-        &var_dir,
-        &dalytran,
-        Launch::FileSizeLimited,
-    )
-    .await?;
-    // audit: CBTRN02C-038
-    let status = assert_abended(&output, &var_dir, Some(WRITE_DALYREJS), &needles);
-    status_blocked(status.as_deref());
-    assert_event(&output, &[("operation", WRITE_DALYREJS_OP)], &needles);
-    // audit: CBTRN02C-038
-    assert_posted_prefix(&Tables::read(&mut store).await?.transactions, &rows, &daily)
+        let rows = fixpost_rows()?;
+        let dalytran = fixture_path(DAILYTRAN);
+        let daily: Vec<DailyTransactionRecord> =
+            decode_fixture::<DailyTransactionRecord>(&fs::read(&dalytran)?)?
+                .into_iter()
+                .map(|framed| framed.record)
+                .collect();
+        let var_dir = scratch.path().join("rejects");
+        let output = run_posttran_with(
+            guard.database_url(),
+            &var_dir,
+            &dalytran,
+            Launch::FileSizeLimited,
+        )
+        .await?;
+        // audit: CBTRN02C-038
+        let status = assert_abended(&output, &var_dir, Some(WRITE_DALYREJS), &needles);
+        status_blocked(status.as_deref());
+        assert_event(&output, &[("operation", WRITE_DALYREJS_OP)], &needles);
+        // audit: CBTRN02C-038
+        assert_posted_prefix(&Tables::read(&mut store).await?.transactions, &rows, &daily)
+    })
 }
 
 /// An account update that fails other than by matching no row ends the job: an event naming the
@@ -2499,68 +2580,70 @@ async fn a_failed_category_balance_or_reject_write_abends_at_that_write() -> Tes
 /// line of its own. The category balance written before it stands, and no transaction is
 /// written. The test holds the account's row lock, and the job's session gives up waiting for it
 /// after a second, with SQLSTATE 55P03.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_account_rewrite_abends_after_its_category_balance_is_written() -> TestResult {
-    let needles = Needles::load()?;
-    let record = scratch_record(&first_daily_record()?, LOADED_TYPE, SCRATCH_CENTS)?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
-    let before = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("account-rewrite")?;
-    let input = scratch.write("rewrite.txt", &lines_of(&[&record]))?;
+#[test]
+fn a_failed_account_rewrite_abends_after_its_category_balance_is_written() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let record = scratch_record(&first_daily_record()?, LOADED_TYPE, SCRATCH_CENTS)?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+        let before = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("account-rewrite")?;
+        let input = scratch.write("rewrite.txt", &lines_of(&[&record]))?;
 
-    let mut lock = store.begin().await?;
-    let locked = AccountRepository::lock_by_id(&mut lock, PicU::new(SCRATCH_ACCOUNT)?).await?;
-    assert!(locked.is_some(), "the scratch account is not loaded");
-    let output = run_posttran_with(
-        &session_url(&guard, LOCK_TIMEOUT_SESSION),
-        scratch.path(),
-        &input,
-        Launch::Direct,
-    )
-    .await;
-    lock.rollback().await?;
-    let output = output?;
-    // audit: CBTRN02C-039
-    assert_abended(&output, scratch.path(), None, &needles);
-    // audit: CBTRN02C-039
-    assert!(
-        messages(&output)
-            .iter()
-            .all(|message| !message.starts_with(STATUS_PREFIX)),
-        "a failed account rewrite showed a status line"
-    );
-    // audit: CBTRN02C-039
-    assert_event(
-        &output,
-        &[
-            ("operation", REWRITE_ACCTFILE_OP),
-            ("error", database_error(LOCK_TIMEOUT_SQLSTATE).as_str()),
-        ],
-        &needles,
-    );
-    let after = Tables::read(&mut store).await?;
-    // audit: CBTRN02C-039
-    assert!(
-        after.transactions.is_empty() && after.accounts == before.accounts,
-        "a failed account rewrite left a transaction or an account change"
-    );
-    // audit: CBTRN02C-015
-    assert_balance_moved(
-        &before.balances,
-        &after.balances,
-        LOADED_KEY,
-        Decimal::new(SCRATCH_CENTS, 2),
-    )?;
-    // audit: CBTRN02C-039
-    blocked(
-        "CBTRN02C-039",
-        "X-POSTTRAN-5",
-        "the COBOL outcome of an account rewrite that fails other than by INVALID KEY, which \
-         tests no status and goes on with the records an earlier read left",
-    );
-    Ok(())
+        let mut lock = store.begin().await?;
+        let locked = AccountRepository::lock_by_id(&mut lock, PicU::new(SCRATCH_ACCOUNT)?).await?;
+        assert!(locked.is_some(), "the scratch account is not loaded");
+        let output = run_posttran_with(
+            &session_url(&guard, LOCK_TIMEOUT_SESSION),
+            scratch.path(),
+            &input,
+            Launch::Direct,
+        )
+        .await;
+        lock.rollback().await?;
+        let output = output?;
+        // audit: CBTRN02C-039
+        assert_abended(&output, scratch.path(), None, &needles);
+        // audit: CBTRN02C-039
+        assert!(
+            messages(&output)
+                .iter()
+                .all(|message| !message.starts_with(STATUS_PREFIX)),
+            "a failed account rewrite showed a status line"
+        );
+        // audit: CBTRN02C-039
+        assert_event(
+            &output,
+            &[
+                ("operation", REWRITE_ACCTFILE_OP),
+                ("error", database_error(LOCK_TIMEOUT_SQLSTATE).as_str()),
+            ],
+            &needles,
+        );
+        let after = Tables::read(&mut store).await?;
+        // audit: CBTRN02C-039
+        assert!(
+            after.transactions.is_empty() && after.accounts == before.accounts,
+            "a failed account rewrite left a transaction or an account change"
+        );
+        // audit: CBTRN02C-015
+        assert_balance_moved(
+            &before.balances,
+            &after.balances,
+            LOADED_KEY,
+            Decimal::new(SCRATCH_CENTS, 2),
+        )?;
+        // audit: CBTRN02C-039
+        blocked(
+            "CBTRN02C-039",
+            "X-POSTTRAN-5",
+            "the COBOL outcome of an account rewrite that fails other than by INVALID KEY, which \
+             tests no status and goes on with the records an earlier read left",
+        );
+        Ok(())
+    })
 }
 
 /// One run of [`a_failed_table_read_abends_before_the_first_record`].
@@ -2589,126 +2672,130 @@ struct ReadFailure {
 /// (CBTRN02C-039). Each run then abends with exit status 12 and prints no path; the reject
 /// generation, created after the cross-reference read and before the other two, is removed
 /// (CBTRN02C-044); and no table changes, as no write precedes these reads.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_table_read_abends_before_the_first_record() -> TestResult {
-    let needles = Needles::load()?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let before = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("read-failures")?;
-    let dalytran = fixture_path(DAILYTRAN);
-    let unavailable = unavailable_error();
+#[test]
+fn a_failed_table_read_abends_before_the_first_record() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let before = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("read-failures")?;
+        let dalytran = fixture_path(DAILYTRAN);
+        let unavailable = unavailable_error();
 
-    // In the job's read order: the cross-reference before the reject generation is created, the
-    // accounts after it, then the category balances (CBTRN02C-031).
-    let cases = [
-        ReadFailure {
-            rule: "CBTRN02C-039",
-            table: "card_xref",
-            column: CARD_XREF_COLUMN,
-            line: None,
-            operation: READ_XREFFILE_OP,
-            after_rejects_open: false,
-        },
-        ReadFailure {
-            rule: "CBTRN02C-039",
-            table: "accounts",
-            column: ACCOUNTS_COLUMN,
-            line: None,
-            operation: READ_ACCTFILE_OP,
-            after_rejects_open: true,
-        },
-        ReadFailure {
-            rule: "CBTRN02C-038",
-            table: "tran_cat_balances",
-            column: TRAN_CAT_BALANCES_COLUMN,
-            line: Some(READ_TCATBALF),
-            operation: READ_TCATBALF_OP,
-            after_rejects_open: true,
-        },
-    ];
-    for ReadFailure {
-        rule,
-        table,
-        column,
-        line,
-        operation,
-        after_rejects_open,
-    } in cases
-    {
-        let var_dir = scratch.path().join(table);
-        let relay = Relay::start(guard.database_url(), column)?;
-        let output =
-            run_posttran_with(relay.database_url(), &var_dir, &dalytran, Launch::Direct).await?;
-        let cut = relay.cut_made();
-        drop(relay);
-        // audit: CBTRN02C-038
-        // audit: CBTRN02C-039
-        assert!(
-            cut,
-            "{rule}: the relay never met the row description of {table}"
-        );
-        // audit: CBTRN02C-038
-        // audit: CBTRN02C-039
-        let status = assert_abended(&output, &var_dir, line, &needles);
-        let log: Vec<String> = messages(&output)
-            .into_iter()
-            .filter(|message| is_job_log(message))
-            .collect();
-        // Nothing of the run follows the failed read: no record is read, so no not-found line,
-        // and neither the counts nor the end line appear.
-        // audit: CBTRN02C-038
-        // audit: CBTRN02C-039
-        // audit: CBTRN02C-043
-        assert_eq!(
-            log,
-            [START_LINE],
-            "{rule}: the job log of a run whose read of {table} failed"
-        );
-        // The reject directory is allocated with the generation, which then exists until the
-        // abend removes it; before its open the run has allocated neither.
-        let left = fs::read_dir(var_dir.join("dalyrejs"))
-            .ok()
-            .map(Iterator::count);
-        // audit: CBTRN02C-044
-        assert_eq!(
-            left,
-            after_rejects_open.then_some(0),
-            "{rule}: the entries left in the reject directory after a failed read of {table}"
-        );
-        // audit: CBTRN02C-038
-        // audit: CBTRN02C-039
-        assert_cause_before_abend(&output, operation, &unavailable, &needles);
-        if line.is_some() {
+        // In the job's read order: the cross-reference before the reject generation is created, the
+        // accounts after it, then the category balances (CBTRN02C-031).
+        let cases = [
+            ReadFailure {
+                rule: "CBTRN02C-039",
+                table: "card_xref",
+                column: CARD_XREF_COLUMN,
+                line: None,
+                operation: READ_XREFFILE_OP,
+                after_rejects_open: false,
+            },
+            ReadFailure {
+                rule: "CBTRN02C-039",
+                table: "accounts",
+                column: ACCOUNTS_COLUMN,
+                line: None,
+                operation: READ_ACCTFILE_OP,
+                after_rejects_open: true,
+            },
+            ReadFailure {
+                rule: "CBTRN02C-038",
+                table: "tran_cat_balances",
+                column: TRAN_CAT_BALANCES_COLUMN,
+                line: Some(READ_TCATBALF),
+                operation: READ_TCATBALF_OP,
+                after_rejects_open: true,
+            },
+        ];
+        for ReadFailure {
+            rule,
+            table,
+            column,
+            line,
+            operation,
+            after_rejects_open,
+        } in cases
+        {
+            let var_dir = scratch.path().join(table);
+            let relay = Relay::start(guard.database_url(), column)?;
+            let output =
+                run_posttran_with(relay.database_url(), &var_dir, &dalytran, Launch::Direct)
+                    .await?;
+            let cut = relay.cut_made();
+            drop(relay);
             // audit: CBTRN02C-038
-            status_blocked(status.as_deref());
-        } else {
             // audit: CBTRN02C-039
             assert!(
-                messages(&output).iter().all(|message| {
-                    !message.starts_with(STATUS_PREFIX) && !message.starts_with(FAILURE_LINE_PREFIX)
-                }),
-                "{rule}: a failed read of {table} showed a failure or status line"
+                cut,
+                "{rule}: the relay never met the row description of {table}"
             );
+            // audit: CBTRN02C-038
             // audit: CBTRN02C-039
-            blocked(
-                rule,
-                "X-POSTTRAN-5",
-                &format!(
-                    "the COBOL outcome of a read of {table} that fails other than by \
-                     INVALID KEY, which tests no status and goes on with the records an earlier \
-                     read left"
-                ),
+            let status = assert_abended(&output, &var_dir, line, &needles);
+            let log: Vec<String> = messages(&output)
+                .into_iter()
+                .filter(|message| is_job_log(message))
+                .collect();
+            // Nothing of the run follows the failed read: no record is read, so no not-found line,
+            // and neither the counts nor the end line appear.
+            // audit: CBTRN02C-038
+            // audit: CBTRN02C-039
+            // audit: CBTRN02C-043
+            assert_eq!(
+                log,
+                [START_LINE],
+                "{rule}: the job log of a run whose read of {table} failed"
+            );
+            // The reject directory is allocated with the generation, which then exists until the
+            // abend removes it; before its open the run has allocated neither.
+            let left = fs::read_dir(var_dir.join("dalyrejs"))
+                .ok()
+                .map(Iterator::count);
+            // audit: CBTRN02C-044
+            assert_eq!(
+                left,
+                after_rejects_open.then_some(0),
+                "{rule}: the entries left in the reject directory after a failed read of {table}"
+            );
+            // audit: CBTRN02C-038
+            // audit: CBTRN02C-039
+            assert_cause_before_abend(&output, operation, &unavailable, &needles);
+            if line.is_some() {
+                // audit: CBTRN02C-038
+                status_blocked(status.as_deref());
+            } else {
+                // audit: CBTRN02C-039
+                assert!(
+                    messages(&output).iter().all(|message| {
+                        !message.starts_with(STATUS_PREFIX)
+                            && !message.starts_with(FAILURE_LINE_PREFIX)
+                    }),
+                    "{rule}: a failed read of {table} showed a failure or status line"
+                );
+                // audit: CBTRN02C-039
+                blocked(
+                    rule,
+                    "X-POSTTRAN-5",
+                    &format!(
+                        "the COBOL outcome of a read of {table} that fails other than by \
+                         INVALID KEY, which tests no status and goes on with the records an earlier \
+                         read left"
+                    ),
+                );
+            }
+            // audit: CBTRN02C-038
+            // audit: CBTRN02C-039
+            assert!(
+                Tables::read(&mut store).await? == before,
+                "{rule}: the run whose read of {table} failed changed a table"
             );
         }
-        // audit: CBTRN02C-038
-        // audit: CBTRN02C-039
-        assert!(
-            Tables::read(&mut store).await? == before,
-            "{rule}: the run whose read of {table} failed changed a table"
-        );
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// A reject generation that cannot be written at its close ends the run with
@@ -2717,51 +2804,53 @@ async fn a_failed_table_read_abends_before_the_first_record() -> TestResult {
 /// 8 KiB the job buffers, so no byte of them reaches the file before the close, and they exceed
 /// the file-size limit of one shell block, 1,024 bytes at most, the job runs under, so the
 /// close's write fails.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_failed_reject_close_shows_the_cross_reference_status() -> TestResult {
-    let needles = Needles::load()?;
-    let reject = card_record(
-        &first_daily_record()?,
-        UNKNOWN_CARD,
-        LOADED_TYPE,
-        SCRATCH_CENTS,
-    )?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let before = Tables::read(&mut store).await?;
-    let scratch = Scratch::new("reject-close")?;
-    let input = scratch.write("close.txt", &lines_of(&[&reject, &reject, &reject]))?;
-    let output = run_posttran_with(
-        guard.database_url(),
-        scratch.path(),
-        &input,
-        Launch::FileSizeLimited,
-    )
-    .await?;
-    // audit: CBTRN02C-040
-    let status = assert_abended(&output, scratch.path(), Some(CLOSE_DALYREJS), &needles);
-    // audit: CBTRN02C-040
-    assert_eq!(
-        status.as_deref(),
-        Some(REJECT_CLOSE_STATUS),
-        "the status line"
-    );
-    assert_event(&output, &[("operation", CLOSE_DALYREJS_OP)], &needles);
-    let log: Vec<String> = messages(&output)
-        .into_iter()
-        .filter(|message| is_job_log(message))
-        .collect();
-    // audit: CBTRN02C-040
-    assert_eq!(
-        log,
-        [START_LINE],
-        "the job log of a run whose reject close failed"
-    );
-    assert!(
-        Tables::read(&mut store).await? == before,
-        "a run that only rejected changed a table"
-    );
-    Ok(())
+#[test]
+fn a_failed_reject_close_shows_the_cross_reference_status() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let reject = card_record(
+            &first_daily_record()?,
+            UNKNOWN_CARD,
+            LOADED_TYPE,
+            SCRATCH_CENTS,
+        )?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let before = Tables::read(&mut store).await?;
+        let scratch = Scratch::new("reject-close")?;
+        let input = scratch.write("close.txt", &lines_of(&[&reject, &reject, &reject]))?;
+        let output = run_posttran_with(
+            guard.database_url(),
+            scratch.path(),
+            &input,
+            Launch::FileSizeLimited,
+        )
+        .await?;
+        // audit: CBTRN02C-040
+        let status = assert_abended(&output, scratch.path(), Some(CLOSE_DALYREJS), &needles);
+        // audit: CBTRN02C-040
+        assert_eq!(
+            status.as_deref(),
+            Some(REJECT_CLOSE_STATUS),
+            "the status line"
+        );
+        assert_event(&output, &[("operation", CLOSE_DALYREJS_OP)], &needles);
+        let log: Vec<String> = messages(&output)
+            .into_iter()
+            .filter(|message| is_job_log(message))
+            .collect();
+        // audit: CBTRN02C-040
+        assert_eq!(
+            log,
+            [START_LINE],
+            "the job log of a run whose reject close failed"
+        );
+        assert!(
+            Tables::read(&mut store).await? == before,
+            "a run that only rejected changed a table"
+        );
+        Ok(())
+    })
 }
 
 /// An account update that matches no row changes no outcome (X-POSTTRAN-3): its record is not
@@ -2769,96 +2858,99 @@ async fn a_failed_reject_close_shows_the_cross_reference_status() -> TestResult 
 /// still written, after its category balance. The test removes the record's account after the
 /// job has read it: it replaces `accounts` by every account but that one in a transaction of its
 /// own, and commits it once the job is past its reads.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_account_update_that_matches_no_row_changes_no_outcome() -> TestResult {
-    let needles = Needles::load()?;
-    let template = first_daily_record()?;
-    let reject = card_record(&template, UNKNOWN_CARD, LOADED_TYPE, SCRATCH_CENTS)?;
-    let posted = scratch_record(&template, LOADED_TYPE, SCRATCH_CENTS)?;
-    let mut records = vec![reject.as_slice(); UNKNOWN_CARD_RECORDS];
-    records.push(posted.as_slice());
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
-    let before = Tables::read(&mut store).await?;
-    let remaining: Vec<AccountRecord> = before
-        .accounts
-        .iter()
-        .filter(|account| account.id.get() != SCRATCH_ACCOUNT)
-        .cloned()
-        .collect();
-    let scratch = Scratch::new("account-removed")?;
-    let input = scratch.write("removed.txt", &lines_of(&records))?;
-    let rejects = generation(scratch.path(), FIRST_GENERATION);
+#[test]
+fn an_account_update_that_matches_no_row_changes_no_outcome() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let template = first_daily_record()?;
+        let reject = card_record(&template, UNKNOWN_CARD, LOADED_TYPE, SCRATCH_CENTS)?;
+        let posted = scratch_record(&template, LOADED_TYPE, SCRATCH_CENTS)?;
+        let mut records = vec![reject.as_slice(); UNKNOWN_CARD_RECORDS];
+        records.push(posted.as_slice());
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        CardXrefRepository::insert(&mut store, &scratch_xref()?).await?;
+        let before = Tables::read(&mut store).await?;
+        let remaining: Vec<AccountRecord> = before
+            .accounts
+            .iter()
+            .filter(|account| account.id.get() != SCRATCH_ACCOUNT)
+            .cloned()
+            .collect();
+        let scratch = Scratch::new("account-removed")?;
+        let input = scratch.write("removed.txt", &lines_of(&records))?;
+        let rejects = generation(scratch.path(), FIRST_GENERATION);
 
-    // The replacement holds `SHARE ROW EXCLUSIVE` on `accounts` until it ends. The job's read of
-    // the table does not wait for it and still finds the account, while the job's update of the
-    // account waits for the commit and then finds the row gone, whether it was issued before the
-    // commit or after it. The commit point is sound because the job reads `card_xref`,
-    // `accounts` and `tran_cat_balances` whole before its first record, and its reject
-    // generation receives bytes only when the 8 KiB it buffers first overflows, at the twentieth
-    // unknown-card reject: bytes in the generation show the reads done and the posted record,
-    // the last, not yet reached.
-    let mut removal = store.begin().await?;
-    AccountRepository::replace_all(&mut removal, &remaining).await?;
-    let (output, committed) = tokio::join!(
-        run_posttran(&guard, scratch.path(), &input),
-        commit_after_reads(removal, &rejects)
-    );
-    let output = output?;
-    committed?;
-    assert_eq!(
-        output.status.code(),
-        Some(REJECTS_EXIT_STATUS),
-        "{}",
-        needles.report(&output)
-    );
-    assert_eq!(written_paths(&output), [rejects.clone()]);
-    // audit: CBTRN02C-023
-    assert_job_log(&output, 0, REMOVED_ACCOUNT_COUNT_LINES);
-    // Each record is the `0100` reject of an unknown card, so the posted record is none of them
-    // and none carries the `0109` its failed account update moved (CBTRN02C-027).
-    let expected = expected_reject(&reject, INVALID_CARD_REASON, INVALID_CARD_DESC)?;
-    let bytes = fs::read(&rejects)?;
-    let written = fixed_records(&bytes, REJECT_LEN)?;
-    // audit: CBTRN02C-023
-    assert_eq!(
-        written.len(),
-        UNKNOWN_CARD_RECORDS,
-        "reject records written"
-    );
-    for (index, record) in written.iter().enumerate() {
-        let offset = first_difference(record, &expected);
+        // The replacement holds `SHARE ROW EXCLUSIVE` on `accounts` until it ends. The job's read of
+        // the table does not wait for it and still finds the account, while the job's update of the
+        // account waits for the commit and then finds the row gone, whether it was issued before the
+        // commit or after it. The commit point is sound because the job reads `card_xref`,
+        // `accounts` and `tran_cat_balances` whole before its first record, and its reject
+        // generation receives bytes only when the 8 KiB it buffers first overflows, at the twentieth
+        // unknown-card reject: bytes in the generation show the reads done and the posted record,
+        // the last, not yet reached.
+        let mut removal = store.begin().await?;
+        AccountRepository::replace_all(&mut removal, &remaining).await?;
+        let (output, committed) = join(
+            run_posttran(&guard, scratch.path(), &input),
+            commit_after_reads(removal, &rejects),
+        )
+        .await;
+        let output = output?;
+        committed?;
+        assert_eq!(
+            output.status.code(),
+            Some(REJECTS_EXIT_STATUS),
+            "{}",
+            needles.report(&output)
+        );
+        assert_eq!(written_paths(&output), [rejects.clone()]);
+        // audit: CBTRN02C-023
+        assert_job_log(&output, 0, REMOVED_ACCOUNT_COUNT_LINES);
+        // Each record is the `0100` reject of an unknown card, so the posted record is none of them
+        // and none carries the `0109` its failed account update moved (CBTRN02C-027).
+        let expected = expected_reject(&reject, INVALID_CARD_REASON, INVALID_CARD_DESC)?;
+        let bytes = fs::read(&rejects)?;
+        let written = fixed_records(&bytes, REJECT_LEN)?;
+        // audit: CBTRN02C-023
+        assert_eq!(
+            written.len(),
+            UNKNOWN_CARD_RECORDS,
+            "reject records written"
+        );
+        for (index, record) in written.iter().enumerate() {
+            let offset = first_difference(record, &expected);
+            assert!(
+                offset.is_none(),
+                "reject record {index} differs from the unknown-card reject at byte offset \
+                 {offset:?}"
+            );
+        }
+        let after = Tables::read(&mut store).await?;
+        let [transaction] = after.transactions.as_slice() else {
+            panic!(
+                "{} transactions, not the posted scratch record alone",
+                after.transactions.len()
+            );
+        };
+        // audit: CBTRN02C-023
+        assert_posted(
+            transaction,
+            &DailyTransactionRecord::decode(&posted)?,
+            records.len(),
+        );
+        // audit: CBTRN02C-015
+        assert_balance_moved(
+            &before.balances,
+            &after.balances,
+            LOADED_KEY,
+            Decimal::new(SCRATCH_CENTS, 2),
+        )?;
+        // audit: CBTRN02C-023
         assert!(
-            offset.is_none(),
-            "reject record {index} differs from the unknown-card reject at byte offset \
-             {offset:?}"
+            after.accounts == remaining,
+            "the accounts are not those the replacement left"
         );
-    }
-    let after = Tables::read(&mut store).await?;
-    let [transaction] = after.transactions.as_slice() else {
-        panic!(
-            "{} transactions, not the posted scratch record alone",
-            after.transactions.len()
-        );
-    };
-    // audit: CBTRN02C-023
-    assert_posted(
-        transaction,
-        &DailyTransactionRecord::decode(&posted)?,
-        records.len(),
-    );
-    // audit: CBTRN02C-015
-    assert_balance_moved(
-        &before.balances,
-        &after.balances,
-        LOADED_KEY,
-        Decimal::new(SCRATCH_CENTS, 2),
-    )?;
-    // audit: CBTRN02C-023
-    assert!(
-        after.accounts == remaining,
-        "the accounts are not those the replacement left"
-    );
-    Ok(())
+        Ok(())
+    })
 }

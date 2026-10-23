@@ -498,6 +498,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The 14 spaces codec A supplies for the `FILLER` the fixture bodies omit.
     const BLANK_FILLER: [u8; 14] = *b"              ";
 
@@ -564,238 +573,249 @@ mod tests {
     // audit: LOADS-014
     // audit: LOADS-015
     // audit: LOADS-024
-    #[tokio::test]
-    async fn fixture_load_runs_twice_and_every_read_path_finds_each_record() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let records = fixture_records()?;
-        assert_eq!(records.len(), 50);
+    #[test]
+    fn fixture_load_runs_twice_and_every_read_path_finds_each_record() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let records = fixture_records()?;
+            assert_eq!(records.len(), 50);
 
-        // Freshly migrated, then loaded: both runs leave exactly the input set.
-        for _ in 0..2 {
-            assert_eq!(store.replace_all(&records).await?, 50);
-            assert!(
-                store.find_all().await? == by_card(&records),
-                "find_all returns every loaded record in card-number order"
-            );
-        }
+            // Freshly migrated, then loaded: both runs leave exactly the input set.
+            for _ in 0..2 {
+                assert_eq!(store.replace_all(&records).await?, 50);
+                assert!(
+                    store.find_all().await? == by_card(&records),
+                    "find_all returns every loaded record in card-number order"
+                );
+            }
 
-        for record in &records {
-            assert!(
-                store.find_by_id(&record.card_num).await?.as_ref() == Some(record),
-                "find_by_id returns the record of its card number"
-            );
-            assert!(
-                store.find_by_acct_id(record.acct_id).await?.as_ref() == Some(record),
-                "find_by_acct_id returns the one record of its account"
-            );
-            assert!(
-                store.find_first_two_by_acct_id(record.acct_id).await? == [record.clone()],
-                "each fixture account has exactly one cross-reference"
-            );
-        }
+            for record in &records {
+                assert!(
+                    store.find_by_id(&record.card_num).await?.as_ref() == Some(record),
+                    "find_by_id returns the record of its card number"
+                );
+                assert!(
+                    store.find_by_acct_id(record.acct_id).await?.as_ref() == Some(record),
+                    "find_by_acct_id returns the one record of its account"
+                );
+                assert!(
+                    store.find_first_two_by_acct_id(record.acct_id).await? == [record.clone()],
+                    "each fixture account has exactly one cross-reference"
+                );
+            }
 
-        let absent_card = CardNumber::new(PicX::from_array(*b"0000000000000000"));
-        assert!(store.find_by_id(&absent_card).await?.is_none());
-        let absent_account = PicU::new(ABSENT_ACCOUNT)?;
-        assert!(store.find_by_acct_id(absent_account).await?.is_none());
-        assert!(
-            store
-                .find_first_two_by_acct_id(absent_account)
-                .await?
-                .is_empty()
-        );
-        Ok(())
+            let absent_card = CardNumber::new(PicX::from_array(*b"0000000000000000"));
+            assert!(store.find_by_id(&absent_card).await?.is_none());
+            let absent_account = PicU::new(ABSENT_ACCOUNT)?;
+            assert!(store.find_by_acct_id(absent_account).await?.is_none());
+            assert!(
+                store
+                    .find_first_two_by_acct_id(absent_account)
+                    .await?
+                    .is_empty()
+            );
+            Ok(())
+        })
     }
 
     // audit: LOADS-023
-    #[tokio::test]
-    async fn an_account_with_several_cards_reads_the_lowest_card_number_first() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let shared = 12_345_678_901;
-        // Inserted out of key order, so the order read back comes from the statements.
-        let records = [
-            xref(*b"7000000000000003", 3, shared)?,
-            xref(*b"1000000000000009", 9, shared)?,
-            xref(*b"5000000000000001", 1, shared)?,
-            xref(*b"0900000000000000", 4, 98_765_432_109)?,
-        ];
-        for record in &records {
-            store.insert(record).await?;
-        }
-        let shared = PicU::new(shared)?;
-        let [highest, lowest, middle, other] = records;
+    #[test]
+    fn an_account_with_several_cards_reads_the_lowest_card_number_first() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let shared = 12_345_678_901;
+            // Inserted out of key order, so the order read back comes from the statements.
+            let records = [
+                xref(*b"7000000000000003", 3, shared)?,
+                xref(*b"1000000000000009", 9, shared)?,
+                xref(*b"5000000000000001", 1, shared)?,
+                xref(*b"0900000000000000", 4, 98_765_432_109)?,
+            ];
+            for record in &records {
+                store.insert(record).await?;
+            }
+            let shared = PicU::new(shared)?;
+            let [highest, lowest, middle, other] = records;
 
-        assert!(
-            store.find_by_acct_id(shared).await? == Some(lowest.clone()),
-            "the alternate-key read returns the lowest card number"
-        );
-        assert!(
-            store.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()],
-            "the probe returns the two lowest card numbers of the account, in order, never more"
-        );
-        assert!(
-            store.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()],
-            "an account with one record returns that record alone"
-        );
-        assert!(
-            store.find_all().await?
-                == [
-                    other.clone(),
-                    lowest.clone(),
-                    middle.clone(),
-                    highest.clone()
-                ],
-            "the whole table in card-number order"
-        );
-        assert!(
-            store.find_by_id(&middle.card_num).await? == Some(middle.clone()),
-            "the keyed read ignores the shared account"
-        );
+            assert!(
+                store.find_by_acct_id(shared).await? == Some(lowest.clone()),
+                "the alternate-key read returns the lowest card number"
+            );
+            assert!(
+                store.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()],
+                "the probe returns the two lowest card numbers of the account, in order, never more"
+            );
+            assert!(
+                store.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()],
+                "an account with one record returns that record alone"
+            );
+            assert!(
+                store.find_all().await?
+                    == [
+                        other.clone(),
+                        lowest.clone(),
+                        middle.clone(),
+                        highest.clone()
+                    ],
+                "the whole table in card-number order"
+            );
+            assert!(
+                store.find_by_id(&middle.card_num).await? == Some(middle.clone()),
+                "the keyed read ignores the shared account"
+            );
 
-        // The same statements inside a transaction, the one the account chain shares included.
-        let mut tx: PgTx<'static> = store.begin().await?;
-        assert!(
-            select_first_by_acct_id(tx.conn(), shared).await? == Some(lowest.clone()),
-            "the keyed statement keeps the lowest card number"
-        );
-        assert!(
-            select_first_two_by_acct_id(tx.conn(), shared).await?
-                == [lowest.clone(), middle.clone()],
-            "the statement the account chain shares returns the two lowest card numbers"
-        );
-        assert!(tx.find_by_acct_id(shared).await? == Some(lowest.clone()));
-        assert!(tx.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()]);
-        assert!(tx.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()]);
-        let absent_account = PicU::new(ABSENT_ACCOUNT)?;
-        assert!(
-            tx.find_first_two_by_acct_id(absent_account)
-                .await?
-                .is_empty()
-        );
-        assert!(tx.find_by_id(&other.card_num).await? == Some(other.clone()));
-        assert!(tx.find_all().await?.len() == 4);
-        tx.rollback().await?;
-        Ok(())
+            // The same statements inside a transaction, the one the account chain shares included.
+            let mut tx: PgTx<'static> = store.begin().await?;
+            assert!(
+                select_first_by_acct_id(tx.conn(), shared).await? == Some(lowest.clone()),
+                "the keyed statement keeps the lowest card number"
+            );
+            assert!(
+                select_first_two_by_acct_id(tx.conn(), shared).await?
+                    == [lowest.clone(), middle.clone()],
+                "the statement the account chain shares returns the two lowest card numbers"
+            );
+            assert!(tx.find_by_acct_id(shared).await? == Some(lowest.clone()));
+            assert!(
+                tx.find_first_two_by_acct_id(shared).await? == [lowest.clone(), middle.clone()]
+            );
+            assert!(tx.find_first_two_by_acct_id(other.acct_id).await? == [other.clone()]);
+            let absent_account = PicU::new(ABSENT_ACCOUNT)?;
+            assert!(
+                tx.find_first_two_by_acct_id(absent_account)
+                    .await?
+                    .is_empty()
+            );
+            assert!(tx.find_by_id(&other.card_num).await? == Some(other.clone()));
+            assert!(tx.find_all().await?.len() == 4);
+            tx.rollback().await?;
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_duplicate_card_number_is_typed_and_a_savepoint_keeps_the_transaction() -> TestResult
-    {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let first = xref(*b"4000123412341234", 1, 1)?;
-        let same_card = xref(*b"4000123412341234", 2, 2)?;
-        let second = xref(*b"4000123412349999", 3, 3)?;
+    #[test]
+    fn a_duplicate_card_number_is_typed_and_a_savepoint_keeps_the_transaction() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let first = xref(*b"4000123412341234", 1, 1)?;
+            let same_card = xref(*b"4000123412341234", 2, 2)?;
+            let second = xref(*b"4000123412349999", 3, 3)?;
 
-        store.insert(&first).await?;
-        assert_duplicate_key(store.insert(&same_card).await.err().as_ref());
+            store.insert(&first).await?;
+            assert_duplicate_key(store.insert(&same_card).await.err().as_ref());
 
-        let mut tx = store.begin().await?;
-        let mut savepoint = tx.savepoint().await?;
-        assert_duplicate_key(savepoint.insert(&same_card).await.err().as_ref());
-        savepoint.rollback().await?;
-        tx.insert(&second).await?;
-        tx.commit().await?;
+            let mut tx = store.begin().await?;
+            let mut savepoint = tx.savepoint().await?;
+            assert_duplicate_key(savepoint.insert(&same_card).await.err().as_ref());
+            savepoint.rollback().await?;
+            tx.insert(&second).await?;
+            tx.commit().await?;
 
-        assert!(
-            store.find_all().await? == [first.clone(), second.clone()],
-            "the first row stands and the insert after the savepoint committed"
-        );
-        Ok(())
+            assert!(
+                store.find_all().await? == [first.clone(), second.clone()],
+                "the first row stands and the insert after the savepoint committed"
+            );
+            Ok(())
+        })
     }
 
     // audit: LOADS-014
     // audit: LOADS-018
-    #[tokio::test]
-    async fn replace_all_keeps_only_its_input_and_fails_as_a_whole() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let a = xref(*b"6000000000000001", 1, 1)?;
-        let b = xref(*b"6000000000000002", 2, 2)?;
-        let c = xref(*b"6000000000000003", 3, 3)?;
+    #[test]
+    fn replace_all_keeps_only_its_input_and_fails_as_a_whole() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let a = xref(*b"6000000000000001", 1, 1)?;
+            let b = xref(*b"6000000000000002", 2, 2)?;
+            let c = xref(*b"6000000000000003", 3, 3)?;
 
-        assert_eq!(store.replace_all(&[b.clone(), a.clone()]).await?, 2);
-        assert_eq!(store.replace_all(&[c.clone()]).await?, 1);
-        assert!(
-            store.find_all().await? == [c.clone()],
-            "rows the input lacks are gone"
-        );
-        assert_eq!(store.replace_all(&[a.clone(), b.clone()]).await?, 2);
+            assert_eq!(store.replace_all(&[b.clone(), a.clone()]).await?, 2);
+            assert_eq!(store.replace_all(&[c.clone()]).await?, 1);
+            assert!(
+                store.find_all().await? == [c.clone()],
+                "rows the input lacks are gone"
+            );
+            assert_eq!(store.replace_all(&[a.clone(), b.clone()]).await?, 2);
 
-        // A failing load deletes and inserts nothing: the previous contents remain.
-        assert_duplicate_key(
-            store
-                .replace_all(&[c.clone(), c.clone()])
-                .await
-                .err()
-                .as_ref(),
-        );
-        assert!(
-            store.find_all().await? == [a.clone(), b.clone()],
-            "a failed load leaves the previous contents"
-        );
+            // A failing load deletes and inserts nothing: the previous contents remain.
+            assert_duplicate_key(
+                store
+                    .replace_all(&[c.clone(), c.clone()])
+                    .await
+                    .err()
+                    .as_ref(),
+            );
+            assert!(
+                store.find_all().await? == [a.clone(), b.clone()],
+                "a failed load leaves the previous contents"
+            );
 
-        // On a transaction the replacement is the caller's: rolled back, then committed.
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[c.clone()]).await?, 1);
-        assert!(tx.find_all().await? == [c.clone()]);
-        tx.rollback().await?;
-        assert!(
-            store.find_all().await? == [a.clone(), b.clone()],
-            "a rolled-back replacement leaves the previous contents"
-        );
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[c.clone(), a.clone()]).await?, 2);
-        tx.commit().await?;
-        assert!(
-            store.find_all().await? == [a, c],
-            "a committed replacement holds exactly its input"
-        );
+            // On a transaction the replacement is the caller's: rolled back, then committed.
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[c.clone()]).await?, 1);
+            assert!(tx.find_all().await? == [c.clone()]);
+            tx.rollback().await?;
+            assert!(
+                store.find_all().await? == [a.clone(), b.clone()],
+                "a rolled-back replacement leaves the previous contents"
+            );
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[c.clone(), a.clone()]).await?, 2);
+            tx.commit().await?;
+            assert!(
+                store.find_all().await? == [a, c],
+                "a committed replacement holds exactly its input"
+            );
 
-        assert_eq!(store.replace_all(&[]).await?, 0);
-        assert!(store.find_all().await?.is_empty());
-        Ok(())
+            assert_eq!(store.replace_all(&[]).await?, 0);
+            assert!(store.find_all().await?.is_empty());
+            Ok(())
+        })
     }
 
     /// A record codec B cannot store, after one it can, fails the replacement before the delete:
     /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
     /// so committing it after the error keeps the previous contents.
     // audit: LOADS-018
-    #[tokio::test]
-    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let original = [
-            xref(*b"6100000000000001", 1, 1)?,
-            xref(*b"6100000000000002", 2, 2)?,
-        ];
-        assert_eq!(store.replace_all(&original).await?, 2);
-        let unstorable = CardXrefRecord {
-            filler: PicX::from_array(*b"             \0"),
-            ..xref(*b"6100000000000004", 4, 4)?
-        };
-        let input = [xref(*b"6100000000000003", 3, 3)?, unstorable];
-        let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
+    #[test]
+    fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let original = [
+                xref(*b"6100000000000001", 1, 1)?,
+                xref(*b"6100000000000002", 2, 2)?,
+            ];
+            assert_eq!(store.replace_all(&original).await?, 2);
+            let unstorable = CardXrefRecord {
+                filler: PicX::from_array(*b"             \0"),
+                ..xref(*b"6100000000000004", 4, 4)?
+            };
+            let input = [xref(*b"6100000000000003", 3, 3)?, unstorable];
+            let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
 
-        assert_eq!(store.replace_all(&input).await, invalid);
-        assert!(
-            store.find_all().await? == original,
-            "a failed load through the pool leaves the previous contents"
-        );
+            assert_eq!(store.replace_all(&input).await, invalid);
+            assert!(
+                store.find_all().await? == original,
+                "a failed load through the pool leaves the previous contents"
+            );
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&input).await, invalid);
-        assert!(
-            tx.find_all().await? == original,
-            "the transaction deleted nothing and is not aborted"
-        );
-        tx.commit().await?;
-        assert!(
-            store.find_all().await? == original,
-            "committing after the error keeps the previous contents"
-        );
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&input).await, invalid);
+            assert!(
+                tx.find_all().await? == original,
+                "the transaction deleted nothing and is not aborted"
+            );
+            tx.commit().await?;
+            assert!(
+                store.find_all().await? == original,
+                "committing after the error keeps the previous contents"
+            );
+            Ok(())
+        })
     }
 }

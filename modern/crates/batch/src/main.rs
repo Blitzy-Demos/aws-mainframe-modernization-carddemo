@@ -14,9 +14,12 @@
 //!
 //! This file holds only the process lifecycle: it parses the command line, checks the
 //! `cbpaup0j` SYSIN record, reads the configuration, checks the job's output directory, installs
-//! telemetry, opens the `PostgreSQL` pool and runs the selected job.
+//! telemetry, builds the async runtime, opens the `PostgreSQL` pool and runs the selected job.
 //! Business rules live in `domain::batch`, every query in the `persistence` repository traits and
 //! every file read and write in the job modules.
+//!
+//! The file uses no `tokio` or `tracing` macro: the runtime is built explicitly in `run`, and
+//! events go through `emit`, whose documentation says why.
 //!
 //! # Schema
 //!
@@ -51,10 +54,11 @@
 //!
 //! A failed run writes one line, `carddemo-batch <subcommand>: <reason>`. The reason is a
 //! refused `cbpaup0j` SYSIN record, a configuration error that names its variable and never its
-//! value, a telemetry failure, a database connection failure that names `DATABASE_URL` and
-//! gives the value-free summary of `runtime::db`, the job's error, or a failure to write
-//! standard output. None of them shows a record, a card number, an SSN, a password or the
-//! connection URL (Cardholder Data Redaction).
+//! value, a telemetry failure, an async runtime that cannot be built (`cannot build the async
+//! runtime: <error>`, also an `ERROR` event of that message in the job span), a database
+//! connection failure that names `DATABASE_URL` and gives the value-free summary of
+//! `runtime::db`, the job's error, or a failure to write standard output. None of them shows a
+//! record, a card number, an SSN, a password or the connection URL (Cardholder Data Redaction).
 //! A job's error on its output directory, such as `allocating generation (reports under
 //! CARDDEMO_VAR_DIR): not a directory`, names the setting of that directory instead of its path.
 //! `posttran`, `intcalc` and `tranrept` end such a failure with their audited abend,
@@ -86,8 +90,8 @@
 //!   ends through `9999-ABEND` (CBPAUP0C-028, `CBPAUP0C.cbl:381-382`) or 12 for the user abend
 //!   `U0999` of `posttran` (escalation `X-POSTTRAN-2`).
 //! - 1 for every other failure: a refused SYSIN record, configuration (an output directory
-//!   holding a line break included), telemetry, database connection, standard output, or a job
-//!   error that carries no return code.
+//!   holding a line break included), telemetry, the async runtime build, database connection,
+//!   standard output, or a job error that carries no return code.
 //! - 2 for a usage error, reported by `clap` before anything else runs, so `--help` and
 //!   `--version` need neither the environment nor a database.
 //!
@@ -110,8 +114,8 @@ use domain::batch::loads::LoadJob;
 use domain::clock::SystemClock;
 use persistence::PgStore;
 use runtime::config::Config;
-use tracing::callsite::{Callsite as _, DefaultCallsite};
-use tracing::field::{Field, Value};
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{self, FieldSet, Value};
 use tracing::metadata::Kind;
 use tracing::{Event, Instrument, Level, Metadata, Span};
 
@@ -126,8 +130,7 @@ use crate::jobs::{
 /// The prefix of every standard-error line, followed by the subcommand.
 const PROGRAM: &str = "carddemo-batch";
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     // First, so that `--help`, `--version` and usage errors need no environment.
     let cli = Cli::parse();
     let job = cli.job.name();
@@ -158,10 +161,35 @@ async fn main() -> ExitCode {
             );
         }
     };
-    let code = execute(job, checked, &config)
-        .instrument(runtime::telemetry::job_span(job))
-        .await;
+    let code = run(job, checked, &config);
+    // Dropped once the runtime has shut down and every event is emitted, so the span exporter
+    // flushes everything the run recorded. Its exporter is synchronous and needs no runtime.
     drop(guard);
+    code
+}
+
+/// Builds the multi-threaded async runtime, runs `selected` on it inside the job span, and
+/// shuts the runtime down before returning the job's exit code.
+///
+/// The runtime is built here, by hand, because `#[tokio::main]` expands to a block carrying a
+/// lint suppression and an `expect` on the build, and this workspace admits no lint
+/// suppression, generated ones included. A runtime that cannot be built is reported by
+/// [`runtime_failed`] instead.
+fn run(job: &'static str, selected: CheckedJob<'_>, config: &Config) -> ExitCode {
+    let async_runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(async_runtime) => async_runtime,
+        // In the job span, as every other failure of the job is reported.
+        Err(error) => {
+            return runtime::telemetry::job_span(job).in_scope(|| runtime_failed(job, &error));
+        }
+    };
+    let code = async_runtime
+        .block_on(execute(job, selected, config).instrument(runtime::telemetry::job_span(job)));
+    // Shutdown waits for the runtime's threads, as the end of `#[tokio::main]` does.
+    drop(async_runtime);
     code
 }
 
@@ -307,7 +335,7 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
             if intcalc {
                 jobs::intcalc::show_start();
             }
-            tracing::error!(job, error = %error, "database connection failed (DATABASE_URL)");
+            connection_failed(job, &error);
             if intcalc {
                 jobs::intcalc::show_failed_connection();
             }
@@ -394,8 +422,7 @@ fn finish(job: &'static str, result: Result<JobOutcome, JobError>) -> ExitCode {
     match result {
         Ok(outcome) => {
             if print_paths(&outcome.written).is_err() {
-                tracing::error!(job, "cannot write to standard output");
-                return fail(job, &"cannot write to standard output");
+                return stdout_failed(job);
             }
             runtime::telemetry::record_job_outcome(&span, outcome.return_code, &outcome.counts);
             job_finished(job, outcome.return_code, outcome.written.len());
@@ -406,80 +433,204 @@ fn finish(job: &'static str, result: Result<JobOutcome, JobError>) -> ExitCode {
             if let Some(return_code) = code {
                 runtime::telemetry::record_job_outcome(&span, return_code, &[]);
             }
-            tracing::error!(job, error = %error, "job failed");
+            job_failed(job, &error);
             report(job, &error);
             code.map_or(ExitCode::FAILURE, ExitCode::from)
         }
     }
 }
 
-/// The message of the outcome event of a job that ran to its end, and the name of its callsites.
-const JOB_FINISHED: &str = "job finished";
-
-/// The fields of the [`JOB_FINISHED`] event, in the order [`job_finished`] gives their values.
-const JOB_FINISHED_FIELDS: &[&str] = &["message", "job", "return_code", "written"];
-
-// Written out: `tracing::info!`/`warn!` expand to an `allow(unused_imports)` lint suppression.
-/// The `INFO` callsite of the [`JOB_FINISHED`] event, for return code 0.
-static JOB_FINISHED_INFO: DefaultCallsite = DefaultCallsite::new(&JOB_FINISHED_INFO_METADATA);
-
-/// The metadata of [`JOB_FINISHED_INFO`].
-static JOB_FINISHED_INFO_METADATA: Metadata<'static> = tracing::metadata! {
-    name: JOB_FINISHED,
-    target: module_path!(),
-    level: Level::INFO,
-    fields: JOB_FINISHED_FIELDS,
-    callsite: &JOB_FINISHED_INFO,
-    kind: Kind::EVENT,
-};
-
-/// The `WARN` callsite of the [`JOB_FINISHED`] event, for any other return code.
-static JOB_FINISHED_WARN: DefaultCallsite = DefaultCallsite::new(&JOB_FINISHED_WARN_METADATA);
-
-/// The metadata of [`JOB_FINISHED_WARN`].
-static JOB_FINISHED_WARN_METADATA: Metadata<'static> = tracing::metadata! {
-    name: JOB_FINISHED,
-    target: module_path!(),
-    level: Level::WARN,
-    fields: JOB_FINISHED_FIELDS,
-    callsite: &JOB_FINISHED_WARN,
-    kind: Kind::EVENT,
-};
-
-/// Emits the [`JOB_FINISHED`] event of a job that ran to its end, in the current span, with the
-/// fields `job`, `return_code` and `written`: `INFO` for return code 0 and `WARN` for any other.
+/// The callsite of one event of this binary, whose metadata names `N` fields, `message` first.
+/// It is written out in place of a `tracing` event macro, whose expansion carries a lint
+/// suppression (see [`emit`]).
 ///
-/// It decides through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s event
-/// macros do, so the event is the line a macro would write: target `carddemo_batch` and fields
-/// `{"message":"job finished","job":…,"return_code":…,"written":…}`.
-fn job_finished(job: &str, return_code: u8, written: usize) {
-    // An event's level is fixed at its callsite, so each level has its own callsite.
-    let callsite = if return_code == 0 {
-        &JOB_FINISHED_INFO
-    } else {
-        &JOB_FINISHED_WARN
-    };
+/// [`event_metadata`] and [`emit`] take the same `N`, so an event always carries exactly one
+/// value, or `None`, per field it declares.
+struct EventSite<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> EventSite<N> {
+    /// The callsite of the event that `metadata` describes.
+    const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the event `name` at `level`, with the field `names`, for the callsite `site`.
+///
+/// The target and the module path are this crate's root module, `carddemo_batch`, which a
+/// `tracing` macro in this file would have given the event, so `RUST_LOG` directives select it
+/// as before. No source file or line is given: the JSON output and the span export print
+/// neither.
+const fn event_metadata<const N: usize>(
+    name: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        module_path!(),
+        level,
+        None,
+        None,
+        Some(module_path!()),
+        FieldSet::new(names, Identifier(&site.0)),
+        Kind::EVENT,
+    )
+}
+
+/// Emits one event of `site` in the current span, with `values`, one per field the site names
+/// and in that order, a `None` leaving its field out, when the current subscriber enables it.
+///
+/// Every `tracing` event macro expands to an attribute that allows `unused_imports`, and this
+/// workspace admits no lint suppression, generated ones included. So each event of this file has
+/// its callsite written out, an [`EventSite`] over its [`event_metadata`], and this function
+/// takes the steps an event macro takes: it decides through `runtime::telemetry::event_enabled`
+/// and dispatches with `Event::dispatch`. `RUST_LOG` filtering, the JSON line and the span
+/// export therefore treat these events exactly as they treat a macro's.
+fn emit<const N: usize>(site: &'static EventSite<N>, values: [Option<&dyn Value>; N]) {
+    let callsite = &site.0;
     if !runtime::telemetry::event_enabled(callsite) {
         return;
     }
     let metadata = callsite.metadata();
-    let fields = metadata.fields();
-    // Both callsites declare every name of `JOB_FINISHED_FIELDS`, so each lookup finds its field.
-    let (Some(message_field), Some(job_field), Some(return_code_field), Some(written_field)) = (
-        fields.field("message"),
-        fields.field("job"),
-        fields.field("return_code"),
-        fields.field("written"),
-    ) else {
-        return;
+    // The site's field names and `values` have the same length `N`, so each field gets its value.
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+}
+
+/// The message of the outcome event of a job that ran to its end, and the name of its callsites.
+const JOB_FINISHED: &str = "job finished";
+
+/// The fields of the [`JOB_FINISHED`] event, in the order [`job_finished`] gives their values.
+const JOB_FINISHED_FIELDS: [&str; 4] = ["message", "job", "return_code", "written"];
+
+/// The `INFO` callsite of the [`JOB_FINISHED`] event, for return code 0.
+static JOB_FINISHED_INFO: EventSite<4> = EventSite::new(&JOB_FINISHED_INFO_METADATA);
+
+/// The metadata of [`JOB_FINISHED_INFO`].
+static JOB_FINISHED_INFO_METADATA: Metadata<'static> = event_metadata(
+    JOB_FINISHED,
+    Level::INFO,
+    &JOB_FINISHED_FIELDS,
+    &JOB_FINISHED_INFO,
+);
+
+/// The `WARN` callsite of the [`JOB_FINISHED`] event, for any other return code.
+static JOB_FINISHED_WARN: EventSite<4> = EventSite::new(&JOB_FINISHED_WARN_METADATA);
+
+/// The metadata of [`JOB_FINISHED_WARN`].
+static JOB_FINISHED_WARN_METADATA: Metadata<'static> = event_metadata(
+    JOB_FINISHED,
+    Level::WARN,
+    &JOB_FINISHED_FIELDS,
+    &JOB_FINISHED_WARN,
+);
+
+/// Emits the [`JOB_FINISHED`] event of a job that ran to its end, in the current span, with the
+/// fields `job`, `return_code` and `written`: `INFO` for return code 0 and `WARN` for any other.
+///
+/// It goes through [`emit`], so the event is the line a macro would write: target
+/// `carddemo_batch` and fields `{"message":"job finished","job":…,"return_code":…,"written":…}`.
+fn job_finished(job: &str, return_code: u8, written: usize) {
+    // An event's level is fixed at its callsite, so each level has its own callsite.
+    let site = if return_code == 0 {
+        &JOB_FINISHED_INFO
+    } else {
+        &JOB_FINISHED_WARN
     };
-    let values: [(&Field, Option<&dyn Value>); 4] = [
-        (&message_field, Some(&JOB_FINISHED)),
-        (&job_field, Some(&job)),
-        (&return_code_field, Some(&return_code)),
-        (&written_field, Some(&written)),
-    ];
-    Event::dispatch(metadata, &fields.value_set(&values));
+    emit(
+        site,
+        [
+            Some(&JOB_FINISHED),
+            Some(&job),
+            Some(&return_code),
+            Some(&written),
+        ],
+    );
+}
+
+/// The message of the event of a pool that cannot be opened, and the name of its callsite.
+const CONNECTION_FAILED: &str = "database connection failed (DATABASE_URL)";
+
+/// Emits the `ERROR` event [`CONNECTION_FAILED`] in the current span, with the fields `job` and
+/// `error`, the value-free summary of the connection error as text.
+fn connection_failed(job: &str, error: &runtime::db::ErrorSummary) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        CONNECTION_FAILED,
+        Level::ERROR,
+        &["message", "job", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&CONNECTION_FAILED),
+            Some(&job),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// The message of the event of written paths that cannot be printed, the reason of its
+/// standard-error line, and the name of its callsite.
+const STDOUT_FAILED: &str = "cannot write to standard output";
+
+/// Reports written paths that cannot be printed: the `ERROR` event [`STDOUT_FAILED`] in the
+/// current span, with the field `job`, then the standard-error line; returns the generic failure
+/// status.
+fn stdout_failed(job: &str) -> ExitCode {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> =
+        event_metadata(STDOUT_FAILED, Level::ERROR, &["message", "job"], &SITE);
+    emit(&SITE, [Some(&STDOUT_FAILED), Some(&job)]);
+    fail(job, &STDOUT_FAILED)
+}
+
+/// The message of the event of a failed job, and the name of its callsite.
+const JOB_FAILED: &str = "job failed";
+
+/// Emits the `ERROR` event [`JOB_FAILED`] in the current span, with the fields `job` and `error`,
+/// the job's error as text.
+fn job_failed(job: &str, error: &JobError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        JOB_FAILED,
+        Level::ERROR,
+        &["message", "job", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [Some(&JOB_FAILED), Some(&job), Some(&field::display(error))],
+    );
+}
+
+/// The message of the event of an async runtime that cannot be built, the start of the reason of
+/// its standard-error line, and the name of its callsite.
+const RUNTIME_FAILED: &str = "cannot build the async runtime";
+
+/// Reports an async runtime that cannot be built: the `ERROR` event [`RUNTIME_FAILED`] in the
+/// current span, with the fields `job` and `error`, the build's I/O error as text, then the
+/// standard-error line `carddemo-batch <job>: cannot build the async runtime: <error>`; returns
+/// the generic failure status.
+fn runtime_failed(job: &str, error: &io::Error) -> ExitCode {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        RUNTIME_FAILED,
+        Level::ERROR,
+        &["message", "job", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&RUNTIME_FAILED),
+            Some(&job),
+            Some(&field::display(error)),
+        ],
+    );
+    fail(job, &format_args!("{RUNTIME_FAILED}: {error}"))
 }
 
 /// Writes each path on its own line of standard output, then flushes it.
@@ -527,7 +678,7 @@ mod tests {
 
     use super::{
         CheckedJob, PROGRAM, STATEMENT_DIR_LINE_BREAK, VAR_DIR_LINE_BREAK, check, check_output_dir,
-        finish, output_setting, write_paths,
+        finish, output_setting, runtime_failed, stdout_failed, write_paths,
     };
     use crate::cli::{Cli, Job};
     use crate::jobs::{JobError, JobOutcome};
@@ -933,6 +1084,68 @@ mod tests {
                 None => assert!(!span.contains("return_code"), "{span}"),
             }
             assert!(!capture.contains("job finished"), "{}", capture.text());
+        }
+    }
+
+    /// A failure path of `main`: it reports in the current span and returns the exit status.
+    type Failure<'a> = &'a dyn Fn() -> ExitCode;
+
+    /// Each failure event of `main` is one `ERROR` event of target `carddemo_batch` in the job
+    /// span, whose fields are exactly the message, the job as text and, where the failure has
+    /// one, the error as its `Display` text, in that order, and the run exits with status 1.
+    #[test]
+    fn a_failure_event_is_one_error_in_the_job_span_with_the_job_and_the_error() {
+        let abend = || JobError::Abend {
+            code: None,
+            reason: "ABENDING PROGRAM",
+        };
+        let failed_job = || finish("intcalc", Err(abend()));
+        // What building the runtime's I/O driver meets when the process may open no more file
+        // descriptors: `EMFILE`, error 24 on Linux.
+        let no_descriptor = io::Error::from_raw_os_error(24);
+        let cases: [(&str, Failure<'_>, &str, Option<String>); 3] = [
+            (
+                "posttran",
+                &|| runtime_failed("posttran", &no_descriptor),
+                "cannot build the async runtime",
+                Some(no_descriptor.to_string()),
+            ),
+            (
+                "tranrept",
+                &|| stdout_failed("tranrept"),
+                "cannot write to standard output",
+                None,
+            ),
+            (
+                "intcalc",
+                &failed_job,
+                "job failed",
+                Some(abend().to_string()),
+            ),
+        ];
+        for (job, fails, message, error) in cases {
+            let capture = trace_capture::capture();
+            let code = job_span(job).in_scope(fails);
+            assert_eq!(code, ExitCode::FAILURE, "{message}");
+
+            let event = sole_event(&capture, message);
+            assert!(event.contains(r#""level":"ERROR""#), "{event}");
+            assert!(event.contains(r#""target":"carddemo_batch""#), "{event}");
+            let Some(fields) = member(&event, "fields") else {
+                panic!("no fields member in {event}");
+            };
+            let expected = match error {
+                Some(error) => format!(r#""message":"{message}","job":"{job}","error":"{error}""#),
+                None => format!(r#""message":"{message}","job":"{job}""#),
+            };
+            assert_eq!(fields, expected, "{event}");
+            let Some(span) = member(&event, "span") else {
+                panic!("no span member in {event}");
+            };
+            assert_members(
+                span,
+                &[r#""name":"batch.job""#, &format!(r#""job":"{job}""#)],
+            );
         }
     }
 }

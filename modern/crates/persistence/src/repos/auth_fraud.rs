@@ -330,6 +330,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// Not a fixture card number: no error may repeat any part of it.
     const CARD: &[u8; 16] = b"9876543210987654";
 
@@ -397,156 +406,162 @@ mod tests {
     // audit: COPAUS2C-008
     // audit: COPAUS2C-011
     // audit: COPAUS2C-013
-    #[tokio::test]
-    async fn insert_duplicate_update_and_read_follow_copaus2c() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let original = record()?;
-        let card = CardNumber::new(PicX::from_array(*CARD));
-        let reported = day(2022, 7, 18)?;
+    #[test]
+    fn insert_duplicate_update_and_read_follow_copaus2c() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let original = record()?;
+            let card = CardNumber::new(PicX::from_array(*CARD));
+            let reported = day(2022, 7, 18)?;
 
-        assert_eq!(store.find_by_id(&card, original.auth_ts).await?, None);
-        store.insert(&original, reported).await?;
-        assert_eq!(
-            store.find_by_id(&card, original.auth_ts).await?,
-            Some((original.clone(), Some(reported)))
-        );
+            assert_eq!(store.find_by_id(&card, original.auth_ts).await?, None);
+            store.insert(&original, reported).await?;
+            assert_eq!(
+                store.find_by_id(&card, original.auth_ts).await?,
+                Some((original.clone(), Some(reported)))
+            );
 
-        let mut again = original.clone();
-        again.auth_fraud = FraudAction::Remove.flag();
-        let duplicate = store.insert(&again, day(2022, 7, 19)?).await;
-        let Err(error) = duplicate else {
-            return Err("the second insert of one key must fail".into());
-        };
-        assert!(error.is_duplicate(), "{error:?}");
-        assert!(
-            error
-                .constraint()
-                .is_some_and(|name| KEY_INDEXES.contains(&name)),
-            "{error:?}"
-        );
-        assert_no_card_digits(&error);
-        assert_eq!(
-            store.find_by_id(&card, original.auth_ts).await?,
-            Some((original.clone(), Some(reported)))
-        );
+            let mut again = original.clone();
+            again.auth_fraud = FraudAction::Remove.flag();
+            let duplicate = store.insert(&again, day(2022, 7, 19)?).await;
+            let Err(error) = duplicate else {
+                return Err("the second insert of one key must fail".into());
+            };
+            assert!(error.is_duplicate(), "{error:?}");
+            assert!(
+                error
+                    .constraint()
+                    .is_some_and(|name| KEY_INDEXES.contains(&name)),
+                "{error:?}"
+            );
+            assert_no_card_digits(&error);
+            assert_eq!(
+                store.find_by_id(&card, original.auth_ts).await?,
+                Some((original.clone(), Some(reported)))
+            );
 
-        let removed = day(2022, 7, 20)?;
-        let flag = FraudAction::Remove.flag();
-        assert!(
-            store
-                .update_flag(&card, original.auth_ts, &flag, removed)
-                .await?
-        );
-        let expected = FraudRecord {
-            auth_fraud: flag.clone(),
-            ..original.clone()
-        };
-        assert_eq!(
-            store.find_by_id(&card, original.auth_ts).await?,
-            Some((expected, Some(removed)))
-        );
+            let removed = day(2022, 7, 20)?;
+            let flag = FraudAction::Remove.flag();
+            assert!(
+                store
+                    .update_flag(&card, original.auth_ts, &flag, removed)
+                    .await?
+            );
+            let expected = FraudRecord {
+                auth_fraud: flag.clone(),
+                ..original.clone()
+            };
+            assert_eq!(
+                store.find_by_id(&card, original.auth_ts).await?,
+                Some((expected, Some(removed)))
+            );
 
-        let other = CardNumber::new(PicX::from_array(*OTHER_CARD));
-        let later = day(2022, 1, 16)?
-            .and_hms_micro_opt(10, 30, 45, 123_000)
-            .ok_or("invalid test timestamp")?;
-        for (key_card, key_ts) in [(&other, original.auth_ts), (&card, later)] {
-            assert!(!store.update_flag(key_card, key_ts, &flag, removed).await?);
-            assert_eq!(store.find_by_id(key_card, key_ts).await?, None);
-        }
-        Ok(())
+            let other = CardNumber::new(PicX::from_array(*OTHER_CARD));
+            let later = day(2022, 1, 16)?
+                .and_hms_micro_opt(10, 30, 45, 123_000)
+                .ok_or("invalid test timestamp")?;
+            for (key_card, key_ts) in [(&other, original.auth_ts), (&card, later)] {
+                assert!(!store.update_flag(key_card, key_ts, &flag, removed).await?);
+                assert_eq!(store.find_by_id(key_card, key_ts).await?, None);
+            }
+            Ok(())
+        })
     }
 
     /// On a transaction the duplicate runs inside a savepoint, so the update that follows runs in
     /// the same unit of work; without the savepoint the duplicate aborts the transaction.
     // audit: COPAUS2C-008
     // audit: COPAUS2C-012
-    #[tokio::test]
-    async fn a_duplicate_inside_a_savepoint_leaves_the_transaction_usable() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let original = record()?;
-        let card = CardNumber::new(PicX::from_array(*CARD));
-        let flag = FraudAction::Remove.flag();
-        let (first, second) = (day(2022, 7, 18)?, day(2022, 7, 19)?);
+    #[test]
+    fn a_duplicate_inside_a_savepoint_leaves_the_transaction_usable() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let original = record()?;
+            let card = CardNumber::new(PicX::from_array(*CARD));
+            let flag = FraudAction::Remove.flag();
+            let (first, second) = (day(2022, 7, 18)?, day(2022, 7, 19)?);
 
-        let mut tx = store.begin().await?;
-        let mut savepoint = tx.savepoint().await?;
-        savepoint.insert(&original, first).await?;
-        savepoint.commit().await?;
+            let mut tx = store.begin().await?;
+            let mut savepoint = tx.savepoint().await?;
+            savepoint.insert(&original, first).await?;
+            savepoint.commit().await?;
 
-        let mut savepoint = tx.savepoint().await?;
-        let duplicate = savepoint.insert(&original, second).await;
-        assert!(
-            duplicate
-                .as_ref()
-                .is_err_and(PersistenceError::is_duplicate)
-        );
-        savepoint.rollback().await?;
-        assert!(
-            tx.update_flag(&card, original.auth_ts, &flag, second)
-                .await?
-        );
-        tx.commit().await?;
+            let mut savepoint = tx.savepoint().await?;
+            let duplicate = savepoint.insert(&original, second).await;
+            assert!(
+                duplicate
+                    .as_ref()
+                    .is_err_and(PersistenceError::is_duplicate)
+            );
+            savepoint.rollback().await?;
+            assert!(
+                tx.update_flag(&card, original.auth_ts, &flag, second)
+                    .await?
+            );
+            tx.commit().await?;
 
-        let expected = FraudRecord {
-            auth_fraud: flag.clone(),
-            ..original.clone()
-        };
-        let mut reader = store.clone();
-        assert_eq!(
-            reader.find_by_id(&card, original.auth_ts).await?,
-            Some((expected, Some(second)))
-        );
+            let expected = FraudRecord {
+                auth_fraud: flag.clone(),
+                ..original.clone()
+            };
+            let mut reader = store.clone();
+            assert_eq!(
+                reader.find_by_id(&card, original.auth_ts).await?,
+                Some((expected, Some(second)))
+            );
 
-        let mut tx = store.begin().await?;
-        let duplicate = tx.insert(&original, second).await;
-        assert!(
-            duplicate
-                .as_ref()
-                .is_err_and(PersistenceError::is_duplicate)
-        );
-        let aborted = tx.update_flag(&card, original.auth_ts, &flag, second).await;
-        assert_eq!(
-            aborted.map_err(|error| error.sqlstate().map(str::to_owned)),
-            Err(Some("25P02".to_owned()))
-        );
-        tx.rollback().await?;
-        Ok(())
+            let mut tx = store.begin().await?;
+            let duplicate = tx.insert(&original, second).await;
+            assert!(
+                duplicate
+                    .as_ref()
+                    .is_err_and(PersistenceError::is_duplicate)
+            );
+            let aborted = tx.update_flag(&card, original.auth_ts, &flag, second).await;
+            assert_eq!(
+                aborted.map_err(|error| error.sqlstate().map(str::to_owned)),
+                Err(Some("25P02".to_owned()))
+            );
+            tx.rollback().await?;
+            Ok(())
+        })
     }
 
     /// A key finer than a microsecond names no `TIMESTAMP(6)` instant: every method refuses it
     /// before a statement runs, and nothing is written.
     // audit: COPAUS2C-004
-    #[tokio::test]
-    async fn a_key_the_column_cannot_hold_is_refused_by_every_method() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let card = CardNumber::new(PicX::from_array(*CARD));
-        let reported = day(2022, 7, 18)?;
-        let finer = day(2022, 1, 15)?
-            .and_hms_nano_opt(10, 30, 45, 123_000_001)
-            .ok_or("invalid test timestamp")?;
-        let refused = Err(PersistenceError::decode("auth_ts", DecodeKind::OutOfRange));
+    #[test]
+    fn a_key_the_column_cannot_hold_is_refused_by_every_method() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let card = CardNumber::new(PicX::from_array(*CARD));
+            let reported = day(2022, 7, 18)?;
+            let finer = day(2022, 1, 15)?
+                .and_hms_nano_opt(10, 30, 45, 123_000_001)
+                .ok_or("invalid test timestamp")?;
+            let refused = Err(PersistenceError::decode("auth_ts", DecodeKind::OutOfRange));
 
-        let mut original = record()?;
-        original.auth_ts = finer;
-        assert_eq!(store.insert(&original, reported).await, refused);
-        let flag = FraudAction::Report.flag();
-        assert_eq!(
-            store
-                .update_flag(&card, finer, &flag, reported)
-                .await
-                .map(drop),
-            refused
-        );
-        assert_eq!(store.find_by_id(&card, finer).await.map(drop), refused);
+            let mut original = record()?;
+            original.auth_ts = finer;
+            assert_eq!(store.insert(&original, reported).await, refused);
+            let flag = FraudAction::Report.flag();
+            assert_eq!(
+                store
+                    .update_flag(&card, finer, &flag, reported)
+                    .await
+                    .map(drop),
+                refused
+            );
+            assert_eq!(store.find_by_id(&card, finer).await.map(drop), refused);
 
-        let whole = finer
-            .with_nanosecond(123_000_000)
-            .ok_or("invalid nanosecond")?;
-        assert_eq!(store.find_by_id(&card, whole).await?, None);
-        Ok(())
+            let whole = finer
+                .with_nanosecond(123_000_000)
+                .ok_or("invalid nanosecond")?;
+            assert_eq!(store.find_by_id(&card, whole).await?, None);
+            Ok(())
+        })
     }
 }

@@ -1142,6 +1142,7 @@ describe("COSGN00 session storage", () => {
     expect(sessionStorage.getItem(SESSION_KEY)).toBeNull();
   });
 
+  // audit: COSGN00C-021
   it("first entry and F3 each end the session and leave every other key in place", () => {
     stubFetch();
     sessionStorage.setItem("unrelated", "kept");
@@ -1312,6 +1313,208 @@ describe("COSGN00 in the route table: a session listener that throws", () => {
     expect(seen).toEqual([null, stored, null, null, null]);
     expect(failing.mock.results.map((result) => result.type)).toEqual(Array(5).fill("throw"));
     expect(sent).toHaveLength(2);
+    router.dispose();
+  });
+});
+
+// A key-driven read is a mutation, which leaving its screen does not cancel, so its answer can
+// arrive after F3 has reached sign-on and a new sign-on has stored a later session. A 401 refuses
+// only the token its request carried: answering a request of the earlier session, or a sign-on,
+// which carries no token, it leaves the later session and the screen that session reached as they
+// are (COSGN00C-021). The current session's own 401 still ends it at once, as "COACTVW in the
+// route table: a 401 ends the session" and "COSGN00 in the route table: a session listener that
+// throws" prove.
+describe("COSGN00 in the route table: a late 401 leaves a later session in place", () => {
+  /** The account the view on `/accounts/view` asks for: the first `acctdata.txt` account. */
+  const ACCOUNT = "00000000050";
+  const VIEW_PATH = `/api/v1/accounts/${ACCOUNT}/view`;
+  /** The session of the earlier sign-on, still stored when the held request is sent. */
+  const earlier: StoredSession = { token: "test-token-earlier", userId: "USER0001", userType: "U" };
+  /** The session the later sign-on stores: `userSignon` as sign-on stores it. */
+  const later: StoredSession = {
+    token: userSignon.token,
+    userId: userSignon.user_id,
+    userType: userSignon.user_type,
+  };
+  const refused: components["schemas"]["ScreenError"] = {
+    message: "The sign-on token is missing, invalid or expired",
+  };
+  const mainMenu: components["schemas"]["MenuResponse"] = {
+    invalid_option_message: "Please enter a valid option number...",
+    options: [],
+    user_type: userSignon.user_type,
+  };
+
+  /**
+   * Replaces `fetch`. Every request is recorded with its method, path and `Authorization`
+   * header. The first request `held` matches is answered 401 with `refused` only once `release`
+   * is called, which also runs when the test finishes, so no request outlives it; every other
+   * sign-on gets `userSignon`, every main-menu load `mainMenu`, and anything else a 500.
+   */
+  function stubApi(held: (method: string, path: string) => boolean) {
+    const sent: { method: string; path: string; authorization: string | null }[] = [];
+    let release = (): void => undefined;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    onTestFinished(release);
+    let holding = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = input instanceof Request ? input : new Request(input, init);
+        const path = new URL(req.url).pathname;
+        sent.push({ method: req.method, path, authorization: req.headers.get("Authorization") });
+        if (!holding && held(req.method, path)) {
+          holding = true;
+          await released;
+          return json(401, refused);
+        }
+        if (req.method === "POST" && path === "/api/v1/signon") {
+          return json(200, userSignon);
+        }
+        if (req.method === "GET" && path === "/api/v1/menus/main") {
+          return json(200, mainMenu);
+        }
+        const unexpected: components["schemas"]["ScreenError"] = {
+          message: `Unexpected request ${req.method} ${path}`,
+        };
+        return json(500, unexpected);
+      }),
+    );
+    return { sent, release };
+  }
+
+  /** The route table at the last of `entries`, the earlier ones behind it in the history. */
+  function renderRouteTable(entries: string[]): ReturnType<typeof createMemoryRouter> {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, {
+      initialEntries: entries,
+      initialIndex: entries.length - 1,
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    return router;
+  }
+
+  /** Waits for the main menu, its load answered: `ENTER=Continue` is no longer refused. */
+  async function mainMenuShown(): Promise<void> {
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", { name: "ENTER=Continue" }).getAttribute("aria-disabled"),
+      ).toBeNull();
+    });
+  }
+
+  /** Signs on at a sign-on screen whose keys are free, landing on the main menu. */
+  async function signOnAgain(): Promise<void> {
+    await waitFor(() => {
+      expect(enterButton().getAttribute("aria-disabled")).toBeNull();
+    });
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+    fireEvent.click(enterButton());
+    await mainMenuShown();
+  }
+
+  /**
+   * Answers the held request 401 and gives its answer the time to reach the client, the session
+   * and the route guard, then asserts that the later session and the main menu it reached stand.
+   */
+  async function releaseAndExpectLaterSession(
+    router: ReturnType<typeof createMemoryRouter>,
+    release: () => void,
+  ): Promise<void> {
+    release();
+    await lingers();
+    expect(getSession()).toEqual(later);
+    expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+    expect(screen.getByRole("heading", { level: 1, name: "Main Menu" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "ENTER=Sign-on" })).toBeNull();
+  }
+
+  // audit: COSGN00C-021
+  it("a read sent with the earlier session's token and answered 401 after F3 and a new sign-on leaves the new session on the main menu", async () => {
+    setSession(earlier.token, earlier.userId, earlier.userType);
+    const { sent, release } = stubApi((method, path) => method === "GET" && path === VIEW_PATH);
+    const router = renderRouteTable([PATHS.COACTVW]);
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+
+    // ENTER sends the view with the earlier token, and the stub holds it. F3 stays free while
+    // the view is out: it returns to the main menu, whose F3 goes to sign-on, and sign-on's entry
+    // ends the earlier session.
+    const account = document.querySelector('input[data-field="ACCTSID"]');
+    if (!(account instanceof HTMLInputElement)) {
+      throw new Error("Expected the account number input");
+    }
+    fireEvent.change(account, { target: { value: ACCOUNT } });
+    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+    await waitFor(() => {
+      expect(sent).toHaveLength(1);
+    });
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    await mainMenuShown();
+    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+    expect(getSession()).toBeNull();
+
+    await signOnAgain();
+    expect(getSession()).toEqual(later);
+
+    await releaseAndExpectLaterSession(router, release);
+    expect(sent).toEqual([
+      { method: "GET", path: VIEW_PATH, authorization: `Bearer ${earlier.token}` },
+      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${earlier.token}` },
+      { method: "POST", path: "/api/v1/signon", authorization: null },
+      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
+    ]);
+    router.dispose();
+  });
+
+  // The sign-on screen refuses every key while its sign-on is out, so a second sign-on needs a
+  // new screen: the browser's Back returns to the application's root, whose route opens one.
+  // audit: COSGN00C-021
+  it("a sign-on sent with no token and answered 401 after a new sign-on leaves the new session on the main menu", async () => {
+    const { sent, release } = stubApi(
+      (method, path) => method === "POST" && path === "/api/v1/signon",
+    );
+    const router = renderRouteTable(["/", PATHS.COSGN00]);
+    expect(
+      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+    ).toBeTruthy();
+
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+    fireEvent.click(enterButton());
+    await waitFor(() => {
+      expect(enterButton().getAttribute("aria-disabled")).toBe("true");
+    });
+    await act(async () => {
+      await router.navigate(-1);
+    });
+    await waitFor(() => {
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+    });
+
+    await signOnAgain();
+    expect(getSession()).toEqual(later);
+
+    await releaseAndExpectLaterSession(router, release);
+    expect(sent).toEqual([
+      { method: "POST", path: "/api/v1/signon", authorization: null },
+      { method: "POST", path: "/api/v1/signon", authorization: null },
+      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
+    ]);
     router.dispose();
   });
 });

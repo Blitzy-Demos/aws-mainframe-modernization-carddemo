@@ -26,8 +26,13 @@
 //! (COUSR00C-020, COUSR00C-021). A row carries the user ID, names and type, never a password or
 //! its hash (COUSR00C-028, Cardholder Data Redaction).
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use domain::copybook::{PicU, PicX};
 use domain::online::cousr00c as rules;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
@@ -42,7 +47,7 @@ use super::{PageDirection, resolve_page_size, text};
 // The schema name `UserListQuery` is the frontend's `components["schemas"]["UserListQuery"]`
 // (Generated API Types Only). The state members beyond `page_key` and `page_no` carry the rest
 // of `CDEMO-CU00-INFO`, which COUSR00C-006 and COUSR00C-016 require a request to echo.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, IntoParams, Validate)]
+#[derive(Debug, Clone, Default, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct UserListQuery {
     /// `USRIDIN`, the search field: ENTER lists from the first user ID at or above it, as typed,
@@ -86,7 +91,6 @@ pub struct UserListQuery {
     pub has_next_page: Option<bool>,
     /// Rows per page, 1 to 100; absent, the map's 10 (Bounded Pagination). Outside the range,
     /// 422. The screen never sends it.
-    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]
@@ -169,7 +173,7 @@ fn page_number(page_no: Option<i64>) -> PicU<8> {
 /// There is no password member: `SEC-USR-PWD` never reaches the map, and the list never reads
 /// the stored hash (CSUSR01Y-004, Cardholder Data Redaction).
 // The schema name `UserListRow` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct UserListRow {
     /// `USRIDnn` (8), `SEC-USR-ID`: the user ID a `U` or `D` selection carries to the update or
     /// delete screen (COUSR00C-008, COUSR00C-009).
@@ -204,7 +208,7 @@ impl From<rules::UserListRow> for UserListRow {
 /// The `ScreenError`s are the handler's: 401 and 403 from the gate, 400 for a member that
 /// breaks its rule, 422 for `page_size`, and 500 `Unable to lookup User...` (COUSR00C-026).
 // The schema name `UserListResponse` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct UserListResponse {
     /// The page: `page_size` row positions, row 1 first, `null` for a blank row (COUSR00C-013,
     /// COUSR00C-018, COUSR00C-024). `null` when nothing was read: the screen keeps the rows, page
@@ -273,12 +277,253 @@ fn shown_key(key: &PicX<8>) -> Option<String> {
     (!shown.is_empty()).then_some(shown)
 }
 
+// Wire forms, written by hand: serde_derive wraps every implementation it generates in a block
+// carrying `allow` lint suppressions, and no source of this workspace, generated or written,
+// carries one. Each keeps the form the derive gave. A struct is a map of its members
+// under their Rust names, in declaration order, an absent `Option` written as `null`; it reads
+// its members in any order, refuses one sent twice or a required one missing, takes `None` for
+// an absent `Option`, and skips an unknown member unread as `IgnoredAny`. `page_size` reads
+// through the parent module's `page_size_from_query`.
+
+/// The query string's `page_size`, as `super::page_size_from_query` reads it.
+struct QueryPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for QueryPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_query(deserializer).map(Self)
+    }
+}
+
+impl Serialize for UserListQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 8)?;
+        out.serialize_field("start_user_id", &self.start_user_id)?;
+        out.serialize_field("page_key", &self.page_key)?;
+        out.serialize_field("direction", &self.direction)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("page_size", &self.page_size)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for UserListQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for UserListQuery {
+    const NAME: &'static str = "UserListQuery";
+    const FIELDS: &'static [&'static str] = &[
+        "start_user_id",
+        "page_key",
+        "direction",
+        "first_key",
+        "last_key",
+        "page_no",
+        "has_next_page",
+        "page_size",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut start_user_id, mut page_key, mut direction) = (None, None, None);
+        let (mut first_key, mut last_key, mut page_no) = (None, None, None);
+        let (mut has_next_page, mut page_size) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "start_user_id" => member(&mut map, &mut start_user_id, "start_user_id")?,
+                "page_key" => member(&mut map, &mut page_key, "page_key")?,
+                "direction" => member(&mut map, &mut direction, "direction")?,
+                "first_key" => member(&mut map, &mut first_key, "first_key")?,
+                "last_key" => member(&mut map, &mut last_key, "last_key")?,
+                "page_no" => member(&mut map, &mut page_no, "page_no")?,
+                "has_next_page" => member(&mut map, &mut has_next_page, "has_next_page")?,
+                "page_size" => member::<_, QueryPageSize>(&mut map, &mut page_size, "page_size")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            start_user_id: start_user_id.unwrap_or_default(),
+            page_key: page_key.unwrap_or_default(),
+            direction: direction.unwrap_or_default(),
+            first_key: first_key.unwrap_or_default(),
+            last_key: last_key.unwrap_or_default(),
+            page_no: page_no.unwrap_or_default(),
+            has_next_page: has_next_page.unwrap_or_default(),
+            page_size: page_size.and_then(|QueryPageSize(size)| size),
+        })
+    }
+}
+
+impl Serialize for UserListRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 4)?;
+        out.serialize_field("user_id", &self.user_id)?;
+        out.serialize_field("first_name", &self.first_name)?;
+        out.serialize_field("last_name", &self.last_name)?;
+        out.serialize_field("user_type", &self.user_type)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for UserListRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for UserListRow {
+    const NAME: &'static str = "UserListRow";
+    const FIELDS: &'static [&'static str] = &["user_id", "first_name", "last_name", "user_type"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut user_id, mut first_name) = (None, None);
+        let (mut last_name, mut user_type) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "user_id" => member(&mut map, &mut user_id, "user_id")?,
+                "first_name" => member(&mut map, &mut first_name, "first_name")?,
+                "last_name" => member(&mut map, &mut last_name, "last_name")?,
+                "user_type" => member(&mut map, &mut user_type, "user_type")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            user_id: required(user_id, "user_id")?,
+            first_name: required(first_name, "first_name")?,
+            last_name: required(last_name, "last_name")?,
+            user_type: required(user_type, "user_type")?,
+        })
+    }
+}
+
+impl Serialize for UserListResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 6)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("message", &self.message)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for UserListResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for UserListResponse {
+    const NAME: &'static str = "UserListResponse";
+    const FIELDS: &'static [&'static str] = &[
+        "rows",
+        "page_no",
+        "first_key",
+        "last_key",
+        "has_next_page",
+        "message",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut rows, mut page_no, mut first_key) = (None, None, None);
+        let (mut last_key, mut has_next_page, mut message) = (None, None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "rows" => member(&mut map, &mut rows, "rows")?,
+                "page_no" => member(&mut map, &mut page_no, "page_no")?,
+                "first_key" => member(&mut map, &mut first_key, "first_key")?,
+                "last_key" => member(&mut map, &mut last_key, "last_key")?,
+                "has_next_page" => member(&mut map, &mut has_next_page, "has_next_page")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            rows: rows.unwrap_or_default(),
+            page_no: required(page_no, "page_no")?,
+            first_key: first_key.unwrap_or_default(),
+            last_key: last_key.unwrap_or_default(),
+            has_next_page: required(has_next_page, "has_next_page")?,
+            message: message.unwrap_or_default(),
+        })
+    }
+}
+
+/// A struct of this module read from the members of a map.
+trait FromMembers<'de>: Sized {
+    /// The Rust name, which a format may record.
+    const NAME: &'static str;
+    /// The members' wire names, in declaration order.
+    const FIELDS: &'static [&'static str];
+
+    /// The struct from `map`'s members.
+    ///
+    /// # Errors
+    ///
+    /// A member sent twice, a required member missing, or a value that does not deserialise.
+    fn from_members<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error>;
+}
+
+/// `T` read from `deserializer` as a struct: a map, through [`MembersVisitor`].
+fn read_struct<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromMembers<'de>,
+{
+    deserializer.deserialize_struct(T::NAME, T::FIELDS, MembersVisitor(PhantomData))
+}
+
+/// The visitor of [`read_struct`]: it accepts a map alone and hands its members to `T`.
+struct MembersVisitor<T>(PhantomData<T>);
+
+impl<'de, T: FromMembers<'de>> Visitor<'de> for MembersVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "struct {}", T::NAME)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        T::from_members(map)
+    }
+}
+
+/// Reads the value of the member `name` into `slot`. A second occurrence is the duplicate-field
+/// error, raised before its value is read.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// Skips the value of a member no struct of this module names, unread.
+fn skip<'de, A: MapAccess<'de>>(map: &mut A) -> Result<(), A::Error> {
+    map.next_value::<IgnoredAny>().map(|IgnoredAny| ())
+}
+
+/// The value read for the required member `name`, or the missing-field error.
+fn required<T, E: de::Error>(slot: Option<T>, name: &'static str) -> Result<T, E> {
+    slot.ok_or_else(|| E::missing_field(name))
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
 
-    use axum::extract::{FromRequestParts, Request};
-    use axum::http::StatusCode;
+    use axum::extract::{FromRequestParts, Query, Request};
+    use axum::http::{StatusCode, Uri};
     use domain::copybook::{PicU, PicX};
     use domain::online::cousr00c as rules;
     use utoipa::{IntoParams, ToSchema};
@@ -291,6 +536,15 @@ mod tests {
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// The ten in-stream users of `DUSRSECJ.jcl:35-44`, in key order: user ID, first name, last
     /// name, type.
@@ -775,81 +1029,146 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn query_strings_are_validated_with_the_page_size_alone_answering_422() -> TestResult {
-        let echoed = query(
-            "/api/v1/users?direction=forward&page_key=USER0005&first_key=ADMIN001\
-             &last_key=USER0005&page_no=1&has_next_page=true&page_size=10",
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
-        assert_eq!(echoed.direction, Some(PageDirection::Forward));
-        assert_eq!(echoed.has_next_page, Some(true));
-        assert_eq!(echoed.page_no, Some(1));
-        let first_entry = query("/api/v1/users?page_no=0")
+    #[test]
+    fn query_strings_are_validated_with_the_page_size_alone_answering_422() -> TestResult {
+        block_on(async {
+            let echoed = query(
+                "/api/v1/users?direction=forward&page_key=USER0005&first_key=ADMIN001\
+                 &last_key=USER0005&page_no=1&has_next_page=true&page_size=10",
+            )
             .await?
             .map_err(|error| error.to_string())?;
-        assert_eq!(first_entry.page_no, Some(0));
+            assert_eq!(echoed.direction, Some(PageDirection::Forward));
+            assert_eq!(echoed.has_next_page, Some(true));
+            assert_eq!(echoed.page_no, Some(1));
+            let first_entry = query("/api/v1/users?page_no=0")
+                .await?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(first_entry.page_no, Some(0));
 
-        let cases = [
-            (
-                "/api/v1/users?page_size=101",
-                StatusCode::UNPROCESSABLE_ENTITY,
-                PAGE_SIZE_MESSAGE,
-                Some(PAGE_SIZE_FIELD),
-            ),
-            (
-                "/api/v1/users?page_size=0&start_user_id=USER00010",
-                StatusCode::UNPROCESSABLE_ENTITY,
-                PAGE_SIZE_MESSAGE,
-                Some(PAGE_SIZE_FIELD),
-            ),
-            // audit: COUSR00-015
-            (
-                "/api/v1/users?start_user_id=USER00010",
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("start_user_id"),
-            ),
-            (
-                "/api/v1/users?direction=backward&page_key=ADMIN0010",
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("page_key"),
-            ),
-            (
-                "/api/v1/users?page_no=100000000",
-                StatusCode::BAD_REQUEST,
-                FIELD_RANGE_MESSAGE,
-                Some("page_no"),
-            ),
-            (
-                "/api/v1/users?page_no=-1",
-                StatusCode::BAD_REQUEST,
-                FIELD_RANGE_MESSAGE,
-                Some("page_no"),
-            ),
-            (
-                "/api/v1/users?direction=sideways",
-                StatusCode::BAD_REQUEST,
-                INVALID_QUERY,
+            let cases = [
+                (
+                    "/api/v1/users?page_size=101",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    PAGE_SIZE_MESSAGE,
+                    Some(PAGE_SIZE_FIELD),
+                ),
+                (
+                    "/api/v1/users?page_size=0&start_user_id=USER00010",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    PAGE_SIZE_MESSAGE,
+                    Some(PAGE_SIZE_FIELD),
+                ),
+                // audit: COUSR00-015
+                (
+                    "/api/v1/users?start_user_id=USER00010",
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("start_user_id"),
+                ),
+                (
+                    "/api/v1/users?direction=backward&page_key=ADMIN0010",
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("page_key"),
+                ),
+                (
+                    "/api/v1/users?page_no=100000000",
+                    StatusCode::BAD_REQUEST,
+                    FIELD_RANGE_MESSAGE,
+                    Some("page_no"),
+                ),
+                (
+                    "/api/v1/users?page_no=-1",
+                    StatusCode::BAD_REQUEST,
+                    FIELD_RANGE_MESSAGE,
+                    Some("page_no"),
+                ),
+                (
+                    "/api/v1/users?direction=sideways",
+                    StatusCode::BAD_REQUEST,
+                    INVALID_QUERY,
+                    None,
+                ),
+                (
+                    "/api/v1/users?has_next_page=Y",
+                    StatusCode::BAD_REQUEST,
+                    INVALID_QUERY,
+                    None,
+                ),
+            ];
+            for (uri, status, message, field) in cases {
+                let error = query(uri).await?.err().ok_or(uri)?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (status, message, field),
+                    "{uri}"
+                );
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn every_body_keeps_its_wire_form_byte_for_byte() -> TestResult {
+        // Members in declaration order, an absent value as `null`.
+        let response = UserListResponse {
+            rows: Some(vec![
+                Some(UserListRow::from(domain_row(
+                    "ADMIN001", "MARGARET", "GOLD", "A",
+                ))),
                 None,
-            ),
-            (
-                "/api/v1/users?has_next_page=Y",
-                StatusCode::BAD_REQUEST,
-                INVALID_QUERY,
-                None,
-            ),
-        ];
-        for (uri, status, message, field) in cases {
-            let error = query(uri).await?.err().ok_or(uri)?;
+            ]),
+            page_no: 1,
+            first_key: Some("ADMIN001".to_owned()),
+            last_key: None,
+            has_next_page: false,
+            message: None,
+        };
+        let wire = r#"{"rows":[{"user_id":"ADMIN001","first_name":"MARGARET","last_name":"GOLD","user_type":"A"},null],"page_no":1,"first_key":"ADMIN001","last_key":null,"has_next_page":false,"message":null}"#;
+        assert_eq!(serde_json::to_string(&response)?, wire);
+        assert_eq!(serde_json::from_str::<UserListResponse>(wire)?, response);
+        let kept = UserListResponse {
+            rows: None,
+            message: Some("You are already at the top of the page...".to_owned()),
+            ..response
+        };
+        let wire = r#"{"rows":null,"page_no":1,"first_key":"ADMIN001","last_key":null,"has_next_page":false,"message":"You are already at the top of the page..."}"#;
+        assert_eq!(serde_json::to_string(&kept)?, wire);
+        assert_eq!(serde_json::from_str::<UserListResponse>(wire)?, kept);
+        assert_eq!(
+            serde_json::to_string(&UserListQuery {
+                direction: Some(PageDirection::Backward),
+                page_no: Some(2),
+                page_size: Some(5),
+                ..UserListQuery::default()
+            })?,
+            r#"{"start_user_id":null,"page_key":null,"direction":"backward","first_key":null,"last_key":null,"page_no":2,"has_next_page":null,"page_size":5}"#
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_sent_twice_is_refused_and_an_unknown_one_skipped() -> TestResult {
+        let response = r#""rows":null,"page_no":1,"first_key":null,"last_key":null,"has_next_page":true,"message":null"#;
+        for (body, accepted) in [
+            (format!("{{{response}}}"), true),
+            (format!(r#"{{{response},"page_no":2}}"#), false),
+            (format!(r#"{{"x":[1e400],{response}}}"#), true),
+            (r#"{"rows":null,"page_no":1}"#.to_owned(), false),
+        ] {
             assert_eq!(
-                (error.status(), error.message(), error.field()),
-                (status, message, field),
-                "{uri}"
+                serde_json::from_str::<UserListResponse>(&body).is_ok(),
+                accepted,
+                "{body}"
             );
         }
+        let twice: Uri = "/api/v1/users?page_no=1&page_no=2".parse()?;
+        assert!(Query::<UserListQuery>::try_from_uri(&twice).is_err());
+        let unknown: Uri = "/api/v1/users?unknown=1&page_no=2&page_size=007".parse()?;
+        let Query(query) = Query::<UserListQuery>::try_from_uri(&unknown)?;
+        assert_eq!((query.page_no, query.page_size), (Some(2), Some(7)));
+        assert_eq!(query.start_user_id, None);
         Ok(())
     }
 }

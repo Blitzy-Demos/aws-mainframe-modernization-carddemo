@@ -55,6 +55,10 @@
 use domain::online::cotrn01c::{self, TranLookup, TranView, TranViewFailure};
 use domain::records::TransactionRecord;
 use persistence::{PersistenceError, TransactionRepository};
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -103,14 +107,33 @@ fn lookup(read: &Result<Option<TransactionRecord>, PersistenceError>) -> TranLoo
         Ok(Some(record)) => TranLookup::Found(record),
         Ok(None) => TranLookup::NotFound,
         Err(error) => {
+            // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint
+            // suppression.
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message", "program", "paragraph", "error"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
             // The error's `Display` holds only an SQLSTATE and a constraint or column name,
             // never the key or a stored value (Cardholder Data Redaction).
-            tracing::error!(
-                program = "COTRN01C",
-                paragraph = "READ-TRANSACT-FILE",
-                error = %error,
-                "TRANSACT read failed; answering Unable to lookup Transaction"
-            );
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[
+                        Some(
+                            &"TRANSACT read failed; answering Unable to lookup Transaction"
+                                as &dyn Value,
+                        ),
+                        Some(&"COTRN01C" as &dyn Value),
+                        Some(&"READ-TRANSACT-FILE" as &dyn Value),
+                        Some(&display(error) as &dyn Value),
+                    ]),
+                );
+            }
             TranLookup::Error
         }
     }

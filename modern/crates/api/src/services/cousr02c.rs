@@ -404,34 +404,85 @@ fn answered(
             // `rules::modified` refuses with a store-class failure only when the stored hash
             // cannot be verified; its other refusal is the input class's no-change message.
             if failure.class() == FailureClass::Store {
-                tracing::error!(
-                    program = PROGRAM,
-                    paragraph = CHANGE_PARAGRAPH,
-                    "stored password hash could not be verified; answering Unable to lookup User"
-                );
+                hash_unverified();
             }
             Err(ServiceError::Rule(failure))
         }
         Ok(Err(Unchanged::NotHashed(error))) => {
-            tracing::error!(
-                program = PROGRAM,
-                paragraph = CHANGE_PARAGRAPH,
-                error = %error,
-                "new password not hashed; answering 500"
-            );
+            new_password_not_hashed(error);
             Err(ServiceError::Internal)
         }
         Err(PasswordWorkError::Saturated) => Err(ServiceError::Saturated),
         Err(PasswordWorkError::Interrupted { panicked }) => {
-            tracing::error!(
-                program = PROGRAM,
-                paragraph = CHANGE_PARAGRAPH,
-                panicked,
-                "password task did not complete; answering 500"
-            );
+            password_task_incomplete(panicked);
             Err(ServiceError::Internal)
         }
     }
+}
+
+/// The `ERROR` event of a stored hash that could not be verified: the program and the
+/// paragraph, and nothing of the row or the request.
+fn hash_unverified() {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "hash_unverified",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"stored password hash could not be verified; answering Unable to lookup User"),
+            Some(&PROGRAM),
+            Some(&CHANGE_PARAGRAPH),
+        ],
+    );
+}
+
+/// The `ERROR` event of a new password argon2id could not hash: the program, the paragraph and
+/// the fixed class text of `error`.
+fn new_password_not_hashed(error: PasswordError) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "new_password_not_hashed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"new password not hashed; answering 500"),
+            Some(&PROGRAM),
+            Some(&CHANGE_PARAGRAPH),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// The `ERROR` event of a change-test task that did not complete: the program, the paragraph
+/// and whether it `panicked`, never its payload.
+fn password_task_incomplete(panicked: bool) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "password_task_incomplete",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "panicked"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"password task did not complete; answering 500"),
+            Some(&PROGRAM),
+            Some(&CHANGE_PARAGRAPH),
+            Some(&panicked),
+        ],
+    );
 }
 
 /// The change test against the held row, its basis, and the row it yields: the request's names
@@ -484,20 +535,33 @@ async fn abandon<T>(tx: PgTx<'_>, refusal: Refusal) -> Result<T, Refusal> {
 /// The error's `Display` holds only an SQLSTATE, a constraint name or a column name, never a
 /// stored or request value (Cardholder Data Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        error = %error,
-        "USRSEC access failed"
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "usrsec_access_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"USRSEC access failed"),
+            Some(&PROGRAM),
+            Some(&paragraph),
+            Some(&field::display(error)),
+        ],
     );
 }
 
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
+    use std::future::poll_fn;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
+    use std::task::Poll;
     use std::time::{Duration, Instant};
 
     use domain::SystemClock;
@@ -522,13 +586,43 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-    /// without the lint attributes that macro's expansion carries.
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
     fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(test)
+    }
+
+    /// Runs `first` and `second` at once and answers both outputs once both have finished, the
+    /// concurrent progress Tokio's join macro gives without the unchecked pinning and lint
+    /// attributes its expansion carries: each future is pinned on the heap with `Box::pin`, the
+    /// pin that needs no pinning macro, and every wake polls each one that has not yet finished.
+    async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+        let (mut first, mut second) = (Box::pin(first), Box::pin(second));
+        let (mut first_output, mut second_output) = (None, None);
+        poll_fn(|cx| {
+            if first_output.is_none() {
+                if let Poll::Ready(output) = first.as_mut().poll(cx) {
+                    first_output = Some(output);
+                }
+            }
+            if second_output.is_none() {
+                if let Poll::Ready(output) = second.as_mut().poll(cx) {
+                    second_output = Some(output);
+                }
+            }
+            match (first_output.take(), second_output.take()) {
+                (Some(from_first), Some(from_second)) => Poll::Ready((from_first, from_second)),
+                (from_first, from_second) => {
+                    first_output = from_first;
+                    second_output = from_second;
+                    Poll::Pending
+                }
+            }
+        })
+        .await
     }
 
     /// A failure as the response shows it: message, field name and HTTP status.
@@ -699,274 +793,281 @@ mod tests {
             meanwhile.await?;
             hold.release().await
         };
-        let (outcome, released) =
-            tokio::join!(update(state, &admin, "USER0001", body), interleaved);
+        let (outcome, released) = join(update(state, &admin, "USER0001", body), interleaved).await;
         assert!(released?, "the held computation was not released");
         Ok(outcome)
     }
 
-    #[tokio::test]
-    async fn the_shared_read_answers_the_row_or_its_failure() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store, &["USER0001"]).await?;
-        let state = app_state(store);
-        let admin = admin()?;
+    #[test]
+    fn the_shared_read_answers_the_row_or_its_failure() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            let state = app_state(store);
+            let admin = admin()?;
 
-        // audit: COUSR02C-011
-        // audit: COUSR02C-012
-        let view = fetch(&state, &admin, "USER0001")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(
-            (
-                view.user_id,
-                view.first_name,
-                view.last_name,
-                view.user_type
-            ),
-            (
-                PicX::from_text("USER0001")?,
-                PicX::from_text("LAWRENCE")?,
-                PicX::from_text("THOMAS")?,
-                PicX::from_array([b'U']),
-            )
-        );
+            // audit: COUSR02C-011
+            // audit: COUSR02C-012
+            let view = fetch(&state, &admin, "USER0001")
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(
+                (
+                    view.user_id,
+                    view.first_name,
+                    view.last_name,
+                    view.user_type
+                ),
+                (
+                    PicX::from_text("USER0001")?,
+                    PicX::from_text("LAWRENCE")?,
+                    PicX::from_text("THOMAS")?,
+                    PicX::from_array([b'U']),
+                )
+            );
 
-        // audit: COUSR02C-010
-        // audit: COUSR03C-010
-        // audit: COUSR02C-015
-        // audit: COUSR03C-013
-        let blank = ("User ID can NOT be empty...", "user_id", 400);
-        let cases = [
-            ("", blank),
-            ("        ", blank),
-            ("NOBODY01", NOT_FOUND),
-            ("user0001", NOT_FOUND),
-            (" USER0001", NOT_FOUND),
-        ];
-        for (user_id, expected) in cases {
-            let outcome = fetch(&state, &admin, user_id).await;
-            assert_eq!(shown(&outcome), Some(expected), "{user_id:?}");
-        }
-        Ok(())
+            // audit: COUSR02C-010
+            // audit: COUSR03C-010
+            // audit: COUSR02C-015
+            // audit: COUSR03C-013
+            let blank = ("User ID can NOT be empty...", "user_id", 400);
+            let cases = [
+                ("", blank),
+                ("        ", blank),
+                ("NOBODY01", NOT_FOUND),
+                ("user0001", NOT_FOUND),
+                (" USER0001", NOT_FOUND),
+            ];
+            for (user_id, expected) in cases {
+                let outcome = fetch(&state, &admin, user_id).await;
+                assert_eq!(shown(&outcome), Some(expected), "{user_id:?}");
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn the_edits_run_in_order_before_any_read_and_write_nothing() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store, &["USER0001"]).await?;
-        let state = app_state(store.clone());
-        let admin = admin()?;
-        let before = stored(&store, "USER0001").await?;
+    #[test]
+    fn the_edits_run_in_order_before_any_read_and_write_nothing() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            let state = app_state(store.clone());
+            let admin = admin()?;
+            let before = stored(&store, "USER0001").await?;
 
-        // audit: COUSR02C-018
-        // audit: COUSR02C-019
-        // audit: COUSR02C-020
-        // audit: COUSR02C-021
-        // audit: COUSR02C-022
-        let cases = [
-            (
-                "  ",
-                request("", "", None, ""),
-                ("User ID can NOT be empty...", "user_id"),
-            ),
-            (
-                "USER0001",
-                request("", "", None, ""),
-                ("First Name can NOT be empty...", "first_name"),
-            ),
-            (
-                "USER0001",
-                request("A", " ", None, ""),
-                ("Last Name can NOT be empty...", "last_name"),
-            ),
-            (
-                "USER0001",
-                request("A", "B", Some(" "), ""),
-                ("Password can NOT be empty...", "password"),
-            ),
-            (
-                "USER0001",
-                request("A", "B", None, ""),
-                ("User Type can NOT be empty...", "user_type"),
-            ),
-            (
-                "NOBODY01",
-                request("", "B", None, "U"),
-                ("First Name can NOT be empty...", "first_name"),
-            ),
-        ];
-        for (user_id, body, (message, field)) in cases {
-            let outcome = update(&state, &admin, user_id, body).await;
-            assert_eq!(shown(&outcome), Some((message, field, 400)), "{message}");
-        }
+            // audit: COUSR02C-018
+            // audit: COUSR02C-019
+            // audit: COUSR02C-020
+            // audit: COUSR02C-021
+            // audit: COUSR02C-022
+            let cases = [
+                (
+                    "  ",
+                    request("", "", None, ""),
+                    ("User ID can NOT be empty...", "user_id"),
+                ),
+                (
+                    "USER0001",
+                    request("", "", None, ""),
+                    ("First Name can NOT be empty...", "first_name"),
+                ),
+                (
+                    "USER0001",
+                    request("A", " ", None, ""),
+                    ("Last Name can NOT be empty...", "last_name"),
+                ),
+                (
+                    "USER0001",
+                    request("A", "B", Some(" "), ""),
+                    ("Password can NOT be empty...", "password"),
+                ),
+                (
+                    "USER0001",
+                    request("A", "B", None, ""),
+                    ("User Type can NOT be empty...", "user_type"),
+                ),
+                (
+                    "NOBODY01",
+                    request("", "B", None, "U"),
+                    ("First Name can NOT be empty...", "first_name"),
+                ),
+            ];
+            for (user_id, body, (message, field)) in cases {
+                let outcome = update(&state, &admin, user_id, body).await;
+                assert_eq!(shown(&outcome), Some((message, field, 400)), "{message}");
+            }
 
-        // audit: COUSR02C-026
-        // audit: COUSR02C-027
-        // audit: COUSR02C-028
-        for password in [None, Some(STORED_PASSWORD)] {
-            let body = request("LAWRENCE", "THOMAS", password, "U");
+            // audit: COUSR02C-026
+            // audit: COUSR02C-027
+            // audit: COUSR02C-028
+            for password in [None, Some(STORED_PASSWORD)] {
+                let body = request("LAWRENCE", "THOMAS", password, "U");
+                let outcome = update(&state, &admin, "USER0001", body).await;
+                assert_eq!(
+                    shown(&outcome),
+                    Some(NOT_MODIFIED),
+                    "{}",
+                    password.is_some()
+                );
+            }
+            assert_eq!(stored(&store, "USER0001").await?, before);
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn a_change_rewrites_the_whole_held_row() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001", "AB CD"]).await?;
+            let state = app_state(store.clone());
+            let admin = admin()?;
+            let before = stored(&store, "USER0001").await?;
+
+            // audit: COUSR02C-024
+            // audit: COUSR02C-026
+            // audit: COUSR02C-029
+            let renamed = update(
+                &state,
+                &admin,
+                "USER0001",
+                request("LARRY", "THOMAS", None, "u"),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+            assert_eq!(renamed, "User USER0001 has been updated ...");
+            let after = stored(&store, "USER0001").await?;
+            assert_eq!(
+                (&after.fname, &after.usr_type, &after.filler),
+                (
+                    &PicX::from_text("LARRY")?,
+                    &PicX::from_array([b'u']),
+                    &before.filler
+                )
+            );
+            assert!(
+                after.password_hash == before.password_hash,
+                "an omitted password is kept"
+            );
+
+            // audit: COUSR02C-027
+            let body = request("LARRY", "THOMAS", Some(NEW_PASSWORD), "u");
+            let message = update(&state, &admin, "USER0001", body)
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(message, "User USER0001 has been updated ...");
+            let after = stored(&store, "USER0001").await?;
+            assert!(password::verify(
+                password_bytes(NEW_PASSWORD)?,
+                &after.password_hash
+            )?);
+            assert!(!password::verify(
+                password_bytes(STORED_PASSWORD)?,
+                &after.password_hash
+            )?);
+            assert_eq!(
+                (&after.fname, &after.filler),
+                (&PicX::from_text("LARRY")?, &before.filler)
+            );
+
+            // audit: COUSR02C-030
+            let spaced = update(&state, &admin, "AB CD", request("ANN", "LEE", None, "U"))
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(spaced, "User AB has been updated ...");
+
+            // audit: COUSR02C-025
+            // No row has the key: the store effect alone is asserted (halt candidate
+            // X-COUSR02C-H1), and no row appears.
+            let missing = update(&state, &admin, "NOBODY01", request("A", "B", None, "U")).await;
+            assert!(missing.is_err());
+            let mut probe = store.clone();
+            let key = PicX::from_text("NOBODY01")?;
+            assert!(
+                UserRepository::find_by_id(&mut probe, &key)
+                    .await?
+                    .is_none()
+            );
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn store_failures_answer_with_the_programs_messages_and_trace_no_value() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store, &["USER0001"]).await?;
+            UserRepository::insert(
+                &mut store,
+                &entry("BADHASH1", "not-a-phc-string".to_owned())?,
+            )
+            .await?;
+            let state = app_state(store.clone())
+                .with_password_work(PasswordWork::new(1, 1).with_wait(STUCK));
+            let admin = admin()?;
+            let traces = trace_capture::capture();
+            let before = stored(&store, "USER0001").await?;
+
+            // audit: COUSR02C-032
+            // A first name codec B cannot store fails the rewrite, which rolls back.
+            let body = request("\u{c9}MILE", "THOMAS", Some(NEW_PASSWORD), "U");
             let outcome = update(&state, &admin, "USER0001", body).await;
             assert_eq!(
                 shown(&outcome),
-                Some(NOT_MODIFIED),
-                "{}",
-                password.is_some()
+                Some(("Unable to Update User...", "first_name", 500))
             );
-        }
-        assert_eq!(stored(&store, "USER0001").await?, before);
-        Ok(())
-    }
+            assert_eq!(stored(&store, "USER0001").await?, before);
+            assert!(traces.contains("UPDATE-USER-SEC-FILE"));
 
-    #[tokio::test]
-    async fn a_change_rewrites_the_whole_held_row() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store, &["USER0001", "AB CD"]).await?;
-        let state = app_state(store.clone());
-        let admin = admin()?;
-        let before = stored(&store, "USER0001").await?;
+            // A stored hash that cannot be verified is the read's failure (X-COUSR02C-4).
+            let body = request("X", "Y", Some(NEW_PASSWORD), "U");
+            let outcome = update(&state, &admin, "BADHASH1", body).await;
+            assert_eq!(shown(&outcome), Some(LOOKUP_FAILED));
+            assert_eq!(
+                stored(&store, "BADHASH1").await?.fname,
+                PicX::from_text("LAWRENCE")?
+            );
+            assert!(traces.contains("stored password hash could not be verified"));
 
-        // audit: COUSR02C-024
-        // audit: COUSR02C-026
-        // audit: COUSR02C-029
-        let renamed = update(
-            &state,
-            &admin,
-            "USER0001",
-            request("LARRY", "THOMAS", None, "u"),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        assert_eq!(renamed, "User USER0001 has been updated ...");
-        let after = stored(&store, "USER0001").await?;
-        assert_eq!(
-            (&after.fname, &after.usr_type, &after.filler),
-            (
-                &PicX::from_text("LARRY")?,
-                &PicX::from_array([b'u']),
-                &before.filler
-            )
-        );
-        assert!(
-            after.password_hash == before.password_hash,
-            "an omitted password is kept"
-        );
+            // The store goes away after the read and before the transaction, which then cannot
+            // begin: that has no audited text.
+            let outcome = interleaved_update(&state, request("A", "B", None, "U"), async {
+                store.pool().close().await;
+                Ok(())
+            })
+            .await?;
+            assert_eq!(
+                outcome,
+                Err(ServiceError::Store(PersistenceError::Unavailable))
+            );
 
-        // audit: COUSR02C-027
-        let body = request("LARRY", "THOMAS", Some(NEW_PASSWORD), "u");
-        let message = update(&state, &admin, "USER0001", body)
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(message, "User USER0001 has been updated ...");
-        let after = stored(&store, "USER0001").await?;
-        assert!(password::verify(
-            password_bytes(NEW_PASSWORD)?,
-            &after.password_hash
-        )?);
-        assert!(!password::verify(
-            password_bytes(STORED_PASSWORD)?,
-            &after.password_hash
-        )?);
-        assert_eq!(
-            (&after.fname, &after.filler),
-            (&PicX::from_text("LARRY")?, &before.filler)
-        );
+            // audit: COUSR02C-016
+            // audit: COUSR03C-014
+            assert_eq!(
+                shown(&fetch(&state, &admin, "USER0001").await),
+                Some(LOOKUP_FAILED)
+            );
+            assert!(traces.contains("READ-USER-SEC-FILE"));
+            let outcome = update(&state, &admin, "USER0001", request("A", "B", None, "U")).await;
+            assert_eq!(
+                outcome,
+                Err(ServiceError::Store(PersistenceError::Unavailable))
+            );
 
-        // audit: COUSR02C-030
-        let spaced = update(&state, &admin, "AB CD", request("ANN", "LEE", None, "U"))
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(spaced, "User AB has been updated ...");
-
-        // audit: COUSR02C-025
-        // No row has the key: the store effect alone is asserted (halt candidate
-        // X-COUSR02C-H1), and no row appears.
-        let missing = update(&state, &admin, "NOBODY01", request("A", "B", None, "U")).await;
-        assert!(missing.is_err());
-        let mut probe = store.clone();
-        let key = PicX::from_text("NOBODY01")?;
-        assert!(
-            UserRepository::find_by_id(&mut probe, &key)
-                .await?
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn store_failures_answer_with_the_programs_messages_and_trace_no_value() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store, &["USER0001"]).await?;
-        UserRepository::insert(
-            &mut store,
-            &entry("BADHASH1", "not-a-phc-string".to_owned())?,
-        )
-        .await?;
-        let state =
-            app_state(store.clone()).with_password_work(PasswordWork::new(1, 1).with_wait(STUCK));
-        let admin = admin()?;
-        let traces = trace_capture::capture();
-        let before = stored(&store, "USER0001").await?;
-
-        // audit: COUSR02C-032
-        // A first name codec B cannot store fails the rewrite, which rolls back.
-        let body = request("\u{c9}MILE", "THOMAS", Some(NEW_PASSWORD), "U");
-        let outcome = update(&state, &admin, "USER0001", body).await;
-        assert_eq!(
-            shown(&outcome),
-            Some(("Unable to Update User...", "first_name", 500))
-        );
-        assert_eq!(stored(&store, "USER0001").await?, before);
-        assert!(traces.contains("UPDATE-USER-SEC-FILE"));
-
-        // A stored hash that cannot be verified is the read's failure (X-COUSR02C-4).
-        let body = request("X", "Y", Some(NEW_PASSWORD), "U");
-        let outcome = update(&state, &admin, "BADHASH1", body).await;
-        assert_eq!(shown(&outcome), Some(LOOKUP_FAILED));
-        assert_eq!(
-            stored(&store, "BADHASH1").await?.fname,
-            PicX::from_text("LAWRENCE")?
-        );
-        assert!(traces.contains("stored password hash could not be verified"));
-
-        // The store goes away after the read and before the transaction, which then cannot
-        // begin: that has no audited text.
-        let outcome = interleaved_update(&state, request("A", "B", None, "U"), async {
-            store.pool().close().await;
+            for value in [
+                STORED_PASSWORD,
+                NEW_PASSWORD,
+                "$argon2id$",
+                "not-a-phc-string",
+            ] {
+                assert!(!traces.contains(value), "the trace holds {value}");
+            }
             Ok(())
         })
-        .await?;
-        assert_eq!(
-            outcome,
-            Err(ServiceError::Store(PersistenceError::Unavailable))
-        );
-
-        // audit: COUSR02C-016
-        // audit: COUSR03C-014
-        assert_eq!(
-            shown(&fetch(&state, &admin, "USER0001").await),
-            Some(LOOKUP_FAILED)
-        );
-        assert!(traces.contains("READ-USER-SEC-FILE"));
-        let outcome = update(&state, &admin, "USER0001", request("A", "B", None, "U")).await;
-        assert_eq!(
-            outcome,
-            Err(ServiceError::Store(PersistenceError::Unavailable))
-        );
-
-        for value in [
-            STORED_PASSWORD,
-            NEW_PASSWORD,
-            "$argon2id$",
-            "not-a-phc-string",
-        ] {
-            assert!(!traces.contains(value), "the trace holds {value}");
-        }
-        Ok(())
     }
 
     /// Another admin rewrites the row after the update's unlocked read: the lock finds a row
@@ -1220,13 +1321,12 @@ mod tests {
         })
     }
 
-    /// Six admins update the same user at once, more than the four attempts an earlier bound
-    /// allowed: every update reads the row before any of them commits, and their change tests
-    /// run one after another on one worker, so each lock after a commit finds the row changed.
-    /// Each update tests again against the row as it now is and commits in its turn, as the
-    /// COBOL's `READ … UPDATE` serializes them: all six answer `User USER0001 has been updated
-    /// ...`, and the row holds the names of the update that committed last, its hash and
-    /// `FILLER` kept.
+    /// Six admins update the same user at once: every update reads the row before any of them
+    /// commits, and their change tests run one after another on one worker, so each lock after
+    /// a commit finds the row changed. Each update tests again against the row as it now is
+    /// and commits in its turn, as the COBOL's `READ … UPDATE` serializes them: all six answer
+    /// `User USER0001 has been updated ...`, and the row holds the names of the update that
+    /// committed last, its hash and `FILLER` kept.
     #[test]
     fn concurrent_updates_of_one_user_all_succeed_and_the_last_commit_stands() -> TestResult {
         /// How many admins update the user at once.
@@ -1376,72 +1476,74 @@ mod tests {
     /// The change test's failures are logged once, after the task is awaited, with their class
     /// and never a value, and keep their answers: the unverifiable stored hash its `Unable to
     /// lookup User...` (`X-COUSR02C-4`), the hash and task failures their 500.
-    #[tokio::test]
-    async fn change_test_failures_are_logged_once_and_keep_their_answers() -> TestResult {
-        let unverified = rules::read(UserRead::Error)
-            .err()
-            .ok_or("a failed read gave a view")?;
-        let unmodified = rules::edit_user_id("")
-            .err()
-            .ok_or("a blank ID passed the edit")?;
-        let row = entry("USER0001", "$argon2id$v=19$stand-in".to_owned())?;
-        let traces = trace_capture::capture();
-        let cases = [
-            (
-                Err(PasswordWorkError::Interrupted { panicked: false }),
-                Err(ServiceError::Internal),
-                Some(("ERROR", r#""panicked":false"#)),
-            ),
-            // The saturated budget has logged its own refusal.
-            (
-                Err(PasswordWorkError::Saturated),
-                Err(ServiceError::Saturated),
-                None,
-            ),
-            (
-                Ok(Err(Unchanged::NotHashed(PasswordError::Hash))),
-                Err(ServiceError::Internal),
-                Some(("ERROR", "password hashing failed")),
-            ),
-            (
-                Ok(Err(Unchanged::Refused(unverified))),
-                Err(ServiceError::Rule(unverified)),
-                Some(("ERROR", "stored password hash could not be verified")),
-            ),
-            (
-                Ok(Err(Unchanged::Refused(unmodified))),
-                Err(ServiceError::Rule(unmodified)),
-                None,
-            ),
-            (Ok(Ok(row.clone())), Ok(row), None),
-        ];
-        for (computed, expected, logged) in cases {
-            traces.clear();
-            let answer = answered(computed);
-            assert!(answer == expected, "{logged:?}");
-            let lines = traces.lines();
-            match logged {
-                None => assert!(lines.is_empty(), "{}", traces.text()),
-                Some((level, text)) => {
-                    let [line] = lines.as_slice() else {
-                        return Err(format!("{text}: {} lines", lines.len()).into());
-                    };
-                    let level = format!(r#""level":"{level}""#);
-                    for part in [
-                        level.as_str(),
-                        r#""program":"COUSR02C""#,
-                        r#""paragraph":"UPDATE-USER-INFO""#,
-                        text,
-                    ] {
-                        assert!(line.contains(part), "{part} missing from {line}");
+    #[test]
+    fn change_test_failures_are_logged_once_and_keep_their_answers() -> TestResult {
+        block_on(async {
+            let unverified = rules::read(UserRead::Error)
+                .err()
+                .ok_or("a failed read gave a view")?;
+            let unmodified = rules::edit_user_id("")
+                .err()
+                .ok_or("a blank ID passed the edit")?;
+            let row = entry("USER0001", "$argon2id$v=19$stand-in".to_owned())?;
+            let traces = trace_capture::capture();
+            let cases = [
+                (
+                    Err(PasswordWorkError::Interrupted { panicked: false }),
+                    Err(ServiceError::Internal),
+                    Some(("ERROR", r#""panicked":false"#)),
+                ),
+                // The saturated budget has logged its own refusal.
+                (
+                    Err(PasswordWorkError::Saturated),
+                    Err(ServiceError::Saturated),
+                    None,
+                ),
+                (
+                    Ok(Err(Unchanged::NotHashed(PasswordError::Hash))),
+                    Err(ServiceError::Internal),
+                    Some(("ERROR", "password hashing failed")),
+                ),
+                (
+                    Ok(Err(Unchanged::Refused(unverified))),
+                    Err(ServiceError::Rule(unverified)),
+                    Some(("ERROR", "stored password hash could not be verified")),
+                ),
+                (
+                    Ok(Err(Unchanged::Refused(unmodified))),
+                    Err(ServiceError::Rule(unmodified)),
+                    None,
+                ),
+                (Ok(Ok(row.clone())), Ok(row), None),
+            ];
+            for (computed, expected, logged) in cases {
+                traces.clear();
+                let answer = answered(computed);
+                assert!(answer == expected, "{logged:?}");
+                let lines = traces.lines();
+                match logged {
+                    None => assert!(lines.is_empty(), "{}", traces.text()),
+                    Some((level, text)) => {
+                        let [line] = lines.as_slice() else {
+                            return Err(format!("{text}: {} lines", lines.len()).into());
+                        };
+                        let level = format!(r#""level":"{level}""#);
+                        for part in [
+                            level.as_str(),
+                            r#""program":"COUSR02C""#,
+                            r#""paragraph":"UPDATE-USER-INFO""#,
+                            text,
+                        ] {
+                            assert!(line.contains(part), "{part} missing from {line}");
+                        }
                     }
                 }
             }
-        }
-        for value in ["USER0001", "$argon2id$", STORED_PASSWORD, NEW_PASSWORD] {
-            assert!(!traces.contains(value), "the trace holds {value}");
-        }
-        Ok(())
+            for value in ["USER0001", "$argon2id$", STORED_PASSWORD, NEW_PASSWORD] {
+                assert!(!traces.contains(value), "the trace holds {value}");
+            }
+            Ok(())
+        })
     }
 
     #[test]

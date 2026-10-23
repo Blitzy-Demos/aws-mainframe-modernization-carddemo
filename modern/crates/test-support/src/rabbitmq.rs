@@ -1048,7 +1048,7 @@ mod tests {
         MAX_FRAME_PAYLOAD, METHOD_FRAME, OPERATION_TIMEOUT, bind_source, forward_frames, image,
         message_count, next_frame, request, start_rabbitmq,
     };
-    use crate::tests::{MISSING_ENTRYPOINT, failed_start_case, guarded_container_case};
+    use crate::tests::{MISSING_ENTRYPOINT, block_on, failed_start_case, guarded_container_case};
     use crate::{HarnessError, modern_dir};
 
     /// Frame type of a content header frame.
@@ -1065,6 +1065,9 @@ mod tests {
 
     /// One frame of `kind` on channel 1 with `payload`, as the broker writes it.
     fn frame(kind: u8, payload: &[u8]) -> Vec<u8> {
+        // TRUNCATION: checked, with a fallback the reader refuses: the payloads these tests build
+        // are a few octets long, far below `u32::MAX`, and a length that did not fit would become
+        // `u32::MAX`, which `next_frame` rejects for exceeding `MAX_FRAME_PAYLOAD`, never misreads.
         let size = u32::try_from(payload.len()).unwrap_or(u32::MAX);
         let mut bytes = vec![kind, 0, 1];
         bytes.extend_from_slice(&size.to_be_bytes());
@@ -1145,6 +1148,9 @@ mod tests {
         if let Some(end) = wrong_end.last_mut() {
             *end = 0;
         }
+        // TRUNCATION: checked, and the conversion always succeeds: `MAX_FRAME_PAYLOAD + 1` is
+        // 2^20 + 1, far below `u32::MAX`; the `u32::MAX` fallback also exceeds `MAX_FRAME_PAYLOAD`,
+        // so this case stays an oversize payload either way.
         let oversize = u32::try_from(MAX_FRAME_PAYLOAD + 1).unwrap_or(u32::MAX);
         let mut too_large = vec![METHOD_FRAME, 0, 1];
         too_large.extend_from_slice(&oversize.to_be_bytes());
@@ -1220,117 +1226,130 @@ mod tests {
             .map_err(|err| HarnessError::new(context, &err))
     }
 
-    #[tokio::test]
-    async fn a_gate_withholds_each_confirmation_until_it_is_released_or_refused()
+    #[test]
+    fn a_gate_withholds_each_confirmation_until_it_is_released_or_refused()
     -> Result<(), HarnessError> {
-        let guard = start_rabbitmq().await?;
-        let gate = guard.confirm_gate().await?;
-        assert!(
-            !format!("{gate:?}").contains("carddemo@"),
-            "the gate's Debug shows no credential"
-        );
-        let direct = guard.connect().await?;
-        let observer = bounded("open the observer channel", direct.create_channel()).await?;
-        let gated = gate.connect().await?;
-        let channel = bounded("open a gated channel", gated.create_channel()).await?;
-        let select = channel.confirm_select(ConfirmSelectOptions::default());
-        bounded("select confirms", select).await?;
-
-        let cases: [(Settle, Confirmation); 2] = [
-            (ConfirmGate::release, Confirmation::Ack(None)),
-            (ConfirmGate::refuse, Confirmation::Nack(None)),
-        ];
-        for (index, (settle, expected)) in cases.into_iter().enumerate() {
-            let publish = channel.basic_publish(
-                "",
-                GATE_QUEUE,
-                BasicPublishOptions::default(),
-                b"gate",
-                BasicProperties::default(),
-            );
-            let mut confirmation = pin!(bounded("publish through the gate", publish).await?);
-            gate.wait_for_arrivals(index + 1, OPERATION_TIMEOUT).await?;
-            assert_eq!(
-                (gate.arrived(), gate.passed()),
-                (index + 1, index),
-                "case {index}: the confirmation is held"
-            );
-            let early = time::timeout(HELD_FOR, &mut confirmation).await;
+        block_on(async {
+            let guard = start_rabbitmq().await?;
+            let gate = guard.confirm_gate().await?;
             assert!(
-                early.is_err(),
-                "case {index}: the publisher learned of a held confirmation"
+                !format!("{gate:?}").contains("carddemo@"),
+                "the gate's Debug shows no credential"
             );
-            // Queued while its confirmation is held: queue presence is not confirmation.
-            let queued = message_count(&observer, GATE_QUEUE).await?;
-            assert_eq!(
-                usize::try_from(queued).ok(),
-                Some(index + 1),
-                "case {index}: the broker queued the message before confirming it"
-            );
-            settle(&gate);
-            let received = bounded("await the confirmation", confirmation).await?;
-            assert_eq!(received, expected, "case {index}: what the publisher sees");
-            assert_eq!(gate.passed(), index + 1, "case {index}: handed on");
-        }
-        bounded(
-            "close the gated connection",
-            gated.close(200, "gate test done"),
-        )
-        .await?;
-        bounded(
-            "close the observer connection",
-            direct.close(200, "gate test done"),
-        )
-        .await
+            let direct = guard.connect().await?;
+            let observer = bounded("open the observer channel", direct.create_channel()).await?;
+            let gated = gate.connect().await?;
+            let channel = bounded("open a gated channel", gated.create_channel()).await?;
+            let select = channel.confirm_select(ConfirmSelectOptions::default());
+            bounded("select confirms", select).await?;
+
+            let cases: [(Settle, Confirmation); 2] = [
+                (ConfirmGate::release, Confirmation::Ack(None)),
+                (ConfirmGate::refuse, Confirmation::Nack(None)),
+            ];
+            for (index, (settle, expected)) in cases.into_iter().enumerate() {
+                let publish = channel.basic_publish(
+                    "",
+                    GATE_QUEUE,
+                    BasicPublishOptions::default(),
+                    b"gate",
+                    BasicProperties::default(),
+                );
+                let mut confirmation = pin!(bounded("publish through the gate", publish).await?);
+                gate.wait_for_arrivals(index + 1, OPERATION_TIMEOUT).await?;
+                assert_eq!(
+                    (gate.arrived(), gate.passed()),
+                    (index + 1, index),
+                    "case {index}: the confirmation is held"
+                );
+                let early = time::timeout(HELD_FOR, &mut confirmation).await;
+                assert!(
+                    early.is_err(),
+                    "case {index}: the publisher learned of a held confirmation"
+                );
+                // Queued while its confirmation is held: queue presence is not confirmation.
+                let queued = message_count(&observer, GATE_QUEUE).await?;
+                assert_eq!(
+                    usize::try_from(queued).ok(),
+                    Some(index + 1),
+                    "case {index}: the broker queued the message before confirming it"
+                );
+                settle(&gate);
+                let received = bounded("await the confirmation", confirmation).await?;
+                assert_eq!(received, expected, "case {index}: what the publisher sees");
+                assert_eq!(gate.passed(), index + 1, "case {index}: handed on");
+            }
+            bounded(
+                "close the gated connection",
+                gated.close(200, "gate test done"),
+            )
+            .await?;
+            bounded(
+                "close the observer connection",
+                direct.close(200, "gate test done"),
+            )
+            .await
+        })
     }
 
-    #[tokio::test]
-    async fn a_started_broker_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
-        let guard = start_rabbitmq().await?;
-        let id = guard.container.id().to_owned();
-        guarded_container_case(guard, &id, IMAGE).await
+    #[test]
+    fn a_started_broker_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
+        block_on(async {
+            let guard = start_rabbitmq().await?;
+            let id = guard.container.id().to_owned();
+            guarded_container_case(guard, &id, IMAGE).await
+        })
     }
 
-    #[tokio::test]
-    async fn a_failed_start_removes_only_its_own_container() -> Result<(), HarnessError> {
-        let modern = modern_dir();
-        let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
-        let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;
-        failed_start_case(
-            request(
-                image().with_entrypoint(MISSING_ENTRYPOINT),
-                conf,
-                definitions,
-            ),
-            "start rabbitmq",
-        )
-        .await
+    #[test]
+    fn a_failed_start_removes_only_its_own_container() -> Result<(), HarnessError> {
+        block_on(async {
+            let modern = modern_dir();
+            let conf = bind_source(modern.join("rabbitmq/rabbitmq.conf")).await?;
+            let definitions = bind_source(modern.join("rabbitmq/definitions.json")).await?;
+            failed_start_case(
+                request(
+                    image().with_entrypoint(MISSING_ENTRYPOINT),
+                    conf,
+                    definitions,
+                ),
+                "start rabbitmq",
+            )
+            .await
+        })
     }
 
-    // `#[tokio::test]` runs on a current-thread runtime, where blocking the worker would stall
+    // `block_on` runs the test on a current-thread runtime, where blocking the worker would stall
     // every other task and timer.
-    #[tokio::test]
-    async fn broker_files_resolve_to_absolute_utf8_paths() {
-        for file in ["rabbitmq/rabbitmq.conf", "rabbitmq/definitions.json"] {
-            let resolved = bind_source(modern_dir().join(file)).await;
-            assert!(
-                resolved
-                    .as_deref()
-                    .is_ok_and(|path| Path::new(path).is_absolute() && path.ends_with(file)),
-                "{file}: {resolved:?}"
-            );
-        }
+    #[test]
+    fn broker_files_resolve_to_absolute_utf8_paths() -> Result<(), HarnessError> {
+        block_on(async {
+            for file in ["rabbitmq/rabbitmq.conf", "rabbitmq/definitions.json"] {
+                let resolved = bind_source(modern_dir().join(file)).await;
+                assert!(
+                    resolved
+                        .as_deref()
+                        .is_ok_and(|path| Path::new(path).is_absolute() && path.ends_with(file)),
+                    "{file}: {resolved:?}"
+                );
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_missing_broker_file_is_reported_with_its_path() {
-        let Err(err) = bind_source(modern_dir().join("rabbitmq/missing.conf")).await else {
-            panic!("a missing broker file resolved");
-        };
-        let text = err.to_string();
-        assert!(
-            text.starts_with("resolve rabbitmq mount: ") && text.contains("rabbitmq/missing.conf"),
-            "{text}"
-        );
+    #[test]
+    fn a_missing_broker_file_is_reported_with_its_path() -> Result<(), HarnessError> {
+        block_on(async {
+            let Err(err) = bind_source(modern_dir().join("rabbitmq/missing.conf")).await else {
+                panic!("a missing broker file resolved");
+            };
+            let text = err.to_string();
+            assert!(
+                text.starts_with("resolve rabbitmq mount: ")
+                    && text.contains("rabbitmq/missing.conf"),
+                "{text}"
+            );
+            Ok(())
+        })
     }
 }

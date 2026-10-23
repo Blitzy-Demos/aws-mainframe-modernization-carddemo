@@ -39,6 +39,7 @@ use domain::records::{
 };
 use domain::sensitive::{CardNumber, Cvv, Password, Ssn};
 use proptest::prelude::*;
+use proptest::strategy::Union;
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------------------------
@@ -964,35 +965,35 @@ fn pic_x<const N: usize>() -> impl Strategy<Value = PicX<N>> {
 /// A `PIC 9(N)` value in `0..=10^N - 1`, its bounds weighted in (PIC-003, PIC-023).
 fn pic_u<const N: u32>() -> impl Strategy<Value = PicU<N>> {
     let max = PicU::<N>::MAX;
-    prop_oneof![
-        1 => Just(0),
-        1 => Just(max),
-        8 => 0..=max,
-    ]
+    Union::new_weighted(vec![
+        (1, Just(0).boxed()),
+        (1, Just(max).boxed()),
+        (8, (0..=max).boxed()),
+    ])
     .prop_filter_map("a PIC 9(n) value", |value| PicU::<N>::new(value).ok())
 }
 
 /// A `PIC S9(N)` value in `-(10^N - 1)..=10^N - 1`, its bounds weighted in (PIC-010, PIC-023).
 fn pic_s<const N: u32>() -> impl Strategy<Value = PicS<N>> {
     let max = PicS::<N>::MAX;
-    prop_oneof![
-        1 => Just(-max),
-        1 => Just(0),
-        1 => Just(max),
-        7 => -max..=max,
-    ]
+    Union::new_weighted(vec![
+        (1, Just(-max).boxed()),
+        (1, Just(0).boxed()),
+        (1, Just(max).boxed()),
+        (7, (-max..=max).boxed()),
+    ])
     .prop_filter_map("a PIC S9(n) value", |value| PicS::<N>::new(value).ok())
 }
 
 /// A `V99` decimal with at most `int_digits` integer digits, its bounds weighted in.
 fn scaled(int_digits: u32) -> impl Strategy<Value = Decimal> {
     let max = 10_i64.pow(int_digits + 2) - 1;
-    prop_oneof![
-        1 => Just(-max),
-        1 => Just(0),
-        1 => Just(max),
-        7 => -max..=max,
-    ]
+    Union::new_weighted(vec![
+        (1, Just(-max).boxed()),
+        (1, Just(0).boxed()),
+        (1, Just(max).boxed()),
+        (7, (-max..=max).boxed()),
+    ])
     .prop_map(amount)
 }
 
@@ -1023,32 +1024,38 @@ fn time_of_day() -> impl Strategy<Value = NaiveTime> {
 
 /// A `PIC X(10)` date: blank or a calendar date (PIC-015).
 fn pic_date() -> impl Strategy<Value = PicDate> {
-    prop_oneof![
-        1 => Just(PicDate::BLANK),
-        4 => calendar_date()
-            .prop_filter_map("a four-digit year", |date| PicDate::new(Some(date)).ok()),
-    ]
+    Union::new_weighted(vec![
+        (1, Just(PicDate::BLANK).boxed()),
+        (
+            4,
+            calendar_date()
+                .prop_filter_map("a four-digit year", |date| PicDate::new(Some(date)).ok())
+                .boxed(),
+        ),
+    ])
 }
 
 /// A `PIC X(26)` timestamp: blank, or a value in layout `I`, `D` or `S`, the screen-date layout
 /// carrying a date at midnight only (PIC-017 to PIC-020).
 fn pic_timestamp() -> impl Strategy<Value = PicTimestamp> {
     let forms = prop::sample::select(vec![TsForm::Iso, TsForm::Db2, TsForm::ScreenDate]);
-    prop_oneof![
-        1 => Just(PicTimestamp::BLANK),
-        4 => (calendar_date(), time_of_day(), forms).prop_filter_map(
-            "a timestamp its layout can carry",
-            |(date, time, form)| {
-                let value = match form {
-                    TsForm::ScreenDate => date.and_time(NaiveTime::MIN),
-                    TsForm::Iso | TsForm::Db2 => date.and_time(time),
-                };
-                CobolTimestamp::new(value, form)
-                    .ok()
-                    .map(|stamp| PicTimestamp::new(Some(stamp)))
-            },
+    Union::new_weighted(vec![
+        (1, Just(PicTimestamp::BLANK).boxed()),
+        (
+            4,
+            (calendar_date(), time_of_day(), forms)
+                .prop_filter_map("a timestamp its layout can carry", |(date, time, form)| {
+                    let value = match form {
+                        TsForm::ScreenDate => date.and_time(NaiveTime::MIN),
+                        TsForm::Iso | TsForm::Db2 => date.and_time(time),
+                    };
+                    CobolTimestamp::new(value, form)
+                        .ok()
+                        .map(|stamp| PicTimestamp::new(Some(stamp)))
+                })
+                .boxed(),
         ),
-    ]
+    ])
 }
 
 /// A card number built from 16 ASCII digits through `CardNumber::parse`.

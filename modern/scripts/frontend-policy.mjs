@@ -490,9 +490,11 @@ function sourceFiles(directory) {
 //   `budget` characters again is left unmasked from the first offset whose masks are not final,
 //   which hides nothing from the scan but exposes what its comments and strings quote.
 function maskSource(text, jsx = false) {
-  // Sticky matchers for an identifier and for a JSX name, which may also contain `-`; ID_PART
-  // tests one identifier code point (`$` and the joiners included). Each reads by code point,
-  // never by code unit.
+  // Sticky matchers, which read by code point (the `u` flag), never by code unit: `identifierStart`
+  // tests for one character that can begin an identifier (`$`, `_` or an ID_Start character);
+  // `identifier` reads a whole identifier, whose later characters are ID_Continue characters, `$`
+  // or the joiners U+200C and U+200D; `jsxName` reads one part of a JSX element or attribute name,
+  // which may also contain `-`.
   const identifierStart = /[$_\p{ID_Start}]/uy;
   const identifier = /[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}]*/uy;
   const jsxName = /[$_\p{ID_Start}][$\u200c\u200d\p{ID_Continue}-]*/uy;

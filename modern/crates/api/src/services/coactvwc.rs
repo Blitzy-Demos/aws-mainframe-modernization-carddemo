@@ -39,6 +39,10 @@
 use domain::copybook::PicU;
 use domain::online::coactvwc::{self, AccountView, Lookup, ViewFailure};
 use persistence::{AccountCustomerChain, AccountRepository, ChainLink, PersistenceError};
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -100,13 +104,28 @@ fn report_failed<T>(link: &ChainLink<T>, paragraph: &'static str, statement: &'s
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        statement,
-        error = %error,
-        "file read failed; answering the program's file error"
-    );
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "program", "paragraph", "statement", "error"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"file read failed; answering the program's file error" as &dyn Value),
+                Some(&PROGRAM as &dyn Value),
+                Some(&paragraph as &dyn Value),
+                Some(&statement as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
 }
 
 /// One read of the chain as the lookup [`coactvwc::view`] takes: CICS `NORMAL` is
@@ -301,9 +320,10 @@ mod tests {
         Ok(())
     }
 
-    /// COACTVWC-037, COACTVWC-042, COACTVWC-046: each failed read is logged once, with its
-    /// paragraph and the store error, before the domain answers as before; a read that found
-    /// its record or none logs nothing, and no event holds a key or a stored value.
+    /// COACTVWC-037, COACTVWC-042, COACTVWC-046: each failed read is logged once, as an `ERROR`
+    /// event of COACTVWC with its paragraph, its statement and the store error, and the view
+    /// answers with the program's file error; a read that found its record or none, or that the
+    /// chain never issued, logs nothing, and no event holds a key or a stored value.
     #[test]
     fn each_failed_read_is_logged_once_without_any_value() -> TestResult {
         let (xref, account, customer) = records()?;

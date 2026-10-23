@@ -50,6 +50,10 @@ use domain::copybook::PicX;
 use domain::online::corpt00c::{
     self, ConfirmOutcome, DECK_RECORD_LEN, ReportFailure, ReportInput, ReportKind,
 };
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -316,21 +320,69 @@ fn answer(
             kind: io_kind,
             removed,
         }) => {
-            tracing::error!(
-                step = step.name(),
-                io_error = %io_kind,
-                partial_deck_removed = removed,
-                setting = DECK_DIR_SETTING,
-                "job deck not written"
-            );
+            // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint
+            // suppression.
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message", "step", "io_error", "partial_deck_removed", "setting"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[
+                        Some(&"job deck not written" as &dyn Value),
+                        Some(&step.name() as &dyn Value),
+                        Some(&display(io_kind) as &dyn Value),
+                        Some(&removed as &dyn Value),
+                        Some(&DECK_DIR_SETTING as &dyn Value),
+                    ]),
+                );
+            }
             Err(ServiceError::Rule(corpt00c::tdq_write_failure()))
         }
         Err(DeckError::FileName) => {
-            tracing::error!("job deck not written: generation file name is not UTF-8");
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[Some(
+                        &"job deck not written: generation file name is not UTF-8" as &dyn Value,
+                    )]),
+                );
+            }
             Err(ServiceError::Internal)
         }
         Err(DeckError::Task) => {
-            tracing::error!("job deck writer task ended without an answer");
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[Some(
+                        &"job deck writer task ended without an answer" as &dyn Value,
+                    )]),
+                );
+            }
             Err(ServiceError::Internal)
         }
     }
@@ -351,6 +403,10 @@ mod tests {
         self, ConfirmOutcome, DECK_RECORD_COUNT, DECK_RECORD_LEN, ReportKind,
     };
     use test_support::trace_capture;
+    use tracing::callsite::DefaultCallsite;
+    use tracing::field::{Value, display};
+    use tracing::metadata::Kind;
+    use tracing::{Event, Level, Metadata};
 
     use super::{
         DECK_DIR_SETTING, DeckError, DeckStep, ReportRequestDto, answer, check_deck_dir, decide,
@@ -402,12 +458,26 @@ mod tests {
 
     impl Drop for ScratchDir {
         fn drop(&mut self) {
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message", "operation", "io_error"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
             if let Err(error) = remove_tree(&self.0) {
-                tracing::error!(
-                    operation = "remove scratch directory",
-                    io_error = %error.kind(),
-                    "scratch directory not removed"
-                );
+                if runtime::telemetry::event_enabled(&EVENT) {
+                    Event::dispatch(
+                        &EVENT_METADATA,
+                        &EVENT_METADATA.fields().value_set_all(&[
+                            Some(&"scratch directory not removed" as &dyn Value),
+                            Some(&"remove scratch directory" as &dyn Value),
+                            Some(&display(error.kind()) as &dyn Value),
+                        ]),
+                    );
+                }
             }
         }
     }

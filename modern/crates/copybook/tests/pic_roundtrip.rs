@@ -24,6 +24,7 @@ use copybook::{
     PicTimestamp, PicU, PicX, RecordReader, RecordWriter, Terminator, TsForm, lines,
 };
 use proptest::prelude::*;
+use proptest::strategy::Union;
 use rust_decimal::Decimal;
 
 // ---------------------------------------------------------------------------------------------
@@ -136,7 +137,7 @@ fn printable(len: usize) -> impl Strategy<Value = Vec<u8>> {
 
 /// A byte `PicX` rejects: a control byte, DEL or a byte above `0x7F` (PIC-002).
 fn non_printable() -> impl Strategy<Value = u8> {
-    prop_oneof![0_u8..0x20, 0x7F_u8..=0xFF]
+    Union::new([(0_u8..0x20).boxed(), (0x7F_u8..=0xFF).boxed()])
 }
 
 /// Bytes of a signed DISPLAY field `len` bytes wide: ASCII digits, then an overpunch byte.
@@ -545,9 +546,15 @@ proptest! {
         // PA-AUTH-DATE-9C = 99999 - YYDDD, PA-AUTH-TIME-9C = 999999999 - HHMMSSmmm
         // (COPAUA0C.cbl:874-875).
         let date_key = PicS::<5>::complement_from(yyddd).map_err(fail)?;
+        // TRUNCATION: a sign conversion only: the key is `99999 − yyddd`, 0 to 99999 for every
+        // generated `yyddd`, so it converts into `u64` exactly; a negative key would give `None`
+        // and fail the assertion rather than wrap.
         prop_assert_eq!(u64::try_from(date_key.get()).ok(), Some(99_999 - yyddd));
         prop_assert_eq!(date_key.uncomplement(), Ok(yyddd));
         let time_key = PicS::<9>::complement_from(hhmmssmmm).map_err(fail)?;
+        // TRUNCATION: a sign conversion only: the key is `999999999 − hhmmssmmm`, 0 to 999999999
+        // for every generated `hhmmssmmm`, so it converts into `u64` exactly; a negative key would
+        // give `None` and fail the assertion rather than wrap.
         prop_assert_eq!(u64::try_from(time_key.get()).ok(), Some(999_999_999 - hhmmssmmm));
         prop_assert_eq!(time_key.uncomplement(), Ok(hhmmssmmm));
     }
@@ -558,6 +565,9 @@ proptest! {
         // PA-ACCT-ID PIC S9(11) COMP-3 joins ACCT-ID PIC 9(11).
         let unsigned = PicU::<11>::new(acct_id).map_err(fail)?;
         let signed = PicS::<11>::from(unsigned);
+        // TRUNCATION: a sign conversion only: `signed` is built from the unsigned `PIC 9(11)`
+        // value `acct_id`, 0 to 10^11 − 1, so it converts into `u64` exactly; a negative value
+        // would give `None` and fail the assertion rather than wrap.
         prop_assert_eq!(u64::try_from(signed.get()).ok(), Some(acct_id));
         prop_assert_eq!(PicU::<11>::try_from(signed), Ok(unsigned));
         prop_assert_eq!(u64::from(unsigned), acct_id);

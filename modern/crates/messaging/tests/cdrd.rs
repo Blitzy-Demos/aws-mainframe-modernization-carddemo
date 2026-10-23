@@ -34,8 +34,10 @@
 //!   reply; the failure paths, which the candidate leaves assertable, are checked that way.
 
 use std::error::Error;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -43,6 +45,7 @@ use domain::messaging::codate01::{
     BUFFER_LEN, ERROR_QUEUE, MQ_ERR_DISPLAY_LEN, REPLY_QUEUE, REPLY_TEXT_LEN,
 };
 use domain::{Clock, FixedClock};
+use insta::internals::SnapshotContents;
 use lapin::message::Delivery;
 use lapin::options::{ConfirmSelectOptions, QueueDeclareOptions, QueueDeleteOptions};
 use lapin::types::{FieldTable, ShortString};
@@ -272,6 +275,48 @@ where
     outcome.map_err(Into::into)
 }
 
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
+}
+
+/// Drives `first` and `second` concurrently on the calling task until both have finished, and
+/// returns both outputs. Every poll polls each future that has not finished yet, and a finished
+/// one is never polled again. Both are boxed, so that they never move once polled.
+async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_output = None;
+    let mut second_output = None;
+    std::future::poll_fn(|context| {
+        if first_output.is_none() {
+            if let Poll::Ready(output) = first.as_mut().poll(context) {
+                first_output = Some(output);
+            }
+        }
+        if second_output.is_none() {
+            if let Poll::Ready(output) = second.as_mut().poll(context) {
+                second_output = Some(output);
+            }
+        }
+        match (first_output.take(), second_output.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready((first_done, second_done)),
+            (first_left, second_left) => {
+                first_output = first_left;
+                second_output = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
 /// One `process_next` of `worker` on `connection`. Its future is boxed because it holds the
 /// whole put path, too large to keep inline in every test's future (`clippy::large_futures`).
 async fn step<W: Step>(worker: &mut W, connection: &Connection) -> TestResult<Processed> {
@@ -358,6 +403,43 @@ fn reply_rendering(body: &[u8]) -> TestResult<String> {
     Ok(format!(
         "{masked}\nlen={len} trailing_spaces={trailing_spaces}"
     ))
+}
+
+/// Fails unless `rendered` matches this file's committed snapshot `name`,
+/// `tests/snapshots/cdrd__<name>.snap`, as insta matches a named file snapshot: both texts with
+/// their leading line breaks and trailing whitespace trimmed and every CRLF read as LF. The
+/// snapshot is only read, never written or refreshed. A mismatch names the snapshot, both lengths
+/// and the first differing byte offset, never the text.
+fn compare_snapshot(name: &str, rendered: &str) -> TestResult {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join(format!("cdrd__{name}.snap"));
+    let snapshot = insta::Snapshot::from_file(&path)
+        .map_err(|error| format!("the committed snapshot {name} cannot be read: {error}"))?;
+    let SnapshotContents::Text(committed) = snapshot.contents() else {
+        return Err(format!("the committed snapshot {name} is not a text snapshot").into());
+    };
+    let expected = committed.to_string();
+    let actual = rendered
+        .trim_start_matches(['\r', '\n'])
+        .trim_end()
+        .replace("\r\n", "\n");
+    if actual == expected {
+        return Ok(());
+    }
+    let differs_at = actual
+        .bytes()
+        .zip(expected.bytes())
+        .position(|(got, want)| got != want)
+        .unwrap_or_else(|| actual.len().min(expected.len()));
+    Err(format!(
+        "the rendering differs from the committed snapshot {name} at byte {differs_at}: {} \
+         bytes rendered, {} committed",
+        actual.len(),
+        expected.len()
+    )
+    .into())
 }
 
 /// Asserts the `MQ-ERR-DISPLAY` body that a failed put of the reply to `queue` publishes, every
@@ -497,279 +579,291 @@ impl Held {
 // audit: CODATE01-007
 // audit: CODATE01-010
 // audit: CODATE01-011
-#[tokio::test]
-async fn reply_on_fixed_queue_with_copied_properties() -> TestResult {
-    let harness = Harness::start().await?;
-    let reply_to = rabbitmq::declare_reply_queue(&harness.channel).await?;
-    let properties = request_ids("cdrd-msg-0001", "cdrd-corr-0001")
-        .with_reply_to(ShortString::from(reply_to.as_str()));
-    harness.publish_request(b"DATE", properties).await?;
-    let mut worker = harness.worker().await?;
+#[test]
+fn reply_on_fixed_queue_with_copied_properties() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let reply_to = rabbitmq::declare_reply_queue(&harness.channel).await?;
+        let properties = request_ids("cdrd-msg-0001", "cdrd-corr-0001")
+            .with_reply_to(ShortString::from(reply_to.as_str()));
+        harness.publish_request(b"DATE", properties).await?;
+        let mut worker = harness.worker().await?;
 
-    let processed = step(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::Replied);
+        let processed = step(&mut worker, &harness.worker_connection).await?;
+        assert_eq!(processed, Processed::Replied);
 
-    let reply = harness.take(REPLY_QUEUE).await?;
-    assert_reply_body(&reply.data)?;
-    assert_copied_properties(
-        &reply.properties,
-        Some("cdrd-msg-0001"),
-        Some("cdrd-corr-0001"),
-    );
-    // The request's reply_to is ignored: the reply goes only to CARD.DEMO.REPLY.DATE.
-    let misrouted = rabbitmq::get(&harness.channel, &reply_to, Duration::ZERO).await?;
-    assert!(
-        misrouted.is_none(),
-        "a reply went to the request's reply_to"
-    );
-    insta::assert_snapshot!("fixed_clock_reply", reply_rendering(&reply.data)?);
-    Ok(())
+        let reply = harness.take(REPLY_QUEUE).await?;
+        assert_reply_body(&reply.data)?;
+        assert_copied_properties(
+            &reply.properties,
+            Some("cdrd-msg-0001"),
+            Some("cdrd-corr-0001"),
+        );
+        // The request's reply_to is ignored: the reply goes only to CARD.DEMO.REPLY.DATE.
+        let misrouted = rabbitmq::get(&harness.channel, &reply_to, Duration::ZERO).await?;
+        assert!(
+            misrouted.is_none(),
+            "a reply went to the request's reply_to"
+        );
+        compare_snapshot("fixed_clock_reply", &reply_rendering(&reply.data)?)?;
+        Ok(())
+    })
 }
 
 // audit: CODATE01-001
 // audit: CODATE01-010
 // audit: CODATE01-013
-#[tokio::test]
-async fn replies_ignore_the_request_body_and_copy_only_their_own_ids() -> TestResult {
-    let harness = Harness::start().await?;
-    // An empty body, then 1,000 bytes of every byte value; the second request has no
-    // correlation_id.
-    let any_bytes: Vec<u8> = (0..=u8::MAX).cycle().take(BUFFER_LEN).collect();
-    harness
-        .publish_request(b"", request_ids("cdrd-msg-0002", "cdrd-corr-0002"))
-        .await?;
-    let second = BasicProperties::default().with_message_id(ShortString::from("cdrd-msg-0003"));
-    harness.publish_request(&any_bytes, second).await?;
-    let mut worker = harness.worker().await?;
+#[test]
+fn replies_ignore_the_request_body_and_copy_only_their_own_ids() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // An empty body, then 1,000 bytes of every byte value; the second request has no
+        // correlation_id.
+        let any_bytes: Vec<u8> = (0..=u8::MAX).cycle().take(BUFFER_LEN).collect();
+        harness
+            .publish_request(b"", request_ids("cdrd-msg-0002", "cdrd-corr-0002"))
+            .await?;
+        let second = BasicProperties::default().with_message_id(ShortString::from("cdrd-msg-0003"));
+        harness.publish_request(&any_bytes, second).await?;
+        let mut worker = harness.worker().await?;
 
-    for _ in 0..2 {
+        for _ in 0..2 {
+            let processed = step(&mut worker, &harness.worker_connection).await?;
+            assert_eq!(processed, Processed::Replied);
+        }
+
+        let first = harness.take(REPLY_QUEUE).await?;
+        let second = harness.take(REPLY_QUEUE).await?;
+        assert_reply_body(&first.data)?;
+        assert_copied_properties(
+            &first.properties,
+            Some("cdrd-msg-0002"),
+            Some("cdrd-corr-0002"),
+        );
+        assert_copied_properties(&second.properties, Some("cdrd-msg-0003"), None);
+        // One clock instant, two different request bodies: the same reply bytes.
+        assert_eq!(
+            first.data, second.data,
+            "the reply depends on the request body"
+        );
+        Ok(())
+    })
+}
+
+// audit: CODATE01-012
+#[test]
+fn ack_follows_confirmed_reply() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        harness
+            .publish_request(b"DATE", request_ids("cdrd-msg-0004", "cdrd-corr-0004"))
+            .await?;
+        let record = Arc::new(Record::default());
+        let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
+
+        // The worker answers while the test holds the reply's confirmation, then releases it.
+        let held = harness.hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::release);
+        let (processed, held) = join(step(&mut worker, &gated), held).await;
+        // Queue presence is not confirmation: the reply was on its queue throughout the hold.
+        assert_eq!(
+            held?,
+            Held::unsettled(1, 0),
+            "while the reply's confirmation was held: the reply queued, the request unsettled"
+        );
+        assert_eq!(processed?, Processed::Replied);
+        assert_eq!(
+            record.acks.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged once"
+        );
+        assert_eq!(
+            record.passed_at_ack.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged before the reply's confirmation reached the worker"
+        );
+        assert!(
+            !record.rejected.load(Ordering::SeqCst),
+            "the request was rejected"
+        );
+
+        // The double, not the consumer channel, settled the request: closing the worker's
+        // connection returns it to its queue.
+        let close = gated.close(REPLY_SUCCESS, "test done");
+        bounded("close the worker connection", close).await?;
+        harness.wait_for_count(harness.request_queue(), 1).await
+    })
+}
+
+// audit: CODATE01-012
+// audit: CODATE01-014
+// audit: CODATE01-015
+// audit: CODATE01-018
+#[test]
+fn refused_reply_confirmation_acks_only_after_the_confirmed_mqput_err() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        harness
+            .publish_request(b"DATE", request_ids("cdrd-msg-0008", "cdrd-corr-0008"))
+            .await?;
+        let record = Arc::new(Record::default());
+        let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
+
+        // The reply's confirmation is held, then refused; the MQPUT ERR message's is held, then
+        // released.
+        let holds = async {
+            let reply = harness
+                .hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::refuse)
+                .await?;
+            let error = harness
+                .hold(&gate, &record, 2, ERROR_QUEUE, ConfirmGate::release)
+                .await?;
+            Ok::<_, Box<dyn Error + Send + Sync>>((reply, error))
+        };
+        let (processed, holds) = join(step(&mut worker, &gated), holds).await;
+        let (reply_hold, error_hold) = holds?;
+        // The broker queued the reply and only the worker was told Nack, so the reply is on
+        // CARD.DEMO.REPLY.DATE: a refused confirmation, not an unroutable reply.
+        assert_eq!(
+            reply_hold,
+            Held::unsettled(1, 0),
+            "while the reply's confirmation was held"
+        );
+        assert_eq!(
+            error_hold,
+            Held::unsettled(1, 1),
+            "while the error message's confirmation was held"
+        );
+        // Only Ack(None) is a confirmed put: the refused reply took the MQPUT ERR path.
+        assert_eq!(processed?, Processed::ErrorRouted);
+        assert_eq!(
+            record.acks.load(Ordering::SeqCst),
+            1,
+            "the request was acknowledged once"
+        );
+        assert_eq!(
+            record.passed_at_ack.load(Ordering::SeqCst),
+            2,
+            "the request was acknowledged before the error message's confirmation reached the worker"
+        );
+        assert!(
+            !record.rejected.load(Ordering::SeqCst),
+            "the request was rejected"
+        );
+        let error = harness.take(ERROR_QUEUE).await?;
+        assert_error_body(&error.data, REPLY_QUEUE)?;
+        assert_copied_properties(
+            &error.properties,
+            Some("cdrd-msg-0008"),
+            Some("cdrd-corr-0008"),
+        );
+
+        // The double, not the consumer channel, settled the request: closing the worker's
+        // connection returns it to its queue.
+        let close = gated.close(REPLY_SUCCESS, "test done");
+        bounded("close the worker connection", close).await?;
+        harness.wait_for_count(harness.request_queue(), 1).await
+    })
+}
+
+// audit: CODATE01-014
+// audit: CODATE01-015
+// audit: CODATE01-018
+#[test]
+fn reply_put_failure_routes_mq_err_display_to_error_queue() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.worker().await?;
+        harness.delete_queue(REPLY_QUEUE).await?;
+        harness
+            .publish_request(b"DATE", request_ids("cdrd-msg-0005", "cdrd-corr-0005"))
+            .await?;
+
+        let processed = step(&mut worker, &harness.worker_connection).await?;
+        assert_eq!(processed, Processed::ErrorRouted);
+        let error = harness.take(ERROR_QUEUE).await?;
+        assert_error_body(&error.data, REPLY_QUEUE)?;
+        assert_copied_properties(
+            &error.properties,
+            Some("cdrd-msg-0005"),
+            Some("cdrd-corr-0005"),
+        );
+
+        // The request was acknowledged after the confirmed error message: closing the consumer
+        // channel returns nothing to the request queue.
+        bounded(
+            "reopen the worker channels",
+            Step::reopen(&mut worker, &harness.worker_connection),
+        )
+        .await?;
+        harness.assert_request_queue_stays_empty().await?;
+
+        // No task boundary: with its reply queue back, the worker answers the next request.
+        let declare = harness.channel.queue_declare(
+            REPLY_QUEUE,
+            QueueDeclareOptions {
+                durable: true,
+                ..QueueDeclareOptions::default()
+            },
+            FieldTable::default(),
+        );
+        bounded("declare the reply queue again", declare).await?;
+        harness
+            .publish_request(b"DATE", request_ids("cdrd-msg-0006", "cdrd-corr-0006"))
+            .await?;
         let processed = step(&mut worker, &harness.worker_connection).await?;
         assert_eq!(processed, Processed::Replied);
-    }
-
-    let first = harness.take(REPLY_QUEUE).await?;
-    let second = harness.take(REPLY_QUEUE).await?;
-    assert_reply_body(&first.data)?;
-    assert_copied_properties(
-        &first.properties,
-        Some("cdrd-msg-0002"),
-        Some("cdrd-corr-0002"),
-    );
-    assert_copied_properties(&second.properties, Some("cdrd-msg-0003"), None);
-    // One clock instant, two different request bodies: the same reply bytes.
-    assert_eq!(
-        first.data, second.data,
-        "the reply depends on the request body"
-    );
-    Ok(())
-}
-
-// audit: CODATE01-012
-#[tokio::test]
-async fn ack_follows_confirmed_reply() -> TestResult {
-    let harness = Harness::start().await?;
-    harness
-        .publish_request(b"DATE", request_ids("cdrd-msg-0004", "cdrd-corr-0004"))
-        .await?;
-    let record = Arc::new(Record::default());
-    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
-
-    // The worker answers while the test holds the reply's confirmation, then releases it.
-    let held = harness.hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::release);
-    let (processed, held) = tokio::join!(step(&mut worker, &gated), held);
-    // Queue presence is not confirmation: the reply was on its queue throughout the hold.
-    assert_eq!(
-        held?,
-        Held::unsettled(1, 0),
-        "while the reply's confirmation was held: the reply queued, the request unsettled"
-    );
-    assert_eq!(processed?, Processed::Replied);
-    assert_eq!(
-        record.acks.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged once"
-    );
-    assert_eq!(
-        record.passed_at_ack.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged before the reply's confirmation reached the worker"
-    );
-    assert!(
-        !record.rejected.load(Ordering::SeqCst),
-        "the request was rejected"
-    );
-
-    // The double, not the consumer channel, settled the request: closing the worker's
-    // connection returns it to its queue.
-    let close = gated.close(REPLY_SUCCESS, "test done");
-    bounded("close the worker connection", close).await?;
-    harness.wait_for_count(harness.request_queue(), 1).await
-}
-
-// audit: CODATE01-012
-// audit: CODATE01-014
-// audit: CODATE01-015
-// audit: CODATE01-018
-#[tokio::test]
-async fn refused_reply_confirmation_acks_only_after_the_confirmed_mqput_err() -> TestResult {
-    let harness = Harness::start().await?;
-    harness
-        .publish_request(b"DATE", request_ids("cdrd-msg-0008", "cdrd-corr-0008"))
-        .await?;
-    let record = Arc::new(Record::default());
-    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
-
-    // The reply's confirmation is held, then refused; the MQPUT ERR message's is held, then
-    // released.
-    let holds = async {
-        let reply = harness
-            .hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::refuse)
-            .await?;
-        let error = harness
-            .hold(&gate, &record, 2, ERROR_QUEUE, ConfirmGate::release)
-            .await?;
-        Ok::<_, Box<dyn Error + Send + Sync>>((reply, error))
-    };
-    let (processed, holds) = tokio::join!(step(&mut worker, &gated), holds);
-    let (reply_hold, error_hold) = holds?;
-    // The broker queued the reply and only the worker was told Nack, so the reply is on
-    // CARD.DEMO.REPLY.DATE: a refused confirmation, not an unroutable reply.
-    assert_eq!(
-        reply_hold,
-        Held::unsettled(1, 0),
-        "while the reply's confirmation was held"
-    );
-    assert_eq!(
-        error_hold,
-        Held::unsettled(1, 1),
-        "while the error message's confirmation was held"
-    );
-    // Only Ack(None) is a confirmed put: the refused reply took the MQPUT ERR path.
-    assert_eq!(processed?, Processed::ErrorRouted);
-    assert_eq!(
-        record.acks.load(Ordering::SeqCst),
-        1,
-        "the request was acknowledged once"
-    );
-    assert_eq!(
-        record.passed_at_ack.load(Ordering::SeqCst),
-        2,
-        "the request was acknowledged before the error message's confirmation reached the worker"
-    );
-    assert!(
-        !record.rejected.load(Ordering::SeqCst),
-        "the request was rejected"
-    );
-    let error = harness.take(ERROR_QUEUE).await?;
-    assert_error_body(&error.data, REPLY_QUEUE)?;
-    assert_copied_properties(
-        &error.properties,
-        Some("cdrd-msg-0008"),
-        Some("cdrd-corr-0008"),
-    );
-
-    // The double, not the consumer channel, settled the request: closing the worker's
-    // connection returns it to its queue.
-    let close = gated.close(REPLY_SUCCESS, "test done");
-    bounded("close the worker connection", close).await?;
-    harness.wait_for_count(harness.request_queue(), 1).await
-}
-
-// audit: CODATE01-014
-// audit: CODATE01-015
-// audit: CODATE01-018
-#[tokio::test]
-async fn reply_put_failure_routes_mq_err_display_to_error_queue() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.worker().await?;
-    harness.delete_queue(REPLY_QUEUE).await?;
-    harness
-        .publish_request(b"DATE", request_ids("cdrd-msg-0005", "cdrd-corr-0005"))
-        .await?;
-
-    let processed = step(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::ErrorRouted);
-    let error = harness.take(ERROR_QUEUE).await?;
-    assert_error_body(&error.data, REPLY_QUEUE)?;
-    assert_copied_properties(
-        &error.properties,
-        Some("cdrd-msg-0005"),
-        Some("cdrd-corr-0005"),
-    );
-
-    // The request was acknowledged after the confirmed error message: closing the consumer
-    // channel returns nothing to the request queue.
-    bounded(
-        "reopen the worker channels",
-        Step::reopen(&mut worker, &harness.worker_connection),
-    )
-    .await?;
-    harness.assert_request_queue_stays_empty().await?;
-
-    // No task boundary: with its reply queue back, the worker answers the next request.
-    let declare = harness.channel.queue_declare(
-        REPLY_QUEUE,
-        QueueDeclareOptions {
-            durable: true,
-            ..QueueDeclareOptions::default()
-        },
-        FieldTable::default(),
-    );
-    bounded("declare the reply queue again", declare).await?;
-    harness
-        .publish_request(b"DATE", request_ids("cdrd-msg-0006", "cdrd-corr-0006"))
-        .await?;
-    let processed = step(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::Replied);
-    let reply = harness.take(REPLY_QUEUE).await?;
-    assert_reply_body(&reply.data)?;
-    assert_copied_properties(
-        &reply.properties,
-        Some("cdrd-msg-0006"),
-        Some("cdrd-corr-0006"),
-    );
-    Ok(())
+        let reply = harness.take(REPLY_QUEUE).await?;
+        assert_reply_body(&reply.data)?;
+        assert_copied_properties(
+            &reply.properties,
+            Some("cdrd-msg-0006"),
+            Some("cdrd-corr-0006"),
+        );
+        Ok(())
+    })
 }
 
 // audit: CODATE01-019
-#[tokio::test]
-async fn error_put_failure_discards_the_request_with_one_error_event() -> TestResult {
-    let harness = Harness::start().await?;
-    let mut worker = harness.worker().await?;
-    harness.delete_queue(REPLY_QUEUE).await?;
-    harness.delete_queue(ERROR_QUEUE).await?;
-    harness
-        .publish_request(b"DATE", request_ids("cdrd-msg-0007", "cdrd-corr-0007"))
+#[test]
+fn error_put_failure_discards_the_request_with_one_error_event() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let mut worker = harness.worker().await?;
+        harness.delete_queue(REPLY_QUEUE).await?;
+        harness.delete_queue(ERROR_QUEUE).await?;
+        harness
+            .publish_request(b"DATE", request_ids("cdrd-msg-0007", "cdrd-corr-0007"))
+            .await?;
+
+        let capture = trace_capture::capture();
+        let processed = step(&mut worker, &harness.worker_connection).await?;
+        let lines = capture.lines();
+        drop(capture);
+        assert_eq!(processed, Processed::Discarded);
+        // The event that stands in for DISPLAY MQ-ERR-DISPLAY; its code fields are HALTED(H4).
+        let errors: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(r#""level":"ERROR""#))
+            .collect();
+        let [event] = errors.as_slice() else {
+            return Err(format!("expected one ERROR event, got {errors:?}").into());
+        };
+        for member in [
+            r#""return_message":"MQPUT ERR""#,
+            r#""queue_name":"CARD.DEMO.ERROR""#,
+        ] {
+            assert!(event.contains(member), "{member} missing from {event}");
+        }
+
+        // Rejected without requeue, and CARD.DEMO.REQUEST.DATE has no dead-letter arguments: closing
+        // the consumer channel returns nothing, so the request is gone and not redelivered.
+        bounded(
+            "reopen the worker channels",
+            Step::reopen(&mut worker, &harness.worker_connection),
+        )
         .await?;
-
-    let capture = trace_capture::capture();
-    let processed = step(&mut worker, &harness.worker_connection).await?;
-    let lines = capture.lines();
-    drop(capture);
-    assert_eq!(processed, Processed::Discarded);
-    // The event that stands in for DISPLAY MQ-ERR-DISPLAY; its code fields are HALTED(H4).
-    let errors: Vec<&String> = lines
-        .iter()
-        .filter(|line| line.contains(r#""level":"ERROR""#))
-        .collect();
-    let [event] = errors.as_slice() else {
-        return Err(format!("expected one ERROR event, got {errors:?}").into());
-    };
-    for member in [
-        r#""return_message":"MQPUT ERR""#,
-        r#""queue_name":"CARD.DEMO.ERROR""#,
-    ] {
-        assert!(event.contains(member), "{member} missing from {event}");
-    }
-
-    // Rejected without requeue, and CARD.DEMO.REQUEST.DATE has no dead-letter arguments: closing
-    // the consumer channel returns nothing, so the request is gone and not redelivered.
-    bounded(
-        "reopen the worker channels",
-        Step::reopen(&mut worker, &harness.worker_connection),
-    )
-    .await?;
-    harness.assert_request_queue_stays_empty().await
+        harness.assert_request_queue_stays_empty().await
+    })
 }
 
 /// Reports the MQ completion and reason codes of the error body as `BLOCKED`: IBM MQ defines

@@ -8,8 +8,9 @@
 //! Startup, in order:
 //! 1. reads the configuration through `runtime::config::Config`, the only reader of the
 //!    environment;
-//! 2. refuses to start when `CARDDEMO_JWT_SECRET` is empty or unset, before anything else is set
-//!    up, so that neither an invalid `RUST_LOG` nor the state of the database can hide that
+//! 2. refuses to start when `CARDDEMO_JWT_SECRET` is empty, unset, only whitespace or shorter
+//!    than 32 bytes (`runtime::config::MIN_JWT_SECRET_BYTES`), before anything else is set up,
+//!    so that neither an invalid `RUST_LOG` nor the state of the database can hide that
 //!    diagnostic;
 //! 3. installs the JSON tracing subscriber on standard output, with the optional span export of
 //!    `CARDDEMO_OTEL_EXPORT`;
@@ -95,8 +96,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // Checked before the subscriber is installed, so a missing secret is reported as such
-    // whatever `RUST_LOG` or the database holds. The message names the variable, never a value.
+    // Checked before the subscriber is installed, so a missing, blank or too short secret is
+    // reported as such whatever `RUST_LOG` or the database holds. The message names the variable
+    // and the rule it breaks, never the value or its length.
     if let Err(error) = config.require_jwt_secret() {
         eprintln!("carddemo-api: configuration error: {error}");
         return ExitCode::FAILURE;
@@ -582,11 +584,16 @@ mod tests {
         let summary = serde_json::to_string(&summary).expect("a string serializes");
         // The emitting call, its level, and the exact `fields` object of its line: `message`
         // first, a `None` field absent.
-        let cases: [(fn(), &str, String); 13] = [
+        let cases: [(fn(), &str, String); 14] = [
             (
                 || cannot_start(&EnvError::MissingJwtSecret),
                 "ERROR",
-                r#"{"message":"carddemo-api cannot start","error":"CARDDEMO_JWT_SECRET is empty or unset; the API refuses to start without it"}"#.to_owned(),
+                r#"{"message":"carddemo-api cannot start","error":"CARDDEMO_JWT_SECRET is empty, blank or unset; the API refuses to start without it"}"#.to_owned(),
+            ),
+            (
+                || cannot_start(&EnvError::WeakJwtSecret),
+                "ERROR",
+                r#"{"message":"carddemo-api cannot start","error":"CARDDEMO_JWT_SECRET is shorter than 32 bytes; the API refuses to start with it"}"#.to_owned(),
             ),
             (
                 || runtime_failed(io::ErrorKind::OutOfMemory),

@@ -54,8 +54,9 @@ use domain::online::cousr02c::{StoredUserView, UserMaintFailure, UserRead};
 use domain::online::cousr03c::{self as rules, DeleteResult};
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
+use tracing::{Level, Metadata, field};
 
-use crate::app::AppState;
+use crate::app::{AppState, EventSite, emit, event_metadata};
 use crate::auth::extract::AdminUser;
 use crate::error::ServiceError;
 
@@ -147,11 +148,22 @@ fn delete_result(result: Result<bool, PersistenceError>) -> DeleteResult {
 /// The error's `Display` holds only an SQLSTATE, a constraint name or a column name, never a
 /// stored or request value (Cardholder Data Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        error = %error,
-        "USRSEC access failed"
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "usrsec_access_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"USRSEC access failed"),
+            Some(&PROGRAM),
+            Some(&paragraph),
+            Some(&field::display(error)),
+        ],
     );
 }
 
@@ -180,6 +192,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A failure as the response shows it: message, field name and HTTP status.
     type Shown = (&'static str, &'static str, u16);
@@ -339,68 +360,74 @@ mod tests {
     // audit: COUSR03C-017
     // audit: COUSR03C-019
     // audit: COUSR03C-020
-    #[tokio::test]
-    async fn the_held_row_is_deleted_under_the_received_key() -> TestResult {
-        for (raw, message) in [
-            ("USER0001", "User USER0001 has been deleted ..."),
-            ("user0001", "User user0001 has been deleted ..."),
-            ("AB CD", "User AB has been deleted ..."),
-            (" ADMIN", "User  has been deleted ..."),
-        ] {
-            let id = key(raw)?;
-            let mut store = Scripted::answering(Ok(Some(entry(raw)?)), Ok(true));
-            let answer = delete_held(&mut store, &id)
-                .await
-                .map_err(|f| f.message())?;
-            assert_eq!(answer, message, "{raw:?}");
-            // One locked read and one delete, both of the padded key as received.
-            assert_eq!(store.locked, [id.clone()], "{raw:?}");
-            assert_eq!(store.deleted, [id], "{raw:?}");
-        }
-        Ok(())
+    #[test]
+    fn the_held_row_is_deleted_under_the_received_key() -> TestResult {
+        block_on(async {
+            for (raw, message) in [
+                ("USER0001", "User USER0001 has been deleted ..."),
+                ("user0001", "User user0001 has been deleted ..."),
+                ("AB CD", "User AB has been deleted ..."),
+                (" ADMIN", "User  has been deleted ..."),
+            ] {
+                let id = key(raw)?;
+                let mut store = Scripted::answering(Ok(Some(entry(raw)?)), Ok(true));
+                let answer = delete_held(&mut store, &id)
+                    .await
+                    .map_err(|f| f.message())?;
+                assert_eq!(answer, message, "{raw:?}");
+                // One locked read and one delete, both of the padded key as received.
+                assert_eq!(store.locked, [id.clone()], "{raw:?}");
+                assert_eq!(store.deleted, [id], "{raw:?}");
+            }
+            Ok(())
+        })
     }
 
     // audit: COUSR03C-021
     // audit: COUSR03C-022
-    #[tokio::test]
-    async fn a_delete_that_removes_nothing_or_fails_is_refused() -> TestResult {
-        let traces = trace_capture::capture();
-        let failed = PersistenceError::Database {
-            sqlstate: Some(CANCELED.to_owned()),
-            constraint: None,
-        };
-        for (answer, expected) in [(Ok(false), NOT_FOUND), (Err(failed), UPDATE_FAILED)] {
-            let mut store = Scripted::answering(Ok(Some(entry("USER0001")?)), answer);
-            let outcome = delete_held(&mut store, &key("USER0001")?).await;
-            assert_eq!(
-                outcome.as_ref().err().map(shown_failure),
-                Some(expected),
-                "{}",
-                expected.0
-            );
-        }
-        // The `DISPLAY` of the codes becomes an event naming the paragraph and the SQLSTATE.
-        assert!(traces.contains("DELETE-USER-SEC-FILE"));
-        assert!(traces.contains(CANCELED));
-        assert!(!traces.contains("unverified-test-hash"));
-        Ok(())
+    #[test]
+    fn a_delete_that_removes_nothing_or_fails_is_refused() -> TestResult {
+        block_on(async {
+            let traces = trace_capture::capture();
+            let failed = PersistenceError::Database {
+                sqlstate: Some(CANCELED.to_owned()),
+                constraint: None,
+            };
+            for (answer, expected) in [(Ok(false), NOT_FOUND), (Err(failed), UPDATE_FAILED)] {
+                let mut store = Scripted::answering(Ok(Some(entry("USER0001")?)), answer);
+                let outcome = delete_held(&mut store, &key("USER0001")?).await;
+                assert_eq!(
+                    outcome.as_ref().err().map(shown_failure),
+                    Some(expected),
+                    "{}",
+                    expected.0
+                );
+            }
+            // The `DISPLAY` of the codes becomes an event naming the paragraph and the SQLSTATE.
+            assert!(traces.contains("DELETE-USER-SEC-FILE"));
+            assert!(traces.contains(CANCELED));
+            assert!(!traces.contains("unverified-test-hash"));
+            Ok(())
+        })
     }
 
     // audit: COUSR03C-018
-    #[tokio::test]
-    async fn a_read_that_holds_nothing_issues_no_delete() -> TestResult {
-        // No row, or a failed read: halt candidate X-COUSR03C-H1 leaves only the store effect
-        // assertable, so the answer is checked to be no success and no delete to have run.
-        let traces = trace_capture::capture();
-        for lock in [Ok(None), Err(PersistenceError::Unavailable)] {
-            let mut store = Scripted::answering(lock, Ok(true));
-            let outcome = delete_held(&mut store, &key("NOBODY01")?).await;
-            assert!(outcome.is_err());
-            assert_eq!(store.locked.len(), 1);
-            assert!(store.deleted.is_empty());
-        }
-        assert!(traces.contains("READ-USER-SEC-FILE"));
-        Ok(())
+    #[test]
+    fn a_read_that_holds_nothing_issues_no_delete() -> TestResult {
+        block_on(async {
+            // No row, or a failed read: halt candidate X-COUSR03C-H1 leaves only the store effect
+            // assertable, so the answer is checked to be no success and no delete to have run.
+            let traces = trace_capture::capture();
+            for lock in [Ok(None), Err(PersistenceError::Unavailable)] {
+                let mut store = Scripted::answering(lock, Ok(true));
+                let outcome = delete_held(&mut store, &key("NOBODY01")?).await;
+                assert!(outcome.is_err());
+                assert_eq!(store.locked.len(), 1);
+                assert!(store.deleted.is_empty());
+            }
+            assert!(traces.contains("READ-USER-SEC-FILE"));
+            Ok(())
+        })
     }
 
     // audit: COUSR03C-016
@@ -409,67 +436,71 @@ mod tests {
     // audit: COUSR03C-019
     // audit: COUSR03C-020
     // audit: COUSR03C-024
-    #[tokio::test]
-    async fn the_delete_removes_only_the_named_row() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        for id in ["USER0001", "ADMIN001", "AB CD"] {
-            UserRepository::insert(&mut store, &entry(id)?).await?;
-        }
-        let state = app_state(store.clone());
-        let admin = admin()?;
+    #[test]
+    fn the_delete_removes_only_the_named_row() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            for id in ["USER0001", "ADMIN001", "AB CD"] {
+                UserRepository::insert(&mut store, &entry(id)?).await?;
+            }
+            let state = app_state(store.clone());
+            let admin = admin()?;
 
-        // A blank ID is refused before any read, and nothing changes.
-        let blank = delete(&state, &admin, "        ").await;
-        assert_eq!(shown(&blank), Some(USER_ID_EMPTY));
+            // A blank ID is refused before any read, and nothing changes.
+            let blank = delete(&state, &admin, "        ").await;
+            assert_eq!(shown(&blank), Some(USER_ID_EMPTY));
 
-        let message = delete(&state, &admin, "USER0001")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(message, "User USER0001 has been deleted ...");
-        assert!(stored(&store, "USER0001").await?.is_none());
-        assert!(stored(&store, "ADMIN001").await?.is_some());
+            let message = delete(&state, &admin, "USER0001")
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(message, "User USER0001 has been deleted ...");
+            assert!(stored(&store, "USER0001").await?.is_none());
+            assert!(stored(&store, "ADMIN001").await?.is_some());
 
-        let spaced = delete(&state, &admin, "AB CD")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(spaced, "User AB has been deleted ...");
-        assert!(stored(&store, "AB CD").await?.is_none());
+            let spaced = delete(&state, &admin, "AB CD")
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(spaced, "User AB has been deleted ...");
+            assert!(stored(&store, "AB CD").await?.is_none());
 
-        // No row has the key, the lower-case form of a stored ID included: only the store
-        // effect is asserted (halt candidate X-COUSR03C-H1), and the stored admin remains.
-        for missing in ["NOBODY01", "admin001", "USER0001"] {
-            assert!(delete(&state, &admin, missing).await.is_err(), "{missing}");
-        }
-        let kept = stored(&store, "ADMIN001").await?;
-        assert_eq!(
-            kept.map(|row| (row.id, row.fname, row.password_hash)),
-            Some((
-                PicX::from_text("ADMIN001")?,
-                PicX::from_text("LAWRENCE")?,
-                "unverified-test-hash".to_owned()
-            ))
-        );
+            // No row has the key, the lower-case form of a stored ID included: only the store
+            // effect is asserted (halt candidate X-COUSR03C-H1), and the stored admin remains.
+            for missing in ["NOBODY01", "admin001", "USER0001"] {
+                assert!(delete(&state, &admin, missing).await.is_err(), "{missing}");
+            }
+            let kept = stored(&store, "ADMIN001").await?;
+            assert_eq!(
+                kept.map(|row| (row.id, row.fname, row.password_hash)),
+                Some((
+                    PicX::from_text("ADMIN001")?,
+                    PicX::from_text("LAWRENCE")?,
+                    "unverified-test-hash".to_owned()
+                ))
+            );
 
-        // The caller may delete their own user: nothing compares the target with the token.
-        let own = delete(&state, &admin, "ADMIN001")
-            .await
-            .map_err(|error| error.to_string())?;
-        assert_eq!(own, "User ADMIN001 has been deleted ...");
-        assert!(stored(&store, "ADMIN001").await?.is_none());
-        Ok(())
+            // The caller may delete their own user: nothing compares the target with the token.
+            let own = delete(&state, &admin, "ADMIN001")
+                .await
+                .map_err(|error| error.to_string())?;
+            assert_eq!(own, "User ADMIN001 has been deleted ...");
+            assert!(stored(&store, "ADMIN001").await?.is_none());
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_transaction_that_cannot_begin_is_a_store_error() -> TestResult {
-        let guard = start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let state = app_state(store.clone());
-        store.pool().close().await;
-        assert_eq!(
-            delete(&state, &admin()?, "USER0001").await,
-            Err(ServiceError::Store(PersistenceError::Unavailable))
-        );
-        Ok(())
+    #[test]
+    fn a_transaction_that_cannot_begin_is_a_store_error() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let state = app_state(store.clone());
+            store.pool().close().await;
+            assert_eq!(
+                delete(&state, &admin()?, "USER0001").await,
+                Err(ServiceError::Store(PersistenceError::Unavailable))
+            );
+            Ok(())
+        })
     }
 }

@@ -181,7 +181,11 @@ use persistence::{
     AccountRepository, CardXrefRepository, Dataset, DisclosureGroupRepository, PersistenceError,
     PgSession, PgStore, TranCatBalanceRepository,
 };
-use runtime::telemetry::JobCounter;
+use runtime::telemetry::{JobCounter, event_enabled};
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{self, FieldSet, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use super::{JobContext, JobError, JobOutcome, OutputFile, SYSTRAN_DIR_SETTING, count};
 use crate::cli::IntcalcArgs;
@@ -326,7 +330,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
     close_acctfile(session).await;
     // Every file is closed: the last line of the job log, which `main`'s path line follows
     // (CBACT04C-030).
-    tracing::info!("{END_LINE}");
+    show_info_line(END_LINE);
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
@@ -372,10 +376,13 @@ async fn open_acctfile(store: &PgStore) -> Result<PgSession, JobError> {
 /// naming the close and the error, and the run keeps its outcome.
 async fn close_acctfile(session: PgSession) {
     if let Err(error) = session.close().await {
-        tracing::warn!(
-            operation = CLOSE_ACCTFILE_OP,
-            error = %error,
-            "CBACT04C writer claim release failed; the closed session ends the claim"
+        emit(
+            &CLAIM_RELEASE_WARN,
+            [
+                &CLAIM_RELEASE_FAILED,
+                &CLOSE_ACCTFILE_OP,
+                &field::display(&error),
+            ],
         );
     }
 }
@@ -404,7 +411,7 @@ async fn post_interest<A: AccountRepository>(
     for balance in balances {
         // `DISPLAY TRAN-CAT-BAL-RECORD` follows the read and comes before the break and the
         // lookups, so a rewrite or lookup that abends follows it (CBACT04C-003).
-        tracing::info!("{}", record_line(balance));
+        show_info_line(&record_line(balance));
         let effects = match intcalc.process(balance, clock) {
             Ok(effects) => effects,
             Err(error) => {
@@ -481,13 +488,19 @@ fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -
 /// the error's text, which names an SQLSTATE, a constraint or a column only (Cardholder Data
 /// Redaction).
 fn report(operation: &'static str, error: &PersistenceError) {
-    tracing::error!(operation, error = %error, "CBACT04C database call failed");
+    emit(
+        &DATABASE_CALL_ERROR,
+        [&DATABASE_CALL_FAILED, &operation, &field::display(error)],
+    );
 }
 
 /// Reports why a local-file call failed: the file operation and the error's text, a static step
 /// and the I/O error kind, or the generation limit and the `SYSTRAN` base, never the path.
 fn report_file(operation: &'static str, error: &JobError) {
-    tracing::error!(operation, error = %error, "CBACT04C file operation failed");
+    emit(
+        &FILE_OPERATION_ERROR,
+        [&FILE_OPERATION_FAILED, &operation, &field::display(error)],
+    );
 }
 
 /// `9999-ABEND-PROGRAM` after the failure line `line` and the status line of `status`, as
@@ -506,7 +519,7 @@ fn abend(line: &'static str, status: Status) -> JobError {
 /// CBACT04C-002). [`run`] shows it first, and `main` shows it before its connection event when
 /// it cannot connect, as the connection is the first open (CBACT04C-034).
 pub(crate) fn show_start() {
-    tracing::info!("{START_LINE}");
+    show_info_line(START_LINE);
 }
 
 /// The job log of the first open's failure when `main` cannot connect to `PostgreSQL`, the
@@ -534,16 +547,16 @@ fn record_line(balance: &TranCatBalanceRecord) -> String {
 /// that finds no `DEFAULT` record either shows them as `ERROR` events through [`lookup_abend`]
 /// (CBACT04C-011), never here.
 fn show_default_fallback() {
-    tracing::info!("{DISCLOSURE_MISSING_LINE}");
-    tracing::info!("{TRY_DEFAULT_LINE}");
+    show_info_line(DISCLOSURE_MISSING_LINE);
+    show_info_line(TRY_DEFAULT_LINE);
 }
 
 /// The `DISPLAY` lines of a failure path: the failure line `line` and the status line of
 /// `status`, each an `ERROR` event whose message is the line (X-INTCALC-4; CBACT04C-036,
 /// CBACT04C-037), then `ABENDING PROGRAM` (CBACT04C-038).
 fn show_abend(line: &'static str, status: Status) {
-    tracing::error!("{line}");
-    tracing::error!("{}", file_status_line(status.code()));
+    show_error_line(line);
+    show_error_line(&file_status_line(status.code()));
     abending_program();
 }
 
@@ -551,7 +564,7 @@ fn show_abend(line: &'static str, status: Status) {
 /// whose field `abend_code` records `ABCODE`, 999 (`CBACT04C.cbl:628-632`; CBACT04C-038,
 /// X-INTCALC-3).
 fn abending_program() {
-    tracing::error!(abend_code = ABEND_CODE, "{ABEND_LINE}");
+    emit(&ABEND_ERROR, [&ABEND_LINE, &ABEND_CODE]);
 }
 
 /// A lookup abend the domain returns: each line `CBACT04C` displays for it, in order and as
@@ -563,11 +576,152 @@ fn lookup_abend(error: IntcalcError) -> JobError {
         if line == ABEND_LINE {
             abending_program();
         } else {
-            tracing::error!("{line}");
+            show_error_line(&line);
         }
     }
     JobError::Intcalc(error)
 }
+
+/// Shows `line` as one `INFO` event of the job log whose message is the line (X-INTCALC-4).
+fn show_info_line(line: &str) {
+    emit(&JOB_LOG_INFO, [&line]);
+}
+
+/// Shows `line` as one `ERROR` event of the job log whose message is the line (X-INTCALC-4).
+fn show_error_line(line: &str) {
+    emit(&JOB_LOG_ERROR, [&line]);
+}
+
+/// The name of the job-log callsites, whose events carry a displayed line as their message.
+const JOB_LOG: &str = "CBACT04C job log";
+
+/// The fields of a job-log line: its message, the line.
+const JOB_LOG_FIELDS: &[&str; 1] = &["message"];
+
+/// The fields of `ABENDING PROGRAM`: its message, the line, and the abend code.
+const ABEND_FIELDS: &[&str; 2] = &["message", "abend_code"];
+
+/// The fields of an event that reports a failed call: its message, the file operation the call
+/// replaces and the error's text.
+const FAILURE_FIELDS: &[&str; 3] = &["message", "operation", "error"];
+
+/// The message of the warning of a session close that failed, in [`close_acctfile`].
+const CLAIM_RELEASE_FAILED: &str =
+    "CBACT04C writer claim release failed; the closed session ends the claim";
+
+/// The message of the event of a failed repository call, in [`report`].
+const DATABASE_CALL_FAILED: &str = "CBACT04C database call failed";
+
+/// The message of the event of a failed local-file call, in [`report_file`].
+const FILE_OPERATION_FAILED: &str = "CBACT04C file operation failed";
+
+/// The callsite of one event of this job, whose metadata names `N` fields, `message` first.
+///
+/// [`event_metadata`] and [`emit`] take the same `N`, so an event always carries exactly one
+/// value per field it declares.
+struct EventSite<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> EventSite<N> {
+    /// The callsite of the event that `metadata` describes.
+    const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the event `name` at `level`, with the field `names`, for the callsite `site`.
+///
+/// The target and the module path are this module's path, the target a `tracing` macro gives an
+/// event here, so `RUST_LOG` directives select the event exactly as they would select a macro's.
+/// No source file or line is given: the JSON output and the span export print neither.
+const fn event_metadata<const N: usize>(
+    name: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        module_path!(),
+        level,
+        None,
+        None,
+        Some(module_path!()),
+        FieldSet::new(names, Identifier(&site.0)),
+        Kind::EVENT,
+    )
+}
+
+/// Emits one event of `site` in the current span with `values`, one per field the site names
+/// and in that order, when the current subscriber enables it.
+///
+/// The decision is `runtime::telemetry::event_enabled`, which takes the steps an event macro
+/// takes, so the level filters, the JSON layer and the span export treat the event exactly as
+/// they treat a macro's.
+fn emit<const N: usize>(site: &'static EventSite<N>, values: [&dyn Value; N]) {
+    let callsite = &site.0;
+    if !event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    let values = values.map(Some);
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+}
+
+// Written out: the `tracing` event macros, `info!`, `warn!` and `error!`, expand to an
+// `allow(unused_imports)` lint suppression.
+/// The `INFO` callsite of a job-log line.
+static JOB_LOG_INFO: EventSite<1> = EventSite::new(&JOB_LOG_INFO_METADATA);
+
+/// The metadata of [`JOB_LOG_INFO`].
+static JOB_LOG_INFO_METADATA: Metadata<'static> =
+    event_metadata(JOB_LOG, Level::INFO, JOB_LOG_FIELDS, &JOB_LOG_INFO);
+
+/// The `ERROR` callsite of a job-log line of a failure path.
+static JOB_LOG_ERROR: EventSite<1> = EventSite::new(&JOB_LOG_ERROR_METADATA);
+
+/// The metadata of [`JOB_LOG_ERROR`].
+static JOB_LOG_ERROR_METADATA: Metadata<'static> =
+    event_metadata(JOB_LOG, Level::ERROR, JOB_LOG_FIELDS, &JOB_LOG_ERROR);
+
+/// The `ERROR` callsite of `ABENDING PROGRAM` and its abend code, in [`abending_program`].
+static ABEND_ERROR: EventSite<2> = EventSite::new(&ABEND_ERROR_METADATA);
+
+/// The metadata of [`ABEND_ERROR`].
+static ABEND_ERROR_METADATA: Metadata<'static> =
+    event_metadata(ABEND_LINE, Level::ERROR, ABEND_FIELDS, &ABEND_ERROR);
+
+/// The `WARN` callsite of a session close that failed, in [`close_acctfile`].
+static CLAIM_RELEASE_WARN: EventSite<3> = EventSite::new(&CLAIM_RELEASE_WARN_METADATA);
+
+/// The metadata of [`CLAIM_RELEASE_WARN`].
+static CLAIM_RELEASE_WARN_METADATA: Metadata<'static> = event_metadata(
+    CLAIM_RELEASE_FAILED,
+    Level::WARN,
+    FAILURE_FIELDS,
+    &CLAIM_RELEASE_WARN,
+);
+
+/// The `ERROR` callsite of a failed repository call, in [`report`].
+static DATABASE_CALL_ERROR: EventSite<3> = EventSite::new(&DATABASE_CALL_ERROR_METADATA);
+
+/// The metadata of [`DATABASE_CALL_ERROR`].
+static DATABASE_CALL_ERROR_METADATA: Metadata<'static> = event_metadata(
+    DATABASE_CALL_FAILED,
+    Level::ERROR,
+    FAILURE_FIELDS,
+    &DATABASE_CALL_ERROR,
+);
+
+/// The `ERROR` callsite of a failed local-file call, in [`report_file`].
+static FILE_OPERATION_ERROR: EventSite<3> = EventSite::new(&FILE_OPERATION_ERROR_METADATA);
+
+/// The metadata of [`FILE_OPERATION_ERROR`].
+static FILE_OPERATION_ERROR_METADATA: Metadata<'static> = event_metadata(
+    FILE_OPERATION_FAILED,
+    Level::ERROR,
+    FAILURE_FIELDS,
+    &FILE_OPERATION_ERROR,
+);
 
 #[cfg(test)]
 mod tests {
@@ -575,8 +729,10 @@ mod tests {
     use std::collections::btree_map::Entry;
     use std::error::Error;
     use std::fs;
+    use std::future::poll_fn;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::task::Poll;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use chrono::{NaiveDate, Timelike};
@@ -924,6 +1080,50 @@ mod tests {
                 })
     }
 
+    /// Runs `test` to completion on a current-thread runtime with I/O and time enabled, the
+    /// runtime tokio's test attribute builds, without the lint attributes that attribute's
+    /// expansion carries. The test runs on the calling thread, so a trace capture the test
+    /// starts sees every event of it.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
+    /// Drives `first` and `second` together on the calling task until both have finished and
+    /// returns their outputs in that order. Every wake polls each future not yet finished and
+    /// never a finished one again, so neither waits for the other to end, as tokio's join macro
+    /// drives its futures, without the pinning and lint attributes that macro's expansion
+    /// carries.
+    async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+        let mut first = Box::pin(first);
+        let mut second = Box::pin(second);
+        let mut first_output = None;
+        let mut second_output = None;
+        poll_fn(|cx| {
+            if first_output.is_none() {
+                if let Poll::Ready(output) = first.as_mut().poll(cx) {
+                    first_output = Some(output);
+                }
+            }
+            if second_output.is_none() {
+                if let Poll::Ready(output) = second.as_mut().poll(cx) {
+                    second_output = Some(output);
+                }
+            }
+            match (first_output.take(), second_output.take()) {
+                (Some(first), Some(second)) => Poll::Ready((first, second)),
+                (first, second) => {
+                    first_output = first;
+                    second_output = second;
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     /// Account 1 is rewritten at the break of account 2 with its interest added and both cycle
     /// fields zeroed; account 2, the last in key order, keeps every field (E08), while the
     /// records of both are written in key order with consecutive suffixes.
@@ -931,64 +1131,66 @@ mod tests {
     // audit: CBACT04C-026
     // audit: CBACT04C-027
     // audit: FIXINT-903
-    #[tokio::test]
-    async fn every_account_but_the_last_is_rewritten() -> TestResult {
-        let scratch = Scratch::new()?;
-        let before = [account(1, 10_000)?, account(2, 20_000)?];
-        let mut ledger = Ledger::holding(&before, false);
-        let mut run = intcalc()?;
-        let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
-        let balances = [balance(1, 120_000)?, balance(2, 240_000)?];
-        let rewritten =
-            post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran).await?;
-        let summary = run.finish();
-        let path = systran.finish().await?;
+    #[test]
+    fn every_account_but_the_last_is_rewritten() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let before = [account(1, 10_000)?, account(2, 20_000)?];
+            let mut ledger = Ledger::holding(&before, false);
+            let mut run = intcalc()?;
+            let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
+            let balances = [balance(1, 120_000)?, balance(2, 240_000)?];
+            let rewritten =
+                post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran).await?;
+            let summary = run.finish();
+            let path = systran.finish().await?;
 
-        assert_eq!(rewritten, 1);
-        assert_eq!(ledger.rewrites, [PicU::new(1)?]);
-        let first = ledger.rows.get(&PicU::new(1)?).ok_or("account 1 is held")?;
-        // 100.00 and the 15.00 of (1200.00 * 15.00) / 1200 (ARITH-001, ARITH-013).
-        assert_eq!(first.curr_bal, money::<10>(11_500)?);
-        assert_eq!(first.curr_cyc_credit, Money::<10>::ZERO);
-        assert_eq!(first.curr_cyc_debit, Money::<10>::ZERO);
-        assert_eq!(ledger.rows.get(&PicU::new(2)?), before.get(1));
-        assert_eq!(summary.records_read(), 2);
-        assert_eq!(summary.transactions_written(), 2);
-        assert_eq!(summary.unapplied_last_account(), Some(PicU::new(2)?));
+            assert_eq!(rewritten, 1);
+            assert_eq!(ledger.rewrites, [PicU::new(1)?]);
+            let first = ledger.rows.get(&PicU::new(1)?).ok_or("account 1 is held")?;
+            // 100.00 and the 15.00 of (1200.00 * 15.00) / 1200 (ARITH-001, ARITH-013).
+            assert_eq!(first.curr_bal, money::<10>(11_500)?);
+            assert_eq!(first.curr_cyc_credit, Money::<10>::ZERO);
+            assert_eq!(first.curr_cyc_debit, Money::<10>::ZERO);
+            assert_eq!(ledger.rows.get(&PicU::new(2)?), before.get(1));
+            assert_eq!(summary.records_read(), 2);
+            assert_eq!(summary.transactions_written(), 2);
+            assert_eq!(summary.unapplied_last_account(), Some(PicU::new(2)?));
 
-        assert_eq!(path, scratch.path().join("SYSTRAN.G0001"));
-        let bytes = fs::read(&path)?;
-        let records = systran_records(&bytes)?;
-        let expected = [
-            ("2022071800000001", 1, 1_500),
-            ("2022071800000002", 2, 3_000),
-        ];
-        assert_eq!(records.len(), expected.len());
-        for (raw, (id, owner, cents)) in records.into_iter().zip(expected) {
-            let record = TransactionRecord::decode(raw)?;
-            assert_eq!(record.id, PicX::from_text(id)?, "{id}");
-            assert_eq!(record.amt, money::<9>(cents)?, "{id}");
-            assert!(record.card_num == card(owner), "{id}: card number");
-            // Time fields are compared by format only (AAP 0.5.6): one clock reading, in layout
-            // `D` and cut to hundredths, fills both fields (CBACT04C-022).
-            let orig_text = raw.get(278..304).ok_or("TRAN-ORIG-TS is in the record")?;
-            let proc_text = raw.get(304..330).ok_or("TRAN-PROC-TS is in the record")?;
-            assert!(is_db2_hundredths(orig_text), "{id}: TRAN-ORIG-TS");
-            assert!(is_db2_hundredths(proc_text), "{id}: TRAN-PROC-TS");
-            assert_eq!(orig_text, proc_text, "{id}: one reading for both fields");
-            assert_eq!(
-                record.orig_ts, record.proc_ts,
-                "{id}: one reading for both fields"
-            );
-            let stamp = record.orig_ts.value().ok_or("TRAN-ORIG-TS is not blank")?;
-            assert_eq!(stamp.form(), TsForm::Db2, "{id}: layout D");
-            assert_eq!(
-                stamp.value().nanosecond() % NANOS_PER_HUNDREDTH,
-                0,
-                "{id}: hundredths"
-            );
-        }
-        Ok(())
+            assert_eq!(path, scratch.path().join("SYSTRAN.G0001"));
+            let bytes = fs::read(&path)?;
+            let records = systran_records(&bytes)?;
+            let expected = [
+                ("2022071800000001", 1, 1_500),
+                ("2022071800000002", 2, 3_000),
+            ];
+            assert_eq!(records.len(), expected.len());
+            for (raw, (id, owner, cents)) in records.into_iter().zip(expected) {
+                let record = TransactionRecord::decode(raw)?;
+                assert_eq!(record.id, PicX::from_text(id)?, "{id}");
+                assert_eq!(record.amt, money::<9>(cents)?, "{id}");
+                assert!(record.card_num == card(owner), "{id}: card number");
+                // Time fields are compared by format only (AAP 0.5.6): one clock reading, in layout
+                // `D` and cut to hundredths, fills both fields (CBACT04C-022).
+                let orig_text = raw.get(278..304).ok_or("TRAN-ORIG-TS is in the record")?;
+                let proc_text = raw.get(304..330).ok_or("TRAN-PROC-TS is in the record")?;
+                assert!(is_db2_hundredths(orig_text), "{id}: TRAN-ORIG-TS");
+                assert!(is_db2_hundredths(proc_text), "{id}: TRAN-PROC-TS");
+                assert_eq!(orig_text, proc_text, "{id}: one reading for both fields");
+                assert_eq!(
+                    record.orig_ts, record.proc_ts,
+                    "{id}: one reading for both fields"
+                );
+                let stamp = record.orig_ts.value().ok_or("TRAN-ORIG-TS is not blank")?;
+                assert_eq!(stamp.form(), TsForm::Db2, "{id}: layout D");
+                assert_eq!(
+                    stamp.value().nanosecond() % NANOS_PER_HUNDREDTH,
+                    0,
+                    "{id}: hundredths"
+                );
+            }
+            Ok(())
+        })
     }
 
     /// How an abending run must end.
@@ -1020,6 +1222,54 @@ mod tests {
         "ERROR RE-WRITING ACCOUNT FILE",
         "FILE STATUS IS: NNNN0023",
         "ABENDING PROGRAM",
+    ];
+
+    /// The abending runs of [`abends_keep_the_rewrites_made_before_them`]: a rewrite that finds
+    /// no row, a rewrite that fails as a statement, a lookup that finds no account after a
+    /// rewrite stands, and a rewrite that finds no row before a lookup that would find none.
+    const ABENDS: [Case; 4] = [
+        Case {
+            held: &[2],
+            failing: false,
+            keys: [1, 2],
+            ends: Ends::RewriteNotFound,
+            kept: &[],
+            log: REWRITE_NOT_FOUND_LOG,
+        },
+        Case {
+            held: &[1, 2],
+            failing: true,
+            keys: [1, 2],
+            ends: Ends::StoreFailure,
+            kept: &[],
+            log: &[
+                "CBACT04C database call failed",
+                "ERROR RE-WRITING ACCOUNT FILE",
+                "FILE STATUS IS: NNNN0030",
+                "ABENDING PROGRAM",
+            ],
+        },
+        Case {
+            held: &[1, 2],
+            failing: false,
+            keys: [1, 3],
+            ends: Ends::AccountNotFound,
+            kept: &[1],
+            log: &[
+                "ACCOUNT NOT FOUND: 00000000003",
+                "ERROR READING ACCOUNT FILE",
+                "FILE STATUS IS: NNNN0023",
+                "ABENDING PROGRAM",
+            ],
+        },
+        Case {
+            held: &[2],
+            failing: false,
+            keys: [1, 3],
+            ends: Ends::RewriteNotFound,
+            kept: &[],
+            log: REWRITE_NOT_FOUND_LOG,
+        },
     ];
 
     /// `TRAN-CAT-BAL PIC S9(09)V99` of [`balance`]`(_, 120_000)`, 1200.00, as its record line
@@ -1073,108 +1323,67 @@ mod tests {
     // audit: CBACT04C-032
     // audit: CBACT04C-036
     // audit: CBACT04C-038
-    #[tokio::test]
-    async fn abends_keep_the_rewrites_made_before_them() -> TestResult {
-        let cases = [
-            Case {
-                held: &[2],
-                failing: false,
-                keys: [1, 2],
-                ends: Ends::RewriteNotFound,
-                kept: &[],
-                log: REWRITE_NOT_FOUND_LOG,
-            },
-            Case {
-                held: &[1, 2],
-                failing: true,
-                keys: [1, 2],
-                ends: Ends::StoreFailure,
-                kept: &[],
-                log: &[
-                    "CBACT04C database call failed",
-                    "ERROR RE-WRITING ACCOUNT FILE",
-                    "FILE STATUS IS: NNNN0030",
-                    "ABENDING PROGRAM",
-                ],
-            },
-            Case {
-                held: &[1, 2],
-                failing: false,
-                keys: [1, 3],
-                ends: Ends::AccountNotFound,
-                kept: &[1],
-                log: &[
-                    "ACCOUNT NOT FOUND: 00000000003",
-                    "ERROR READING ACCOUNT FILE",
-                    "FILE STATUS IS: NNNN0023",
-                    "ABENDING PROGRAM",
-                ],
-            },
-            Case {
-                held: &[2],
-                failing: false,
-                keys: [1, 3],
-                ends: Ends::RewriteNotFound,
-                kept: &[],
-                log: REWRITE_NOT_FOUND_LOG,
-            },
-        ];
-        for Case {
-            held,
-            failing,
-            keys,
-            ends,
-            kept,
-            log,
-        } in cases
-        {
-            let scratch = Scratch::new()?;
-            let accounts = held
-                .iter()
-                .map(|&id| account(id, 10_000))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut ledger = Ledger::holding(&accounts, failing);
-            let mut run = intcalc()?;
-            let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
-            let balances = keys
-                .into_iter()
-                .map(|id| balance(id, 120_000))
-                .collect::<Result<Vec<_>, _>>()?;
-            let capture = trace_capture::capture();
-            let error = post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran)
-                .await
-                .err()
-                .ok_or("the run abends")?;
-            let matched = match ends {
-                Ends::RewriteNotFound | Ends::StoreFailure => matches!(
-                    &error,
-                    JobError::Abend { code: None, reason } if *reason == REWRITE_ACCOUNT_ERROR
-                ),
-                Ends::AccountNotFound => matches!(
-                    &error,
-                    JobError::Intcalc(IntcalcError::AccountNotFound { .. })
-                ),
-            };
-            assert!(matched, "{ends:?} ended with {error}");
-            assert_eq!(messages(&capture), abend_log(keys, log), "{ends:?}");
-            assert!(
-                capture.lines().iter().any(|line| {
-                    line.contains(r#""message":"ABENDING PROGRAM""#)
-                        && line.contains(r#""abend_code":999"#)
-                        && line.contains(r#""level":"ERROR""#)
-                }),
-                "{ends:?}: no ERROR event `ABENDING PROGRAM` records abend code 999"
-            );
-            drop(capture);
-            let kept = kept
-                .iter()
-                .map(|&id| PicU::new(id))
-                .collect::<Result<Vec<PicU<11>>, _>>()?;
-            assert_eq!(ledger.rewrites, kept, "{ends:?}");
-            drop(systran);
-            assert_eq!(fs::read_dir(scratch.path())?.count(), 0, "{ends:?}");
-        }
-        Ok(())
+    #[test]
+    fn abends_keep_the_rewrites_made_before_them() -> TestResult {
+        block_on(async {
+            for Case {
+                held,
+                failing,
+                keys,
+                ends,
+                kept,
+                log,
+            } in ABENDS
+            {
+                let scratch = Scratch::new()?;
+                let accounts = held
+                    .iter()
+                    .map(|&id| account(id, 10_000))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut ledger = Ledger::holding(&accounts, failing);
+                let mut run = intcalc()?;
+                let mut systran = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
+                let balances = keys
+                    .into_iter()
+                    .map(|id| balance(id, 120_000))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let capture = trace_capture::capture();
+                let error =
+                    post_interest(&mut run, &balances, &clock()?, &mut ledger, &mut systran)
+                        .await
+                        .err()
+                        .ok_or("the run abends")?;
+                let matched = match ends {
+                    Ends::RewriteNotFound | Ends::StoreFailure => matches!(
+                        &error,
+                        JobError::Abend { code: None, reason } if *reason == REWRITE_ACCOUNT_ERROR
+                    ),
+                    Ends::AccountNotFound => matches!(
+                        &error,
+                        JobError::Intcalc(IntcalcError::AccountNotFound { .. })
+                    ),
+                };
+                assert!(matched, "{ends:?} ended with {error}");
+                assert_eq!(messages(&capture), abend_log(keys, log), "{ends:?}");
+                assert!(
+                    capture.lines().iter().any(|line| {
+                        line.contains(r#""message":"ABENDING PROGRAM""#)
+                            && line.contains(r#""abend_code":999"#)
+                            && line.contains(r#""level":"ERROR""#)
+                    }),
+                    "{ends:?}: no ERROR event `ABENDING PROGRAM` records abend code 999"
+                );
+                drop(capture);
+                let kept = kept
+                    .iter()
+                    .map(|&id| PicU::new(id))
+                    .collect::<Result<Vec<PicU<11>>, _>>()?;
+                assert_eq!(ledger.rewrites, kept, "{ends:?}");
+                drop(systran);
+                assert_eq!(fs::read_dir(scratch.path())?.count(), 0, "{ends:?}");
+            }
+            Ok(())
+        })
     }
 
     /// While another run holds the claim on `accounts`, the `OPEN I-O` of the account file
@@ -1184,66 +1393,68 @@ mod tests {
     // audit: CBACT04C-034
     // audit: CBACT04C-038
     // audit: CBACT04C-039
-    #[tokio::test]
-    async fn an_account_file_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
-        let scratch = Scratch::new()?;
-        let guard = posted_database(&scratch.path().join("posttran")).await?;
-        let store = PgStore::new(guard.pool().clone());
-        let config = var_config(scratch.path())?;
-        let clock = clock()?;
-        let ctx = JobContext {
-            store: &store,
-            config: &config,
-            clock: &clock,
-        };
-        let args = IntcalcArgs {
-            parm_date: ParmDate::DEFAULT,
-        };
-        let before = accounts(&store).await?;
+    #[test]
+    fn an_account_file_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let guard = posted_database(&scratch.path().join("posttran")).await?;
+            let store = PgStore::new(guard.pool().clone());
+            let config = var_config(scratch.path())?;
+            let clock = clock()?;
+            let ctx = JobContext {
+                store: &store,
+                config: &config,
+                clock: &clock,
+            };
+            let args = IntcalcArgs {
+                parm_date: ParmDate::DEFAULT,
+            };
+            let before = accounts(&store).await?;
 
-        let mut held = store.session().await?;
-        assert!(
-            held.claim_writer(Dataset::Accounts).await?,
-            "the test claims the free account file"
-        );
-        let error = run(&ctx, &args)
-            .await
-            .err()
-            .ok_or("a run passed an account file another run holds")?;
-        assert!(
-            matches!(&error, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
-            "{error}"
-        );
-        assert_eq!(error.exit_code(), None);
-        assert_eq!(
-            error.to_string(),
-            "ABEND: ERROR OPENING ACCOUNT MASTER FILE"
-        );
-        assert!(
-            accounts(&store).await? == before,
-            "a refused run rewrote an account"
-        );
-        assert!(file_names(&config.systran_dir())?.is_empty());
-        held.close().await?;
+            let mut held = store.session().await?;
+            assert!(
+                held.claim_writer(Dataset::Accounts).await?,
+                "the test claims the free account file"
+            );
+            let error = run(&ctx, &args)
+                .await
+                .err()
+                .ok_or("a run passed an account file another run holds")?;
+            assert!(
+                matches!(&error, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
+                "{error}"
+            );
+            assert_eq!(error.exit_code(), None);
+            assert_eq!(
+                error.to_string(),
+                "ABEND: ERROR OPENING ACCOUNT MASTER FILE"
+            );
+            assert!(
+                accounts(&store).await? == before,
+                "a refused run rewrote an account"
+            );
+            assert!(file_names(&config.systran_dir())?.is_empty());
+            held.close().await?;
 
-        let once = after_one_run(&store, &scratch.path().join("expected")).await?;
-        let outcome = run(&ctx, &args).await?;
-        assert_eq!(outcome.return_code, 0);
-        assert_eq!(
-            outcome.written,
-            [config.systran_dir().join("SYSTRAN.G0001")]
-        );
-        assert!(
-            accounts(&store).await? == once,
-            "the accounts differ from one run's interest"
-        );
-        let mut free = store.session().await?;
-        assert!(
-            free.claim_writer(Dataset::Accounts).await?,
-            "a finished run still holds the account file"
-        );
-        free.close().await?;
-        Ok(())
+            let once = after_one_run(&store, &scratch.path().join("expected")).await?;
+            let outcome = run(&ctx, &args).await?;
+            assert_eq!(outcome.return_code, 0);
+            assert_eq!(
+                outcome.written,
+                [config.systran_dir().join("SYSTRAN.G0001")]
+            );
+            assert!(
+                accounts(&store).await? == once,
+                "the accounts differ from one run's interest"
+            );
+            let mut free = store.session().await?;
+            assert!(
+                free.claim_writer(Dataset::Accounts).await?,
+                "a finished run still holds the account file"
+            );
+            free.close().await?;
+            Ok(())
+        })
     }
 
     /// Two runs started together over the same database: one claims the account file and posts
@@ -1251,46 +1462,48 @@ mod tests {
     /// holds what one run leaves, as the in-memory table computes it over the same tables, and
     /// one generation exists.
     // audit: CBACT04C-039
-    #[tokio::test]
-    async fn of_two_runs_at_once_one_posts_interest_and_the_other_is_refused() -> TestResult {
-        let scratch = Scratch::new()?;
-        let guard = posted_database(&scratch.path().join("posttran")).await?;
-        let store = PgStore::new(guard.pool().clone());
-        let config = var_config(scratch.path())?;
-        let clock = clock()?;
-        let ctx = JobContext {
-            store: &store,
-            config: &config,
-            clock: &clock,
-        };
-        let args = IntcalcArgs {
-            parm_date: ParmDate::DEFAULT,
-        };
-        let once = after_one_run(&store, &scratch.path().join("expected")).await?;
+    #[test]
+    fn of_two_runs_at_once_one_posts_interest_and_the_other_is_refused() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let guard = posted_database(&scratch.path().join("posttran")).await?;
+            let store = PgStore::new(guard.pool().clone());
+            let config = var_config(scratch.path())?;
+            let clock = clock()?;
+            let ctx = JobContext {
+                store: &store,
+                config: &config,
+                clock: &clock,
+            };
+            let args = IntcalcArgs {
+                parm_date: ParmDate::DEFAULT,
+            };
+            let once = after_one_run(&store, &scratch.path().join("expected")).await?;
 
-        let (first, second) = tokio::join!(run(&ctx, &args), run(&ctx, &args));
-        let (posted, refused) = match (first, second) {
-            (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
-            (first, second) => {
-                return Err(format!(
-                    "one run must post and one be refused: {:?}, {:?}",
-                    first.map(|outcome| outcome.return_code),
-                    second.map(|outcome| outcome.return_code)
-                )
-                .into());
-            }
-        };
-        assert_eq!(posted.return_code, 0);
-        assert_eq!(posted.written, [config.systran_dir().join("SYSTRAN.G0001")]);
-        assert!(
-            matches!(&refused, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
-            "{refused}"
-        );
-        assert_eq!(file_names(&config.systran_dir())?, ["SYSTRAN.G0001"]);
-        assert!(
-            accounts(&store).await? == once,
-            "the accounts differ from one run's interest"
-        );
-        Ok(())
+            let (first, second) = join(run(&ctx, &args), run(&ctx, &args)).await;
+            let (posted, refused) = match (first, second) {
+                (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
+                (first, second) => {
+                    return Err(format!(
+                        "one run must post and one be refused: {:?}, {:?}",
+                        first.map(|outcome| outcome.return_code),
+                        second.map(|outcome| outcome.return_code)
+                    )
+                    .into());
+                }
+            };
+            assert_eq!(posted.return_code, 0);
+            assert_eq!(posted.written, [config.systran_dir().join("SYSTRAN.G0001")]);
+            assert!(
+                matches!(&refused, JobError::Abend { code: None, reason } if *reason == OPEN_ACCOUNT_ERROR),
+                "{refused}"
+            );
+            assert_eq!(file_names(&config.systran_dir())?, ["SYSTRAN.G0001"]);
+            assert!(
+                accounts(&store).await? == once,
+                "the accounts differ from one run's interest"
+            );
+            Ok(())
+        })
     }
 }

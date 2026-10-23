@@ -198,6 +198,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The first cross-reference record's card number (`cardxref.txt:1`).
     const CARD: &str = "0500024453765740";
 
@@ -284,104 +293,112 @@ mod tests {
     // audit: COPAUA0C-110
     // audit: CCPAUERY-011
     // audit: CCPAUERY-012
-    #[tokio::test]
-    async fn inserts_get_increasing_ids_and_read_back_verbatim_in_write_order() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        assert_eq!(store.find_all().await?, Vec::new());
+    #[test]
+    fn inserts_get_increasing_ids_and_read_back_verbatim_in_write_order() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            assert_eq!(store.find_all().await?, Vec::new());
 
-        let mut written: Vec<(i64, ErrorLogRecord)> = Vec::new();
-        for record in log_records()? {
-            let id = store.insert(&record).await?;
-            if let Some((previous, _)) = written.last() {
-                assert!(id > *previous, "id {id} after {previous}");
+            let mut written: Vec<(i64, ErrorLogRecord)> = Vec::new();
+            for record in log_records()? {
+                let id = store.insert(&record).await?;
+                if let Some((previous, _)) = written.last() {
+                    assert!(id > *previous, "id {id} after {previous}");
+                }
+                written.push((id, record));
             }
-            written.push((id, record));
-        }
-        let read = store.find_all().await?;
-        assert_eq!(read, written);
+            let read = store.find_all().await?;
+            assert_eq!(read, written);
 
-        // A card-number key is stored only as the redacted form it arrived in.
-        let keys: Vec<&[u8; 20]> = read
-            .iter()
-            .map(|(_, row)| row.event_key.as_bytes())
-            .collect();
-        assert_eq!(
-            keys,
-            [&CARD_KEY, &CARD_KEY, &CARD_KEY, b"00000000050         "]
-        );
-        for (_, row) in &read {
-            assert!(!row.event_key.to_text().contains(CARD));
-        }
-        Ok(())
+            // A card-number key is stored only as the redacted form it arrived in.
+            let keys: Vec<&[u8; 20]> = read
+                .iter()
+                .map(|(_, row)| row.event_key.as_bytes())
+                .collect();
+            assert_eq!(
+                keys,
+                [&CARD_KEY, &CARD_KEY, &CARD_KEY, b"00000000050         "]
+            );
+            for (_, row) in &read {
+                assert!(!row.event_key.to_text().contains(CARD));
+            }
+            Ok(())
+        })
     }
 
     // audit: COPAUA0C-110
     // audit: COPAUA0C-119
-    #[tokio::test]
-    async fn a_store_row_stands_when_a_concurrently_open_transaction_rolls_back() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let [m004, i003, i004, _] = log_records()?;
+    #[test]
+    fn a_store_row_stands_when_a_concurrently_open_transaction_rolls_back() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let [m004, i003, i004, _] = log_records()?;
 
-        // The authorization transaction is open when the worker logs through the store.
-        let mut tx = store.begin().await?;
-        let in_tx = tx.insert(&i003).await?;
-        let own = store.insert(&m004).await?;
-        assert!(own > in_tx);
-        assert_eq!(
-            tx.find_all().await?,
-            [(in_tx, i003.clone()), (own, m004.clone())]
-        );
-        assert_eq!(store.find_all().await?, [(own, m004.clone())]);
+            // The authorization transaction is open when the worker logs through the store.
+            let mut tx = store.begin().await?;
+            let in_tx = tx.insert(&i003).await?;
+            let own = store.insert(&m004).await?;
+            assert!(own > in_tx);
+            assert_eq!(
+                tx.find_all().await?,
+                [(in_tx, i003.clone()), (own, m004.clone())]
+            );
+            assert_eq!(store.find_all().await?, [(own, m004.clone())]);
 
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, [(own, m004.clone())]);
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, [(own, m004.clone())]);
 
-        // A committed transaction keeps its row, and the sequence never goes back: the id
-        // the rolled-back insert took is not reused.
-        let mut tx = store.begin().await?;
-        let committed = tx.insert(&i004).await?;
-        tx.commit().await?;
-        assert!(committed > own);
-        assert_eq!(store.find_all().await?, [(own, m004), (committed, i004)]);
-        Ok(())
+            // A committed transaction keeps its row, and the sequence never goes back: the id
+            // the rolled-back insert took is not reused.
+            let mut tx = store.begin().await?;
+            let committed = tx.insert(&i004).await?;
+            tx.commit().await?;
+            assert!(committed > own);
+            assert_eq!(store.find_all().await?, [(own, m004), (committed, i004)]);
+            Ok(())
+        })
     }
 
     // audit: PIC-002
-    #[tokio::test]
-    async fn a_byte_no_char_column_stores_fails_before_any_statement() -> TestResult {
-        let mut store = unreachable_store();
-        let [m004, ..] = log_records()?;
-        let mut message = *m004.message.as_bytes();
-        if let Some(first) = message.first_mut() {
-            *first = 0xC3;
-        }
-        let invalid = ErrorLogRecord {
-            message: PicX::from_array(message),
-            ..m004
-        };
-        // Reaching the database would report it unavailable; the conversion fails first.
-        assert_eq!(
-            store.insert(&invalid).await,
-            Err(PersistenceError::decode(
-                "err_message",
-                DecodeKind::InvalidByte
-            ))
-        );
-        Ok(())
+    #[test]
+    fn a_byte_no_char_column_stores_fails_before_any_statement() -> TestResult {
+        block_on(async {
+            let mut store = unreachable_store();
+            let [m004, ..] = log_records()?;
+            let mut message = *m004.message.as_bytes();
+            if let Some(first) = message.first_mut() {
+                *first = 0xC3;
+            }
+            let invalid = ErrorLogRecord {
+                message: PicX::from_array(message),
+                ..m004
+            };
+            // Reaching the database would report it unavailable; the conversion fails first.
+            assert_eq!(
+                store.insert(&invalid).await,
+                Err(PersistenceError::decode(
+                    "err_message",
+                    DecodeKind::InvalidByte
+                ))
+            );
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_closed_pool_is_unavailable_to_both_methods() -> TestResult {
-        let mut store = unreachable_store();
-        store.pool().close().await;
-        let [m004, ..] = log_records()?;
-        assert_eq!(
-            store.insert(&m004).await,
-            Err(PersistenceError::Unavailable)
-        );
-        assert_eq!(store.find_all().await, Err(PersistenceError::Unavailable));
-        Ok(())
+    #[test]
+    fn a_closed_pool_is_unavailable_to_both_methods() -> TestResult {
+        block_on(async {
+            let mut store = unreachable_store();
+            store.pool().close().await;
+            let [m004, ..] = log_records()?;
+            assert_eq!(
+                store.insert(&m004).await,
+                Err(PersistenceError::Unavailable)
+            );
+            assert_eq!(store.find_all().await, Err(PersistenceError::Unavailable));
+            Ok(())
+        })
     }
 }

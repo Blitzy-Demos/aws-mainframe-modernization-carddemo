@@ -62,10 +62,10 @@ use domain::online::cosgn00c::{
 };
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
-use tracing::{Level, Metadata};
+use tracing::{Level, Metadata, field};
 
 use crate::app::{AppState, EventSite, PasswordWork, PasswordWorkError, emit, event_metadata};
-use crate::auth::jwt::JwtKeys;
+use crate::auth::jwt::{JwtError, JwtKeys};
 use crate::dto::cosgn00c::SignonRequest;
 use crate::error::ServiceError;
 
@@ -99,7 +99,7 @@ pub(crate) async fn signon(
         // Reported here, inside the request span, before the decision leaves the runtime
         // worker. `PersistenceError` displays an SQLSTATE and a constraint name at most, never a
         // bound value, so the event names neither the user ID nor the row.
-        tracing::error!(error = %error, "sign-on user read failed");
+        read_failed(error);
     }
     let signed_on = decided(&state.password_work, key, read)
         .await?
@@ -107,6 +107,26 @@ pub(crate) async fn signon(
         .map_err(ServiceError::Rule)?;
     let token = issue_token(&state.jwt, &signed_on)?;
     Ok((token, signed_on))
+}
+
+/// The `ERROR` event of a failed user read (`WHEN OTHER`, COSGN00C-020): the store's `error`
+/// alone, by its `Display`.
+fn read_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "read_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"sign-on user read failed"),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 /// `cosgn00c::decide` over the read's `UserLookup`, run on Tokio's blocking pool within `work`:
@@ -179,17 +199,38 @@ fn lookup(read: &Result<Option<UserEntry>, PersistenceError>) -> UserLookup<'_> 
 fn issue_token(jwt: &JwtKeys, signed_on: &SignedOn) -> Result<String, ServiceError<SignonFailure>> {
     jwt.issue(&signed_on.user_id, &signed_on.user_type)
         .map_err(|error| {
-            tracing::error!(error = %error, "sign-on token could not be issued");
+            token_not_issued(error);
             ServiceError::Internal
         })
+}
+
+/// The `ERROR` event of a token that could not be signed: the fixed text of the `JwtError`,
+/// never the claims or the key.
+fn token_not_issued(error: JwtError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "token_not_issued",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"sign-on token could not be issued"),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
+    use std::future::poll_fn;
     use std::path::PathBuf;
-    use std::pin::pin;
     use std::sync::Arc;
+    use std::task::Poll;
     use std::time::{Duration, Instant};
 
     use domain::SystemClock;
@@ -210,13 +251,56 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-    /// without the lint attributes that macro's expansion carries.
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
     fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(test)
+    }
+
+    /// Runs `first` and `second` at once and answers both outputs once both have finished, the
+    /// concurrent progress Tokio's join macro gives without the unchecked pinning and lint
+    /// attributes its expansion carries: each future is pinned on the heap with `Box::pin`, the
+    /// pin that needs no pinning macro, and every wake polls each one that has not yet finished.
+    async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+        let (mut first, mut second) = (Box::pin(first), Box::pin(second));
+        let (mut first_output, mut second_output) = (None, None);
+        poll_fn(|cx| {
+            if first_output.is_none() {
+                if let Poll::Ready(output) = first.as_mut().poll(cx) {
+                    first_output = Some(output);
+                }
+            }
+            if second_output.is_none() {
+                if let Poll::Ready(output) = second.as_mut().poll(cx) {
+                    second_output = Some(output);
+                }
+            }
+            match (first_output.take(), second_output.take()) {
+                (Some(from_first), Some(from_second)) => Poll::Ready((from_first, from_second)),
+                (from_first, from_second) => {
+                    first_output = from_first;
+                    second_output = from_second;
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
+    /// Runs four futures at once and answers their outputs in order once all have finished, as
+    /// a [`join`] of two [`join`]s: every wake still polls each future not yet finished.
+    async fn join4<A: Future, B: Future, C: Future, D: Future>(
+        first: A,
+        second: B,
+        third: C,
+        fourth: D,
+    ) -> (A::Output, B::Output, C::Output, D::Output) {
+        let ((first, second), (third, fourth)) =
+            join(join(first, second), join(third, fourth)).await;
+        (first, second, third, fourth)
     }
 
     /// A local-only signing secret for these tests.
@@ -278,97 +362,127 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn sign_on_outcomes_follow_the_read_and_the_stored_user() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store).await?;
-        let state = app_state(store.clone(), 3600);
+    #[test]
+    fn sign_on_outcomes_follow_the_read_and_the_stored_user() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store).await?;
+            let state = app_state(store.clone(), 3600);
 
-        // audit: COSGN00C-009
-        // audit: COSGN00C-013
-        // audit: COSGN00C-014
-        // audit: COSGN00C-015
-        // audit: COSGN00C-016
-        let successes = [
-            (
-                "ADMIN001",
-                TYPED_PASSWORD,
-                "ADMIN001",
-                UserType::ADMIN,
-                "/admin",
-            ),
-            ("user0001", "testpw01", "USER0001", UserType::USER, "/menu"),
-        ];
-        for (user_id, typed, expected_id, expected_type, route) in successes {
-            let (token, signed_on) = signon(&state, request(user_id, typed))
-                .await
-                .map_err(|error| error.to_string())?;
+            // audit: COSGN00C-009
+            // audit: COSGN00C-013
+            // audit: COSGN00C-014
+            // audit: COSGN00C-015
+            // audit: COSGN00C-016
+            let successes = [
+                (
+                    "ADMIN001",
+                    TYPED_PASSWORD,
+                    "ADMIN001",
+                    UserType::ADMIN,
+                    "/admin",
+                ),
+                ("user0001", "testpw01", "USER0001", UserType::USER, "/menu"),
+            ];
+            for (user_id, typed, expected_id, expected_type, route) in successes {
+                let (token, signed_on) = signon(&state, request(user_id, typed))
+                    .await
+                    .map_err(|error| error.to_string())?;
+                assert_eq!(
+                    signed_on.user_id.as_bytes(),
+                    expected_id.as_bytes(),
+                    "{user_id}"
+                );
+                assert_eq!(signed_on.user_type, expected_type, "{user_id}");
+                assert_eq!(signed_on.next_route.path(), route, "{user_id}");
+                let claims = state.jwt.verify(&token)?;
+                assert_eq!(claims.sub, expected_id, "{user_id}");
+                assert_eq!(claims.usr_type.as_bytes(), expected_type.code().as_bytes());
+                assert!(!token.contains(TYPED_PASSWORD), "{user_id}");
+            }
+
+            // audit: COSGN00C-003
+            // audit: COSGN00C-007
+            // audit: COSGN00C-008
+            // audit: COSGN00C-018
+            // audit: COSGN00C-019
+            // audit: COSGN00C-020
+            let failures = [
+                (
+                    "ADMIN0011",
+                    TYPED_PASSWORD,
+                    SignonFailure::Rejected(SignonField::UserId),
+                ),
+                ("", TYPED_PASSWORD, SignonFailure::UserIdBlank),
+                ("        ", "", SignonFailure::UserIdBlank),
+                ("ADMIN001", "", SignonFailure::PasswordBlank),
+                ("ADMIN001", "WRONGPW1", SignonFailure::WrongPassword),
+                ("NOBODY01", TYPED_PASSWORD, SignonFailure::UserNotFound),
+                ("LOWER001", "lowerpw1", SignonFailure::WrongPassword),
+                ("BADHASH1", TYPED_PASSWORD, SignonFailure::UnableToVerify),
+            ];
+            for (user_id, typed, expected) in failures {
+                let outcome = signon(&state, request(user_id, typed)).await;
+                assert_eq!(outcome, Err(ServiceError::Rule(expected)), "{user_id:?}");
+            }
+
+            // A token that cannot be issued answers without detail: here the lifetime overflows.
+            let overflowing = app_state(store, u64::MAX);
+            let traces = trace_capture::capture();
+            let outcome = signon(&overflowing, request("ADMIN001", TYPED_PASSWORD)).await;
+            assert_eq!(outcome, Err(ServiceError::Internal));
+            // It is logged as one `ERROR` of this module carrying the `JwtError::Lifetime` text
+            // alone. The read writes lines of other targets, so only this module's are counted.
+            let lines = traces.lines_with_target("api::services::cosgn00c");
+            let [line] = lines.as_slice() else {
+                return Err(format!("token not issued: {} lines", lines.len()).into());
+            };
+            let event: serde_json::Value = serde_json::from_str(line)?;
             assert_eq!(
-                signed_on.user_id.as_bytes(),
-                expected_id.as_bytes(),
-                "{user_id}"
+                event.get("level").and_then(serde_json::Value::as_str),
+                Some("ERROR")
             );
-            assert_eq!(signed_on.user_type, expected_type, "{user_id}");
-            assert_eq!(signed_on.next_route.path(), route, "{user_id}");
-            let claims = state.jwt.verify(&token)?;
-            assert_eq!(claims.sub, expected_id, "{user_id}");
-            assert_eq!(claims.usr_type.as_bytes(), expected_type.code().as_bytes());
-            assert!(!token.contains(TYPED_PASSWORD), "{user_id}");
-        }
-
-        // audit: COSGN00C-003
-        // audit: COSGN00C-007
-        // audit: COSGN00C-008
-        // audit: COSGN00C-018
-        // audit: COSGN00C-019
-        // audit: COSGN00C-020
-        let failures = [
-            (
-                "ADMIN0011",
-                TYPED_PASSWORD,
-                SignonFailure::Rejected(SignonField::UserId),
-            ),
-            ("", TYPED_PASSWORD, SignonFailure::UserIdBlank),
-            ("        ", "", SignonFailure::UserIdBlank),
-            ("ADMIN001", "", SignonFailure::PasswordBlank),
-            ("ADMIN001", "WRONGPW1", SignonFailure::WrongPassword),
-            ("NOBODY01", TYPED_PASSWORD, SignonFailure::UserNotFound),
-            ("LOWER001", "lowerpw1", SignonFailure::WrongPassword),
-            ("BADHASH1", TYPED_PASSWORD, SignonFailure::UnableToVerify),
-        ];
-        for (user_id, typed, expected) in failures {
-            let outcome = signon(&state, request(user_id, typed)).await;
-            assert_eq!(outcome, Err(ServiceError::Rule(expected)), "{user_id:?}");
-        }
-
-        // A token that cannot be issued answers without detail: here the lifetime overflows.
-        let overflowing = app_state(store, u64::MAX);
-        let outcome = signon(&overflowing, request("ADMIN001", TYPED_PASSWORD)).await;
-        assert_eq!(outcome, Err(ServiceError::Internal));
-        Ok(())
+            assert_eq!(
+                event.get("target").and_then(serde_json::Value::as_str),
+                Some("api::services::cosgn00c")
+            );
+            assert_eq!(
+                event.get("fields"),
+                Some(&serde_json::json!({
+                    "message": "sign-on token could not be issued",
+                    "error": "token lifetime overflow",
+                }))
+            );
+            for value in ["ADMIN001", TYPED_PASSWORD] {
+                assert!(!traces.contains(value), "the trace holds {value}");
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_failed_read_is_unable_to_verify_and_reports_no_value() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store).await?;
-        store.pool().close().await;
-        let state = app_state(store, 3600);
+    #[test]
+    fn a_failed_read_is_unable_to_verify_and_reports_no_value() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store).await?;
+            store.pool().close().await;
+            let state = app_state(store, 3600);
 
-        let traces = trace_capture::capture();
-        // audit: COSGN00C-020
-        let outcome = signon(&state, request("ADMIN001", TYPED_PASSWORD)).await;
-        assert_eq!(
-            outcome,
-            Err(ServiceError::Rule(SignonFailure::UnableToVerify))
-        );
-        assert!(traces.contains("sign-on user read failed"));
-        for value in ["ADMIN001", TYPED_PASSWORD] {
-            assert!(!traces.contains(value), "the trace holds {value}");
-        }
-        Ok(())
+            let traces = trace_capture::capture();
+            // audit: COSGN00C-020
+            let outcome = signon(&state, request("ADMIN001", TYPED_PASSWORD)).await;
+            assert_eq!(
+                outcome,
+                Err(ServiceError::Rule(SignonFailure::UnableToVerify))
+            );
+            assert!(traces.contains("sign-on user read failed"));
+            for value in ["ADMIN001", TYPED_PASSWORD] {
+                assert!(!traces.contains(value), "the trace holds {value}");
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -458,75 +572,80 @@ mod tests {
     /// so the longest heartbeat gap would reach that duration; on the blocking pool the gap is
     /// a tick plus scheduling delay, far below it even on a loaded host, where the
     /// verification slows as much as the heartbeat.
-    #[tokio::test(flavor = "current_thread")]
-    async fn verification_runs_off_the_runtime_thread() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        seed(&mut store).await?;
-        let state = app_state(store, 3600);
+    #[test]
+    fn verification_runs_off_the_runtime_thread() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            seed(&mut store).await?;
+            let state = app_state(store, 3600);
 
-        let typed = <&[u8; 8]>::try_from(TYPED_PASSWORD.as_bytes())?;
-        let hash = password::hash(typed)?;
-        let started = Instant::now();
-        assert!(password::verify(typed, &hash)?);
-        let one_verification = started.elapsed();
+            let typed = <&[u8; 8]>::try_from(TYPED_PASSWORD.as_bytes())?;
+            let hash = password::hash(typed)?;
+            let started = Instant::now();
+            assert!(password::verify(typed, &hash)?);
+            let one_verification = started.elapsed();
 
-        // Unknown users verify nothing; signing them on at once opens the pool's connections
-        // first, so connection setup stays out of the measured window.
-        let unknown = tokio::join!(
-            signon(&state, request("NOBODY01", TYPED_PASSWORD)),
-            signon(&state, request("NOBODY02", TYPED_PASSWORD)),
-            signon(&state, request("NOBODY03", TYPED_PASSWORD)),
-            signon(&state, request("NOBODY04", TYPED_PASSWORD)),
-        );
-        let not_found = || Err(ServiceError::Rule(SignonFailure::UserNotFound));
-        assert_eq!(
-            unknown,
-            (not_found(), not_found(), not_found(), not_found())
-        );
+            // Unknown users verify nothing; signing them on at once opens the pool's connections
+            // first, so connection setup stays out of the measured window.
+            let unknown = join4(
+                signon(&state, request("NOBODY01", TYPED_PASSWORD)),
+                signon(&state, request("NOBODY02", TYPED_PASSWORD)),
+                signon(&state, request("NOBODY03", TYPED_PASSWORD)),
+                signon(&state, request("NOBODY04", TYPED_PASSWORD)),
+            )
+            .await;
+            let not_found = || Err(ServiceError::Rule(SignonFailure::UserNotFound));
+            assert_eq!(
+                unknown,
+                (not_found(), not_found(), not_found(), not_found())
+            );
 
-        let mut signons = pin!(async {
-            tokio::join!(
+            let mut signons = Box::pin(join4(
                 signon(&state, request("ADMIN001", TYPED_PASSWORD)),
                 signon(&state, request("USER0001", TYPED_PASSWORD)),
                 signon(&state, request("ADMIN001", "WRONGPW1")),
                 signon(&state, request("USER0001", "WRONGPW1")),
-            )
-        });
-        // Every poll of the sign-ons happens inside one iteration, so a decision that held the
-        // thread would lengthen that iteration's gap, including the iteration that finishes.
-        let mut largest_gap = Duration::ZERO;
-        let (admin, user, wrong_admin, wrong_user) = loop {
-            let tick = Instant::now();
-            let finished = tokio::select! {
-                outcomes = &mut signons => Some(outcomes),
-                () = tokio::time::sleep(HEARTBEAT) => None,
+            ));
+            // Every poll of the sign-ons happens inside one iteration, so a decision that held the
+            // thread would lengthen that iteration's gap, including the iteration that finishes.
+            let mut largest_gap = Duration::ZERO;
+            let (admin, user, wrong_admin, wrong_user) = loop {
+                let tick = Instant::now();
+                // The sign-ons are polled first, then a fresh heartbeat, whose tick ends the
+                // iteration while they are still pending.
+                let mut heartbeat = Box::pin(tokio::time::sleep(HEARTBEAT));
+                let finished = poll_fn(|cx| match signons.as_mut().poll(cx) {
+                    Poll::Ready(outcomes) => Poll::Ready(Some(outcomes)),
+                    Poll::Pending => heartbeat.as_mut().poll(cx).map(|()| None),
+                })
+                .await;
+                largest_gap = largest_gap.max(tick.elapsed());
+                if let Some(outcomes) = finished {
+                    break outcomes;
+                }
             };
-            largest_gap = largest_gap.max(tick.elapsed());
-            if let Some(outcomes) = finished {
-                break outcomes;
-            }
-        };
 
-        for (outcome, route) in [(admin, "/admin"), (user, "/menu")] {
-            let (token, signed_on) = outcome.map_err(|error| error.to_string())?;
-            assert_eq!(signed_on.next_route.path(), route);
-            assert_eq!(
-                state.jwt.verify(&token)?.sub.as_bytes(),
-                signed_on.user_id.as_bytes()
+            for (outcome, route) in [(admin, "/admin"), (user, "/menu")] {
+                let (token, signed_on) = outcome.map_err(|error| error.to_string())?;
+                assert_eq!(signed_on.next_route.path(), route);
+                assert_eq!(
+                    state.jwt.verify(&token)?.sub.as_bytes(),
+                    signed_on.user_id.as_bytes()
+                );
+            }
+            for outcome in [wrong_admin, wrong_user] {
+                assert_eq!(
+                    outcome,
+                    Err(ServiceError::Rule(SignonFailure::WrongPassword))
+                );
+            }
+            assert!(
+                largest_gap < one_verification / 2,
+                "the runtime thread stalled {largest_gap:?}; one verification takes \
+                 {one_verification:?}"
             );
-        }
-        for outcome in [wrong_admin, wrong_user] {
-            assert_eq!(
-                outcome,
-                Err(ServiceError::Rule(SignonFailure::WrongPassword))
-            );
-        }
-        assert!(
-            largest_gap < one_verification / 2,
-            "the runtime thread stalled {largest_gap:?}; one verification takes \
-             {one_verification:?}"
-        );
-        Ok(())
+            Ok(())
+        })
     }
 }

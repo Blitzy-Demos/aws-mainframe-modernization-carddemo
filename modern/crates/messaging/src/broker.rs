@@ -113,6 +113,9 @@ use lapin::{
     BasicProperties, Channel, ChannelState, Connection, ConnectionProperties, ConnectionState,
 };
 use runtime::telemetry::{IdKey, ScreenedText};
+use tracing::{Level, Metadata, field};
+
+use crate::{EventSite, emit, event_metadata};
 
 /// How long [`connect`] may take from the TCP connect to the broker's `connection.open-ok`: the
 /// socket, the protocol header and the `start`, `tune` and `open` exchanges together. The
@@ -722,11 +725,7 @@ impl Session {
                     self.transport.release();
                     return;
                 }
-                Err(fault) => tracing::warn!(
-                    reason,
-                    error = %fault,
-                    "closing the AMQP connection failed; its socket is shut down"
-                ),
+                Err(fault) => connection_close_failed(reason, &fault),
             }
         }
         self.transport.shut_down();
@@ -889,7 +888,7 @@ fn shut_down_socket(socket: &Socket) {
     if let Err(error) = socket.shutdown(Shutdown::Both) {
         let kind = error.kind();
         if kind != io::ErrorKind::NotConnected {
-            tracing::warn!(?kind, "shutting down the AMQP socket failed");
+            socket_shutdown_failed(kind);
         }
     }
 }
@@ -948,7 +947,7 @@ async fn close_quietly(channel: &Channel, reason: &str) {
         return;
     }
     if let Err(fault) = within(OPERATION_DEADLINE, channel.close(CLOSE_NORMAL, reason)).await {
-        tracing::warn!(reason, error = %fault, "closing an AMQP channel failed");
+        channel_close_failed(reason, &fault);
     }
 }
 
@@ -1393,6 +1392,66 @@ pub async fn idle(poll_interval: Duration) {
     tokio::time::sleep(poll_interval).await;
 }
 
+/// `WARN` when closing the AMQP connection with `reason` failed with `fault`, before its socket
+/// is shut down.
+fn connection_close_failed(reason: &str, fault: &Fault) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "connection_close_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "reason", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"closing the AMQP connection failed; its socket is shut down"),
+            Some(&reason),
+            Some(&field::display(fault)),
+        ],
+    );
+}
+
+/// `WARN` when shutting the AMQP socket down failed with an I/O error of `kind`.
+fn socket_shutdown_failed(kind: io::ErrorKind) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "socket_shutdown_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "kind"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"shutting down the AMQP socket failed"),
+            Some(&field::debug(&kind)),
+        ],
+    );
+}
+
+/// `WARN` when closing an AMQP channel with `reason` failed with `fault`.
+fn channel_close_failed(reason: &str, fault: &Fault) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "channel_close_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "reason", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"closing an AMQP channel failed"),
+            Some(&reason),
+            Some(&field::display(fault)),
+        ],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -1413,6 +1472,7 @@ mod tests {
         PublishFailure, QueueCheck, QueueLabel, Request, connect_first, copied_properties,
         cp00_properties, is_host_not_resolved, jittered, parse_url, within,
     };
+    use crate::current_thread;
 
     /// The first card number of `app/data/ASCII/cardxref.txt`.
     const CARD_NUMBER: &str = "0500024453765740";
@@ -2018,23 +2078,25 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_wait_ends_by_its_deadline_and_keeps_only_the_fault() {
-        let deadline = Duration::from_millis(20);
-        let pending = within(deadline, std::future::pending::<lapin::Result<()>>()).await;
-        assert_eq!(pending, Err(Fault::TimedOut { after: deadline }));
+    #[test]
+    fn a_wait_ends_by_its_deadline_and_keeps_only_the_fault() {
+        current_thread().block_on(async {
+            let deadline = Duration::from_millis(20);
+            let pending = within(deadline, std::future::pending::<lapin::Result<()>>()).await;
+            assert_eq!(pending, Err(Fault::TimedOut { after: deadline }));
 
-        let ready = within(deadline, async { lapin::Result::Ok(7) }).await;
-        assert_eq!(ready, Ok(7));
+            let ready = within(deadline, async { lapin::Result::Ok(7) }).await;
+            assert_eq!(ready, Ok(7));
 
-        let failed = within(deadline, async {
-            lapin::Result::<()>::Err(lapin::Error::IOError(Arc::new(io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("os text naming {CARD_NUMBER}"),
-            ))))
-        })
-        .await;
-        assert_eq!(failed, Err(Fault::Io(io::ErrorKind::ConnectionRefused)));
+            let failed = within(deadline, async {
+                lapin::Result::<()>::Err(lapin::Error::IOError(Arc::new(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("os text naming {CARD_NUMBER}"),
+                ))))
+            })
+            .await;
+            assert_eq!(failed, Err(Fault::Io(io::ErrorKind::ConnectionRefused)));
+        });
     }
 
     #[test]
@@ -2103,18 +2165,6 @@ mod tests {
             "failed to lookup address information",
         ))));
         assert_eq!(other, Fault::Io(io::ErrorKind::Other));
-    }
-
-    /// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made
-    /// here so that no test macro expands into a lint suppression or an unchecked pin.
-    fn current_thread() -> tokio::runtime::Runtime {
-        match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => panic!("a current-thread runtime does not build: {error}"),
-        }
     }
 
     #[test]
@@ -2400,86 +2450,91 @@ mod tests {
         report
     }
 
-    #[tokio::test]
-    async fn a_handshake_given_up_ends_its_tcp_connection() -> io::Result<()> {
+    #[test]
+    fn a_handshake_given_up_ends_its_tcp_connection() -> io::Result<()> {
         use super::connect_within;
 
-        // Given up once by the connect deadline, and once by the caller, which drops the
-        // unfinished attempt as a stop does.
-        for dropped_by_caller in [false, true] {
-            let (url, report) = scripted_broker(Script::Silent)?;
-            let started = std::time::Instant::now();
-            let outcome = if dropped_by_caller {
-                tokio::time::timeout(TEST_DEADLINE, connect_within(&url, CONNECT_DEADLINE))
-                    .await
-                    .ok()
-            } else {
-                Some(connect_within(&url, TEST_DEADLINE).await)
-            };
-            let given_up = std::time::Instant::now();
-            assert!(
-                match &outcome {
-                    None => dropped_by_caller,
-                    Some(Err(AmqpError::Connect(Fault::TimedOut { after }))) => {
-                        !dropped_by_caller && *after == TEST_DEADLINE
-                    }
-                    Some(_) => false,
-                },
-                "dropped by the caller: {dropped_by_caller}, outcome: {outcome:?}"
-            );
-            assert!(given_up.duration_since(started) < TEST_DEADLINE.saturating_add(END_WITHIN));
-            assert_connection_ended(&report, given_up);
-        }
-        Ok(())
+        current_thread().block_on(async {
+            // Given up once by the connect deadline, and once by the caller, which drops the
+            // unfinished attempt as a stop does.
+            for dropped_by_caller in [false, true] {
+                let (url, report) = scripted_broker(Script::Silent)?;
+                let started = std::time::Instant::now();
+                let outcome = if dropped_by_caller {
+                    tokio::time::timeout(TEST_DEADLINE, connect_within(&url, CONNECT_DEADLINE))
+                        .await
+                        .ok()
+                } else {
+                    Some(connect_within(&url, TEST_DEADLINE).await)
+                };
+                let given_up = std::time::Instant::now();
+                assert!(
+                    match &outcome {
+                        None => dropped_by_caller,
+                        Some(Err(AmqpError::Connect(Fault::TimedOut { after }))) => {
+                            !dropped_by_caller && *after == TEST_DEADLINE
+                        }
+                        Some(_) => false,
+                    },
+                    "dropped by the caller: {dropped_by_caller}, outcome: {outcome:?}"
+                );
+                assert!(
+                    given_up.duration_since(started) < TEST_DEADLINE.saturating_add(END_WITHIN)
+                );
+                assert_connection_ended(&report, given_up);
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_session_ends_its_tcp_connection_whether_its_close_is_answered_or_not()
-    -> io::Result<()> {
+    #[test]
+    fn a_session_ends_its_tcp_connection_whether_its_close_is_answered_or_not() -> io::Result<()> {
         use super::connect_within;
 
-        // (script, closed): a close the broker never answers; a session dropped without a
-        // close; and a close the broker answers, after which the session is dropped.
-        let cases = [
-            (Script::WithholdCloseOk, true),
-            (Script::WithholdCloseOk, false),
-            (Script::AnswerCloseOk, true),
-        ];
-        for (script, closed) in cases {
-            let (url, report) = scripted_broker(script)?;
-            let session = match connect_within(&url, CONNECT_DEADLINE).await {
-                Ok(session) => session,
-                Err(error) => panic!("{script:?}: the scripted handshake failed: {error}"),
-            };
-            assert!(session.connection().status().connected(), "{script:?}");
-            let started = std::time::Instant::now();
-            if closed {
-                session
-                    .close_within("carddemo-mq session test", TEST_DEADLINE)
-                    .await;
-                assert!(
-                    started.elapsed() < TEST_DEADLINE.saturating_add(END_WITHIN),
-                    "{script:?}: the close outlived its deadline"
-                );
+        current_thread().block_on(async {
+            // (script, closed): a close the broker never answers; a session dropped without a
+            // close; and a close the broker answers, after which the session is dropped.
+            let cases = [
+                (Script::WithholdCloseOk, true),
+                (Script::WithholdCloseOk, false),
+                (Script::AnswerCloseOk, true),
+            ];
+            for (script, closed) in cases {
+                let (url, report) = scripted_broker(script)?;
+                let session = match connect_within(&url, CONNECT_DEADLINE).await {
+                    Ok(session) => session,
+                    Err(error) => panic!("{script:?}: the scripted handshake failed: {error}"),
+                };
+                assert!(session.connection().status().connected(), "{script:?}");
+                let started = std::time::Instant::now();
+                if closed {
+                    session
+                        .close_within("carddemo-mq session test", TEST_DEADLINE)
+                        .await;
+                    assert!(
+                        started.elapsed() < TEST_DEADLINE.saturating_add(END_WITHIN),
+                        "{script:?}: the close outlived its deadline"
+                    );
+                }
+                // A close never answered must end the connection by itself, so that session is
+                // held until the broker has reported; every other one is dropped first.
+                let kept = if closed && matches!(script, Script::WithholdCloseOk) {
+                    Some(session)
+                } else {
+                    drop(session);
+                    None
+                };
+                let given_up = std::time::Instant::now();
+                let seen = assert_connection_ended(&report, given_up);
+                if closed {
+                    assert!(
+                        seen.is_some_and(|seen| seen.close_requested),
+                        "{script:?}: the client sent no connection.close before the socket ended"
+                    );
+                }
+                drop(kept);
             }
-            // A close never answered must end the connection by itself, so that session is held
-            // until the broker has reported; every other one is dropped first.
-            let kept = if closed && matches!(script, Script::WithholdCloseOk) {
-                Some(session)
-            } else {
-                drop(session);
-                None
-            };
-            let given_up = std::time::Instant::now();
-            let seen = assert_connection_ended(&report, given_up);
-            if closed {
-                assert!(
-                    seen.is_some_and(|seen| seen.close_requested),
-                    "{script:?}: the client sent no connection.close before the socket ended"
-                );
-            }
-            drop(kept);
-        }
-        Ok(())
+            Ok(())
+        })
     }
 }

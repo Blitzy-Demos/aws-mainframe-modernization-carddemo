@@ -22,8 +22,9 @@
 //! ([`TransactionRow::from_record`] and [`TransactionRow::into_record`]) and no byte is trimmed,
 //! padded or normalised here. Each statement is written once, in a private function over any
 //! executor, and [`PgStore`] (pool, autocommit), [`PgTx`] (the caller's transaction) and
-//! [`PgSession`] (a batch job's session, autocommit) run it. Every column is `COLLATE "C"`, so key comparisons and orders are byte order, which
-//! is the numeric order of the 16-digit IDs every in-scope writer stores (COTRN02C-043).
+//! [`PgSession`] (a batch job's session, autocommit) run it. Every character column is
+//! `COLLATE "C"`, so key comparisons and orders are byte order, which is the numeric order of the
+//! 16-digit IDs every in-scope writer stores (COTRN02C-043).
 //!
 //! Two statements are each shared by two methods. The processing-date window:
 //! `stream_processed_between` yields its rows as [`TransactionRows`], each decoded as it is
@@ -909,6 +910,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// Card numbers in no fixture file, every `cardxref.txt` number starting with `0`: no error
     /// may repeat them.
     const CARD_A: &[u8; 16] = b"9900000000000001";
@@ -994,43 +1004,45 @@ mod tests {
     // audit: COTRN01C-011
     // audit: COTRN01C-012
     // audit: CBTRN02C-024
-    #[tokio::test]
-    async fn store_allocates_reads_back_and_refuses_a_duplicate_id() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn store_allocates_reads_back_and_refuses_a_duplicate_id() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
 
-        // The empty table takes the end-of-file branch: ID 1, and nothing to read.
-        assert_eq!(store.next_id().await?, key(b"0000000000000001"));
-        assert!(store.find_last().await?.is_none());
-        assert!(store.find_by_id(&key(b"0000000000000001")).await?.is_none());
+            // The empty table takes the end-of-file branch: ID 1, and nothing to read.
+            assert_eq!(store.next_id().await?, key(b"0000000000000001"));
+            assert!(store.find_last().await?.is_none());
+            assert!(store.find_by_id(&key(b"0000000000000001")).await?.is_none());
 
-        let five = record(b"0000000000000005", CARD_B, BLANK_TS)?;
-        let ten = record(b"0000000000000010", CARD_A, b"2022-07-18-10.15.42.370000")?;
-        let seven = record(b"0000000000000007", CARD_A, b"2022-06-10 19:27:53.000000")?;
-        for inserted in [&five, &ten, &seven] {
-            store.insert(inserted).await?;
-        }
+            let five = record(b"0000000000000005", CARD_B, BLANK_TS)?;
+            let ten = record(b"0000000000000010", CARD_A, b"2022-07-18-10.15.42.370000")?;
+            let seven = record(b"0000000000000007", CARD_A, b"2022-06-10 19:27:53.000000")?;
+            for inserted in [&five, &ten, &seven] {
+                store.insert(inserted).await?;
+            }
 
-        // The highest ID plus one, whatever the insertion order; each row reads back equal.
-        assert_eq!(store.next_id().await?, key(b"0000000000000011"));
-        assert_eq!(store.find_last().await?, Some(ten.clone()));
-        for stored in [&five, &ten, &seven] {
-            assert_eq!(store.find_by_id(&stored.id).await?.as_ref(), Some(stored));
-        }
-        assert!(store.find_by_id(&key(b"0000000000000006")).await?.is_none());
+            // The highest ID plus one, whatever the insertion order; each row reads back equal.
+            assert_eq!(store.next_id().await?, key(b"0000000000000011"));
+            assert_eq!(store.find_last().await?, Some(ten.clone()));
+            for stored in [&five, &ten, &seven] {
+                assert_eq!(store.find_by_id(&stored.id).await?.as_ref(), Some(stored));
+            }
+            assert!(store.find_by_id(&key(b"0000000000000006")).await?.is_none());
 
-        // A second row with a taken ID is `DUPREC`; the stored row is unchanged, and the error
-        // names the constraint alone, never the card number.
-        let refused = store
-            .insert(&record(b"0000000000000010", CARD_B, BLANK_TS)?)
-            .await;
-        let duplicate = PersistenceError::Duplicate {
-            constraint: Some("transactions_pkey".to_owned()),
-        };
-        assert_eq!(refused, Err(duplicate.clone()));
-        assert!(!format!("{duplicate}{duplicate:?}").contains("9900000000000002"));
-        assert_eq!(store.find_by_id(&ten.id).await?, Some(ten));
-        Ok(())
+            // A second row with a taken ID is `DUPREC`; the stored row is unchanged, and the error
+            // names the constraint alone, never the card number.
+            let refused = store
+                .insert(&record(b"0000000000000010", CARD_B, BLANK_TS)?)
+                .await;
+            let duplicate = PersistenceError::Duplicate {
+                constraint: Some("transactions_pkey".to_owned()),
+            };
+            assert_eq!(refused, Err(duplicate.clone()));
+            assert!(!format!("{duplicate}{duplicate:?}").contains("9900000000000002"));
+            assert_eq!(store.find_by_id(&ten.id).await?, Some(ten));
+            Ok(())
+        })
     }
 
     // audit: COTRN00C-011
@@ -1043,73 +1055,75 @@ mod tests {
     // audit: PIC-018
     // audit: PIC-019
     // audit: PIC-020
-    #[tokio::test]
-    async fn pages_card_order_and_processing_window_follow_the_keys() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let rows: [(&[u8; 16], &[u8; 16], &[u8; 26]); 6] = [
-            // The last instant before the window: excluded.
-            (b"0000000000000001", CARD_B, b"2021-12-31 23:59:59.999999"),
-            // The window's first instant, layout `I`.
-            (b"0000000000000002", CARD_A, b"2022-01-01 00:00:00.000000"),
-            // A screen date inside the window, layout `S`.
-            (b"0000000000000003", CARD_B, b"2022-03-15                "),
-            // A blank processing timestamp: never selected.
-            (b"0000000000000004", CARD_A, BLANK_TS),
-            // The window's last day, layout `D`.
-            (b"0000000000000005", CARD_B, b"2022-07-06-23.59.59.990000"),
-            // The first instant after the window: excluded.
-            (b"0000000000000006", CARD_A, b"2022-07-07 00:00:00.000000"),
-        ];
-        for (id, card, proc_ts) in rows {
-            store.insert(&record(id, card, proc_ts)?).await?;
-        }
-        let [one, two, three, four, five, six] = rows.map(|(id, _, _)| *id);
-        let blank = PicX::<16>::spaces();
+    #[test]
+    fn pages_card_order_and_processing_window_follow_the_keys() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let rows: [(&[u8; 16], &[u8; 16], &[u8; 26]); 6] = [
+                // The last instant before the window: excluded.
+                (b"0000000000000001", CARD_B, b"2021-12-31 23:59:59.999999"),
+                // The window's first instant, layout `I`.
+                (b"0000000000000002", CARD_A, b"2022-01-01 00:00:00.000000"),
+                // A screen date inside the window, layout `S`.
+                (b"0000000000000003", CARD_B, b"2022-03-15                "),
+                // A blank processing timestamp: never selected.
+                (b"0000000000000004", CARD_A, BLANK_TS),
+                // The window's last day, layout `D`.
+                (b"0000000000000005", CARD_B, b"2022-07-06-23.59.59.990000"),
+                // The first instant after the window: excluded.
+                (b"0000000000000006", CARD_A, b"2022-07-07 00:00:00.000000"),
+            ];
+            for (id, card, proc_ts) in rows {
+                store.insert(&record(id, card, proc_ts)?).await?;
+            }
+            let [one, two, three, four, five, six] = rows.map(|(id, _, _)| *id);
+            let blank = PicX::<16>::spaces();
 
-        // Forward pages start at the key, inclusive; a blank key ranks below every ID.
-        assert_eq!(ids(&store.page_after(&blank, 3).await?), [one, two, three]);
-        assert_eq!(
-            ids(&store.page_after(&key(&four), 11).await?),
-            [four, five, six]
-        );
-        assert!(
-            store
-                .page_after(&key(b"0000000000000007"), 11)
-                .await?
-                .is_empty()
-        );
-        assert!(store.page_after(&blank, 0).await?.is_empty());
-        // Backward pages start at the key, inclusive, and run downwards.
-        assert_eq!(
-            ids(&store.page_before(&key(&four), 2).await?),
-            [four, three]
-        );
-        let all_down = [six, five, four, three, two, one];
-        assert_eq!(
-            ids(&store.page_before(&key(b"0000000000000009"), 11).await?),
-            all_down
-        );
-        assert!(store.page_before(&blank, 11).await?.is_empty());
+            // Forward pages start at the key, inclusive; a blank key ranks below every ID.
+            assert_eq!(ids(&store.page_after(&blank, 3).await?), [one, two, three]);
+            assert_eq!(
+                ids(&store.page_after(&key(&four), 11).await?),
+                [four, five, six]
+            );
+            assert!(
+                store
+                    .page_after(&key(b"0000000000000007"), 11)
+                    .await?
+                    .is_empty()
+            );
+            assert!(store.page_after(&blank, 0).await?.is_empty());
+            // Backward pages start at the key, inclusive, and run downwards.
+            assert_eq!(
+                ids(&store.page_before(&key(&four), 2).await?),
+                [four, three]
+            );
+            let all_down = [six, five, four, three, two, one];
+            assert_eq!(
+                ids(&store.page_before(&key(b"0000000000000009"), 11).await?),
+                all_down
+            );
+            assert!(store.page_before(&blank, 11).await?.is_empty());
 
-        // CREASTMT: card number, then transaction ID.
-        let card_order = [two, four, six, one, three, five];
-        assert_eq!(ids(&store.find_all_in_card_order().await?), card_order);
+            // CREASTMT: card number, then transaction ID.
+            let card_order = [two, four, six, one, three, five];
+            assert_eq!(ids(&store.find_all_in_card_order().await?), card_order);
 
-        // TRANREPT: both boundary days included, the blank timestamp and the days outside the
-        // window excluded, in card-number order.
-        let (start, end) = (day(2022, 1, 1)?, day(2022, 7, 6)?);
-        let window = store.find_processed_between(start, end).await?;
-        assert_eq!(ids(&window), [two, three, five]);
-        assert_eq!(ids(&store.find_processed_between(end, end).await?), [five]);
-        assert!(store.find_processed_between(end, start).await?.is_empty());
-        // The streamed selection yields the same records, in the same order, for each window.
-        for (from, to) in [(start, end), (end, end), (end, start)] {
-            let found = store.find_processed_between(from, to).await?;
-            let streamed = drain(store.stream_processed_between(from, to).await?).await?;
-            assert_eq!(streamed, found, "{from} to {to}");
-        }
-        Ok(())
+            // TRANREPT: both boundary days included, the blank timestamp and the days outside the
+            // window excluded, in card-number order.
+            let (start, end) = (day(2022, 1, 1)?, day(2022, 7, 6)?);
+            let window = store.find_processed_between(start, end).await?;
+            assert_eq!(ids(&window), [two, three, five]);
+            assert_eq!(ids(&store.find_processed_between(end, end).await?), [five]);
+            assert!(store.find_processed_between(end, start).await?.is_empty());
+            // The streamed selection yields the same records, in the same order, for each window.
+            for (from, to) in [(start, end), (end, end), (end, start)] {
+                let found = store.find_processed_between(from, to).await?;
+                let streamed = drain(store.stream_processed_between(from, to).await?).await?;
+                assert_eq!(streamed, found, "{from} to {to}");
+            }
+            Ok(())
+        })
     }
 
     /// CREASTMT's reads of the card order on the pool, a transaction and a session: the
@@ -1120,64 +1134,66 @@ mod tests {
     // audit: CBSTM03A-006
     // audit: CBSTM03A-008
     // audit: CBSTM03A-013
-    #[tokio::test]
-    async fn card_order_is_streamed_whole_and_read_by_card() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let (card_a, card_b) = (card(CARD_A), card(CARD_B));
-        let unknown = card(b"9900000000000003");
+    #[test]
+    fn card_order_is_streamed_whole_and_read_by_card() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let (card_a, card_b) = (card(CARD_A), card(CARD_B));
+            let unknown = card(b"9900000000000003");
 
-        // An empty table: no row to stream, none for a card.
-        assert!(drain(store.stream_in_card_order().await?).await?.is_empty());
-        assert!(store.find_by_card(&card_a).await?.is_empty());
+            // An empty table: no row to stream, none for a card.
+            assert!(drain(store.stream_in_card_order().await?).await?.is_empty());
+            assert!(store.find_by_card(&card_a).await?.is_empty());
 
-        let rows: [(&[u8; 16], &[u8; 16]); 5] = [
-            (b"0000000000000009", CARD_B),
-            (b"0000000000000007", CARD_A),
-            (b"0000000000000003", CARD_A),
-            (b"0000000000000001", CARD_B),
-            (b"0000000000000005", CARD_A),
-        ];
-        for (id, card_num) in rows {
-            store.insert(&record(id, card_num, BLANK_TS)?).await?;
-        }
-        let of_a = [
-            *b"0000000000000003",
-            *b"0000000000000005",
-            *b"0000000000000007",
-        ];
-        let of_b = [*b"0000000000000001", *b"0000000000000009"];
-        let all = store.find_all_in_card_order().await?;
-        assert_eq!(ids(&all), [of_a.as_slice(), of_b.as_slice()].concat());
-        assert_eq!(drain(store.stream_in_card_order().await?).await?, all);
-        for (card_num, expected) in [(&card_a, of_a.as_slice()), (&card_b, of_b.as_slice())] {
-            let found = store.find_by_card(card_num).await?;
-            assert_eq!(ids(&found), expected);
-            assert!(found.iter().all(|record| record.card_num == *card_num));
-        }
-        assert!(store.find_by_card(&unknown).await?.is_empty());
+            let rows: [(&[u8; 16], &[u8; 16]); 5] = [
+                (b"0000000000000009", CARD_B),
+                (b"0000000000000007", CARD_A),
+                (b"0000000000000003", CARD_A),
+                (b"0000000000000001", CARD_B),
+                (b"0000000000000005", CARD_A),
+            ];
+            for (id, card_num) in rows {
+                store.insert(&record(id, card_num, BLANK_TS)?).await?;
+            }
+            let of_a = [
+                *b"0000000000000003",
+                *b"0000000000000005",
+                *b"0000000000000007",
+            ];
+            let of_b = [*b"0000000000000001", *b"0000000000000009"];
+            let all = store.find_all_in_card_order().await?;
+            assert_eq!(ids(&all), [of_a.as_slice(), of_b.as_slice()].concat());
+            assert_eq!(drain(store.stream_in_card_order().await?).await?, all);
+            for (card_num, expected) in [(&card_a, of_a.as_slice()), (&card_b, of_b.as_slice())] {
+                let found = store.find_by_card(card_num).await?;
+                assert_eq!(ids(&found), expected);
+                assert!(found.iter().all(|record| record.card_num == *card_num));
+            }
+            assert!(store.find_by_card(&unknown).await?.is_empty());
 
-        // A transaction reads its own uncommitted row in both.
-        let mut tx = store.begin().await?;
-        tx.insert(&record(b"0000000000000002", CARD_A, BLANK_TS)?)
-            .await?;
-        let in_tx = tx.find_all_in_card_order().await?;
-        assert_eq!(in_tx.len(), all.len() + 1);
-        assert_eq!(drain(tx.stream_in_card_order().await?).await?, in_tx);
-        let of_a_in_tx = [&[*b"0000000000000002"], of_a.as_slice()].concat();
-        assert_eq!(ids(&tx.find_by_card(&card_a).await?), of_a_in_tx);
-        let mut partly = tx.stream_in_card_order().await?;
-        assert!(partly.next().await?.is_some());
-        drop(partly);
-        assert!(tx.find_by_card(&unknown).await?.is_empty());
-        tx.rollback().await?;
+            // A transaction reads its own uncommitted row in both.
+            let mut tx = store.begin().await?;
+            tx.insert(&record(b"0000000000000002", CARD_A, BLANK_TS)?)
+                .await?;
+            let in_tx = tx.find_all_in_card_order().await?;
+            assert_eq!(in_tx.len(), all.len() + 1);
+            assert_eq!(drain(tx.stream_in_card_order().await?).await?, in_tx);
+            let of_a_in_tx = [&[*b"0000000000000002"], of_a.as_slice()].concat();
+            assert_eq!(ids(&tx.find_by_card(&card_a).await?), of_a_in_tx);
+            let mut partly = tx.stream_in_card_order().await?;
+            assert!(partly.next().await?.is_some());
+            drop(partly);
+            assert!(tx.find_by_card(&unknown).await?.is_empty());
+            tx.rollback().await?;
 
-        // A session sees the committed rows alone.
-        let mut session = store.session().await?;
-        assert_eq!(drain(session.stream_in_card_order().await?).await?, all);
-        assert_eq!(ids(&session.find_by_card(&card_b).await?), of_b);
-        session.close().await?;
-        Ok(())
+            // A session sees the committed rows alone.
+            let mut session = store.session().await?;
+            assert_eq!(drain(session.stream_in_card_order().await?).await?, all);
+            assert_eq!(ids(&session.find_by_card(&card_b).await?), of_b);
+            session.close().await?;
+            Ok(())
+        })
     }
 
     /// A double that holds the answer of its window read: the default
@@ -1245,28 +1261,30 @@ mod tests {
 
     /// The default stream of a double, and rows built from results, which end at their first
     /// error and stay ended.
-    #[tokio::test]
-    async fn held_rows_yield_their_records_and_end_at_the_first_error() -> TestResult {
-        let (start, end) = (day(2022, 1, 1)?, day(2022, 7, 6)?);
-        let first = record(b"0000000000000002", CARD_A, b"2022-01-01 00:00:00.000000")?;
-        let second = record(b"0000000000000001", CARD_B, b"2022-03-15                ")?;
-        let held = vec![first.clone(), second.clone()];
-        let mut answering = Held(Ok(held.clone()));
-        let streamed = drain(answering.stream_processed_between(start, end).await?).await?;
-        assert_eq!(streamed, held);
-        let mut failing = Held(Err(PersistenceError::Unavailable));
-        let refused = failing.stream_processed_between(start, end).await;
-        assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
+    #[test]
+    fn held_rows_yield_their_records_and_end_at_the_first_error() -> TestResult {
+        block_on(async {
+            let (start, end) = (day(2022, 1, 1)?, day(2022, 7, 6)?);
+            let first = record(b"0000000000000002", CARD_A, b"2022-01-01 00:00:00.000000")?;
+            let second = record(b"0000000000000001", CARD_B, b"2022-03-15                ")?;
+            let held = vec![first.clone(), second.clone()];
+            let mut answering = Held(Ok(held.clone()));
+            let streamed = drain(answering.stream_processed_between(start, end).await?).await?;
+            assert_eq!(streamed, held);
+            let mut failing = Held(Err(PersistenceError::Unavailable));
+            let refused = failing.stream_processed_between(start, end).await;
+            assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
 
-        let mut rows = TransactionRows::from_results(vec![
-            Ok(first.clone()),
-            Err(PersistenceError::Unavailable),
-            Ok(second),
-        ]);
-        assert_eq!(rows.next().await?, Some(first));
-        assert_eq!(rows.next().await, Err(PersistenceError::Unavailable));
-        assert_eq!(rows.next().await?, None);
-        Ok(())
+            let mut rows = TransactionRows::from_results(vec![
+                Ok(first.clone()),
+                Err(PersistenceError::Unavailable),
+                Ok(second),
+            ]);
+            assert_eq!(rows.next().await?, Some(first));
+            assert_eq!(rows.next().await, Err(PersistenceError::Unavailable));
+            assert_eq!(rows.next().await?, None);
+            Ok(())
+        })
     }
 
     /// A double that holds the answer of its card-order read: the default
@@ -1335,148 +1353,155 @@ mod tests {
     /// The default card-order reads of a double: the stream yields the held records in their
     /// order; `find_by_card` keeps one card's records in that order, none for a card no record
     /// carries; both fail as the whole read fails.
-    #[tokio::test]
-    async fn held_card_order_is_streamed_and_read_by_card_by_default() -> TestResult {
-        let (card_a, card_b) = (card(CARD_A), card(CARD_B));
-        let a1 = record(b"0000000000000001", CARD_A, BLANK_TS)?;
-        let a3 = record(b"0000000000000003", CARD_A, BLANK_TS)?;
-        let b2 = record(b"0000000000000002", CARD_B, BLANK_TS)?;
-        let held = vec![a1.clone(), a3.clone(), b2.clone()];
-        let mut answering = CardOrdered(Ok(held.clone()));
-        assert_eq!(drain(answering.stream_in_card_order().await?).await?, held);
-        assert_eq!(answering.find_by_card(&card_a).await?, [a1, a3]);
-        assert_eq!(answering.find_by_card(&card_b).await?, [b2]);
-        let unknown = card(b"9900000000000003");
-        assert!(answering.find_by_card(&unknown).await?.is_empty());
+    #[test]
+    fn held_card_order_is_streamed_and_read_by_card_by_default() -> TestResult {
+        block_on(async {
+            let (card_a, card_b) = (card(CARD_A), card(CARD_B));
+            let a1 = record(b"0000000000000001", CARD_A, BLANK_TS)?;
+            let a3 = record(b"0000000000000003", CARD_A, BLANK_TS)?;
+            let b2 = record(b"0000000000000002", CARD_B, BLANK_TS)?;
+            let held = vec![a1.clone(), a3.clone(), b2.clone()];
+            let mut answering = CardOrdered(Ok(held.clone()));
+            assert_eq!(drain(answering.stream_in_card_order().await?).await?, held);
+            assert_eq!(answering.find_by_card(&card_a).await?, [a1, a3]);
+            assert_eq!(answering.find_by_card(&card_b).await?, [b2]);
+            let unknown = card(b"9900000000000003");
+            assert!(answering.find_by_card(&unknown).await?.is_empty());
 
-        let mut failing = CardOrdered(Err(PersistenceError::Unavailable));
-        let refused = failing.stream_in_card_order().await;
-        assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
-        assert_eq!(
-            failing.find_by_card(&card_a).await,
-            Err(PersistenceError::Unavailable)
-        );
-        Ok(())
+            let mut failing = CardOrdered(Err(PersistenceError::Unavailable));
+            let refused = failing.stream_in_card_order().await;
+            assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
+            assert_eq!(
+                failing.find_by_card(&card_a).await,
+                Err(PersistenceError::Unavailable)
+            );
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn keys_no_statement_can_bind_and_negative_limits_are_refused() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let high_values = PicX::from_array([0xFF; 16]);
-        let invalid = PersistenceError::decode("tran_id", DecodeKind::InvalidByte);
-        assert_eq!(
-            store.page_after(&high_values, 1).await,
-            Err(invalid.clone())
-        );
-        assert_eq!(
-            store.page_before(&high_values, 1).await,
-            Err(invalid.clone())
-        );
-        assert_eq!(store.find_by_id(&high_values).await, Err(invalid));
-        // A card number no `CHAR(16)` value can hold names the column alone.
-        let unbound = PersistenceError::decode("card_num", DecodeKind::InvalidByte);
-        assert_eq!(
-            store.find_by_card(&CardNumber::new(high_values)).await,
-            Err(unbound)
-        );
-        let refused = store.page_after(&PicX::spaces(), -1).await;
-        assert_eq!(
-            refused.as_ref().err().and_then(PersistenceError::sqlstate),
-            Some("2201W")
-        );
-        Ok(())
+    #[test]
+    fn keys_no_statement_can_bind_and_negative_limits_are_refused() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let high_values = PicX::from_array([0xFF; 16]);
+            let invalid = PersistenceError::decode("tran_id", DecodeKind::InvalidByte);
+            assert_eq!(
+                store.page_after(&high_values, 1).await,
+                Err(invalid.clone())
+            );
+            assert_eq!(
+                store.page_before(&high_values, 1).await,
+                Err(invalid.clone())
+            );
+            assert_eq!(store.find_by_id(&high_values).await, Err(invalid));
+            // A card number no `CHAR(16)` value can hold names the column alone.
+            let unbound = PersistenceError::decode("card_num", DecodeKind::InvalidByte);
+            assert_eq!(
+                store.find_by_card(&CardNumber::new(high_values)).await,
+                Err(unbound)
+            );
+            let refused = store.page_after(&PicX::spaces(), -1).await;
+            assert_eq!(
+                refused.as_ref().err().and_then(PersistenceError::sqlstate),
+                Some("2201W")
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRN02C-043
     // audit: COBIL00C-023
-    #[tokio::test]
-    async fn tx_allocation_wraps_and_refuses_a_highest_id_that_is_not_digits() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let mut tx = store.begin().await?;
-        tx.insert(&record(b"9999999999999999", CARD_A, BLANK_TS)?)
-            .await?;
+    #[test]
+    fn tx_allocation_wraps_and_refuses_a_highest_id_that_is_not_digits() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let mut tx = store.begin().await?;
+            tx.insert(&record(b"9999999999999999", CARD_A, BLANK_TS)?)
+                .await?;
 
-        // `ADD 1` to sixteen 9s stores sixteen 0s. The transaction sees its own insert; the
-        // pool does not, until the commit.
-        assert_eq!(tx.next_id().await?, key(b"0000000000000000"));
-        assert_eq!(store.next_id().await?, key(b"0000000000000001"));
+            // `ADD 1` to sixteen 9s stores sixteen 0s. The transaction sees its own insert; the
+            // pool does not, until the commit.
+            assert_eq!(tx.next_id().await?, key(b"0000000000000000"));
+            assert_eq!(store.next_id().await?, key(b"0000000000000001"));
 
-        // A highest ID with a byte other than a digit is refused, naming the column alone.
-        let not_numeric = PersistenceError::decode("tran_id", DecodeKind::NotNumeric);
-        for odd in [b"999999999999999:", b"ABCDEFGHIJKLMNOP"] {
-            let mut savepoint = tx.savepoint().await?;
-            savepoint.insert(&record(odd, CARD_A, BLANK_TS)?).await?;
-            assert_eq!(
-                savepoint.find_last().await?.map(|last| last.id),
-                Some(key(odd))
-            );
-            assert_eq!(savepoint.next_id().await, Err(not_numeric.clone()));
-            savepoint.rollback().await?;
-        }
-        assert_eq!(tx.next_id().await?, key(b"0000000000000000"));
-        tx.commit().await?;
-        assert_eq!(store.next_id().await?, key(b"0000000000000000"));
-        Ok(())
+            // A highest ID with a byte other than a digit is refused, naming the column alone.
+            let not_numeric = PersistenceError::decode("tran_id", DecodeKind::NotNumeric);
+            for odd in [b"999999999999999:", b"ABCDEFGHIJKLMNOP"] {
+                let mut savepoint = tx.savepoint().await?;
+                savepoint.insert(&record(odd, CARD_A, BLANK_TS)?).await?;
+                assert_eq!(
+                    savepoint.find_last().await?.map(|last| last.id),
+                    Some(key(odd))
+                );
+                assert_eq!(savepoint.next_id().await, Err(not_numeric.clone()));
+                savepoint.rollback().await?;
+            }
+            assert_eq!(tx.next_id().await?, key(b"0000000000000000"));
+            tx.commit().await?;
+            assert_eq!(store.next_id().await?, key(b"0000000000000000"));
+            Ok(())
+        })
     }
 
     // audit: CBTRN02C-025
     // audit: COTRN02C-050
-    #[tokio::test]
-    async fn tx_reads_its_own_rows_and_survives_a_failed_insert_only_in_a_savepoint() -> TestResult
-    {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let first = record(b"0000000000000041", CARD_B, b"2022-05-01 08:00:00.000000")?;
-        let second = record(b"0000000000000042", CARD_A, BLANK_TS)?;
+    #[test]
+    fn tx_reads_its_own_rows_and_survives_a_failed_insert_only_in_a_savepoint() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let first = record(b"0000000000000041", CARD_B, b"2022-05-01 08:00:00.000000")?;
+            let second = record(b"0000000000000042", CARD_A, BLANK_TS)?;
 
-        // Inside a savepoint the failed insert is undone and the transaction goes on.
-        let mut tx = store.begin().await?;
-        tx.insert(&first).await?;
-        tx.insert(&second).await?;
-        let mut savepoint = tx.savepoint().await?;
-        let clash = record(b"0000000000000041", CARD_A, BLANK_TS)?;
-        let refused = savepoint.insert(&clash).await;
-        assert!(refused.as_ref().is_err_and(PersistenceError::is_duplicate));
-        savepoint.rollback().await?;
-        assert_eq!(tx.next_id().await?, key(b"0000000000000043"));
-        assert_eq!(tx.find_by_id(&first.id).await?.as_ref(), Some(&first));
-        assert_eq!(tx.find_last().await?.as_ref(), Some(&second));
-        let both_down = [*second.id.as_bytes(), *first.id.as_bytes()];
-        assert_eq!(ids(&tx.page_before(&second.id, 11).await?), both_down);
-        assert_eq!(
-            ids(&tx.page_after(&first.id, 1).await?),
-            [*first.id.as_bytes()]
-        );
-        let card_order = [*second.id.as_bytes(), *first.id.as_bytes()];
-        assert_eq!(ids(&tx.find_all_in_card_order().await?), card_order);
-        let may = day(2022, 5, 1)?;
-        let window = tx.find_processed_between(may, may).await?;
-        assert_eq!(window, [first.clone()]);
-        // The streamed selection sees the same uncommitted row. Rows dropped before their end
-        // stop the read and leave the transaction's connection usable.
-        let streamed = drain(tx.stream_processed_between(may, may).await?).await?;
-        assert_eq!(streamed, window);
-        let mut rows = tx.stream_processed_between(may, may).await?;
-        assert_eq!(rows.next().await?.as_ref(), Some(&first));
-        drop(rows);
-        assert_eq!(tx.next_id().await?, key(b"0000000000000043"));
-        tx.commit().await?;
+            // Inside a savepoint the failed insert is undone and the transaction goes on.
+            let mut tx = store.begin().await?;
+            tx.insert(&first).await?;
+            tx.insert(&second).await?;
+            let mut savepoint = tx.savepoint().await?;
+            let clash = record(b"0000000000000041", CARD_A, BLANK_TS)?;
+            let refused = savepoint.insert(&clash).await;
+            assert!(refused.as_ref().is_err_and(PersistenceError::is_duplicate));
+            savepoint.rollback().await?;
+            assert_eq!(tx.next_id().await?, key(b"0000000000000043"));
+            assert_eq!(tx.find_by_id(&first.id).await?.as_ref(), Some(&first));
+            assert_eq!(tx.find_last().await?.as_ref(), Some(&second));
+            let both_down = [*second.id.as_bytes(), *first.id.as_bytes()];
+            assert_eq!(ids(&tx.page_before(&second.id, 11).await?), both_down);
+            assert_eq!(
+                ids(&tx.page_after(&first.id, 1).await?),
+                [*first.id.as_bytes()]
+            );
+            let card_order = [*second.id.as_bytes(), *first.id.as_bytes()];
+            assert_eq!(ids(&tx.find_all_in_card_order().await?), card_order);
+            let may = day(2022, 5, 1)?;
+            let window = tx.find_processed_between(may, may).await?;
+            assert_eq!(window, [first.clone()]);
+            // The streamed selection sees the same uncommitted row. Rows dropped before their end
+            // stop the read and leave the transaction's connection usable.
+            let streamed = drain(tx.stream_processed_between(may, may).await?).await?;
+            assert_eq!(streamed, window);
+            let mut rows = tx.stream_processed_between(may, may).await?;
+            assert_eq!(rows.next().await?.as_ref(), Some(&first));
+            drop(rows);
+            assert_eq!(tx.next_id().await?, key(b"0000000000000043"));
+            tx.commit().await?;
 
-        // Without a savepoint the failed insert aborts the transaction: the next statement is
-        // refused (SQLSTATE 25P02), and the rollback leaves the table as it was.
-        let mut tx = store.begin().await?;
-        let refused = tx.insert(&clash).await;
-        assert!(refused.as_ref().is_err_and(PersistenceError::is_duplicate));
-        let aborted = tx.next_id().await;
-        assert_eq!(
-            aborted.as_ref().err().and_then(PersistenceError::sqlstate),
-            Some("25P02")
-        );
-        tx.rollback().await?;
-        assert_eq!(store.find_by_id(&first.id).await?, Some(first));
-        assert_eq!(store.next_id().await?, key(b"0000000000000043"));
-        Ok(())
+            // Without a savepoint the failed insert aborts the transaction: the next statement is
+            // refused (SQLSTATE 25P02), and the rollback leaves the table as it was.
+            let mut tx = store.begin().await?;
+            let refused = tx.insert(&clash).await;
+            assert!(refused.as_ref().is_err_and(PersistenceError::is_duplicate));
+            let aborted = tx.next_id().await;
+            assert_eq!(
+                aborted.as_ref().err().and_then(PersistenceError::sqlstate),
+                Some("25P02")
+            );
+            tx.rollback().await?;
+            assert_eq!(store.find_by_id(&first.id).await?, Some(first));
+            assert_eq!(store.next_id().await?, key(b"0000000000000043"));
+            Ok(())
+        })
     }
 }

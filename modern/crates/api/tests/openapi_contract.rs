@@ -761,7 +761,7 @@ fn emitter_refuses_any_other_command_line() -> TestResult {
 }
 
 /// The HS256 secret of the test state: a local-only value.
-const SECRET: &str = "openapi-contract-test-secret";
+const SECRET: &str = "openapi-contract-local-only-test-secret";
 
 /// The administrator of the `DUSRSECJ` deck and the password of every deck user (README).
 const ADMIN_USER: &str = "ADMIN001";

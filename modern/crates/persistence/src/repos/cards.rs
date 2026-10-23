@@ -688,6 +688,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// Card numbers in ascending order. None is a fixture card number: no test here quotes
     /// `carddata.txt`.
     const NUMBERS: [&str; 5] = [
@@ -823,48 +832,50 @@ mod tests {
     /// and filtered in SQL, and the reads by number and by handle find a card or report `None`,
     /// on the pool and inside a transaction alike; a duplicate number is refused by `cards_pkey`
     /// and a negative bound by the server.
-    #[tokio::test]
-    async fn browses_and_lookups_follow_the_key_order_filters_and_handles() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let cards = sample()?;
-        for record in &cards {
-            store.insert(record).await?;
-        }
-        let [_, _, c3, _, _] = &cards;
-        assert_eq!(
-            store.insert(c3).await,
-            Err(PersistenceError::Duplicate {
-                constraint: Some("cards_pkey".to_owned())
-            })
-        );
+    #[test]
+    fn browses_and_lookups_follow_the_key_order_filters_and_handles() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let cards = sample()?;
+            for record in &cards {
+                store.insert(record).await?;
+            }
+            let [_, _, c3, _, _] = &cards;
+            assert_eq!(
+                store.insert(c3).await,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some("cards_pkey".to_owned())
+                })
+            );
 
-        let all = store.find_all().await?;
-        assert_eq!(records(&all), cards.to_vec());
-        let entries = exactly::<5>(all)?;
-        let handles = entries.clone().map(|(handle, _)| handle);
-        assert!(
-            handles
-                .iter()
-                .enumerate()
-                .all(|(i, h)| !handles.iter().skip(i + 1).any(|o| o == h))
-        );
+            let all = store.find_all().await?;
+            assert_eq!(records(&all), cards.to_vec());
+            let entries = exactly::<5>(all)?;
+            let handles = entries.clone().map(|(handle, _)| handle);
+            assert!(
+                handles
+                    .iter()
+                    .enumerate()
+                    .all(|(i, h)| !handles.iter().skip(i + 1).any(|o| o == h))
+            );
 
-        check_lookups(&mut store, &cards, &entries).await?;
-        check_forward(&mut store, &cards, &entries).await?;
-        check_backward(&mut store, &cards, &entries).await?;
-        assert!(matches!(
-            store.page_after(None, None, None, -1).await,
-            Err(PersistenceError::Database { .. })
-        ));
+            check_lookups(&mut store, &cards, &entries).await?;
+            check_forward(&mut store, &cards, &entries).await?;
+            check_backward(&mut store, &cards, &entries).await?;
+            assert!(matches!(
+                store.page_after(None, None, None, -1).await,
+                Err(PersistenceError::Database { .. })
+            ));
 
-        let mut tx = store.begin().await?;
-        check_lookups(&mut tx, &cards, &entries).await?;
-        check_forward(&mut tx, &cards, &entries).await?;
-        check_backward(&mut tx, &cards, &entries).await?;
-        assert_eq!(tx.find_all().await?, entries.to_vec());
-        tx.commit().await?;
-        Ok(())
+            let mut tx = store.begin().await?;
+            check_lookups(&mut tx, &cards, &entries).await?;
+            check_forward(&mut tx, &cards, &entries).await?;
+            check_backward(&mut tx, &cards, &entries).await?;
+            assert_eq!(tx.find_all().await?, entries.to_vec());
+            tx.commit().await?;
+            Ok(())
+        })
     }
 
     // audit: COCRDUPC-036
@@ -872,79 +883,82 @@ mod tests {
     /// A reload replaces the rows in one transaction and gives every card a new handle; an update
     /// rewrites every column but the key and the handle; a row lock taken on a transaction holds
     /// off a second one until the first commits.
-    #[tokio::test]
-    async fn reloads_updates_and_row_locks_keep_their_contracts() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let [c1, c2, c3, _, c5] = sample()?;
-        let [n1, n2, ..] = NUMBERS;
-        let load = [c1.clone(), c2.clone(), c3.clone()];
+    #[test]
+    fn reloads_updates_and_row_locks_keep_their_contracts() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let [c1, c2, c3, _, c5] = sample()?;
+            let [n1, n2, ..] = NUMBERS;
+            let load = [c1.clone(), c2.clone(), c3.clone()];
 
-        // Two loads of the same records: same contents, all-new handles (LOADS-026, LOADS-027).
-        assert_eq!(store.replace_all(&load).await?, 3);
-        let first = store.find_all().await?;
-        assert_eq!(store.replace_all(&load).await?, 3);
-        let second = store.find_all().await?;
-        assert_eq!(records(&first), load.to_vec());
-        assert_eq!(records(&second), load.to_vec());
-        assert!(
-            second
-                .iter()
-                .all(|(new, _)| first.iter().all(|(old, _)| old != new))
-        );
-        for (old, _) in &first {
-            assert_eq!(store.find_by_ref(*old).await?, None);
-        }
+            // Two loads of the same records: same contents, all-new handles (LOADS-026, LOADS-027).
+            assert_eq!(store.replace_all(&load).await?, 3);
+            let first = store.find_all().await?;
+            assert_eq!(store.replace_all(&load).await?, 3);
+            let second = store.find_all().await?;
+            assert_eq!(records(&first), load.to_vec());
+            assert_eq!(records(&second), load.to_vec());
+            assert!(
+                second
+                    .iter()
+                    .all(|(new, _)| first.iter().all(|(old, _)| old != new))
+            );
+            for (old, _) in &first {
+                assert_eq!(store.find_by_ref(*old).await?, None);
+            }
 
-        // A failing load leaves the previous contents (LOADS-018).
-        assert!(matches!(
-            store.replace_all(&[c5.clone(), c5.clone()]).await,
-            Err(PersistenceError::Duplicate { .. })
-        ));
-        assert_eq!(store.find_all().await?, second);
+            // A failing load leaves the previous contents (LOADS-018).
+            assert!(matches!(
+                store.replace_all(&[c5.clone(), c5.clone()]).await,
+                Err(PersistenceError::Duplicate { .. })
+            ));
+            assert_eq!(store.find_all().await?, second);
 
-        // A load inside the caller's transaction, rolled back, leaves them too; an empty load
-        // empties the table.
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(slice::from_ref(&c5)).await?, 1);
-        assert_eq!(records(&tx.find_all().await?), vec![c5.clone()]);
-        assert_eq!(tx.replace_all(&[]).await?, 0);
-        assert_eq!(tx.find_all().await?, Vec::new());
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, second);
-
-        // The rewrite keeps the key and the handle and changes every other column.
-        let [s1, s2, _] = exactly::<3>(second)?;
-        let renamed = card(n2, 777, "RENAMED HOLDER", "N")?;
-        assert!(store.update(&renamed).await?);
-        assert_eq!(
-            store.find_by_id(&c2.num).await?,
-            Some((s2.0, renamed.clone()))
-        );
-        assert!(!store.update(&c5).await?);
-        assert_eq!(store.find_by_id(&c5.num).await?, None);
-
-        // `READ … UPDATE`: the second lock waits for the first transaction, then reads its write.
-        let mut holder = store.begin().await?;
-        assert_eq!(holder.lock_by_id(&c1.num).await?, Some(s1.clone()));
-        let waiter_store = store.clone();
-        let key = c1.num.clone();
-        let waiter = tokio::spawn(async move {
-            let mut tx = waiter_store.begin().await?;
-            let locked = tx.lock_by_id(&key).await?;
+            // A load inside the caller's transaction, rolled back, leaves them too; an empty load
+            // empties the table.
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(slice::from_ref(&c5)).await?, 1);
+            assert_eq!(records(&tx.find_all().await?), vec![c5.clone()]);
+            assert_eq!(tx.replace_all(&[]).await?, 0);
+            assert_eq!(tx.find_all().await?, Vec::new());
             tx.rollback().await?;
-            Ok::<_, PersistenceError>(locked)
-        });
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(!waiter.is_finished());
-        let blocked = card(n1, 901, "SAMPLE HOLDER", "N")?;
-        assert!(holder.update(&blocked).await?);
-        holder.commit().await?;
-        assert_eq!(waiter.await??, Some((s1.0, blocked)));
+            assert_eq!(store.find_all().await?, second);
 
-        // Without a transaction the lock ends with the call, so the next lock does not wait.
-        assert!(store.lock_by_id(&c1.num).await?.is_some());
-        assert!(store.lock_by_id(&c1.num).await?.is_some());
-        Ok(())
+            // The rewrite keeps the key and the handle and changes every other column.
+            let [s1, s2, _] = exactly::<3>(second)?;
+            let renamed = card(n2, 777, "RENAMED HOLDER", "N")?;
+            assert!(store.update(&renamed).await?);
+            assert_eq!(
+                store.find_by_id(&c2.num).await?,
+                Some((s2.0, renamed.clone()))
+            );
+            assert!(!store.update(&c5).await?);
+            assert_eq!(store.find_by_id(&c5.num).await?, None);
+
+            // `READ … UPDATE`: the second lock waits for the first transaction, then reads its
+            // write.
+            let mut holder = store.begin().await?;
+            assert_eq!(holder.lock_by_id(&c1.num).await?, Some(s1.clone()));
+            let waiter_store = store.clone();
+            let key = c1.num.clone();
+            let waiter = tokio::spawn(async move {
+                let mut tx = waiter_store.begin().await?;
+                let locked = tx.lock_by_id(&key).await?;
+                tx.rollback().await?;
+                Ok::<_, PersistenceError>(locked)
+            });
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!waiter.is_finished());
+            let blocked = card(n1, 901, "SAMPLE HOLDER", "N")?;
+            assert!(holder.update(&blocked).await?);
+            holder.commit().await?;
+            assert_eq!(waiter.await??, Some((s1.0, blocked)));
+
+            // Without a transaction the lock ends with the call, so the next lock does not wait.
+            assert!(store.lock_by_id(&c1.num).await?.is_some());
+            assert!(store.lock_by_id(&c1.num).await?.is_some());
+            Ok(())
+        })
     }
 }

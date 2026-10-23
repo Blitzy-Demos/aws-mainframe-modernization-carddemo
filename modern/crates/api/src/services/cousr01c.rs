@@ -64,8 +64,9 @@ use domain::online::cousr01c::{self, UserAddFailure, UserAddInput};
 use domain::password::{self, PasswordError};
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
+use tracing::{Level, Metadata, field};
 
-use crate::app::{AppState, PasswordWork, PasswordWorkError};
+use crate::app::{AppState, EventSite, PasswordWork, PasswordWorkError, emit, event_metadata};
 use crate::auth::extract::AdminUser;
 use crate::dto::cousr01c::UserAddRequest;
 use crate::error::ServiceError;
@@ -176,25 +177,59 @@ fn hashed<T>(
     match computed {
         Ok((record, Ok(password_hash))) => Ok((record, password_hash)),
         Ok((_, Err(error))) => {
-            tracing::error!(
-                program = PROGRAM,
-                paragraph = ENTER_PARAGRAPH,
-                error = %error,
-                "password not hashed; answering Unable to Add User"
-            );
+            not_hashed(error);
             Err(ServiceError::Rule(cousr01c::write_failure()))
         }
         Err(PasswordWorkError::Saturated) => Err(ServiceError::Saturated),
         Err(PasswordWorkError::Interrupted { panicked }) => {
-            tracing::error!(
-                program = PROGRAM,
-                paragraph = ENTER_PARAGRAPH,
-                panicked,
-                "password hashing task did not complete; answering Unable to Add User"
-            );
+            hashing_incomplete(panicked);
             Err(ServiceError::Rule(cousr01c::write_failure()))
         }
     }
+}
+
+/// The `ERROR` event of a password argon2id could not hash: the program, the paragraph and the
+/// fixed class text of `error`.
+fn not_hashed(error: PasswordError) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "not_hashed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"password not hashed; answering Unable to Add User"),
+            Some(&PROGRAM),
+            Some(&ENTER_PARAGRAPH),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// The `ERROR` event of a hashing task that did not complete: the program, the paragraph and
+/// whether it `panicked`, never its payload.
+fn hashing_incomplete(panicked: bool) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "hashing_incomplete",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "panicked"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"password hashing task did not complete; answering Unable to Add User"),
+            Some(&PROGRAM),
+            Some(&ENTER_PARAGRAPH),
+            Some(&panicked),
+        ],
+    );
 }
 
 /// The program's answer to a failed insert: `DUPKEY`/`DUPREC` for the `users_pkey` violation,
@@ -208,14 +243,31 @@ fn write_answer(error: &PersistenceError) -> UserAddFailure {
     if error.is_duplicate() {
         cousr01c::duplicate_user_id()
     } else {
-        tracing::error!(
-            program = PROGRAM,
-            paragraph = WRITE_PARAGRAPH,
-            error = %error,
-            "USRSEC write failed; answering Unable to Add User"
-        );
+        write_failed(error);
         cousr01c::write_failure()
     }
+}
+
+/// The `ERROR` event of a `WHEN OTHER` insert failure: the program, the paragraph and the
+/// store's `error` by its `Display`.
+fn write_failed(error: &PersistenceError) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "write_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "program", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"USRSEC write failed; answering Unable to Add User"),
+            Some(&PROGRAM),
+            Some(&WRITE_PARAGRAPH),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -240,8 +292,8 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn Error>>;
 
-    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-    /// without the lint attributes that macro's expansion carries.
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
     fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -364,34 +416,35 @@ mod tests {
     // audit: COUSR01C-018
     // audit: COUSR01C-019
     // audit: COUSR01C-021
-    #[tokio::test]
-    async fn a_valid_request_stores_every_field_as_typed_with_the_hash_of_its_password()
-    -> TestResult {
-        let mut store = InsertOnly::answering(Ok(()));
-        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
-        assert_eq!(message, "User NEWUSR01 has been added ...");
+    #[test]
+    fn a_valid_request_stores_every_field_as_typed_with_the_hash_of_its_password() -> TestResult {
+        block_on(async {
+            let mut store = InsertOnly::answering(Ok(()));
+            let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
+            assert_eq!(message, "User NEWUSR01 has been added ...");
 
-        let [entry] = store.inserted.as_slice() else {
-            return Err(format!("{} inserts", store.inserted.len()).into());
-        };
-        assert_eq!(entry.id, PicX::from_array(*b"NEWUSR01"));
-        assert_eq!(entry.fname, PicX::from_text(" jane")?);
-        assert_eq!(entry.lname, PicX::from_text("o'Neil")?);
-        assert_eq!(entry.usr_type, PicX::from_array(*b"a"));
-        assert!(entry.filler.is_spaces());
+            let [entry] = store.inserted.as_slice() else {
+                return Err(format!("{} inserts", store.inserted.len()).into());
+            };
+            assert_eq!(entry.id, PicX::from_array(*b"NEWUSR01"));
+            assert_eq!(entry.fname, PicX::from_text(" jane")?);
+            assert_eq!(entry.lname, PicX::from_text("o'Neil")?);
+            assert_eq!(entry.usr_type, PicX::from_array(*b"a"));
+            assert!(entry.filler.is_spaces());
 
-        assert!(entry.password_hash.starts_with("$argon2id$"));
-        assert!(!entry.password_hash.contains(PASSWORD));
-        assert_eq!(
-            password::verify(STORED_PASSWORD, &entry.password_hash),
-            Ok(true)
-        );
-        // Hashed as typed, never upper-cased: sign-on's upper-cased compare fails (E26).
-        assert_eq!(
-            password::verify(SIGNON_PASSWORD, &entry.password_hash),
-            Ok(false)
-        );
-        Ok(())
+            assert!(entry.password_hash.starts_with("$argon2id$"));
+            assert!(!entry.password_hash.contains(PASSWORD));
+            assert_eq!(
+                password::verify(STORED_PASSWORD, &entry.password_hash),
+                Ok(true)
+            );
+            // Hashed as typed, never upper-cased: sign-on's upper-cased compare fails (E26).
+            assert_eq!(
+                password::verify(SIGNON_PASSWORD, &entry.password_hash),
+                Ok(false)
+            );
+            Ok(())
+        })
     }
 
     // audit: COUSR01C-010
@@ -399,172 +452,185 @@ mod tests {
     // audit: COUSR01C-012
     // audit: COUSR01C-013
     // audit: COUSR01C-014
-    #[tokio::test]
-    async fn the_first_empty_field_answers_and_nothing_is_written() -> TestResult {
-        type Blank = fn(&mut UserAddRequest);
-        let cases: [(Blank, &str, &str); 5] = [
-            (
-                |r| r.first_name.clear(),
-                "First Name can NOT be empty...",
-                "first_name",
-            ),
-            (
-                |r| r.last_name = "   ".to_owned(),
-                "Last Name can NOT be empty...",
-                "last_name",
-            ),
-            (
-                |r| r.user_id.clear(),
-                "User ID can NOT be empty...",
-                "user_id",
-            ),
-            (
-                |r| r.password = " ".to_owned(),
-                "Password can NOT be empty...",
-                "password",
-            ),
-            (
-                |r| r.user_type.clear(),
-                "User Type can NOT be empty...",
-                "user_type",
-            ),
-        ];
-        for (position, &(blank, message, field)) in cases.iter().enumerate() {
-            // The field alone, then with every later field empty too: the earliest one answers.
-            let mut alone = request();
-            blank(&mut alone);
-            let mut with_later = request();
-            for &(later, _, _) in cases.iter().skip(position) {
-                later(&mut with_later);
+    #[test]
+    fn the_first_empty_field_answers_and_nothing_is_written() -> TestResult {
+        block_on(async {
+            type Blank = fn(&mut UserAddRequest);
+            let cases: [(Blank, &str, &str); 5] = [
+                (
+                    |r| r.first_name.clear(),
+                    "First Name can NOT be empty...",
+                    "first_name",
+                ),
+                (
+                    |r| r.last_name = "   ".to_owned(),
+                    "Last Name can NOT be empty...",
+                    "last_name",
+                ),
+                (
+                    |r| r.user_id.clear(),
+                    "User ID can NOT be empty...",
+                    "user_id",
+                ),
+                (
+                    |r| r.password = " ".to_owned(),
+                    "Password can NOT be empty...",
+                    "password",
+                ),
+                (
+                    |r| r.user_type.clear(),
+                    "User Type can NOT be empty...",
+                    "user_type",
+                ),
+            ];
+            for (position, &(blank, message, field)) in cases.iter().enumerate() {
+                // The field alone, then with every later field empty too: the earliest one answers.
+                let mut alone = request();
+                blank(&mut alone);
+                let mut with_later = request();
+                for &(later, _, _) in cases.iter().skip(position) {
+                    later(&mut with_later);
+                }
+                for case in [alone, with_later] {
+                    let mut store = InsertOnly::answering(Ok(()));
+                    let failure =
+                        rule(insert_user(&mut store, &PasswordWork::default(), case).await)?;
+                    assert_eq!(
+                        (failure.message(), failure.field().name()),
+                        (message, field)
+                    );
+                    assert_eq!(failure.class().http_status(), 400, "{message}");
+                    assert!(store.inserted.is_empty(), "{message}");
+                }
             }
-            for case in [alone, with_later] {
-                let mut store = InsertOnly::answering(Ok(()));
-                let failure = rule(insert_user(&mut store, &PasswordWork::default(), case).await)?;
-                assert_eq!(
-                    (failure.message(), failure.field().name()),
-                    (message, field)
-                );
-                assert_eq!(failure.class().http_status(), 400, "{message}");
-                assert!(store.inserted.is_empty(), "{message}");
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     // audit: COUSR01C-023
-    #[tokio::test]
-    async fn a_taken_user_id_is_the_duplicate_answer() -> TestResult {
-        let traces = trace_capture::capture();
-        for constraint in [Some("users_pkey".to_owned()), None] {
-            let mut store = InsertOnly::answering(Err(PersistenceError::Duplicate { constraint }));
-            let failure = rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
-            assert_eq!(failure, cousr01c::duplicate_user_id());
-            assert_eq!(
-                (failure.message(), failure.field().name()),
-                ("User ID already exist...", "user_id")
-            );
-            assert_eq!(store.inserted.len(), 1);
-        }
-        // A taken ID is the user's input, not an operational failure: nothing is logged.
-        assert!(traces.text().is_empty(), "{}", traces.text());
-        Ok(())
+    #[test]
+    fn a_taken_user_id_is_the_duplicate_answer() -> TestResult {
+        block_on(async {
+            let traces = trace_capture::capture();
+            for constraint in [Some("users_pkey".to_owned()), None] {
+                let mut store =
+                    InsertOnly::answering(Err(PersistenceError::Duplicate { constraint }));
+                let failure =
+                    rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
+                assert_eq!(failure, cousr01c::duplicate_user_id());
+                assert_eq!(
+                    (failure.message(), failure.field().name()),
+                    ("User ID already exist...", "user_id")
+                );
+                assert_eq!(store.inserted.len(), 1);
+            }
+            // A taken ID is the user's input, not an operational failure: nothing is logged.
+            assert!(traces.text().is_empty(), "{}", traces.text());
+            Ok(())
+        })
     }
 
     // audit: COUSR01C-024
-    #[tokio::test]
-    async fn any_other_store_error_is_unable_to_add_user() -> TestResult {
-        let errors = [
-            PersistenceError::Unavailable,
-            PersistenceError::NotFound,
-            PersistenceError::Database {
-                sqlstate: Some("57014".to_owned()),
-                constraint: None,
-            },
-            PersistenceError::Check {
-                constraint: Some("users_check".to_owned()),
-            },
-            PersistenceError::Restrict { constraint: None },
-            PersistenceError::decode("usr_id", DecodeKind::InvalidByte),
-        ];
-        let traces = trace_capture::capture();
-        for error in errors {
-            traces.clear();
-            let shown = format!("{error:?}");
-            let cause = error.to_string();
-            let mut store = InsertOnly::answering(Err(error));
-            let failure = rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
-            assert_eq!(failure, cousr01c::write_failure(), "{shown}");
-            assert_eq!(
-                (failure.message(), failure.field().name()),
-                ("Unable to Add User...", "first_name"),
-                "{shown}"
-            );
-            assert_eq!(failure.class().http_status(), 500, "{shown}");
+    #[test]
+    fn any_other_store_error_is_unable_to_add_user() -> TestResult {
+        block_on(async {
+            let errors = [
+                PersistenceError::Unavailable,
+                PersistenceError::NotFound,
+                PersistenceError::Database {
+                    sqlstate: Some("57014".to_owned()),
+                    constraint: None,
+                },
+                PersistenceError::Check {
+                    constraint: Some("users_check".to_owned()),
+                },
+                PersistenceError::Restrict { constraint: None },
+                PersistenceError::decode("usr_id", DecodeKind::InvalidByte),
+            ];
+            let traces = trace_capture::capture();
+            for error in errors {
+                traces.clear();
+                let shown = format!("{error:?}");
+                let cause = error.to_string();
+                let mut store = InsertOnly::answering(Err(error));
+                let failure =
+                    rule(insert_user(&mut store, &PasswordWork::default(), request()).await)?;
+                assert_eq!(failure, cousr01c::write_failure(), "{shown}");
+                assert_eq!(
+                    (failure.message(), failure.field().name()),
+                    ("Unable to Add User...", "first_name"),
+                    "{shown}"
+                );
+                assert_eq!(failure.class().http_status(), 500, "{shown}");
 
-            // The cause is logged once, before the answer, and the event names no request value.
-            let lines = traces.lines();
-            let [line] = lines.as_slice() else {
-                return Err(format!("{shown}: {} lines", lines.len()).into());
-            };
-            for expected in [
-                r#""level":"ERROR""#,
-                r#""program":"COUSR01C""#,
-                r#""paragraph":"WRITE-USER-SEC-FILE""#,
-                cause.as_str(),
-            ] {
-                assert!(line.contains(expected), "{expected} missing from {line}");
+                // The cause is logged once, before the answer, and the event names no request
+                // value.
+                let lines = traces.lines();
+                let [line] = lines.as_slice() else {
+                    return Err(format!("{shown}: {} lines", lines.len()).into());
+                };
+                for expected in [
+                    r#""level":"ERROR""#,
+                    r#""program":"COUSR01C""#,
+                    r#""paragraph":"WRITE-USER-SEC-FILE""#,
+                    cause.as_str(),
+                ] {
+                    assert!(line.contains(expected), "{expected} missing from {line}");
+                }
+                for value in [PASSWORD, "NEWUSR01", "$argon2id$"] {
+                    assert!(!line.contains(value), "{shown}: the event holds {value}");
+                }
             }
-            for value in [PASSWORD, "NEWUSR01", "$argon2id$"] {
-                assert!(!line.contains(value), "{shown}: the event holds {value}");
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     // audit: COUSR01C-024
-    #[tokio::test]
-    async fn a_hash_or_task_failure_is_logged_and_answers_unable_to_add_user() -> TestResult {
-        let traces = trace_capture::capture();
-        let cases = [
-            (
-                Err(PasswordWorkError::Interrupted { panicked: false }),
-                [
-                    "password hashing task did not complete",
-                    r#""panicked":false"#,
-                ],
-            ),
-            (
-                Ok(((), Err(PasswordError::Hash))),
-                ["password not hashed", "password hashing failed"],
-            ),
-        ];
-        for (computed, texts) in cases {
-            traces.clear();
-            assert_eq!(
-                hashed(computed),
-                Err(ServiceError::Rule(cousr01c::write_failure()))
-            );
-            let lines = traces.lines();
-            let [line] = lines.as_slice() else {
-                return Err(format!("{texts:?}: {} lines", lines.len()).into());
-            };
-            for expected in [
-                r#""level":"ERROR""#,
-                r#""program":"COUSR01C""#,
-                r#""paragraph":"PROCESS-ENTER-KEY""#,
-            ]
-            .into_iter()
-            .chain(texts)
-            {
-                assert!(line.contains(expected), "{expected} missing from {line}");
+    #[test]
+    fn a_hash_or_task_failure_is_logged_and_answers_unable_to_add_user() -> TestResult {
+        block_on(async {
+            let traces = trace_capture::capture();
+            let cases = [
+                (
+                    Err(PasswordWorkError::Interrupted { panicked: false }),
+                    [
+                        "password hashing task did not complete",
+                        r#""panicked":false"#,
+                    ],
+                ),
+                (
+                    Ok(((), Err(PasswordError::Hash))),
+                    ["password not hashed", "password hashing failed"],
+                ),
+            ];
+            for (computed, texts) in cases {
+                traces.clear();
+                assert_eq!(
+                    hashed(computed),
+                    Err(ServiceError::Rule(cousr01c::write_failure()))
+                );
+                let lines = traces.lines();
+                let [line] = lines.as_slice() else {
+                    return Err(format!("{texts:?}: {} lines", lines.len()).into());
+                };
+                for expected in [
+                    r#""level":"ERROR""#,
+                    r#""program":"COUSR01C""#,
+                    r#""paragraph":"PROCESS-ENTER-KEY""#,
+                ]
+                .into_iter()
+                .chain(texts)
+                {
+                    assert!(line.contains(expected), "{expected} missing from {line}");
+                }
             }
-        }
 
-        traces.clear();
-        let computed = hashed(Ok(((), Ok("$argon2id$v=19$stand-in".to_owned()))));
-        assert_eq!(computed, Ok(((), "$argon2id$v=19$stand-in".to_owned())));
-        assert!(traces.text().is_empty(), "{}", traces.text());
-        Ok(())
+            traces.clear();
+            let computed = hashed(Ok(((), Ok("$argon2id$v=19$stand-in".to_owned()))));
+            assert_eq!(computed, Ok(((), "$argon2id$v=19$stand-in".to_owned())));
+            assert!(traces.text().is_empty(), "{}", traces.text());
+            Ok(())
+        })
     }
 
     #[test]
@@ -599,75 +665,80 @@ mod tests {
     }
 
     // audit: COUSR01C-018
-    #[tokio::test]
-    async fn no_answer_or_stored_value_shows_the_password_or_its_hash() -> TestResult {
-        let mut store = InsertOnly::answering(Ok(()));
-        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
-        assert!(!message.contains(PASSWORD));
+    #[test]
+    fn no_answer_or_stored_value_shows_the_password_or_its_hash() -> TestResult {
+        block_on(async {
+            let mut store = InsertOnly::answering(Ok(()));
+            let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
+            assert!(!message.contains(PASSWORD));
 
-        let [entry] = store.inserted.as_slice() else {
-            return Err(format!("{} inserts", store.inserted.len()).into());
-        };
-        let shown = format!("{entry:?}");
-        assert!(!shown.contains(PASSWORD), "{shown}");
-        assert!(!shown.contains(&entry.password_hash), "{shown}");
-
-        let answers = [
-            Err(PersistenceError::Duplicate { constraint: None }),
-            Err(PersistenceError::Unavailable),
-        ];
-        for answer in answers {
-            let mut store = InsertOnly::answering(answer);
-            let error = match insert_user(&mut store, &PasswordWork::default(), request()).await {
-                Ok(message) => return Err(format!("added: {message}").into()),
-                Err(error) => error,
+            let [entry] = store.inserted.as_slice() else {
+                return Err(format!("{} inserts", store.inserted.len()).into());
             };
-            let shown = format!("{error} {error:?}");
+            let shown = format!("{entry:?}");
             assert!(!shown.contains(PASSWORD), "{shown}");
-        }
-        Ok(())
+            assert!(!shown.contains(&entry.password_hash), "{shown}");
+
+            let answers = [
+                Err(PersistenceError::Duplicate { constraint: None }),
+                Err(PersistenceError::Unavailable),
+            ];
+            for answer in answers {
+                let mut store = InsertOnly::answering(answer);
+                let error = match insert_user(&mut store, &PasswordWork::default(), request()).await
+                {
+                    Ok(message) => return Err(format!("added: {message}").into()),
+                    Err(error) => error,
+                };
+                let shown = format!("{error} {error:?}");
+                assert!(!shown.contains(PASSWORD), "{shown}");
+            }
+            Ok(())
+        })
     }
 
     // audit: COUSR01C-016
     // audit: COUSR01C-023
-    #[tokio::test]
-    async fn the_store_keeps_the_added_user_and_refuses_its_id_twice() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let key = PicX::from_array(*b"NEWUSR01");
+    #[test]
+    fn the_store_keeps_the_added_user_and_refuses_its_id_twice() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let key = PicX::from_array(*b"NEWUSR01");
 
-        let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
-        assert_eq!(message, "User NEWUSR01 has been added ...");
-        let stored = UserRepository::find_by_id(&mut store, &key)
-            .await?
-            .ok_or("the added user is not stored")?;
-        assert_eq!(stored.fname, PicX::from_text(" jane")?);
-        assert_eq!(stored.usr_type, PicX::from_array(*b"a"));
-        assert!(stored.filler.is_spaces());
-        assert_eq!(
-            password::verify(STORED_PASSWORD, &stored.password_hash),
-            Ok(true)
-        );
+            let message = insert_user(&mut store, &PasswordWork::default(), request()).await?;
+            assert_eq!(message, "User NEWUSR01 has been added ...");
+            let stored = UserRepository::find_by_id(&mut store, &key)
+                .await?
+                .ok_or("the added user is not stored")?;
+            assert_eq!(stored.fname, PicX::from_text(" jane")?);
+            assert_eq!(stored.usr_type, PicX::from_array(*b"a"));
+            assert!(stored.filler.is_spaces());
+            assert_eq!(
+                password::verify(STORED_PASSWORD, &stored.password_hash),
+                Ok(true)
+            );
 
-        // The same 8 bytes again: the existing row stays as it was.
-        let again = UserAddRequest {
-            first_name: "OTHER".to_owned(),
-            ..request()
-        };
-        let failure = rule(insert_user(&mut store, &PasswordWork::default(), again).await)?;
-        assert_eq!(failure, cousr01c::duplicate_user_id());
-        let kept = UserRepository::find_by_id(&mut store, &key)
-            .await?
-            .ok_or("the added user is gone")?;
-        assert!(kept == stored, "the stored row changed");
+            // The same 8 bytes again: the existing row stays as it was.
+            let again = UserAddRequest {
+                first_name: "OTHER".to_owned(),
+                ..request()
+            };
+            let failure = rule(insert_user(&mut store, &PasswordWork::default(), again).await)?;
+            assert_eq!(failure, cousr01c::duplicate_user_id());
+            let kept = UserRepository::find_by_id(&mut store, &key)
+                .await?
+                .ok_or("the added user is gone")?;
+            assert!(kept == stored, "the stored row changed");
 
-        // Keys compare byte for byte, so the lower-case ID is another user.
-        let lower = UserAddRequest {
-            user_id: "newusr01".to_owned(),
-            ..request()
-        };
-        let message = insert_user(&mut store, &PasswordWork::default(), lower).await?;
-        assert_eq!(message, "User newusr01 has been added ...");
-        Ok(())
+            // Keys compare byte for byte, so the lower-case ID is another user.
+            let lower = UserAddRequest {
+                user_id: "newusr01".to_owned(),
+                ..request()
+            };
+            let message = insert_user(&mut store, &PasswordWork::default(), lower).await?;
+            assert_eq!(message, "User newusr01 has been added ...");
+            Ok(())
+        })
     }
 }

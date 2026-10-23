@@ -50,6 +50,10 @@
 use domain::online::cocrdlic::{self as rules, CardPage, CardRef, ListFailure, ListPlan, Read};
 use domain::sensitive::CardNumber;
 use persistence::{CardRepository, PersistenceError};
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -198,7 +202,25 @@ async fn next_card<R: CardRepository>(
 /// A failed read of `CARDDAT`: the file-error text of COCRDLIC-031, a 500. The log line names the
 /// SQLSTATE and constraint only, never a key or a filter.
 fn browse_failed(error: &PersistenceError) -> ServiceError<ListFailure> {
-    tracing::error!(error = %error, "card list browse failed");
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "error"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"card list browse failed" as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
     ServiceError::Rule(ListFailure::file_error())
 }
 
@@ -221,6 +243,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// One card as the repository returns it, handle first.
     type Entry = (CardRef, CardRecord);
@@ -516,208 +547,228 @@ mod tests {
     // audit: COCRDLIC-017
     // audit: COCRDLIC-019
     // audit: COCRDLIC-033
-    #[tokio::test]
-    async fn fresh_start_lists_seven_cards_and_reads_ahead_unfiltered() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let page = browse(&mut store, CardListQuery::default()).await?;
-        assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
-        assert_eq!(page.page_no(), rules::PageNumber::FIRST);
-        assert_eq!(page.first_key(), Some(CardRef::new(1)));
-        assert_eq!(page.next_page(), NextPage::Exists);
-        assert_eq!(page.last_key(), Some(CardRef::new(8)));
-        assert_eq!(page.message(), None);
-        assert_eq!(
-            page.info_message(),
-            Some("TYPE S FOR DETAIL, U TO UPDATE ANY RECORD")
-        );
-        assert_eq!(store.browses, page_and_lookahead(7));
-        Ok(())
+    #[test]
+    fn fresh_start_lists_seven_cards_and_reads_ahead_unfiltered() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let page = browse(&mut store, CardListQuery::default()).await?;
+            assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
+            assert_eq!(page.page_no(), rules::PageNumber::FIRST);
+            assert_eq!(page.first_key(), Some(CardRef::new(1)));
+            assert_eq!(page.next_page(), NextPage::Exists);
+            assert_eq!(page.last_key(), Some(CardRef::new(8)));
+            assert_eq!(page.message(), None);
+            assert_eq!(
+                page.info_message(),
+                Some("TYPE S FOR DETAIL, U TO UPDATE ANY RECORD")
+            );
+            assert_eq!(store.browses, page_and_lookahead(7));
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-018
     // audit: COCRDLIC-023
     // audit: COCRDLIC-027
     // audit: COCRDLIC-028
-    #[tokio::test]
-    async fn paging_follows_the_echoed_handles() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let first = browse(&mut store, CardListQuery::default()).await?;
+    #[test]
+    fn paging_follows_the_echoed_handles() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let first = browse(&mut store, CardListQuery::default()).await?;
 
-        let second = browse(&mut store, echo(&first, Some(PageDirection::Forward))).await?;
-        assert_eq!(handles(&second), (8..=14).collect::<Vec<_>>());
-        assert_eq!(i64::from(second.page_no()), 2);
-        assert_eq!(second.last_key(), Some(CardRef::new(15)));
+            let second = browse(&mut store, echo(&first, Some(PageDirection::Forward))).await?;
+            assert_eq!(handles(&second), (8..=14).collect::<Vec<_>>());
+            assert_eq!(i64::from(second.page_no()), 2);
+            assert_eq!(second.last_key(), Some(CardRef::new(15)));
 
-        let again = browse(&mut store, echo(&second, None)).await?;
-        assert_eq!(handles(&again), handles(&second));
-        assert_eq!(i64::from(again.page_no()), 2);
+            let again = browse(&mut store, echo(&second, None)).await?;
+            assert_eq!(handles(&again), handles(&second));
+            assert_eq!(i64::from(again.page_no()), 2);
 
-        store.browses.clear();
-        let back = browse(&mut store, echo(&second, Some(PageDirection::Backward))).await?;
-        assert_eq!(handles(&back), (1..=7).collect::<Vec<_>>());
-        assert_eq!(back.page_no(), rules::PageNumber::FIRST);
-        assert_eq!(back.first_key(), Some(CardRef::new(1)));
-        assert_eq!(back.message_kind(), Some(ListMessage::NoPreviousPages));
-        assert_eq!(
-            store.browses,
-            vec![Browse {
-                backward: true,
-                account: false,
-                card: false,
-                limit: 8,
-            }]
-        );
-        Ok(())
+            store.browses.clear();
+            let back = browse(&mut store, echo(&second, Some(PageDirection::Backward))).await?;
+            assert_eq!(handles(&back), (1..=7).collect::<Vec<_>>());
+            assert_eq!(back.page_no(), rules::PageNumber::FIRST);
+            assert_eq!(back.first_key(), Some(CardRef::new(1)));
+            assert_eq!(back.message_kind(), Some(ListMessage::NoPreviousPages));
+            assert_eq!(
+                store.browses,
+                vec![Browse {
+                    backward: true,
+                    account: false,
+                    card: false,
+                    limit: 8,
+                }]
+            );
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-010
     // audit: COCRDLIC-020
-    #[tokio::test]
-    async fn filters_reach_the_query_and_a_short_page_needs_no_look_ahead() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let query = CardListQuery {
-            acct_id: Some(account_text(&store, 3)?),
-            ..CardListQuery::default()
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(handles(&page), vec![3]);
-        assert_eq!(page.next_page(), NextPage::NotExists);
-        assert_eq!(page.message_kind(), Some(ListMessage::NoMoreRecords));
-        assert_eq!(
-            store.browses,
-            vec![Browse {
-                backward: false,
-                account: true,
-                card: false,
-                limit: 7,
-            }]
-        );
-        Ok(())
+    #[test]
+    fn filters_reach_the_query_and_a_short_page_needs_no_look_ahead() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let query = CardListQuery {
+                acct_id: Some(account_text(&store, 3)?),
+                ..CardListQuery::default()
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(handles(&page), vec![3]);
+            assert_eq!(page.next_page(), NextPage::NotExists);
+            assert_eq!(page.message_kind(), Some(ListMessage::NoMoreRecords));
+            assert_eq!(
+                store.browses,
+                vec![Browse {
+                    backward: false,
+                    account: true,
+                    card: false,
+                    limit: 7,
+                }]
+            );
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-019
-    #[tokio::test]
-    async fn look_ahead_ignores_the_filters() -> TestResult {
-        // Seven cards of account 1, then one of account 2: the filtered page is full, and the
-        // look-ahead finds the account-2 card although the filter excludes it.
-        let mut store = MemoryStore::new(synthetic(8, |n| if n <= 7 { 1 } else { 2 })?);
-        let query = CardListQuery {
-            acct_id: Some("00000000001".to_owned()),
-            ..CardListQuery::default()
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
-        assert_eq!(page.next_page(), NextPage::Exists);
-        assert_eq!(page.last_key(), Some(CardRef::new(8)));
-        let lookahead = store.browses.last().copied().ok_or("no look-ahead read")?;
-        assert_eq!(
-            lookahead,
-            Browse {
-                backward: false,
-                account: false,
-                card: false,
-                limit: 2,
-            }
-        );
-        Ok(())
+    #[test]
+    fn look_ahead_ignores_the_filters() -> TestResult {
+        block_on(async {
+            // Seven cards of account 1, then one of account 2: the filtered page is full, and the
+            // look-ahead finds the account-2 card although the filter excludes it.
+            let mut store = MemoryStore::new(synthetic(8, |n| if n <= 7 { 1 } else { 2 })?);
+            let query = CardListQuery {
+                acct_id: Some("00000000001".to_owned()),
+                ..CardListQuery::default()
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
+            assert_eq!(page.next_page(), NextPage::Exists);
+            assert_eq!(page.last_key(), Some(CardRef::new(8)));
+            let lookahead = store.browses.last().copied().ok_or("no look-ahead read")?;
+            assert_eq!(
+                lookahead,
+                Browse {
+                    backward: false,
+                    account: false,
+                    card: false,
+                    limit: 2,
+                }
+            );
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-019
-    #[tokio::test]
-    async fn a_full_last_page_has_no_next_page() -> TestResult {
-        let mut store = MemoryStore::new(synthetic(7, |_| 1)?);
-        let page = browse(&mut store, CardListQuery::default()).await?;
-        assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
-        assert_eq!(page.next_page(), NextPage::NotExists);
-        assert_eq!(page.last_key(), Some(CardRef::new(7)));
-        assert_eq!(page.message_kind(), Some(ListMessage::NoMoreRecords));
-        Ok(())
+    #[test]
+    fn a_full_last_page_has_no_next_page() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(synthetic(7, |_| 1)?);
+            let page = browse(&mut store, CardListQuery::default()).await?;
+            assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
+            assert_eq!(page.next_page(), NextPage::NotExists);
+            assert_eq!(page.last_key(), Some(CardRef::new(7)));
+            assert_eq!(page.message_kind(), Some(ListMessage::NoMoreRecords));
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn page_size_bounds_every_read() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let query = CardListQuery {
-            page_size: Some(3),
-            ..CardListQuery::default()
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(handles(&page), vec![1, 2, 3]);
-        assert_eq!(page.last_key(), Some(CardRef::new(4)));
-        assert_eq!(store.browses, page_and_lookahead(3));
-        Ok(())
+    #[test]
+    fn page_size_bounds_every_read() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let query = CardListQuery {
+                page_size: Some(3),
+                ..CardListQuery::default()
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(handles(&page), vec![1, 2, 3]);
+            assert_eq!(page.last_key(), Some(CardRef::new(4)));
+            assert_eq!(store.browses, page_and_lookahead(3));
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-014
-    #[tokio::test]
-    async fn reread_starts_from_the_first_card() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let first = browse(&mut store, CardListQuery::default()).await?;
-        let second = browse(&mut store, echo(&first, Some(PageDirection::Forward))).await?;
-        let query = CardListQuery {
-            reread: Some(true),
-            ..echo(&second, None)
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
-        assert_eq!(i64::from(page.page_no()), 2);
-        assert_eq!(page.message(), None);
-        Ok(())
+    #[test]
+    fn reread_starts_from_the_first_card() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let first = browse(&mut store, CardListQuery::default()).await?;
+            let second = browse(&mut store, echo(&first, Some(PageDirection::Forward))).await?;
+            let query = CardListQuery {
+                reread: Some(true),
+                ..echo(&second, None)
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
+            assert_eq!(i64::from(page.page_no()), 2);
+            assert_eq!(page.message(), None);
+            Ok(())
+        })
     }
 
     // HALTED(X-COCRDLIC-H2): the evident path of the filter edit, asserted as the replacement's
     // answer and no parity result.
-    #[tokio::test]
-    async fn a_filter_edit_failure_reads_nothing() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let query = CardListQuery {
-            card_num: Some("12345".to_owned()),
-            ..CardListQuery::default()
-        };
-        let failure = match browse(&mut store, query).await {
-            Err(ServiceError::Rule(failure)) => failure,
-            other => return Err(format!("expected a filter failure, got {other:?}").into()),
-        };
-        assert_eq!(failure.class(), rules::FailureClass::Input);
-        assert_eq!(failure.field(), Some(rules::ListField::Card));
-        assert!(store.browses.is_empty());
-        Ok(())
+    #[test]
+    fn a_filter_edit_failure_reads_nothing() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let query = CardListQuery {
+                card_num: Some("12345".to_owned()),
+                ..CardListQuery::default()
+            };
+            let failure = match browse(&mut store, query).await {
+                Err(ServiceError::Rule(failure)) => failure,
+                other => return Err(format!("expected a filter failure, got {other:?}").into()),
+            };
+            assert_eq!(failure.class(), rules::FailureClass::Input);
+            assert_eq!(failure.field(), Some(rules::ListField::Card));
+            assert!(store.browses.is_empty());
+            Ok(())
+        })
     }
 
     // audit: COCRDLIC-031
-    #[tokio::test]
-    async fn a_store_failure_is_the_file_error() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        store.failing = true;
-        let fresh = browse(&mut store, CardListQuery::default()).await;
-        assert_eq!(
-            fresh.err(),
-            Some(ServiceError::Rule(rules::ListFailure::file_error()))
-        );
+    #[test]
+    fn a_store_failure_is_the_file_error() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            store.failing = true;
+            let fresh = browse(&mut store, CardListQuery::default()).await;
+            assert_eq!(
+                fresh.err(),
+                Some(ServiceError::Rule(rules::ListFailure::file_error()))
+            );
 
-        // The start-key lookup is a read of the card file too.
-        let keyed = CardListQuery {
-            first_key: Some(1),
-            ..CardListQuery::default()
-        };
-        assert_eq!(
-            browse(&mut store, keyed).await.err(),
-            Some(ServiceError::Rule(rules::ListFailure::file_error()))
-        );
-        Ok(())
+            // The start-key lookup is a read of the card file too.
+            let keyed = CardListQuery {
+                first_key: Some(1),
+                ..CardListQuery::default()
+            };
+            assert_eq!(
+                browse(&mut store, keyed).await.err(),
+                Some(ServiceError::Rule(rules::ListFailure::file_error()))
+            );
+            Ok(())
+        })
     }
 
     // HALTED(X-COCRDLIC-H1): a key that names no card has no parity result (COCRDLIC-038).
-    #[tokio::test]
-    async fn an_unknown_handle_restarts_from_the_lowest_card() -> TestResult {
-        let mut store = MemoryStore::new(fixture()?);
-        let query = CardListQuery {
-            first_key: Some(999),
-            ..CardListQuery::default()
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
-        Ok(())
+    #[test]
+    fn an_unknown_handle_restarts_from_the_lowest_card() -> TestResult {
+        block_on(async {
+            let mut store = MemoryStore::new(fixture()?);
+            let query = CardListQuery {
+                first_key: Some(999),
+                ..CardListQuery::default()
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(handles(&page), (1..=7).collect::<Vec<_>>());
+            Ok(())
+        })
     }
 
     /// The account of fixture card `handle`, as the eleven digits a screen filter types.

@@ -21,10 +21,12 @@ use copybook::{Error, FixedRecord, PicU, PicX, RecordReader, RecordWriter};
 ///
 /// The source holds transaction categories twice (E23). This is the VSAM version: the
 /// `trancatg` load writes it to `transaction_categories`, and only `tranrept` reads it, for the
-/// CBTRN03C report lookups. The Db2 version, maintained by COTRTLIC, COTRTUPC and COBTUPDT, is
-/// [`Db2TransactionCategory`](super::Db2TransactionCategory). No conversion between the two is
-/// provided, because no component copies between the versions: TRANEXTR, the only source step
-/// that does, is out of scope, so a Db2 maintenance change never alters a report lookup.
+/// CBTRN03C report lookups. The Db2 version is
+/// [`Db2TransactionCategory`](super::Db2TransactionCategory), seeded by migration 0006 and never
+/// written by COTRTLIC, COTRTUPC or COBTUPDT: they maintain only its parent `TRANSACTION_TYPE`,
+/// whose delete its rows restrict. No conversion between the two is provided, because no
+/// component copies between the versions: TRANEXTR, the only source step that does, is out of
+/// scope, so a Db2 maintenance change never alters a report lookup.
 ///
 /// Every field is kept byte for byte: the description keeps its padding (PIC-001) and the
 /// `FILLER` keeps whatever it holds, the four `0` characters of every fixture record included

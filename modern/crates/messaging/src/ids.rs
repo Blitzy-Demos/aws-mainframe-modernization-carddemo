@@ -48,7 +48,8 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 /// this process's ID and the next counter value, joined by `-`, in the format the module
 /// documentation states.
 ///
-/// Every call in one process returns a different ID, also under a clock that does not move.
+/// Every call in one process returns a different ID until the sequence counter wraps after 2^64
+/// calls, also under a clock that does not move.
 #[must_use]
 pub fn next_message_id(clock: &dyn Clock) -> String {
     let timestamp = clock.now().format("%Y%m%d%H%M%S%3f");

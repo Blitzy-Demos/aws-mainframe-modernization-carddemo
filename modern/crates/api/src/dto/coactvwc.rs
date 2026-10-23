@@ -52,6 +52,7 @@ use chrono::NaiveDate;
 use domain::online::coactvwc as rules;
 use domain::sensitive::Ssn;
 use serde::Serialize;
+use serde::ser::{SerializeMap, Serializer};
 use utoipa::ToSchema;
 
 use super::{digits, full_text};
@@ -73,10 +74,11 @@ use crate::error::{ScreenError, ServiceError};
 // information row is the screen's constant prompt that no response carries (COACTVWC-008,
 // COACTVWC-027, COACTVW-096).
 //
-// The two blocks are flattened, so the body is one object whose members follow the map, as
-// before the blocks had types of their own; the schema is `allOf` the two block schemas and
-// `acct_id`. The same block types travel in `AccountViewError`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+// The two blocks are flattened: the body is one object whose members follow the map's order,
+// `acct_id`, then the account block's members, then the customer block's, as the hand-written
+// `Serialize` below writes them; the schema is `allOf` the two block schemas and `acct_id`. The
+// same block types travel in `AccountViewError`, there as nested objects.
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountViewResponse {
     /// The account number every read used: eleven digits, leading zeros included
     /// (COACTVWC-032).
@@ -89,10 +91,22 @@ pub struct AccountViewResponse {
     pub customer: AccountViewCustomerBlock,
 }
 
+/// One object: `acct_id`, then the members of the account block, then those of the customer
+/// block, each block's in its declaration order.
+impl Serialize for AccountViewResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("acct_id", &self.acct_id)?;
+        self.account.serialize_members(&mut map)?;
+        self.customer.serialize_members(&mut map)?;
+        map.end()
+    }
+}
+
 /// The account block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from
 /// `ACCOUNT-RECORD` (COACTVWC-010 to COACTVWC-015): part of every [`AccountViewResponse`], and of
 /// an [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountViewAccountBlock {
     /// `ACCT-ACTIVE-STATUS`, the one-character active flag of `ACSTTUS` (COACTVWC-010,
     /// COACTVW-016).
@@ -122,12 +136,43 @@ pub struct AccountViewAccountBlock {
     pub group_id: String,
 }
 
+impl AccountViewAccountBlock {
+    /// Writes the block's members into `map` in declaration order, a blank date as `null`: the
+    /// block's own object, or the top level of an [`AccountViewResponse`].
+    ///
+    /// # Errors
+    ///
+    /// The serialiser's error for a member.
+    fn serialize_members<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("active_status", &self.active_status)?;
+        map.serialize_entry("open_date", &self.open_date)?;
+        map.serialize_entry("expiration_date", &self.expiration_date)?;
+        map.serialize_entry("reissue_date", &self.reissue_date)?;
+        map.serialize_entry("credit_limit", &self.credit_limit)?;
+        map.serialize_entry("cash_credit_limit", &self.cash_credit_limit)?;
+        map.serialize_entry("current_balance", &self.current_balance)?;
+        map.serialize_entry("current_cycle_credit", &self.current_cycle_credit)?;
+        map.serialize_entry("current_cycle_debit", &self.current_cycle_debit)?;
+        map.serialize_entry("group_id", &self.group_id)?;
+        Ok(())
+    }
+}
+
+/// The block's ten members, as an object of their own.
+impl Serialize for AccountViewAccountBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(10))?;
+        self.serialize_members(&mut map)?;
+        map.end()
+    }
+}
+
 /// The customer block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from
 /// `CUSTOMER-RECORD` (COACTVWC-016 to COACTVWC-026): part of every [`AccountViewResponse`], and
 /// of an [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008). The SSN
 /// is only ever its redacted form.
 // No `Deserialize`: the SSN travels redacted and cannot be read back.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountViewCustomerBlock {
     /// `CUST-ID`: nine digits, leading zeros included (COACTVWC-016, COACTVW-047).
     pub customer_id: String,
@@ -173,6 +218,46 @@ pub struct AccountViewCustomerBlock {
     /// `CUST-PRI-CARD-HOLDER-IND`, the one-character `ACSPFLG` flag (COACTVWC-026,
     /// COACTVW-094).
     pub primary_card_holder: String,
+}
+
+impl AccountViewCustomerBlock {
+    /// Writes the block's members into `map` in declaration order, the SSN in its redacted form
+    /// and a blank date as `null`: the block's own object, or the top level of an
+    /// [`AccountViewResponse`].
+    ///
+    /// # Errors
+    ///
+    /// The serialiser's error for a member.
+    fn serialize_members<M: SerializeMap>(&self, map: &mut M) -> Result<(), M::Error> {
+        map.serialize_entry("customer_id", &self.customer_id)?;
+        map.serialize_entry("ssn", &self.ssn)?;
+        map.serialize_entry("date_of_birth", &self.date_of_birth)?;
+        map.serialize_entry("fico_score", &self.fico_score)?;
+        map.serialize_entry("first_name", &self.first_name)?;
+        map.serialize_entry("middle_name", &self.middle_name)?;
+        map.serialize_entry("last_name", &self.last_name)?;
+        map.serialize_entry("address_line_1", &self.address_line_1)?;
+        map.serialize_entry("address_line_2", &self.address_line_2)?;
+        map.serialize_entry("city", &self.city)?;
+        map.serialize_entry("state", &self.state)?;
+        map.serialize_entry("zip", &self.zip)?;
+        map.serialize_entry("country", &self.country)?;
+        map.serialize_entry("phone_1", &self.phone_1)?;
+        map.serialize_entry("phone_2", &self.phone_2)?;
+        map.serialize_entry("government_id", &self.government_id)?;
+        map.serialize_entry("eft_account_id", &self.eft_account_id)?;
+        map.serialize_entry("primary_card_holder", &self.primary_card_holder)?;
+        Ok(())
+    }
+}
+
+/// The block's eighteen members, as an object of their own.
+impl Serialize for AccountViewCustomerBlock {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(18))?;
+        self.serialize_members(&mut map)?;
+        map.end()
+    }
 }
 
 /// The view as `1200-SETUP-SCREEN-VARS` fills the map: the key with its leading zeros and the
@@ -257,7 +342,7 @@ impl From<rules::CustomerBlock> for AccountViewCustomerBlock {
 // `ScreenError` schema, requiring only `message`, leaves open. A bare `ScreenError` would drop
 // the blocks the COBOL shows with these messages, which the parity rows COACTVWC-008 and
 // COACTVWC-009 require. The schema is `allOf` `ScreenError` and the two optional blocks.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AccountViewError {
     /// The message and its field, as the `ScreenError` whose status the response carries.
     #[serde(flatten)]
@@ -268,6 +353,22 @@ pub struct AccountViewError {
     /// The customer block shown beside the message, if any (COACTVWC-008).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub customer: Option<AccountViewCustomerBlock>,
+}
+
+/// The `ScreenError`'s members at the top level, then `account` and `customer`, each a nested
+/// object, when present.
+impl Serialize for AccountViewError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        self.error.serialize_members(&mut map)?;
+        if let Some(account) = &self.account {
+            map.serialize_entry("account", account)?;
+        }
+        if let Some(customer) = &self.customer {
+            map.serialize_entry("customer", customer)?;
+        }
+        map.end()
+    }
 }
 
 /// The program's failure: its `ScreenError`, through `api::error`, and the blocks the domain
@@ -595,8 +696,8 @@ mod tests {
         Ok(())
     }
 
-    /// The member order of the 200 body: the map's, as before the blocks had types of their
-    /// own, so flattening them changed no byte of the body.
+    /// The member order of the 200 body follows the map: `acct_id`, then the account block's
+    /// members, then the customer block's, all at the top level of one object.
     #[test]
     fn the_body_keeps_the_member_order_of_the_map() -> TestResult {
         let text = serde_json::to_string(&AccountViewResponse::from(domain_view()?))?;
@@ -814,6 +915,52 @@ mod tests {
         );
         let response = both.into_response();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// The bytes of the 200 body and of the error bodies: the 200 is `acct_id` and then the
+    /// members of the account and customer block objects, all at one level; an error is the
+    /// `ScreenError`'s members, then each block it carries as its own nested object.
+    #[test]
+    fn the_blocks_are_written_flat_in_the_view_and_nested_in_an_error() -> TestResult {
+        let members = |object: &str| -> Result<String, &'static str> {
+            object
+                .strip_prefix('{')
+                .and_then(|rest| rest.strip_suffix('}'))
+                .map(str::to_owned)
+                .ok_or("not a JSON object")
+        };
+        let response = AccountViewResponse::from(domain_view()?);
+        let account = serde_json::to_string(&response.account)?;
+        let customer = serde_json::to_string(&response.customer)?;
+        assert!(account.starts_with(r#"{"active_status":"Y","open_date":"2014-11-20","#));
+        assert!(customer.starts_with(r#"{"customer_id":"000000007","ssn":"***-**-6789","#));
+        assert_eq!(
+            serde_json::to_string(&response)?,
+            format!(
+                r#"{{"acct_id":"00000000042",{},{}}}"#,
+                members(&account)?,
+                members(&customer)?
+            )
+        );
+
+        for (account_read, customer_read) in
+            [(Read::NotFound, Read::Found), (Read::Found, Read::NotFound)]
+        {
+            let body = AccountViewError::from(domain_failure(account_read, customer_read)?);
+            let mut expected = members(&serde_json::to_string(&body.error)?)?;
+            if let Some(block) = &body.account {
+                expected.push_str(&format!(r#","account":{}"#, serde_json::to_string(block)?));
+            }
+            if let Some(block) = &body.customer {
+                expected.push_str(&format!(r#","customer":{}"#, serde_json::to_string(block)?));
+            }
+            assert_eq!(
+                serde_json::to_string(&body)?,
+                format!("{{{expected}}}"),
+                "{account_read:?} account, {customer_read:?} customer"
+            );
+        }
         Ok(())
     }
 

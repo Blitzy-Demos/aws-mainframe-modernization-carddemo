@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COUSR00C PROCESS-PAGE-BACKWARD (app/cbl/COUSR00C.cbl:336-379): STARTBR (default GTEQ, 586-614)\n-- + READPREV (653-682) over USRSEC by SEC-USR-ID (KEYS(8,0), app/jcl/DUSRSECJ.jcl:65), in\n-- descending key byte order, the reverse of the \"C\" collation migration 0003 gives usr_id, which\n-- orders the stored ASCII bytes, whereas the KSDS ordered EBCDIC bytes. The two orders agree for\n-- the fixture user IDs, ADMIN001 to ADMIN005 and USER0001 to USER0005, which first differ letter\n-- against letter or digit against digit. They need not agree for arbitrary IDs, which can first\n-- differ digit against letter or lower case against upper case (escalation candidate\n-- X-COUSR00C-2 in modern/audit/online/COUSR00C.md). The first READPREV after STARTBR returns the\n-- start record, which F7 discards, so the start key is inclusive. Audit rows COUSR00C-022 to\n-- COUSR00C-024. Only the four columns POPULATE-USER-DATA shows are read, and no credential\n-- column. Endpoint 16 GET /api/v1/users [A] (F7). Rule: Bounded Pagination (users_pkey, scanned\n-- backward).\n-- Parameters: 1 start user ID, inclusive (the first user ID shown, or empty for LOW-VALUES),\n-- 2 row limit.\nSELECT\n    usr_id,\n    usr_fname,\n    usr_lname,\n    usr_type\nFROM users\nWHERE usr_id <= $1::bpchar\nORDER BY usr_id DESC\nLIMIT $2::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "usr_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "usr_fname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "usr_lname",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "usr_type",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "c92478fea23de1e5d34917f52fa8760efba4a9ad98293ad400ea39f5ca42019d"
+}

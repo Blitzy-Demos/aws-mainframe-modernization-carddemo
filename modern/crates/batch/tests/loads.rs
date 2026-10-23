@@ -32,10 +32,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
+use std::future::poll_fn;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use copybook::framing::decode_all;
@@ -63,6 +66,16 @@ use tokio::sync::oneshot;
 use tokio::time::{self, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// Runs `test` to completion on a multi-thread runtime with every driver enabled and the default
+/// worker count, the one Tokio's test attribute builds for its `multi_thread` flavour, without the
+/// lint attributes, `expect` and unchecked pin that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
 
 /// The nine load subcommands in `scripts/dev-up.sh` order, the refresh order of
 /// `scripts/remote_refresh.sh:16-44` less TRANFILE (LOADS.md; LOADS-001 to LOADS-009).
@@ -1069,293 +1082,301 @@ async fn assert_refused_accounts(
 /// files read in place, and re-encoded inside each line's framing to the lines' bytes
 /// ([`assert_fixture_contents`]); its users with the deck's records ([`assert_users`]). The later
 /// runs are compared with that proven first load.
-#[tokio::test(flavor = "multi_thread")]
-async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("rerun")?;
-    let needles = Needles::load()?;
-    let passwords = fixture_user_passwords()?;
-    let card_numbers: BTreeSet<Vec<u8>> = fixture_card_numbers()?
-        .into_iter()
-        .map(String::into_bytes)
-        .collect();
-    let inputs = read_inputs()?;
-    let mut store = PgStore::new(guard.pool().clone());
+#[test]
+fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("rerun")?;
+        let needles = Needles::load()?;
+        let passwords = fixture_user_passwords()?;
+        let card_numbers: BTreeSet<Vec<u8>> = fixture_card_numbers()?
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let inputs = read_inputs()?;
+        let mut store = PgStore::new(guard.pool().clone());
 
-    let seeded = snapshot(&mut store).await?;
-    // audit: LOADS-015
-    assert_migrated_only(&seeded);
-    // audit: LOADS-015
-    run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
-    let first = snapshot(&mut store).await?;
-    assert_fixture_contents(&first)?;
-    assert_master_contents(&first, &card_numbers);
-    assert_reference_contents(&first);
-    assert_users(&first.users, &passwords)?;
-    assert_account_reads(&mut store, &first).await?;
-    assert_db2_untouched(&mut store, &seeded, &first).await?;
-    assert_unloaded_tables_empty(&mut store, "dev-up.sh order").await?;
+        let seeded = snapshot(&mut store).await?;
+        // audit: LOADS-015
+        assert_migrated_only(&seeded);
+        // audit: LOADS-015
+        run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
+        let first = snapshot(&mut store).await?;
+        assert_fixture_contents(&first)?;
+        assert_master_contents(&first, &card_numbers);
+        assert_reference_contents(&first);
+        assert_users(&first.users, &passwords)?;
+        assert_account_reads(&mut store, &first).await?;
+        assert_db2_untouched(&mut store, &seeded, &first).await?;
+        assert_unloaded_tables_empty(&mut store, "dev-up.sh order").await?;
 
-    // audit: LOADS-014
-    run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
-    let second = snapshot(&mut store).await?;
-    // audit: LOADS-014
-    // audit: LOADS-026
-    // audit: LOADS-036
-    // audit: FIXLOAD-010
-    assert_same_contents(&first, &second, "rerun in dev-up.sh order");
-    // audit: LOADS-027
-    // audit: FIXLOAD-002
-    assert_fresh_card_refs(&[&first], &second);
-    // audit: LOADS-033
-    // audit: FIXLOAD-009
-    assert_users(&second.users, &passwords)?;
-    assert_unloaded_tables_empty(&mut store, "rerun in dev-up.sh order").await?;
+        // audit: LOADS-014
+        run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
+        let second = snapshot(&mut store).await?;
+        // audit: LOADS-014
+        // audit: LOADS-026
+        // audit: LOADS-036
+        // audit: FIXLOAD-010
+        assert_same_contents(&first, &second, "rerun in dev-up.sh order");
+        // audit: LOADS-027
+        // audit: FIXLOAD-002
+        assert_fresh_card_refs(&[&first], &second);
+        // audit: LOADS-033
+        // audit: FIXLOAD-009
+        assert_users(&second.users, &passwords)?;
+        assert_unloaded_tables_empty(&mut store, "rerun in dev-up.sh order").await?;
 
-    let reverse: Vec<&str> = DEV_UP_ORDER.into_iter().rev().collect();
-    // audit: LOADS-025
-    run_loads(&guard, &scratch, &reverse, &needles).await?;
-    let third = snapshot(&mut store).await?;
-    // audit: LOADS-025
-    // audit: FIXLOAD-010
-    assert_same_contents(&first, &third, "reverse dev-up.sh order");
-    // audit: LOADS-027
-    assert_fresh_card_refs(&[&first, &second], &third);
-    assert_users(&third.users, &passwords)?;
-    assert_unloaded_tables_empty(&mut store, "reverse dev-up.sh order").await?;
+        let reverse: Vec<&str> = DEV_UP_ORDER.into_iter().rev().collect();
+        // audit: LOADS-025
+        run_loads(&guard, &scratch, &reverse, &needles).await?;
+        let third = snapshot(&mut store).await?;
+        // audit: LOADS-025
+        // audit: FIXLOAD-010
+        assert_same_contents(&first, &third, "reverse dev-up.sh order");
+        // audit: LOADS-027
+        assert_fresh_card_refs(&[&first, &second], &third);
+        assert_users(&third.users, &passwords)?;
+        assert_unloaded_tables_empty(&mut store, "reverse dev-up.sh order").await?;
 
-    assert_inputs_unchanged(&inputs)?;
-    // audit: LOADS-035
-    // audit: LOADS-038
-    // audit: FIXLOAD-011
-    assert_no_file_written(&scratch)?;
-    Ok(())
+        assert_inputs_unchanged(&inputs)?;
+        // audit: LOADS-035
+        // audit: LOADS-038
+        // audit: FIXLOAD-011
+        assert_no_file_written(&scratch)?;
+        Ok(())
+    })
 }
 
 /// `--input` names the file a fixture load reads, whatever `CARDDEMO_FIXTURE_DIR` holds; without
 /// it, a fixture missing from that directory fails the load before the table is touched; and a
 /// load writes only its own table.
-#[tokio::test(flavor = "multi_thread")]
-async fn input_override_wins_over_fixture_dir() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("input")?;
-    let empty = scratch.path("no-fixtures");
-    fs::create_dir(&empty)?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let before = snapshot(&mut store).await?;
+#[test]
+fn input_override_wins_over_fixture_dir() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("input")?;
+        let empty = scratch.path("no-fixtures");
+        fs::create_dir(&empty)?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let before = snapshot(&mut store).await?;
 
-    let missing = run_batch(&guard, &scratch, &["acctfile"], Some(&empty)).await?;
-    let expected_path = empty.join("acctdata.txt");
-    // audit: LOADS-010
-    // audit: LOADS-019
-    assert_failed(&missing, "acctfile without its fixture");
-    // audit: LOADS-019
-    assert!(
-        contains(&missing.stderr, path_arg(&expected_path)?.as_bytes()),
-        "acctfile without its fixture: the error does not name the path"
-    );
-    // audit: LOADS-019
-    assert!(
-        AccountRepository::find_all(&mut store).await?.is_empty(),
-        "accounts: a failed load wrote rows"
-    );
+        let missing = run_batch(&guard, &scratch, &["acctfile"], Some(&empty)).await?;
+        let expected_path = empty.join("acctdata.txt");
+        // audit: LOADS-010
+        // audit: LOADS-019
+        assert_failed(&missing, "acctfile without its fixture");
+        // audit: LOADS-019
+        assert!(
+            contains(&missing.stderr, path_arg(&expected_path)?.as_bytes()),
+            "acctfile without its fixture: the error does not name the path"
+        );
+        // audit: LOADS-019
+        assert!(
+            AccountRepository::find_all(&mut store).await?.is_empty(),
+            "accounts: a failed load wrote rows"
+        );
 
-    let input = fs::canonicalize(fixture_path("acctdata.txt"))?;
-    let args = ["acctfile", "--input", path_arg(&input)?];
-    let loaded = run_batch(&guard, &scratch, &args, Some(&empty)).await?;
-    // audit: LOADS-010
-    assert_exit(&loaded, 0, "acctfile --input");
-    let after = snapshot(&mut store).await?;
-    // audit: LOADS-010
-    // audit: FIXLOAD-001
-    assert_eq!(after.accounts.len(), 50, "accounts: rows");
-    let changed: Vec<&str> = differences(&before, &after)
-        .into_iter()
-        .map(|(table, _)| table)
-        .collect();
-    // audit: LOADS-028
-    assert_eq!(changed, ["accounts"], "tables acctfile changed");
-    // audit: LOADS-038
-    assert_no_file_written(&scratch)?;
-    Ok(())
+        let input = fs::canonicalize(fixture_path("acctdata.txt"))?;
+        let args = ["acctfile", "--input", path_arg(&input)?];
+        let loaded = run_batch(&guard, &scratch, &args, Some(&empty)).await?;
+        // audit: LOADS-010
+        assert_exit(&loaded, 0, "acctfile --input");
+        let after = snapshot(&mut store).await?;
+        // audit: LOADS-010
+        // audit: FIXLOAD-001
+        assert_eq!(after.accounts.len(), 50, "accounts: rows");
+        let changed: Vec<&str> = differences(&before, &after)
+            .into_iter()
+            .map(|(table, _)| table)
+            .collect();
+        // audit: LOADS-028
+        assert_eq!(changed, ["accounts"], "tables acctfile changed");
+        // audit: LOADS-038
+        assert_no_file_written(&scratch)?;
+        Ok(())
+    })
 }
 
 /// With `CARDDEMO_FIXTURE_DIR` unset and no `--input`, a fixture load reads
 /// `../app/data/ASCII/<file>.txt` and `dusrsecj` reads `../app/jcl/DUSRSECJ.jcl`, both relative
 /// to `modern/`; a deck that is broken or missing then fails and leaves the users as they were.
-#[tokio::test(flavor = "multi_thread")]
-async fn default_fixture_dir_resolves_from_modern() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("defaults")?;
-    let mut store = PgStore::new(guard.pool().clone());
+#[test]
+fn default_fixture_dir_resolves_from_modern() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("defaults")?;
+        let mut store = PgStore::new(guard.pool().clone());
 
-    let types = run_batch(&guard, &scratch, &["trantype"], None).await?;
-    // audit: LOADS-010
-    assert_exit(&types, 0, "trantype");
-    // audit: LOADS-010
-    // audit: FIXLOAD-008
-    assert_eq!(
-        TransactionTypeRepository::find_all(&mut store).await?.len(),
-        7,
-        "transaction_types: rows"
-    );
+        let types = run_batch(&guard, &scratch, &["trantype"], None).await?;
+        // audit: LOADS-010
+        assert_exit(&types, 0, "trantype");
+        // audit: LOADS-010
+        // audit: FIXLOAD-008
+        assert_eq!(
+            TransactionTypeRepository::find_all(&mut store).await?.len(),
+            7,
+            "transaction_types: rows"
+        );
 
-    let users = run_batch(&guard, &scratch, &["dusrsecj"], None).await?;
-    // audit: LOADS-012
-    assert_exit(&users, 0, "dusrsecj");
-    let loaded = snapshot(&mut store).await?;
-    // audit: LOADS-012
-    // audit: FIXLOAD-009
-    assert_eq!(loaded.users.len(), 10, "users: rows");
+        let users = run_batch(&guard, &scratch, &["dusrsecj"], None).await?;
+        // audit: LOADS-012
+        assert_exit(&users, 0, "dusrsecj");
+        let loaded = snapshot(&mut store).await?;
+        // audit: LOADS-012
+        // audit: FIXLOAD-009
+        assert_eq!(loaded.users.len(), 10, "users: rows");
 
-    let decks = [
-        (
-            "no-sysut1.jcl",
-            "//DUSRSECJ JOB\n//STEP01  EXEC PGM=IEBGENER\n".to_owned(),
-        ),
-        ("no-delimiter.jcl", "//SYSUT1   DD *\n".to_owned()),
-        (
-            "long-line.jcl",
-            format!("//SYSUT1   DD *\n{}\n/*\n", "X".repeat(81)),
-        ),
-    ];
-    for (name, text) in decks {
-        let deck = scratch.path(name);
-        fs::write(&deck, text)?;
+        let decks = [
+            (
+                "no-sysut1.jcl",
+                "//DUSRSECJ JOB\n//STEP01  EXEC PGM=IEBGENER\n".to_owned(),
+            ),
+            ("no-delimiter.jcl", "//SYSUT1   DD *\n".to_owned()),
+            (
+                "long-line.jcl",
+                format!("//SYSUT1   DD *\n{}\n/*\n", "X".repeat(81)),
+            ),
+        ];
+        for (name, text) in decks {
+            let deck = scratch.path(name);
+            fs::write(&deck, text)?;
+            let output = run_batch(
+                &guard,
+                &scratch,
+                &["dusrsecj", "--input", path_arg(&deck)?],
+                None,
+            )
+            .await?;
+            // audit: LOADS-013
+            assert_failed(&output, name);
+            let after = snapshot(&mut store).await?;
+            // audit: LOADS-013
+            assert_eq!(
+                first_difference(&loaded.users, &after.users),
+                None,
+                "{name}: users changed"
+            );
+        }
+
+        let missing = scratch.path("missing.jcl");
         let output = run_batch(
             &guard,
             &scratch,
-            &["dusrsecj", "--input", path_arg(&deck)?],
+            &["dusrsecj", "--input", path_arg(&missing)?],
             None,
         )
         .await?;
-        // audit: LOADS-013
-        assert_failed(&output, name);
+        // audit: LOADS-019
+        assert_failed(&output, "dusrsecj over a missing deck");
+        // audit: LOADS-019
+        assert!(
+            contains(&output.stderr, path_arg(&missing)?.as_bytes()),
+            "dusrsecj over a missing deck: the error does not name the path"
+        );
         let after = snapshot(&mut store).await?;
-        // audit: LOADS-013
+        // audit: LOADS-019
         assert_eq!(
             first_difference(&loaded.users, &after.users),
             None,
-            "{name}: users changed"
+            "missing deck: users changed"
         );
-    }
-
-    let missing = scratch.path("missing.jcl");
-    let output = run_batch(
-        &guard,
-        &scratch,
-        &["dusrsecj", "--input", path_arg(&missing)?],
-        None,
-    )
-    .await?;
-    // audit: LOADS-019
-    assert_failed(&output, "dusrsecj over a missing deck");
-    // audit: LOADS-019
-    assert!(
-        contains(&output.stderr, path_arg(&missing)?.as_bytes()),
-        "dusrsecj over a missing deck: the error does not name the path"
-    );
-    let after = snapshot(&mut store).await?;
-    // audit: LOADS-019
-    assert_eq!(
-        first_difference(&loaded.users, &after.users),
-        None,
-        "missing deck: users changed"
-    );
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Scratch copies of `acctdata.txt` passed with `--input`: a subset replaces the loaded table
 /// with exactly its own records, and an input codec A refuses, or whose keys do not rise, fails
 /// before any write and leaves the previous rows.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_refused_input_leaves_the_previous_contents() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("refused")?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let fixture = fs::read(fixture_path("acctdata.txt"))?;
-    let loaded = run_batch(&guard, &scratch, &["acctfile"], Some(&fixture_dir())).await?;
-    assert_exit(&loaded, 0, "acctfile");
+#[test]
+fn a_refused_input_leaves_the_previous_contents() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("refused")?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let fixture = fs::read(fixture_path("acctdata.txt"))?;
+        let loaded = run_batch(&guard, &scratch, &["acctfile"], Some(&fixture_dir())).await?;
+        assert_exit(&loaded, 0, "acctfile");
 
-    let subset = scratch.path("acctdata-first-10.txt");
-    fs::write(&subset, first_lines(&fixture, 10))?;
-    let replaced = run_batch(
-        &guard,
-        &scratch,
-        &["acctfile", "--input", path_arg(&subset)?],
-        None,
-    )
-    .await?;
-    // audit: LOADS-014
-    assert_exit(&replaced, 0, "acctfile over the first 10 records");
-    let previous = AccountRepository::find_all(&mut store).await?;
-    let keys: Vec<u64> = previous.iter().map(|account| account.id.get()).collect();
-    // audit: LOADS-014
-    assert_eq!(
-        keys,
-        (1..=10).collect::<Vec<u64>>(),
-        "accounts: keys after the subset"
-    );
+        let subset = scratch.path("acctdata-first-10.txt");
+        fs::write(&subset, first_lines(&fixture, 10))?;
+        let replaced = run_batch(
+            &guard,
+            &scratch,
+            &["acctfile", "--input", path_arg(&subset)?],
+            None,
+        )
+        .await?;
+        // audit: LOADS-014
+        assert_exit(&replaced, 0, "acctfile over the first 10 records");
+        let previous = AccountRepository::find_all(&mut store).await?;
+        let keys: Vec<u64> = previous.iter().map(|account| account.id.get()).collect();
+        // audit: LOADS-014
+        assert_eq!(
+            keys,
+            (1..=10).collect::<Vec<u64>>(),
+            "accounts: keys after the subset"
+        );
 
-    let lines: Vec<&[u8]> = fixture.split_inclusive(|&byte| byte == b'\n').collect();
-    let [line_1, line_2, rest @ ..] = lines.as_slice() else {
-        return Err("acctdata.txt holds fewer than two lines".into());
-    };
-    let start_1 = line_1
-        .get(..20)
-        .ok_or("line 1 of acctdata.txt is shorter than 20 bytes")?;
-    let start_2 = line_2
-        .get(..20)
-        .ok_or("line 2 of acctdata.txt is shorter than 20 bytes")?;
-    // Line 2 cut to its first 20 bytes ends inside `ACCT-CURR-BAL` (offset 12, 12 bytes), not in
-    // the trailing FILLER, so codec A refuses it (PIC-013).
-    let short = Refusal {
-        name: "acctdata-short-line.txt",
-        bytes: concat(
-            [*line_1, start_2, b"\n".as_slice()]
-                .into_iter()
-                .chain(rest.iter().copied()),
-        ),
-        refused_line: start_2,
-        named_lines: &["line 2"],
-    };
-    // The first two records swapped: the key on line 2 is below the key on line 1.
-    let swapped = Refusal {
-        name: "acctdata-swapped.txt",
-        bytes: concat([*line_2, *line_1].into_iter().chain(rest.iter().copied())),
-        refused_line: start_1,
-        named_lines: &["line 2", "line 1"],
-    };
+        let lines: Vec<&[u8]> = fixture.split_inclusive(|&byte| byte == b'\n').collect();
+        let [line_1, line_2, rest @ ..] = lines.as_slice() else {
+            return Err("acctdata.txt holds fewer than two lines".into());
+        };
+        let start_1 = line_1
+            .get(..20)
+            .ok_or("line 1 of acctdata.txt is shorter than 20 bytes")?;
+        let start_2 = line_2
+            .get(..20)
+            .ok_or("line 2 of acctdata.txt is shorter than 20 bytes")?;
+        // Line 2 cut to its first 20 bytes ends inside `ACCT-CURR-BAL` (offset 12, 12 bytes), not
+        // in the trailing FILLER, so codec A refuses it (PIC-013).
+        let short = Refusal {
+            name: "acctdata-short-line.txt",
+            bytes: concat(
+                [*line_1, start_2, b"\n".as_slice()]
+                    .into_iter()
+                    .chain(rest.iter().copied()),
+            ),
+            refused_line: start_2,
+            named_lines: &["line 2"],
+        };
+        // The first two records swapped: the key on line 2 is below the key on line 1.
+        let swapped = Refusal {
+            name: "acctdata-swapped.txt",
+            bytes: concat([*line_2, *line_1].into_iter().chain(rest.iter().copied())),
+            refused_line: start_1,
+            named_lines: &["line 2", "line 1"],
+        };
 
-    // audit: LOADS-016
-    assert_refused_accounts(&guard, &scratch, &mut store, &short, &previous).await?;
-    // audit: LOADS-017
-    assert_refused_accounts(&guard, &scratch, &mut store, &swapped, &previous).await?;
+        // audit: LOADS-016
+        assert_refused_accounts(&guard, &scratch, &mut store, &short, &previous).await?;
+        // audit: LOADS-017
+        assert_refused_accounts(&guard, &scratch, &mut store, &swapped, &previous).await?;
 
-    // Every transaction of this session is read-only, so `PostgreSQL` refuses the statement
-    // that opens the replacement, the table lock before the delete, with SQLSTATE 25006
-    // (`read_only_sql_transaction`), whatever the input holds.
-    let read_only = format!(
-        "{}?options[default_transaction_read_only]=on",
-        guard.database_url()
-    );
-    let whole = fs::canonicalize(fixture_path("acctdata.txt"))?;
-    let args = ["acctfile", "--input", path_arg(&whole)?];
-    let output = run_batch_on(&read_only, &scratch, &args, None).await?;
-    // audit: LOADS-018
-    assert_failed(&output, "acctfile in a read-only session");
-    // audit: LOADS-018
-    assert!(
-        contains(&output.stderr, b"25006"),
-        "acctfile in a read-only session: the error does not carry the SQLSTATE"
-    );
-    // audit: LOADS-018
-    assert_eq!(
-        first_difference(&previous, &AccountRepository::find_all(&mut store).await?),
-        None,
-        "acctfile in a read-only session: accounts changed; first changed row"
-    );
-    Ok(())
+        // Every transaction of this session is read-only, so `PostgreSQL` refuses the statement
+        // that opens the replacement, the table lock before the delete, with SQLSTATE 25006
+        // (`read_only_sql_transaction`), whatever the input holds.
+        let read_only = format!(
+            "{}?options[default_transaction_read_only]=on",
+            guard.database_url()
+        );
+        let whole = fs::canonicalize(fixture_path("acctdata.txt"))?;
+        let args = ["acctfile", "--input", path_arg(&whole)?];
+        let output = run_batch_on(&read_only, &scratch, &args, None).await?;
+        // audit: LOADS-018
+        assert_failed(&output, "acctfile in a read-only session");
+        // audit: LOADS-018
+        assert!(
+            contains(&output.stderr, b"25006"),
+            "acctfile in a read-only session: the error does not carry the SQLSTATE"
+        );
+        // audit: LOADS-018
+        assert_eq!(
+            first_difference(&previous, &AccountRepository::find_all(&mut store).await?),
+            None,
+            "acctfile in a read-only session: accounts changed; first changed row"
+        );
+        Ok(())
+    })
 }
 
 /// One lock wait of a backend, as the server logs it under `log_lock_waits`.
@@ -1588,6 +1609,48 @@ async fn observe_overlap(
     Ok((pid_a, pid_b))
 }
 
+/// Drives `a`, `b` and `c` concurrently on the current task, as Tokio's join macro does, and
+/// returns their outputs once all three have finished. Every wake polls each future that has not
+/// finished, so one that is pending never holds back the others, and a finished one is never
+/// polled again. Each future is pinned in a box of its own, so no unchecked pin is needed, and
+/// none has to be `'static` or `Send`, as spawning it would require.
+async fn join3<A: Future, B: Future, C: Future>(
+    a: A,
+    b: B,
+    c: C,
+) -> (A::Output, B::Output, C::Output) {
+    let (mut a, mut b, mut c) = (Some(Box::pin(a)), Some(Box::pin(b)), Some(Box::pin(c)));
+    let (mut a_output, mut b_output, mut c_output) = (None, None, None);
+    poll_fn(|cx| {
+        poll_unfinished(&mut a, &mut a_output, cx);
+        poll_unfinished(&mut b, &mut b_output, cx);
+        poll_unfinished(&mut c, &mut c_output, cx);
+        match (a_output.take(), b_output.take(), c_output.take()) {
+            (Some(a), Some(b), Some(c)) => Poll::Ready((a, b, c)),
+            unfinished => {
+                (a_output, b_output, c_output) = unfinished;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// Polls `future` with `cx` unless it has finished. Once it finishes, its output is kept in
+/// `output` and the future is dropped, so it is never polled again.
+fn poll_unfinished<F: Future>(
+    future: &mut Option<Pin<Box<F>>>,
+    output: &mut Option<F::Output>,
+    cx: &mut Context<'_>,
+) {
+    if let Some(pinned) = future {
+        if let Poll::Ready(value) = pinned.as_mut().poll(cx) {
+            *output = Some(value);
+            *future = None;
+        }
+    }
+}
+
 /// Two runs of `acctfile` whose transactions overlap, over disjoint inputs: lines 11-30 of
 /// `acctdata.txt` (run A) and lines 31-50 (run B), on a table holding lines 1-10.
 ///
@@ -1598,145 +1661,149 @@ async fn observe_overlap(
 /// reader still sees lines 1-10. The test then rolls its transaction back: A commits first, B
 /// acquires the table lock A held and commits last. Both exit 0, and the table holds exactly the
 /// records of lines 31-50: no row of lines 1-10 or of run A, so never a union of inputs.
-#[tokio::test(flavor = "multi_thread")]
-async fn concurrent_runs_of_one_load_leave_one_input_set() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("concurrent")?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let mut reader = PgStore::new(guard.pool().clone());
-    let fixture = fs::read(fixture_path("acctdata.txt"))?;
-    let (prior_path, prior) = account_slice(&scratch, &fixture, "acctdata-1-10.txt", 0..10)?;
-    let (a_path, a_records) = account_slice(&scratch, &fixture, "acctdata-11-30.txt", 10..30)?;
-    let (b_path, b_records) = account_slice(&scratch, &fixture, "acctdata-31-50.txt", 30..50)?;
-    let (prior_keys, a_keys, b_keys) = (
-        account_keys(&prior),
-        account_keys(&a_records),
-        account_keys(&b_records),
-    );
-    assert!(
-        prior_keys.is_disjoint(&a_keys)
-            && prior_keys.is_disjoint(&b_keys)
-            && a_keys.is_disjoint(&b_keys),
-        "acctdata.txt: two of lines 1-10, 11-30 and 31-50 share a key"
-    );
+#[test]
+fn concurrent_runs_of_one_load_leave_one_input_set() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("concurrent")?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let mut reader = PgStore::new(guard.pool().clone());
+        let fixture = fs::read(fixture_path("acctdata.txt"))?;
+        let (prior_path, prior) = account_slice(&scratch, &fixture, "acctdata-1-10.txt", 0..10)?;
+        let (a_path, a_records) = account_slice(&scratch, &fixture, "acctdata-11-30.txt", 10..30)?;
+        let (b_path, b_records) = account_slice(&scratch, &fixture, "acctdata-31-50.txt", 30..50)?;
+        let (prior_keys, a_keys, b_keys) = (
+            account_keys(&prior),
+            account_keys(&a_records),
+            account_keys(&b_records),
+        );
+        assert!(
+            prior_keys.is_disjoint(&a_keys)
+                && prior_keys.is_disjoint(&b_keys)
+                && a_keys.is_disjoint(&b_keys),
+            "acctdata.txt: two of lines 1-10, 11-30 and 31-50 share a key"
+        );
 
-    let loaded = run_batch(
-        &guard,
-        &scratch,
-        &["acctfile", "--input", path_arg(&prior_path)?],
-        None,
-    )
-    .await?;
-    // audit: LOADS-014
-    assert_exit(&loaded, 0, "acctfile over lines 1-10");
-    // audit: LOADS-014
-    assert_eq!(
-        first_difference(&prior, &AccountRepository::find_all(&mut store).await?),
-        None,
-        "accounts after lines 1-10: first row that differs"
-    );
+        let loaded = run_batch(
+            &guard,
+            &scratch,
+            &["acctfile", "--input", path_arg(&prior_path)?],
+            None,
+        )
+        .await?;
+        // audit: LOADS-014
+        assert_exit(&loaded, 0, "acctfile over lines 1-10");
+        // audit: LOADS-014
+        assert_eq!(
+            first_difference(&prior, &AccountRepository::find_all(&mut store).await?),
+            None,
+            "accounts after lines 1-10: first row that differs"
+        );
 
-    // `SELECT … FOR UPDATE` takes ROW SHARE on the table, which the load's SHARE ROW EXCLUSIVE
-    // does not conflict with, and the row lock, which the load's delete waits for.
-    let mut held = store.begin().await?;
-    let first_key = prior.first().ok_or("lines 1-10 hold no record")?.id;
-    AccountRepository::lock_by_id(&mut held, first_key)
-        .await?
-        .ok_or("accounts: the first row of lines 1-10 is not stored")?;
+        // `SELECT … FOR UPDATE` takes ROW SHARE on the table, which the load's SHARE ROW EXCLUSIVE
+        // does not conflict with, and the row lock, which the load's delete waits for.
+        let mut held = store.begin().await?;
+        let first_key = prior.first().ok_or("lines 1-10 hold no record")?.id;
+        AccountRepository::lock_by_id(&mut held, first_key)
+            .await?
+            .ok_or("accounts: the first row of lines 1-10 is not stored")?;
 
-    let logged = format!("{}?{LOG_LOCK_WAITS}", guard.database_url());
-    let a_args = ["acctfile", "--input", path_arg(&a_path)?];
-    let b_args = ["acctfile", "--input", path_arg(&b_path)?];
-    let (a_ended, b_ended) = (AtomicBool::new(false), AtomicBool::new(false));
-    let (start_b, b_started) = oneshot::channel::<()>();
+        let logged = format!("{}?{LOG_LOCK_WAITS}", guard.database_url());
+        let a_args = ["acctfile", "--input", path_arg(&a_path)?];
+        let b_args = ["acctfile", "--input", path_arg(&b_path)?];
+        let (a_ended, b_ended) = (AtomicBool::new(false), AtomicBool::new(false));
+        let (start_b, b_started) = oneshot::channel::<()>();
 
-    let run_a = async {
-        let output = run_batch_on(&logged, &scratch, &a_args, None).await;
-        a_ended.store(true, Ordering::SeqCst);
-        output
-    };
-    let run_b = async {
-        // An observer that fails before B is due drops the sender, and B never runs.
-        if b_started.await.is_err() {
-            return Ok(None);
-        }
-        let output = run_batch_on(&logged, &scratch, &b_args, None).await;
-        b_ended.store(true, Ordering::SeqCst);
-        output.map(Some)
-    };
-    let observer = async {
-        let observed =
-            observe_overlap(&guard, &mut reader, &prior, start_b, [&a_ended, &b_ended]).await;
-        // Whatever was observed, ending the test's transaction lets A, then B, go on, so no run
-        // is left waiting.
-        held.rollback().await?;
-        observed
-    };
-    let (a_output, b_output, overlap) = tokio::join!(run_a, run_b, observer);
+        let run_a = async {
+            let output = run_batch_on(&logged, &scratch, &a_args, None).await;
+            a_ended.store(true, Ordering::SeqCst);
+            output
+        };
+        let run_b = async {
+            // An observer that fails before B is due drops the sender, and B never runs.
+            if b_started.await.is_err() {
+                return Ok(None);
+            }
+            let output = run_batch_on(&logged, &scratch, &b_args, None).await;
+            b_ended.store(true, Ordering::SeqCst);
+            output.map(Some)
+        };
+        let observer = async {
+            let observed =
+                observe_overlap(&guard, &mut reader, &prior, start_b, [&a_ended, &b_ended]).await;
+            // Whatever was observed, ending the test's transaction lets A, then B, go on, so no run
+            // is left waiting.
+            held.rollback().await?;
+            observed
+        };
+        let (a_output, b_output, overlap) = join3(run_a, run_b, observer).await;
 
-    // audit: LOADS-040
-    assert_exit(&a_output?, 0, "acctfile over lines 11-30");
-    let b_output: Option<Output> = b_output?;
-    if let Some(output) = &b_output {
         // audit: LOADS-040
-        assert_exit(output, 0, "acctfile over lines 31-50");
-    }
-    let (_, pid_b) = overlap?;
-    if b_output.is_none() {
-        return Err("acctfile over lines 31-50 never started".into());
-    }
-    // audit: LOADS-040
-    await_lock_wait(
-        &guard,
-        "run B acquiring the table lock after run A ended",
-        None,
-        |wait| {
-            wait.acquired
-                && wait.pid == pid_b
-                && wait.lock.starts_with("ShareRowExclusiveLock on relation ")
-        },
-    )
-    .await?;
+        assert_exit(&a_output?, 0, "acctfile over lines 11-30");
+        let b_output: Option<Output> = b_output?;
+        if let Some(output) = &b_output {
+            // audit: LOADS-040
+            assert_exit(output, 0, "acctfile over lines 31-50");
+        }
+        let (_, pid_b) = overlap?;
+        if b_output.is_none() {
+            return Err("acctfile over lines 31-50 never started".into());
+        }
+        // audit: LOADS-040
+        await_lock_wait(
+            &guard,
+            "run B acquiring the table lock after run A ended",
+            None,
+            |wait| {
+                wait.acquired
+                    && wait.pid == pid_b
+                    && wait.lock.starts_with("ShareRowExclusiveLock on relation ")
+            },
+        )
+        .await?;
 
-    let after = AccountRepository::find_all(&mut store).await?;
-    // audit: LOADS-014
-    // audit: LOADS-040
-    assert_eq!(
-        after.len(),
-        b_records.len(),
-        "accounts after both runs: rows against lines 31-50"
-    );
-    // audit: LOADS-014
-    // audit: LOADS-040
-    assert_eq!(
-        first_difference(&b_records, &after),
-        None,
-        "accounts after both runs: first row that differs from lines 31-50"
-    );
-    Ok(())
+        let after = AccountRepository::find_all(&mut store).await?;
+        // audit: LOADS-014
+        // audit: LOADS-040
+        assert_eq!(
+            after.len(),
+            b_records.len(),
+            "accounts after both runs: rows against lines 31-50"
+        );
+        // audit: LOADS-014
+        // audit: LOADS-040
+        assert_eq!(
+            first_difference(&b_records, &after),
+            None,
+            "accounts after both runs: first row that differs from lines 31-50"
+        );
+        Ok(())
+    })
 }
 
 /// Against a database `carddemo-migrate` has not migrated, the maintenance database `postgres`
 /// of the same server, every load fails at its first statement and creates no schema, so the
 /// same load fails again on a second run.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_load_never_migrates() -> TestResult {
-    let guard = start_postgres().await?;
-    let scratch = Scratch::create("unmigrated")?;
-    let (server, _) = guard
-        .database_url()
-        .rsplit_once('/')
-        .ok_or("the database URL names no database")?;
-    let unmigrated = format!("{server}/postgres");
-    let fixtures = fixture_dir();
-    for run in ["first", "second"] {
-        for job in DEV_UP_ORDER {
-            let output = run_batch_on(&unmigrated, &scratch, &[job], Some(&fixtures)).await?;
-            // audit: LOADS-021
-            assert_failed(&output, &format!("{run} {job} on an unmigrated database"));
+#[test]
+fn a_load_never_migrates() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let scratch = Scratch::create("unmigrated")?;
+        let (server, _) = guard
+            .database_url()
+            .rsplit_once('/')
+            .ok_or("the database URL names no database")?;
+        let unmigrated = format!("{server}/postgres");
+        let fixtures = fixture_dir();
+        for run in ["first", "second"] {
+            for job in DEV_UP_ORDER {
+                let output = run_batch_on(&unmigrated, &scratch, &[job], Some(&fixtures)).await?;
+                // audit: LOADS-021
+                assert_failed(&output, &format!("{run} {job} on an unmigrated database"));
+            }
         }
-    }
-    // audit: LOADS-021
-    assert_no_file_written(&scratch)?;
-    Ok(())
+        // audit: LOADS-021
+        assert_no_file_written(&scratch)?;
+        Ok(())
+    })
 }

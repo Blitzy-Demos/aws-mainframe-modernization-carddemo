@@ -56,9 +56,8 @@ pub struct TransactionCategoryRow {
     pub(crate) filler: String,
 }
 
-// The conversions are public while the fields stay crate-only: the row is re-exported from
-// `rows`, and a crate-only conversion that no repository calls yet is dead code, which
-// `warnings = "deny"` turns into a build error that no lint attribute may silence (R15).
+// The conversions are public, as the row type re-exported from `rows` is, while the fields stay
+// crate-only: code outside the crate can run codec B through them but never reach a column value.
 impl TransactionCategoryRow {
     /// The row that stores `record`, every byte of its three `PIC X` fields kept and its category
     /// code held in the 64-bit `BIGINT` column (CVTRA04Y-001 to CVTRA04Y-004, PIC-023).

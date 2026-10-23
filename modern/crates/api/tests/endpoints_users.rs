@@ -86,8 +86,8 @@ use tower::ServiceExt as _;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
-/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-/// without the lint attributes that macro's expansion carries.
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries.
 fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -509,20 +509,22 @@ const REGULAR_IDS: [&str; 5] = ["USER0001", "USER0002", "USER0003", "USER0004", 
 
 /// Endpoint 16, COUSR00C: the gate, the first entry, ENTER with a search value, F7 and F8 over
 /// one page and over two, short pages, and the browses a halt candidate blocks.
-#[tokio::test]
-async fn cousr00c_list_rows() -> TestResult {
-    let api = Api::loaded().await?;
-    let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
-    list_gate(&api).await?;
-    let first = list_first_entry(&api, &admin).await?;
-    list_on_the_only_page(&api, &admin, &first).await?;
-    list_from_a_search_value(&api, &admin, &first).await?;
-    // An eleventh user, so that the list has a second page.
-    api.add_user(&admin, "USER0006", UPPER_PASSWORD, "U")
-        .await?;
-    list_two_pages(&api, &admin).await?;
-    list_short_pages(&api, &admin).await?;
-    list_blocked(&api, &admin).await
+#[test]
+fn cousr00c_list_rows() -> TestResult {
+    block_on(async {
+        let api = Api::loaded().await?;
+        let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
+        list_gate(&api).await?;
+        let first = list_first_entry(&api, &admin).await?;
+        list_on_the_only_page(&api, &admin, &first).await?;
+        list_from_a_search_value(&api, &admin, &first).await?;
+        // An eleventh user, so that the list has a second page.
+        api.add_user(&admin, "USER0006", UPPER_PASSWORD, "U")
+            .await?;
+        list_two_pages(&api, &admin).await?;
+        list_short_pages(&api, &admin).await?;
+        list_blocked(&api, &admin).await
+    })
 }
 
 /// COUSR00C-001: no token and an invalid one are 401, a `U` token 403.
@@ -810,17 +812,19 @@ fn add_body_with(member: &str, value: &str) -> Value {
 /// Endpoint 17, COUSR01C: the gate, the empty-field edits in order, the map lengths, the row
 /// stored as typed with the hash of its password, the sign-on consequences of storing as
 /// typed (E26), the success message and the duplicate.
-#[tokio::test]
-async fn cousr01c_add_rows() -> TestResult {
-    let api = Api::loaded().await?;
-    let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
-    add_gate(&api).await?;
-    add_empty_fields(&api, &admin).await?;
-    add_map_lengths(&api, &admin).await?;
-    add_stores_the_row_as_typed(&api, &admin).await?;
-    add_any_user_type(&api, &admin).await?;
-    add_then_sign_on(&api, &admin).await?;
-    add_messages_and_duplicates(&api, &admin).await
+#[test]
+fn cousr01c_add_rows() -> TestResult {
+    block_on(async {
+        let api = Api::loaded().await?;
+        let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
+        add_gate(&api).await?;
+        add_empty_fields(&api, &admin).await?;
+        add_map_lengths(&api, &admin).await?;
+        add_stores_the_row_as_typed(&api, &admin).await?;
+        add_any_user_type(&api, &admin).await?;
+        add_then_sign_on(&api, &admin).await?;
+        add_messages_and_duplicates(&api, &admin).await
+    })
 }
 
 /// COUSR01C-001 and COUSR01C-002: 401 without a valid token and 403 for a `U` token, before
@@ -1144,19 +1148,21 @@ fn update_body(
 /// Endpoints 18 to 20, COUSR02C and COUSR03C, in one fixed order on one database: the gate, the
 /// shared read, the update's edits, change test, password and type rules, its messages, then
 /// the delete and an admin's delete of their own user.
-#[tokio::test]
-async fn cousr02c_cousr03c_maintenance_rows() -> TestResult {
-    let api = Api::loaded().await?;
-    let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
-    maintenance_gate(&api).await?;
-    read_rows(&api, &admin).await?;
-    update_edit_rows(&api, &admin).await?;
-    update_change_rows(&api, &admin).await?;
-    update_password_rows(&api, &admin).await?;
-    update_type_and_token_rows(&api, &admin).await?;
-    update_message_and_blocked_rows(&api, &admin).await?;
-    delete_rows(&api, &admin).await?;
-    delete_own_user_rows(&api, &admin).await
+#[test]
+fn cousr02c_cousr03c_maintenance_rows() -> TestResult {
+    block_on(async {
+        let api = Api::loaded().await?;
+        let admin = api.token("ADMIN001", FIXTURE_PASSWORD).await?;
+        maintenance_gate(&api).await?;
+        read_rows(&api, &admin).await?;
+        update_edit_rows(&api, &admin).await?;
+        update_change_rows(&api, &admin).await?;
+        update_password_rows(&api, &admin).await?;
+        update_type_and_token_rows(&api, &admin).await?;
+        update_message_and_blocked_rows(&api, &admin).await?;
+        delete_rows(&api, &admin).await?;
+        delete_own_user_rows(&api, &admin).await
+    })
 }
 
 /// 401 without a valid token and 403 for a `U` token on endpoints 18, 19 and 20, with nothing
@@ -1656,58 +1662,60 @@ async fn delete_own_user_rows(api: &Api, admin: &str) -> TestResult {
 /// Store failures, over an empty database whose pool is closed: the list, the read and the
 /// add answer with their programs' messages (COUSR00C-026, COUSR01C-024, COUSR02C-016,
 /// COUSR03C-014).
-#[tokio::test]
-async fn store_failure_rows() -> TestResult {
-    let api = Api::closed().await?;
-    // Sign-on reads the store, so the token comes from the state's own keys.
-    let admin = api.state.jwt.issue(&key("ADMIN001")?, &UserType::ADMIN)?;
+#[test]
+fn store_failure_rows() -> TestResult {
+    block_on(async {
+        let api = Api::closed().await?;
+        // Sign-on reads the store, so the token comes from the state's own keys.
+        let admin = api.state.jwt.issue(&key("ADMIN001")?, &UserType::ADMIN)?;
 
-    let list = api.list(Some(&admin), "").await?;
-    // audit: COUSR00C-026
-    expect_error(
-        &list,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        LOOKUP_FAILED,
-        None,
-    )?;
-    let fetch = api.fetch(Some(&admin), "USER0001").await?;
-    // audit: COUSR02C-016
-    // audit: COUSR03C-014
-    expect_error(
-        &fetch,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        LOOKUP_FAILED,
-        Some("first_name"),
-    )?;
-    let add = api.add(Some(&admin), &add_body("NEWUSR01")).await?;
-    // audit: COUSR01C-024
-    expect_error(
-        &add,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        ADD_FAILED,
-        Some("first_name"),
-    )?;
+        let list = api.list(Some(&admin), "").await?;
+        // audit: COUSR00C-026
+        expect_error(
+            &list,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOOKUP_FAILED,
+            None,
+        )?;
+        let fetch = api.fetch(Some(&admin), "USER0001").await?;
+        // audit: COUSR02C-016
+        // audit: COUSR03C-014
+        expect_error(
+            &fetch,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            LOOKUP_FAILED,
+            Some("first_name"),
+        )?;
+        let add = api.add(Some(&admin), &add_body("NEWUSR01")).await?;
+        // audit: COUSR01C-024
+        expect_error(
+            &add,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ADD_FAILED,
+            Some("first_name"),
+        )?;
 
-    // The delete opens its transaction before it reads, and the update, whose unlocked read
-    // fails, then reads inside its transaction. A transaction that cannot begin has no audited
-    // text, so the API's fixed 500 answers, with no store detail. The rewrite and delete
-    // failures of COUSR02C-032 and COUSR03C-022 follow a successful locked read, which a closed
-    // pool never gives; `cousr02c_cousr03c_write_outcome_rows` proves them over a probed store.
-    let body = update_body("LAWRENCE", "THOMSON", "U", None);
-    let update = api.update(Some(&admin), "USER0001", &body).await?;
-    expect_error(
-        &update,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        UNABLE_TO_PROCESS,
-        None,
-    )?;
-    let delete = api.delete(Some(&admin), "USER0001").await?;
-    expect_error(
-        &delete,
-        StatusCode::INTERNAL_SERVER_ERROR,
-        UNABLE_TO_PROCESS,
-        None,
-    )
+        // The delete opens its transaction before it reads, and the update, whose unlocked read
+        // fails, then reads inside its transaction. A transaction that cannot begin has no audited
+        // text, so the API's fixed 500 answers, with no store detail. The rewrite and delete
+        // failures of COUSR02C-032 and COUSR03C-022 follow a successful locked read, which a closed
+        // pool never gives; `cousr02c_cousr03c_write_outcome_rows` proves them over a probed store.
+        let body = update_body("LAWRENCE", "THOMSON", "U", None);
+        let update = api.update(Some(&admin), "USER0001", &body).await?;
+        expect_error(
+            &update,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            UNABLE_TO_PROCESS,
+            None,
+        )?;
+        let delete = api.delete(Some(&admin), "USER0001").await?;
+        expect_error(
+            &delete,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            UNABLE_TO_PROCESS,
+            None,
+        )
+    })
 }
 
 /// One call a [`ScriptedProbe`] was asked about, with the argument it carried.

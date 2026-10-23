@@ -741,13 +741,20 @@ function cursorField(state: CoactupKeyState): FieldName {
   return state === "S" || state === "E" || state === "N" ? "activeStatus" : "acctId";
 }
 
-/** The `from` path of the route state the transferring screen set, if any. */
+/** Route paths of the 21 screens; the only places F3 returns to. */
+const SCREEN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
+
+/**
+ * The `from` path of the route state the transferring screen set, when it is a screen path. Any
+ * other value, such as a URL, a protocol-relative or backslash form or a path no screen has,
+ * counts as no caller, so F3 opens the main menu (COACTUPC-005).
+ */
 function fromPath(state: unknown): string | undefined {
   return typeof state === "object" &&
     state !== null &&
     "from" in state &&
     typeof state.from === "string" &&
-    state.from.startsWith("/")
+    SCREEN_PATHS.has(state.from)
     ? state.from
     : undefined;
 }
@@ -1139,9 +1146,17 @@ export function COACTUP(): ReactNode {
     form.setFocus("activeStatus");
   }
 
-  /** F3: back to the screen that transferred here, else the main menu (COACTUPC-005). */
+  /**
+   * F3: back to the screen that transferred here, else the main menu (COACTUPC-005). A transfer
+   * the router refuses, by throwing or by rejecting, opens the main menu instead, so F3 always
+   * leaves for a screen.
+   */
   function exit(): void {
-    navigate(fromPath(location.state) ?? PATHS.COMEN01, { state: { from: PATHS.COACTUP } });
+    const options = { state: { from: PATHS.COACTUP } };
+    const target = fromPath(location.state) ?? PATHS.COMEN01;
+    void Promise.resolve()
+      .then(() => navigate(target, options))
+      .catch(() => navigate(PATHS.COMEN01, options));
   }
 
   const availability = coactupKeys(screen.state);

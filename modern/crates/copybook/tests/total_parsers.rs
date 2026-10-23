@@ -25,6 +25,7 @@ use copybook::{
 };
 use proptest::prelude::*;
 use proptest::sample::Index;
+use proptest::strategy::Union;
 
 /// Longest generated input, in bytes.
 const MAX_LEN: usize = 1024;
@@ -122,13 +123,16 @@ fn config() -> ProptestConfig {
 /// `COMP-3` digit pair, or a `COMP-3` digit and sign. Pure random bytes almost never get past a
 /// field's first digit check; these reach the digit, sign, nibble and date branches behind it.
 fn codec_byte() -> impl Strategy<Value = u8> {
-    prop_oneof![
-        any::<u8>(),
-        prop::sample::select(CODEC_TEXT),
-        (0_u8..=9, 0_u8..=9).prop_map(|(high, low)| (high << 4) | low),
+    Union::new([
+        any::<u8>().boxed(),
+        prop::sample::select(CODEC_TEXT).boxed(),
+        (0_u8..=9, 0_u8..=9)
+            .prop_map(|(high, low)| (high << 4) | low)
+            .boxed(),
         (0_u8..=9, prop::sample::select(PACKED_SIGNS))
-            .prop_map(|(digit, sign)| (digit << 4) | sign),
-    ]
+            .prop_map(|(digit, sign)| (digit << 4) | sign)
+            .boxed(),
+    ])
 }
 
 /// `(int_digits, scale)` of a picture the codecs support: 1 to 18 digits, at most 4 of them

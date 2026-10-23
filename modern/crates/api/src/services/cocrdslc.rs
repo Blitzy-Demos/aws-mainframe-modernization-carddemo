@@ -39,6 +39,10 @@
 use domain::online::cocrdlic::CardRef;
 use domain::online::cocrdslc::{self, CardKey, CardLookup, CardView, DetailFailure};
 use persistence::CardRepository;
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -97,7 +101,28 @@ async fn detail<R: CardRepository>(
         },
         Ok(None) => CardLookup::NotFound,
         Err(error) => {
-            tracing::error!(%error, "CARDDAT read failed; answering the COCRDSLC file error");
+            // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint
+            // suppression.
+            static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+            static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+                name: concat!("event ", file!(), ":", line!()),
+                target: module_path!(),
+                level: Level::ERROR,
+                fields: &["message", "error"],
+                callsite: &EVENT,
+                kind: Kind::EVENT,
+            };
+            if runtime::telemetry::event_enabled(&EVENT) {
+                Event::dispatch(
+                    &EVENT_METADATA,
+                    &EVENT_METADATA.fields().value_set_all(&[
+                        Some(
+                            &"CARDDAT read failed; answering the COCRDSLC file error" as &dyn Value,
+                        ),
+                        Some(&display(error) as &dyn Value),
+                    ]),
+                );
+            }
             CardLookup::Error
         }
     };
@@ -128,6 +153,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A synthetic card number, in no fixture.
     const CARD: &str = "1111222233334444";
@@ -299,102 +333,112 @@ mod tests {
     // audit: COCRDSLC-014
     // audit: COCRDSLC-018
     // audit: COCRDSLC-023
-    #[tokio::test]
-    async fn number_and_handle_read_the_same_card_shown_redacted_to_a_user() -> TestResult {
-        let user = user(UserType::USER)?;
-        let mut cards = table()?;
+    #[test]
+    fn number_and_handle_read_the_same_card_shown_redacted_to_a_user() -> TestResult {
+        block_on(async {
+            let user = user(UserType::USER)?;
+            let mut cards = table()?;
 
-        let by_number = detail(&mut cards, &user, query(ACCT, Some(CARD), None)).await?;
-        let by_handle = detail(&mut cards, &user, query(ACCT, None, Some(HANDLE))).await?;
+            let by_number = detail(&mut cards, &user, query(ACCT, Some(CARD), None)).await?;
+            let by_handle = detail(&mut cards, &user, query(ACCT, None, Some(HANDLE))).await?;
 
-        assert_eq!(
-            cards.calls,
-            Calls {
-                by_id: 1,
-                by_ref: 1,
-                other: 0
-            }
-        );
-        assert_eq!(by_number, by_handle);
-        assert_eq!(by_number.acct_id, PicU::new(50)?);
-        assert_eq!(by_number.card_ref, CardRef::new(HANDLE));
-        let CardNumberDisclosure::Redacted(number) = &by_number.card_num else {
-            return Err("a user token was shown the full card number".into());
-        };
-        assert_eq!(number.redacted(), REDACTED);
-        Ok(())
+            assert_eq!(
+                cards.calls,
+                Calls {
+                    by_id: 1,
+                    by_ref: 1,
+                    other: 0
+                }
+            );
+            assert_eq!(by_number, by_handle);
+            assert_eq!(by_number.acct_id, PicU::new(50)?);
+            assert_eq!(by_number.card_ref, CardRef::new(HANDLE));
+            let CardNumberDisclosure::Redacted(number) = &by_number.card_num else {
+                return Err("a user token was shown the full card number".into());
+            };
+            assert_eq!(number.redacted(), REDACTED);
+            Ok(())
+        })
     }
 
     // audit: COCRDSLC-022
-    #[tokio::test]
-    async fn an_administrator_token_is_shown_the_full_number() -> TestResult {
-        let mut cards = table()?;
-        let view = detail(
-            &mut cards,
-            &user(UserType::ADMIN)?,
-            query(ACCT, None, Some(HANDLE)),
-        )
-        .await?;
+    #[test]
+    fn an_administrator_token_is_shown_the_full_number() -> TestResult {
+        block_on(async {
+            let mut cards = table()?;
+            let view = detail(
+                &mut cards,
+                &user(UserType::ADMIN)?,
+                query(ACCT, None, Some(HANDLE)),
+            )
+            .await?;
 
-        let CardNumberDisclosure::Full(number) = &view.card_num else {
-            return Err("an administrator token was shown the redacted number".into());
-        };
-        assert_eq!(serde_json::to_value(number)?, json!(CARD));
-        Ok(())
+            let CardNumberDisclosure::Full(number) = &view.card_num else {
+                return Err("an administrator token was shown the redacted number".into());
+            };
+            assert_eq!(serde_json::to_value(number)?, json!(CARD));
+            Ok(())
+        })
     }
 
     // audit: COCRDSLC-015
-    #[tokio::test]
-    async fn an_unknown_number_or_handle_is_not_found() -> TestResult {
-        let user = user(UserType::USER)?;
-        let mut cards = table()?;
+    #[test]
+    fn an_unknown_number_or_handle_is_not_found() -> TestResult {
+        block_on(async {
+            let user = user(UserType::USER)?;
+            let mut cards = table()?;
 
-        for request in [
-            query(ACCT, Some("9999888877776666"), None),
-            query(ACCT, None, Some(HANDLE + 1)),
-        ] {
-            let failure = rule(detail(&mut cards, &user, request).await)?;
-            assert_eq!(failure.message(), DID_NOT_FIND_ACCTCARD_COMBO);
-            assert_eq!(failure.class(), FailureClass::NotFound);
-        }
-        Ok(())
+            for request in [
+                query(ACCT, Some("9999888877776666"), None),
+                query(ACCT, None, Some(HANDLE + 1)),
+            ] {
+                let failure = rule(detail(&mut cards, &user, request).await)?;
+                assert_eq!(failure.message(), DID_NOT_FIND_ACCTCARD_COMBO);
+                assert_eq!(failure.class(), FailureClass::NotFound);
+            }
+            Ok(())
+        })
     }
 
     // audit: COCRDSLC-016
-    #[tokio::test]
-    async fn a_failed_read_is_the_file_error_not_a_store_error() -> TestResult {
-        let user = user(UserType::ADMIN)?;
-        let mut cards = Cards::unreachable();
+    #[test]
+    fn a_failed_read_is_the_file_error_not_a_store_error() -> TestResult {
+        block_on(async {
+            let user = user(UserType::ADMIN)?;
+            let mut cards = Cards::unreachable();
 
-        for request in [
-            query(ACCT, Some(CARD), None),
-            query(ACCT, None, Some(HANDLE)),
-        ] {
-            let failure = rule(detail(&mut cards, &user, request).await)?;
-            assert_eq!(failure.message(), FILE_ERROR);
-            assert_eq!(failure.class(), FailureClass::Store);
-        }
-        assert_eq!(cards.calls.other, 0);
-        Ok(())
+            for request in [
+                query(ACCT, Some(CARD), None),
+                query(ACCT, None, Some(HANDLE)),
+            ] {
+                let failure = rule(detail(&mut cards, &user, request).await)?;
+                assert_eq!(failure.message(), FILE_ERROR);
+                assert_eq!(failure.class(), FailureClass::Store);
+            }
+            assert_eq!(cards.calls.other, 0);
+            Ok(())
+        })
     }
 
     // audit: COCRDSLC-007
     // audit: COCRDSLC-008
-    #[tokio::test]
-    async fn an_edit_failure_reads_no_card() -> TestResult {
-        let user = user(UserType::ADMIN)?;
-        let mut cards = table()?;
+    #[test]
+    fn an_edit_failure_reads_no_card() -> TestResult {
+        block_on(async {
+            let user = user(UserType::ADMIN)?;
+            let mut cards = table()?;
 
-        for (request, message) in [
-            (query("", None, None), NO_SEARCH_CRITERIA_RECEIVED),
-            (query(ACCT, Some(CARD), Some(HANDLE)), CARD_FILTER_INVALID),
-        ] {
-            assert_eq!(
-                rule(detail(&mut cards, &user, request).await)?.message(),
-                message
-            );
-        }
-        assert_eq!(cards.calls, Calls::default());
-        Ok(())
+            for (request, message) in [
+                (query("", None, None), NO_SEARCH_CRITERIA_RECEIVED),
+                (query(ACCT, Some(CARD), Some(HANDLE)), CARD_FILTER_INVALID),
+            ] {
+                assert_eq!(
+                    rule(detail(&mut cards, &user, request).await)?.message(),
+                    message
+                );
+            }
+            assert_eq!(cards.calls, Calls::default());
+            Ok(())
+        })
     }
 }

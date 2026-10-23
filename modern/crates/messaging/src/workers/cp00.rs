@@ -95,7 +95,7 @@ use std::sync::Arc;
 use copybook::{PicS, PicU};
 use domain::messaging::copaua0c::{
     self, CardNumberError, CustomerLookup, Decision, FieldError, FoundContext, LogSite, Lookup,
-    ParseError, SqlState, SummaryState,
+    ParseError, SqlState, SummaryError, SummaryState,
 };
 use domain::records::{
     AccountRecord, AuthReply, AuthRequestRecord, CardXrefRecord, CustomerRecord, ErrorLogRecord,
@@ -109,10 +109,11 @@ use persistence::{
 };
 use runtime::config::Config;
 use runtime::telemetry::{self, IdKey};
+use tracing::{Level, Metadata, field};
 
 use super::{Channels, Processed, Step, StepError};
 use crate::broker::{self, Acknowledger, AmqpError, Consumer, PublishFailure, QueueCheck, Request};
-use crate::ids;
+use crate::{EventSite, emit, event_metadata, event_metadata_with_target, ids};
 
 /// The environment variable of the request queue, which the start-up refusal and a failed
 /// passive declare of the request queue name in place of the configured value.
@@ -321,10 +322,7 @@ impl AuthTx for PgTx<'static> {
             Ok(()) => PgTx::commit(savepoint).await,
             Err(error) => {
                 if let Err(rollback) = PgTx::rollback(savepoint).await {
-                    tracing::warn!(
-                        error = %rollback,
-                        "rolling back to the detail savepoint failed"
-                    );
+                    detail_savepoint_rollback_failed(&rollback);
                 }
                 Err(error)
             }
@@ -587,10 +585,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// A parseable card with a malformed field: the `05`/`9000` decline, confirmed and then
     /// acknowledged, with no lock and no write (COPAUA0C-007 to COPAUA0C-012, COPAUA0C-082).
     async fn field_error(&mut self, error: &FieldError) -> Processed {
-        tracing::warn!(
-            fault = %error.fault,
-            "the CP00 request has a malformed field; it is declined with no write"
-        );
+        malformed_field(error);
         let reply = copaua0c::field_error_reply(error);
         match self.answer(&reply).await {
             Ok(()) => Processed::Replied,
@@ -676,12 +671,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
             summary,
         };
         let decision = copaua0c::decide(request, &Lookup::CardFound(context));
-        tracing::debug!(
-            status = ?decision.status,
-            reason = ?decision.reason,
-            guard = ?decision.guard,
-            "CP00 decision"
-        );
+        cp00_decision(&decision);
         match self.answer(&decision.reply).await {
             Ok(()) => self.write_after_ack(tx, request, &context, &decision).await,
             Err(why) => self.unanswered(why, &request.card_num, Some(tx)).await,
@@ -791,7 +781,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                 // HALTED(X-ARITH-6), COPAUA0C-094 and COPAUA0C-095: a count at 9999 has no
                 // expected next value, so no summary is written; the `I003` path is interim
                 // handling, not a parity result.
-                tracing::error!(error = %error, "the summary update cannot be built");
+                summary_update_unbuildable(error);
                 let site = LogSite::I003 {
                     card,
                     sqlstate: None,
@@ -803,14 +793,14 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         let failure = match updated {
             Ok(true) => None,
             Ok(false) => {
-                tracing::error!("the summary update changed no row");
+                summary_update_no_row();
                 Some(LogSite::I003 {
                     card,
                     sqlstate: None,
                 })
             }
             Err(error) => {
-                tracing::error!(error = %error, "the summary update failed");
+                summary_update_failed(&error);
                 Some(LogSite::I003 {
                     card,
                     sqlstate: sqlstate(&error),
@@ -825,10 +815,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
             .insert_detail(PicS::from(context.xref.acct_id), &detail)
             .await;
         if let Err(error) = inserted {
-            tracing::error!(
-                error = %error,
-                "the detail insert failed; the summary update commits alone"
-            );
+            detail_insert_failed(&error);
             let site = LogSite::I004 {
                 card,
                 sqlstate: sqlstate(&error),
@@ -836,10 +823,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
             self.log(site).await;
         }
         if let Err(error) = tx.commit().await {
-            tracing::error!(
-                error = %error,
-                "the authorization did not commit; the confirmed reply stands unrecorded"
-            );
+            commit_failed(&error);
         }
         Processed::Replied
     }
@@ -905,18 +889,12 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     ) -> Processed {
         match why {
             Unanswered::AckFailed(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "the acknowledgement failed; nothing is written and the request is requeued"
-                );
+                ack_failed(&error);
                 rollback(tx).await;
                 self.channels.abandon().await
             }
             Unanswered::NotConfirmed(undelivered) => {
-                tracing::warn!(
-                    reason = %undelivered,
-                    "the reply was not confirmed; the request is dead-lettered"
-                );
+                reply_unconfirmed(&undelivered);
                 self.log(LogSite::M004 { card }).await;
                 rollback(tx).await;
                 let processed = self.dead_letter().await;
@@ -924,10 +902,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
                     && matches!(undelivered, Undelivered::Failed(_))
                 {
                     if let Err(error) = self.channels.reopen_publisher(self.connection).await {
-                        tracing::warn!(
-                            error = %error,
-                            "reopening the publisher channel failed; the next get reports it"
-                        );
+                        publisher_reopen_failed(&error);
                     }
                 }
                 processed
@@ -954,11 +929,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         error: &PersistenceError,
         tx: Option<S::Tx>,
     ) -> Processed {
-        tracing::error!(
-            location = %location(site),
-            error = %error,
-            "a CP00 store read failed; the request is declined 05/9000 with no authorization write"
-        );
+        store_read_failed(site, error);
         if matches!(error, PersistenceError::Unavailable) {
             self.store_unavailable = true;
         }
@@ -984,10 +955,7 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
         match self.channels.reject_without_requeue(self.request).await {
             Ok(()) => Processed::DeadLettered,
             Err(error) => {
-                tracing::warn!(
-                    error = %error,
-                    "rejecting the request failed; the broker requeues it"
-                );
+                reject_failed(&error);
                 self.channels.abandon().await
             }
         }
@@ -1004,26 +972,14 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     /// stands for the row not written.
     async fn log(&self, site: LogSite<'_>) {
         let location = location(site);
-        if site.ends_task() {
-            tracing::error!(location = %location, err_message = site.message(), "CSSL error log");
-        } else {
-            tracing::warn!(location = %location, err_message = site.message(), "CSSL error log");
-        }
+        cssl_error_log(site, &location);
         if self.store_unavailable {
-            tracing::error!(
-                location = %location,
-                err_message = site.message(),
-                "the cssl_error_log row is not written because the database is unavailable"
-            );
+            cssl_row_not_attempted(&location, site.message());
             return;
         }
         let record = copaua0c::error_log(site, self.clock);
         if let Err(error) = self.store.log(&record).await {
-            tracing::error!(
-                location = %location,
-                error = %error,
-                "the cssl_error_log row could not be written"
-            );
+            cssl_row_write_failed(&location, &error);
         }
     }
 }
@@ -1036,18 +992,42 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
 /// alert is matched to the span's other lines. Then the body's length and the cause. It never
 /// carries a body byte or the text of either ID.
 fn unparseable_alert(request: &Request, id_key: &IdKey, error: &CardNumberError) {
-    tracing::error!(
-        target: telemetry::ALERT_TARGET,
-        alert = copaua0c::ALERT_CARD_UNPARSEABLE,
-        message_id = request
-            .screened_message_id(Some(id_key))
-            .map(tracing::field::display),
-        correlation_id = request
-            .screened_correlation_id(Some(id_key))
-            .map(tracing::field::display),
-        body_len = error.body_len,
-        cause = ?error.cause,
-        "the CP00 request has no readable card number; it is dead-lettered without a reply"
+    static SITE: EventSite<6> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata_with_target(
+        "cp00_card_unparseable",
+        telemetry::ALERT_TARGET,
+        module_path!(),
+        Level::ERROR,
+        &[
+            "message",
+            "alert",
+            "message_id",
+            "correlation_id",
+            "body_len",
+            "cause",
+        ],
+        &SITE,
+    );
+    // An `Option` records nothing when it is `None`, which leaves the field out of the event.
+    let message_id = request
+        .screened_message_id(Some(id_key))
+        .map(field::display);
+    let correlation_id = request
+        .screened_correlation_id(Some(id_key))
+        .map(field::display);
+    emit(
+        &SITE,
+        [
+            Some(
+                &"the CP00 request has no readable card number; it is dead-lettered without a \
+                  reply",
+            ),
+            Some(&copaua0c::ALERT_CARD_UNPARSEABLE),
+            Some(&message_id),
+            Some(&correlation_id),
+            Some(&error.body_len),
+            Some(&field::debug(&error.cause)),
+        ],
     );
 }
 
@@ -1058,10 +1038,7 @@ async fn rollback<T: AuthTx>(tx: Option<T>) {
         return;
     };
     if let Err(error) = tx.rollback().await {
-        tracing::warn!(
-            error = %error,
-            "rolling back the authorization transaction failed"
-        );
+        rollback_failed(&error);
     }
 }
 
@@ -1074,6 +1051,361 @@ fn location(site: LogSite<'_>) -> Cow<'static, str> {
 /// HALTED(H4) (COPAUA0C-112).
 fn sqlstate(error: &PersistenceError) -> Option<SqlState> {
     error.sqlstate().and_then(SqlState::parse)
+}
+
+/// `WARN` when rolling back to the detail savepoint failed with `error`.
+fn detail_savepoint_rollback_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "detail_savepoint_rollback_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"rolling back to the detail savepoint failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when a request whose card number parses has a malformed field, with the field's
+/// `fault`, before its decline.
+fn malformed_field(error: &FieldError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "malformed_field",
+        module_path!(),
+        Level::WARN,
+        &["message", "fault"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the CP00 request has a malformed field; it is declined with no write"),
+            Some(&field::display(&error.fault)),
+        ],
+    );
+}
+
+/// `DEBUG` with the `decision`'s status, reason and guard outcome, before its reply.
+fn cp00_decision(decision: &Decision) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "cp00_decision",
+        module_path!(),
+        Level::DEBUG,
+        &["message", "status", "reason", "guard"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"CP00 decision"),
+            Some(&field::debug(&decision.status)),
+            Some(&field::debug(&decision.reason)),
+            Some(&field::debug(&decision.guard)),
+        ],
+    );
+}
+
+/// `ERROR` when the summary update cannot be built, with the domain's `error`.
+fn summary_update_unbuildable(error: SummaryError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "summary_update_unbuildable",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the summary update cannot be built"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when the summary update changed no row.
+fn summary_update_no_row() {
+    static SITE: EventSite<1> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "summary_update_no_row",
+        module_path!(),
+        Level::ERROR,
+        &["message"],
+        &SITE,
+    );
+    emit(&SITE, [Some(&"the summary update changed no row")]);
+}
+
+/// `ERROR` when the summary update failed with the store `error`.
+fn summary_update_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "summary_update_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the summary update failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when the detail insert failed with the store `error`, so the summary update commits
+/// alone.
+fn detail_insert_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "detail_insert_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the detail insert failed; the summary update commits alone"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when the authorization did not commit, with the store `error`.
+fn commit_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "commit_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the authorization did not commit; the confirmed reply stands unrecorded"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when the acknowledgement of a confirmed reply failed with `error`, so nothing is
+/// written and the request is requeued.
+fn ack_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "ack_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the acknowledgement failed; nothing is written and the request is requeued"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when the reply was not confirmed, for the `undelivered` reason, so the request is
+/// dead-lettered.
+fn reply_unconfirmed(undelivered: &Undelivered) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reply_unconfirmed",
+        module_path!(),
+        Level::WARN,
+        &["message", "reason"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the reply was not confirmed; the request is dead-lettered"),
+            Some(&field::display(undelivered)),
+        ],
+    );
+}
+
+/// `WARN` when reopening the publisher channel after an unconfirmed reply failed with `error`.
+fn publisher_reopen_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "publisher_reopen_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"reopening the publisher channel failed; the next get reports it"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` when a store read failed at the log location of `site` with the store `error`,
+/// before the `05`/`9000` decline.
+fn store_read_failed(site: LogSite<'_>, error: &PersistenceError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "store_read_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "location", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(
+                &"a CP00 store read failed; the request is declined 05/9000 with no authorization \
+                  write",
+            ),
+            Some(&field::display(&location(site))),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when rejecting the request failed with `error`, so the broker requeues it.
+fn reject_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reject_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"rejecting the request failed; the broker requeues it"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// The `CSSL error log` event of the row of `site`, with its `location` and its message:
+/// `ERROR` for a critical site, `WARN` for a warning (COPAUA0C-110). It never carries the row's
+/// event key.
+fn cssl_error_log(site: LogSite<'_>, location: &str) {
+    // An event's level is fixed at its callsite, so each level has its own callsite.
+    if site.ends_task() {
+        static SITE: EventSite<3> = EventSite::new(&METADATA);
+        static METADATA: Metadata<'static> = event_metadata(
+            "cssl_error_log_critical",
+            module_path!(),
+            Level::ERROR,
+            &["message", "location", "err_message"],
+            &SITE,
+        );
+        emit(
+            &SITE,
+            [
+                Some(&"CSSL error log"),
+                Some(&field::display(location)),
+                Some(&site.message()),
+            ],
+        );
+    } else {
+        static SITE: EventSite<3> = EventSite::new(&METADATA);
+        static METADATA: Metadata<'static> = event_metadata(
+            "cssl_error_log_warning",
+            module_path!(),
+            Level::WARN,
+            &["message", "location", "err_message"],
+            &SITE,
+        );
+        emit(
+            &SITE,
+            [
+                Some(&"CSSL error log"),
+                Some(&field::display(location)),
+                Some(&site.message()),
+            ],
+        );
+    }
+}
+
+/// `ERROR` standing for the `cssl_error_log` row of `location` and `err_message` that is not
+/// written, because the database is unavailable.
+fn cssl_row_not_attempted(location: &str, err_message: &str) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "cssl_row_not_attempted",
+        module_path!(),
+        Level::ERROR,
+        &["message", "location", "err_message"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the cssl_error_log row is not written because the database is unavailable"),
+            Some(&field::display(location)),
+            Some(&err_message),
+        ],
+    );
+}
+
+/// `ERROR` when the `cssl_error_log` row of `location` could not be written, with the store
+/// `error`.
+fn cssl_row_write_failed(location: &str, error: &PersistenceError) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "cssl_row_write_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "location", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the cssl_error_log row could not be written"),
+            Some(&field::display(location)),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when rolling back the authorization transaction failed with the store `error`.
+fn rollback_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "rollback_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"rolling back the authorization transaction failed"),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]

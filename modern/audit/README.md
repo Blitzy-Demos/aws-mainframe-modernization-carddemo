@@ -1,6 +1,6 @@
 # Derive-lane audit
 
-This directory is the parity oracle's derive-lane (#2) audit. No recorded COBOL outputs exist, so every expected result the replacement is tested against is interpreted from the COBOL source and written here before the code and tests that consume it. Code that consumes an audit file is accepted only once that file is `Accepted` in the review status table below (a9; AAP 0.8.6). The COBOL tree is read in place at commit `59cc6c2` and never modified (R16).
+This directory is the parity oracle's derive-lane (#2) audit. No recorded COBOL outputs exist, so every expected result the replacement is tested against is interpreted from the COBOL source and written here before the code and tests that consume it. The one known exception, two frontend consumers committed before their audit file, is recorded with the remedial sequence that followed it under "Derive-lane ordering" below. Code that consumes an audit file is accepted only once that file is `Accepted` in the review status table below (a9; AAP 0.8.6). The COBOL tree is read in place at commit `59cc6c2` and never modified (R16).
 
 This file sets the conventions every other audit file follows, which `modern/crates/test-support/src/audit_index.rs` parses and `modern/crates/test-support/tests/audit_coverage.rs` (a8) enforces, and it holds the reviewer's ledger, which `modern/docs/SIGNOFF.md` (g8) reads.
 
@@ -108,7 +108,7 @@ Under Cardholder Data Redaction, no audit file contains a full card number, SSN,
   - Name: `X-<FILE>-<n>`. `<FILE>` is the file's upper-case short name (`COPYBOOKS`, `ARITH`, `FIXTURES`, `SCREENS`, `HALTS`; the program or job name for the online, batch and messaging files), and `<n>` is a number unique within the file, which a file may prefix with `H` for its halt candidates (`X-FIXTURES-H1`).
   - An escalation candidate gives `Found in` (path:lines), `Anomaly class` (a class of `ESCALATIONS.md`), `Finding` and `Proposed resolution`. A halt candidate gives `Path`, `Why no single result`, `Bindings blocked`, `Escalation` and `Candidate resolution`, and says whether it proposes a new halt or joins an existing one.
   - Until the reviewer folds a halt candidate in or rejects it, no parity assertion is written for what it names.
-- During review the reviewer folds escalation candidates into `ESCALATIONS.md` under its next free ID (E48 onward; E01–E47 are assigned) and halt candidates into `HALTS.md`, as a new row from H7 onward or into the existing halt whose case they share. The candidate's file then cites the assigned ID. The `## Later entries` sections of both files give the procedure.
+- During review the reviewer folds escalation candidates into `ESCALATIONS.md` under its next free ID (E57 onward; E01–E56 are assigned) and halt candidates into `HALTS.md`, as a new row from H7 onward or into the existing halt whose case they share. The candidate's file then cites the assigned ID. The `## Later entries` sections of both files give the procedure.
 
 ### Rules governing the audit
 
@@ -128,6 +128,38 @@ A reviewer who knows the COBOL sources compares, for each audit file:
 The reviewer then records the decision in the status table below: `Accepted` or `Rejected`, with name and date (`YYYY-MM-DD`). Notes give the commit reviewed and, for `Rejected`, the rows to revise. An accepted file that changes after the reviewed commit needs a new decision before code that consumes the change is accepted. Agreement with each escalation resolution is recorded in the `Status` column of `ESCALATIONS.md`, and a halt changes status only as `HALTS.md` allows. Only the reviewer writes in the review status, E29 and halt acknowledgement tables below; no cell is pre-filled, defaulted or inferred.
 
 A binding whose expectations come from an audit file counts as passed only once that file is `Accepted`: g1b, g3a, g3b, i2, i9, NAV, R8 and n5 through their audits, i8 and d9 through `copybooks.md` and `fixtures.md` (a9; AAP 0.9.1).
+
+## Derive-lane ordering
+
+The order of work is read from the repository history: the oldest commit of each path (`git log --follow --format='%h %ad' --date=iso -- <path>`). History is kept as it happened. No commit, date or review cell is rewritten to make an audit look earlier.
+
+| Consumer | First commit | Audit file it consumes | First commit of the audit file |
+|---|---|---|---|
+| `frontend/src/auth/session.ts` | `5ff8b7a`, 2026-10-20 20:00:45 UTC | `online/COSGN00C.md` | `b3ed593`, 2026-10-20 21:58:11 UTC |
+| `frontend/src/auth/RequireSignon.tsx` | `ddb13cc`, 2026-10-20 20:19:45 UTC | `online/COSGN00C.md` | `b3ed593`, 2026-10-20 21:58:11 UTC |
+
+The remedial sequence ran in three steps, each committed after the one before:
+
+1. `a435785`, the audit first. `online/COSGN00C.md` was re-derived from `COSGN00C.cbl`, `COCOM01Y.cpy`, `COMEN01C.cbl` and `COADM01C.cbl`.
+   - `COSGN00C-002` was corrected. Only the `EIBCALEN = 0` transfers pass no COMMAREA: the `XCTL` of `RETURN-TO-SIGNON-SCREEN` after F3 on the main or admin menu. The function programs started without a COMMAREA pass theirs (`X-COSGN00C-H2`).
+   - `COSGN00C-004`, `COSGN00C-006` and `COSGN00C-014` to `COSGN00C-017` were confirmed against their cited lines.
+   - The preamble now names the frontend consumers.
+   - `COSGN00C-021` was added, with escalation candidate `X-COSGN00C-4`: a 401 ends only the session whose token the refused request carried.
+2. `9ef33e8`, the consumers against the revised file.
+   - `session.ts` and `RequireSignon.tsx` were revalidated row by row, as the table below shows. No code diverged, and only their doc comments changed.
+   - The 401 handling of `api/client.ts` was regenerated to `COSGN00C-021`: it clears the stored session only while that session still holds the token the refused request carried.
+3. This record.
+
+| Row | Consumer code | Proving test (file: test or group) |
+|---|---|---|
+| `COSGN00C-002` | `screens/COSGN00.tsx` first entry, through `clearSession` in `auth/session.ts` | `COSGN00.test.tsx`: "renders the cleared map on first entry and ends any stored session" |
+| `COSGN00C-004` | `screens/COSGN00.tsx` F3, through `clearSession` | `COSGN00.test.tsx`: "F3 replaces the screen with the session-end text and ends the session" |
+| `COSGN00C-006` | `api/client.ts`: sign-on carries no `Authorization` header | `COSGN00.test.tsx`: "ENTER sends no bearer token while an earlier session is stored, …" |
+| `COSGN00C-014` | `auth/session.ts` stores the token, user ID and user type, and nothing else | `COSGN00.test.tsx`: "ENTER stores exactly the token, user ID and user type …" |
+| `COSGN00C-015`, `COSGN00C-016`, `COSGN00C-017` | `isAdmin` in `auth/session.ts` (`'A'` only); `refusedTarget` in `auth/RequireSignon.tsx` (`/signon` with no session, `/menu` for any other user type on an admin path); `screens/COSGN00.tsx` stores the session, then navigates to `next_route` | `COSGN00.test.tsx`: "ENTER $title, sending the input as typed and storing the session"; `COUSR02.test.tsx` and `COUSR03.test.tsx`: "opened with a U session, goes to the main menu, …" |
+| `COSGN00C-021` | `answered` and `sentToken` in `api/client.ts`; the session subscription of `auth/RequireSignon.tsx` | `COSGN00.test.tsx`: "COSGN00 in the route table: a late 401 leaves a later session in place"; `COACTVW.test.tsx`: "COACTVW in the route table: a 401 ends the session" |
+
+From here on, a change to `auth/session.ts`, `auth/RequireSignon.tsx` or the session handling of `api/client.ts` starts with a revision of `online/COSGN00C.md`, committed before the code that consumes it. Review the file as it stands at `a435785` or later, and record that commit in the Notes cell as the review procedure requires.
 
 ## Review status
 

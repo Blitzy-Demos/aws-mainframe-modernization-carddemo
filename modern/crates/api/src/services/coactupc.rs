@@ -61,6 +61,10 @@ use persistence::{
     AccountCustomerChain, AccountRepository, ChainLink, CustomerRepository, PersistenceError,
     PgStore, PgTx,
 };
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -385,13 +389,28 @@ fn rewritten(result: Result<bool, PersistenceError>, statement: &'static str) ->
 /// an SQLSTATE and a constraint or column name, never a key or a stored value (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, statement: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        statement,
-        error = %error,
-        "file statement failed; answering the program's message"
-    );
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "program", "paragraph", "statement", "error"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"file statement failed; answering the program's message" as &dyn Value),
+                Some(&PROGRAM as &dyn Value),
+                Some(&paragraph as &dyn Value),
+                Some(&statement as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
 }
 
 #[cfg(test)]

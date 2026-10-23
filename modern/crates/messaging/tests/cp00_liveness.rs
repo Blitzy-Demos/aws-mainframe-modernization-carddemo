@@ -23,6 +23,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use copybook::{PicS, PicU};
@@ -321,7 +322,7 @@ impl Harness {
     /// with the system clock, and declares the test's reply queue.
     async fn start() -> Result<Self, TestError> {
         let (rabbit, postgres) =
-            tokio::try_join!(rabbitmq::start_rabbitmq(), start_loaded_postgres())?;
+            try_join(rabbitmq::start_rabbitmq(), start_loaded_postgres()).await?;
         let config = Config {
             amqp_url: rabbit.amqp_url().to_owned(),
             database_url: postgres.database_url().to_owned(),
@@ -616,182 +617,239 @@ fn assert_replies_per_probe(probes: &[Probe], replies: &[Reply]) -> TestResult {
     Ok(())
 }
 
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack. It and every task it spawns run
+/// on the test's thread, so a trace capture the test starts sees them all.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
+}
+
+/// Drives `first` and `second` concurrently on the calling task until both have succeeded, and
+/// returns both values. Every poll polls each future that has not finished yet, and a finished
+/// one is never polled again; both are boxed, so that they never move once polled. The first
+/// error is returned at once, and the other future is dropped unfinished.
+async fn try_join<T, U, E>(
+    first: impl Future<Output = Result<T, E>>,
+    second: impl Future<Output = Result<U, E>>,
+) -> Result<(T, U), E> {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_value = None;
+    let mut second_value = None;
+    std::future::poll_fn(|context| {
+        if first_value.is_none() {
+            match first.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => first_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if second_value.is_none() {
+            match second.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => second_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (first_value.take(), second_value.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready(Ok((first_done, second_done))),
+            (first_left, second_left) => {
+                first_value = first_left;
+                second_value = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
 // audit: COPAUA0C-008
 // audit: COPAUA0C-012
 // audit: COPAUA0C-132
-#[tokio::test]
-async fn valid_card_non_numeric_amount_gets_one_9000_decline_and_no_writes() -> TestResult {
-    let mut harness = Harness::start().await?;
-    let fixture = harness.fixture_card(SINGLE_ACCOUNT).await?;
-    let before = harness.counts().await?;
-    let ids = Ids::new("NUMVAL");
-    let body = body_of(&request_fields(&fixture.card, NON_NUMERIC_AMOUNT));
-    harness.send(&body, &ids).await?;
+#[test]
+fn valid_card_non_numeric_amount_gets_one_9000_decline_and_no_writes() -> TestResult {
+    block_on(async {
+        let mut harness = Harness::start().await?;
+        let fixture = harness.fixture_card(SINGLE_ACCOUNT).await?;
+        let before = harness.counts().await?;
+        let ids = Ids::new("NUMVAL");
+        let body = body_of(&request_fields(&fixture.card, NON_NUMERIC_AMOUNT));
+        harness.send(&body, &ids).await?;
 
-    assert_eq!(harness.step().await?, Processed::Replied);
-    let reply = harness.take_reply().await?;
-    assert_eq!(
-        reply.correlation_id.as_deref(),
-        Some(ids.correlation_id.as_str())
-    );
-    assert_eq!(reply.response, "05");
-    assert_eq!(reply.reason, "9000");
-    assert_eq!(reply.amount, ZERO_AMOUNT_FIELD);
-    assert!(
-        reply.card == CardNumber::parse(&fixture.card)?.redacted(),
-        "the reply's card field is not the redacted card number"
-    );
-    assert_eq!(
-        harness.counts().await?,
-        before,
-        "a field error takes no lock and writes no row"
-    );
+        assert_eq!(harness.step().await?, Processed::Replied);
+        let reply = harness.take_reply().await?;
+        assert_eq!(
+            reply.correlation_id.as_deref(),
+            Some(ids.correlation_id.as_str())
+        );
+        assert_eq!(reply.response, "05");
+        assert_eq!(reply.reason, "9000");
+        assert_eq!(reply.amount, ZERO_AMOUNT_FIELD);
+        assert!(
+            reply.card == CardNumber::parse(&fixture.card)?.redacted(),
+            "the reply's card field is not the redacted card number"
+        );
+        assert_eq!(
+            harness.counts().await?,
+            before,
+            "a field error takes no lock and writes no row"
+        );
 
-    // Acknowledged after the confirmed publish: nothing returns to the request queue when the
-    // worker's connection closes, and nothing was dead-lettered.
-    harness.close_worker().await?;
-    harness.assert_len_stays(&harness.request_queue, 0).await?;
-    harness.assert_len_stays(DEAD_LETTER_QUEUE, 0).await?;
-    Ok(())
+        // Acknowledged after the confirmed publish: nothing returns to the request queue when the
+        // worker's connection closes, and nothing was dead-lettered.
+        harness.close_worker().await?;
+        harness.assert_len_stays(&harness.request_queue, 0).await?;
+        harness.assert_len_stays(DEAD_LETTER_QUEUE, 0).await?;
+        Ok(())
+    })
 }
 
 // audit: COPAUA0C-006
-#[tokio::test(flavor = "current_thread")]
-async fn unparseable_card_is_dead_lettered_with_alert_and_no_reply() -> TestResult {
-    let mut harness = Harness::start().await?;
-    let before = harness.counts().await?;
-    let ids = Ids::new("UNPARSEABLE");
-    let body = body_of(&request_fields("ABC", APPROVED_AMOUNT));
-    harness.send(&body, &ids).await?;
+#[test]
+fn unparseable_card_is_dead_lettered_with_alert_and_no_reply() -> TestResult {
+    block_on(async {
+        let mut harness = Harness::start().await?;
+        let before = harness.counts().await?;
+        let ids = Ids::new("UNPARSEABLE");
+        let body = body_of(&request_fields("ABC", APPROVED_AMOUNT));
+        harness.send(&body, &ids).await?;
 
-    // The capture is the default of this thread, which runs every task of the current-thread
-    // runtime, and the step carries its dispatcher as well.
-    let capture = trace_capture::capture();
-    let processed = harness.step().with_subscriber(capture.dispatch()).await?;
-    assert_eq!(processed, Processed::DeadLettered);
+        // The capture is the default of this thread, which runs every task of the current-thread
+        // runtime, and the step carries its dispatcher as well.
+        let capture = trace_capture::capture();
+        let processed = harness.step().with_subscriber(capture.dispatch()).await?;
+        assert_eq!(processed, Processed::DeadLettered);
 
-    let alerts = capture.lines_with_target(ALERT_TARGET);
-    let [alert] = alerts.as_slice() else {
-        return Err(format!("{} alert lines, not exactly one", alerts.len()).into());
-    };
-    for member in [
-        r#""level":"ERROR""#.to_owned(),
-        format!(r#""alert":"{ALERT_CARD_UNPARSEABLE}""#),
-        format!(
-            r#""message_id":"{}""#,
-            screened(&harness.id_key, &ids.message_id)
-        ),
-        format!(
-            r#""correlation_id":"{}""#,
-            screened(&harness.id_key, &ids.correlation_id)
-        ),
-        format!(r#""body_len":{}"#, body.len()),
-    ] {
-        assert!(alert.contains(&member), "{member} missing from {alert}");
-    }
-    let text = capture.text();
-    assert_eq!(text.matches(ALERT_CARD_UNPARSEABLE).count(), 1, "{text}");
-    let body_text = String::from_utf8(body.clone())?;
-    for needle in [
-        body_text.as_str(),
-        "ABC,",
-        ",ABC",
-        MERCHANT_ID,
-        MERCHANT_NAME,
-        MERCHANT_CITY,
-        ",102030,",
-        ids.message_id.as_str(),
-        ids.correlation_id.as_str(),
-    ] {
-        assert!(!text.contains(needle), "{needle:?} captured in {text}");
-    }
-    for card in fixture_card_numbers()? {
-        assert!(!text.contains(&card), "a fixture card number was captured");
-    }
-    drop(capture);
+        let alerts = capture.lines_with_target(ALERT_TARGET);
+        let [alert] = alerts.as_slice() else {
+            return Err(format!("{} alert lines, not exactly one", alerts.len()).into());
+        };
+        for member in [
+            r#""level":"ERROR""#.to_owned(),
+            format!(r#""alert":"{ALERT_CARD_UNPARSEABLE}""#),
+            format!(
+                r#""message_id":"{}""#,
+                screened(&harness.id_key, &ids.message_id)
+            ),
+            format!(
+                r#""correlation_id":"{}""#,
+                screened(&harness.id_key, &ids.correlation_id)
+            ),
+            format!(r#""body_len":{}"#, body.len()),
+        ] {
+            assert!(alert.contains(&member), "{member} missing from {alert}");
+        }
+        let text = capture.text();
+        assert_eq!(text.matches(ALERT_CARD_UNPARSEABLE).count(), 1, "{text}");
+        let body_text = String::from_utf8(body.clone())?;
+        for needle in [
+            body_text.as_str(),
+            "ABC,",
+            ",ABC",
+            MERCHANT_ID,
+            MERCHANT_NAME,
+            MERCHANT_CITY,
+            ",102030,",
+            ids.message_id.as_str(),
+            ids.correlation_id.as_str(),
+        ] {
+            assert!(!text.contains(needle), "{needle:?} captured in {text}");
+        }
+        for card in fixture_card_numbers()? {
+            assert!(!text.contains(&card), "a fixture card number was captured");
+        }
+        drop(capture);
 
-    // The broker moved the rejected request, body unchanged, and nothing answered it.
-    harness.wait_for_len(DEAD_LETTER_QUEUE, 1).await?;
-    let dead = rabbitmq::get(&harness.client, DEAD_LETTER_QUEUE, REPLY_WAIT)
-        .await?
-        .ok_or("the dead-letter queue is empty")?;
-    assert!(dead.delivery.data == body, "the dead-lettered body differs");
-    let reply = rabbitmq::get(&harness.client, &harness.reply_queue, NO_REPLY_WAIT).await?;
-    assert!(reply.is_none(), "an unparseable card was answered");
-    assert_eq!(
-        harness.counts().await?,
-        before,
-        "an unparseable card wrote a row"
-    );
+        // The broker moved the rejected request, body unchanged, and nothing answered it.
+        harness.wait_for_len(DEAD_LETTER_QUEUE, 1).await?;
+        let dead = rabbitmq::get(&harness.client, DEAD_LETTER_QUEUE, REPLY_WAIT)
+            .await?
+            .ok_or("the dead-letter queue is empty")?;
+        assert!(dead.delivery.data == body, "the dead-lettered body differs");
+        let reply = rabbitmq::get(&harness.client, &harness.reply_queue, NO_REPLY_WAIT).await?;
+        assert!(reply.is_none(), "an unparseable card was answered");
+        assert_eq!(
+            harness.counts().await?,
+            before,
+            "an unparseable card wrote a row"
+        );
 
-    harness.close_worker().await?;
-    harness.assert_len_stays(&harness.request_queue, 0).await?;
-    Ok(())
+        harness.close_worker().await?;
+        harness.assert_len_stays(&harness.request_queue, 0).await?;
+        Ok(())
+    })
 }
 
 /// The settlement event of a replied request carries the reply's generated `message_id`
 /// verbatim and the request's `message_id` and `correlation_id` as their keyed digests, the
 /// latter equal to the digest of the `correlation_id` the reply carries: an operator finds the
 /// request's log lines from either message and never reads an ID's text.
-#[tokio::test(flavor = "current_thread")]
-async fn a_replied_request_is_logged_with_its_reply_message_id_and_keyed_ids() -> TestResult {
-    let mut harness = Harness::start().await?;
-    let fixture = harness.fixture_card(SINGLE_ACCOUNT).await?;
-    let ids = Ids::new("CORRELATED");
-    let body = body_of(&request_fields(&fixture.card, APPROVED_AMOUNT));
-    harness.send(&body, &ids).await?;
+#[test]
+fn a_replied_request_is_logged_with_its_reply_message_id_and_keyed_ids() -> TestResult {
+    block_on(async {
+        let mut harness = Harness::start().await?;
+        let fixture = harness.fixture_card(SINGLE_ACCOUNT).await?;
+        let ids = Ids::new("CORRELATED");
+        let body = body_of(&request_fields(&fixture.card, APPROVED_AMOUNT));
+        harness.send(&body, &ids).await?;
 
-    let capture = trace_capture::capture();
-    let processed = harness.step().with_subscriber(capture.dispatch()).await?;
-    assert_eq!(processed, Processed::Replied);
-    let reply = harness.take_reply().await?;
-    let reply_message_id = reply
-        .message_id
-        .as_deref()
-        .ok_or("the reply carries no message_id")?;
-    let reply_correlation_id = reply
-        .correlation_id
-        .as_deref()
-        .ok_or("the reply carries no correlation_id")?;
-    assert_eq!(reply_correlation_id, ids.correlation_id);
-    assert_ne!(
-        reply_message_id, ids.message_id,
-        "the reply's message_id is new"
-    );
+        let capture = trace_capture::capture();
+        let processed = harness.step().with_subscriber(capture.dispatch()).await?;
+        assert_eq!(processed, Processed::Replied);
+        let reply = harness.take_reply().await?;
+        let reply_message_id = reply
+            .message_id
+            .as_deref()
+            .ok_or("the reply carries no message_id")?;
+        let reply_correlation_id = reply
+            .correlation_id
+            .as_deref()
+            .ok_or("the reply carries no correlation_id")?;
+        assert_eq!(reply_correlation_id, ids.correlation_id);
+        assert_ne!(
+            reply_message_id, ids.message_id,
+            "the reply's message_id is new"
+        );
 
-    let lines = capture.lines();
-    let settled: Vec<&String> = lines
-        .iter()
-        .filter(|line| line.contains(SETTLED_MESSAGE))
-        .collect();
-    let [event] = settled.as_slice() else {
-        return Err(format!("{} settlement events, not exactly one", settled.len()).into());
-    };
-    let message_digest = screened(&harness.id_key, &ids.message_id);
-    let correlation_digest = screened(&harness.id_key, reply_correlation_id);
-    for digest in [&message_digest, &correlation_digest] {
-        assert_eq!(digest.len(), 43, "{digest} is no keyed digest");
-    }
-    for member in [
-        r#""outcome":"replied""#.to_owned(),
-        format!(r#""reply_message_id":"{reply_message_id}""#),
-        format!(r#""message_id":"{message_digest}""#),
-        format!(r#""correlation_id":"{correlation_digest}""#),
-    ] {
-        assert!(event.contains(&member), "{member} missing from {event}");
-    }
-    let text = capture.text();
-    for needle in [ids.message_id.as_str(), ids.correlation_id.as_str()] {
-        assert!(!text.contains(needle), "{needle:?} captured in {text}");
-    }
-    for card in fixture_card_numbers()? {
-        assert!(!text.contains(&card), "a fixture card number was captured");
-    }
-    drop(capture);
+        let lines = capture.lines();
+        let settled: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains(SETTLED_MESSAGE))
+            .collect();
+        let [event] = settled.as_slice() else {
+            return Err(format!("{} settlement events, not exactly one", settled.len()).into());
+        };
+        let message_digest = screened(&harness.id_key, &ids.message_id);
+        let correlation_digest = screened(&harness.id_key, reply_correlation_id);
+        for digest in [&message_digest, &correlation_digest] {
+            assert_eq!(digest.len(), 43, "{digest} is no keyed digest");
+        }
+        for member in [
+            r#""outcome":"replied""#.to_owned(),
+            format!(r#""reply_message_id":"{reply_message_id}""#),
+            format!(r#""message_id":"{message_digest}""#),
+            format!(r#""correlation_id":"{correlation_digest}""#),
+        ] {
+            assert!(event.contains(&member), "{member} missing from {event}");
+        }
+        let text = capture.text();
+        for needle in [ids.message_id.as_str(), ids.correlation_id.as_str()] {
+            assert!(!text.contains(needle), "{needle:?} captured in {text}");
+        }
+        for card in fixture_card_numbers()? {
+            assert!(!text.contains(&card), "a fixture card number was captured");
+        }
+        drop(capture);
 
-    harness.close_worker().await?;
-    harness.assert_len_stays(&harness.request_queue, 0).await?;
-    Ok(())
+        harness.close_worker().await?;
+        harness.assert_len_stays(&harness.request_queue, 0).await?;
+        Ok(())
+    })
 }
 
 // audit: COPAUA0C-006
@@ -802,48 +860,54 @@ async fn a_replied_request_is_logged_with_its_reply_message_id_and_keyed_ids() -
 // audit: COPAUA0C-011
 // audit: COPAUA0C-012
 // audit: COPAUA0C-132
-#[tokio::test]
-async fn mixed_batch_yields_one_reply_per_removal() -> TestResult {
-    let mut harness = Harness::start().await?;
-    let probes = mixed_probes(&harness).await?;
-    // At-least-once delivery: every request reaches the queue twice.
-    for _delivery in 0..2 {
-        for probe in &probes {
-            harness.send(&probe.body, &probe.ids).await?;
+#[test]
+fn mixed_batch_yields_one_reply_per_removal() -> TestResult {
+    block_on(async {
+        let mut harness = Harness::start().await?;
+        let probes = mixed_probes(&harness).await?;
+        // At-least-once delivery: every request reaches the queue twice.
+        for _delivery in 0..2 {
+            for probe in &probes {
+                harness.send(&probe.body, &probe.ids).await?;
+            }
         }
-    }
-    let deliveries = 2 * probes.len();
-    let drained = time::timeout(BATCH_TIMEOUT, drain(&mut harness, deliveries + 1)).await??;
+        let deliveries = 2 * probes.len();
+        let drained = time::timeout(BATCH_TIMEOUT, drain(&mut harness, deliveries + 1)).await??;
 
-    let unparseable = probes
-        .iter()
-        .filter(|probe| probe.kind == Kind::UnparseableCard)
-        .count();
-    let parseable = probes.len() - unparseable;
-    assert_eq!(
-        drained.replies.len() + drained.dead_lettered,
-        deliveries,
-        "every delivery is removed once"
-    );
-    assert_eq!(
-        drained.replies.len(),
-        2 * parseable,
-        "one reply per parseable removal"
-    );
-    assert_eq!(
-        drained.dead_lettered,
-        2 * unparseable,
-        "unparseable removals are dead-lettered"
-    );
-    harness
-        .wait_for_len(DEAD_LETTER_QUEUE, u32::try_from(2 * unparseable)?)
-        .await?;
-    assert_replies_per_probe(&probes, &drained.replies)?;
+        let unparseable = probes
+            .iter()
+            .filter(|probe| probe.kind == Kind::UnparseableCard)
+            .count();
+        let parseable = probes.len() - unparseable;
+        assert_eq!(
+            drained.replies.len() + drained.dead_lettered,
+            deliveries,
+            "every delivery is removed once"
+        );
+        assert_eq!(
+            drained.replies.len(),
+            2 * parseable,
+            "one reply per parseable removal"
+        );
+        assert_eq!(
+            drained.dead_lettered,
+            2 * unparseable,
+            "unparseable removals are dead-lettered"
+        );
+        // TRUNCATION: checked, never lossy. `unparseable` counts the three probes of
+        // UNPARSEABLE_CARDS, each delivered twice, so the dead-lettered count is 6, which `u32`
+        // holds; a refused conversion fails the test through `?`, never wraps.
+        let dead_letters = u32::try_from(2 * unparseable)?;
+        harness
+            .wait_for_len(DEAD_LETTER_QUEUE, dead_letters)
+            .await?;
+        assert_replies_per_probe(&probes, &drained.replies)?;
 
-    harness.close_worker().await?;
-    harness.assert_len_stays(&harness.request_queue, 0).await?;
-    harness.assert_len_stays(&harness.reply_queue, 0).await?;
-    Ok(())
+        harness.close_worker().await?;
+        harness.assert_len_stays(&harness.request_queue, 0).await?;
+        harness.assert_len_stays(&harness.reply_queue, 0).await?;
+        Ok(())
+    })
 }
 
 // The body's length and its byte at offset 63 have no single COBOL value; this file compares

@@ -18,16 +18,20 @@
 //! converted here (Checked Integer Narrowing).
 
 use domain::online::comen01c as rules;
+use serde::de::{self, Deserializer, MapAccess};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use super::{digits, full_text, text};
+use super::{
+    Member, ObjectMembers, digits, field_if_present, full_text, read_object, skip_member, text,
+};
 
 /// One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide
 /// ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021, COADM01C-006 to COADM01C-012).
 // The schema name `MenuOptionDto` is the frontend's `components["schemas"]["MenuOptionDto"]`
 // (Generated API Types Only); `MenuResponse` references it, which registers it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "number": "01",
     "name": "Account View                       ",
@@ -77,12 +81,98 @@ pub struct MenuOptionDto {
     pub unavailable_message: Option<String>,
 }
 
+/// Every member in declaration order, an absent `user_type` or `unavailable_message` left out.
+impl Serialize for MenuOptionDto {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let len = 6
+            + usize::from(self.user_type.is_some())
+            + usize::from(self.unavailable_message.is_some());
+        let mut state = serializer.serialize_struct("MenuOptionDto", len)?;
+        state.serialize_field("number", &self.number)?;
+        state.serialize_field("name", &self.name)?;
+        state.serialize_field("text", &self.text)?;
+        state.serialize_field("program", &self.program)?;
+        field_if_present(&mut state, "user_type", self.user_type.as_ref())?;
+        state.serialize_field("admin_only", &self.admin_only)?;
+        state.serialize_field("installed", &self.installed)?;
+        field_if_present(
+            &mut state,
+            "unavailable_message",
+            self.unavailable_message.as_ref(),
+        )?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `user_type` and `unavailable_message` may be absent or `null` and whose
+/// other members are required. An unknown member is skipped; a repeated one is an error.
+impl<'de> Deserialize<'de> for MenuOptionDto {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, MenuOptionDtoMembers>(deserializer)
+    }
+}
+
+/// The members of a [`MenuOptionDto`] being read.
+#[derive(Default)]
+struct MenuOptionDtoMembers {
+    number: Member<String>,
+    name: Member<String>,
+    text: Member<String>,
+    program: Member<String>,
+    user_type: Member<Option<String>>,
+    admin_only: Member<bool>,
+    installed: Member<bool>,
+    unavailable_message: Member<Option<String>>,
+}
+
+impl ObjectMembers for MenuOptionDtoMembers {
+    type Object = MenuOptionDto;
+    const NAME: &'static str = "MenuOptionDto";
+    const FIELDS: &'static [&'static str] = &[
+        "number",
+        "name",
+        "text",
+        "program",
+        "user_type",
+        "admin_only",
+        "installed",
+        "unavailable_message",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "number" => self.number.read(map, "number"),
+            "name" => self.name.read(map, "name"),
+            "text" => self.text.read(map, "text"),
+            "program" => self.program.read(map, "program"),
+            "user_type" => self.user_type.read(map, "user_type"),
+            "admin_only" => self.admin_only.read(map, "admin_only"),
+            "installed" => self.installed.read(map, "installed"),
+            "unavailable_message" => self.unavailable_message.read(map, "unavailable_message"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<MenuOptionDto, E> {
+        Ok(MenuOptionDto {
+            number: self.number.required("number")?,
+            name: self.name.required("name")?,
+            text: self.text.required("text")?,
+            program: self.program.required("program")?,
+            user_type: self.user_type.optional(),
+            admin_only: self.admin_only.required("admin_only")?,
+            installed: self.installed.required("installed")?,
+            unavailable_message: self.unavailable_message.optional(),
+        })
+    }
+}
+
 /// The body of endpoints 2 and 3: the option table in table order and the program's rejection
 /// texts (COMEN01C-004, COMEN01C-011, COMEN01C-020, COADM01C-005, COADM01C-014).
 // The schema name `MenuResponse` is fixed by AAP 0.3.4.1 and 0.6.2 and is the only menu payload
 // type of the frontend's `schema.d.ts` (Generated API Types Only); `COMEN01.tsx` and `COADM01.tsx`
 // both use it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "options": [{
         "number": "01",
@@ -117,6 +207,77 @@ pub struct MenuResponse {
     /// which refuses no option by user type (COMEN01C-011, COADM01C-012).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_only_message: Option<String>,
+}
+
+/// Every member in declaration order, an absent `user_type` or `admin_only_message` left out.
+impl Serialize for MenuResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let len = 2
+            + usize::from(self.user_type.is_some())
+            + usize::from(self.admin_only_message.is_some());
+        let mut state = serializer.serialize_struct("MenuResponse", len)?;
+        state.serialize_field("options", &self.options)?;
+        field_if_present(&mut state, "user_type", self.user_type.as_ref())?;
+        state.serialize_field("invalid_option_message", &self.invalid_option_message)?;
+        field_if_present(
+            &mut state,
+            "admin_only_message",
+            self.admin_only_message.as_ref(),
+        )?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `user_type` and `admin_only_message` may be absent or `null` and whose
+/// other members are required, each option an object of its own. An unknown member is skipped;
+/// a repeated one is an error.
+impl<'de> Deserialize<'de> for MenuResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, MenuResponseMembers>(deserializer)
+    }
+}
+
+/// The members of a [`MenuResponse`] being read.
+#[derive(Default)]
+struct MenuResponseMembers {
+    options: Member<Vec<MenuOptionDto>>,
+    user_type: Member<Option<String>>,
+    invalid_option_message: Member<String>,
+    admin_only_message: Member<Option<String>>,
+}
+
+impl ObjectMembers for MenuResponseMembers {
+    type Object = MenuResponse;
+    const NAME: &'static str = "MenuResponse";
+    const FIELDS: &'static [&'static str] = &[
+        "options",
+        "user_type",
+        "invalid_option_message",
+        "admin_only_message",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "options" => self.options.read(map, "options"),
+            "user_type" => self.user_type.read(map, "user_type"),
+            "invalid_option_message" => self
+                .invalid_option_message
+                .read(map, "invalid_option_message"),
+            "admin_only_message" => self.admin_only_message.read(map, "admin_only_message"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<MenuResponse, E> {
+        Ok(MenuResponse {
+            options: self.options.required("options")?,
+            user_type: self.user_type.optional(),
+            invalid_option_message: self
+                .invalid_option_message
+                .required("invalid_option_message")?,
+            admin_only_message: self.admin_only_message.optional(),
+        })
+    }
 }
 
 /// One option row: the domain option and the unavailable text its program gives it.

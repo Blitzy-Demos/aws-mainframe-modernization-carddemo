@@ -61,8 +61,9 @@ use std::path::{Path, PathBuf};
 const NON_RULE_FILES: [&str; 3] = ["README.md", "ESCALATIONS.md", "HALTS.md"];
 /// The halt report, directly under `modern/audit/`.
 const HALTS_FILE: &str = "HALTS.md";
-/// The first header cell of a rule table and of the halt table.
+/// The first header cell of a rule table.
 const RULE_TABLE_FIRST_CELL: &str = "Rule ID";
+/// The first header cell of the halt table of `HALTS.md`.
 const HALT_TABLE_FIRST_CELL: &str = "ID";
 const LAYER_COLUMN: &str = "Layer";
 const EXPECTED_RESULT_COLUMN: &str = "Expected result";

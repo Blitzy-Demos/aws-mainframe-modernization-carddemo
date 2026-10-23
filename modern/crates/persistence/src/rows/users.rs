@@ -164,7 +164,8 @@ impl UserRow {
 /// of `queries/users_page_forward.sql` and `queries/users_page_backward.sql`, which name no
 /// credential column (COUSR00C-028, Bounded Pagination).
 ///
-/// Only `repos` reads it; `Debug`, `Clone` and `Serialize` are left underived, as on every row.
+/// Only `repos` reads it. It derives neither `Debug` nor `Serialize`, as no row does, and leaves
+/// `Clone` underived.
 pub struct UserListRow {
     /// `usr_id CHAR(8)` (CSUSR01Y-001).
     pub(crate) usr_id: String,

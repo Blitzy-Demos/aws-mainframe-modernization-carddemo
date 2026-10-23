@@ -35,6 +35,7 @@
 
 use std::error::Error;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -721,6 +722,56 @@ async fn bounded<T, E: Into<BoxError>>(
     time::timeout(WAIT, future).await?.map_err(Into::into)
 }
 
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
+}
+
+/// Drives `first` and `second` concurrently on the calling task until both have succeeded, and
+/// returns both values. Every poll polls each future that has not finished yet, and a finished
+/// one is never polled again; both are boxed, so that they never move once polled. The first
+/// error is returned at once, and the other future is dropped unfinished.
+async fn try_join<T, U, E>(
+    first: impl Future<Output = Result<T, E>>,
+    second: impl Future<Output = Result<U, E>>,
+) -> Result<(T, U), E> {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_value = None;
+    let mut second_value = None;
+    std::future::poll_fn(|context| {
+        if first_value.is_none() {
+            match first.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => first_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if second_value.is_none() {
+            match second.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => second_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (first_value.take(), second_value.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready(Ok((first_done, second_done))),
+            (first_left, second_left) => {
+                first_value = first_left;
+                second_value = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
 /// Opens the workers' AMQP session on `config.amqp_url` under `dispatch`, as `messaging::run`
 /// connects.
 ///
@@ -807,72 +858,74 @@ fn masked_cdra_requests(probes: &Probes) -> Vec<Vec<u8>> {
 /// `correlation_id` too, which the trace shows only as their keyed digests. Neither body nor the
 /// trace holds a protected value.
 // audit: CODATE01-009
-#[tokio::test]
-async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
-    let needles = Needles::fixture()?;
-    let probes = Probes::fixture()?;
-    let body = [
-        probes.card.as_str(),
-        probes.ssn_dashed.as_str(),
-        probes.password.as_str(),
-    ]
-    .join(",")
-    .into_bytes();
-    // CDRD reads no store, so this test starts the broker alone.
-    let broker = rabbitmq::start_rabbitmq().await?;
-    let config = Config {
-        amqp_url: broker.amqp_url().to_owned(),
-        ..Config::default()
-    };
-    let client = Client::open(&broker).await?;
-    let capture = trace_capture::capture();
-    let dispatch = capture.dispatch();
-    let session = connect(&config, &dispatch).await?;
-    let connection = session.connection();
-    let opening = cdrd::Worker::open(connection, &config, fixed_clock()?);
-    let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
-    let mut published = Published::default();
-    let queue = config.queue_request_date.as_str();
+#[test]
+fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
+    block_on(async {
+        let needles = Needles::fixture()?;
+        let probes = Probes::fixture()?;
+        let body = [
+            probes.card.as_str(),
+            probes.ssn_dashed.as_str(),
+            probes.password.as_str(),
+        ]
+        .join(",")
+        .into_bytes();
+        // CDRD reads no store, so this test starts the broker alone.
+        let broker = rabbitmq::start_rabbitmq().await?;
+        let config = Config {
+            amqp_url: broker.amqp_url().to_owned(),
+            ..Config::default()
+        };
+        let client = Client::open(&broker).await?;
+        let capture = trace_capture::capture();
+        let dispatch = capture.dispatch();
+        let session = connect(&config, &dispatch).await?;
+        let connection = session.connection();
+        let opening = cdrd::Worker::open(connection, &config, fixed_clock()?);
+        let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
+        let mut published = Published::default();
+        let queue = config.queue_request_date.as_str();
 
-    client
-        .request(
-            queue,
-            &body,
-            id_properties(&probes.card, &probes.ssn_dashed),
-        )
-        .await?;
-    assert_eq!(
-        settle(&mut worker, connection, &dispatch).await?,
-        Processed::Replied
-    );
-    for reply in published.take(&client, codate01::REPLY_QUEUE, 1).await? {
-        assert_fixed_shape("the CDRD reply", &reply, codate01::REPLY_TEXT_LEN);
-    }
+        client
+            .request(
+                queue,
+                &body,
+                id_properties(&probes.card, &probes.ssn_dashed),
+            )
+            .await?;
+        assert_eq!(
+            settle(&mut worker, connection, &dispatch).await?,
+            Processed::Replied
+        );
+        for reply in published.take(&client, codate01::REPLY_QUEUE, 1).await? {
+            assert_fixed_shape("the CDRD reply", &reply, codate01::REPLY_TEXT_LEN);
+        }
 
-    client.delete_queue(codate01::REPLY_QUEUE).await?;
-    client
-        .request(queue, &body, id_properties(&probes.password, &probes.card))
-        .await?;
-    assert_eq!(
-        settle(&mut worker, connection, &dispatch).await?,
-        Processed::ErrorRouted
-    );
-    for error in published.take(&client, codate01::ERROR_QUEUE, 1).await? {
-        assert_fixed_shape("the CDRD error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
-    }
-    close(&session, &dispatch).await?;
+        client.delete_queue(codate01::REPLY_QUEUE).await?;
+        client
+            .request(queue, &body, id_properties(&probes.password, &probes.card))
+            .await?;
+        assert_eq!(
+            settle(&mut worker, connection, &dispatch).await?,
+            Processed::ErrorRouted
+        );
+        for error in published.take(&client, codate01::ERROR_QUEUE, 1).await? {
+            assert_fixed_shape("the CDRD error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
+        }
+        close(&session, &dispatch).await?;
 
-    published.assert_redacted(&needles);
-    assert_settled(&capture, "CDRD", 2);
-    assert_keyed(
-        &capture,
-        &config,
-        "CDRD",
-        &[&probes.card, &probes.ssn_dashed, &probes.password],
-    );
-    assert_no_sensitive("the CDRD trace", capture.text().as_bytes(), &needles);
-    assert_no_cvv_member("the CDRD trace", &capture.lines());
-    client.close().await
+        published.assert_redacted(&needles);
+        assert_settled(&capture, "CDRD", 2);
+        assert_keyed(
+            &capture,
+            &config,
+            "CDRD",
+            &[&probes.card, &probes.ssn_dashed, &probes.password],
+        );
+        assert_no_sensitive("the CDRD trace", capture.text().as_bytes(), &needles);
+        assert_no_cvv_member("the CDRD trace", &capture.lines());
+        client.close().await
+    })
 }
 
 /// CDRA answers `INQA` for every fixture account, the masked requests of
@@ -880,95 +933,98 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
 /// a store whose pool is closed, which routes the error body to `CARD.DEMO.ERROR`
 /// (COACCT01-028). No reply, error body or trace holds a protected value.
 // audit: COACCT01-035
-#[tokio::test]
-async fn cdra_outputs_and_traces_are_redacted() -> TestResult {
-    let needles = Needles::fixture()?;
-    let probes = Probes::fixture()?;
-    let (broker, database) = tokio::try_join!(
-        rabbitmq::start_rabbitmq(),
-        fixtures::start_loaded_postgres()
-    )?;
-    let config = Config {
-        amqp_url: broker.amqp_url().to_owned(),
-        database_url: database.database_url().to_owned(),
-        ..Config::default()
-    };
-    let store = PgStore::new(database.pool().clone());
-    let accounts = AccountRepository::find_all(&mut store.clone()).await?;
-    assert_eq!(accounts.len(), 50, "acctdata.txt holds 50 accounts");
-    let mut requests: Vec<(Vec<u8>, bool)> = accounts
-        .iter()
-        .map(|account| {
-            let id = account.id.get();
-            (format!("INQA{id:011}").into_bytes(), false)
-        })
-        .collect();
-    requests.extend(
-        masked_cdra_requests(&probes)
-            .into_iter()
-            .map(|body| (body, true)),
-    );
-    // `cdra::Worker` reads only through a `PgStore`, so the failing store is one whose pool on
-    // the same database is closed before the worker reads through it: the read fails.
-    let closed = bounded(runtime::db::connect(&config)).await?;
-    time::timeout(WAIT, closed.close()).await?;
+#[test]
+fn cdra_outputs_and_traces_are_redacted() -> TestResult {
+    block_on(async {
+        let needles = Needles::fixture()?;
+        let probes = Probes::fixture()?;
+        let (broker, database) = try_join(
+            rabbitmq::start_rabbitmq(),
+            fixtures::start_loaded_postgres(),
+        )
+        .await?;
+        let config = Config {
+            amqp_url: broker.amqp_url().to_owned(),
+            database_url: database.database_url().to_owned(),
+            ..Config::default()
+        };
+        let store = PgStore::new(database.pool().clone());
+        let accounts = AccountRepository::find_all(&mut store.clone()).await?;
+        assert_eq!(accounts.len(), 50, "acctdata.txt holds 50 accounts");
+        let mut requests: Vec<(Vec<u8>, bool)> = accounts
+            .iter()
+            .map(|account| {
+                let id = account.id.get();
+                (format!("INQA{id:011}").into_bytes(), false)
+            })
+            .collect();
+        requests.extend(
+            masked_cdra_requests(&probes)
+                .into_iter()
+                .map(|body| (body, true)),
+        );
+        // `cdra::Worker` reads only through a `PgStore`, so the failing store is one whose pool on
+        // the same database is closed before the worker reads through it: the read fails.
+        let closed = bounded(runtime::db::connect(&config)).await?;
+        time::timeout(WAIT, closed.close()).await?;
 
-    let client = Client::open(&broker).await?;
-    let capture = trace_capture::capture();
-    let dispatch = capture.dispatch();
-    let session = connect(&config, &dispatch).await?;
-    let connection = session.connection();
-    let opening = cdra::Worker::open(connection, &config, store);
-    let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
-    let opening = cdra::Worker::open(connection, &config, PgStore::new(closed));
-    let mut failing = bounded(opening.with_subscriber(dispatch.clone())).await?;
-    let mut published = Published::default();
-    let queue = config.queue_request_acct.as_str();
+        let client = Client::open(&broker).await?;
+        let capture = trace_capture::capture();
+        let dispatch = capture.dispatch();
+        let session = connect(&config, &dispatch).await?;
+        let connection = session.connection();
+        let opening = cdra::Worker::open(connection, &config, store);
+        let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
+        let opening = cdra::Worker::open(connection, &config, PgStore::new(closed));
+        let mut failing = bounded(opening.with_subscriber(dispatch.clone())).await?;
+        let mut published = Published::default();
+        let queue = config.queue_request_acct.as_str();
 
-    for (body, _) in &requests {
+        for (body, _) in &requests {
+            client
+                .request(queue, body, BasicProperties::default())
+                .await?;
+            assert_eq!(
+                settle(&mut worker, connection, &dispatch).await?,
+                Processed::Replied
+            );
+        }
+        let replies = published
+            .take(&client, coacct01::REPLY_QUEUE, requests.len())
+            .await?;
+        for (position, ((_, masked), reply)) in requests.iter().zip(&replies).enumerate() {
+            assert!(
+                !masked || reply.get(37..48) == Some(MASKED_KEY.as_slice()),
+                "CDRA reply {position}: offsets 37-47 are not eleven `*`"
+            );
+            // A masked reply is not-found text (48 bytes) or bad-parameter text (63 bytes), so
+            // every byte from 63 on is padding either way.
+            let written = if *masked {
+                coacct01::BAD_PARAMETER_TEXT_LEN
+            } else {
+                coacct01::ACCT_RESPONSE_LEN
+            };
+            assert_fixed_shape(&format!("CDRA reply {position}"), reply, written);
+        }
+
         client
-            .request(queue, body, BasicProperties::default())
+            .request(queue, b"INQA00000000001", BasicProperties::default())
             .await?;
         assert_eq!(
-            settle(&mut worker, connection, &dispatch).await?,
-            Processed::Replied
+            settle(&mut failing, connection, &dispatch).await?,
+            Processed::ErrorRouted
         );
-    }
-    let replies = published
-        .take(&client, coacct01::REPLY_QUEUE, requests.len())
-        .await?;
-    for (position, ((_, masked), reply)) in requests.iter().zip(&replies).enumerate() {
-        assert!(
-            !masked || reply.get(37..48) == Some(MASKED_KEY.as_slice()),
-            "CDRA reply {position}: offsets 37-47 are not eleven `*`"
-        );
-        // A masked reply is not-found text (48 bytes) or bad-parameter text (63 bytes), so
-        // every byte from 63 on is padding either way.
-        let written = if *masked {
-            coacct01::BAD_PARAMETER_TEXT_LEN
-        } else {
-            coacct01::ACCT_RESPONSE_LEN
-        };
-        assert_fixed_shape(&format!("CDRA reply {position}"), reply, written);
-    }
+        for error in published.take(&client, coacct01::ERROR_QUEUE, 1).await? {
+            assert_fixed_shape("the CDRA error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
+        }
+        close(&session, &dispatch).await?;
 
-    client
-        .request(queue, b"INQA00000000001", BasicProperties::default())
-        .await?;
-    assert_eq!(
-        settle(&mut failing, connection, &dispatch).await?,
-        Processed::ErrorRouted
-    );
-    for error in published.take(&client, coacct01::ERROR_QUEUE, 1).await? {
-        assert_fixed_shape("the CDRA error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
-    }
-    close(&session, &dispatch).await?;
-
-    published.assert_redacted(&needles);
-    assert_settled(&capture, "CDRA", requests.len() + 1);
-    assert_no_sensitive("the CDRA trace", capture.text().as_bytes(), &needles);
-    assert_no_cvv_member("the CDRA trace", &capture.lines());
-    client.close().await
+        published.assert_redacted(&needles);
+        assert_settled(&capture, "CDRA", requests.len() + 1);
+        assert_no_sensitive("the CDRA trace", capture.text().as_bytes(), &needles);
+        assert_no_cvv_member("the CDRA trace", &capture.lines());
+        client.close().await
+    })
 }
 
 /// What the screened fields of a CP00 reply hold (COPAUA0C-062, COPAUA0C-064).
@@ -1283,92 +1339,95 @@ async fn assert_log_rows(
 // audit: COPAUA0C-110
 // audit: COPAUA0C-114
 // audit: COPAUA0C-133
-#[tokio::test]
-async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
-    let needles = Needles::fixture()?;
-    let probes = Probes::fixture()?;
-    let (broker, database) = tokio::try_join!(
-        rabbitmq::start_rabbitmq(),
-        fixtures::start_loaded_postgres()
-    )?;
-    let config = Config {
-        amqp_url: broker.amqp_url().to_owned(),
-        database_url: database.database_url().to_owned(),
-        ..Config::default()
-    };
-    let mut store = PgStore::new(database.pool().clone());
-    let xrefs = bounded(CardXrefRepository::find_all(&mut store)).await?;
-    let requests = cp00_requests(&xrefs, &probes)?;
-    let client = Client::open(&broker).await?;
-    let mut reply_queues = Vec::with_capacity(requests.len());
-    for request in &requests {
-        reply_queues.push(match request.outcome {
-            Outcome::Unconfirmed => MISSING_REPLY_QUEUE.to_owned(),
-            Outcome::Replied(_) | Outcome::Unparseable => client.reply_queue().await?,
-        });
-    }
-
-    let capture = trace_capture::capture();
-    let dispatch = capture.dispatch();
-    let session = connect(&config, &dispatch).await?;
-    let connection = session.connection();
-    let opening = cp00::Worker::open(connection, &config, store.clone(), fixed_clock()?);
-    let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
-    let mut published = Published::default();
-    for (request, reply_to) in requests.iter().zip(&reply_queues) {
-        let properties = match &request.ids {
-            Some((message_id, correlation_id)) => id_properties(message_id, correlation_id),
-            None => BasicProperties::default(),
+#[test]
+fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
+    block_on(async {
+        let needles = Needles::fixture()?;
+        let probes = Probes::fixture()?;
+        let (broker, database) = try_join(
+            rabbitmq::start_rabbitmq(),
+            fixtures::start_loaded_postgres(),
+        )
+        .await?;
+        let config = Config {
+            amqp_url: broker.amqp_url().to_owned(),
+            database_url: database.database_url().to_owned(),
+            ..Config::default()
+        };
+        let mut store = PgStore::new(database.pool().clone());
+        let xrefs = bounded(CardXrefRepository::find_all(&mut store)).await?;
+        let requests = cp00_requests(&xrefs, &probes)?;
+        let client = Client::open(&broker).await?;
+        let mut reply_queues = Vec::with_capacity(requests.len());
+        for request in &requests {
+            reply_queues.push(match request.outcome {
+                Outcome::Unconfirmed => MISSING_REPLY_QUEUE.to_owned(),
+                Outcome::Replied(_) | Outcome::Unparseable => client.reply_queue().await?,
+            });
         }
-        .with_reply_to(reply_to.as_str().into());
-        client
-            .request(&config.queue_request_pauth, &request.body, properties)
-            .await?;
-        let processed = settle(&mut worker, connection, &dispatch).await?;
-        assert_eq!(processed, request.outcome.processed(), "{}", request.label);
-        // A CP00 reply expires five seconds after it is published (E16), so it is taken now,
-        // before the next request is published, and never after later steps.
-        take_reply(&client, &mut published, request, reply_to).await?;
-    }
-    close(&session, &dispatch).await?;
 
-    published.assert_redacted(&needles);
-    let i004_card = card_of(&xrefs, DUPLICATE_KEY_ACCOUNT)?;
-    assert_log_rows(&mut store, &needles, UNKNOWN_CARD, &i004_card).await?;
-    let alerts = capture.lines_with_target(ALERT_TARGET);
-    assert!(
-        alerts.len() == 1
-            && alerts
+        let capture = trace_capture::capture();
+        let dispatch = capture.dispatch();
+        let session = connect(&config, &dispatch).await?;
+        let connection = session.connection();
+        let opening = cp00::Worker::open(connection, &config, store.clone(), fixed_clock()?);
+        let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
+        let mut published = Published::default();
+        for (request, reply_to) in requests.iter().zip(&reply_queues) {
+            let properties = match &request.ids {
+                Some((message_id, correlation_id)) => id_properties(message_id, correlation_id),
+                None => BasicProperties::default(),
+            }
+            .with_reply_to(reply_to.as_str().into());
+            client
+                .request(&config.queue_request_pauth, &request.body, properties)
+                .await?;
+            let processed = settle(&mut worker, connection, &dispatch).await?;
+            assert_eq!(processed, request.outcome.processed(), "{}", request.label);
+            // A CP00 reply expires five seconds after it is published (E16), so it is taken now,
+            // before the next request is published, and never after later steps.
+            take_reply(&client, &mut published, request, reply_to).await?;
+        }
+        close(&session, &dispatch).await?;
+
+        published.assert_redacted(&needles);
+        let i004_card = card_of(&xrefs, DUPLICATE_KEY_ACCOUNT)?;
+        assert_log_rows(&mut store, &needles, UNKNOWN_CARD, &i004_card).await?;
+        let alerts = capture.lines_with_target(ALERT_TARGET);
+        assert!(
+            alerts.len() == 1
+                && alerts
+                    .iter()
+                    .all(|line| line.contains(copaua0c::ALERT_CARD_UNPARSEABLE)),
+            "expected one {} alert, found {} alert lines",
+            copaua0c::ALERT_CARD_UNPARSEABLE,
+            alerts.len()
+        );
+        // The unparseable request's IDs are the fixture password and card number.
+        let alert_ids = [
+            format!(r#""message_id":"{}""#, keyed(&config, &probes.password)),
+            format!(r#""correlation_id":"{}""#, keyed(&config, &probes.card)),
+        ];
+        let shows_ids = |line: &String| {
+            alert_ids
                 .iter()
-                .all(|line| line.contains(copaua0c::ALERT_CARD_UNPARSEABLE)),
-        "expected one {} alert, found {} alert lines",
-        copaua0c::ALERT_CARD_UNPARSEABLE,
-        alerts.len()
-    );
-    // The unparseable request's IDs are the fixture password and card number.
-    let alert_ids = [
-        format!(r#""message_id":"{}""#, keyed(&config, &probes.password)),
-        format!(r#""correlation_id":"{}""#, keyed(&config, &probes.card)),
-    ];
-    let shows_ids = |line: &String| {
-        alert_ids
-            .iter()
-            .all(|member| line.contains(member.as_str()))
-    };
-    assert!(
-        alerts.iter().all(shows_ids),
-        "the alert does not show the request IDs as their keyed digests"
-    );
-    assert_settled(&capture, "CP00", requests.len());
-    assert_keyed(
-        &capture,
-        &config,
-        "CP00",
-        &[&probes.card, &probes.ssn_dashed, &probes.password],
-    );
-    assert_no_sensitive("the CP00 trace", capture.text().as_bytes(), &needles);
-    assert_no_cvv_member("the CP00 trace", &capture.lines());
-    client.close().await
+                .all(|member| line.contains(member.as_str()))
+        };
+        assert!(
+            alerts.iter().all(shows_ids),
+            "the alert does not show the request IDs as their keyed digests"
+        );
+        assert_settled(&capture, "CP00", requests.len());
+        assert_keyed(
+            &capture,
+            &config,
+            "CP00",
+            &[&probes.card, &probes.ssn_dashed, &probes.password],
+        );
+        assert_no_sensitive("the CP00 trace", capture.text().as_bytes(), &needles);
+        assert_no_cvv_member("the CP00 trace", &capture.lines());
+        client.close().await
+    })
 }
 
 /// A synthetic CVV value, the CVV of no fixture card (`carddata.txt`), which no finding may print.

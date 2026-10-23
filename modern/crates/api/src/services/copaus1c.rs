@@ -96,6 +96,10 @@ use persistence::{
     AuthFraudRepository, CardXrefRepository, PendingAuthDetailRepository,
     PendingAuthSummaryRepository, PersistenceError, PgTx,
 };
+use tracing::callsite::DefaultCallsite;
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -505,10 +509,25 @@ async fn replace_detail(tx: &mut PgTx<'_>, key: DetailKey, toggle: &FraudToggle)
 /// statement's name and the error's `Display`, which is only an SQLSTATE and a constraint name:
 /// never a key, a record or a row (Cardholder Data Redaction).
 fn note_store_error(statement: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = "COPAUS1C",
-        statement,
-        error = %error,
-        "store error answered with the program's message"
-    );
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: &["message", "program", "statement", "error"],
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    if runtime::telemetry::event_enabled(&EVENT) {
+        Event::dispatch(
+            &EVENT_METADATA,
+            &EVENT_METADATA.fields().value_set_all(&[
+                Some(&"store error answered with the program's message" as &dyn Value),
+                Some(&"COPAUS1C" as &dyn Value),
+                Some(&statement as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
 }

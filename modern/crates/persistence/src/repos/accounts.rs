@@ -710,6 +710,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the flavour Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// SQLSTATE `lock_not_available`, raised when `lock_timeout` expires.
     const LOCK_NOT_AVAILABLE: &str = "55P03";
 
@@ -856,133 +865,143 @@ mod tests {
     // audit: COACTUPC-085
     // audit: COACTUPC-089
     // audit: COACTUPC-090
-    #[tokio::test]
-    async fn the_chain_reads_the_cross_reference_then_account_and_customer() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let accounts = load_fixtures(&mut store).await?;
+    #[test]
+    fn the_chain_reads_the_cross_reference_then_account_and_customer() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let accounts = load_fixtures(&mut store).await?;
 
-        // All found: cardxref.txt line 1 joins account, customer and card.
-        let linked = key(LINKED)?;
-        let chain = store.find_with_customer(linked).await;
-        let ChainLink::Found(found_xref) = &chain.xref else {
-            return Err("the fixture cross-reference of account 50 is found".into());
-        };
-        assert!(found_xref.acct_id == linked);
-        assert!(
-            chain.account == ChainLink::Found(store.find_by_id(linked).await?.ok_or("account")?)
-        );
-        let ChainLink::Found(found_customer) = &chain.customer else {
-            return Err("the fixture customer of account 50 is found".into());
-        };
-        assert!(found_customer.id == found_xref.cust_id);
-        assert!(
-            accounts
-                .iter()
-                .any(|a| chain.account == ChainLink::Found(a.clone()))
-        );
+            // All found: cardxref.txt line 1 joins account, customer and card.
+            let linked = key(LINKED)?;
+            let chain = store.find_with_customer(linked).await;
+            let ChainLink::Found(found_xref) = &chain.xref else {
+                return Err("the fixture cross-reference of account 50 is found".into());
+            };
+            assert!(found_xref.acct_id == linked);
+            assert!(
+                chain.account
+                    == ChainLink::Found(store.find_by_id(linked).await?.ok_or("account")?)
+            );
+            let ChainLink::Found(found_customer) = &chain.customer else {
+                return Err("the fixture customer of account 50 is found".into());
+            };
+            assert!(found_customer.id == found_xref.cust_id);
+            assert!(
+                accounts
+                    .iter()
+                    .any(|a| chain.account == ChainLink::Found(a.clone()))
+            );
 
-        // Cardholder Data Redaction: the chain prints neither the card number nor the SSN.
-        let printed = format!("{chain:?}");
-        let card = std::str::from_utf8(found_xref.card_num.expose().as_bytes())?;
-        let ssn = format!("{:09}", found_customer.ssn.expose().get());
-        assert!(!printed.contains(card), "the card number is redacted");
-        assert!(!printed.contains(&ssn), "the SSN is redacted");
+            // Cardholder Data Redaction: the chain prints neither the card number nor the SSN.
+            let printed = format!("{chain:?}");
+            let card = std::str::from_utf8(found_xref.card_num.expose().as_bytes())?;
+            let ssn = format!("{:09}", found_customer.ssn.expose().get());
+            assert!(!printed.contains(card), "the card number is redacted");
+            assert!(!printed.contains(&ssn), "the SSN is redacted");
 
-        // No cross-reference: NOTFND, and neither later read is issued.
-        let chain = store.find_with_customer(key(ABSENT_ACCOUNT)?).await;
-        assert!(ended_at_xref(&chain, &ChainLink::NotFound));
+            // No cross-reference: NOTFND, and neither later read is issued.
+            let chain = store.find_with_customer(key(ABSENT_ACCOUNT)?).await;
+            assert!(ended_at_xref(&chain, &ChainLink::NotFound));
 
-        // A cross-reference without its account: the customer is read all the same.
-        let orphan = 12_345_678_901;
-        crate::CardXrefRepository::insert(&mut store, &xref(*b"9200000000000001", LINKED, orphan)?)
+            // A cross-reference without its account: the customer is read all the same.
+            let orphan = 12_345_678_901;
+            crate::CardXrefRepository::insert(
+                &mut store,
+                &xref(*b"9200000000000001", LINKED, orphan)?,
+            )
             .await?;
-        let chain = store.find_with_customer(key(orphan)?).await;
-        assert!(matches!(chain.xref, ChainLink::Found(_)));
-        assert!(chain.account == ChainLink::NotFound);
-        assert!(matches!(&chain.customer, ChainLink::Found(c) if c.id == PicU::new(LINKED)?));
+            let chain = store.find_with_customer(key(orphan)?).await;
+            assert!(matches!(chain.xref, ChainLink::Found(_)));
+            assert!(chain.account == ChainLink::NotFound);
+            assert!(matches!(&chain.customer, ChainLink::Found(c) if c.id == PicU::new(LINKED)?));
 
-        // An account whose cross-reference names a missing customer.
-        let lonely = account(12_345_678_902, "00000001940{")?;
-        store.insert(&lonely).await?;
-        let missing_customer = xref(*b"9200000000000002", ABSENT_CUSTOMER, 12_345_678_902)?;
-        crate::CardXrefRepository::insert(&mut store, &missing_customer).await?;
-        let chain = store.find_with_customer(lonely.id).await;
-        assert!(matches!(chain.xref, ChainLink::Found(_)));
-        assert!(chain.account == ChainLink::Found(lonely.clone()));
-        assert!(chain.customer == ChainLink::NotFound);
+            // An account whose cross-reference names a missing customer.
+            let lonely = account(12_345_678_902, "00000001940{")?;
+            store.insert(&lonely).await?;
+            let missing_customer = xref(*b"9200000000000002", ABSENT_CUSTOMER, 12_345_678_902)?;
+            crate::CardXrefRepository::insert(&mut store, &missing_customer).await?;
+            let chain = store.find_with_customer(lonely.id).await;
+            assert!(matches!(chain.xref, ChainLink::Found(_)));
+            assert!(chain.account == ChainLink::Found(lonely.clone()));
+            assert!(chain.customer == ChainLink::NotFound);
 
-        // Two, then three cross-references share account 50: DUPKEY each time, nothing else
-        // read, though the chain's read takes only the first two rows.
-        let dupkey = ChainLink::Failed(PersistenceError::Duplicate {
-            constraint: Some("card_xref_acct_id_idx".to_owned()),
-        });
-        for card in [*b"9200000000000050", *b"9200000000000051"] {
-            crate::CardXrefRepository::insert(&mut store, &xref(card, LINKED, LINKED)?).await?;
+            // Two, then three cross-references share account 50: DUPKEY each time, nothing else
+            // read, though the chain's read takes only the first two rows.
+            let dupkey = ChainLink::Failed(PersistenceError::Duplicate {
+                constraint: Some("card_xref_acct_id_idx".to_owned()),
+            });
+            for card in [*b"9200000000000050", *b"9200000000000051"] {
+                crate::CardXrefRepository::insert(&mut store, &xref(card, LINKED, LINKED)?).await?;
+                assert!(ended_at_xref(
+                    &store.find_with_customer(linked).await,
+                    &dupkey
+                ));
+            }
+
+            // Inside a transaction the chain gives the same links, three rows sharing account 50.
+            let mut tx = store.begin().await?;
+            assert!(ended_at_xref(&tx.find_with_customer(linked).await, &dupkey));
+            assert!(
+                tx.find_with_customer(lonely.id).await == store.find_with_customer(lonely.id).await
+            );
             assert!(ended_at_xref(
-                &store.find_with_customer(linked).await,
-                &dupkey
+                &tx.find_with_customer(key(ABSENT_ACCOUNT)?).await,
+                &ChainLink::NotFound
             ));
-        }
-
-        // Inside a transaction the chain gives the same links, three rows sharing account 50.
-        let mut tx = store.begin().await?;
-        assert!(ended_at_xref(&tx.find_with_customer(linked).await, &dupkey));
-        assert!(
-            tx.find_with_customer(lonely.id).await == store.find_with_customer(lonely.id).await
-        );
-        assert!(ended_at_xref(
-            &tx.find_with_customer(key(ABSENT_ACCOUNT)?).await,
-            &ChainLink::NotFound
-        ));
-        tx.rollback().await?;
-        Ok(())
+            tx.rollback().await?;
+            Ok(())
+        })
     }
 
     /// A store whose pool is closed cannot acquire the chain's connection: the failure is
     /// reported on the cross-reference link, and nothing else is read.
-    #[tokio::test]
-    async fn a_connection_that_cannot_be_had_fails_the_cross_reference_link() -> TestResult {
-        let options = PgConnectOptions::new()
-            .host("127.0.0.1")
-            .port(9)
-            .username("carddemo")
-            .database("carddemo");
-        let mut store = PgStore::new(PgPoolOptions::new().connect_lazy_with(options));
-        store.pool().close().await;
-        let chain = store.find_with_customer(key(LINKED)?).await;
-        assert!(ended_at_xref(
-            &chain,
-            &ChainLink::Failed(PersistenceError::Unavailable)
-        ));
-        Ok(())
+    #[test]
+    fn a_connection_that_cannot_be_had_fails_the_cross_reference_link() -> TestResult {
+        block_on(async {
+            let options = PgConnectOptions::new()
+                .host("127.0.0.1")
+                .port(9)
+                .username("carddemo")
+                .database("carddemo");
+            let mut store = PgStore::new(PgPoolOptions::new().connect_lazy_with(options));
+            store.pool().close().await;
+            let chain = store.find_with_customer(key(LINKED)?).await;
+            assert!(ended_at_xref(
+                &chain,
+                &ChainLink::Failed(PersistenceError::Unavailable)
+            ));
+            Ok(())
+        })
     }
 
     /// The keyed read returns the stored record or `None`, a second insert of a key is a
     /// duplicate, and the rewrite reports whether the key exists.
-    #[tokio::test]
-    async fn keyed_reads_inserts_and_rewrites_report_the_cics_outcomes() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let stored = account(42, "00000001940}")?;
+    #[test]
+    fn keyed_reads_inserts_and_rewrites_report_the_cics_outcomes() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let stored = account(42, "00000001940}")?;
 
-        store.insert(&stored).await?;
-        assert!(store.find_by_id(key(42)?).await? == Some(stored.clone()));
-        assert!(store.find_by_id(key(43)?).await?.is_none());
-        assert_eq!(
-            store.insert(&stored).await,
-            Err(PersistenceError::Duplicate {
-                constraint: Some("accounts_pkey".to_owned())
-            })
-        );
+            store.insert(&stored).await?;
+            assert!(store.find_by_id(key(42)?).await? == Some(stored.clone()));
+            assert!(store.find_by_id(key(43)?).await?.is_none());
+            assert_eq!(
+                store.insert(&stored).await,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some("accounts_pkey".to_owned())
+                })
+            );
 
-        let rewritten = account(42, "00000099999I")?;
-        assert!(store.update(&rewritten).await?);
-        assert!(store.find_by_id(key(42)?).await? == Some(rewritten.clone()));
-        assert!(!store.update(&account(43, "00000000000{")?).await?);
-        assert!(store.find_by_id(key(43)?).await?.is_none());
-        assert!(store.find_all().await? == vec![rewritten]);
-        Ok(())
+            let rewritten = account(42, "00000099999I")?;
+            assert!(store.update(&rewritten).await?);
+            assert!(store.find_by_id(key(42)?).await? == Some(rewritten.clone()));
+            assert!(!store.update(&account(43, "00000000000{")?).await?);
+            assert!(store.find_by_id(key(43)?).await?.is_none());
+            assert!(store.find_all().await? == vec![rewritten]);
+            Ok(())
+        })
     }
 
     /// On a transaction, `lock_by_id` holds the row lock until the commit, writes stay invisible
@@ -990,58 +1009,60 @@ mod tests {
     /// transaction go on after a duplicate insert. On the pool the lock ends with the call.
     // audit: COACTUPC-101
     // audit: COACTUPC-103
-    #[tokio::test]
-    async fn transactions_hold_row_locks_and_scope_their_writes() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let mut impatient = impatient_store(&guard).await?;
-        let original = account(42, "00000001940{")?;
-        let changed = account(42, "00000000000{")?;
-        let second = account(43, "00000000500{")?;
-        store.insert(&original).await?;
+    #[test]
+    fn transactions_hold_row_locks_and_scope_their_writes() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let mut impatient = impatient_store(&guard).await?;
+            let original = account(42, "00000001940{")?;
+            let changed = account(42, "00000000000{")?;
+            let second = account(43, "00000000500{")?;
+            store.insert(&original).await?;
 
-        let mut tx = store.begin().await?;
-        assert!(tx.lock_by_id(key(42)?).await? == Some(original.clone()));
-        assert!(tx.lock_by_id(key(44)?).await?.is_none());
-        let mut waiting = impatient.begin().await?;
-        assert!(is_lock_timeout(&waiting.lock_by_id(key(42)?).await));
-        drop(waiting);
-        assert!(is_lock_timeout(&impatient.update(&changed).await));
+            let mut tx = store.begin().await?;
+            assert!(tx.lock_by_id(key(42)?).await? == Some(original.clone()));
+            assert!(tx.lock_by_id(key(44)?).await?.is_none());
+            let mut waiting = impatient.begin().await?;
+            assert!(is_lock_timeout(&waiting.lock_by_id(key(42)?).await));
+            drop(waiting);
+            assert!(is_lock_timeout(&impatient.update(&changed).await));
 
-        assert!(tx.update(&changed).await?);
-        tx.insert(&second).await?;
-        assert!(tx.find_by_id(key(42)?).await? == Some(changed.clone()));
-        assert!(tx.find_all().await? == vec![changed.clone(), second.clone()]);
-        assert!(store.find_by_id(key(42)?).await? == Some(original));
-        assert!(store.find_by_id(key(43)?).await?.is_none());
-        tx.commit().await?;
+            assert!(tx.update(&changed).await?);
+            tx.insert(&second).await?;
+            assert!(tx.find_by_id(key(42)?).await? == Some(changed.clone()));
+            assert!(tx.find_all().await? == vec![changed.clone(), second.clone()]);
+            assert!(store.find_by_id(key(42)?).await? == Some(original));
+            assert!(store.find_by_id(key(43)?).await?.is_none());
+            tx.commit().await?;
 
-        let mut after_commit = impatient.begin().await?;
-        assert!(after_commit.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        after_commit.rollback().await?;
+            let mut after_commit = impatient.begin().await?;
+            assert!(after_commit.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            after_commit.rollback().await?;
 
-        assert!(store.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        let mut after_pool_lock = impatient.begin().await?;
-        assert!(after_pool_lock.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        after_pool_lock.commit().await?;
+            assert!(store.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            let mut after_pool_lock = impatient.begin().await?;
+            assert!(after_pool_lock.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            after_pool_lock.commit().await?;
 
-        let mut undone = store.begin().await?;
-        assert!(undone.update(&account(42, "00000077777{")?).await?);
-        undone.rollback().await?;
-        assert!(store.find_by_id(key(42)?).await? == Some(changed));
+            let mut undone = store.begin().await?;
+            assert!(undone.update(&account(42, "00000077777{")?).await?);
+            undone.rollback().await?;
+            assert!(store.find_by_id(key(42)?).await? == Some(changed));
 
-        let mut goes_on = store.begin().await?;
-        let mut savepoint = goes_on.savepoint().await?;
-        assert!(
-            savepoint
-                .insert(&second)
-                .await
-                .is_err_and(|e| e.is_duplicate())
-        );
-        savepoint.rollback().await?;
-        assert!(goes_on.find_by_id(key(43)?).await? == Some(second));
-        goes_on.commit().await?;
-        Ok(())
+            let mut goes_on = store.begin().await?;
+            let mut savepoint = goes_on.savepoint().await?;
+            assert!(
+                savepoint
+                    .insert(&second)
+                    .await
+                    .is_err_and(|e| e.is_duplicate())
+            );
+            savepoint.rollback().await?;
+            assert!(goes_on.find_by_id(key(43)?).await? == Some(second));
+            goes_on.commit().await?;
+            Ok(())
+        })
     }
 
     /// `replace_all` loads the 50 fixture accounts with the same contents twice, accepts an
@@ -1051,85 +1072,89 @@ mod tests {
     // audit: LOADS-014
     // audit: LOADS-015
     // audit: LOADS-018
-    #[tokio::test]
-    async fn replace_all_reloads_the_table_as_one_unit() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let fixtures = fixture::<AccountRecord>("acctdata.txt")?;
-        assert_eq!(fixtures.len(), 50);
+    #[test]
+    fn replace_all_reloads_the_table_as_one_unit() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let fixtures = fixture::<AccountRecord>("acctdata.txt")?;
+            assert_eq!(fixtures.len(), 50);
 
-        assert_eq!(store.replace_all(&[]).await?, 0);
-        assert!(store.find_all().await?.is_empty());
-        store.insert(&account(7, "00000000000{")?).await?;
+            assert_eq!(store.replace_all(&[]).await?, 0);
+            assert!(store.find_all().await?.is_empty());
+            store.insert(&account(7, "00000000000{")?).await?;
 
-        for _ in 0..2 {
-            assert_eq!(store.replace_all(&fixtures).await?, 50);
+            for _ in 0..2 {
+                assert_eq!(store.replace_all(&fixtures).await?, 50);
+                assert!(
+                    store.find_all().await? == by_id(&fixtures),
+                    "exactly the fixture accounts, in key order"
+                );
+            }
+            for record in &fixtures {
+                assert!(store.find_by_id(record.id).await?.as_ref() == Some(record));
+            }
+
+            let clashing = [account(60, "00000000000{")?, account(60, "00000000001A")?];
             assert!(
-                store.find_all().await? == by_id(&fixtures),
-                "exactly the fixture accounts, in key order"
+                store
+                    .replace_all(&clashing)
+                    .await
+                    .is_err_and(|e| e.is_duplicate())
             );
-        }
-        for record in &fixtures {
-            assert!(store.find_by_id(record.id).await?.as_ref() == Some(record));
-        }
+            assert!(store.find_all().await? == by_id(&fixtures));
 
-        let clashing = [account(60, "00000000000{")?, account(60, "00000000001A")?];
-        assert!(
-            store
-                .replace_all(&clashing)
-                .await
-                .is_err_and(|e| e.is_duplicate())
-        );
-        assert!(store.find_all().await? == by_id(&fixtures));
+            let inside = account(61, "00000000000{")?;
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(std::slice::from_ref(&inside)).await?, 1);
+            assert!(tx.find_all().await? == vec![inside.clone()]);
+            tx.rollback().await?;
+            assert!(store.find_all().await? == by_id(&fixtures));
 
-        let inside = account(61, "00000000000{")?;
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(std::slice::from_ref(&inside)).await?, 1);
-        assert!(tx.find_all().await? == vec![inside.clone()]);
-        tx.rollback().await?;
-        assert!(store.find_all().await? == by_id(&fixtures));
-
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(std::slice::from_ref(&inside)).await?, 1);
-        tx.commit().await?;
-        assert!(store.find_all().await? == vec![inside]);
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(std::slice::from_ref(&inside)).await?, 1);
+            tx.commit().await?;
+            assert!(store.find_all().await? == vec![inside]);
+            Ok(())
+        })
     }
 
     /// A record codec B cannot store, after one it can, fails the replacement before the delete:
     /// through the pool nothing changes, and a caller's transaction is left usable and unchanged,
     /// so committing it after the error keeps the previous contents.
     // audit: LOADS-018
-    #[tokio::test]
-    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let original = [account(42, "00000001940{")?, account(43, "00000000500{")?];
-        assert_eq!(store.replace_all(&original).await?, 2);
-        let unstorable = AccountRecord {
-            filler: PicX::moved_from(b"\0"),
-            ..account(45, "00000000000{")?
-        };
-        let input = [account(44, "00000000000{")?, unstorable];
-        let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
+    #[test]
+    fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let original = [account(42, "00000001940{")?, account(43, "00000000500{")?];
+            assert_eq!(store.replace_all(&original).await?, 2);
+            let unstorable = AccountRecord {
+                filler: PicX::moved_from(b"\0"),
+                ..account(45, "00000000000{")?
+            };
+            let input = [account(44, "00000000000{")?, unstorable];
+            let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
 
-        assert_eq!(store.replace_all(&input).await, invalid);
-        assert!(
-            store.find_all().await? == original,
-            "a failed load through the pool leaves the previous contents"
-        );
+            assert_eq!(store.replace_all(&input).await, invalid);
+            assert!(
+                store.find_all().await? == original,
+                "a failed load through the pool leaves the previous contents"
+            );
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&input).await, invalid);
-        assert!(
-            tx.find_all().await? == original,
-            "the transaction deleted nothing and is not aborted"
-        );
-        tx.commit().await?;
-        assert!(
-            store.find_all().await? == original,
-            "committing after the error keeps the previous contents"
-        );
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&input).await, invalid);
+            assert!(
+                tx.find_all().await? == original,
+                "the transaction deleted nothing and is not aborted"
+            );
+            tx.commit().await?;
+            assert!(
+                store.find_all().await? == original,
+                "committing after the error keeps the previous contents"
+            );
+            Ok(())
+        })
     }
 }

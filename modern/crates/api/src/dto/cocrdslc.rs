@@ -43,8 +43,9 @@ use core::fmt;
 use chrono::NaiveDate;
 use domain::online::cocrdslc as rules;
 use domain::sensitive::{CardNumber, DisclosedCardNumber};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
@@ -53,6 +54,44 @@ use super::{digits, full_text};
 /// What the `Debug` of [`CardLookupQuery`] shows for a typed `card_num`, whatever it holds: the
 /// input need not be a card number at all, so no character of it is kept.
 const CARD_NUM_MASK: &str = "****************";
+
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
 
 /// The query string of endpoint 8 (and of endpoint 9): the account and the card to show
 /// (COCRDSLC-006 to COCRDSLC-013).
@@ -66,14 +105,13 @@ const CARD_NUM_MASK: &str = "****************";
 /// `Debug` masks `card_num` and `Serialize` omits it (Cardholder Data Redaction).
 // The schema name `CardLookupQuery` is the frontend's `components["schemas"]["CardLookupQuery"]`
 // (Generated API Types Only); `api::openapi::ApiDoc` registers it.
-#[derive(Clone, Deserialize, ToSchema, IntoParams, Validate)]
+#[derive(Clone, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct CardLookupQuery {
     /// `ACCTSID` (`ACCTSIDI PIC X(11)`): the account number, 11 digits (COCRDSL-013).
-    #[serde(default)]
     #[validate(length(max = 11))]
-    #[schema(max_length = 11, example = "00000000050")]
-    #[param(max_length = 11, example = "00000000050")]
+    #[schema(required = false, max_length = 11, example = "00000000050")]
+    #[param(required = false, max_length = 11, example = "00000000050")]
     pub acct_id: String,
     /// `CARDSID` (`CARDSIDI PIC X(16)`): the card number as typed, 16 digits (COCRDSL-016).
     /// Never sent together with `card_ref`.
@@ -113,6 +151,53 @@ impl Serialize for CardLookupQuery {
     }
 }
 
+/// The members of [`CardLookupQuery`], in declaration order.
+const CARD_LOOKUP_QUERY_MEMBERS: &[&str] = &["acct_id", "card_num", "card_ref"];
+
+/// Each member once, in any order: an absent `acct_id` is the empty text, an absent or `null`
+/// card input is `None`, and a member the query does not declare is skipped.
+impl<'de> Deserialize<'de> for CardLookupQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "CardLookupQuery",
+            CARD_LOOKUP_QUERY_MEMBERS,
+            CardLookupQueryVisitor,
+        )
+    }
+}
+
+/// The visitor of [`CardLookupQuery`]'s members.
+struct CardLookupQueryVisitor;
+
+impl<'de> Visitor<'de> for CardLookupQueryVisitor {
+    type Value = CardLookupQuery;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct CardLookupQuery")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<CardLookupQuery, A::Error> {
+        let mut acct_id = None;
+        let mut card_num = None;
+        let mut card_ref = None;
+        while let Some(name) = map.next_key_seed(WireName(CARD_LOOKUP_QUERY_MEMBERS))? {
+            match name {
+                Some("acct_id") => member(&mut map, &mut acct_id, "acct_id")?,
+                Some("card_num") => member(&mut map, &mut card_num, "card_num")?,
+                Some("card_ref") => member(&mut map, &mut card_ref, "card_ref")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(CardLookupQuery {
+            acct_id: acct_id.unwrap_or_default(),
+            card_num: card_num.flatten(),
+            card_ref: card_ref.flatten(),
+        })
+    }
+}
+
 /// The card number of a [`CardViewResponse`], as the domain's disclosure decided it: either
 /// variant serialises as a plain 16-character string.
 ///
@@ -123,13 +208,22 @@ impl Serialize for CardLookupQuery {
 ///
 /// `Debug` of both variants is the redacted form. The type is no schema of the API document:
 /// the response field that holds it is documented as a `String`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CardViewNumber {
     /// The full number, cleared for disclosure by the domain.
     Full(DisclosedCardNumber),
     /// The redacted number.
     Redacted(CardNumber),
+}
+
+/// The number the variant holds, through that number's own `Serialize`, with no variant name.
+impl Serialize for CardViewNumber {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Full(number) => number.serialize(serializer),
+            Self::Redacted(number) => number.serialize(serializer),
+        }
+    }
 }
 
 /// The domain's variant, one to one: the disclosure is decided before this point.
@@ -149,7 +243,7 @@ impl From<rules::CardNumberDisclosure> for CardViewNumber {
 /// `CVACT02Y` to no screen field (COCRDSLC-021).
 // The schema name `CardViewResponse` is fixed (Generated API Types Only); `api::openapi::ApiDoc`
 // registers it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct CardViewResponse {
     /// `ACCTSIDO`: the account the request named, 11 digits with their leading zeros, never the
     /// card's own account (COCRDSLC-014, COCRDSLC-018).
@@ -180,6 +274,22 @@ pub struct CardViewResponse {
     /// `INFOMSGO` (40): the information message of a found card, `'   Displaying requested
     /// details'` with its three leading spaces (COCRDSLC-020).
     pub info_message: Option<String>,
+}
+
+/// Every member in declaration order, `null` for an absent one.
+impl Serialize for CardViewResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("CardViewResponse", 8)?;
+        out.serialize_field("acct_id", &self.acct_id)?;
+        out.serialize_field("card_ref", &self.card_ref)?;
+        out.serialize_field("card_num", &self.card_num)?;
+        out.serialize_field("embossed_name", &self.embossed_name)?;
+        out.serialize_field("expiration_date", &self.expiration_date)?;
+        out.serialize_field("status", &self.status)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.end()
+    }
 }
 
 /// The fields of the domain's view, rendered as the map shows them.
@@ -219,6 +329,15 @@ mod tests {
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A synthetic card number, in no fixture.
     const CARD: &str = "1111222233334444";
@@ -439,49 +558,108 @@ mod tests {
 
     // audit: COCRDSL-013
     // audit: COCRDSL-016
-    #[tokio::test]
-    async fn the_query_is_deserialised_then_held_to_the_map_lengths() -> TestResult {
-        let by_ref = extract("acct_id=00000000050&card_ref=7").await??;
-        assert_eq!(
-            (by_ref.acct_id.as_str(), by_ref.card_num, by_ref.card_ref),
-            ("00000000050", None, Some(7))
-        );
-        let by_number = extract(&format!("acct_id=00000000050&card_num={CARD}")).await??;
-        assert_eq!(by_number.card_num.as_deref(), Some(CARD));
-        assert_eq!(by_number.card_ref, None);
+    #[test]
+    fn the_query_is_deserialised_then_held_to_the_map_lengths() -> TestResult {
+        block_on(async {
+            let by_ref = extract("acct_id=00000000050&card_ref=7").await??;
+            assert_eq!(
+                (by_ref.acct_id.as_str(), by_ref.card_num, by_ref.card_ref),
+                ("00000000050", None, Some(7))
+            );
+            let by_number = extract(&format!("acct_id=00000000050&card_num={CARD}")).await??;
+            assert_eq!(by_number.card_num.as_deref(), Some(CARD));
+            assert_eq!(by_number.card_ref, None);
 
-        // Absent inputs reach the domain edit, which owns their messages.
-        let empty = extract("").await??;
-        assert_eq!(
-            (empty.acct_id.as_str(), empty.card_num, empty.card_ref),
-            ("", None, None)
-        );
-        let both = extract(&format!("acct_id=00000000050&card_num={CARD}&card_ref=7")).await??;
-        assert!(both.validate().is_ok());
+            // Absent inputs reach the domain edit, which owns their messages.
+            let empty = extract("").await??;
+            assert_eq!(
+                (empty.acct_id.as_str(), empty.card_num, empty.card_ref),
+                ("", None, None)
+            );
+            let both =
+                extract(&format!("acct_id=00000000050&card_num={CARD}&card_ref=7")).await??;
+            assert!(both.validate().is_ok());
 
-        let too_long = format!("{CARD}5");
-        for (query, field) in [
-            ("acct_id=000000000500&card_ref=7".to_owned(), "acct_id"),
-            (
-                format!("acct_id=00000000050&card_num={too_long}"),
-                "card_num",
-            ),
-        ] {
-            let error = extract(&query).await?.err().ok_or("a length is exceeded")?;
+            let too_long = format!("{CARD}5");
+            for (query, field) in [
+                ("acct_id=000000000500&card_ref=7".to_owned(), "acct_id"),
+                (
+                    format!("acct_id=00000000050&card_num={too_long}"),
+                    "card_num",
+                ),
+            ] {
+                let error = extract(&query).await?.err().ok_or("a length is exceeded")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field)),
+                    "{query}"
+                );
+            }
+
+            let error = extract("acct_id=00000000050&card_ref=ABC")
+                .await?
+                .err()
+                .ok_or("a handle is an integer")?;
             assert_eq!(
                 (error.status(), error.message(), error.field()),
-                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field)),
-                "{query}"
+                (StatusCode::BAD_REQUEST, INVALID_QUERY, None)
             );
-        }
+            Ok(())
+        })
+    }
 
-        let error = extract("acct_id=00000000050&card_ref=ABC")
-            .await?
-            .err()
-            .ok_or("a handle is an integer")?;
+    /// A query string naming a member twice is a 400, and a name the query does not declare is
+    /// read past.
+    #[test]
+    fn a_repeated_member_is_refused_and_an_undeclared_one_is_skipped() -> TestResult {
+        block_on(async {
+            for query in [
+                "acct_id=00000000050&acct_id=00000000051&card_ref=7",
+                "acct_id=00000000050&card_num=4444&card_num=4444",
+                "acct_id=00000000050&card_ref=7&card_ref=8",
+            ] {
+                let error = extract(query).await?.err().ok_or("a member is repeated")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
+                    "{query}"
+                );
+            }
+            let query =
+                extract("page_key=3&acct_id=00000000050&direction=x&card_ref=7&flag").await??;
+            assert_eq!(
+                (query.acct_id.as_str(), query.card_num, query.card_ref),
+                ("00000000050", None, Some(7))
+            );
+            Ok(())
+        })
+    }
+
+    /// `null` for either card input reads as no input.
+    #[test]
+    fn a_null_card_input_reads_as_absent() -> TestResult {
+        let query: CardLookupQuery = serde_json::from_value(json!({
+            "acct_id": "00000000050",
+            "card_num": null,
+            "card_ref": null,
+        }))?;
         assert_eq!(
-            (error.status(), error.message(), error.field()),
-            (StatusCode::BAD_REQUEST, INVALID_QUERY, None)
+            (query.acct_id.as_str(), query.card_num, query.card_ref),
+            ("00000000050", None, None)
+        );
+        Ok(())
+    }
+
+    /// The body's text lists the eight members in their declaration order.
+    #[test]
+    fn the_body_names_every_member_in_declaration_order() -> TestResult {
+        let embossed_name = format!("{:<50}", "Test Holder");
+        let response = CardViewResponse::from(view(&UserType::USER, Some(expiry()?))?);
+        assert_eq!(
+            serde_json::to_string(&response)?,
+            format!(
+                r#"{{"acct_id":"00000000050","card_ref":7,"card_num":"{REDACTED}","embossed_name":"{embossed_name}","expiration_date":"2025-04-30","status":"Y","message":null,"info_message":"   Displaying requested details"}}"#
+            )
         );
         Ok(())
     }

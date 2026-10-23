@@ -407,165 +407,178 @@ mod tests {
         }
     }
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The `discgrp` load on a freshly migrated, empty table, the keyed reads of CBACT04C over
     /// every loaded key, the `DEFAULT` keys the fallback reads, misses, a duplicate insert and a
     /// rerun of the load over a table holding a row the input lacks (CBACT04C-009, CBACT04C-010,
     /// LOADS-005, LOADS-014, LOADS-015, LOADS-017, LOADS-032).
-    #[tokio::test]
-    async fn the_load_replaces_the_table_and_every_key_reads_back() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let records = fixture()?;
-        assert_eq!(records.len(), FIXTURE_RECORDS);
-        let expected = in_key_order(&records);
+    #[test]
+    fn the_load_replaces_the_table_and_every_key_reads_back() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let records = fixture()?;
+            assert_eq!(records.len(), FIXTURE_RECORDS);
+            let expected = in_key_order(&records);
 
-        assert!(store.find_all().await?.is_empty());
-        assert_eq!(store.replace_all(&records).await?, 51);
-        let loaded = store.find_all().await?;
-        assert_eq!(loaded, expected);
-        assert!(
-            loaded
-                .iter()
-                .all(|record| record.filler.as_bytes() == &[b'0'; 28])
-        );
+            assert!(store.find_all().await?.is_empty());
+            assert_eq!(store.replace_all(&records).await?, 51);
+            let loaded = store.find_all().await?;
+            assert_eq!(loaded, expected);
+            assert!(
+                loaded
+                    .iter()
+                    .all(|record| record.filler.as_bytes() == &[b'0'; 28])
+            );
 
-        for record in &records {
-            let found = store
-                .find_by_id(
-                    &record.acct_group_id,
-                    &record.tran_type_cd,
-                    record.tran_cat_cd,
-                )
-                .await?;
-            assert_eq!(found.as_ref(), Some(record));
-        }
+            for record in &records {
+                let found = store
+                    .find_by_id(
+                        &record.acct_group_id,
+                        &record.tran_type_cd,
+                        record.tran_cat_cd,
+                    )
+                    .await?;
+                assert_eq!(found.as_ref(), Some(record));
+            }
 
-        // The two `DEFAULT` keys every fixture lookup falls back to: `discgrp.txt:18` and `:25`.
-        // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)` holds
-        // 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
-        let category = PicU::<4>::try_from(1_u64)?;
-        let purchase = store
-            .find_by_id(&default_group(), &PicX::from_array(*b"01"), category)
-            .await?
-            .ok_or("DEFAULT/01/0001 is missing")?;
-        assert_eq!(purchase.int_rate.as_decimal(), Decimal::new(1_500, 2));
-        let zero_rate = store
-            .find_by_id(&default_group(), &PicX::from_array(*b"03"), category)
-            .await?
-            .ok_or("DEFAULT/03/0001 is missing")?;
-        assert!(zero_rate.int_rate.is_zero());
-
-        // The blank `ACCT-GROUP-ID` of every fixture account names no row: `Ok(None)`, never a
-        // `DEFAULT` row in its place (E07). Neither does an unknown type or category.
-        let misses = [
-            (PicX::spaces(), *b"01", 1_u64),
-            (PicX::moved_from(b"DEFAULT"), *b"99", 1),
-            (PicX::moved_from(b"A000000000"), *b"01", 9_999),
-        ];
-        for (group, type_cd, cat_cd) in misses {
+            // The two `DEFAULT` keys every fixture lookup falls back to: `discgrp.txt:18` and
+            // `:25`.
             // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)`
-            // holds 1 and 9999 exactly, and `?` refuses a value above 9999 instead of wrapping.
-            let cat_cd = PicU::<4>::try_from(cat_cd)?;
-            let found = store
-                .find_by_id(&group, &PicX::from_array(type_cd), cat_cd)
-                .await?;
-            assert_eq!(found, None);
-        }
-
-        let extra = seeded(&purchase);
-        store.insert(&extra).await?;
-        assert_eq!(
-            store
-                .find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
+            // holds 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
+            let category = PicU::<4>::try_from(1_u64)?;
+            let purchase = store
+                .find_by_id(&default_group(), &PicX::from_array(*b"01"), category)
                 .await?
-                .as_ref(),
-            Some(&extra)
-        );
-        let duplicate = store.insert(&purchase).await;
-        assert_eq!(
-            duplicate,
-            Err(PersistenceError::Duplicate {
-                constraint: Some(PRIMARY_KEY.to_owned()),
-            })
-        );
+                .ok_or("DEFAULT/01/0001 is missing")?;
+            assert_eq!(purchase.int_rate.as_decimal(), Decimal::new(1_500, 2));
+            let zero_rate = store
+                .find_by_id(&default_group(), &PicX::from_array(*b"03"), category)
+                .await?
+                .ok_or("DEFAULT/03/0001 is missing")?;
+            assert!(zero_rate.int_rate.is_zero());
 
-        assert_eq!(store.replace_all(&records).await?, 51);
-        assert_eq!(store.find_all().await?, expected);
-        assert_eq!(
-            store
-                .find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
-                .await?,
-            None
-        );
-        Ok(())
+            // The blank `ACCT-GROUP-ID` of every fixture account names no row: `Ok(None)`, never a
+            // `DEFAULT` row in its place (E07). Neither does an unknown type or category.
+            let misses = [
+                (PicX::spaces(), *b"01", 1_u64),
+                (PicX::moved_from(b"DEFAULT"), *b"99", 1),
+                (PicX::moved_from(b"A000000000"), *b"01", 9_999),
+            ];
+            for (group, type_cd, cat_cd) in misses {
+                // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)`
+                // holds 1 and 9999 exactly, and `?` refuses a value above 9999 instead of wrapping.
+                let cat_cd = PicU::<4>::try_from(cat_cd)?;
+                let found = store
+                    .find_by_id(&group, &PicX::from_array(type_cd), cat_cd)
+                    .await?;
+                assert_eq!(found, None);
+            }
+
+            let extra = seeded(&purchase);
+            store.insert(&extra).await?;
+            assert_eq!(
+                store
+                    .find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
+                    .await?
+                    .as_ref(),
+                Some(&extra)
+            );
+            let duplicate = store.insert(&purchase).await;
+            assert_eq!(
+                duplicate,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some(PRIMARY_KEY.to_owned()),
+                })
+            );
+
+            assert_eq!(store.replace_all(&records).await?, 51);
+            assert_eq!(store.find_all().await?, expected);
+            assert_eq!(
+                store
+                    .find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
+                    .await?,
+                None
+            );
+            Ok(())
+        })
     }
 
     /// On a [`crate::PgTx`] every call runs in the caller's transaction: a replacement is seen
     /// inside it, and rollback or commit decides what remains. A record no column can store
     /// leaves the table untouched, and a key no column can hold is refused before any query
     /// (LOADS-014, LOADS-018).
-    #[tokio::test]
-    async fn a_transaction_owns_its_replacement_and_unstorable_input_changes_nothing() -> TestResult
-    {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let records = fixture()?;
-        assert_eq!(store.replace_all(&records).await?, 51);
-        // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)` holds
-        // 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
-        let category = PicU::<4>::try_from(1_u64)?;
-        let type_cd = PicX::from_array(*b"01");
+    #[test]
+    fn a_transaction_owns_its_replacement_and_unstorable_input_changes_nothing() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let records = fixture()?;
+            assert_eq!(store.replace_all(&records).await?, 51);
+            // TRUNCATION: none survives. The conversion is checked: `DIS-TRAN-CAT-CD PIC 9(04)`
+            // holds 1 exactly, and `?` refuses a value above 9999 instead of wrapping.
+            let category = PicU::<4>::try_from(1_u64)?;
+            let type_cd = PicX::from_array(*b"01");
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[]).await?, 0);
-        assert!(tx.find_all().await?.is_empty());
-        assert_eq!(
-            tx.find_by_id(&default_group(), &type_cd, category).await?,
-            None
-        );
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, in_key_order(&records));
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[]).await?, 0);
+            assert!(tx.find_all().await?.is_empty());
+            assert_eq!(
+                tx.find_by_id(&default_group(), &type_cd, category).await?,
+                None
+            );
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, in_key_order(&records));
 
-        let kept: Vec<DisclosureGroupRecord> = records.iter().take(2).cloned().collect();
-        let extra = records.first().map(seeded).ok_or("discgrp.txt is empty")?;
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&kept).await?, 2);
-        tx.insert(&extra).await?;
-        assert_eq!(
-            tx.find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
-                .await?
-                .as_ref(),
-            Some(&extra)
-        );
-        tx.commit().await?;
-        let mut committed = kept.clone();
-        committed.push(extra.clone());
-        assert_eq!(store.find_all().await?, in_key_order(&committed));
+            let kept: Vec<DisclosureGroupRecord> = records.iter().take(2).cloned().collect();
+            let extra = records.first().map(seeded).ok_or("discgrp.txt is empty")?;
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&kept).await?, 2);
+            tx.insert(&extra).await?;
+            assert_eq!(
+                tx.find_by_id(&extra.acct_group_id, &extra.tran_type_cd, extra.tran_cat_cd)
+                    .await?
+                    .as_ref(),
+                Some(&extra)
+            );
+            tx.commit().await?;
+            let mut committed = kept.clone();
+            committed.push(extra.clone());
+            assert_eq!(store.find_all().await?, in_key_order(&committed));
 
-        let unstorable = DisclosureGroupRecord {
-            acct_group_id: PicX::from_array(*b"A00000000\xC3"),
-            ..extra
-        };
-        let invalid_group = Err(PersistenceError::decode(
-            "group_id",
-            DecodeKind::InvalidByte,
-        ));
-        assert_eq!(
-            store.replace_all(&[unstorable.clone()]).await,
-            invalid_group.clone().map(|()| 0)
-        );
-        assert_eq!(store.insert(&unstorable).await, invalid_group.clone());
-        assert_eq!(
-            store
-                .find_by_id(
-                    &unstorable.acct_group_id,
-                    &unstorable.tran_type_cd,
-                    unstorable.tran_cat_cd,
-                )
-                .await,
-            invalid_group.map(|()| None)
-        );
-        assert_eq!(store.find_all().await?, in_key_order(&committed));
-        Ok(())
+            let unstorable = DisclosureGroupRecord {
+                acct_group_id: PicX::from_array(*b"A00000000\xC3"),
+                ..extra
+            };
+            let invalid_group = Err(PersistenceError::decode(
+                "group_id",
+                DecodeKind::InvalidByte,
+            ));
+            assert_eq!(
+                store.replace_all(&[unstorable.clone()]).await,
+                invalid_group.clone().map(|()| 0)
+            );
+            assert_eq!(store.insert(&unstorable).await, invalid_group.clone());
+            assert_eq!(
+                store
+                    .find_by_id(
+                        &unstorable.acct_group_id,
+                        &unstorable.tran_type_cd,
+                        unstorable.tran_cat_cd,
+                    )
+                    .await,
+                invalid_group.map(|()| None)
+            );
+            assert_eq!(store.find_all().await?, in_key_order(&committed));
+            Ok(())
+        })
     }
 }

@@ -536,173 +536,190 @@ mod tests {
         )
     }
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The keyed read returns the stored record or `None` (CICS `NORMAL` and `NOTFND`), a second
     /// insert of a key is a duplicate, and the rewrite reports whether the key exists.
-    #[tokio::test]
-    async fn keyed_reads_inserts_and_rewrites_report_the_cics_outcomes() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let stored = sample(42, "Alpha")?;
+    #[test]
+    fn keyed_reads_inserts_and_rewrites_report_the_cics_outcomes() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let stored = sample(42, "Alpha")?;
 
-        store.insert(&stored).await?;
-        assert!(store.find_by_id(key(42)?).await? == Some(stored.clone()));
-        assert!(store.find_by_id(key(43)?).await?.is_none());
+            store.insert(&stored).await?;
+            assert!(store.find_by_id(key(42)?).await? == Some(stored.clone()));
+            assert!(store.find_by_id(key(43)?).await?.is_none());
 
-        let duplicate = store.insert(&stored).await;
-        assert_eq!(
-            duplicate,
-            Err(PersistenceError::Duplicate {
-                constraint: Some("customers_pkey".to_owned())
-            })
-        );
-        if let Err(error) = duplicate {
-            for text in [error.to_string(), format!("{error:?}")] {
-                assert!(
-                    !text.contains(SSN_DIGITS) && !text.contains("3456"),
-                    "{text}"
-                );
+            let duplicate = store.insert(&stored).await;
+            assert_eq!(
+                duplicate,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some("customers_pkey".to_owned())
+                })
+            );
+            if let Err(error) = duplicate {
+                for text in [error.to_string(), format!("{error:?}")] {
+                    assert!(
+                        !text.contains(SSN_DIGITS) && !text.contains("3456"),
+                        "{text}"
+                    );
+                }
             }
-        }
 
-        let rewritten = sample(42, "Rewritten")?;
-        assert!(store.update(&rewritten).await?);
-        assert!(store.find_by_id(key(42)?).await? == Some(rewritten.clone()));
-        assert!(!store.update(&sample(43, "Absent")?).await?);
-        assert!(store.find_by_id(key(43)?).await?.is_none());
-        assert!(store.find_all().await? == vec![rewritten]);
-        Ok(())
+            let rewritten = sample(42, "Rewritten")?;
+            assert!(store.update(&rewritten).await?);
+            assert!(store.find_by_id(key(42)?).await? == Some(rewritten.clone()));
+            assert!(!store.update(&sample(43, "Absent")?).await?);
+            assert!(store.find_by_id(key(43)?).await?.is_none());
+            assert!(store.find_all().await? == vec![rewritten]);
+            Ok(())
+        })
     }
 
     /// On a transaction, `lock_by_id` holds the row lock until the commit, writes stay invisible
     /// to other sessions until then, a rollback undoes them, and a savepoint lets the
     /// transaction go on after a duplicate insert. On the pool the lock ends with the call.
-    #[tokio::test]
-    async fn transactions_hold_row_locks_and_scope_their_writes() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let mut impatient = impatient_store(&guard).await?;
-        let original = sample(42, "Original")?;
-        let changed = sample(42, "Changed")?;
-        let second = sample(43, "Second")?;
-        store.insert(&original).await?;
+    #[test]
+    fn transactions_hold_row_locks_and_scope_their_writes() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let mut impatient = impatient_store(&guard).await?;
+            let original = sample(42, "Original")?;
+            let changed = sample(42, "Changed")?;
+            let second = sample(43, "Second")?;
+            store.insert(&original).await?;
 
-        let mut tx = store.begin().await?;
-        assert!(tx.lock_by_id(key(42)?).await? == Some(original.clone()));
-        assert!(tx.lock_by_id(key(44)?).await?.is_none());
-        let mut waiting = impatient.begin().await?;
-        assert!(is_lock_timeout(&waiting.lock_by_id(key(42)?).await));
-        drop(waiting);
-        assert!(is_lock_timeout(&impatient.update(&changed).await));
+            let mut tx = store.begin().await?;
+            assert!(tx.lock_by_id(key(42)?).await? == Some(original.clone()));
+            assert!(tx.lock_by_id(key(44)?).await?.is_none());
+            let mut waiting = impatient.begin().await?;
+            assert!(is_lock_timeout(&waiting.lock_by_id(key(42)?).await));
+            drop(waiting);
+            assert!(is_lock_timeout(&impatient.update(&changed).await));
 
-        assert!(tx.update(&changed).await?);
-        tx.insert(&second).await?;
-        assert!(tx.find_by_id(key(42)?).await? == Some(changed.clone()));
-        assert!(tx.find_all().await? == vec![changed.clone(), second.clone()]);
-        assert!(store.find_by_id(key(42)?).await? == Some(original));
-        assert!(store.find_by_id(key(43)?).await?.is_none());
-        tx.commit().await?;
+            assert!(tx.update(&changed).await?);
+            tx.insert(&second).await?;
+            assert!(tx.find_by_id(key(42)?).await? == Some(changed.clone()));
+            assert!(tx.find_all().await? == vec![changed.clone(), second.clone()]);
+            assert!(store.find_by_id(key(42)?).await? == Some(original));
+            assert!(store.find_by_id(key(43)?).await?.is_none());
+            tx.commit().await?;
 
-        let mut after_commit = impatient.begin().await?;
-        assert!(after_commit.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        after_commit.rollback().await?;
-        assert!(store.find_all().await? == vec![changed.clone(), second.clone()]);
+            let mut after_commit = impatient.begin().await?;
+            assert!(after_commit.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            after_commit.rollback().await?;
+            assert!(store.find_all().await? == vec![changed.clone(), second.clone()]);
 
-        assert!(store.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        let mut after_pool_lock = impatient.begin().await?;
-        assert!(after_pool_lock.lock_by_id(key(42)?).await? == Some(changed.clone()));
-        after_pool_lock.commit().await?;
+            assert!(store.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            let mut after_pool_lock = impatient.begin().await?;
+            assert!(after_pool_lock.lock_by_id(key(42)?).await? == Some(changed.clone()));
+            after_pool_lock.commit().await?;
 
-        let mut undone = store.begin().await?;
-        assert!(undone.update(&sample(42, "Undone")?).await?);
-        undone.rollback().await?;
-        assert!(store.find_by_id(key(42)?).await? == Some(changed));
+            let mut undone = store.begin().await?;
+            assert!(undone.update(&sample(42, "Undone")?).await?);
+            undone.rollback().await?;
+            assert!(store.find_by_id(key(42)?).await? == Some(changed));
 
-        let mut goes_on = store.begin().await?;
-        let mut savepoint = goes_on.savepoint().await?;
-        assert!(
-            savepoint
-                .insert(&second)
-                .await
-                .is_err_and(|e| e.is_duplicate())
-        );
-        savepoint.rollback().await?;
-        assert!(goes_on.find_by_id(key(43)?).await? == Some(second));
-        goes_on.commit().await?;
-        Ok(())
+            let mut goes_on = store.begin().await?;
+            let mut savepoint = goes_on.savepoint().await?;
+            assert!(
+                savepoint
+                    .insert(&second)
+                    .await
+                    .is_err_and(|e| e.is_duplicate())
+            );
+            savepoint.rollback().await?;
+            assert!(goes_on.find_by_id(key(43)?).await? == Some(second));
+            goes_on.commit().await?;
+            Ok(())
+        })
     }
 
     /// `replace_all` leaves exactly the input set in key order, gives the same contents when run
     /// again, accepts an empty table (LOADS-014, LOADS-015), keeps the previous contents when an
     /// insert fails (LOADS-018), and on a transaction runs inside the caller's unit of work.
-    #[tokio::test]
-    async fn replace_all_reloads_the_table_as_one_unit() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn replace_all_reloads_the_table_as_one_unit() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
 
-        assert_eq!(store.replace_all(&[]).await?, 0);
-        assert!(store.find_all().await?.is_empty());
-        store.insert(&sample(7, "Stale")?).await?;
+            assert_eq!(store.replace_all(&[]).await?, 0);
+            assert!(store.find_all().await?.is_empty());
+            store.insert(&sample(7, "Stale")?).await?;
 
-        let input = [sample(43, "Second")?, sample(42, "First")?];
-        let expected = vec![sample(42, "First")?, sample(43, "Second")?];
-        assert_eq!(store.replace_all(&input).await?, 2);
-        assert!(store.find_all().await? == expected);
-        assert_eq!(store.replace_all(&input).await?, 2);
-        assert!(store.find_all().await? == expected);
+            let input = [sample(43, "Second")?, sample(42, "First")?];
+            let expected = vec![sample(42, "First")?, sample(43, "Second")?];
+            assert_eq!(store.replace_all(&input).await?, 2);
+            assert!(store.find_all().await? == expected);
+            assert_eq!(store.replace_all(&input).await?, 2);
+            assert!(store.find_all().await? == expected);
 
-        let clashing = [sample(50, "Once")?, sample(50, "Twice")?];
-        assert!(
-            store
-                .replace_all(&clashing)
-                .await
-                .is_err_and(|e| e.is_duplicate())
-        );
-        assert!(store.find_all().await? == expected);
+            let clashing = [sample(50, "Once")?, sample(50, "Twice")?];
+            assert!(
+                store
+                    .replace_all(&clashing)
+                    .await
+                    .is_err_and(|e| e.is_duplicate())
+            );
+            assert!(store.find_all().await? == expected);
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&[sample(60, "Inside")?]).await?, 1);
-        assert!(tx.find_all().await? == vec![sample(60, "Inside")?]);
-        tx.rollback().await?;
-        assert!(store.find_all().await? == expected);
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&[sample(60, "Inside")?]).await?, 1);
+            assert!(tx.find_all().await? == vec![sample(60, "Inside")?]);
+            tx.rollback().await?;
+            assert!(store.find_all().await? == expected);
+            Ok(())
+        })
     }
 
     /// A record codec B cannot store, after one it can, fails the replacement before the delete
     /// (LOADS-018): through the pool nothing changes, and a caller's transaction is left usable
     /// and unchanged, so committing it after the error keeps the previous contents.
-    #[tokio::test]
-    async fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
-        let guard = start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let original = [sample(42, "First")?, sample(43, "Second")?];
-        assert_eq!(store.replace_all(&original).await?, 2);
-        let unstorable = CustomerRecord {
-            first_name: PicX::moved_from("Zoë".as_bytes()),
-            ..sample(45, "Unstorable")?
-        };
-        let input = [sample(44, "Replacement")?, unstorable];
-        let invalid = Err(PersistenceError::decode(
-            "cust_first_name",
-            DecodeKind::InvalidByte,
-        ));
+    #[test]
+    fn an_unstorable_record_fails_the_replacement_before_the_delete() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let original = [sample(42, "First")?, sample(43, "Second")?];
+            assert_eq!(store.replace_all(&original).await?, 2);
+            let unstorable = CustomerRecord {
+                first_name: PicX::moved_from("Zoë".as_bytes()),
+                ..sample(45, "Unstorable")?
+            };
+            let input = [sample(44, "Replacement")?, unstorable];
+            let invalid = Err(PersistenceError::decode(
+                "cust_first_name",
+                DecodeKind::InvalidByte,
+            ));
 
-        assert_eq!(store.replace_all(&input).await, invalid);
-        assert!(
-            store.find_all().await? == original,
-            "a failed load through the pool leaves the previous contents"
-        );
+            assert_eq!(store.replace_all(&input).await, invalid);
+            assert!(
+                store.find_all().await? == original,
+                "a failed load through the pool leaves the previous contents"
+            );
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(&input).await, invalid);
-        assert!(
-            tx.find_all().await? == original,
-            "the transaction deleted nothing and is not aborted"
-        );
-        tx.commit().await?;
-        assert!(
-            store.find_all().await? == original,
-            "committing after the error keeps the previous contents"
-        );
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(&input).await, invalid);
+            assert!(
+                tx.find_all().await? == original,
+                "the transaction deleted nothing and is not aborted"
+            );
+            tx.commit().await?;
+            assert!(
+                store.find_all().await? == original,
+                "committing after the error keeps the previous contents"
+            );
+            Ok(())
+        })
     }
 }

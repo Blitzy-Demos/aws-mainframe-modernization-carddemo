@@ -30,11 +30,15 @@
 //! `domain::online::copaus1c::AuthDetailFailure` (COPAUS1C-006, COPAUS1C-009 to COPAUS1C-011,
 //! COPAUS1C-026, COPAUS1C-031, COPAUS1C-033).
 
+use core::fmt;
+
 use domain::CardNumber;
 use domain::online::copaus1c as rules;
 use domain::online::copaus1c::FraudToggleResult as ToggleOutcome;
 use domain::sensitive::redact_free_text;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
@@ -53,23 +57,99 @@ use super::{PageDirection, digits};
 /// processing. The query takes no `page_size`: the endpoint addresses one authorization, not a
 /// collection (Bounded Pagination).
 // The schema name `AuthDetailQuery` is fixed (Generated API Types Only).
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    Default,
-    PartialEq,
-    Eq,
-    Serialize,
-    Deserialize,
-    ToSchema,
-    IntoParams,
-    Validate,
-)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct AuthDetailQuery {
     /// `forward` for F8, the next authorization; absent for ENTER.
     pub direction: Option<PageDirection>,
+}
+
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// Its one member, `direction`, `null` when absent.
+impl Serialize for AuthDetailQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthDetailQuery", 1)?;
+        out.serialize_field("direction", &self.direction)?;
+        out.end()
+    }
+}
+
+/// The members of [`AuthDetailQuery`], in declaration order.
+const AUTH_DETAIL_QUERY_MEMBERS: &[&str] = &["direction"];
+
+/// `direction` read once, absent or `null` as ENTER; any other member, `page_size` included, is
+/// skipped unread.
+impl<'de> Deserialize<'de> for AuthDetailQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "AuthDetailQuery",
+            AUTH_DETAIL_QUERY_MEMBERS,
+            AuthDetailQueryVisitor,
+        )
+    }
+}
+
+/// The visitor of [`AuthDetailQuery`]'s members.
+struct AuthDetailQueryVisitor;
+
+impl<'de> Visitor<'de> for AuthDetailQueryVisitor {
+    type Value = AuthDetailQuery;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct AuthDetailQuery")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<AuthDetailQuery, A::Error> {
+        let mut direction = None;
+        while let Some(name) = map.next_key_seed(WireName(AUTH_DETAIL_QUERY_MEMBERS))? {
+            match name {
+                Some("direction") => member(&mut map, &mut direction, "direction")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(AuthDetailQuery {
+            direction: direction.flatten(),
+        })
+    }
 }
 
 /// One authorization as COPAUS1C's `POPULATE-AUTH-DETAILS` fills `COPAU1A`, the key the screen
@@ -81,7 +161,7 @@ pub struct AuthDetailQuery {
 /// its 11-character redacted form, one more than `MERZIP` ([`redact_free_text`]). It has no
 /// `Deserialize`: the card number it carries is redacted.
 // The schema name `AuthDetailResponse` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 pub struct AuthDetailResponse {
     /// The account, `CDEMO-ACCT-ID PIC 9(11)`: its 11 digits with the leading zeros. The screen
     /// keeps it for the next request (COPAUS1C-003).
@@ -168,6 +248,38 @@ pub struct AuthDetailResponse {
     pub message: Option<String>,
 }
 
+/// Every member in declaration order: the card number in its redacted form, the message `null`
+/// when there is none.
+impl Serialize for AuthDetailResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("AuthDetailResponse", 23)?;
+        out.serialize_field("acct_id", &self.acct_id)?;
+        out.serialize_field("auth_key", &self.auth_key)?;
+        out.serialize_field("card_num", &self.card_num)?;
+        out.serialize_field("auth_date", &self.auth_date)?;
+        out.serialize_field("auth_time", &self.auth_time)?;
+        out.serialize_field("response", &self.response)?;
+        out.serialize_field("reason", &self.reason)?;
+        out.serialize_field("auth_code", &self.auth_code)?;
+        out.serialize_field("amount", &self.amount)?;
+        out.serialize_field("pos_entry_mode", &self.pos_entry_mode)?;
+        out.serialize_field("source", &self.source)?;
+        out.serialize_field("merchant_category_code", &self.merchant_category_code)?;
+        out.serialize_field("card_expiry", &self.card_expiry)?;
+        out.serialize_field("auth_type", &self.auth_type)?;
+        out.serialize_field("transaction_id", &self.transaction_id)?;
+        out.serialize_field("match_status", &self.match_status)?;
+        out.serialize_field("fraud_status", &self.fraud_status)?;
+        out.serialize_field("merchant_name", &self.merchant_name)?;
+        out.serialize_field("merchant_id", &self.merchant_id)?;
+        out.serialize_field("merchant_city", &self.merchant_city)?;
+        out.serialize_field("merchant_state", &self.merchant_state)?;
+        out.serialize_field("merchant_zip", &self.merchant_zip)?;
+        out.serialize_field("message", &self.message)?;
+        out.end()
+    }
+}
+
 /// The view `domain::online::copaus1c` builds for ENTER, F8 and a committed F5, field by field;
 /// the account and the key take the text the screen sends back in the path.
 impl From<rules::AuthDetailView> for AuthDetailResponse {
@@ -241,7 +353,7 @@ impl From<rules::AuthDetailView> for AuthDetailResponse {
 /// unchanged (COPAUS1C-032, COPAUS1C-034).
 // The schema name `FraudToggleResult` is fixed (Generated API Types Only). The domain outcome of
 // the same name is imported as `ToggleOutcome`, so the document holds one schema of that name.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({"message": "AUTH MARKED FRAUD...", "detail": null}))]
 pub struct FraudToggleResult {
     /// The message row: the domain outcome's message (COPAUS1C-032, COPAUS1C-035).
@@ -249,6 +361,16 @@ pub struct FraudToggleResult {
     /// The authorization as replaced, after a commit; absent when the outcome carries no
     /// detail.
     pub detail: Option<AuthDetailResponse>,
+}
+
+/// Both members in declaration order, `detail` `null` when the outcome carries none.
+impl Serialize for FraudToggleResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("FraudToggleResult", 2)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("detail", &self.detail)?;
+        out.end()
+    }
 }
 
 /// A committed F5's view, the `Ok` of `domain::online::copaus1c::FraudToggleResult::into_result`:
@@ -378,6 +500,15 @@ mod tests {
                     }
                 }),
         )
+    }
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
     }
 
     // `domain::online::copaus1c` proves the display values of COPAUS1C-013 to COPAUS1C-023 for
@@ -772,25 +903,82 @@ mod tests {
     }
 
     // audit: COPAUS1C-003
-    #[tokio::test]
-    async fn the_query_is_absent_for_enter_and_forward_for_f8() -> TestResult {
+    #[test]
+    fn the_query_is_absent_for_enter_and_forward_for_f8() -> TestResult {
+        block_on(async {
+            let cases = [
+                ("/detail", None),
+                ("/detail?direction=forward", Some(PageDirection::Forward)),
+                ("/detail?direction=backward", Some(PageDirection::Backward)),
+                // Not a collection: a `page_size` is no member, so it is ignored, never a 422.
+                ("/detail?page_size=101", None),
+            ];
+            for (uri, direction) in cases {
+                let parsed = query(uri)
+                    .await?
+                    .map_err(|status| format!("{uri}: {status}"))?;
+                assert_eq!(parsed, AuthDetailQuery { direction }, "{uri}");
+            }
+            assert_eq!(
+                query("/detail?direction=sideways").await?,
+                Err(StatusCode::BAD_REQUEST)
+            );
+            Ok(())
+        })
+    }
+
+    /// A query string that repeats `direction` does not deserialise, whatever the two values.
+    #[test]
+    fn a_repeated_direction_is_refused() -> TestResult {
+        block_on(async {
+            for uri in [
+                "/detail?direction=forward&direction=forward",
+                "/detail?direction=backward&direction=forward",
+            ] {
+                assert_eq!(query(uri).await?, Err(StatusCode::BAD_REQUEST), "{uri}");
+            }
+            Ok(())
+        })
+    }
+
+    /// The query's JSON form: `direction` read once, absent and `null` alike as ENTER, and any
+    /// other member skipped wherever and however often it appears.
+    #[test]
+    fn the_query_reads_direction_once_and_skips_other_members() -> TestResult {
+        let duplicate = "duplicate field `direction`";
         let cases = [
-            ("/detail", None),
-            ("/detail?direction=forward", Some(PageDirection::Forward)),
-            ("/detail?direction=backward", Some(PageDirection::Backward)),
-            // Not a collection: a `page_size` is no member, so it is ignored, never a 422.
-            ("/detail?page_size=101", None),
+            ("{}", Ok(None)),
+            (r#"{"direction":null}"#, Ok(None)),
+            (
+                r#"{"direction":"forward"}"#,
+                Ok(Some(PageDirection::Forward)),
+            ),
+            (
+                r#"{"page_size":101,"direction":"backward","page_size":7}"#,
+                Ok(Some(PageDirection::Backward)),
+            ),
+            (
+                r#"{"direction":"forward","direction":"forward"}"#,
+                Err(duplicate),
+            ),
+            (
+                r#"{"direction":null,"direction":"backward"}"#,
+                Err(duplicate),
+            ),
         ];
-        for (uri, direction) in cases {
-            let parsed = query(uri)
-                .await?
-                .map_err(|status| format!("{uri}: {status}"))?;
-            assert_eq!(parsed, AuthDetailQuery { direction }, "{uri}");
+        for (wire, expected) in cases {
+            match (serde_json::from_str::<AuthDetailQuery>(wire), expected) {
+                (Ok(read), Ok(direction)) => {
+                    assert_eq!(read, AuthDetailQuery { direction }, "{wire}");
+                }
+                (Err(error), Err(refusal)) => {
+                    assert!(error.to_string().starts_with(refusal), "{wire}: {error}");
+                }
+                (read, expected) => {
+                    return Err(format!("{wire}: read {read:?}, expected {expected:?}").into());
+                }
+            }
         }
-        assert_eq!(
-            query("/detail?direction=sideways").await?,
-            Err(StatusCode::BAD_REQUEST)
-        );
         Ok(())
     }
 
@@ -828,6 +1016,93 @@ mod tests {
             schema.contains("#/components/schemas/PageDirection"),
             "{schema}"
         );
+        Ok(())
+    }
+
+    /// The JSON members each type writes: its schema's properties, in declaration order, an
+    /// absent value written as `null`.
+    #[test]
+    fn every_type_writes_its_schema_members_in_declaration_order() -> TestResult {
+        let cases: [(&str, String, serde_json::Value, &[&str]); 3] = [
+            (
+                "AuthDetailQuery",
+                serde_json::to_string(&AuthDetailQuery::default())?,
+                serde_json::to_value(AuthDetailQuery::schema())?,
+                &["direction"],
+            ),
+            (
+                "AuthDetailResponse",
+                serde_json::to_string(&shown(&record()?)?)?,
+                serde_json::to_value(AuthDetailResponse::schema())?,
+                &[
+                    "acct_id",
+                    "auth_key",
+                    "card_num",
+                    "auth_date",
+                    "auth_time",
+                    "response",
+                    "reason",
+                    "auth_code",
+                    "amount",
+                    "pos_entry_mode",
+                    "source",
+                    "merchant_category_code",
+                    "card_expiry",
+                    "auth_type",
+                    "transaction_id",
+                    "match_status",
+                    "fraud_status",
+                    "merchant_name",
+                    "merchant_id",
+                    "merchant_city",
+                    "merchant_state",
+                    "merchant_zip",
+                    "message",
+                ],
+            ),
+            (
+                "FraudToggleResult",
+                serde_json::to_string(&toggle_response(&record()?)?)?,
+                serde_json::to_value(FraudToggleResult::schema())?,
+                &["message", "detail"],
+            ),
+        ];
+        for (name, text, schema, members) in cases {
+            let names = |object: Option<&serde_json::Map<String, serde_json::Value>>| {
+                let mut keys = object
+                    .map(|object| object.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                keys.sort_unstable();
+                keys
+            };
+            let mut listed = members
+                .iter()
+                .copied()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            listed.sort_unstable();
+            let written = serde_json::from_str::<serde_json::Value>(&text)?;
+            assert_eq!(
+                names(written.as_object()),
+                listed,
+                "{name}: written members"
+            );
+            let declared = schema
+                .get("properties")
+                .and_then(serde_json::Value::as_object);
+            assert_eq!(names(declared), listed, "{name}: schema properties");
+            // The first occurrence of each member's key: an outer member precedes the members
+            // of the detail `FraudToggleResult` nests after its message.
+            let positions = members
+                .iter()
+                .map(|member| text.find(&format!("\"{member}\":")))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| format!("{name}: a member is not written"))?;
+            assert!(
+                positions.is_sorted(),
+                "{name}: members out of declaration order"
+            );
+        }
         Ok(())
     }
 }

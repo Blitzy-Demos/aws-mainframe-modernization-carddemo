@@ -5,6 +5,9 @@ import type { paths } from "./schema";
 /** Endpoint 1, sign-on: the one operation that takes no bearer token. */
 const SIGNON_PATH: keyof paths = "/api/v1/signon";
 
+/** What `sessionMiddleware` writes before the token in the `Authorization` header. */
+const BEARER_PREFIX = "Bearer ";
+
 /**
  * Bearer-token handling for every API call.
  *
@@ -17,8 +20,10 @@ const SIGNON_PATH: keyof paths = "/api/v1/signon";
  * Sign-on obtains the token, so it goes out with no `Authorization` header at all, whatever
  * session is stored, rather than relying on the sign-on screen having ended it first.
  *
- * The session a 401 ends is cleared by `answered`, below, as soon as the 401's status arrives,
- * not by response middleware: the client's `fetch` resolves, and openapi-fetch runs response
+ * A 401 ends only the session whose token the refused request carried (COSGN00C-021). `answered`,
+ * below, reads that token from the request as it is sent and, as soon as the 401's status
+ * arrives, clears the stored session if it still holds the same token. It does so there, not in
+ * response middleware: the client's `fetch` resolves, and openapi-fetch runs response
  * middleware, only once the whole body has arrived.
  *
  * The callback reads, copies and logs no request body: the client is a conduit, so no card
@@ -32,11 +37,22 @@ const sessionMiddleware: Middleware = {
     }
     const token = getToken();
     if (token !== null) {
-      request.headers.set("Authorization", `Bearer ${token}`);
+      request.headers.set("Authorization", `${BEARER_PREFIX}${token}`);
     }
     return request;
   },
 };
+
+/**
+ * The session token `request` carries in its `Authorization: Bearer <token>` header, or `null`
+ * when it carries none: sign-on, and any call sent while nobody is signed on.
+ */
+function sentToken(request: Request): string | null {
+  const authorization = request.headers.get("Authorization");
+  return authorization?.startsWith(BEARER_PREFIX) === true
+    ? authorization.slice(BEARER_PREFIX.length)
+    : null;
+}
 
 /**
  * The longest any API call may take, from sending the request to the last byte of its answer:
@@ -52,17 +68,23 @@ const DEADLINE_MESSAGE = `No answer from the server within ${REQUEST_DEADLINE_MS
 /**
  * The global `fetch`'s answer to `request`, once its body has arrived in full.
  *
- * A 401 means either a failed sign-on (endpoint 1) or a missing, expired or invalid token. Either
- * way the stored session is cleared, which is harmless after a failed sign-on, and it is cleared
- * here, once per response, as soon as the status arrives and before the body is awaited. A 401
- * whose body then stalls past the deadline or fails part-way still ends the session, although
- * openapi-fetch never sees that response. `RequireSignon` is subscribed to the session, so a 401
- * on a guarded screen takes the user to `/signon` at once, without waiting for a navigation;
- * nothing navigates from here.
+ * A 401 means either a failed sign-on (endpoint 1) or a missing, expired or invalid token, and it
+ * refuses only the token the request carried (COSGN00C-021), which is read before the request is
+ * sent: `null` for a request that carries none, as sign-on never does. The stored session is
+ * cleared only when it still holds that token, so a request sent with no token clears it only
+ * when none is stored, which is harmless after a failed sign-on. A key-driven read is not
+ * cancelled when its screen is left, so a 401 can answer a request of a session that F3 and a
+ * new sign-on have since replaced; that answer leaves the later session, and its screen, as they
+ * are. The session is cleared here, once per response, as soon as the status arrives and before
+ * the body is awaited. A 401 whose body then stalls past the deadline or fails part-way still
+ * ends the session, although openapi-fetch never sees that response. `RequireSignon` is
+ * subscribed to the session, so a 401 that ends it on a guarded screen takes the user to
+ * `/signon` at once, without waiting for a navigation; nothing navigates from here.
  */
 async function answered(request: Request): Promise<Response> {
+  const sent = sentToken(request);
   const response = await globalThis.fetch(request);
-  if (response.status === 401) {
+  if (response.status === 401 && getToken() === sent) {
     clearSession();
   }
   await response.clone().arrayBuffer();

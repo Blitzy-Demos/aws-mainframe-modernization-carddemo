@@ -17,14 +17,15 @@
 //!
 //! # Cardholder data
 //!
-//! A response carries the card number only redacted, twelve `*` and its last four digits, beside
-//! its `card_ref` handle, and never a CVV (COCRDUPC-042, `E32`). A save rewrites four values:
-//! the embossed name and the active status as received, the expiry date from the year and month
-//! received and the snapshot's day, and the account of the echoed snapshot, the account entered
-//! for the search or the list row's, which replaces the card's stored account even when it
-//! differs (COCRDUPC-038, `X-COCRDUPC-2`). The stored card number and CVV come from the card
-//! read for update, never from the request. Neither handler logs or traces anything, because
-//! the query of endpoint 9 may hold a typed card number.
+//! The fetch response of endpoint 9 carries the card number only redacted, twelve `*` and its
+//! last four digits, beside its `card_ref` handle; the result of endpoint 10 carries neither the
+//! number nor the handle, and no response carries a CVV (COCRDUPC-042, `E32`). A save rewrites
+//! four values: the embossed name and the active status as received, the expiry date from the
+//! year and month received and the snapshot's day, and the account of the echoed snapshot, the
+//! account entered for the search or the list row's, which replaces the card's stored account
+//! even when it differs (COCRDUPC-038, `X-COCRDUPC-2`). The stored card number and CVV come from
+//! the card read for update, never from the request. Neither handler logs or traces anything,
+//! because the query of endpoint 9 may hold a typed card number.
 
 use axum::Json;
 use axum::extract::State;

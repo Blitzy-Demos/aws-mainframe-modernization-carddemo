@@ -269,8 +269,9 @@ mod tests {
     };
     use crate::HarnessError;
     use crate::tests::{
-        MISSING_ENTRYPOINT, abandoned_start_case, cancelled_start_case, docker, exists,
-        failed_start_case, guarded_container_case, remove, shutdown_start_case,
+        MISSING_ENTRYPOINT, abandoned_start_case, block_on, block_on_multi_thread,
+        cancelled_start_case, docker, exists, failed_start_case, guarded_container_case, remove,
+        shutdown_start_case,
     };
 
     /// Migration bound of the frozen-server case, far below the pool's 30-second acquire
@@ -284,140 +285,153 @@ mod tests {
     /// Interval between two reads of the server log while waiting for a line.
     const LOG_POLL: Duration = Duration::from_millis(50);
 
-    #[tokio::test]
-    async fn a_started_database_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
-        let guard = start_postgres().await?;
-        let id = guard.container.id().to_owned();
-        guarded_container_case(guard, &id, IMAGE).await
+    #[test]
+    fn a_started_database_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let id = guard.container.id().to_owned();
+            guarded_container_case(guard, &id, IMAGE).await
+        })
     }
 
     /// The server log holds what the server wrote from its start, the ready message included,
     /// and what it writes later: a sign-on refused for a wrong password, which issues no SQL,
     /// appears in a read made after it, within [`LOG_BOUND`].
-    #[tokio::test]
-    async fn the_server_log_holds_the_start_and_what_followed() -> Result<(), HarnessError> {
-        // What the server logs for a sign-on refused for its password, naming the user only.
-        let refused_sign_on = format!("password authentication failed for user \"{USER}\"");
-        let guard = start_postgres().await?;
-        let started = guard.server_log().await?;
-        assert!(
-            String::from_utf8_lossy(&started).contains(READY_MESSAGE),
-            "the server log lacks the ready message"
-        );
-        assert!(
-            !String::from_utf8_lossy(&started).contains(&refused_sign_on),
-            "the server log reports a refused sign-on before any was attempted"
-        );
-
-        let wrong = format!(
-            "postgres://{USER}:not-{PASSWORD}@{}",
-            address(guard.database_url())
-        );
-        assert!(
-            PgConnection::connect(&wrong).await.is_err(),
-            "a sign-on with a wrong password succeeded"
-        );
-        let deadline = Instant::now() + LOG_BOUND;
-        while !String::from_utf8_lossy(&guard.server_log().await?).contains(&refused_sign_on) {
+    #[test]
+    fn the_server_log_holds_the_start_and_what_followed() -> Result<(), HarnessError> {
+        block_on(async {
+            // What the server logs for a sign-on refused for its password, naming the user only.
+            let refused_sign_on = format!("password authentication failed for user \"{USER}\"");
+            let guard = start_postgres().await?;
+            let started = guard.server_log().await?;
             assert!(
-                Instant::now() < deadline,
-                "the refused sign-on did not reach the server log within {} ms",
-                LOG_BOUND.as_millis()
+                String::from_utf8_lossy(&started).contains(READY_MESSAGE),
+                "the server log lacks the ready message"
             );
-            time::sleep(LOG_POLL).await;
-        }
-        Ok(())
+            assert!(
+                !String::from_utf8_lossy(&started).contains(&refused_sign_on),
+                "the server log reports a refused sign-on before any was attempted"
+            );
+
+            let wrong = format!(
+                "postgres://{USER}:not-{PASSWORD}@{}",
+                address(guard.database_url())
+            );
+            assert!(
+                PgConnection::connect(&wrong).await.is_err(),
+                "a sign-on with a wrong password succeeded"
+            );
+            let deadline = Instant::now() + LOG_BOUND;
+            while !String::from_utf8_lossy(&guard.server_log().await?).contains(&refused_sign_on) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the refused sign-on did not reach the server log within {} ms",
+                    LOG_BOUND.as_millis()
+                );
+                time::sleep(LOG_POLL).await;
+            }
+            Ok(())
+        })
     }
 
     /// The server is paused between readiness and migration, so it accepts nothing more. The
     /// migration fails at its bound, and the container is gone when the error returns.
-    #[tokio::test]
-    async fn a_server_frozen_after_readiness_fails_the_migration_at_its_bound()
-    -> Result<(), HarnessError> {
-        let docker = docker().await?;
-        let container = start_container(image()).await?;
-        let id = container.id().to_owned();
-        let unmigrated = connect(container).await?;
-        docker
-            .pause_container(&id)
-            .await
-            .map_err(|err| HarnessError::new("pause postgres", &err))?;
+    #[test]
+    fn a_server_frozen_after_readiness_fails_the_migration_at_its_bound() -> Result<(), HarnessError>
+    {
+        block_on(async {
+            let docker = docker().await?;
+            let container = start_container(image()).await?;
+            let id = container.id().to_owned();
+            let unmigrated = connect(container).await?;
+            docker
+                .pause_container(&id)
+                .await
+                .map_err(|err| HarnessError::new("pause postgres", &err))?;
 
-        let started = Instant::now();
-        let migrated = migrate(unmigrated, FROZEN_BOUND).await;
-        let elapsed = started.elapsed();
-        let kept = exists(&docker, &id).await;
-        let leftover = if matches!(kept, Ok(false)) {
-            None
-        } else {
-            Some(remove(&docker, &id).await)
-        };
+            let started = Instant::now();
+            let migrated = migrate(unmigrated, FROZEN_BOUND).await;
+            let elapsed = started.elapsed();
+            let kept = exists(&docker, &id).await;
+            let leftover = if matches!(kept, Ok(false)) {
+                None
+            } else {
+                Some(remove(&docker, &id).await)
+            };
 
-        let Err(err) = migrated else {
-            panic!("the migration of a paused server succeeded");
-        };
-        assert_eq!(
-            err.to_string(),
-            format!(
-                "apply migrations: the migrations did not finish within {} ms",
-                FROZEN_BOUND.as_millis()
-            )
-        );
-        assert!(
-            elapsed >= FROZEN_BOUND && elapsed < FROZEN_BOUND + REMOVAL_ALLOWANCE,
-            "{elapsed:?}"
-        );
-        assert!(
-            matches!(kept, Ok(false)),
-            "the container outlived the error: {kept:?}; removal: {leftover:?}"
-        );
-        Ok(())
+            let Err(err) = migrated else {
+                panic!("the migration of a paused server succeeded");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "apply migrations: the migrations did not finish within {} ms",
+                    FROZEN_BOUND.as_millis()
+                )
+            );
+            assert!(
+                elapsed >= FROZEN_BOUND && elapsed < FROZEN_BOUND + REMOVAL_ALLOWANCE,
+                "{elapsed:?}"
+            );
+            assert!(
+                matches!(kept, Ok(false)),
+                "the container outlived the error: {kept:?}; removal: {leftover:?}"
+            );
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_failed_start_removes_only_its_own_container() -> Result<(), HarnessError> {
-        failed_start_case(
+    #[test]
+    fn a_failed_start_removes_only_its_own_container() -> Result<(), HarnessError> {
+        block_on(failed_start_case(
             request(image().with_entrypoint(MISSING_ENTRYPOINT)),
             "start postgres container",
+        ))
+    }
+
+    #[test]
+    fn an_abandoned_start_removes_its_container_on_a_current_thread_runtime()
+    -> Result<(), HarnessError> {
+        block_on(abandoned_start_case(request(image())))
+    }
+
+    #[test]
+    fn an_abandoned_start_removes_its_container_on_a_multi_thread_runtime()
+    -> Result<(), HarnessError> {
+        block_on_multi_thread(None, abandoned_start_case(request(image())))
+    }
+
+    #[test]
+    fn a_dropped_start_runs_on_and_removes_its_container_on_a_current_thread_runtime()
+    -> Result<(), HarnessError> {
+        block_on(cancelled_start_case(
+            || request(image()),
+            "start postgres container",
+        ))
+    }
+
+    #[test]
+    fn a_dropped_start_runs_on_and_removes_its_container_on_a_multi_thread_runtime()
+    -> Result<(), HarnessError> {
+        block_on_multi_thread(
+            None,
+            cancelled_start_case(|| request(image()), "start postgres container"),
         )
-        .await
     }
 
-    #[tokio::test]
-    async fn an_abandoned_start_removes_its_container_on_a_current_thread_runtime()
-    -> Result<(), HarnessError> {
-        abandoned_start_case(request(image())).await
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn an_abandoned_start_removes_its_container_on_a_multi_thread_runtime()
-    -> Result<(), HarnessError> {
-        abandoned_start_case(request(image())).await
-    }
-
-    #[tokio::test]
-    async fn a_dropped_start_runs_on_and_removes_its_container_on_a_current_thread_runtime()
-    -> Result<(), HarnessError> {
-        cancelled_start_case(|| request(image()), "start postgres container").await
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_dropped_start_runs_on_and_removes_its_container_on_a_multi_thread_runtime()
-    -> Result<(), HarnessError> {
-        cancelled_start_case(|| request(image()), "start postgres container").await
-    }
-
-    #[tokio::test]
-    async fn starts_cut_off_by_a_runtime_shutdown_leave_no_container() -> Result<(), HarnessError> {
-        for multi_thread in [false, true] {
-            shutdown_start_case(
-                || request(image()),
-                "start postgres container",
-                multi_thread,
-            )
-            .await?;
-        }
-        Ok(())
+    #[test]
+    fn starts_cut_off_by_a_runtime_shutdown_leave_no_container() -> Result<(), HarnessError> {
+        block_on(async {
+            for multi_thread in [false, true] {
+                shutdown_start_case(
+                    || request(image()),
+                    "start postgres container",
+                    multi_thread,
+                )
+                .await?;
+            }
+            Ok(())
+        })
     }
 
     #[test]

@@ -96,6 +96,10 @@ use persistence::{
     PendingAuthDetailRepository, PendingAuthSummaryRepository, PersistenceError, PgTx,
 };
 use runtime::telemetry::JobCounter;
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{self, Field, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use super::{JobContext, JobError, JobOutcome};
 use crate::cli::Cbpaup0jArgs;
@@ -396,18 +400,110 @@ fn deleted(outcome: Option<bool>, operation: &'static str) -> bool {
     match outcome {
         Some(true) => true,
         Some(false) => {
-            tracing::error!(operation, "CBPAUP0C delete found no row");
+            no_row(operation);
             false
         }
         None => false,
     }
 }
 
+/// The message of the event [`no_row`] emits, and the name of its callsite.
+const NO_ROW: &str = "CBPAUP0C delete found no row";
+
+/// The fields of the [`NO_ROW`] event, in the order [`no_row`] gives their values.
+const NO_ROW_FIELDS: &[&str] = &["message", "operation"];
+
+// Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+/// The `ERROR` callsite of the [`NO_ROW`] event.
+static NO_ROW_SITE: DefaultCallsite = DefaultCallsite::new(&NO_ROW_METADATA);
+
+/// The metadata of [`NO_ROW_SITE`].
+static NO_ROW_METADATA: Metadata<'static> = tracing::metadata! {
+    name: NO_ROW,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: NO_ROW_FIELDS,
+    callsite: &NO_ROW_SITE,
+    kind: Kind::EVENT,
+};
+
+/// Reports a `DLET` of the DL/I call `operation` that found no row: one `ERROR` event in the
+/// current span, with target `carddemo_batch::jobs::cbpaup0j` and, in this order, the fields
+/// `message` ([`NO_ROW`]) and `operation`. It decides through `runtime::telemetry::event_enabled`
+/// and dispatches as `tracing`'s event macros do, so the event is the line a macro would write.
+fn no_row(operation: &'static str) {
+    if !runtime::telemetry::event_enabled(&NO_ROW_SITE) {
+        return;
+    }
+    let metadata = NO_ROW_SITE.metadata();
+    let fields = metadata.fields();
+    // The callsite declares every name of `NO_ROW_FIELDS`, so each lookup finds its field.
+    let (Some(message_field), Some(operation_field)) =
+        (fields.field("message"), fields.field("operation"))
+    else {
+        return;
+    };
+    // The message is recorded through its `Display`, as the macro records its formatted message.
+    let message = field::display(NO_ROW);
+    let values: [(&Field, Option<&dyn Value>); 2] = [
+        (&message_field, Some(&message)),
+        (&operation_field, Some(&operation)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
+}
+
+/// The message of the event [`report`] emits, and the name of its callsite.
+const CALL_FAILED: &str = "CBPAUP0C database call failed";
+
+/// The fields of the [`CALL_FAILED`] event, in the order [`report`] gives their values.
+const CALL_FAILED_FIELDS: &[&str] = &["message", "operation", "error"];
+
+// Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+/// The `ERROR` callsite of the [`CALL_FAILED`] event.
+static CALL_FAILED_SITE: DefaultCallsite = DefaultCallsite::new(&CALL_FAILED_METADATA);
+
+/// The metadata of [`CALL_FAILED_SITE`].
+static CALL_FAILED_METADATA: Metadata<'static> = tracing::metadata! {
+    name: CALL_FAILED,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: CALL_FAILED_FIELDS,
+    callsite: &CALL_FAILED_SITE,
+    kind: Kind::EVENT,
+};
+
 /// Reports why a database call failed, for the operator: the DL/I call it replaces and the
 /// error's text, which names an SQLSTATE, a constraint or a column only (Cardholder Data
 /// Redaction).
+///
+/// The report is one `ERROR` event in the current span, with target
+/// `carddemo_batch::jobs::cbpaup0j` and, in this order, the fields `message` ([`CALL_FAILED`]),
+/// `operation` and `error`. It decides through `runtime::telemetry::event_enabled` and
+/// dispatches as `tracing`'s event macros do, so the event is the line a macro would write.
 fn report(operation: &'static str, error: &PersistenceError) {
-    tracing::error!(operation, error = %error, "CBPAUP0C database call failed");
+    if !runtime::telemetry::event_enabled(&CALL_FAILED_SITE) {
+        return;
+    }
+    let metadata = CALL_FAILED_SITE.metadata();
+    let fields = metadata.fields();
+    // The callsite declares every name of `CALL_FAILED_FIELDS`, so each lookup finds its field.
+    let (Some(message_field), Some(operation_field), Some(error_field)) = (
+        fields.field("message"),
+        fields.field("operation"),
+        fields.field("error"),
+    ) else {
+        return;
+    };
+    // The message and the error are recorded through their `Display`, as the macro records its
+    // formatted message and a `%` field.
+    let message = field::display(CALL_FAILED);
+    let error = field::display(error);
+    let values: [(&Field, Option<&dyn Value>); 3] = [
+        (&message_field, Some(&message)),
+        (&operation_field, Some(&operation)),
+        (&error_field, Some(&error)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 /// The normal end: the final checkpoint, the end lines and return code 0 (CBPAUP0C-019,
@@ -464,11 +560,65 @@ fn abended(purge: Purge, stopped: Stopped) -> JobError {
 fn display(lines: &[String], abend_from: usize) {
     for (index, line) in lines.iter().enumerate() {
         if index < abend_from {
-            tracing::info!("{line}");
+            show(&SYSOUT_INFO, line);
         } else {
-            tracing::error!("{line}");
+            show(&SYSOUT_ERROR, line);
         }
     }
+}
+
+/// The name of the callsites of the SYSOUT line events.
+const SYSOUT_LINE: &str = "CBPAUP0C SYSOUT line";
+
+/// The field of a SYSOUT line's event: its message alone, the line's text.
+const SYSOUT_LINE_FIELDS: &[&str] = &["message"];
+
+// Written out: `tracing`'s `info!` and `error!` expand to an `allow(unused_imports)` lint
+// suppression.
+/// The `INFO` callsite of the SYSOUT lines of a run.
+static SYSOUT_INFO: DefaultCallsite = DefaultCallsite::new(&SYSOUT_INFO_METADATA);
+
+/// The metadata of [`SYSOUT_INFO`].
+static SYSOUT_INFO_METADATA: Metadata<'static> = tracing::metadata! {
+    name: SYSOUT_LINE,
+    target: module_path!(),
+    level: Level::INFO,
+    fields: SYSOUT_LINE_FIELDS,
+    callsite: &SYSOUT_INFO,
+    kind: Kind::EVENT,
+};
+
+/// The `ERROR` callsite of the SYSOUT lines an abend adds.
+static SYSOUT_ERROR: DefaultCallsite = DefaultCallsite::new(&SYSOUT_ERROR_METADATA);
+
+/// The metadata of [`SYSOUT_ERROR`].
+static SYSOUT_ERROR_METADATA: Metadata<'static> = tracing::metadata! {
+    name: SYSOUT_LINE,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: SYSOUT_LINE_FIELDS,
+    callsite: &SYSOUT_ERROR,
+    kind: Kind::EVENT,
+};
+
+/// Emits the SYSOUT line `line` as one event of `callsite` in the current span, with target
+/// `carddemo_batch::jobs::cbpaup0j` and the field `message` alone, the line's text exactly. It
+/// decides through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s event
+/// macros do, so the event is the line a macro would write.
+fn show(callsite: &'static DefaultCallsite, line: &str) {
+    if !runtime::telemetry::event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    let fields = metadata.fields();
+    // Both callsites declare `message`, so the lookup finds it.
+    let Some(message_field) = fields.field("message") else {
+        return;
+    };
+    // The line is recorded through its `Display`, as the macro records its formatted message.
+    let message = field::display(line);
+    let values: [(&Field, Option<&dyn Value>); 1] = [(&message_field, Some(&message))];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 // `JobError` has no SYSIN variant; the refusal is the audited path of CBPAUP0C-002, so it is an
@@ -536,6 +686,16 @@ mod tests {
     use crate::jobs::JobContext;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Runs `test` to completion on a current-thread runtime with every driver enabled, the one
+    /// Tokio's test attribute builds by default, without the lint attributes, `expect` and
+    /// unchecked pin that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// How long the run is watched before the test treats it as waiting for a row lock.
     const LOCK_WAIT: Duration = Duration::from_millis(500);
@@ -659,52 +819,55 @@ mod tests {
     // audit: CBPAUP0C-009
     // audit: CBPAUP0C-016
     // audit: CBPAUP0C-017
-    #[tokio::test]
-    async fn an_approval_committed_while_the_purge_waits_keeps_its_summary() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let config = Config::from_lookup(|_| None)?;
-        let clock = clock()?;
-        let ctx = JobContext {
-            store: &store,
-            config: &config,
-            clock: &clock,
-        };
-        let params = PurgeParams::parse(SYSIN)?;
-        let today = Purge::new(params.clone(), &clock).today();
-        let (declined, decline) = seed(&store, today).await?;
+    #[test]
+    fn an_approval_committed_while_the_purge_waits_keeps_its_summary() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let config = Config::from_lookup(|_| None)?;
+            let clock = clock()?;
+            let ctx = JobContext {
+                store: &store,
+                config: &config,
+                clock: &clock,
+            };
+            let params = PurgeParams::parse(SYSIN)?;
+            let today = Purge::new(params.clone(), &clock).today();
+            let (declined, decline) = seed(&store, today).await?;
 
-        let mut cp00 = store.begin().await?;
-        let (locked, created) = cp00.lock_or_create(&declined).await?;
-        assert_eq!((&locked, created), (&declined, false));
-        let mut purge = pin!(run(&ctx, params));
-        assert!(
-            time::timeout(LOCK_WAIT, &mut purge).await.is_err(),
-            "the purge waits for the decision that holds the summary"
-        );
-        let (approved, approval) = approve(&mut cp00, &locked, today).await?;
-        cp00.commit().await?;
-        let outcome = purge.await?;
+            let mut cp00 = store.begin().await?;
+            let (locked, created) = cp00.lock_or_create(&declined).await?;
+            assert_eq!((&locked, created), (&declined, false));
+            let mut purge = pin!(run(&ctx, params));
+            assert!(
+                time::timeout(LOCK_WAIT, &mut purge).await.is_err(),
+                "the purge waits for the decision that holds the summary"
+            );
+            let (approved, approval) = approve(&mut cp00, &locked, today).await?;
+            cp00.commit().await?;
+            let outcome = purge.await?;
 
-        assert_eq!(outcome.return_code, 0);
-        assert_eq!(
-            outcome.counts,
-            [
-                (JobCounter::SummariesRead, 2),
-                (JobCounter::SummariesDeleted, 1),
-                (JobCounter::DetailsRead, 2),
-                (JobCounter::DetailsDeleted, 0),
-                (JobCounter::Checkpoints, 1),
-            ]
-        );
-        let mut reader = store.clone();
-        let kept = PendingAuthSummaryRepository::find_by_id(&mut reader, approved.acct_id).await?;
-        assert_eq!(kept, Some(approved.clone()));
-        let purged = PendingAuthSummaryRepository::find_by_id(&mut reader, PicS::new(PURGED)?);
-        assert_eq!(purged.await?, None);
-        let details = reader.find_all_by_acct_id(approved.acct_id).await?;
-        assert_eq!(details, [approval, decline]);
-        Ok(())
+            assert_eq!(outcome.return_code, 0);
+            assert_eq!(
+                outcome.counts,
+                [
+                    (JobCounter::SummariesRead, 2),
+                    (JobCounter::SummariesDeleted, 1),
+                    (JobCounter::DetailsRead, 2),
+                    (JobCounter::DetailsDeleted, 0),
+                    (JobCounter::Checkpoints, 1),
+                ]
+            );
+            let mut reader = store.clone();
+            let kept =
+                PendingAuthSummaryRepository::find_by_id(&mut reader, approved.acct_id).await?;
+            assert_eq!(kept, Some(approved.clone()));
+            let purged = PendingAuthSummaryRepository::find_by_id(&mut reader, PicS::new(PURGED)?);
+            assert_eq!(purged.await?, None);
+            let details = reader.find_all_by_acct_id(approved.acct_id).await?;
+            assert_eq!(details, [approval, decline]);
+            Ok(())
+        })
     }
 
     /// A refused SYSIN record ends the job without a return code, so the exit is non-zero, and

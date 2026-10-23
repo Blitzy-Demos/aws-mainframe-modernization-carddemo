@@ -31,10 +31,14 @@
 //! `PIC +99999999.99` (COTRN00C-032; R1), and no card number in any form (COTRN00C-034;
 //! Cardholder Data Redaction).
 
+use std::fmt;
+
 use chrono::NaiveDateTime;
 use domain::copybook::{PicU, PicX};
 use domain::online::cotrn00c as rules;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
@@ -44,8 +48,8 @@ use super::{PageDirection, full_text, text};
 /// (COTRN00C-003, COTRN00C-004, X-COTRN00C-2).
 // The schema name `TranListEntryKey` is fixed (Generated API Types Only); it is unique across
 // the API because every module's schemas share one `components.schemas` map.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "lowercase")]
 pub enum TranListEntryKey {
     /// `enter`: the main menu's option. The page starts at the lowest transaction.
     Enter,
@@ -65,13 +69,52 @@ impl From<TranListEntryKey> for rules::EntryKey {
     }
 }
 
+/// The wire names of [`TranListEntryKey`]'s variants, in declaration order.
+const ENTRY_KEY_NAMES: &[&str] = &["enter", "pf3", "pf5"];
+
+impl Serialize for TranListEntryKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Enter => serializer.serialize_unit_variant("TranListEntryKey", 0, "enter"),
+            Self::Pf3 => serializer.serialize_unit_variant("TranListEntryKey", 1, "pf3"),
+            Self::Pf5 => serializer.serialize_unit_variant("TranListEntryKey", 2, "pf5"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for TranListEntryKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_enum("TranListEntryKey", ENTRY_KEY_NAMES, EntryKeyVisitor)
+    }
+}
+
+/// The visitor of [`TranListEntryKey`]'s variant names.
+struct EntryKeyVisitor;
+
+impl<'de> Visitor<'de> for EntryKeyVisitor {
+    type Value = TranListEntryKey;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("enum TranListEntryKey")
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<TranListEntryKey, A::Error> {
+        let (name, variant) = data.variant_seed(WireName(ENTRY_KEY_NAMES))?;
+        variant.unit_variant()?;
+        match name {
+            Some("enter") => Ok(TranListEntryKey::Enter),
+            Some("pf3") => Ok(TranListEntryKey::Pf3),
+            Some("pf5") => Ok(TranListEntryKey::Pf5),
+            _ => Err(de::Error::invalid_value(de::Unexpected::Enum, &self)),
+        }
+    }
+}
+
 /// The query string of endpoint 11: the key sent, the search value and the echoed paging
 /// state. Every member is optional; with none the request is an ENTER with a blank search over
 /// the state a menu entry starts from (COTRN00C-002, COTRN00C-011).
 // The schema name `TranListQuery` is fixed (Generated API Types Only).
-#[derive(
-    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, IntoParams, Validate,
-)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, ToSchema, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 // The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
 // scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
@@ -117,7 +160,6 @@ pub struct TranListQuery {
     pub has_next_page: Option<bool>,
     /// Rows of a page, 1 to 100, default 10, the rows of `COTRN0A` (Bounded Pagination); 422
     /// outside that range. The screen never sends it.
-    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]
@@ -180,10 +222,94 @@ fn key_field(key: &str) -> PicX<16> {
     PicX::moved_from(key.as_bytes())
 }
 
+/// The members of [`TranListQuery`], in declaration order.
+const TRAN_LIST_QUERY_MEMBERS: &[&str] = &[
+    "start_tran_id",
+    "direction",
+    "entry_key",
+    "first_key",
+    "last_key",
+    "page_no",
+    "has_next_page",
+    "page_size",
+];
+
+impl Serialize for TranListQuery {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("TranListQuery", 8)?;
+        out.serialize_field("start_tran_id", &self.start_tran_id)?;
+        out.serialize_field("direction", &self.direction)?;
+        out.serialize_field("entry_key", &self.entry_key)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("page_size", &self.page_size)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranListQuery {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "TranListQuery",
+            TRAN_LIST_QUERY_MEMBERS,
+            TranListQueryVisitor,
+        )
+    }
+}
+
+/// The visitor of [`TranListQuery`]'s members.
+struct TranListQueryVisitor;
+
+impl<'de> Visitor<'de> for TranListQueryVisitor {
+    type Value = TranListQuery;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct TranListQuery")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TranListQuery, A::Error> {
+        let mut start_tran_id = None;
+        let mut direction = None;
+        let mut entry_key = None;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut page_no = None;
+        let mut has_next_page = None;
+        let mut page_size = None;
+        while let Some(name) = map.next_key_seed(WireName(TRAN_LIST_QUERY_MEMBERS))? {
+            match name {
+                Some("start_tran_id") => member(&mut map, &mut start_tran_id, "start_tran_id")?,
+                Some("direction") => member(&mut map, &mut direction, "direction")?,
+                Some("entry_key") => member(&mut map, &mut entry_key, "entry_key")?,
+                Some("first_key") => member(&mut map, &mut first_key, "first_key")?,
+                Some("last_key") => member(&mut map, &mut last_key, "last_key")?,
+                Some("page_no") => member(&mut map, &mut page_no, "page_no")?,
+                Some("has_next_page") => member(&mut map, &mut has_next_page, "has_next_page")?,
+                Some("page_size") => member(&mut map, &mut page_size, "page_size")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(TranListQuery {
+            start_tran_id: start_tran_id.flatten(),
+            direction: direction.flatten(),
+            entry_key: entry_key.flatten(),
+            first_key: first_key.flatten(),
+            last_key: last_key.flatten(),
+            page_no: page_no.flatten(),
+            has_next_page: has_next_page.flatten(),
+            page_size: page_size.and_then(|QueryPageSize(size)| size),
+        })
+    }
+}
+
 /// One list row of `COTRN0A`, rows 1 to 10 at screen lines 10 to 19 (COTRN00C-028 to
 /// COTRN00C-034).
 // The schema name `TranListRow` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 // The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
 // scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
 #[schema(example = json!({
@@ -225,10 +351,75 @@ impl From<rules::TranListRow> for TranListRow {
     }
 }
 
+/// The members of [`TranListRow`], in declaration order.
+const TRAN_LIST_ROW_MEMBERS: &[&str] = &[
+    "tran_id",
+    "orig_ts",
+    "display_date",
+    "description",
+    "amount",
+];
+
+impl Serialize for TranListRow {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("TranListRow", 5)?;
+        out.serialize_field("tran_id", &self.tran_id)?;
+        out.serialize_field("orig_ts", &self.orig_ts)?;
+        out.serialize_field("display_date", &self.display_date)?;
+        out.serialize_field("description", &self.description)?;
+        out.serialize_field("amount", &self.amount)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranListRow {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct("TranListRow", TRAN_LIST_ROW_MEMBERS, TranListRowVisitor)
+    }
+}
+
+/// The visitor of [`TranListRow`]'s members.
+struct TranListRowVisitor;
+
+impl<'de> Visitor<'de> for TranListRowVisitor {
+    type Value = TranListRow;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct TranListRow")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TranListRow, A::Error> {
+        let mut tran_id = None;
+        let mut orig_ts = None;
+        let mut display_date = None;
+        let mut description = None;
+        let mut amount = None;
+        while let Some(name) = map.next_key_seed(WireName(TRAN_LIST_ROW_MEMBERS))? {
+            match name {
+                Some("tran_id") => member(&mut map, &mut tran_id, "tran_id")?,
+                Some("orig_ts") => member(&mut map, &mut orig_ts, "orig_ts")?,
+                Some("display_date") => member(&mut map, &mut display_date, "display_date")?,
+                Some("description") => member(&mut map, &mut description, "description")?,
+                Some("amount") => member(&mut map, &mut amount, "amount")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(TranListRow {
+            tran_id: tran_id.ok_or_else(|| de::Error::missing_field("tran_id"))?,
+            orig_ts: orig_ts.flatten(),
+            display_date: display_date.flatten(),
+            description: description.ok_or_else(|| de::Error::missing_field("description"))?,
+            amount: amount.ok_or_else(|| de::Error::missing_field("amount"))?,
+        })
+    }
+}
+
 /// The 200 of endpoint 11: the rows, the paging state the screen echoes with its next request
 /// and the message the program moved last (COTRN00C-035).
 // The schema name `TranListResponse` is fixed (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 // The examples leave out every transaction ID: an ID is sixteen digits, which a card-number
 // scan of the emitted contract cannot tell from a card number (Cardholder Data Redaction).
 #[schema(example = json!({
@@ -295,6 +486,133 @@ impl From<rules::TranPage> for TranListResponse {
     }
 }
 
+/// The members of [`TranListResponse`], in declaration order.
+const TRAN_LIST_RESPONSE_MEMBERS: &[&str] = &[
+    "rows",
+    "rows_kept",
+    "first_key",
+    "last_key",
+    "page_no",
+    "has_next_page",
+    "message",
+];
+
+impl Serialize for TranListResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct("TranListResponse", 7)?;
+        out.serialize_field("rows", &self.rows)?;
+        out.serialize_field("rows_kept", &self.rows_kept)?;
+        out.serialize_field("first_key", &self.first_key)?;
+        out.serialize_field("last_key", &self.last_key)?;
+        out.serialize_field("page_no", &self.page_no)?;
+        out.serialize_field("has_next_page", &self.has_next_page)?;
+        out.serialize_field("message", &self.message)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranListResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_struct(
+            "TranListResponse",
+            TRAN_LIST_RESPONSE_MEMBERS,
+            TranListResponseVisitor,
+        )
+    }
+}
+
+/// The visitor of [`TranListResponse`]'s members.
+struct TranListResponseVisitor;
+
+impl<'de> Visitor<'de> for TranListResponseVisitor {
+    type Value = TranListResponse;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("struct TranListResponse")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<TranListResponse, A::Error> {
+        let mut rows = None;
+        let mut rows_kept = None;
+        let mut first_key = None;
+        let mut last_key = None;
+        let mut page_no = None;
+        let mut has_next_page = None;
+        let mut message = None;
+        while let Some(name) = map.next_key_seed(WireName(TRAN_LIST_RESPONSE_MEMBERS))? {
+            match name {
+                Some("rows") => member(&mut map, &mut rows, "rows")?,
+                Some("rows_kept") => member(&mut map, &mut rows_kept, "rows_kept")?,
+                Some("first_key") => member(&mut map, &mut first_key, "first_key")?,
+                Some("last_key") => member(&mut map, &mut last_key, "last_key")?,
+                Some("page_no") => member(&mut map, &mut page_no, "page_no")?,
+                Some("has_next_page") => member(&mut map, &mut has_next_page, "has_next_page")?,
+                Some("message") => member(&mut map, &mut message, "message")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(TranListResponse {
+            rows: rows.ok_or_else(|| de::Error::missing_field("rows"))?,
+            rows_kept: rows_kept.ok_or_else(|| de::Error::missing_field("rows_kept"))?,
+            first_key: first_key.flatten(),
+            last_key: last_key.flatten(),
+            page_no: page_no.ok_or_else(|| de::Error::missing_field("page_no"))?,
+            has_next_page: has_next_page
+                .ok_or_else(|| de::Error::missing_field("has_next_page"))?,
+            message: message.flatten(),
+        })
+    }
+}
+
+/// A member or variant name of this module's types, read as the entry of its list that it
+/// equals, or `None` for a name the list does not hold.
+#[derive(Clone, Copy)]
+struct WireName(&'static [&'static str]);
+
+impl<'de> DeserializeSeed<'de> for WireName {
+    type Value = Option<&'static str>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_identifier(self)
+    }
+}
+
+impl Visitor<'_> for WireName {
+    type Value = Option<&'static str>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member or variant name")
+    }
+
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(self.0.iter().copied().find(|wire| *wire == name))
+    }
+}
+
+/// Reads the value of `name` into `slot`, refusing a member the object repeats.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// A `page_size` as [`super::page_size_from_query`] reads it from a query string.
+struct QueryPageSize(Option<i64>);
+
+impl<'de> Deserialize<'de> for QueryPageSize {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::page_size_from_query(deserializer).map(Self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
@@ -317,6 +635,15 @@ mod tests {
     use crate::error::ScreenError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A synthetic card number, in no fixture; no response may carry it.
     const CARD: &str = "4000001234567899";
@@ -633,102 +960,106 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn the_query_string_is_parsed_with_its_state() -> TestResult {
-        let query = extract(
-            "/api/v1/transactions?direction=backward&first_key=0000000000000011\
+    #[test]
+    fn the_query_string_is_parsed_with_its_state() -> TestResult {
+        block_on(async {
+            let query = extract(
+                "/api/v1/transactions?direction=backward&first_key=0000000000000011\
              &last_key=0000000000000020&page_no=2&has_next_page=true&page_size=7",
-        )
-        .await?
-        .map_err(|error| error.to_string())?;
-        assert_eq!(query.key(), rules::ListKey::Pf7);
-        assert_eq!(query.page_size(), 7);
-        assert_eq!(
-            query.state(),
-            rules::TranListState::new(
-                Some(id(11)?),
-                Some(id(20)?),
-                PicU::new(2)?,
-                rules::NextPage::Yes
             )
-        );
-
-        let query = extract("/api/v1/transactions?entry_key=pf5&start_tran_id=ABC&page_no=0")
             .await?
             .map_err(|error| error.to_string())?;
-        assert_eq!(query.key(), rules::ListKey::Entry(rules::EntryKey::Pf5));
-        assert_eq!(query.start_tran_id.as_deref(), Some("ABC"));
-        Ok(())
+            assert_eq!(query.key(), rules::ListKey::Pf7);
+            assert_eq!(query.page_size(), 7);
+            assert_eq!(
+                query.state(),
+                rules::TranListState::new(
+                    Some(id(11)?),
+                    Some(id(20)?),
+                    PicU::new(2)?,
+                    rules::NextPage::Yes
+                )
+            );
+
+            let query = extract("/api/v1/transactions?entry_key=pf5&start_tran_id=ABC&page_no=0")
+                .await?
+                .map_err(|error| error.to_string())?;
+            assert_eq!(query.key(), rules::ListKey::Entry(rules::EntryKey::Pf5));
+            assert_eq!(query.start_tran_id.as_deref(), Some("ABC"));
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_query_outside_its_rules_is_rejected() -> TestResult {
-        let too_long = "0".repeat(17);
-        let cases = [
-            (
-                "/api/v1/transactions?page_size=101".to_owned(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                PAGE_SIZE_MESSAGE,
-                Some(PAGE_SIZE_FIELD),
-            ),
-            (
-                "/api/v1/transactions?page_size=0&start_tran_id=ABC".to_owned(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                PAGE_SIZE_MESSAGE,
-                Some(PAGE_SIZE_FIELD),
-            ),
-            (
-                format!("/api/v1/transactions?start_tran_id={too_long}"),
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("start_tran_id"),
-            ),
-            (
-                format!("/api/v1/transactions?first_key={too_long}"),
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("first_key"),
-            ),
-            (
-                format!("/api/v1/transactions?last_key={too_long}"),
-                StatusCode::BAD_REQUEST,
-                FIELD_LENGTH_MESSAGE,
-                Some("last_key"),
-            ),
-            (
-                "/api/v1/transactions?page_no=-1".to_owned(),
-                StatusCode::BAD_REQUEST,
-                FIELD_RANGE_MESSAGE,
-                Some("page_no"),
-            ),
-            (
-                "/api/v1/transactions?page_no=100000000".to_owned(),
-                StatusCode::BAD_REQUEST,
-                FIELD_RANGE_MESSAGE,
-                Some("page_no"),
-            ),
-            (
-                "/api/v1/transactions?entry_key=pf7".to_owned(),
-                StatusCode::BAD_REQUEST,
-                INVALID_QUERY,
-                None,
-            ),
-            (
-                "/api/v1/transactions?has_next_page=Y".to_owned(),
-                StatusCode::BAD_REQUEST,
-                INVALID_QUERY,
-                None,
-            ),
-        ];
-        for (uri, status, message, field) in cases {
-            let error = extract(&uri).await?.err().ok_or("accepted")?;
-            assert_eq!(
-                (error.status(), error.message(), error.field()),
-                (status, message, field),
-                "{uri}"
-            );
-        }
-        Ok(())
+    #[test]
+    fn a_query_outside_its_rules_is_rejected() -> TestResult {
+        block_on(async {
+            let too_long = "0".repeat(17);
+            let cases = [
+                (
+                    "/api/v1/transactions?page_size=101".to_owned(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    PAGE_SIZE_MESSAGE,
+                    Some(PAGE_SIZE_FIELD),
+                ),
+                (
+                    "/api/v1/transactions?page_size=0&start_tran_id=ABC".to_owned(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    PAGE_SIZE_MESSAGE,
+                    Some(PAGE_SIZE_FIELD),
+                ),
+                (
+                    format!("/api/v1/transactions?start_tran_id={too_long}"),
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("start_tran_id"),
+                ),
+                (
+                    format!("/api/v1/transactions?first_key={too_long}"),
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("first_key"),
+                ),
+                (
+                    format!("/api/v1/transactions?last_key={too_long}"),
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    Some("last_key"),
+                ),
+                (
+                    "/api/v1/transactions?page_no=-1".to_owned(),
+                    StatusCode::BAD_REQUEST,
+                    FIELD_RANGE_MESSAGE,
+                    Some("page_no"),
+                ),
+                (
+                    "/api/v1/transactions?page_no=100000000".to_owned(),
+                    StatusCode::BAD_REQUEST,
+                    FIELD_RANGE_MESSAGE,
+                    Some("page_no"),
+                ),
+                (
+                    "/api/v1/transactions?entry_key=pf7".to_owned(),
+                    StatusCode::BAD_REQUEST,
+                    INVALID_QUERY,
+                    None,
+                ),
+                (
+                    "/api/v1/transactions?has_next_page=Y".to_owned(),
+                    StatusCode::BAD_REQUEST,
+                    INVALID_QUERY,
+                    None,
+                ),
+            ];
+            for (uri, status, message, field) in cases {
+                let error = extract(&uri).await?.err().ok_or("accepted")?;
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (status, message, field),
+                    "{uri}"
+                );
+            }
+            Ok(())
+        })
     }
 
     #[test]
@@ -772,5 +1103,197 @@ mod tests {
         assert_eq!(page_size["schema"]["maximum"], 100, "{page_size}");
         assert_eq!(page_size["schema"]["minimum"], 1, "{page_size}");
         Ok(())
+    }
+
+    /// A repeated member is answered 400, and a member the query does not declare is skipped.
+    #[test]
+    fn a_query_member_is_read_once_and_an_unknown_one_is_skipped() -> TestResult {
+        block_on(async {
+            let forward = TranListQuery {
+                direction: Some(PageDirection::Forward),
+                ..TranListQuery::default()
+            };
+            let cases = [
+                ("/api/v1/transactions", Some(TranListQuery::default())),
+                (
+                    "/api/v1/transactions?page_key=0000000000000005&direction=forward",
+                    Some(forward.clone()),
+                ),
+                (
+                    "/api/v1/transactions?direction=forward&page_key=",
+                    Some(forward),
+                ),
+                ("/api/v1/transactions?start_tran_id=A&start_tran_id=B", None),
+                ("/api/v1/transactions?entry_key=pf3&entry_key=pf3", None),
+                ("/api/v1/transactions?page_no=1&page_no=2", None),
+                ("/api/v1/transactions?page_size=5&page_size=5", None),
+            ];
+            for (uri, expected) in cases {
+                match (extract(uri).await?, expected) {
+                    (Ok(query), Some(expected)) => assert_eq!(query, expected, "{uri}"),
+                    (Err(error), None) => assert_eq!(
+                        (error.status(), error.message(), error.field()),
+                        (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
+                        "{uri}"
+                    ),
+                    (outcome, expected) => {
+                        return Err(format!("{uri}: {outcome:?}, expected {expected:?}").into());
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Each entry key is written and read as its lowercase name, and no other text is read.
+    #[test]
+    fn an_entry_key_travels_as_its_lowercase_name_alone() -> TestResult {
+        use TranListEntryKey::{Enter, Pf3, Pf5};
+        for (name, key) in [
+            ("enter", Some(Enter)),
+            ("pf3", Some(Pf3)),
+            ("pf5", Some(Pf5)),
+            ("PF5", None),
+            ("Enter", None),
+            ("pf7", None),
+            ("", None),
+        ] {
+            let text = serde_json::json!(name);
+            let read = serde_json::from_value::<TranListEntryKey>(text.clone()).ok();
+            assert_eq!(read, key, "{name:?}");
+            if let Some(key) = key {
+                assert_eq!(serde_json::to_value(key)?, text, "{name:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// A query is written with all eight members in declaration order, `null` when absent.
+    #[test]
+    fn a_query_serialises_every_member_in_declaration_order() -> TestResult {
+        let filled = TranListQuery {
+            start_tran_id: Some("ABC".to_owned()),
+            direction: Some(PageDirection::Backward),
+            entry_key: Some(TranListEntryKey::Pf5),
+            first_key: Some("A".to_owned()),
+            last_key: Some("B".to_owned()),
+            page_no: Some(2),
+            has_next_page: Some(true),
+            page_size: Some(7),
+        };
+        let cases = [
+            (
+                TranListQuery::default(),
+                concat!(
+                    r#"{"start_tran_id":null,"direction":null,"entry_key":null,"first_key":null,"#,
+                    r#""last_key":null,"page_no":null,"has_next_page":null,"page_size":null}"#
+                ),
+            ),
+            (
+                filled,
+                concat!(
+                    r#"{"start_tran_id":"ABC","direction":"backward","entry_key":"pf5","#,
+                    r#""first_key":"A","last_key":"B","page_no":2,"has_next_page":true,"#,
+                    r#""page_size":7}"#
+                ),
+            ),
+        ];
+        for (query, text) in cases {
+            assert_eq!(serde_json::to_string(&query)?, text, "{query:?}");
+        }
+        Ok(())
+    }
+
+    /// Checks the members of `whole`'s JSON object as `T` reads them: an unknown member is
+    /// skipped, the members `optional` names read as in `cleared` when absent or `null`, and the
+    /// object is refused when a member `required` names is absent or when any member repeats.
+    fn assert_members<T>(whole: &T, cleared: &T, required: &[&str], optional: &[&str]) -> TestResult
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + core::fmt::Debug,
+    {
+        let read = |value: serde_json::Map<String, serde_json::Value>| {
+            serde_json::from_value::<T>(value.into()).map_err(|error| error.to_string())
+        };
+        let members = serde_json::to_value(whole)?
+            .as_object()
+            .cloned()
+            .ok_or("not an object")?;
+
+        let mut unknown = members.clone();
+        unknown.insert(
+            "page_key".to_owned(),
+            serde_json::json!({"nested": [1, null, "text"]}),
+        );
+        assert_eq!(read(unknown)?, *whole);
+
+        let mut absent = members.clone();
+        let mut null = members.clone();
+        for name in optional {
+            absent.remove(*name);
+            null.insert((*name).to_owned(), serde_json::Value::Null);
+        }
+        assert_eq!(read(absent)?, *cleared);
+        assert_eq!(read(null)?, *cleared);
+
+        for name in required {
+            let mut missing = members.clone();
+            missing.remove(*name);
+            let refused = read(missing).err();
+            assert_eq!(refused, Some(format!("missing field `{name}`")), "{name}");
+        }
+
+        let body = serde_json::to_string(whole)?;
+        let rest = body.strip_prefix('{').ok_or("not an object")?;
+        for (name, value) in &members {
+            let repeated = format!("{{\"{name}\":{value},{rest}");
+            let refused = serde_json::from_str::<T>(&repeated)
+                .err()
+                .map(|error| error.to_string());
+            let duplicate = format!("duplicate field `{name}`");
+            assert!(
+                refused.is_some_and(|text| text.starts_with(&duplicate)),
+                "{repeated}"
+            );
+        }
+        Ok(())
+    }
+
+    /// A row and a response read their members as [`assert_members`] checks them.
+    #[test]
+    fn a_row_and_a_response_read_their_members_as_their_schemas_state() -> TestResult {
+        let row = TranListRow::from(rules::row_from(&record(1, 5047, "Purchase")?));
+        let blank_ts = TranListRow {
+            orig_ts: None,
+            display_date: None,
+            ..row.clone()
+        };
+        assert_members(
+            &row,
+            &blank_ts,
+            &["tran_id", "description", "amount"],
+            &["orig_ts", "display_date"],
+        )?;
+
+        let response = TranListResponse {
+            rows: vec![Some(row), None],
+            rows_kept: false,
+            first_key: Some("0000000000000001".to_owned()),
+            last_key: Some("0000000000000001".to_owned()),
+            page_no: 1,
+            has_next_page: false,
+            message: Some("You have reached the bottom of the page...".to_owned()),
+        };
+        let blank_state = TranListResponse {
+            first_key: None,
+            last_key: None,
+            message: None,
+            ..response.clone()
+        };
+        assert_members(
+            &response,
+            &blank_state,
+            &["rows", "rows_kept", "page_no", "has_next_page"],
+            &["first_key", "last_key", "message"],
+        )
     }
 }

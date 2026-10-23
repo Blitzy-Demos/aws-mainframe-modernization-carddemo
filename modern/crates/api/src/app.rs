@@ -20,13 +20,15 @@
 //!   Only).
 //! - [`app`] adds [`DOCUMENT_ROUTE`] after the split, so the document is served without being one
 //!   of its own operations, adds the router's own answers (see "Router-level answers" below),
+//!   sets the body limit of [`MAX_BODY_BYTES`] on every route (see "In-flight limit" below),
 //!   wraps every route and those answers in three layers, from the outermost: the request span,
 //!   the response headers and the in-flight limit (each described below), and binds the state.
 //!   The document is held once, behind an `Arc`, because axum clones every route for each
 //!   connection it accepts.
 //! - `EventSite`, `event_metadata` and `emit`, crate-private, write a tracing event out through
 //!   `tracing`'s callsite API, without the lint suppression every `tracing` event macro expands
-//!   to, for the events of the password-work budget and of the services that use them.
+//!   to, for the events of the password-work budget, of the services that use them and of
+//!   `api::error`'s store failure without an audited message.
 //!
 //! # Router-level answers
 //!
@@ -45,12 +47,22 @@
 //!
 //! # Response headers
 //!
-//! Every response, an error, a router-level answer and the document included, carries
-//! `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`, set by one
-//! `axum::middleware::map_response` layer over every route and fallback. A response can carry
-//! the bearer token of sign-on, the full card number endpoint 8 shows an admin, or other
-//! cardholder and personal data, so no browser or intermediate cache may keep any of them; and
-//! every body is JSON, which a browser must never sniff as another type.
+//! Every response, an error, a router-level answer and the document included, carries four
+//! headers, set by one `axum::middleware::map_response` layer over every route and fallback,
+//! each with exactly one value, replacing any a handler set:
+//!
+//! - `Cache-Control: no-store`. A response can carry the bearer token of sign-on, the full card
+//!   number endpoint 8 shows an admin, or other cardholder and personal data, so no browser or
+//!   intermediate cache may keep any of them.
+//! - `X-Content-Type-Options: nosniff`. Every body is JSON, which a browser must never sniff as
+//!   another type.
+//! - `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`. No page, of
+//!   any origin, may show a response inside a frame: the first header for browsers that read
+//!   only it, the second for those that read the policy. They are defence in depth: every body
+//!   is JSON, and the bearer token travels in the `Authorization` header the frontend sets on
+//!   each request, never in a cookie a browser would send by itself, so a page framing an API
+//!   URL gets no authenticated answer to show. They cover the API's responses only, not the
+//!   frontend's own document, which the Vite dev server serves.
 //!
 //! # In-flight limit
 //!
@@ -61,9 +73,13 @@
 //! 503 with `api::error::SERVER_BUSY` and `Retry-After: 1`; the client may send it again then. A
 //! client that disconnects while waiting gives up its turn. An admitted request keeps its place
 //! until its response is returned, so the work and the memory of the requests in flight stay
-//! bounded however many clients connect. The limit sits inside the other two layers, so a
-//! refused request still has its span, with its route and its 503, and both response headers.
-//! An idle connection holds no place.
+//! bounded however many clients connect. Its body is read whole, at most [`MAX_BODY_BYTES`] of
+//! it, within `api::dto::BODY_READ_DEADLINE` (5 s), before its handler runs: a client that sends
+//! the body slowly, or never, keeps its place no longer than that deadline and is then answered
+//! 400 with `api::dto::BODY_TIMEOUT`, and one that disconnects first gives its place up at once.
+//! Once the body is in, the handler, the services and the store run without a deadline. The
+//! limit sits inside the other two layers, so a refused request still has its span, with its
+//! route and its 503, and the response headers. An idle connection holds no place.
 //!
 //! # Request spans
 //!
@@ -126,7 +142,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{FromRef, MatchedPath, State};
+use axum::extract::{DefaultBodyLimit, FromRef, MatchedPath, State};
 use axum::handler::Handler;
 use axum::http::{HeaderValue, Request, Response, header};
 use axum::middleware::Next;
@@ -221,8 +237,12 @@ impl AppState {
     ///
     /// # Errors
     ///
-    /// [`EnvError::MissingJwtSecret`] when `CARDDEMO_JWT_SECRET` is empty or unset: the API
-    /// cannot sign a token, so it refuses to start (AAP 0.5.6).
+    /// The API refuses to start on either refusal of [`Config::require_jwt_secret`]:
+    /// - [`EnvError::MissingJwtSecret`] when `CARDDEMO_JWT_SECRET` is empty, unset or only
+    ///   whitespace: the API has no key to sign a token with (AAP 0.5.6);
+    /// - [`EnvError::WeakJwtSecret`] when it holds fewer than
+    ///   [`runtime::config::MIN_JWT_SECRET_BYTES`] (32) bytes: a key that short could be guessed
+    ///   offline from one issued token and then sign any identity, an administrator's included.
     pub fn from_config(
         store: PgStore,
         config: &Config,
@@ -741,8 +761,9 @@ pub fn openapi() -> OpenApi {
 }
 
 /// The complete API: the operations of [`router`], the document at [`DOCUMENT_ROUTE`], the
-/// router-level 404 and 405, one `http.request` span per request, the two response headers, the
-/// limit of [`MAX_IN_FLIGHT`] requests at once (see the module documentation) and `state`.
+/// router-level 404 and 405, the body limit of [`MAX_BODY_BYTES`] on every route, one
+/// `http.request` span per request, the response headers, the limit of [`MAX_IN_FLIGHT`]
+/// requests at once (see the module documentation) and `state`.
 #[must_use = "the API answers no request until the router is served"]
 pub fn app(state: AppState) -> Router {
     let (router, document) = router();
@@ -752,9 +773,22 @@ pub fn app(state: AppState) -> Router {
         // After the last route, so that it reaches every method router, and before any layer,
         // since it rewrites only method routers that no layer has wrapped yet.
         .method_not_allowed_fallback(method_not_served)
-        .fallback(no_such_route);
+        .fallback(no_such_route)
+        // Read by every body extractor, so `ValidJson` refuses a larger body with its 400.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
     layered(router, MAX_IN_FLIGHT, ADMISSION_WAIT).with_state(state)
 }
+
+/// The largest request body [`app`] reads, in bytes: 64 KiB, on every route. A larger body,
+/// whether its `Content-Length` announces it or its chunks pass it, is answered 400 with
+/// `api::dto::INVALID_BODY` and no field, by the extractor that reads it, and no more of it is
+/// buffered.
+///
+/// About thirty times the largest body a screen sends, the account update of endpoint 6 at
+/// about 2 KB, so no request of the frontend meets it; and small enough that the bodies of the
+/// [`MAX_IN_FLIGHT`] requests in flight hold at most 16 MiB together, and that a body of this
+/// size arrives within `api::dto::BODY_READ_DEADLINE` at 13 KiB a second.
+pub const MAX_BODY_BYTES: usize = 64 * 1024;
 
 /// The most requests [`app`] works on at once; a request beyond them waits up to
 /// [`ADMISSION_WAIT`] for a place, and is answered 503 with [`SERVER_BUSY`] only when none frees
@@ -765,7 +799,8 @@ pub fn app(state: AppState) -> Router {
 /// of the [`MAX_PASSWORD_WORKERS`] workers of [`PasswordWork::default`], so an ordinary load
 /// never meets it.
 /// And few enough that what the admitted requests hold stays bounded: each buffers at most
-/// axum's default body limit of 2 MiB, so their bodies hold at most 512 MiB together.
+/// [`MAX_BODY_BYTES`] of body, 64 KiB, so their bodies hold at most 16 MiB together, and each
+/// keeps its place for at most `api::dto::BODY_READ_DEADLINE` while its body arrives.
 pub const MAX_IN_FLIGHT: usize = 256;
 
 /// How long a request beyond [`MAX_IN_FLIGHT`] waits for a place before it is answered 503 with
@@ -779,13 +814,13 @@ pub const MAX_IN_FLIGHT: usize = 256;
 pub const ADMISSION_WAIT: Duration = Duration::from_secs(5);
 
 /// `router`, its routes and its fallbacks alike, behind the layers every request passes, from
-/// the outermost: the request span, the two response headers and the limit of `in_flight`
-/// requests at once, raised to 1 when it is 0 and capped at [`Semaphore::MAX_PERMITS`], for
-/// which a request beyond it waits at most `admission_wait`.
+/// the outermost: the request span, the response headers of [`protect_response`] and the limit
+/// of `in_flight` requests at once, raised to 1 when it is 0 and capped at
+/// [`Semaphore::MAX_PERMITS`], for which a request beyond it waits at most `admission_wait`.
 ///
 /// The limit is innermost, so a refused request still has its span, recording its route and its
-/// 503, and still gets both headers. One semaphore serves every route and every connection of
-/// the returned router.
+/// 503, and still gets every response header. One semaphore serves every route and every
+/// connection of the returned router.
 fn layered<S>(router: Router<S>, in_flight: usize, admission_wait: Duration) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
@@ -796,7 +831,7 @@ where
     };
     router
         .layer(middleware::from_fn_with_state(admission, admit))
-        .layer(middleware::map_response(no_store_nosniff))
+        .layer(middleware::map_response(protect_response))
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(RouteSpan)
@@ -870,14 +905,26 @@ const NO_STORE: HeaderValue = HeaderValue::from_static("no-store");
 /// type as it is and never sniffs another.
 const NOSNIFF: HeaderValue = HeaderValue::from_static("nosniff");
 
-/// Adds `Cache-Control: no-store` and `X-Content-Type-Options: nosniff` to `response`, replacing
-/// any value a handler set. Any response can carry a bearer token (sign-on), cardholder data or
-/// personal data, so none may be stored by a cache, and every body is JSON that must never be
-/// read as anything else.
-async fn no_store_nosniff<B>(mut response: Response<B>) -> Response<B> {
+/// The `X-Frame-Options` value of every response: no page, of any origin, may show it in a frame.
+const DENY_FRAMING: HeaderValue = HeaderValue::from_static("DENY");
+
+/// The `Content-Security-Policy` value of every response: `frame-ancestors 'none'`, the same
+/// refusal to be framed as [`DENY_FRAMING`], for browsers that read the policy rather than
+/// `X-Frame-Options`. It sets no other directive, since no response is a document that loads
+/// anything.
+const NO_FRAME_ANCESTORS: HeaderValue = HeaderValue::from_static("frame-ancestors 'none'");
+
+/// Adds `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
+/// and `Content-Security-Policy: frame-ancestors 'none'` to `response`, replacing any value a
+/// handler set. Any response can carry a bearer token (sign-on), cardholder data or personal
+/// data, so none may be stored by a cache, shown inside another page's frame, or read as
+/// anything but the JSON every body is.
+async fn protect_response<B>(mut response: Response<B>) -> Response<B> {
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, NO_STORE);
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, NOSNIFF);
+    headers.insert(header::X_FRAME_OPTIONS, DENY_FRAMING);
+    headers.insert(header::CONTENT_SECURITY_POLICY, NO_FRAME_ANCESTORS);
     response
 }
 
@@ -984,6 +1031,8 @@ pub(crate) fn emit<const N: usize>(site: &'static EventSite<N>, values: [Option<
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error as StdError;
+    use std::io::{self, Read as _, Write as _};
+    use std::net::{SocketAddr, TcpStream};
     use std::num::NonZeroUsize;
     use std::path::PathBuf;
     use std::pin::pin;
@@ -994,10 +1043,12 @@ mod tests {
     use axum::body::{self, Body};
     use axum::extract::FromRef;
     use axum::http::{HeaderMap, Method, Request, StatusCode, header};
+    use axum::middleware::Next;
     use axum::{Router, middleware, routing};
     use chrono::NaiveDate;
     use domain::clock::{Clock, FixedClock};
     use domain::copybook::PicX;
+    use domain::online::cosgn00c::ENTER_USER_ID;
     use domain::online::cosgn00c::UserType;
     use persistence::PgStore;
     use runtime::config::{Config, EnvError};
@@ -1005,9 +1056,11 @@ mod tests {
     use serde_json::{Value, json};
     use test_support::postgres::{PostgresGuard, start_postgres};
     use test_support::trace_capture;
+    use tokio::net::TcpListener;
     use tokio::sync::{Notify, Semaphore, oneshot};
     use tower::ServiceExt as _;
 
+    use super::MAX_BODY_BYTES;
     use super::worker_hold::WorkerHold;
     use super::{
         Admission, AppState, DOCUMENT_ROUTE, MAX_PASSWORD_WORKERS, PASSWORD_QUEUE, PASSWORD_WAIT,
@@ -1015,11 +1068,13 @@ mod tests {
         openapi,
     };
     use crate::auth::jwt::JwtKeys;
+    use crate::dto::cosgn00c::SignonRequest;
+    use crate::dto::{BODY_READ_DEADLINE, BODY_TIMEOUT, INVALID_BODY, ValidJson};
     use crate::error::{METHOD_NOT_SERVED, NO_SUCH_ROUTE, SERVER_BUSY};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
-    const SECRET: &str = "app-unit-test-secret";
+    const SECRET: &str = "app-unit-test-local-only-signing-secret";
 
     /// The 27 operations of AAP 0.3.4.1 in endpoint order: method, path and the operation ID
     /// `<module>_<handler>` of the handler registered for them.
@@ -1195,12 +1250,14 @@ mod tests {
         headers.get(name).and_then(|value| value.to_str().ok())
     }
 
-    /// `headers`, those of the response to `case`, forbid caching and content sniffing, each
-    /// with exactly one value.
+    /// `headers`, those of the response to `case`, forbid caching, content sniffing and framing,
+    /// each with exactly one value.
     fn assert_protected(headers: &HeaderMap, case: &str) {
         for (name, value) in [
             (header::CACHE_CONTROL, "no-store"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
         ] {
             let values: Vec<_> = headers.get_all(&name).iter().collect();
             assert_eq!(values, [value], "{case}: {name}");
@@ -1460,6 +1517,22 @@ mod tests {
             let unset = AppState::from_config(store.clone(), &Config::default(), clock()?);
             assert_eq!(unset.err(), Some(EnvError::MissingJwtSecret));
 
+            // The secret decides whether the state, and so the API, starts at all: a blank one
+            // counts as none, one byte short of the minimum is too weak, the minimum is enough.
+            let minimum = runtime::config::MIN_JWT_SECRET_BYTES;
+            for (secret, refusal) in [
+                (" \t ".repeat(12), Some(EnvError::MissingJwtSecret)),
+                ("k".repeat(minimum - 1), Some(EnvError::WeakJwtSecret)),
+                ("k".repeat(minimum), None),
+            ] {
+                let config = Config {
+                    jwt_secret: secret,
+                    ..Config::default()
+                };
+                let built = AppState::from_config(store.clone(), &config, clock()?);
+                assert_eq!(built.err(), refusal);
+            }
+
             let config = Config {
                 jwt_secret: SECRET.to_owned(),
                 jwt_ttl_seconds: 120,
@@ -1699,6 +1772,31 @@ mod tests {
     }
 
     #[test]
+    fn the_response_headers_replace_every_value_a_handler_set() -> TestResult {
+        block_on(async {
+            // A handler that sets a weaker value of each of the four headers, and two values of
+            // `X-Frame-Options`, still answers with exactly the layer's one value of each.
+            let weakened = routing::get(|| async {
+                (
+                    StatusCode::OK,
+                    axum::response::AppendHeaders([
+                        (header::CACHE_CONTROL, "max-age=60"),
+                        (header::X_CONTENT_TYPE_OPTIONS, "sniff"),
+                        (header::X_FRAME_OPTIONS, "SAMEORIGIN"),
+                        (header::X_FRAME_OPTIONS, "ALLOWALL"),
+                        (header::CONTENT_SECURITY_POLICY, "frame-ancestors *"),
+                    ]),
+                )
+            });
+            let router = layered(Router::new().route("/", weakened), 1, IN_FLIGHT_WAIT);
+            let (status, headers, _) = exchange(router, get("/", None)?).await?;
+            assert_eq!(status, StatusCode::OK);
+            assert_protected(&headers, "a handler's own header values");
+            Ok(())
+        })
+    }
+
+    #[test]
     fn unmatched_paths_and_unserved_methods_answer_screen_errors() -> TestResult {
         block_on(async {
             let (store, _guard) = closed_store().await?;
@@ -1793,6 +1891,247 @@ mod tests {
                 for withheld in ["00000000050", "0500024453765740", "nope", "/users/"] {
                     assert!(!text.contains(withheld), "{case}: recorded {withheld}");
                 }
+            }
+            Ok(())
+        })
+    }
+
+    /// How long a raw client waits for the server to answer and close the connection, so that a
+    /// server that never answers fails the test rather than hanging it.
+    const ANSWER_WAIT: Duration = Duration::from_secs(30);
+
+    /// Serves `router` on an ephemeral local port until the test's runtime ends, and returns the
+    /// address it listens on.
+    async fn serve(router: Router) -> Result<SocketAddr, Box<dyn StdError>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        tokio::spawn(axum::serve(listener, router).into_future());
+        Ok(address)
+    }
+
+    /// A new connection to `address` on which `request` has been written as it is, and on which
+    /// nothing more is sent. It blocks, so a test runs it on Tokio's blocking pool.
+    fn raw_send(address: SocketAddr, request: &[u8]) -> io::Result<TcpStream> {
+        let mut stream = TcpStream::connect(address)?;
+        stream.set_read_timeout(Some(ANSWER_WAIT))?;
+        stream.write_all(request)?;
+        Ok(stream)
+    }
+
+    /// The bytes the server answers with on `stream`, read until it closes the connection. It
+    /// blocks, so a test runs it on Tokio's blocking pool.
+    fn raw_answer(mut stream: TcpStream) -> io::Result<Vec<u8>> {
+        let mut answer = Vec::new();
+        stream.read_to_end(&mut answer)?;
+        Ok(answer)
+    }
+
+    /// The status code and the JSON body of `answer`, an HTTP/1.1 response whose whole body
+    /// follows its head.
+    fn status_and_json(answer: &[u8]) -> Result<(u16, Value), Box<dyn StdError>> {
+        let text = std::str::from_utf8(answer)?;
+        let (head, body) = text
+            .split_once("\r\n\r\n")
+            .ok_or("the answer has no end of head")?;
+        let status = head
+            .split(' ')
+            .nth(1)
+            .ok_or("the answer has no status code")?
+            .parse()?;
+        Ok((status, serde_json::from_str(body)?))
+    }
+
+    /// A sign-on `POST` whose `content-length` announces `announced` bytes and whose head only
+    /// `sent` follows; the server closes the connection once it has answered.
+    fn signon_head_and(announced: usize, sent: &str) -> Vec<u8> {
+        format!(
+            "POST /api/v1/signon HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+             content-length: {announced}\r\nconnection: close\r\n\r\n{sent}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_withheld_body_keeps_its_place_only_until_its_deadline_or_its_disconnect() -> TestResult {
+        block_on(async {
+            // One place, behind which a request waits longer than the test runs, on a route that
+            // reads its body through `ValidJson`. Each request reports its admission, before its
+            // body is read.
+            let (admitted, mut admissions) = tokio::sync::mpsc::unbounded_channel();
+            let route = routing::post(|ValidJson(_): ValidJson<SignonRequest>| async {
+                axum::Json(json!({ "read": true }))
+            });
+            let reporting = move |request: Request<Body>, next: Next| {
+                // The receiver outlives every request of the test, so no report is lost.
+                let _ = admitted.send(());
+                next.run(request)
+            };
+            let router = layered(
+                Router::new()
+                    .route("/api/v1/signon", route)
+                    .route_layer(middleware::from_fn(reporting)),
+                1,
+                LONG_WAIT,
+            );
+            let address = serve(router).await?;
+            let whole = r#"{"user_id":"USER0001","password":"PASSWORD"}"#;
+            let read = (200, json!({ "read": true }));
+
+            // A sign-on that announces 100 bytes and sends its first member only takes the only
+            // place ...
+            let sent = Instant::now();
+            let withheld = tokio::task::spawn_blocking(move || {
+                raw_send(address, &signon_head_and(100, r#"{"user_id":"USER0001""#))
+                    .and_then(raw_answer)
+            });
+            admissions
+                .recv()
+                .await
+                .ok_or("the withheld body was not admitted")?;
+
+            // ... so an ordinary one waits for it. When the deadline passes, the withheld body is
+            // answered with the timeout, and its place admits the ordinary one, which is served.
+            let queued = tokio::task::spawn_blocking(move || {
+                let answer =
+                    raw_send(address, &signon_head_and(whole.len(), whole)).and_then(raw_answer);
+                (answer, Instant::now())
+            });
+            assert_eq!(
+                status_and_json(&withheld.await??)?,
+                (400, json!({ "message": BODY_TIMEOUT }))
+            );
+            let (answer, answered_at) = queued.await?;
+            assert_eq!(status_and_json(&answer?)?, read);
+            let waited = answered_at.duration_since(sent);
+            assert!(waited >= BODY_READ_DEADLINE, "served after {waited:?}");
+            admissions
+                .recv()
+                .await
+                .ok_or("the queued request was not admitted")?;
+
+            // A client that disconnects before its body is complete gives the place up at once:
+            // the next request is served without waiting for that body's deadline.
+            let abandoned =
+                tokio::task::spawn_blocking(move || raw_send(address, &signon_head_and(100, "{")))
+                    .await??;
+            admissions
+                .recv()
+                .await
+                .ok_or("the abandoned body was not admitted")?;
+            drop(abandoned);
+            let disconnected = Instant::now();
+            let answer = tokio::task::spawn_blocking(move || {
+                raw_send(address, &signon_head_and(whole.len(), whole)).and_then(raw_answer)
+            })
+            .await??;
+            assert_eq!(status_and_json(&answer)?, read);
+            let waited = disconnected.elapsed();
+            assert!(waited < BODY_READ_DEADLINE, "served after {waited:?}");
+            Ok(())
+        })
+    }
+
+    /// A sign-on body of exactly `size` bytes, at least 36, whose user ID is blank: the members,
+    /// then spaces.
+    fn blank_signon_of(size: usize) -> Result<String, &'static str> {
+        let members = r#"{"user_id":"","password":"PASSWORD"}"#;
+        let padding = size
+            .checked_sub(members.len())
+            .ok_or("a size below the members' own")?;
+        Ok(format!("{members}{}", " ".repeat(padding)))
+    }
+
+    #[test]
+    fn bodies_over_the_limit_are_unreadable_on_every_route_and_one_at_it_is_read() -> TestResult {
+        block_on(async {
+            let (store, _guard) = closed_store().await?;
+            let keys = JwtKeys::new(SECRET, 3600);
+            let token = user_token(&keys)?;
+            let state = AppState::new(store, keys, clock()?, PathBuf::from("var/jobs"));
+            let unreadable = (StatusCode::BAD_REQUEST, json!({ "message": INVALID_BODY }));
+            let padded = format!(
+                r#"{{"user_id":"USER0001","password":"PASSWORD","pad":"{}"}}"#,
+                "A".repeat(1024 * 1024)
+            );
+            // Method, path, whether a token and a `Content-Length` header are sent, the body, and
+            // the status and body of the answer. A body sent without `Content-Length` arrives as
+            // a chunked one does: its size is known only once it has been read.
+            let cases = [
+                // At the limit, the body is read and the program answers its blank user ID.
+                (
+                    Method::POST,
+                    "/api/v1/signon",
+                    false,
+                    true,
+                    blank_signon_of(MAX_BODY_BYTES)?,
+                    (
+                        StatusCode::BAD_REQUEST,
+                        json!({ "message": ENTER_USER_ID, "field": "user_id" }),
+                    ),
+                ),
+                (
+                    Method::POST,
+                    "/api/v1/signon",
+                    false,
+                    true,
+                    blank_signon_of(MAX_BODY_BYTES + 1)?,
+                    unreadable.clone(),
+                ),
+                (
+                    Method::POST,
+                    "/api/v1/signon",
+                    false,
+                    false,
+                    blank_signon_of(MAX_BODY_BYTES + 1)?,
+                    unreadable.clone(),
+                ),
+                // A member no request declares, a megabyte long, on the sign-on that needs no
+                // token and on the account update of a `U` token.
+                (
+                    Method::POST,
+                    "/api/v1/signon",
+                    false,
+                    true,
+                    padded.clone(),
+                    unreadable.clone(),
+                ),
+                (
+                    Method::PUT,
+                    "/api/v1/accounts/00000000001",
+                    true,
+                    true,
+                    padded,
+                    unreadable.clone(),
+                ),
+                (
+                    Method::PUT,
+                    "/api/v1/accounts/00000000001",
+                    true,
+                    false,
+                    blank_signon_of(MAX_BODY_BYTES + 1)?,
+                    unreadable,
+                ),
+            ];
+            for (method, uri, with_token, announced, body, expected) in cases {
+                let case = format!("{method} {uri} of {} bytes", body.len());
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json");
+                if announced {
+                    request = request.header(header::CONTENT_LENGTH, body.len());
+                }
+                if with_token {
+                    request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+                }
+                let (status, headers, bytes) =
+                    exchange(app(state.clone()), request.body(Body::from(body))?).await?;
+                assert_eq!(
+                    (status, serde_json::from_slice::<Value>(&bytes)?),
+                    expected,
+                    "{case}"
+                );
+                assert_protected(&headers, &case);
             }
             Ok(())
         })

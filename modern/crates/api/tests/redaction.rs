@@ -85,8 +85,18 @@ use utoipa::ToSchema;
 type TestResult = Result<(), Box<dyn Error>>;
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries. The runtime stays on
+/// the test's own thread, the one whose default subscriber `trace_capture` installs.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// The HS256 secret of the test state: a local-only value.
-const SECRET: &str = "redaction-test-secret";
+const SECRET: &str = "redaction-local-only-test-signing-secret";
 
 /// The fixture users of `DUSRSECJ.jcl` whose tokens the tests use, and their password.
 const USER_ID: &str = "USER0001";
@@ -1074,6 +1084,8 @@ async fn seed_authorizations(store: &mut PgStore) -> TestResult {
     let account = PicS::new(AUTH_ACCOUNT)?;
     let amount = Decimal::new(1_000, 2);
     let mut summary = PendingAuthSummaryRecord::initialized(account, PicU::new(AUTH_CUSTOMER)?);
+    // TRUNCATION: checked, never lossy. `SEEDED_DETAILS` is 3, which `i16` holds; a refusal is
+    // a test failure, never a wrapped count.
     summary.approved_auth_cnt = Count::new(i16::try_from(SEEDED_DETAILS)?);
     summary.approved_auth_amt = Money::new(amount * Decimal::from(SEEDED_DETAILS))?;
     PendingAuthSummaryRepository::insert(store, &summary).await?;
@@ -1490,181 +1502,187 @@ fn documented_schema(
 /// collected response, no body holds a needle outside the top-level `card_num` of an endpoint 8
 /// 200 to the `A` token, the trace holds none, no body names a CVV or a password, and the card
 /// list and the account view show the redacted forms.
-#[tokio::test]
-async fn no_sensitive_value_leaves_the_api() -> TestResult {
-    let needles = Needles::load()?;
-    let harness = Harness::start("no_sensitive_value_leaves_the_api").await?;
-    let capture = trace_capture::capture();
-    let mut session = Session::new(&harness);
-    let user = session.sign_on(USER_ID).await?;
-    let admin = session.sign_on(ADMIN_ID).await?;
-    session.run(Token::User, &user).await?;
-    session.run(Token::Admin, &admin).await?;
-    assert!(
-        session.unexpected.is_empty(),
-        "steps answered other than expected: {}",
-        session.unexpected.join("; ")
-    );
-    let endpoints: Vec<u8> = session.exchanges.iter().map(|e| e.endpoint).collect();
-    assert!(
-        (1..=27).all(|number| endpoints.contains(&number)),
-        "an endpoint was not called"
-    );
-    let document = serde_json::to_value(openapi())?;
-    let observed: BTreeSet<String> = session
-        .exchanges
-        .iter()
-        .filter_map(|exchange| {
-            documented_schema(&document, exchange.verb, &exchange.path, exchange.status)
-        })
-        .collect();
-    let unseen: Vec<String> = response_schemas(&document)?
-        .difference(&observed)
-        .cloned()
-        .collect();
-    assert!(
-        unseen.is_empty(),
-        "no collected response was of the response schemas {}",
-        unseen.join(", ")
-    );
+#[test]
+fn no_sensitive_value_leaves_the_api() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let harness = Harness::start("no_sensitive_value_leaves_the_api").await?;
+        let capture = trace_capture::capture();
+        let mut session = Session::new(&harness);
+        let user = session.sign_on(USER_ID).await?;
+        let admin = session.sign_on(ADMIN_ID).await?;
+        session.run(Token::User, &user).await?;
+        session.run(Token::Admin, &admin).await?;
+        assert!(
+            session.unexpected.is_empty(),
+            "steps answered other than expected: {}",
+            session.unexpected.join("; ")
+        );
+        let endpoints: Vec<u8> = session.exchanges.iter().map(|e| e.endpoint).collect();
+        assert!(
+            (1..=27).all(|number| endpoints.contains(&number)),
+            "an endpoint was not called"
+        );
+        let document = serde_json::to_value(openapi())?;
+        let observed: BTreeSet<String> = session
+            .exchanges
+            .iter()
+            .filter_map(|exchange| {
+                documented_schema(&document, exchange.verb, &exchange.path, exchange.status)
+            })
+            .collect();
+        let unseen: Vec<String> = response_schemas(&document)?
+            .difference(&observed)
+            .cloned()
+            .collect();
+        assert!(
+            unseen.is_empty(),
+            "no collected response was of the response schemas {}",
+            unseen.join(", ")
+        );
 
-    assert_bodies_clean(&session.exchanges, &needles);
-    let traced = capture.text();
-    assert!(
-        traced.contains(r#""route":"/api/v1/cards/view""#),
-        "the capture recorded no endpoint 8 span"
-    );
-    assert_clean(&needles, &traced, "the captured trace");
+        assert_bodies_clean(&session.exchanges, &needles);
+        let traced = capture.text();
+        assert!(
+            traced.contains(r#""route":"/api/v1/cards/view""#),
+            "the capture recorded no endpoint 8 span"
+        );
+        assert_clean(&needles, &traced, "the captured trace");
 
-    let forms = check_forms(&session.exchanges, &needles);
-    assert!(
-        forms.failures.is_empty(),
-        "response members break the redaction rule: {}",
-        forms.failures.join("; ")
-    );
-    assert!(
-        forms.card_rows > 0,
-        "no endpoint 7 row showed a card number"
-    );
-    assert!(forms.ssns > 0, "no endpoint 4 response showed an SSN");
-    assert!(
-        forms.error_ssns > 0,
-        "no endpoint 4 or 5 error showed a customer's SSN"
-    );
-    Ok(())
+        let forms = check_forms(&session.exchanges, &needles);
+        assert!(
+            forms.failures.is_empty(),
+            "response members break the redaction rule: {}",
+            forms.failures.join("; ")
+        );
+        assert!(
+            forms.card_rows > 0,
+            "no endpoint 7 row showed a card number"
+        );
+        assert!(forms.ssns > 0, "no endpoint 4 response showed an SSN");
+        assert!(
+            forms.error_ssns > 0,
+            "no endpoint 4 or 5 error showed a customer's SSN"
+        );
+        Ok(())
+    })
 }
 
 /// Endpoint 8 by number and by handle: for the `A` token the full number in the top-level
 /// `card_num` and nowhere else, the rest of the body holding no needle and no unredacted
 /// member; for the `U` token the redacted form and no needle at all.
-#[tokio::test]
-async fn endpoint_8_is_the_single_disclosure() -> TestResult {
-    let needles = Needles::load()?;
-    let harness = Harness::start("endpoint_8_is_the_single_disclosure").await?;
-    let user = harness.sign_on(USER_ID).await?;
-    let admin = harness.sign_on(ADMIN_ID).await?;
-    let by_number = format!("acct_id={ACCOUNT}&card_num={CARD}");
-    let (_, first) = harness.card_view(&by_number, &admin).await?;
-    let card_ref = first.get("card_ref").and_then(Value::as_i64);
-    let by_ref = format!(
-        "acct_id={ACCOUNT}&card_ref={}",
-        card_ref.ok_or("endpoint 8 returned no card_ref")?
-    );
-    let cases = [
-        ("by number with the A token", &by_number, &admin, true),
-        ("by number with the U token", &by_number, &user, false),
-        ("by handle with the A token", &by_ref, &admin, true),
-        ("by handle with the U token", &by_ref, &user, false),
-    ];
-    for (label, query, token, full) in cases {
-        let (body, view) = harness.card_view(query, token).await?;
-        if full {
-            let remainder = disclosed_remainder(&body, CARD, &needles)
-                .map_err(|error| format!("{label}: {error}"))?;
-            assert_clean(&needles, &remainder.to_string(), label);
-            let walk = walk_members(&remainder);
-            assert!(
-                walk.breaks.is_empty(),
-                "{label}: {}",
-                walk.breaks.join("; ")
-            );
-        } else {
-            let shown = view.get("card_num").and_then(Value::as_str);
-            assert!(
-                shown == Some(CARD_REDACTED),
-                "{label}: card_num is not the redacted form"
-            );
-            assert_clean(&needles, &body, label);
+#[test]
+fn endpoint_8_is_the_single_disclosure() -> TestResult {
+    block_on(async {
+        let needles = Needles::load()?;
+        let harness = Harness::start("endpoint_8_is_the_single_disclosure").await?;
+        let user = harness.sign_on(USER_ID).await?;
+        let admin = harness.sign_on(ADMIN_ID).await?;
+        let by_number = format!("acct_id={ACCOUNT}&card_num={CARD}");
+        let (_, first) = harness.card_view(&by_number, &admin).await?;
+        let card_ref = first.get("card_ref").and_then(Value::as_i64);
+        let by_ref = format!(
+            "acct_id={ACCOUNT}&card_ref={}",
+            card_ref.ok_or("endpoint 8 returned no card_ref")?
+        );
+        let cases = [
+            ("by number with the A token", &by_number, &admin, true),
+            ("by number with the U token", &by_number, &user, false),
+            ("by handle with the A token", &by_ref, &admin, true),
+            ("by handle with the U token", &by_ref, &user, false),
+        ];
+        for (label, query, token, full) in cases {
+            let (body, view) = harness.card_view(query, token).await?;
+            if full {
+                let remainder = disclosed_remainder(&body, CARD, &needles)
+                    .map_err(|error| format!("{label}: {error}"))?;
+                assert_clean(&needles, &remainder.to_string(), label);
+                let walk = walk_members(&remainder);
+                assert!(
+                    walk.breaks.is_empty(),
+                    "{label}: {}",
+                    walk.breaks.join("; ")
+                );
+            } else {
+                let shown = view.get("card_num").and_then(Value::as_str);
+                assert!(
+                    shown == Some(CARD_REDACTED),
+                    "{label}: card_num is not the redacted form"
+                );
+                assert_clean(&needles, &body, label);
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Request spans record the method, the route template and the status, never a concrete path
 /// or a query string, and a path no route matches records `UNMATCHED_ROUTE`.
-#[tokio::test]
-async fn spans_record_route_templates_only() -> TestResult {
-    let harness = Harness::start("spans_record_route_templates_only").await?;
-    let capture = trace_capture::capture();
-    let admin = harness.sign_on(ADMIN_ID).await?;
-    let probes = [
-        (format!("/api/v1/accounts/{ACCOUNT}/view"), StatusCode::OK),
-        (
-            format!("{CARD_VIEW}?acct_id={ACCOUNT}&card_num={CARD}"),
-            StatusCode::OK,
-        ),
-        (
-            format!(
-                "/api/v1/accounts/{ACCOUNT}/authorizations\
-                 ?page_key=0778000896999999&direction=forward"
+#[test]
+fn spans_record_route_templates_only() -> TestResult {
+    block_on(async {
+        let harness = Harness::start("spans_record_route_templates_only").await?;
+        let capture = trace_capture::capture();
+        let admin = harness.sign_on(ADMIN_ID).await?;
+        let probes = [
+            (format!("/api/v1/accounts/{ACCOUNT}/view"), StatusCode::OK),
+            (
+                format!("{CARD_VIEW}?acct_id={ACCOUNT}&card_num={CARD}"),
+                StatusCode::OK,
             ),
-            StatusCode::OK,
-        ),
-        (
-            format!("/api/v1/no-such-route/{ACCOUNT}?acct_id={ACCOUNT}"),
-            StatusCode::NOT_FOUND,
-        ),
-    ];
-    for (index, (uri, expected)) in probes.iter().enumerate() {
-        let (status, _) = harness
-            .send(request(Verb::Get, uri, Some(&admin), None)?)
-            .await?;
-        assert_eq!(status, *expected, "probe {index}");
-    }
+            (
+                format!(
+                    "/api/v1/accounts/{ACCOUNT}/authorizations\
+                     ?page_key=0778000896999999&direction=forward"
+                ),
+                StatusCode::OK,
+            ),
+            (
+                format!("/api/v1/no-such-route/{ACCOUNT}?acct_id={ACCOUNT}"),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (index, (uri, expected)) in probes.iter().enumerate() {
+            let (status, _) = harness
+                .send(request(Verb::Get, uri, Some(&admin), None)?)
+                .await?;
+            assert_eq!(status, *expected, "probe {index}");
+        }
 
-    let traced = capture.text();
-    let unmatched = format!(r#""route":"{UNMATCHED_ROUTE}""#);
-    for recorded in [
-        r#""route":"/api/v1/signon""#,
-        r#""route":"/api/v1/accounts/{acct_id}/view""#,
-        r#""route":"/api/v1/cards/view""#,
-        r#""route":"/api/v1/accounts/{acct_id}/authorizations""#,
-        unmatched.as_str(),
-        r#""method":"GET""#,
-        r#""method":"POST""#,
-        r#""status":200"#,
-        r#""status":404"#,
-    ] {
-        assert!(traced.contains(recorded), "the trace lacks {recorded}");
-    }
-    for withheld in [
-        "/api/v1/accounts/00000000050",
-        "/api/v1/no-such-route",
-        "card_num=",
-        "acct_id=",
-        "page_key=",
-        "direction=",
-    ] {
+        let traced = capture.text();
+        let unmatched = format!(r#""route":"{UNMATCHED_ROUTE}""#);
+        for recorded in [
+            r#""route":"/api/v1/signon""#,
+            r#""route":"/api/v1/accounts/{acct_id}/view""#,
+            r#""route":"/api/v1/cards/view""#,
+            r#""route":"/api/v1/accounts/{acct_id}/authorizations""#,
+            unmatched.as_str(),
+            r#""method":"GET""#,
+            r#""method":"POST""#,
+            r#""status":200"#,
+            r#""status":404"#,
+        ] {
+            assert!(traced.contains(recorded), "the trace lacks {recorded}");
+        }
+        for withheld in [
+            "/api/v1/accounts/00000000050",
+            "/api/v1/no-such-route",
+            "card_num=",
+            "acct_id=",
+            "page_key=",
+            "direction=",
+        ] {
+            assert!(
+                !traced.contains(withheld),
+                "the trace holds the URI fragment {withheld}"
+            );
+        }
         assert!(
-            !traced.contains(withheld),
-            "the trace holds the URI fragment {withheld}"
+            !traced.contains(CARD),
+            "the trace holds the requested card number"
         );
-    }
-    assert!(
-        !traced.contains(CARD),
-        "the trace holds the requested card number"
-    );
-    Ok(())
+        Ok(())
+    })
 }
 
 /// What the walk of one `OpenAPI` document found.

@@ -155,8 +155,10 @@ pub trait PendingAuthDetailRepository: Send {
     /// `8500-INSERT-AUTH` (`COPAUA0C.cbl:854-935`; COPAUA0C-098 to COPAUA0C-103).
     ///
     /// CP00 calls it on a [`PgTx::savepoint`] opened inside the transaction that holds the
-    /// summary lock, after the reply is confirmed and the request acknowledged (AAP 0.3.4.2,
-    /// E29). When the insert fails, a failed statement having aborted the savepoint alone, the
+    /// summary lock, after the reply is confirmed and the request acknowledged (AAP 0.3.4.2), for
+    /// the reason
+    /// [Reply before write (E29)](crate::repos::pending_auth_summaries#reply-before-write-e29)
+    /// gives. When the insert fails, a failed statement having aborted the savepoint alone, the
     /// worker rolls back to the savepoint, logs `I004` with `IMS INSERT DETL FAILED` and commits
     /// the summary update without its detail, as the COBOL's unit of work commits at the normal
     /// end of its task (`COPAUA0C.cbl:925-931,1008-1009,1016-1022`, COPAUA0C-120).
@@ -620,6 +622,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// How long a locked read is given to show that it waits: far longer than a read of one row
     /// by its key takes on an idle server.
     const LOCK_WAIT: Duration = Duration::from_millis(300);
@@ -701,200 +712,207 @@ mod tests {
     // audit: COPAUS1C-008
     // audit: COPAUS1C-024
     // audit: CBPAUP0C-010
-    #[tokio::test]
-    async fn reads_follow_the_twin_order_from_an_inclusive_start() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let (acct, other) = (PicS::<11>::new(ACCT)?, PicS::<11>::new(OTHER_ACCT)?);
-        for id in [ACCT, OTHER_ACCT] {
-            seed_summary(guard.pool(), id).await?;
-        }
+    #[test]
+    fn reads_follow_the_twin_order_from_an_inclusive_start() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let (acct, other) = (PicS::<11>::new(ACCT)?, PicS::<11>::new(OTHER_ACCT)?);
+            for id in [ACCT, OTHER_ACCT] {
+                seed_summary(guard.pool(), id).await?;
+            }
 
-        // Two authorizations on one day and one the day before; newest first is twin order.
-        let oldest = detail(25_001, 235_959_999)?;
-        let middle = detail(25_002, 93_015_123)?;
-        let newest = detail(25_002, 101_500_000)?;
-        for record in [&middle, &oldest, &newest] {
-            store.insert(acct, record).await?;
-        }
-        // The same key under another account is another segment.
-        store.insert(other, &middle).await?;
+            // Two authorizations on one day and one the day before; newest first is twin order.
+            let oldest = detail(25_001, 235_959_999)?;
+            let middle = detail(25_002, 93_015_123)?;
+            let newest = detail(25_002, 101_500_000)?;
+            for record in [&middle, &oldest, &newest] {
+                store.insert(acct, record).await?;
+            }
+            // The same key under another account is another segment.
+            store.insert(other, &middle).await?;
 
-        let (first_date, first_time) = (PicS::<5>::new(-99_999)?, PicS::<9>::new(-999_999_999)?);
-        let everything = vec![newest.clone(), middle.clone(), oldest.clone()];
-        assert_eq!(
-            store.page_after(acct, first_date, first_time, 10).await?,
-            everything
-        );
-        assert_eq!(store.find_all_by_acct_id(acct).await?, everything);
-        assert_eq!(
-            store.find_all_by_acct_id(other).await?,
-            vec![middle.clone()]
-        );
+            let (first_date, first_time) =
+                (PicS::<5>::new(-99_999)?, PicS::<9>::new(-999_999_999)?);
+            let everything = vec![newest.clone(), middle.clone(), oldest.clone()];
+            assert_eq!(
+                store.page_after(acct, first_date, first_time, 10).await?,
+                everything
+            );
+            assert_eq!(store.find_all_by_acct_id(acct).await?, everything);
+            assert_eq!(
+                store.find_all_by_acct_id(other).await?,
+                vec![middle.clone()]
+            );
 
-        // The start key is included; the limit is bound as given.
-        let (date, time) = (middle.auth_date_9c, middle.auth_time_9c);
-        let from_middle = vec![middle.clone(), oldest.clone()];
-        assert_eq!(store.page_after(acct, date, time, 5).await?, from_middle);
-        assert_eq!(
-            store.page_after(acct, date, time, 1).await?,
-            vec![middle.clone()]
-        );
-        assert!(store.page_after(acct, date, time, 0).await?.is_empty());
-        // From the current detail with a limit of 2: the detail and the next one, as F8 reads.
-        let (newest_date, newest_time) = (newest.auth_date_9c, newest.auth_time_9c);
-        assert_eq!(
-            store.page_after(acct, newest_date, newest_time, 2).await?,
-            vec![newest.clone(), middle.clone()]
-        );
-        // Past the oldest key nothing is left.
-        let past = PicS::<9>::new(oldest.auth_time_9c.get() + 1)?;
-        assert!(
-            store
-                .page_after(acct, oldest.auth_date_9c, past, 5)
-                .await?
-                .is_empty()
-        );
+            // The start key is included; the limit is bound as given.
+            let (date, time) = (middle.auth_date_9c, middle.auth_time_9c);
+            let from_middle = vec![middle.clone(), oldest.clone()];
+            assert_eq!(store.page_after(acct, date, time, 5).await?, from_middle);
+            assert_eq!(
+                store.page_after(acct, date, time, 1).await?,
+                vec![middle.clone()]
+            );
+            assert!(store.page_after(acct, date, time, 0).await?.is_empty());
+            // From the current detail with a limit of 2: the detail and the next one, as F8 reads.
+            let (newest_date, newest_time) = (newest.auth_date_9c, newest.auth_time_9c);
+            assert_eq!(
+                store.page_after(acct, newest_date, newest_time, 2).await?,
+                vec![newest.clone(), middle.clone()]
+            );
+            // Past the oldest key nothing is left.
+            let past = PicS::<9>::new(oldest.auth_time_9c.get() + 1)?;
+            assert!(
+                store
+                    .page_after(acct, oldest.auth_date_9c, past, 5)
+                    .await?
+                    .is_empty()
+            );
 
-        assert_eq!(
-            store.find_by_id(acct, date, time).await?,
-            Some(middle.clone())
-        );
-        assert_eq!(store.find_by_id(acct, date, past).await?, None);
-        let missing = PicS::<11>::new(52)?;
-        assert_eq!(store.find_by_id(missing, date, time).await?, None);
-        assert!(store.find_all_by_acct_id(missing).await?.is_empty());
+            assert_eq!(
+                store.find_by_id(acct, date, time).await?,
+                Some(middle.clone())
+            );
+            assert_eq!(store.find_by_id(acct, date, past).await?, None);
+            let missing = PicS::<11>::new(52)?;
+            assert_eq!(store.find_by_id(missing, date, time).await?, None);
+            assert!(store.find_all_by_acct_id(missing).await?.is_empty());
 
-        // A negative limit is the server's error, never a silent empty page.
-        let refused = store.page_after(acct, date, time, -1).await;
-        let error = refused.err().ok_or("a negative limit was accepted")?;
-        assert_eq!(error.sqlstate(), Some("2201W"), "{error:?}");
-        Ok(())
+            // A negative limit is the server's error, never a silent empty page.
+            let refused = store.page_after(acct, date, time, -1).await;
+            let error = refused.err().ok_or("a negative limit was accepted")?;
+            assert_eq!(error.sqlstate(), Some("2201W"), "{error:?}");
+            Ok(())
+        })
     }
 
     // audit: COPAUA0C-099
     // audit: COPAUA0C-120
-    #[tokio::test]
-    async fn a_failed_insert_inside_a_savepoint_leaves_the_transaction_usable() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let acct = PicS::<11>::new(ACCT)?;
-        seed_summary(guard.pool(), ACCT).await?;
+    #[test]
+    fn a_failed_insert_inside_a_savepoint_leaves_the_transaction_usable() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let acct = PicS::<11>::new(ACCT)?;
+            seed_summary(guard.pool(), ACCT).await?;
 
-        let first = detail(25_040, 120_000_000)?;
-        // A second authorization in the same millisecond: the same key, other fields.
-        let mut second = first.clone();
-        second.auth_resp_code = PicX::from_text("05")?;
-        second.match_status = PicX::from_text("D")?;
+            let first = detail(25_040, 120_000_000)?;
+            // A second authorization in the same millisecond: the same key, other fields.
+            let mut second = first.clone();
+            second.auth_resp_code = PicX::from_text("05")?;
+            second.match_status = PicX::from_text("D")?;
 
-        let mut tx = store.begin().await?;
-        tx.insert(acct, &first).await?;
-        let mut savepoint = tx.savepoint().await?;
-        let duplicate = savepoint.insert(acct, &second).await;
-        let error = duplicate.err().ok_or("a duplicate key was stored")?;
-        assert_eq!(
-            error,
-            PersistenceError::Duplicate {
-                constraint: Some(PRIMARY_KEY.to_owned())
-            }
-        );
-        assert_redacted(&error);
-        savepoint.rollback().await?;
+            let mut tx = store.begin().await?;
+            tx.insert(acct, &first).await?;
+            let mut savepoint = tx.savepoint().await?;
+            let duplicate = savepoint.insert(acct, &second).await;
+            let error = duplicate.err().ok_or("a duplicate key was stored")?;
+            assert_eq!(
+                error,
+                PersistenceError::Duplicate {
+                    constraint: Some(PRIMARY_KEY.to_owned())
+                }
+            );
+            assert_redacted(&error);
+            savepoint.rollback().await?;
 
-        // The enclosing transaction goes on, and commits the first detail alone.
-        let (date, time) = (first.auth_date_9c, first.auth_time_9c);
-        assert_eq!(tx.find_by_id(acct, date, time).await?, Some(first.clone()));
-        assert_eq!(tx.find_all_by_acct_id(acct).await?, vec![first.clone()]);
-        assert_eq!(
-            tx.page_after(acct, date, time, 5).await?,
-            vec![first.clone()]
-        );
-        tx.commit().await?;
-        assert_eq!(store.find_all_by_acct_id(acct).await?, vec![first.clone()]);
+            // The enclosing transaction goes on, and commits the first detail alone.
+            let (date, time) = (first.auth_date_9c, first.auth_time_9c);
+            assert_eq!(tx.find_by_id(acct, date, time).await?, Some(first.clone()));
+            assert_eq!(tx.find_all_by_acct_id(acct).await?, vec![first.clone()]);
+            assert_eq!(
+                tx.page_after(acct, date, time, 5).await?,
+                vec![first.clone()]
+            );
+            tx.commit().await?;
+            assert_eq!(store.find_all_by_acct_id(acct).await?, vec![first.clone()]);
 
-        // On the pool, the same duplicate fails on its own statement and stores nothing.
-        let again = store.insert(acct, &second).await;
-        assert!(again.as_ref().is_err_and(PersistenceError::is_duplicate));
-        assert_eq!(store.find_by_id(acct, date, time).await?, Some(first));
+            // On the pool, the same duplicate fails on its own statement and stores nothing.
+            let again = store.insert(acct, &second).await;
+            assert!(again.as_ref().is_err_and(PersistenceError::is_duplicate));
+            assert_eq!(store.find_by_id(acct, date, time).await?, Some(first));
 
-        // A detail whose account has no summary is refused by the foreign key.
-        let orphan = PicS::<11>::new(OTHER_ACCT)?;
-        let refused = store.insert(orphan, &second).await;
-        let error = refused
-            .err()
-            .ok_or("a detail without its summary was stored")?;
-        assert_eq!(
-            error,
-            PersistenceError::Restrict {
-                constraint: Some(SUMMARY_FK.to_owned())
-            }
-        );
-        assert_redacted(&error);
-        assert!(store.find_all_by_acct_id(orphan).await?.is_empty());
-        Ok(())
+            // A detail whose account has no summary is refused by the foreign key.
+            let orphan = PicS::<11>::new(OTHER_ACCT)?;
+            let refused = store.insert(orphan, &second).await;
+            let error = refused
+                .err()
+                .ok_or("a detail without its summary was stored")?;
+            assert_eq!(
+                error,
+                PersistenceError::Restrict {
+                    constraint: Some(SUMMARY_FK.to_owned())
+                }
+            );
+            assert_redacted(&error);
+            assert!(store.find_all_by_acct_id(orphan).await?.is_empty());
+            Ok(())
+        })
     }
 
     // audit: COPAUS1C-032
     // audit: CBPAUP0C-015
-    #[tokio::test]
-    async fn update_and_delete_report_whether_exactly_one_row_changed() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let (acct, other) = (PicS::<11>::new(ACCT)?, PicS::<11>::new(OTHER_ACCT)?);
-        for id in [ACCT, OTHER_ACCT] {
-            seed_summary(guard.pool(), id).await?;
-        }
-        let stored = detail(25_100, 80_000_500)?;
-        let neighbour = detail(25_100, 80_000_501)?;
-        store.insert(acct, &stored).await?;
-        store.insert(acct, &neighbour).await?;
-        let (date, time) = (stored.auth_date_9c, stored.auth_time_9c);
+    #[test]
+    fn update_and_delete_report_whether_exactly_one_row_changed() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let (acct, other) = (PicS::<11>::new(ACCT)?, PicS::<11>::new(OTHER_ACCT)?);
+            for id in [ACCT, OTHER_ACCT] {
+                seed_summary(guard.pool(), id).await?;
+            }
+            let stored = detail(25_100, 80_000_500)?;
+            let neighbour = detail(25_100, 80_000_501)?;
+            store.insert(acct, &stored).await?;
+            store.insert(acct, &neighbour).await?;
+            let (date, time) = (stored.auth_date_9c, stored.auth_time_9c);
 
-        // Fraud reported: every non-key field is replaced, the key kept.
-        let mut reported = stored.clone();
-        reported.auth_fraud = PicX::from_text("F")?;
-        reported.fraud_rpt_date = PicX::from_text("07/18/22")?;
-        reported.filler = PicX::from_array(*b"~FILLER{}  bytes!");
-        assert!(store.update(acct, &reported).await?);
-        assert_eq!(
-            store.find_by_id(acct, date, time).await?,
-            Some(reported.clone())
-        );
-        assert_eq!(
-            store
-                .find_by_id(acct, neighbour.auth_date_9c, neighbour.auth_time_9c)
-                .await?,
-            Some(neighbour.clone())
-        );
+            // Fraud reported: every non-key field is replaced, the key kept.
+            let mut reported = stored.clone();
+            reported.auth_fraud = PicX::from_text("F")?;
+            reported.fraud_rpt_date = PicX::from_text("07/18/22")?;
+            reported.filler = PicX::from_array(*b"~FILLER{}  bytes!");
+            assert!(store.update(acct, &reported).await?);
+            assert_eq!(
+                store.find_by_id(acct, date, time).await?,
+                Some(reported.clone())
+            );
+            assert_eq!(
+                store
+                    .find_by_id(acct, neighbour.auth_date_9c, neighbour.auth_time_9c)
+                    .await?,
+                Some(neighbour.clone())
+            );
 
-        // No row under that key: nothing replaced, nothing stored.
-        assert!(!store.update(other, &reported).await?);
-        assert!(store.find_all_by_acct_id(other).await?.is_empty());
-        let mut unknown = reported.clone();
-        unknown.auth_time_9c = PicS::new(time.get() - 2)?;
-        assert!(!store.update(acct, &unknown).await?);
+            // No row under that key: nothing replaced, nothing stored.
+            assert!(!store.update(other, &reported).await?);
+            assert!(store.find_all_by_acct_id(other).await?.is_empty());
+            let mut unknown = reported.clone();
+            unknown.auth_time_9c = PicS::new(time.get() - 2)?;
+            assert!(!store.update(acct, &unknown).await?);
 
-        // A replace inside a transaction that rolls back leaves the stored detail as it was.
-        let mut tx = store.begin().await?;
-        assert!(tx.update(acct, &stored).await?);
-        assert_eq!(tx.find_by_id(acct, date, time).await?, Some(stored.clone()));
-        tx.rollback().await?;
-        assert_eq!(store.find_by_id(acct, date, time).await?, Some(reported));
+            // A replace inside a transaction that rolls back leaves the stored detail as it was.
+            let mut tx = store.begin().await?;
+            assert!(tx.update(acct, &stored).await?);
+            assert_eq!(tx.find_by_id(acct, date, time).await?, Some(stored.clone()));
+            tx.rollback().await?;
+            assert_eq!(store.find_by_id(acct, date, time).await?, Some(reported));
 
-        // A delete inside a transaction holds only once committed.
-        let mut tx = store.begin().await?;
-        assert!(tx.delete(acct, date, time).await?);
-        assert!(!tx.delete(acct, date, time).await?);
-        tx.commit().await?;
-        assert_eq!(store.find_by_id(acct, date, time).await?, None);
-        assert!(!store.delete(acct, date, time).await?);
-        assert!(
-            !store
-                .delete(other, neighbour.auth_date_9c, neighbour.auth_time_9c)
-                .await?
-        );
-        assert_eq!(store.find_all_by_acct_id(acct).await?, vec![neighbour]);
-        Ok(())
+            // A delete inside a transaction holds only once committed.
+            let mut tx = store.begin().await?;
+            assert!(tx.delete(acct, date, time).await?);
+            assert!(!tx.delete(acct, date, time).await?);
+            tx.commit().await?;
+            assert_eq!(store.find_by_id(acct, date, time).await?, None);
+            assert!(!store.delete(acct, date, time).await?);
+            assert!(
+                !store
+                    .delete(other, neighbour.auth_date_9c, neighbour.auth_time_9c)
+                    .await?
+            );
+            assert_eq!(store.find_all_by_acct_id(acct).await?, vec![neighbour]);
+            Ok(())
+        })
     }
 
     /// `lock_by_id` on a transaction holds the detail until the transaction ends: a second
@@ -902,60 +920,62 @@ mod tests {
     /// holder commits, reads the flag the holder stored, as the next F5 on the detail must. On
     /// the pool the lock ends with the call, and a key no detail holds is `None`.
     // audit: COPAUS1C-028
-    #[tokio::test]
-    async fn lock_by_id_holds_the_detail_until_the_transaction_ends() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let acct = PicS::<11>::new(ACCT)?;
-        seed_summary(guard.pool(), ACCT).await?;
-        let stored = detail(25_200, 101_010_101)?;
-        store.insert(acct, &stored).await?;
-        let (date, time) = (stored.auth_date_9c, stored.auth_time_9c);
-        let absent = PicS::<9>::new(time.get() + 1)?;
+    #[test]
+    fn lock_by_id_holds_the_detail_until_the_transaction_ends() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let acct = PicS::<11>::new(ACCT)?;
+            seed_summary(guard.pool(), ACCT).await?;
+            let stored = detail(25_200, 101_010_101)?;
+            store.insert(acct, &stored).await?;
+            let (date, time) = (stored.auth_date_9c, stored.auth_time_9c);
+            let absent = PicS::<9>::new(time.get() + 1)?;
 
-        // Through the pool the lock ends with its statement, so a second one does not wait.
-        assert_eq!(
-            store.lock_by_id(acct, date, time).await?,
-            Some(stored.clone())
-        );
-        assert_eq!(
-            store.lock_by_id(acct, date, time).await?,
-            Some(stored.clone())
-        );
-        assert_eq!(store.lock_by_id(acct, date, absent).await?, None);
-
-        let mut holder = store.begin().await?;
-        assert_eq!(holder.lock_by_id(acct, date, absent).await?, None);
-        let mut reported = holder
-            .lock_by_id(acct, date, time)
-            .await?
-            .ok_or("the detail is stored")?;
-        assert_eq!(reported, stored);
-        // A plain read does not wait for the lock.
-        assert_eq!(
-            store.find_by_id(acct, date, time).await?,
-            Some(stored.clone())
-        );
-
-        // Another transaction's locked read waits while the holder's transaction is open.
-        let mut waiter = store.begin().await?;
-        let seen = {
-            let mut waiting = pin!(waiter.lock_by_id(acct, date, time));
-            assert!(
-                timeout(LOCK_WAIT, waiting.as_mut()).await.is_err(),
-                "a second lock of the detail was granted while the first was held"
+            // Through the pool the lock ends with its statement, so a second one does not wait.
+            assert_eq!(
+                store.lock_by_id(acct, date, time).await?,
+                Some(stored.clone())
             );
-            // The holder flags the detail and commits, which releases the lock: the waiter then
-            // reads the detail as the holder committed it, not as it was when the wait began.
-            reported.auth_fraud = PicX::from_text("F")?;
-            reported.fraud_rpt_date = PicX::from_text("07/18/22")?;
-            assert!(holder.update(acct, &reported).await?);
-            holder.commit().await?;
-            waiting.await?
-        };
-        assert_eq!(seen, Some(reported.clone()));
-        waiter.rollback().await?;
-        assert_eq!(store.find_by_id(acct, date, time).await?, Some(reported));
-        Ok(())
+            assert_eq!(
+                store.lock_by_id(acct, date, time).await?,
+                Some(stored.clone())
+            );
+            assert_eq!(store.lock_by_id(acct, date, absent).await?, None);
+
+            let mut holder = store.begin().await?;
+            assert_eq!(holder.lock_by_id(acct, date, absent).await?, None);
+            let mut reported = holder
+                .lock_by_id(acct, date, time)
+                .await?
+                .ok_or("the detail is stored")?;
+            assert_eq!(reported, stored);
+            // A plain read does not wait for the lock.
+            assert_eq!(
+                store.find_by_id(acct, date, time).await?,
+                Some(stored.clone())
+            );
+
+            // Another transaction's locked read waits while the holder's transaction is open.
+            let mut waiter = store.begin().await?;
+            let seen = {
+                let mut waiting = pin!(waiter.lock_by_id(acct, date, time));
+                assert!(
+                    timeout(LOCK_WAIT, waiting.as_mut()).await.is_err(),
+                    "a second lock of the detail was granted while the first was held"
+                );
+                // The holder flags the detail and commits, which releases the lock: the waiter then
+                // reads the detail as the holder committed it, not as it was when the wait began.
+                reported.auth_fraud = PicX::from_text("F")?;
+                reported.fraud_rpt_date = PicX::from_text("07/18/22")?;
+                assert!(holder.update(acct, &reported).await?);
+                holder.commit().await?;
+                waiting.await?
+            };
+            assert_eq!(seen, Some(reported.clone()));
+            waiter.rollback().await?;
+            assert_eq!(store.find_by_id(acct, date, time).await?, Some(reported));
+            Ok(())
+        })
     }
 }

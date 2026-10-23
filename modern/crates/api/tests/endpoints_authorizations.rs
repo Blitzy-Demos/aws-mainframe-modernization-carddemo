@@ -133,8 +133,8 @@ type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 /// A request served by a task of its own, its response not yet read.
 type InFlight = JoinHandle<Result<Response, Infallible>>;
 
-/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
-/// without the lint attributes that macro's expansion carries.
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries.
 fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -903,21 +903,23 @@ fn next_page_flag(reply: &Reply) -> Option<bool> {
 
 /// Endpoints 21 to 23 for USER0001 over account 50's six details, account 27's summary with no
 /// detail, and account 2 with no summary.
-#[tokio::test]
-async fn copaus0c_summary_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let card = card_of(&mut store, ACCT_50).await?;
-    seed_account_50(&mut store, &card, &SPECS).await?;
-    seed_summary(&mut store, 27, 27).await?;
-    let mut api = Api::signed_on(router_over(store)?).await?;
-    summary_edits(&mut api).await?;
-    summary_first_page(&mut api).await?;
-    summary_paging(&mut api).await?;
-    summary_other_accounts(&mut api).await?;
-    // audit: COPAUS0C-051
-    // audit: COPAUS0C-055
-    api.assert_redacted()
+#[test]
+fn copaus0c_summary_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, &SPECS).await?;
+        seed_summary(&mut store, 27, 27).await?;
+        let mut api = Api::signed_on(router_over(store)?).await?;
+        summary_edits(&mut api).await?;
+        summary_first_page(&mut api).await?;
+        summary_paging(&mut api).await?;
+        summary_other_accounts(&mut api).await?;
+        // audit: COPAUS0C-051
+        // audit: COPAUS0C-055
+        api.assert_redacted()
+    })
 }
 
 /// The account edits of `PROCESS-ENTER-KEY`, and the unknown account.
@@ -1125,16 +1127,18 @@ async fn seed_failed_reads(store: &mut PgStore) -> TestResult {
 }
 
 /// Endpoint 21 when the cross-reference, account or customer read finds nothing or fails.
-#[tokio::test]
-async fn copaus0c_failed_reads() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    seed_failed_reads(&mut store).await?;
-    let mut api = Api::signed_on(router_over(store)?).await?;
-    missing_masters(&mut api).await?;
-    xref_system_errors(&mut api, &guard).await?;
-    // audit: COPAUS0C-051
-    api.assert_redacted()
+#[test]
+fn copaus0c_failed_reads() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        seed_failed_reads(&mut store).await?;
+        let mut api = Api::signed_on(router_over(store)?).await?;
+        missing_masters(&mut api).await?;
+        xref_system_errors(&mut api, &guard).await?;
+        // audit: COPAUS0C-051
+        api.assert_redacted()
+    })
 }
 
 /// The account and the customer the cross-reference names are not stored.
@@ -1247,22 +1251,24 @@ fn assert_detail(reply: &Reply, prefix: &str, index: usize) -> TestResult {
 }
 
 /// Endpoints 22 and 23 for USER0001 over account 50's six details.
-#[tokio::test]
-async fn copaus1c_detail_and_fraud_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let card = card_of(&mut store, ACCT_50).await?;
-    seed_account_50(&mut store, &card, &SPECS).await?;
-    let mut api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
-    detail_enter(&mut api).await?;
-    detail_next(&mut api).await?;
-    detail_refusals(&mut api).await?;
-    invalid_date_toggle(&mut api, &mut store).await?;
-    detail_store_unavailable(&mut api, &guard).await?;
-    committed_toggles(&mut api, &mut store, &card).await?;
-    // audit: COPAUS1C-007
-    // audit: COPAUS2C-013
-    api.assert_redacted()
+#[test]
+fn copaus1c_detail_and_fraud_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, &SPECS).await?;
+        let mut api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
+        detail_enter(&mut api).await?;
+        detail_next(&mut api).await?;
+        detail_refusals(&mut api).await?;
+        invalid_date_toggle(&mut api, &mut store).await?;
+        detail_store_unavailable(&mut api, &guard).await?;
+        committed_toggles(&mut api, &mut store, &card).await?;
+        // audit: COPAUS1C-007
+        // audit: COPAUS2C-013
+        api.assert_redacted()
+    })
 }
 
 /// ENTER on each detail: every `COPAU01` field, and no message.
@@ -1329,21 +1335,23 @@ fn decline_specs() -> Vec<Spec> {
 /// Endpoint 22 ENTER for USER0001 on one detail of account 50 per code of COPAUS1C's decline
 /// table, over a database of its own: Resp Reason is the code's table entry. The reason the
 /// table lacks is `copaus1c_detail_and_fraud_rows`'s case (COPAUS1C-018).
-#[tokio::test]
-async fn copaus1c_reason_descriptions() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let card = card_of(&mut store, ACCT_50).await?;
-    seed_account_50(&mut store, &card, &decline_specs()).await?;
-    let mut api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
-    for (&(_, expected), (_, key)) in DECLINE_REASONS.iter().zip(DECLINE_KEYS) {
-        let reply = api.get(&detail_uri(ACCT_50_TEXT, key, "")).await?;
-        reply.expect_ok()?;
-        assert_eq!(reply.text("/auth_key")?, key);
-        // audit: COPAUS1C-017
-        assert_eq!(reply.text("/reason")?, expected, "{key}");
-    }
-    api.assert_redacted()
+#[test]
+fn copaus1c_reason_descriptions() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, &decline_specs()).await?;
+        let mut api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
+        for (&(_, expected), (_, key)) in DECLINE_REASONS.iter().zip(DECLINE_KEYS) {
+            let reply = api.get(&detail_uri(ACCT_50_TEXT, key, "")).await?;
+            reply.expect_ok()?;
+            assert_eq!(reply.text("/auth_key")?, key);
+            // audit: COPAUS1C-017
+            assert_eq!(reply.text("/reason")?, expected, "{key}");
+        }
+        api.assert_redacted()
+    })
 }
 
 /// F8 from a detail to the next, and on the last detail.
@@ -1529,23 +1537,25 @@ fn seeded_report_date() -> TestResult<NaiveDate> {
 /// second pool's sessions give up waiting for after 500 milliseconds, at the detail read and at
 /// the `auth_fraud` insert; and at the replace of the detail and at `FRAUD-UPDATE`, which a
 /// probe answers.
-#[tokio::test]
-async fn copaus2c_rollback_paths() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let card = card_of(&mut store, ACCT_50).await?;
-    seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
-    let waiting = store_with_options(&guard, "options[lock_timeout]=500").await?;
-    let mut api = Api::signed_on(router_over(waiting)?).await?;
-    held_detail_stops_the_read(&mut api, &mut store, &card).await?;
-    replace_fails_after_insert(&mut api, &guard, &mut store, &card).await?;
-    let seeded = fraud_row_of(&LOCKED_SPEC, &card, locked_auth_ts()?, "R")?;
-    AuthFraudRepository::insert(&mut store, &seeded, seeded_report_date()?).await?;
-    insert_fails_on_held_key(&mut api, &mut store, &card).await?;
-    replace_fails_after_update(&mut api, &guard, &mut store, &card).await?;
-    update_fails_through_probe(&mut api, &guard, &mut store, &card).await?;
-    // audit: COPAUS2C-013
-    api.assert_redacted()
+#[test]
+fn copaus2c_rollback_paths() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
+        let waiting = store_with_options(&guard, "options[lock_timeout]=500").await?;
+        let mut api = Api::signed_on(router_over(waiting)?).await?;
+        held_detail_stops_the_read(&mut api, &mut store, &card).await?;
+        replace_fails_after_insert(&mut api, &guard, &mut store, &card).await?;
+        let seeded = fraud_row_of(&LOCKED_SPEC, &card, locked_auth_ts()?, "R")?;
+        AuthFraudRepository::insert(&mut store, &seeded, seeded_report_date()?).await?;
+        insert_fails_on_held_key(&mut api, &mut store, &card).await?;
+        replace_fails_after_update(&mut api, &guard, &mut store, &card).await?;
+        update_fails_through_probe(&mut api, &guard, &mut store, &card).await?;
+        // audit: COPAUS2C-013
+        api.assert_redacted()
+    })
 }
 
 /// Runs F5 on [`LOCKED_KEY`] while a transaction of the test holds the detail's row lock, and
@@ -1900,89 +1910,93 @@ async fn all_arrived(arrivals: &mut watch::Receiver<usize>) -> TestResult {
 /// committed, the holder's first: the answers are half removals and half reports, each showing
 /// the flag it stored, and the detail and its `auth_fraud` row end as that many serial toggles
 /// leave them. Two F5s that read the same flag would both report.
-#[tokio::test]
-async fn copaus1c_concurrent_fraud_toggles() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let card = card_of(&mut store, ACCT_50).await?;
-    seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
-    let acct = auth_acct(ACCT_50)?;
-    let (date, time) = (
-        PicS::new(LOCKED_SPEC.date_9c)?,
-        PicS::new(LOCKED_SPEC.time_9c)?,
-    );
-    let (probe, mut arrivals) = ArrivalProbe::counting((acct, date, time));
-    let shared: Arc<dyn RepositoryProbe> = probe.clone();
-    let probed = request_store(&guard).await?.with_probe(shared);
-    let mut api = Api::signed_on(router_over(probed)?).await?;
-
-    let mut holder = store.begin().await?;
-    let mut confirmed = PendingAuthDetailRepository::lock_by_id(&mut holder, acct, date, time)
-        .await?
-        .ok_or("the detail is seeded")?;
-    let toggles = api.spawn_posts(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY), CONCURRENT_TOGGLES)?;
-    all_arrived(&mut arrivals).await?;
-
-    // Endpoint 22 answers while the detail is held, with the flag last committed.
-    let shown = api.get(&detail_uri(ACCT_50_TEXT, LOCKED_KEY, "")).await?;
-    // audit: COPAUS1C-008
-    shown.expect_ok()?;
-    // audit: COPAUS1C-008
-    assert_eq!(shown.text("/fraud_status")?, "-         ");
-    let answered = toggles.iter().filter(|task| task.is_finished()).count();
-    assert_eq!(answered, 0, "F5s answered while the detail was held");
-    assert!(
-        !probe.passed_lock(),
-        "an F5 got past its locked read while the detail was held"
-    );
-
-    confirmed.auth_fraud = PicX::from_text("F")?;
-    let replaced = PendingAuthDetailRepository::update(&mut holder, acct, &confirmed).await?;
-    assert!(replaced, "the holder flags the detail");
-    holder.commit().await?;
-
-    let replies = api.replies(toggles).await?;
-    let mut removals = 0_usize;
-    for reply in &replies {
-        reply.expect_ok()?;
-        let flag = match reply.message() {
-            "AUTH FRAUD REMOVED..." => {
-                removals += 1;
-                "R"
-            }
-            "AUTH MARKED FRAUD..." => "F",
-            other => return Err(format!("F5 answered {other:?}").into()),
-        };
-        assert_eq!(
-            reply.text("/detail/fraud_status")?,
-            format!("{flag}-07/18/22")
+#[test]
+fn copaus1c_concurrent_fraud_toggles() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let card = card_of(&mut store, ACCT_50).await?;
+        seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
+        let acct = auth_acct(ACCT_50)?;
+        let (date, time) = (
+            PicS::new(LOCKED_SPEC.date_9c)?,
+            PicS::new(LOCKED_SPEC.time_9c)?,
         );
-    }
-    assert_eq!(
-        (removals, replies.len()),
-        (CONCURRENT_TOGGLES / 2, CONCURRENT_TOGGLES),
-        "removals among the F5s"
-    );
-    assert_eq!(
-        *arrivals.borrow(),
-        CONCURRENT_TOGGLES,
-        "locked reads of the detail, one per F5"
-    );
+        let (probe, mut arrivals) = ArrivalProbe::counting((acct, date, time));
+        let shared: Arc<dyn RepositoryProbe> = probe.clone();
+        let probed = request_store(&guard).await?.with_probe(shared);
+        let mut api = Api::signed_on(router_over(probed)?).await?;
 
-    // An even number of toggles from the holder's `F` leaves `F`, with the clock's report date,
-    // and the `auth_fraud` row carries the last toggle's report.
-    let stored = stored_detail(&mut store, &LOCKED_SPEC)
-        .await?
-        .ok_or("the detail is stored")?;
-    let flagged = (stored.auth_fraud.to_text(), stored.fraud_rpt_date.to_text());
-    assert_eq!(flagged, ("F".to_owned(), "07/18/22".to_owned()));
-    let auth_ts = locked_auth_ts()?;
-    let fraud = AuthFraudRepository::find_by_id(&mut store, &card, auth_ts).await?;
-    let expected = fraud_row_of(&LOCKED_SPEC, &card, auth_ts, "F")?;
-    assert_eq!(fraud, Some((expected, Some(clock_now()?.date()))));
-    // audit: COPAUS1C-032
-    report_blocked("X-COPAUS1C-H2: COPAUS1C-032, the detail and fraud row committed by each F5");
-    api.assert_redacted()
+        let mut holder = store.begin().await?;
+        let mut confirmed = PendingAuthDetailRepository::lock_by_id(&mut holder, acct, date, time)
+            .await?
+            .ok_or("the detail is seeded")?;
+        let toggles = api.spawn_posts(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY), CONCURRENT_TOGGLES)?;
+        all_arrived(&mut arrivals).await?;
+
+        // Endpoint 22 answers while the detail is held, with the flag last committed.
+        let shown = api.get(&detail_uri(ACCT_50_TEXT, LOCKED_KEY, "")).await?;
+        // audit: COPAUS1C-008
+        shown.expect_ok()?;
+        // audit: COPAUS1C-008
+        assert_eq!(shown.text("/fraud_status")?, "-         ");
+        let answered = toggles.iter().filter(|task| task.is_finished()).count();
+        assert_eq!(answered, 0, "F5s answered while the detail was held");
+        assert!(
+            !probe.passed_lock(),
+            "an F5 got past its locked read while the detail was held"
+        );
+
+        confirmed.auth_fraud = PicX::from_text("F")?;
+        let replaced = PendingAuthDetailRepository::update(&mut holder, acct, &confirmed).await?;
+        assert!(replaced, "the holder flags the detail");
+        holder.commit().await?;
+
+        let replies = api.replies(toggles).await?;
+        let mut removals = 0_usize;
+        for reply in &replies {
+            reply.expect_ok()?;
+            let flag = match reply.message() {
+                "AUTH FRAUD REMOVED..." => {
+                    removals += 1;
+                    "R"
+                }
+                "AUTH MARKED FRAUD..." => "F",
+                other => return Err(format!("F5 answered {other:?}").into()),
+            };
+            assert_eq!(
+                reply.text("/detail/fraud_status")?,
+                format!("{flag}-07/18/22")
+            );
+        }
+        assert_eq!(
+            (removals, replies.len()),
+            (CONCURRENT_TOGGLES / 2, CONCURRENT_TOGGLES),
+            "removals among the F5s"
+        );
+        assert_eq!(
+            *arrivals.borrow(),
+            CONCURRENT_TOGGLES,
+            "locked reads of the detail, one per F5"
+        );
+
+        // An even number of toggles from the holder's `F` leaves `F`, with the clock's report date,
+        // and the `auth_fraud` row carries the last toggle's report.
+        let stored = stored_detail(&mut store, &LOCKED_SPEC)
+            .await?
+            .ok_or("the detail is stored")?;
+        let flagged = (stored.auth_fraud.to_text(), stored.fraud_rpt_date.to_text());
+        assert_eq!(flagged, ("F".to_owned(), "07/18/22".to_owned()));
+        let auth_ts = locked_auth_ts()?;
+        let fraud = AuthFraudRepository::find_by_id(&mut store, &card, auth_ts).await?;
+        let expected = fraud_row_of(&LOCKED_SPEC, &card, auth_ts, "F")?;
+        assert_eq!(fraud, Some((expected, Some(clock_now()?.date()))));
+        // audit: COPAUS1C-032
+        report_blocked(
+            "X-COPAUS1C-H2: COPAUS1C-032, the detail and fraud row committed by each F5",
+        );
+        api.assert_redacted()
+    })
 }
 
 /// One call a [`ScriptedProbe`] was asked about: the arguments a test asserts on, cloned inside

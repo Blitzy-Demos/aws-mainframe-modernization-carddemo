@@ -1,5 +1,8 @@
 # CardDemo Rust workspace: virtual manifest. Every member under crates/ inherits the package
-# fields, dependency versions and lints declared here; member manifests never carry a version.
+# fields (edition, rust-version, license, publish) and lints declared here, and declares each
+# dependency, internal crates included, with `workspace = true`, so dependency versions and paths
+# live only in this file. No package version is shared: batch, persistence, runtime and
+# test-support state their own 0.1.0, and the other members state none.
 #
 # Version policy: a pin written MAJOR.MINOR is a tilde requirement, so the lockfile stays on that
 # minor line; a pinned range is a caret requirement. The trailing comment on each dependency is

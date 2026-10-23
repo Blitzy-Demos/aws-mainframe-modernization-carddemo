@@ -393,6 +393,9 @@ fn packed_values() -> Vec<Decimal> {
         state = state
             .wrapping_mul(LCG_MULTIPLIER)
             .wrapping_add(LCG_INCREMENT);
+        // TRUNCATION: a sign conversion only: the remainder modulo `PACKED_CENTS_BOUND` is below
+        // 10^11, far below `i64::MAX`, so the conversion into `i64` is exact and the `expect` is
+        // never reached.
         let cents = i64::try_from((state >> 33) % PACKED_CENTS_BOUND)
             .expect("cents below 10^11 fit 64 signed bits");
         let signed = if index % 2 == 1 { -cents } else { cents };

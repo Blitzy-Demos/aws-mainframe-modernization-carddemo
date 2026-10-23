@@ -79,6 +79,10 @@ use std::path::Path;
 use domain::batch::cobtupdt::{Maintenance, MaintenanceAction, SqlOutcome, decode_input};
 use persistence::{Db2TransactionTypeRepository, PersistenceError, PgTx};
 use runtime::telemetry::JobCounter;
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{self, Field, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use super::{JobContext, JobError, JobOutcome};
 
@@ -133,8 +137,10 @@ enum Failure {
 /// A failed `A`, `U` or `D` statement is no error: it is reported to the domain, which sets
 /// return code 4, and the run goes on (COBTUPDT-022).
 pub(crate) async fn run(ctx: &JobContext<'_>, input: &Path) -> Result<JobOutcome, JobError> {
-    // The read and the decoding block, so they run as one step on the blocking pool, awaited
-    // before the database is reached, with the errors of an inline run (W011-F05).
+    // The read and the decoding block, so they run as one step on the blocking pool, which
+    // finishes before the database is reached. Its first failure ends the run there: an
+    // unreadable file as `JobError::Io`, else the first line that is no record as
+    // `JobError::Input` (COBTUPDT-004).
     let input = input.to_path_buf();
     let records = super::blocking(super::READING_INPUT, move || {
         decode_input(&super::read_input(&input)?).map_err(JobError::from)
@@ -272,17 +278,65 @@ async fn settle(
     }
 }
 
+/// The message of the event [`report`] emits for a failed statement, and the name of its
+/// callsite.
+const STATEMENT_FAILED: &str = "COBTUPDT database call failed";
+
+/// The fields of the [`STATEMENT_FAILED`] event, in the order [`report`] gives their values.
+const STATEMENT_FAILED_FIELDS: &[&str] =
+    &["message", "operation", "error", "unit_of_work_rolled_back"];
+
+// Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+/// The `ERROR` callsite of the [`STATEMENT_FAILED`] event.
+static STATEMENT_FAILED_SITE: DefaultCallsite = DefaultCallsite::new(&STATEMENT_FAILED_METADATA);
+
+/// The metadata of [`STATEMENT_FAILED_SITE`].
+static STATEMENT_FAILED_METADATA: Metadata<'static> = tracing::metadata! {
+    name: STATEMENT_FAILED,
+    target: module_path!(),
+    level: Level::ERROR,
+    fields: STATEMENT_FAILED_FIELDS,
+    callsite: &STATEMENT_FAILED_SITE,
+    kind: Kind::EVENT,
+};
+
 /// Reports why the statement of paragraph `operation` failed, for the operator: the paragraph,
 /// the error's text, which names an SQLSTATE, a constraint or a column only, and whether the
 /// failure stands for `SQLCODE` -911, so that the run's unit of work is rolled back. No
 /// description, type code, record or job-log line reaches it (Cardholder Data Redaction).
+///
+/// The report is one `ERROR` event in the current span, with target
+/// `carddemo_batch::jobs::mnttrdb2` and, in this order, the fields `message`
+/// ([`STATEMENT_FAILED`]), `operation`, `error` and `unit_of_work_rolled_back`. It decides
+/// through `runtime::telemetry::event_enabled` and dispatches as `tracing`'s event macros do, so
+/// the event is the line a macro would write.
 fn report(operation: &'static str, error: &PersistenceError, unit_of_work_rolled_back: bool) {
-    tracing::error!(
-        operation,
-        error = %error,
-        unit_of_work_rolled_back,
-        "COBTUPDT database call failed"
-    );
+    if !runtime::telemetry::event_enabled(&STATEMENT_FAILED_SITE) {
+        return;
+    }
+    let metadata = STATEMENT_FAILED_SITE.metadata();
+    let fields = metadata.fields();
+    // The callsite declares every name of `STATEMENT_FAILED_FIELDS`, so each lookup finds its
+    // field.
+    let (Some(message_field), Some(operation_field), Some(error_field), Some(rolled_back_field)) = (
+        fields.field("message"),
+        fields.field("operation"),
+        fields.field("error"),
+        fields.field("unit_of_work_rolled_back"),
+    ) else {
+        return;
+    };
+    // The message and the error are recorded through their `Display`, as the macro records its
+    // formatted message and a `%` field.
+    let message = field::display(STATEMENT_FAILED);
+    let error = field::display(error);
+    let values: [(&Field, Option<&dyn Value>); 4] = [
+        (&message_field, Some(&message)),
+        (&operation_field, Some(&operation)),
+        (&error_field, Some(&error)),
+        (&rolled_back_field, Some(&unit_of_work_rolled_back)),
+    ];
+    Event::dispatch(metadata, &fields.value_set(&values));
 }
 
 /// What the failure of an `A`, `U` or `D` statement stands for, by the `SQLCODE` mapping of

@@ -81,14 +81,14 @@ use std::time::Duration;
 
 use lapin::{BasicProperties, Connection};
 use runtime::telemetry::{self, IdKey};
-use tracing::Instrument;
+use tracing::{Instrument, Level, Metadata, field};
 
-use crate::Stop;
 use crate::broker::{
     self, Acknowledger, AmqpError, Backoff, Consumer, PublishFailure, Publisher, QueueCheck,
     Request,
 };
 use crate::error_body::{self, Flow, Site};
+use crate::{EventSite, Stop, emit, event_metadata};
 
 /// CDRD, the port of `CODATE01`: the system date and time reply on `CARD.DEMO.REPLY.DATE`.
 pub mod cdrd;
@@ -259,23 +259,14 @@ pub async fn drive<W: Step>(
                 backoff.reset();
                 continue;
             }
-            Ok(Processed::Requeued) => tracing::warn!(
-                queue = worker.queue(),
-                outcome = "requeued",
-                "the worker closed its consumer channel; the broker requeues the request"
-            ),
+            Ok(Processed::Requeued) => request_requeued(worker.queue()),
             // A lost connection fails every channel first, and no reopen on it can succeed.
             Err(StepError::Channel(error))
                 if error.is_connection_lost() || !connection.status().connected() =>
             {
                 return Err(stopped(worker.queue(), StepError::ConnectionLost(error)));
             }
-            Err(StepError::Channel(error)) => tracing::warn!(
-                queue = worker.queue(),
-                outcome = "channel unusable",
-                error = %error,
-                "a worker channel failed; reopening the channels"
-            ),
+            Err(StepError::Channel(error)) => channel_unusable(worker.queue(), &error),
             Err(lost @ StepError::ConnectionLost(_)) => {
                 return Err(stopped(worker.queue(), lost));
             }
@@ -289,11 +280,22 @@ pub async fn drive<W: Step>(
 /// Emits the `ERROR` event of a worker on `queue` that stops because its connection is lost,
 /// and returns `lost` for [`drive`] to return.
 fn stopped(queue: &str, lost: StepError) -> StepError {
-    tracing::error!(
-        queue,
-        outcome = "connection lost",
-        error = %lost,
-        "the worker stops until the connection is restored"
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "worker_stopped",
+        module_path!(),
+        Level::ERROR,
+        &["message", "queue", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the worker stops until the connection is restored"),
+            Some(&queue),
+            Some(&"connection lost"),
+            Some(&field::display(&lost)),
+        ],
     );
     lost
 }
@@ -323,12 +325,7 @@ async fn recover<W: Step>(
             Err(error) if error.is_connection_lost() || !connection.status().connected() => {
                 return Err(StepError::ConnectionLost(error));
             }
-            Err(error) => tracing::warn!(
-                queue = worker.queue(),
-                outcome = "reopen failed",
-                error = %error,
-                "reopening the worker channels failed; retrying"
-            ),
+            Err(error) => reopen_failed(worker.queue(), &error),
         }
     }
 }
@@ -400,13 +397,7 @@ where
     async {
         let processed = handling.await;
         if let Some(outcome) = settled_outcome(processed) {
-            tracing::info!(
-                queue,
-                outcome,
-                redelivered = request.redelivered,
-                body_len = request.body.len(),
-                "the request is settled"
-            );
+            request_settled(queue, outcome, request.redelivered, request.body.len());
         }
         processed
     }
@@ -629,16 +620,9 @@ pub(crate) async fn reply_fixed<A: Acknowledger>(
     {
         Ok(()) => acknowledged(channels, request, Processed::Replied).await,
         Err(failure) => {
-            tracing::warn!(
-                reply_queue,
-                failure = %failure,
-                "the reply was not confirmed; the MQPUT ERR message goes to the error queue"
-            );
+            reply_unconfirmed(reply_queue, &failure);
             if let Err(error) = channels.reopen_publisher(connection).await {
-                tracing::warn!(
-                    error = %error,
-                    "no publisher channel for the error message; the broker requeues the request"
-                );
+                error_publisher_unavailable(&error);
                 return channels.abandon().await;
             }
             route_error(
@@ -686,24 +670,13 @@ pub(crate) async fn route_error<A: Acknowledger>(
     let display = error_body::mq_err_display(flow, Site::ErrorPut);
     let return_message = display.return_message.to_text();
     let queue_name = display.queue_name.to_text();
-    tracing::error!(
-        return_message,
-        queue_name,
-        failure = %failure,
-        "MQ-ERR-DISPLAY: the error message was not confirmed either; the request is discarded"
-    );
+    mq_err_display(&return_message, &queue_name, &failure);
     if let Err(error) = channels.reject_without_requeue(request).await {
-        tracing::warn!(
-            error = %error,
-            "rejecting the request failed; the broker requeues it"
-        );
+        reject_failed(&error);
         return channels.abandon().await;
     }
     if let Err(error) = channels.reopen_publisher(connection).await {
-        tracing::warn!(
-            error = %error,
-            "reopening the publisher channel failed; the next get reopens both channels"
-        );
+        publisher_reopen_failed(&error);
     }
     Processed::Discarded
 }
@@ -718,13 +691,225 @@ async fn acknowledged<A: Acknowledger>(
     match channels.ack(request).await {
         Ok(()) => outcome,
         Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "the acknowledgement after a confirmed publication failed; the broker requeues it"
-            );
+            ack_failed(&error);
             channels.abandon().await
         }
     }
+}
+
+/// `WARN` when the worker on `queue` closed its consumer channel, so the broker requeues the
+/// request.
+fn request_requeued(queue: &str) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "request_requeued",
+        module_path!(),
+        Level::WARN,
+        &["message", "queue", "outcome"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the worker closed its consumer channel; the broker requeues the request"),
+            Some(&queue),
+            Some(&"requeued"),
+        ],
+    );
+}
+
+/// `WARN` when a channel of the worker on `queue` failed with `error`, before the channels are
+/// reopened.
+fn channel_unusable(queue: &str, error: &AmqpError) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "channel_unusable",
+        module_path!(),
+        Level::WARN,
+        &["message", "queue", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"a worker channel failed; reopening the channels"),
+            Some(&queue),
+            Some(&"channel unusable"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when reopening the channels of the worker on `queue` failed with `error`, before the
+/// next attempt.
+fn reopen_failed(queue: &str, error: &AmqpError) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reopen_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "queue", "outcome", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"reopening the worker channels failed; retrying"),
+            Some(&queue),
+            Some(&"reopen failed"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `INFO` in the current span, a request's `mq.message` span, once the request taken from
+/// `queue` is settled, with its `outcome`, its `redelivered` flag and its `body_len`: never a
+/// body byte or an ID.
+fn request_settled(queue: &str, outcome: &str, redelivered: bool, body_len: usize) {
+    static SITE: EventSite<5> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "request_settled",
+        module_path!(),
+        Level::INFO,
+        &["message", "queue", "outcome", "redelivered", "body_len"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the request is settled"),
+            Some(&queue),
+            Some(&outcome),
+            Some(&redelivered),
+            Some(&body_len),
+        ],
+    );
+}
+
+/// `WARN` when the reply to `reply_queue` was not confirmed, with the `failure`, before the
+/// `MQPUT ERR` message goes to the error queue.
+fn reply_unconfirmed(reply_queue: &str, failure: &PublishFailure) {
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reply_unconfirmed",
+        module_path!(),
+        Level::WARN,
+        &["message", "reply_queue", "failure"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"the reply was not confirmed; the MQPUT ERR message goes to the error queue"),
+            Some(&reply_queue),
+            Some(&field::display(failure)),
+        ],
+    );
+}
+
+/// `WARN` when no publisher channel can be reopened for the error message, with the `error`.
+fn error_publisher_unavailable(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "error_publisher_unavailable",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"no publisher channel for the error message; the broker requeues the request"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `ERROR` in place of the COBOL `DISPLAY MQ-ERR-DISPLAY` when the error message was not
+/// confirmed either, with its `return_message`, its `queue_name` and the `failure`.
+fn mq_err_display(return_message: &str, queue_name: &str, failure: &PublishFailure) {
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "mq_err_display",
+        module_path!(),
+        Level::ERROR,
+        &["message", "return_message", "queue_name", "failure"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(
+                &"MQ-ERR-DISPLAY: the error message was not confirmed either; the request is \
+                  discarded",
+            ),
+            Some(&return_message),
+            Some(&queue_name),
+            Some(&field::display(failure)),
+        ],
+    );
+}
+
+/// `WARN` when rejecting a request failed with `error`, so the broker requeues it.
+fn reject_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "reject_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"rejecting the request failed; the broker requeues it"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when reopening the publisher channel after an unconfirmed error message failed with
+/// `error`.
+fn publisher_reopen_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "publisher_reopen_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"reopening the publisher channel failed; the next get reopens both channels"),
+            Some(&field::display(error)),
+        ],
+    );
+}
+
+/// `WARN` when the acknowledgement after a confirmed publication failed with `error`, so the
+/// broker requeues the request.
+fn ack_failed(error: &AmqpError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "ack_failed",
+        module_path!(),
+        Level::WARN,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(
+                &"the acknowledgement after a confirmed publication failed; the broker requeues it",
+            ),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -734,6 +919,7 @@ mod tests {
 
     use super::{AMQP_QUEUE_NAME_LEN, Processed, cdrd, check_request_queue, cp00, in_message_span};
     use crate::broker::{AmqpError, Request};
+    use crate::current_thread;
 
     /// The request queue of the settlement cases, the default of `CARDDEMO_QUEUE_REQUEST_PAUTH`.
     const QUEUE: &str = "CARD.DEMO.REQUEST.PAUTH";
@@ -745,100 +931,102 @@ mod tests {
         rest.split_once('}').map(|(fields, _)| fields)
     }
 
-    #[tokio::test]
-    async fn a_settled_request_leaves_one_info_event_in_its_span_with_no_body_or_id_text() {
-        // A test card number, an SSN and a password, assembled at run time.
-        let card = format!("4111{}", "1".repeat(12));
-        let ssn = ["123-45", "-6789"].concat();
-        let password = ["PASS", "WORD"].concat();
-        let body = format!("220718,102030,{card},{ssn},{password},").into_bytes();
-        let body_len = body.len();
-        let correlation_id = format!("{ssn} {password}");
-        let cases = [
-            (Processed::Replied, Some("replied"), false),
-            (Processed::ErrorRouted, Some("error-routed"), true),
-            (Processed::DeadLettered, Some("dead-lettered"), false),
-            (Processed::Discarded, Some("discarded"), true),
-            (Processed::Requeued, None, true),
-        ];
-        // The worker's key, made from its `CARDDEMO_AMQP_URL` (here the local default), and how
-        // the span shows each ID: its base64url HMAC-SHA256 under it.
-        let amqp_url = "amqp://carddemo:carddemo@localhost:5672/%2f";
-        let id_key = IdKey::new(amqp_url);
-        let shown_message_id = ScreenedText::keyed(&card, &id_key).to_string();
-        let shown_correlation_id = ScreenedText::keyed(&correlation_id, &id_key).to_string();
-        for digest in [&shown_message_id, &shown_correlation_id] {
-            assert_eq!(digest.len(), 43, "{digest}");
-        }
-        for (processed, outcome, redelivered) in cases {
-            let request = Request {
-                delivery_tag: 5,
-                body: body.clone(),
-                message_id: Some(card.clone()),
-                correlation_id: Some(correlation_id.clone()),
-                reply_to: Some(password.clone()),
-                redelivered,
-            };
-
-            let capture = trace_capture::capture();
-            let returned = in_message_span(QUEUE, &request, &id_key, async { processed }).await;
-            assert_eq!(returned, processed);
-
-            let lines = capture.lines();
-            let events: Vec<&String> = lines
-                .iter()
-                .filter(|line| line.contains(r#""message":"the request is settled""#))
-                .collect();
-            if let Some(outcome) = outcome {
-                let [event] = events.as_slice() else {
-                    panic!("{outcome}: expected one settlement event, got {lines:?}");
+    #[test]
+    fn a_settled_request_leaves_one_info_event_in_its_span_with_no_body_or_id_text() {
+        current_thread().block_on(async {
+            // A test card number, an SSN and a password, assembled at run time.
+            let card = format!("4111{}", "1".repeat(12));
+            let ssn = ["123-45", "-6789"].concat();
+            let password = ["PASS", "WORD"].concat();
+            let body = format!("220718,102030,{card},{ssn},{password},").into_bytes();
+            let body_len = body.len();
+            let correlation_id = format!("{ssn} {password}");
+            let cases = [
+                (Processed::Replied, Some("replied"), false),
+                (Processed::ErrorRouted, Some("error-routed"), true),
+                (Processed::DeadLettered, Some("dead-lettered"), false),
+                (Processed::Discarded, Some("discarded"), true),
+                (Processed::Requeued, None, true),
+            ];
+            // The worker's key, made from its `CARDDEMO_AMQP_URL` (here the local default), and how
+            // the span shows each ID: its base64url HMAC-SHA256 under it.
+            let amqp_url = "amqp://carddemo:carddemo@localhost:5672/%2f";
+            let id_key = IdKey::new(amqp_url);
+            let shown_message_id = ScreenedText::keyed(&card, &id_key).to_string();
+            let shown_correlation_id = ScreenedText::keyed(&correlation_id, &id_key).to_string();
+            for digest in [&shown_message_id, &shown_correlation_id] {
+                assert_eq!(digest.len(), 43, "{digest}");
+            }
+            for (processed, outcome, redelivered) in cases {
+                let request = Request {
+                    delivery_tag: 5,
+                    body: body.clone(),
+                    message_id: Some(card.clone()),
+                    correlation_id: Some(correlation_id.clone()),
+                    reply_to: Some(password.clone()),
+                    redelivered,
                 };
-                // The span's opening line, the event and the span's closing line.
-                assert_eq!(lines.len(), 3, "{outcome}: {lines:?}");
-                for member in [
-                    r#""level":"INFO""#.to_owned(),
-                    r#""name":"mq.message""#.to_owned(),
-                    format!(r#""message_id":"{shown_message_id}""#),
-                    format!(r#""correlation_id":"{shown_correlation_id}""#),
-                ] {
-                    assert!(event.contains(&member), "{member} missing from {event}");
-                }
-                let fields = event_fields(event).unwrap_or_default();
-                for member in [
-                    format!(r#""queue":"{QUEUE}""#),
-                    format!(r#""outcome":"{outcome}""#),
-                    format!(r#""redelivered":{redelivered}"#),
-                    format!(r#""body_len":{body_len}"#),
-                ] {
-                    assert!(fields.contains(&member), "{member} missing from {event}");
-                }
-                for id in ["message_id", "correlation_id", "reply_to"] {
-                    assert!(!fields.contains(id), "{id} among the fields of {event}");
-                }
-            } else {
-                assert!(events.is_empty(), "{processed:?}: {lines:?}");
-                assert!(
-                    !capture.contains(r#""outcome""#),
-                    "{processed:?}: {lines:?}"
-                );
-                // The span's opening and closing lines only.
-                assert_eq!(lines.len(), 2, "{processed:?}: {lines:?}");
-            }
 
-            // The protected values, the key's URL, and the body's fields in the comma-delimited
-            // context they have in the body, so that a timestamp's digits cannot match them.
-            let text = capture.text();
-            for value in [
-                card.as_str(),
-                ssn.as_str(),
-                password.as_str(),
-                amqp_url,
-                "220718,",
-                ",102030,",
-            ] {
-                assert!(!text.contains(value), "{value:?} in {text}");
+                let capture = trace_capture::capture();
+                let returned = in_message_span(QUEUE, &request, &id_key, async { processed }).await;
+                assert_eq!(returned, processed);
+
+                let lines = capture.lines();
+                let events: Vec<&String> = lines
+                    .iter()
+                    .filter(|line| line.contains(r#""message":"the request is settled""#))
+                    .collect();
+                if let Some(outcome) = outcome {
+                    let [event] = events.as_slice() else {
+                        panic!("{outcome}: expected one settlement event, got {lines:?}");
+                    };
+                    // The span's opening line, the event and the span's closing line.
+                    assert_eq!(lines.len(), 3, "{outcome}: {lines:?}");
+                    for member in [
+                        r#""level":"INFO""#.to_owned(),
+                        r#""name":"mq.message""#.to_owned(),
+                        format!(r#""message_id":"{shown_message_id}""#),
+                        format!(r#""correlation_id":"{shown_correlation_id}""#),
+                    ] {
+                        assert!(event.contains(&member), "{member} missing from {event}");
+                    }
+                    let fields = event_fields(event).unwrap_or_default();
+                    for member in [
+                        format!(r#""queue":"{QUEUE}""#),
+                        format!(r#""outcome":"{outcome}""#),
+                        format!(r#""redelivered":{redelivered}"#),
+                        format!(r#""body_len":{body_len}"#),
+                    ] {
+                        assert!(fields.contains(&member), "{member} missing from {event}");
+                    }
+                    for id in ["message_id", "correlation_id", "reply_to"] {
+                        assert!(!fields.contains(id), "{id} among the fields of {event}");
+                    }
+                } else {
+                    assert!(events.is_empty(), "{processed:?}: {lines:?}");
+                    assert!(
+                        !capture.contains(r#""outcome""#),
+                        "{processed:?}: {lines:?}"
+                    );
+                    // The span's opening and closing lines only.
+                    assert_eq!(lines.len(), 2, "{processed:?}: {lines:?}");
+                }
+
+                // The protected values, the key's URL, and the body's fields in the comma-delimited
+                // context they have in the body, so that a timestamp's digits cannot match them.
+                let text = capture.text();
+                for value in [
+                    card.as_str(),
+                    ssn.as_str(),
+                    password.as_str(),
+                    amqp_url,
+                    "220718,",
+                    ",102030,",
+                ] {
+                    assert!(!text.contains(value), "{value:?} in {text}");
+                }
             }
-        }
+        });
     }
 
     #[test]

@@ -212,8 +212,14 @@ pub fn with_report_date(
 /// `VARCHAR(22)` column holds all 22 bytes of [`AuthFraudRow::merchant_name`], trailing spaces
 /// included.
 ///
-/// The derived `Debug` shows the card number only in its redacted form (COPAUS2C-013); every
-/// other field holds no protected value.
+/// The derived `Debug` shows the card number only in its redacted form (COPAUS2C-013) and every
+/// other field as it is. The text the detail kept from the CP00 request, such as
+/// `merchant_name`, `merchant_id`, `merchant_city`, `merchant_zip` and `transaction_id`, is
+/// moved unchanged and may hold a protected value, such as a card number or an SSN, so a row
+/// must not be formatted into a log line, a span or an error. Where such text reaches a
+/// response, it passes through [`crate::sensitive::redact_free_text`], which masks its SSN- and
+/// card-number-shaped numbers, as `api::dto::copaus0c` and `api::dto::copaus1c` do for
+/// endpoints 21 to 23 (Cardholder Data Redaction, E32).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthFraudRow {
     /// `CARD_NUM CHAR(16)`, the first key part, from `PA-CARD-NUM`: the full number, kept in the

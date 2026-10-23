@@ -21,9 +21,13 @@
 use core::fmt;
 
 use domain::online::cosgn00c as rules;
+use serde::de::{self, Deserializer, MapAccess};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
+
+use super::{Member, ObjectMembers, read_object, skip_member};
 
 /// What `Debug` and the schema example show for a password: one `*` per map position.
 const PASSWORD_MASK: &str = "********";
@@ -36,7 +40,7 @@ const PASSWORD_MASK: &str = "********";
 /// bytes of printable ASCII, and answer a blank field with its own message.
 // The schema name `SignonRequest` is the frontend's `components["schemas"]["SignonRequest"]`
 // (Generated API Types Only). `Debug` is written by hand so that the password never prints.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Clone, PartialEq, Eq, ToSchema, Validate)]
 pub struct SignonRequest {
     /// `USERIDI PIC X(8)`: the user ID as typed, at most 8 characters. Upper-cased by the
     /// program before the read, so `user0001` signs on as `USER0001` (COSGN00C-009).
@@ -46,19 +50,60 @@ pub struct SignonRequest {
     pub user_id: String,
     /// `PASSWDI PIC X(8)`, a dark field: the password as typed, at most 8 characters. Accepted,
     /// never returned.
-    // `skip_serializing_if` with an always-true predicate rather than `skip_serializing`: utoipa
-    // drops a `skip_serializing` member from the schema altogether, which would leave the
-    // generated `SignonRequest` without a password. The predicate keeps the field documented as
-    // `writeOnly` while no serialisation ever emits it.
-    #[serde(default, skip_serializing_if = "never_serialized")]
+    // No `skip_serializing` here: utoipa would drop the member from the schema altogether, which
+    // would leave the generated `SignonRequest` without a password. The schema documents it as
+    // `writeOnly`, and the hand-written `Serialize` never writes it.
+    #[serde(default)]
     #[schema(write_only, max_length = 8, example = "********")]
     #[validate(length(max = 8))]
     pub password: String,
 }
 
-/// The serialisation predicate of [`SignonRequest::password`]: always skip it.
-const fn never_serialized(_password: &str) -> bool {
-    true
+/// `user_id` only: the password is never written.
+impl Serialize for SignonRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("SignonRequest", 1)?;
+        state.serialize_field("user_id", &self.user_id)?;
+        // Cardholder Data Redaction: the password is input only.
+        state.skip_field("password")?;
+        state.end()
+    }
+}
+
+/// A JSON object whose absent members are the empty text. An unknown member is skipped; a
+/// repeated one is an error.
+impl<'de> Deserialize<'de> for SignonRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, SignonRequestMembers>(deserializer)
+    }
+}
+
+/// The members of a [`SignonRequest`] being read.
+#[derive(Default)]
+struct SignonRequestMembers {
+    user_id: Member<String>,
+    password: Member<String>,
+}
+
+impl ObjectMembers for SignonRequestMembers {
+    type Object = SignonRequest;
+    const NAME: &'static str = "SignonRequest";
+    const FIELDS: &'static [&'static str] = &["user_id", "password"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "user_id" => self.user_id.read(map, "user_id"),
+            "password" => self.password.read(map, "password"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<SignonRequest, E> {
+        Ok(SignonRequest {
+            user_id: self.user_id.or_default(),
+            password: self.password.or_default(),
+        })
+    }
 }
 
 /// The user ID and the mask; the password itself is never shown.
@@ -79,7 +124,7 @@ impl fmt::Debug for SignonRequest {
 /// the program transfers to (COSGN00C-014 to COSGN00C-016).
 // The schema name `SignonResponse` is fixed (Generated API Types Only). `Debug` is written by
 // hand so that the bearer token never reaches a log.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, ToSchema)]
 pub struct SignonResponse {
     /// The HS256 bearer token for every other endpoint, with claims `sub` (the user ID),
     /// `usr_type`, `iat` and `exp`.
@@ -97,6 +142,60 @@ pub struct SignonResponse {
     /// `/menu` (COMEN01C) for every other type (COSGN00C-015, COSGN00C-016).
     #[schema(example = "/admin")]
     pub next_route: String,
+}
+
+/// Every member in declaration order.
+impl Serialize for SignonResponse {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("SignonResponse", 4)?;
+        state.serialize_field("token", &self.token)?;
+        state.serialize_field("user_id", &self.user_id)?;
+        state.serialize_field("user_type", &self.user_type)?;
+        state.serialize_field("next_route", &self.next_route)?;
+        state.end()
+    }
+}
+
+/// A JSON object of every member. An unknown member is skipped; a repeated or absent one is an
+/// error.
+impl<'de> Deserialize<'de> for SignonResponse {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, SignonResponseMembers>(deserializer)
+    }
+}
+
+/// The members of a [`SignonResponse`] being read.
+#[derive(Default)]
+struct SignonResponseMembers {
+    token: Member<String>,
+    user_id: Member<String>,
+    user_type: Member<String>,
+    next_route: Member<String>,
+}
+
+impl ObjectMembers for SignonResponseMembers {
+    type Object = SignonResponse;
+    const NAME: &'static str = "SignonResponse";
+    const FIELDS: &'static [&'static str] = &["token", "user_id", "user_type", "next_route"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "token" => self.token.read(map, "token"),
+            "user_id" => self.user_id.read(map, "user_id"),
+            "user_type" => self.user_type.read(map, "user_type"),
+            "next_route" => self.next_route.read(map, "next_route"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<SignonResponse, E> {
+        Ok(SignonResponse {
+            token: self.token.required("token")?,
+            user_id: self.user_id.required("user_id")?,
+            user_type: self.user_type.required("user_type")?,
+            next_route: self.next_route.required("next_route")?,
+        })
+    }
 }
 
 /// The identity and the route; the token is left out.
@@ -171,76 +270,93 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn missing_and_empty_members_reach_the_program_as_empty_text() -> TestResult {
-        for body in [
-            "{}",
-            r#"{"user_id": ""}"#,
-            r#"{"password": ""}"#,
-            r#"{"user_id": "", "password": ""}"#,
-        ] {
-            let request = extract(body)
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
+    #[test]
+    fn missing_and_empty_members_reach_the_program_as_empty_text() -> TestResult {
+        block_on(async {
+            for body in [
+                "{}",
+                r#"{"user_id": ""}"#,
+                r#"{"password": ""}"#,
+                r#"{"user_id": "", "password": ""}"#,
+            ] {
+                let request = extract(body)
+                    .await?
+                    .map_err(|error| error.message().to_owned())?;
+                assert_eq!(request.user_id, "", "{body}");
+                assert_eq!(request.password, "", "{body}");
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn values_are_kept_exactly_as_typed() -> TestResult {
+        block_on(async {
+            let request = extract(r#"{"user_id": " user01 ", "password": "pa ss wd"}"#).await?;
+            let request = request.map_err(|error| error.message().to_owned())?;
+            assert_eq!(request.user_id, " user01 ");
+            assert_eq!(request.password, "pa ss wd");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn each_member_admits_at_most_its_eight_map_positions() -> TestResult {
+        block_on(async {
+            for (body, field) in [
+                (
+                    json!({"user_id": "ABCDEFGHI", "password": "ABCDEFGH"}),
+                    "user_id",
+                ),
+                (
+                    json!({"user_id": "ADMIN001", "password": "ABCDEFGHI"}),
+                    "password",
+                ),
+            ] {
+                let Err(error) = extract(&body.to_string()).await? else {
+                    return Err(format!("{field}: nine characters were accepted").into());
+                };
+                assert_eq!(
+                    (error.status(), error.message(), error.field()),
+                    (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field))
+                );
+            }
+            // Eight characters fit, whatever their byte length; the program's edit judges the bytes.
+            let eight = extract(r#"{"user_id": "ÄBCDEFGH", "password": "12345678"}"#).await?;
+            assert!(eight.is_ok());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn the_password_is_never_serialised_or_shown_by_debug() -> TestResult {
+        block_on(async {
+            let body = json!({"user_id": "ADMIN001", "password": TYPED_PASSWORD}).to_string();
+            let request = extract(&body)
                 .await?
                 .map_err(|error| error.message().to_owned())?;
-            assert_eq!(request.user_id, "", "{body}");
-            assert_eq!(request.password, "", "{body}");
-        }
-        Ok(())
-    }
+            assert_eq!(request.password, TYPED_PASSWORD);
 
-    #[tokio::test]
-    async fn values_are_kept_exactly_as_typed() -> TestResult {
-        let request = extract(r#"{"user_id": " user01 ", "password": "pa ss wd"}"#).await?;
-        let request = request.map_err(|error| error.message().to_owned())?;
-        assert_eq!(request.user_id, " user01 ");
-        assert_eq!(request.password, "pa ss wd");
-        Ok(())
-    }
+            let serialised = serde_json::to_value(&request)?;
+            assert_eq!(serialised, json!({"user_id": "ADMIN001"}));
 
-    #[tokio::test]
-    async fn each_member_admits_at_most_its_eight_map_positions() -> TestResult {
-        for (body, field) in [
-            (
-                json!({"user_id": "ABCDEFGHI", "password": "ABCDEFGH"}),
-                "user_id",
-            ),
-            (
-                json!({"user_id": "ADMIN001", "password": "ABCDEFGHI"}),
-                "password",
-            ),
-        ] {
-            let Err(error) = extract(&body.to_string()).await? else {
-                return Err(format!("{field}: nine characters were accepted").into());
-            };
+            let debug = format!("{request:?}");
             assert_eq!(
-                (error.status(), error.message(), error.field()),
-                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field))
+                debug,
+                format!(r#"SignonRequest {{ user_id: "ADMIN001", password: "{PASSWORD_MASK}" }}"#)
             );
-        }
-        // Eight characters fit, whatever their byte length; the program's edit judges the bytes.
-        let eight = extract(r#"{"user_id": "ÄBCDEFGH", "password": "12345678"}"#).await?;
-        assert!(eight.is_ok());
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn the_password_is_never_serialised_or_shown_by_debug() -> TestResult {
-        let body = json!({"user_id": "ADMIN001", "password": TYPED_PASSWORD}).to_string();
-        let request = extract(&body)
-            .await?
-            .map_err(|error| error.message().to_owned())?;
-        assert_eq!(request.password, TYPED_PASSWORD);
-
-        let serialised = serde_json::to_value(&request)?;
-        assert_eq!(serialised, json!({"user_id": "ADMIN001"}));
-
-        let debug = format!("{request:?}");
-        assert_eq!(
-            debug,
-            format!(r#"SignonRequest {{ user_id: "ADMIN001", password: "{PASSWORD_MASK}" }}"#)
-        );
-        assert!(!debug.contains(TYPED_PASSWORD));
-        Ok(())
+            assert!(!debug.contains(TYPED_PASSWORD));
+            Ok(())
+        })
     }
 
     #[test]

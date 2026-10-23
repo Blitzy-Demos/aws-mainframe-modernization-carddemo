@@ -62,6 +62,16 @@ use test_support::postgres::start_postgres;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+/// Runs `test` to completion on a multi-thread runtime with every driver enabled and the default
+/// worker count, the one Tokio's test attribute builds for its `multi_thread` flavour, without the
+/// lint attributes, `expect` and unchecked pin that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// The width of `WS-INPUT-REC`: action, code and description (COBTUPDT-002).
 const RECORD_LEN: usize = 53;
 
@@ -513,112 +523,117 @@ async fn assert_derived_records(store: &mut PgStore) -> TestResult {
 
 /// COBTUPDT-101 to COBTUPDT-111: the ten derived records in one run, on a database holding the
 /// Db2 seed and the loaded VSAM data version.
-#[tokio::test(flavor = "multi_thread")]
-async fn derived_record_set_applies_in_order() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("derived")?;
-    let before = Snapshot::read(&mut store).await?;
-    assert_seeded(&before)?;
-    assert_vsam_loaded(&before);
+#[test]
+fn derived_record_set_applies_in_order() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("derived")?;
+        let before = Snapshot::read(&mut store).await?;
+        assert_seeded(&before)?;
+        assert_vsam_loaded(&before);
 
-    let input = scratch.write_input(&DERIVED_RUN)?;
-    let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
+        let input = scratch.write_input(&DERIVED_RUN)?;
+        let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
 
-    // audit: COBTUPDT-111
-    // audit: COBTUPDT-022
-    // audit: COBTUPDT-023
-    assert_eq!(run.status, Some(4), "COBTUPDT-111: stderr {}", run.stderr);
-    // audit: COBTUPDT-025
-    // audit: COBTUPDT-006
-    assert_quiet(&run, "COBTUPDT-111");
-    // Only records 109 and 110 fail a statement; record 110 is the last, so its event shows that
-    // the run went on after the failures of records 104 and 106 to 109.
-    // audit: COBTUPDT-019
-    assert_failed_statements(
-        &run,
-        &[(INSERT_DB, DUPLICATE_KEY), (DELETE_DB, RESTRICTED)],
-        "COBTUPDT-111",
-    );
-    // audit: COBTUPDT-020
-    blocked("COBTUPDT-020", "X-HALTS-2");
+        // audit: COBTUPDT-111
+        // audit: COBTUPDT-022
+        // audit: COBTUPDT-023
+        assert_eq!(run.status, Some(4), "COBTUPDT-111: stderr {}", run.stderr);
+        // audit: COBTUPDT-025
+        // audit: COBTUPDT-006
+        assert_quiet(&run, "COBTUPDT-111");
+        // Only records 109 and 110 fail a statement; record 110 is the last, so its event shows
+        // that the run went on after the failures of records 104 and 106 to 109.
+        // audit: COBTUPDT-019
+        assert_failed_statements(
+            &run,
+            &[(INSERT_DB, DUPLICATE_KEY), (DELETE_DB, RESTRICTED)],
+            "COBTUPDT-111",
+        );
+        // audit: COBTUPDT-020
+        blocked("COBTUPDT-020", "X-HALTS-2");
 
-    assert_derived_records(&mut store).await?;
-    let after = Snapshot::read(&mut store).await?;
-    // audit: COBTUPDT-024
-    assert_eq!(
-        after.db2_types,
-        seeded_types_with(&padded(UPDATE_01_103.2))?,
-        "COBTUPDT-111: db2.transaction_type"
-    );
-    assert_eq!(
-        after.db2_categories, before.db2_categories,
-        "COBTUPDT-111: db2.transaction_type_category"
-    );
-    // audit: COBTUPDT-026
-    assert_eq!(
-        after.vsam(),
-        before.vsam(),
-        "COBTUPDT-026: VSAM data version"
-    );
-    Ok(())
+        assert_derived_records(&mut store).await?;
+        let after = Snapshot::read(&mut store).await?;
+        // audit: COBTUPDT-024
+        assert_eq!(
+            after.db2_types,
+            seeded_types_with(&padded(UPDATE_01_103.2))?,
+            "COBTUPDT-111: db2.transaction_type"
+        );
+        assert_eq!(
+            after.db2_categories, before.db2_categories,
+            "COBTUPDT-111: db2.transaction_type_category"
+        );
+        // audit: COBTUPDT-026
+        assert_eq!(
+            after.vsam(),
+            before.vsam(),
+            "COBTUPDT-026: VSAM data version"
+        );
+        Ok(())
+    })
 }
 
 /// COBTUPDT-112: the derived records that reach no `9999-ABEND`, on a fresh database, then
 /// record 102 alone on the same database, where row `08` is absent again, which shows the row
 /// the insert writes.
-#[tokio::test(flavor = "multi_thread")]
-async fn all_valid_records_exit_zero() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("valid")?;
-    let before = Snapshot::read(&mut store).await?;
-    assert_seeded(&before)?;
-    assert_vsam_loaded(&before);
+#[test]
+fn all_valid_records_exit_zero() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("valid")?;
+        let before = Snapshot::read(&mut store).await?;
+        assert_seeded(&before)?;
+        assert_vsam_loaded(&before);
 
-    let input = scratch.write_input(&VALID_RUN)?;
-    let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
-    // Exit 0 also shows that record 105 found the row record 102 inserted (COBTUPDT-016).
-    // audit: COBTUPDT-112
-    // audit: COBTUPDT-023
-    assert_eq!(run.status, Some(0), "COBTUPDT-112: stderr {}", run.stderr);
-    assert_quiet(&run, "COBTUPDT-112");
-    assert_failed_statements(&run, &[], "COBTUPDT-112");
-    let after = Snapshot::read(&mut store).await?;
-    // audit: COBTUPDT-112
-    assert_eq!(
-        after.db2_types,
-        seeded_types_with(&padded(UPDATE_01_103.2))?,
-        "COBTUPDT-112: db2.transaction_type"
-    );
-    assert_eq!(
-        after.db2_categories, before.db2_categories,
-        "COBTUPDT-112: db2.transaction_type_category"
-    );
-    // audit: COBTUPDT-026
-    assert_eq!(
-        after.vsam(),
-        before.vsam(),
-        "COBTUPDT-026: VSAM data version"
-    );
+        let input = scratch.write_input(&VALID_RUN)?;
+        let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
+        // Exit 0 also shows that record 105 found the row record 102 inserted (COBTUPDT-016).
+        // audit: COBTUPDT-112
+        // audit: COBTUPDT-023
+        assert_eq!(run.status, Some(0), "COBTUPDT-112: stderr {}", run.stderr);
+        assert_quiet(&run, "COBTUPDT-112");
+        assert_failed_statements(&run, &[], "COBTUPDT-112");
+        let after = Snapshot::read(&mut store).await?;
+        // audit: COBTUPDT-112
+        assert_eq!(
+            after.db2_types,
+            seeded_types_with(&padded(UPDATE_01_103.2))?,
+            "COBTUPDT-112: db2.transaction_type"
+        );
+        assert_eq!(
+            after.db2_categories, before.db2_categories,
+            "COBTUPDT-112: db2.transaction_type_category"
+        );
+        // audit: COBTUPDT-026
+        assert_eq!(
+            after.vsam(),
+            before.vsam(),
+            "COBTUPDT-026: VSAM data version"
+        );
 
-    let input = scratch.write_input(&[ADD_08_102])?;
-    let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
-    assert_eq!(run.status, Some(0), "COBTUPDT-102: stderr {}", run.stderr);
-    assert_quiet(&run, "COBTUPDT-102");
-    // audit: COBTUPDT-102
-    // audit: COBTUPDT-010
-    assert_row(
-        &mut store,
-        ADD_08_102.1,
-        &padded(ADD_08_102.2),
-        "COBTUPDT-102",
-    )
-    .await?;
-    let categories =
-        Db2TransactionTypeCategoryRepository::find_all_by_type(&mut store, &code_of("08")?).await?;
-    assert!(categories.is_empty(), "COBTUPDT-102: categories of 08");
-    Ok(())
+        let input = scratch.write_input(&[ADD_08_102])?;
+        let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
+        assert_eq!(run.status, Some(0), "COBTUPDT-102: stderr {}", run.stderr);
+        assert_quiet(&run, "COBTUPDT-102");
+        // audit: COBTUPDT-102
+        // audit: COBTUPDT-010
+        assert_row(
+            &mut store,
+            ADD_08_102.1,
+            &padded(ADD_08_102.2),
+            "COBTUPDT-102",
+        )
+        .await?;
+        let categories =
+            Db2TransactionTypeCategoryRepository::find_all_by_type(&mut store, &code_of("08")?)
+                .await?;
+        assert!(categories.is_empty(), "COBTUPDT-102: categories of 08");
+        Ok(())
+    })
 }
 
 /// Second lines that are no COBTUPDT record, each after the valid record 102: a body of 52 or
@@ -661,54 +676,56 @@ fn malformed_lines() -> Vec<(&'static str, Vec<u8>)> {
 /// COBTUPDT-003, COBTUPDT-004 and COBTUPDT-113: an input that cannot be read, or holds a line
 /// that is no record, fails the run before any record is processed, with a status other than 0
 /// and 4; an empty input changes nothing and ends with 0.
-#[tokio::test(flavor = "multi_thread")]
-async fn refused_or_empty_input_changes_nothing() -> TestResult {
-    let guard = start_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("refused")?;
-    let before = Snapshot::read(&mut store).await?;
-    assert_seeded(&before)?;
+#[test]
+fn refused_or_empty_input_changes_nothing() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("refused")?;
+        let before = Snapshot::read(&mut store).await?;
+        assert_seeded(&before)?;
 
-    let mut cases = vec![("absent", scratch.path().join("absent.input"))];
-    for (name, line) in malformed_lines() {
-        let path = scratch.path().join(format!("{name}.input"));
-        let mut bytes = input_record(ADD_08_102.0, ADD_08_102.1, ADD_08_102.2);
-        bytes.extend(line);
-        fs::write(&path, bytes)?;
-        cases.push((name, path));
-    }
-    for (case, input) in cases {
+        let mut cases = vec![("absent", scratch.path().join("absent.input"))];
+        for (name, line) in malformed_lines() {
+            let path = scratch.path().join(format!("{name}.input"));
+            let mut bytes = input_record(ADD_08_102.0, ADD_08_102.1, ADD_08_102.2);
+            bytes.extend(line);
+            fs::write(&path, bytes)?;
+            cases.push((name, path));
+        }
+        for (case, input) in cases {
+            let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
+            // audit: COBTUPDT-004
+            assert!(
+                run.status.is_some_and(|status| status != 0 && status != 4),
+                "COBTUPDT-004 ({case}): exit status {:?}",
+                run.status
+            );
+            assert!(
+                run.stderr.starts_with("carddemo-batch mnttrdb2: "),
+                "COBTUPDT-004 ({case}): stderr {}",
+                run.stderr
+            );
+            assert_quiet(&run, "COBTUPDT-004");
+            // audit: COBTUPDT-003
+            assert_eq!(
+                Snapshot::read(&mut store).await?,
+                before,
+                "COBTUPDT-003 ({case}): no record may be processed"
+            );
+        }
+        // audit: COBTUPDT-005
+        blocked("COBTUPDT-005", "X-MNTTRDB2-H1");
+
+        let input = scratch.write_input(&[])?;
         let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
-        // audit: COBTUPDT-004
-        assert!(
-            run.status.is_some_and(|status| status != 0 && status != 4),
-            "COBTUPDT-004 ({case}): exit status {:?}",
-            run.status
-        );
-        assert!(
-            run.stderr.starts_with("carddemo-batch mnttrdb2: "),
-            "COBTUPDT-004 ({case}): stderr {}",
-            run.stderr
-        );
-        assert_quiet(&run, "COBTUPDT-004");
-        // audit: COBTUPDT-003
-        assert_eq!(
-            Snapshot::read(&mut store).await?,
-            before,
-            "COBTUPDT-003 ({case}): no record may be processed"
-        );
-    }
-    // audit: COBTUPDT-005
-    blocked("COBTUPDT-005", "X-MNTTRDB2-H1");
-
-    let input = scratch.write_input(&[])?;
-    let run = run_mnttrdb2(guard.database_url(), &scratch, &input).await?;
-    // audit: COBTUPDT-113
-    // audit: COBTUPDT-025
-    assert_eq!(run.status, Some(0), "COBTUPDT-113: stderr {}", run.stderr);
-    assert_quiet(&run, "COBTUPDT-113");
-    assert_eq!(Snapshot::read(&mut store).await?, before, "COBTUPDT-113");
-    Ok(())
+        // audit: COBTUPDT-113
+        // audit: COBTUPDT-025
+        assert_eq!(run.status, Some(0), "COBTUPDT-113: stderr {}", run.stderr);
+        assert_quiet(&run, "COBTUPDT-113");
+        assert_eq!(Snapshot::read(&mut store).await?, before, "COBTUPDT-113");
+        Ok(())
+    })
 }
 
 /// `database_url` with every session giving up a lock wait after one second, so that a row the
@@ -764,68 +781,72 @@ async fn run_with_01_locked(
 /// The audit provokes these failures through a repository double. The job runs here as a
 /// separate process, which no double reaches, so the test holds the row's lock instead and the
 /// job's `lock_timeout` ends its wait with the same SQLSTATE, `55P03`, on every run.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_lock_timeout_rolls_back_the_unit_of_work() -> TestResult {
-    let guard = start_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let scratch = Scratch::new("lock")?;
-    let before = Snapshot::read(&mut store).await?;
-    assert_seeded(&before)?;
-    let (code_01, seeded_01) = SEED_TYPES[0];
+#[test]
+fn a_lock_timeout_rolls_back_the_unit_of_work() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let scratch = Scratch::new("lock")?;
+        let before = Snapshot::read(&mut store).await?;
+        assert_seeded(&before)?;
+        let (code_01, seeded_01) = SEED_TYPES[0];
 
-    // The insert of record 102 comes before the failed update, in the unit of work it undoes.
-    run_with_01_locked(
-        &store,
-        &scratch,
-        guard.database_url(),
-        &[ADD_08_102, UPDATE_01_103],
-    )
-    .await?;
-    // audit: COBTUPDT-024
-    assert_no_row(&mut store, ADD_08_102.1, "COBTUPDT-024: earlier insert").await?;
-    // audit: COBTUPDT-014
-    assert_row(&mut store, code_01, seeded_01, "COBTUPDT-014").await?;
+        // The insert of record 102 comes before the failed update, in the unit of work it undoes.
+        run_with_01_locked(
+            &store,
+            &scratch,
+            guard.database_url(),
+            &[ADD_08_102, UPDATE_01_103],
+        )
+        .await?;
+        // audit: COBTUPDT-024
+        assert_no_row(&mut store, ADD_08_102.1, "COBTUPDT-024: earlier insert").await?;
+        // audit: COBTUPDT-014
+        assert_row(&mut store, code_01, seeded_01, "COBTUPDT-014").await?;
 
-    // The same insert after the failed update falls in the new unit of work, committed.
-    run_with_01_locked(
-        &store,
-        &scratch,
-        guard.database_url(),
-        &[UPDATE_01_103, ADD_08_102],
-    )
-    .await?;
-    // audit: COBTUPDT-024
-    assert_row(
-        &mut store,
-        ADD_08_102.1,
-        &padded(ADD_08_102.2),
-        "COBTUPDT-024: later insert",
-    )
-    .await?;
-    // audit: COBTUPDT-014
-    assert_row(&mut store, code_01, seeded_01, "COBTUPDT-014").await?;
-    assert_eq!(
-        Snapshot::read(&mut store).await?.db2_categories,
-        before.db2_categories,
-        "COBTUPDT-014: db2.transaction_type_category"
-    );
-    Ok(())
+        // The same insert after the failed update falls in the new unit of work, committed.
+        run_with_01_locked(
+            &store,
+            &scratch,
+            guard.database_url(),
+            &[UPDATE_01_103, ADD_08_102],
+        )
+        .await?;
+        // audit: COBTUPDT-024
+        assert_row(
+            &mut store,
+            ADD_08_102.1,
+            &padded(ADD_08_102.2),
+            "COBTUPDT-024: later insert",
+        )
+        .await?;
+        // audit: COBTUPDT-014
+        assert_row(&mut store, code_01, seeded_01, "COBTUPDT-014").await?;
+        assert_eq!(
+            Snapshot::read(&mut store).await?.db2_categories,
+            before.db2_categories,
+            "COBTUPDT-014: db2.transaction_type_category"
+        );
+        Ok(())
+    })
 }
 
 /// COBTUPDT-001: `--input` has no default, so `mnttrdb2` without it is a usage error, reported
 /// before the environment or the database is reached: the database URL here leads nowhere, and
 /// a connection attempt would end with status 1, not 2.
-#[tokio::test(flavor = "multi_thread")]
-async fn mnttrdb2_without_input_is_a_usage_error() -> TestResult {
-    let scratch = Scratch::new("usage")?;
-    let run = run_batch(UNREACHABLE_DATABASE, &scratch, vec!["mnttrdb2".into()]).await?;
-    // audit: COBTUPDT-001
-    assert_eq!(run.status, Some(2), "COBTUPDT-001: stderr {}", run.stderr);
-    assert!(run.stdout.is_empty(), "COBTUPDT-001: stdout {}", run.stdout);
-    assert!(
-        run.stderr.contains("--input"),
-        "COBTUPDT-001: stderr {}",
-        run.stderr
-    );
-    Ok(())
+#[test]
+fn mnttrdb2_without_input_is_a_usage_error() -> TestResult {
+    block_on(async {
+        let scratch = Scratch::new("usage")?;
+        let run = run_batch(UNREACHABLE_DATABASE, &scratch, vec!["mnttrdb2".into()]).await?;
+        // audit: COBTUPDT-001
+        assert_eq!(run.status, Some(2), "COBTUPDT-001: stderr {}", run.stderr);
+        assert!(run.stdout.is_empty(), "COBTUPDT-001: stdout {}", run.stdout);
+        assert!(
+            run.stderr.contains("--input"),
+            "COBTUPDT-001: stderr {}",
+            run.stderr
+        );
+        Ok(())
+    })
 }

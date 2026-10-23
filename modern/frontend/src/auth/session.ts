@@ -10,7 +10,8 @@ import { z } from "zod";
  * (`SignedOnUser` and `AdminUser` extractors), and the user type kept here only chooses
  * navigation. Storage holds exactly the token, user ID and user type, never a password,
  * card number or other payload, and this module logs nothing. The JWT is never decoded:
- * an expired token surfaces as the API's 401, on which `api/client.ts` clears the session.
+ * an expired token surfaces as the API's 401, on which `api/client.ts` clears the session when
+ * the refused request carried the token still stored (COSGN00C-021).
  * Every sign-on and every clear is announced to the listeners of {@link subscribeSession},
  * through which the route guard follows the session as it changes. So is every restore of the
  * page from the browser's back/forward cache: the restored page resumes as it was frozen, while a
@@ -167,14 +168,18 @@ export function getSession(): StoredSession | null {
   }
 }
 
-/** The bearer token for `api/client.ts`, or `null` when nobody is signed on. */
+/**
+ * The bearer token `api/client.ts` sends, and compares with the token a request answered 401
+ * carried, or `null` when nobody is signed on.
+ */
 export function getToken(): string | null {
   return getSession()?.token ?? null;
 }
 
 /**
- * Ends the session (sign-off, or a 401 from the API), then notifies the listeners, so a mounted
- * route guard sends the user to `/signon` at once. Never throws.
+ * Ends the session: on the sign-on screen's first entry and F3, and on a 401 that answers a
+ * request sent with the stored token (`api/client.ts`, COSGN00C-021). Then notifies the
+ * listeners, so a mounted route guard sends the user to `/signon` at once. Never throws.
  */
 export function clearSession(): void {
   try {

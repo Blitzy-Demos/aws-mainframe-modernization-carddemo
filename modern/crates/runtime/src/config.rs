@@ -82,6 +82,11 @@ const DEFAULT_JWT_TTL_SECONDS: u64 = 3600;
 /// the epoch: every accepted lifetime issues a token, and a longer one is refused here at
 /// startup rather than failing every sign-on.
 const MAX_JWT_TTL_SECONDS: u64 = i64::MAX.unsigned_abs();
+/// The fewest bytes a `CARDDEMO_JWT_SECRET` may hold: 32, the 256-bit hash output of HS256
+/// (HMAC-SHA256), which RFC 7518 section 3.2 sets as the smallest HS256 key.
+/// [`Config::require_jwt_secret`] refuses a shorter secret, so the API never signs with a key
+/// short enough to be guessed offline from a token it issued.
+pub const MIN_JWT_SECRET_BYTES: usize = 32;
 const DEFAULT_VAR_DIR: &str = "./var";
 const DEFAULT_FIXTURE_DIR: &str = "../app/data/ASCII";
 
@@ -145,8 +150,10 @@ pub struct Config {
     /// Listen address of the API, `host:port` (`CARDDEMO_API_BIND`, default `127.0.0.1:8080`).
     /// Kept as given; the API resolves it when it binds.
     pub api_bind: String,
-    /// HS256 signing secret of the API (`CARDDEMO_JWT_SECRET`). No default: empty when unset,
-    /// and the API refuses to start then (see [`Config::require_jwt_secret`]).
+    /// HS256 signing secret of the API (`CARDDEMO_JWT_SECRET`). No default: empty when unset.
+    /// Kept as given, never trimmed. The API refuses to start unless it holds something other
+    /// than whitespace and at least [`MIN_JWT_SECRET_BYTES`] bytes (see
+    /// [`Config::require_jwt_secret`]).
     pub jwt_secret: String,
     /// Token lifetime in seconds (`CARDDEMO_JWT_TTL_SECONDS`, default `3600`, from `1` to
     /// `9223372036854775807`, which is `i64::MAX`).
@@ -305,16 +312,23 @@ impl Config {
         })
     }
 
-    /// The JWT signing secret, which the API requires before it starts.
+    /// The JWT signing secret, which the API requires before it starts, exactly as configured:
+    /// surrounding whitespace is part of the key and is never trimmed.
     ///
     /// # Errors
     ///
-    /// [`EnvError::MissingJwtSecret`] when [`Config::jwt_secret`] is empty.
+    /// - [`EnvError::MissingJwtSecret`] when [`Config::jwt_secret`] is empty or holds only
+    ///   whitespace (`char::is_whitespace`), which is no secret at all;
+    /// - [`EnvError::WeakJwtSecret`] when it holds fewer than [`MIN_JWT_SECRET_BYTES`] bytes of
+    ///   UTF-8.
     pub fn require_jwt_secret(&self) -> Result<&str, EnvError> {
-        if self.jwt_secret.is_empty() {
+        let secret = self.jwt_secret.as_str();
+        if secret.trim().is_empty() {
             Err(EnvError::MissingJwtSecret)
+        } else if secret.len() < MIN_JWT_SECRET_BYTES {
+            Err(EnvError::WeakJwtSecret)
         } else {
-            Ok(&self.jwt_secret)
+            Ok(secret)
         }
     }
 
@@ -398,8 +412,12 @@ pub enum EnvError {
         /// What the value must be.
         expected: &'static str,
     },
-    /// `CARDDEMO_JWT_SECRET` is empty or unset, and the API cannot sign tokens without it.
+    /// `CARDDEMO_JWT_SECRET` is empty, unset or only whitespace, and the API cannot sign tokens
+    /// without it.
     MissingJwtSecret,
+    /// `CARDDEMO_JWT_SECRET` holds fewer than [`MIN_JWT_SECRET_BYTES`] bytes, too short a key for
+    /// the API to sign tokens with.
+    WeakJwtSecret,
 }
 
 impl fmt::Display for EnvError {
@@ -416,7 +434,13 @@ impl fmt::Display for EnvError {
             }
             Self::MissingJwtSecret => write!(
                 f,
-                "{CARDDEMO_JWT_SECRET} is empty or unset; the API refuses to start without it"
+                "{CARDDEMO_JWT_SECRET} is empty, blank or unset; the API refuses to start \
+                 without it"
+            ),
+            Self::WeakJwtSecret => write!(
+                f,
+                "{CARDDEMO_JWT_SECRET} is shorter than {MIN_JWT_SECRET_BYTES} bytes; the API \
+                 refuses to start with it"
             ),
         }
     }
@@ -428,7 +452,7 @@ impl Error for EnvError {}
 mod tests {
     use super::{
         CARDDEMO_JWT_SECRET, CARDDEMO_JWT_TTL_SECONDS, CARDDEMO_MQ_POLL_MS, CARDDEMO_OTEL_EXPORT,
-        CARDDEMO_VAR_DIR, Config, EnvError, OtelExport, VARIABLES,
+        CARDDEMO_VAR_DIR, Config, EnvError, MIN_JWT_SECRET_BYTES, OtelExport, VARIABLES,
     };
     use std::collections::{BTreeSet, HashMap};
     use std::env::{self, VarError};
@@ -526,6 +550,14 @@ mod tests {
                 ..Config::default()
             }
         );
+        // The copied example starts the API as it stands: its placeholder is long enough.
+        assert_eq!(
+            from_example
+                .require_jwt_secret()
+                .map(|kept| kept == placeholder),
+            Ok(true),
+            "the example's local-only JWT secret is accepted unchanged"
+        );
         assert_eq!(
             parse_ok(&[(CARDDEMO_OTEL_EXPORT, "stdout")]).otel_export,
             OtelExport::Stdout
@@ -542,7 +574,7 @@ mod tests {
             ("CARDDEMO_QUEUE_REQUEST_PAUTH", "Q.PAUTH"),
             ("CARDDEMO_MQ_POLL_MS", "40"),
             ("CARDDEMO_API_BIND", "localhost:9090"),
-            ("CARDDEMO_JWT_SECRET", "s3cret"),
+            ("CARDDEMO_JWT_SECRET", "local-override-test-signing-secret"),
             ("CARDDEMO_JWT_TTL_SECONDS", "60"),
             ("CARDDEMO_VAR_DIR", "/srv/var"),
             ("CARDDEMO_STATEMENT_DIR", "/srv/stmt"),
@@ -560,7 +592,7 @@ mod tests {
                 queue_request_pauth: "Q.PAUTH".to_owned(),
                 mq_poll_ms: 40,
                 api_bind: "localhost:9090".to_owned(),
-                jwt_secret: "s3cret".to_owned(),
+                jwt_secret: "local-override-test-signing-secret".to_owned(),
                 jwt_ttl_seconds: 60,
                 var_dir: PathBuf::from("/srv/var"),
                 statement_dir: PathBuf::from("/srv/stmt"),
@@ -570,7 +602,12 @@ mod tests {
             }
         );
         assert_eq!(config.mq_poll_interval(), Duration::from_millis(40));
-        assert_eq!(config.require_jwt_secret(), Ok("s3cret"));
+        assert_eq!(
+            config
+                .require_jwt_secret()
+                .map(|kept| kept == "local-override-test-signing-secret"),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -702,8 +739,59 @@ mod tests {
             Config::default().require_jwt_secret(),
             Err(EnvError::MissingJwtSecret)
         );
-        let config = parse_ok(&[(CARDDEMO_JWT_SECRET, "local-secret")]);
-        assert_eq!(config.require_jwt_secret(), Ok("local-secret"));
+
+        // What `require_jwt_secret` answers for each `CARDDEMO_JWT_SECRET`, by a label that
+        // stands for the value in failure text; `Ok(())` means it returns the value unchanged.
+        let cases: [(&str, String, Result<(), EnvError>); 11] = [
+            ("unset", String::new(), Err(EnvError::MissingJwtSecret)),
+            (
+                "three spaces",
+                " ".repeat(3),
+                Err(EnvError::MissingJwtSecret),
+            ),
+            (
+                "tabs, newlines and spaces",
+                " \t\n\r\t \n".to_owned(),
+                Err(EnvError::MissingJwtSecret),
+            ),
+            (
+                "40 spaces",
+                " ".repeat(MIN_JWT_SECRET_BYTES + 8),
+                Err(EnvError::MissingJwtSecret),
+            ),
+            (
+                "16 ideographic spaces, 48 bytes",
+                "\u{3000}".repeat(16),
+                Err(EnvError::MissingJwtSecret),
+            ),
+            ("1 byte", "k".to_owned(), Err(EnvError::WeakJwtSecret)),
+            (
+                "31 bytes",
+                "k".repeat(MIN_JWT_SECRET_BYTES - 1),
+                Err(EnvError::WeakJwtSecret),
+            ),
+            (
+                "16 characters in 31 bytes",
+                format!("{}k", "\u{e9}".repeat(15)),
+                Err(EnvError::WeakJwtSecret),
+            ),
+            ("32 bytes", "k".repeat(MIN_JWT_SECRET_BYTES), Ok(())),
+            (
+                "32 bytes with a space at each end",
+                format!(" {} ", "k".repeat(MIN_JWT_SECRET_BYTES - 2)),
+                Ok(()),
+            ),
+            ("64 bytes", "k".repeat(2 * MIN_JWT_SECRET_BYTES), Ok(())),
+        ];
+        for (label, secret, expected) in cases {
+            // Parsing never refuses a secret: only the API's startup asks for one.
+            let config = parse_ok(&[(CARDDEMO_JWT_SECRET, secret.as_str())]);
+            assert_eq!(
+                config.require_jwt_secret().map(|kept| kept == secret),
+                expected.map(|()| true),
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -775,9 +863,18 @@ mod tests {
         );
         assert_eq!(
             EnvError::MissingJwtSecret.to_string(),
-            "CARDDEMO_JWT_SECRET is empty or unset; the API refuses to start without it"
+            "CARDDEMO_JWT_SECRET is empty, blank or unset; the API refuses to start without it"
         );
-        for variant in [not_unicode, error, EnvError::MissingJwtSecret] {
+        assert_eq!(
+            EnvError::WeakJwtSecret.to_string(),
+            "CARDDEMO_JWT_SECRET is shorter than 32 bytes; the API refuses to start with it"
+        );
+        for variant in [
+            not_unicode,
+            error,
+            EnvError::MissingJwtSecret,
+            EnvError::WeakJwtSecret,
+        ] {
             assert!(!variant.to_string().is_empty());
             assert!(variant.source().is_none());
         }

@@ -38,9 +38,14 @@
 //!
 //! No value this program handles is protected (Cardholder Data Redaction).
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use axum::extract::{FromRequestParts, Path};
 use axum::http::request::Parts;
 use domain::online::cotrtupc as rules;
+use serde::de::{self, Deserializer, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::ser::{self, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
@@ -57,7 +62,7 @@ const TYPE_CODE_FIELD: &str = "type_code";
 /// before anything is read. Every other edit, the blank, numeric and zero tests and the
 /// normalisation included, is the domain's (COTRTUPC-004 to COTRTUPC-008), so the code reaches
 /// it otherwise unparsed.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, Validate)]
 pub struct TypeCodePath {
     /// The code as typed: up to 2 characters.
     #[validate(length(max = 2))]
@@ -92,9 +97,8 @@ impl<S: Send + Sync> FromRequestParts<S> for TypeCodePath {
 /// COTRTUPC-041, COTRTUPC-044).
 // The schema name `CotrtupcAid` keeps it apart from every other program's key enum in
 // `components.schemas` (Generated API Types Only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "UPPERCASE")]
-#[schema(as = CotrtupcAid)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(as = CotrtupcAid, rename_all = "UPPERCASE")]
 pub enum Aid {
     /// `ENTER`: validate the description entered for the code shown (COTRTUPC-016 to
     /// COTRTUPC-021).
@@ -107,7 +111,11 @@ pub enum Aid {
     Pf5,
     /// Any other key name. Absent from the schema and never serialised: the screen never sends
     /// it, and serialising it is an error rather than a value the server would read differently.
-    #[serde(other, skip_serializing)]
+    // No serde derive reads this attribute: `ToSchema` declares `serde` as a helper attribute,
+    // and `skip` is the only way it leaves a variant out of a plain enum's `enum` list. The
+    // hand-written `Deserialize` below reads every other key name as this variant, and its
+    // `Serialize` refuses it.
+    #[serde(skip)]
     Unserved,
 }
 
@@ -131,8 +139,8 @@ impl From<Aid> for rules::TtupAid {
 /// The screen keeps it until the next request and derives from it the keys it shows, the fields
 /// it protects and, after an error response, the info row (COTRTUPC-045, COTRTUPC-046). It carries
 /// no authority, and no request sends it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ToSchema)]
+#[schema(rename_all = "snake_case")]
 pub enum TranTypeMaintState {
     /// Low-values or spaces, `TTUP-DETAILS-NOT-FETCHED`: the fresh screen (COTRTUPC-003).
     DetailsNotFetched,
@@ -199,7 +207,7 @@ impl From<rules::TtupState> for TranTypeMaintState {
 /// prompt as info row (COTRTUPC-009). A code no row holds gives state `details_not_found` with
 /// the normalised code, no description, error row `No record found for this key in database`
 /// and info row `Press F05 to add. F12 to cancel` (COTRTUPC-010).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "type_code": "01",
     "description": "PURCHASE",
@@ -245,7 +253,7 @@ impl From<rules::TranTypeView> for TranTypeView {
 /// naming `description`. Absent, it is the empty text, as the domain reads an absent field.
 // `{ aid, description? }` as AAP 0.3.4.1 and the audit's endpoint mapping give it: no member
 // echoes the screen's state, because the service derives the state it serves (module docs).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 #[schema(example = json!({"aid": "ENTER", "description": "PURCHASES"}))]
 pub struct TranTypeActionRequest {
     /// The key pressed.
@@ -275,7 +283,7 @@ impl TranTypeActionRequest {
 /// `changes_okayed_and_done`, info row `Changes committed to database`, after the update or the
 /// insert that follows an update finding no row (COTRTUPC-024, COTRTUPC-026). PF4 gives state
 /// `delete_done`, info row `Delete successful.` (COTRTUPC-032).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "type_code": "01",
     "description": "PURCHASES                                         ",
@@ -404,14 +412,409 @@ fn error_row(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| text.to_owned())
 }
 
+// Wire forms, written by hand: serde_derive wraps every implementation it generates in a block
+// carrying `allow` lint suppressions, and no source of this workspace, generated or written,
+// carries one. Each keeps the form the derive gave. A struct is a map of its members
+// under their Rust names, in declaration order, an absent `Option` written as `null`; it reads
+// its members in any order, refuses one sent twice or a required one missing, takes `None` for
+// an absent `Option`, and skips an unknown member unread as `IgnoredAny`. A unit variant is its
+// wire name.
+
+impl<'de> Deserialize<'de> for TypeCodePath {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TypeCodePath {
+    const NAME: &'static str = "TypeCodePath";
+    const FIELDS: &'static [&'static str] = &[TYPE_CODE_FIELD];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let mut type_code = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                TYPE_CODE_FIELD => member(&mut map, &mut type_code, TYPE_CODE_FIELD)?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_code: required(type_code, TYPE_CODE_FIELD)?,
+        })
+    }
+}
+
+impl Serialize for Aid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::Enter => (0, "ENTER"),
+            Self::Pf4 => (1, "PF4"),
+            Self::Pf5 => (2, "PF5"),
+            Self::Unserved => {
+                return Err(ser::Error::custom(
+                    "the enum variant Aid::Unserved cannot be serialized",
+                ));
+            }
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for Aid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for Aid {
+    const NAME: &'static str = "Aid";
+    const VARIANTS: &'static [&'static str] = &["ENTER", "PF4", "PF5"];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        Some(match name {
+            "ENTER" => Self::Enter,
+            "PF4" => Self::Pf4,
+            "PF5" => Self::Pf5,
+            _ => Self::Unserved,
+        })
+    }
+}
+
+impl Serialize for TranTypeMaintState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (index, name) = match self {
+            Self::DetailsNotFetched => (0, "details_not_fetched"),
+            Self::InvalidSearchKeys => (1, "invalid_search_keys"),
+            Self::DetailsNotFound => (2, "details_not_found"),
+            Self::ShowDetails => (3, "show_details"),
+            Self::CreateNewRecord => (4, "create_new_record"),
+            Self::ReviewNewRecord => (5, "review_new_record"),
+            Self::ConfirmDelete => (6, "confirm_delete"),
+            Self::StartDelete => (7, "start_delete"),
+            Self::DeleteDone => (8, "delete_done"),
+            Self::DeleteFailed => (9, "delete_failed"),
+            Self::ChangesNotOk => (10, "changes_not_ok"),
+            Self::ChangesOkNotConfirmed => (11, "changes_ok_not_confirmed"),
+            Self::ChangesOkayedLockError => (12, "changes_okayed_lock_error"),
+            Self::ChangesOkayedButFailed => (13, "changes_okayed_but_failed"),
+            Self::ChangesOkayedAndDone => (14, "changes_okayed_and_done"),
+            Self::ChangesBackedOut => (15, "changes_backed_out"),
+        };
+        serializer.serialize_unit_variant(<Self as UnitEnum>::NAME, index, name)
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeMaintState {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_unit_enum(deserializer)
+    }
+}
+
+impl UnitEnum for TranTypeMaintState {
+    const NAME: &'static str = "TranTypeMaintState";
+    const VARIANTS: &'static [&'static str] = &[
+        "details_not_fetched",
+        "invalid_search_keys",
+        "details_not_found",
+        "show_details",
+        "create_new_record",
+        "review_new_record",
+        "confirm_delete",
+        "start_delete",
+        "delete_done",
+        "delete_failed",
+        "changes_not_ok",
+        "changes_ok_not_confirmed",
+        "changes_okayed_lock_error",
+        "changes_okayed_but_failed",
+        "changes_okayed_and_done",
+        "changes_backed_out",
+    ];
+
+    fn from_wire(name: &str) -> Option<Self> {
+        Some(match name {
+            "details_not_fetched" => Self::DetailsNotFetched,
+            "invalid_search_keys" => Self::InvalidSearchKeys,
+            "details_not_found" => Self::DetailsNotFound,
+            "show_details" => Self::ShowDetails,
+            "create_new_record" => Self::CreateNewRecord,
+            "review_new_record" => Self::ReviewNewRecord,
+            "confirm_delete" => Self::ConfirmDelete,
+            "start_delete" => Self::StartDelete,
+            "delete_done" => Self::DeleteDone,
+            "delete_failed" => Self::DeleteFailed,
+            "changes_not_ok" => Self::ChangesNotOk,
+            "changes_ok_not_confirmed" => Self::ChangesOkNotConfirmed,
+            "changes_okayed_lock_error" => Self::ChangesOkayedLockError,
+            "changes_okayed_but_failed" => Self::ChangesOkayedButFailed,
+            "changes_okayed_and_done" => Self::ChangesOkayedAndDone,
+            "changes_backed_out" => Self::ChangesBackedOut,
+            _ => return None,
+        })
+    }
+}
+
+impl Serialize for TranTypeView {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 5)?;
+        out.serialize_field("type_code", &self.type_code)?;
+        out.serialize_field("description", &self.description)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.serialize_field("state", &self.state)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeView {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeView {
+    const NAME: &'static str = "TranTypeView";
+    const FIELDS: &'static [&'static str] = &[
+        "type_code",
+        "description",
+        "message",
+        "info_message",
+        "state",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_code, mut description, mut message) = (None, None, None);
+        let (mut info_message, mut state) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_code" => member(&mut map, &mut type_code, "type_code")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                "info_message" => member(&mut map, &mut info_message, "info_message")?,
+                "state" => member(&mut map, &mut state, "state")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_code: required(type_code, "type_code")?,
+            description: description.unwrap_or_default(),
+            message: message.unwrap_or_default(),
+            info_message: required(info_message, "info_message")?,
+            state: required(state, "state")?,
+        })
+    }
+}
+
+impl Serialize for TranTypeActionRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 2)?;
+        out.serialize_field("aid", &self.aid)?;
+        out.serialize_field("description", &self.description)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeActionRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeActionRequest {
+    const NAME: &'static str = "TranTypeActionRequest";
+    const FIELDS: &'static [&'static str] = &["aid", "description"];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut aid, mut description) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "aid" => member(&mut map, &mut aid, "aid")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                // A `state` member among them: the screen's echo, which decides nothing.
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            aid: required(aid, "aid")?,
+            description: description.unwrap_or_default(),
+        })
+    }
+}
+
+impl Serialize for TranTypeActionResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut out = serializer.serialize_struct(<Self as FromMembers<'_>>::NAME, 7)?;
+        out.serialize_field("type_code", &self.type_code)?;
+        out.serialize_field("description", &self.description)?;
+        out.serialize_field("message", &self.message)?;
+        out.serialize_field("info_message", &self.info_message)?;
+        out.serialize_field("state", &self.state)?;
+        out.serialize_field("committed", &self.committed)?;
+        out.serialize_field("deleted", &self.deleted)?;
+        out.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for TranTypeActionResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_struct(deserializer)
+    }
+}
+
+impl<'de> FromMembers<'de> for TranTypeActionResult {
+    const NAME: &'static str = "TranTypeActionResult";
+    const FIELDS: &'static [&'static str] = &[
+        "type_code",
+        "description",
+        "message",
+        "info_message",
+        "state",
+        "committed",
+        "deleted",
+    ];
+
+    fn from_members<A: MapAccess<'de>>(mut map: A) -> Result<Self, A::Error> {
+        let (mut type_code, mut description, mut message) = (None, None, None);
+        let (mut info_message, mut state) = (None, None);
+        let (mut committed, mut deleted) = (None, None);
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type_code" => member(&mut map, &mut type_code, "type_code")?,
+                "description" => member(&mut map, &mut description, "description")?,
+                "message" => member(&mut map, &mut message, "message")?,
+                "info_message" => member(&mut map, &mut info_message, "info_message")?,
+                "state" => member(&mut map, &mut state, "state")?,
+                "committed" => member(&mut map, &mut committed, "committed")?,
+                "deleted" => member(&mut map, &mut deleted, "deleted")?,
+                _ => skip(&mut map)?,
+            }
+        }
+        Ok(Self {
+            type_code: required(type_code, "type_code")?,
+            description: description.unwrap_or_default(),
+            message: message.unwrap_or_default(),
+            info_message: required(info_message, "info_message")?,
+            state: required(state, "state")?,
+            committed: required(committed, "committed")?,
+            deleted: required(deleted, "deleted")?,
+        })
+    }
+}
+
+/// A struct of this module read from the members of a map.
+trait FromMembers<'de>: Sized {
+    /// The Rust name, which a format may record.
+    const NAME: &'static str;
+    /// The members' wire names, in declaration order.
+    const FIELDS: &'static [&'static str];
+
+    /// The struct from `map`'s members.
+    ///
+    /// # Errors
+    ///
+    /// A member sent twice, a required member missing, or a value that does not deserialise.
+    fn from_members<A: MapAccess<'de>>(map: A) -> Result<Self, A::Error>;
+}
+
+/// `T` read from `deserializer` as a struct: a map, through [`MembersVisitor`].
+fn read_struct<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromMembers<'de>,
+{
+    deserializer.deserialize_struct(T::NAME, T::FIELDS, MembersVisitor(PhantomData))
+}
+
+/// The visitor of [`read_struct`]: it accepts a map alone and hands its members to `T`.
+struct MembersVisitor<T>(PhantomData<T>);
+
+impl<'de, T: FromMembers<'de>> Visitor<'de> for MembersVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "struct {}", T::NAME)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+        T::from_members(map)
+    }
+}
+
+/// Reads the value of the member `name` into `slot`. A second occurrence is the duplicate-field
+/// error, raised before its value is read.
+fn member<'de, A, T>(map: &mut A, slot: &mut Option<T>, name: &'static str) -> Result<(), A::Error>
+where
+    A: MapAccess<'de>,
+    T: Deserialize<'de>,
+{
+    if slot.is_some() {
+        return Err(de::Error::duplicate_field(name));
+    }
+    *slot = Some(map.next_value()?);
+    Ok(())
+}
+
+/// Skips the value of a member no struct of this module names, unread.
+fn skip<'de, A: MapAccess<'de>>(map: &mut A) -> Result<(), A::Error> {
+    map.next_value::<IgnoredAny>().map(|IgnoredAny| ())
+}
+
+/// The value read for the required member `name`, or the missing-field error.
+fn required<T, E: de::Error>(slot: Option<T>, name: &'static str) -> Result<T, E> {
+    slot.ok_or_else(|| E::missing_field(name))
+}
+
+/// A unit enum of this module and its wire names.
+trait UnitEnum: Sized {
+    /// The Rust name, which a format may record.
+    const NAME: &'static str;
+    /// The wire names, in declaration order.
+    const VARIANTS: &'static [&'static str];
+
+    /// The variant the wire name `name` reads as; `None` for a name the enum refuses.
+    fn from_wire(name: &str) -> Option<Self>;
+}
+
+/// `T` read from `deserializer` as a unit variant, through [`VariantVisitor`].
+fn read_unit_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: UnitEnum,
+{
+    deserializer.deserialize_enum(T::NAME, T::VARIANTS, VariantVisitor(PhantomData))
+}
+
+/// The visitor of [`read_unit_enum`]: a variant name `T` admits, carrying no value. A name it
+/// refuses is the unknown-variant error.
+struct VariantVisitor<T>(PhantomData<T>);
+
+impl<'de, T: UnitEnum> Visitor<'de> for VariantVisitor<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "enum {}", T::NAME)
+    }
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
+        let (name, variant) = data.variant::<String>()?;
+        let value = T::from_wire(&name)
+            .ok_or_else(|| <A::Error as de::Error>::unknown_variant(&name, T::VARIANTS))?;
+        variant.unit_variant()?;
+        Ok(value)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
+    use std::fmt::Debug;
 
     use domain::copybook::PicX;
     use domain::online::cotrtupc as rules;
     use domain::records::db2_transaction_type::Db2TransactionType;
     use rules::{MaintEffect, MaintOutcome, StoreResult, TtupAid, TtupState, TypeLookup};
+    use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use serde_json::json;
     use utoipa::{PartialSchema, ToSchema};
     use validator::Validate;
@@ -822,5 +1225,121 @@ mod tests {
         assert_eq!(TranTypeActionResult::name(), "TranTypeActionResult");
         assert_eq!(TranTypeMaintState::name(), "TranTypeMaintState");
         assert_eq!(Aid::name(), "CotrtupcAid");
+    }
+
+    /// Asserts `value` serialises to `wire` exactly and reads back from it as itself.
+    fn assert_wire<T>(value: &T, wire: &str) -> TestResult
+    where
+        T: Serialize + DeserializeOwned + PartialEq + Debug,
+    {
+        assert_eq!(serde_json::to_string(value)?, wire);
+        assert_eq!(&serde_json::from_str::<T>(wire)?, value, "{wire}");
+        Ok(())
+    }
+
+    /// A reading case: whether a type reads the JSON text, the text, and the expected answer.
+    type ReadCase = (fn(&str) -> bool, String, bool);
+
+    /// Whether `json` deserialises into `T`.
+    fn reads<T: DeserializeOwned>(json: &str) -> bool {
+        serde_json::from_str::<T>(json).is_ok()
+    }
+
+    #[test]
+    fn every_body_keeps_its_wire_form_byte_for_byte() -> TestResult {
+        // Members in declaration order, an absent value as `null`.
+        assert_wire(
+            &TranTypeView {
+                type_code: "09".to_owned(),
+                description: None,
+                message: Some(NOT_FOUND.to_owned()),
+                info_message: ADD_PROMPT.to_owned(),
+                state: TranTypeMaintState::DetailsNotFound,
+            },
+            &format!(
+                r#"{{"type_code":"09","description":null,"message":"{NOT_FOUND}","info_message":"{ADD_PROMPT}","state":"details_not_found"}}"#
+            ),
+        )?;
+        assert_wire(
+            &TranTypeActionResult {
+                type_code: "01".to_owned(),
+                description: Some("PURCHASE".to_owned()),
+                message: None,
+                info_message: DELETED.to_owned(),
+                state: TranTypeMaintState::DeleteDone,
+                committed: true,
+                deleted: true,
+            },
+            &format!(
+                r#"{{"type_code":"01","description":"PURCHASE","message":null,"info_message":"{DELETED}","state":"delete_done","committed":true,"deleted":true}}"#
+            ),
+        )?;
+        for (description, wire) in [
+            (None, r#"{"aid":"PF4","description":null}"#),
+            (Some("A".to_owned()), r#"{"aid":"PF4","description":"A"}"#),
+        ] {
+            assert_wire(
+                &TranTypeActionRequest {
+                    aid: Aid::Pf4,
+                    description,
+                },
+                wire,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_sent_twice_is_refused_and_an_unknown_one_skipped() {
+        let view = r#""type_code":"01","description":null,"message":null,"info_message":"","state":"show_details""#;
+        let result = format!(r#"{view},"committed":false,"deleted":false"#);
+        let cases: [ReadCase; 11] = [
+            (reads::<TranTypeView>, format!("{{{view}}}"), true),
+            (
+                reads::<TranTypeView>,
+                format!(r#"{{{view},"state":"show_details"}}"#),
+                false,
+            ),
+            (
+                reads::<TranTypeView>,
+                format!(r#"{{{view},"extra":[1,{{"x":1e400}}]}}"#),
+                true,
+            ),
+            (
+                reads::<TranTypeView>,
+                r#"{"type_code":"01","state":"show_details"}"#.to_owned(),
+                false,
+            ),
+            (reads::<TranTypeActionResult>, format!("{{{result}}}"), true),
+            (
+                reads::<TranTypeActionResult>,
+                format!(r#"{{{result},"deleted":true}}"#),
+                false,
+            ),
+            (reads::<TranTypeActionResult>, format!("{{{view}}}"), false),
+            (
+                reads::<TranTypeActionRequest>,
+                r#"{"aid":"PF5","aid":"PF5"}"#.to_owned(),
+                false,
+            ),
+            (
+                reads::<TranTypeActionRequest>,
+                r#"{"aid":"PF5","description":"A","description":"A"}"#.to_owned(),
+                false,
+            ),
+            (
+                reads::<TranTypeActionRequest>,
+                r#"{"description":"A","aid":"ENTER","x":null}"#.to_owned(),
+                true,
+            ),
+            (
+                reads::<TranTypeMaintState>,
+                r#""SHOW_DETAILS""#.to_owned(),
+                false,
+            ),
+        ];
+        for (read, json, accepted) in cases {
+            assert_eq!(read(&json), accepted, "{json}");
+        }
     }
 }

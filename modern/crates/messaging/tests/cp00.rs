@@ -77,6 +77,7 @@ use std::error::Error;
 use std::net::TcpListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -255,7 +256,7 @@ impl Harness {
     /// reply queue, and fixes the clock at 2022-07-18 10:11:12.345, one instant to the
     /// millisecond for every reading.
     async fn start() -> Result<Self, BoxError> {
-        let (broker, postgres) = tokio::try_join!(start_rabbitmq(), start_loaded_postgres())?;
+        let (broker, postgres) = try_join(start_rabbitmq(), start_loaded_postgres()).await?;
         let connection = broker.connect().await?;
         let channel = timeout(WAIT, connection.create_channel()).await??;
         timeout(
@@ -532,7 +533,7 @@ impl Harness {
             handle.request();
             (finished, Instant::now())
         };
-        let ((outcome, returned_at), (finished, stopped_at)) = tokio::join!(returned, driving);
+        let ((outcome, returned_at), (finished, stopped_at)) = join(returned, driving).await;
         let outcome = outcome?;
         let finished = finished?;
         Ok((
@@ -560,6 +561,86 @@ async fn process<W: Step>(worker: &mut W, session: &Session) -> Result<Processed
         }
         sleep(POLL).await;
     }
+}
+
+/// Runs `test` to completion on a current-thread runtime with the I/O and time drivers, the
+/// runtime Tokio's test attribute builds, without the lint attributes, `expect` and unchecked
+/// pinning that the attribute's expansion carries. A runtime that cannot be built fails the test.
+/// The test future is boxed, so that it never sits on the stack.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(Box::pin(test))
+}
+
+/// Drives `first` and `second` concurrently on the calling task until both have finished, and
+/// returns both outputs. Every poll polls each future that has not finished yet, and a finished
+/// one is never polled again. Both are boxed, so that they never move once polled.
+async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_output = None;
+    let mut second_output = None;
+    std::future::poll_fn(|context| {
+        if first_output.is_none() {
+            if let Poll::Ready(output) = first.as_mut().poll(context) {
+                first_output = Some(output);
+            }
+        }
+        if second_output.is_none() {
+            if let Poll::Ready(output) = second.as_mut().poll(context) {
+                second_output = Some(output);
+            }
+        }
+        match (first_output.take(), second_output.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready((first_done, second_done)),
+            (first_left, second_left) => {
+                first_output = first_left;
+                second_output = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
+}
+
+/// Drives `first` and `second` concurrently on the calling task, as [`join`] does, until both
+/// have succeeded, and returns both values. The first error is returned at once, and the other
+/// future is dropped unfinished.
+async fn try_join<T, U, E>(
+    first: impl Future<Output = Result<T, E>>,
+    second: impl Future<Output = Result<U, E>>,
+) -> Result<(T, U), E> {
+    let mut first = Box::pin(first);
+    let mut second = Box::pin(second);
+    let mut first_value = None;
+    let mut second_value = None;
+    std::future::poll_fn(|context| {
+        if first_value.is_none() {
+            match first.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => first_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        if second_value.is_none() {
+            match second.as_mut().poll(context) {
+                Poll::Ready(Ok(value)) => second_value = Some(value),
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => {}
+            }
+        }
+        match (first_value.take(), second_value.take()) {
+            (Some(first_done), Some(second_done)) => Poll::Ready(Ok((first_done, second_done))),
+            (first_left, second_left) => {
+                first_value = first_left;
+                second_value = second_left;
+                Poll::Pending
+            }
+        }
+    })
+    .await
 }
 
 /// A local TCP port on which nothing listens: the operating system hands it to a listener that
@@ -1178,69 +1259,71 @@ impl Acknowledger for StandInAcknowledger {
 // audit: COPAUA0C-100
 // audit: COPAUA0C-101
 // audit: COPAUA0C-103
-#[tokio::test]
-async fn approval_creates_summary_and_pending_detail() -> TestResult {
-    let harness = Harness::start().await?;
-    // Account 1: balance 194.00, credit limit 2020.00, cash limit 1020.00, no summary, so
-    // 100.00 is within 2020.00 − 194.00 and the guard's 194.00 + 0.00 + 100.00.
-    let xref = harness.xref(1).await?;
-    let tran_id = "CP00T01 0000001";
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", tran_id);
-    let sent = harness
-        .send(&body, &harness.reply_queue, "approval")
-        .await?;
+#[test]
+fn approval_creates_summary_and_pending_detail() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // Account 1: balance 194.00, credit limit 2020.00, cash limit 1020.00, no summary, so
+        // 100.00 is within 2020.00 − 194.00 and the guard's 194.00 + 0.00 + 100.00.
+        let xref = harness.xref(1).await?;
+        let tran_id = "CP00T01 0000001";
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", tran_id);
+        let sent = harness
+            .send(&body, &harness.reply_queue, "approval")
+            .await?;
 
-    let (session, mut worker) = harness.open_worker().await?;
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let (session, mut worker) = harness.open_worker().await?;
+        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    let summary = harness
-        .summary(xref.acct_id)
-        .await?
-        .ok_or("the approval left no summary")?;
-    assert_eq!(summary.acct_id, PicS::from(xref.acct_id), "acct_id");
-    assert_eq!(summary.cust_id, xref.cust_id, "cust_id");
-    assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
-    assert_eq!(summary.declined_auth_cnt.get(), 0, "declined_auth_cnt");
-    assert_amounts(&[
-        ("credit_limit", summary.credit_limit.as_decimal(), 202_000),
-        ("cash_limit", summary.cash_limit.as_decimal(), 102_000),
-        (
-            "credit_balance",
-            summary.credit_balance.as_decimal(),
+        let summary = harness
+            .summary(xref.acct_id)
+            .await?
+            .ok_or("the approval left no summary")?;
+        assert_eq!(summary.acct_id, PicS::from(xref.acct_id), "acct_id");
+        assert_eq!(summary.cust_id, xref.cust_id, "cust_id");
+        assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
+        assert_eq!(summary.declined_auth_cnt.get(), 0, "declined_auth_cnt");
+        assert_amounts(&[
+            ("credit_limit", summary.credit_limit.as_decimal(), 202_000),
+            ("cash_limit", summary.cash_limit.as_decimal(), 102_000),
+            (
+                "credit_balance",
+                summary.credit_balance.as_decimal(),
+                10_000,
+            ),
+            ("cash_balance", summary.cash_balance.as_decimal(), 0),
+            (
+                "approved_auth_amt",
+                summary.approved_auth_amt.as_decimal(),
+                10_000,
+            ),
+            (
+                "declined_auth_amt",
+                summary.declined_auth_amt.as_decimal(),
+                0,
+            ),
+        ]);
+
+        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+        assert_decided(&detail, &APPROVED);
+        assert_request_echo(&detail, &xref.card_num, tran_id);
+        assert_amounts(&[(
+            "transaction_amt",
+            detail.transaction_amt.as_decimal(),
             10_000,
-        ),
-        ("cash_balance", summary.cash_balance.as_decimal(), 0),
-        (
-            "approved_auth_amt",
-            summary.approved_auth_amt.as_decimal(),
-            10_000,
-        ),
-        (
-            "declined_auth_amt",
-            summary.declined_auth_amt.as_decimal(),
-            0,
-        ),
-    ]);
+        )]);
+        assert!(
+            harness.log_rows().await?.is_empty(),
+            "an approval logs no cssl_error_log row"
+        );
 
-    let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-    assert_decided(&detail, &APPROVED);
-    assert_request_echo(&detail, &xref.card_num, tran_id);
-    assert_amounts(&[(
-        "transaction_amt",
-        detail.transaction_amt.as_decimal(),
-        10_000,
-    )]);
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "an approval logs no cssl_error_log row"
-    );
-
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the approved request was acknowledged");
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the approved request was acknowledged");
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-042
@@ -1251,58 +1334,60 @@ async fn approval_creates_summary_and_pending_detail() -> TestResult {
 // audit: COPAUA0C-095
 // audit: COPAUA0C-101
 // audit: COPAUA0C-103
-#[tokio::test]
-async fn insufficient_funds_decline_counts_declined() -> TestResult {
-    let harness = Harness::start().await?;
-    // Account 1's available amount is 2020.00 − 194.00 = 1826.00, so 5000.00 is declined for
-    // insufficient funds with the account and the customer found: `05`/`4100`.
-    let xref = harness.xref(1).await?;
-    let tran_id = "CP00T02 0000001";
-    let body = auth_request(card_text(&xref.card_num)?, "5000.00", tran_id);
-    let sent = harness.send(&body, &harness.reply_queue, "decline").await?;
+#[test]
+fn insufficient_funds_decline_counts_declined() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // Account 1's available amount is 2020.00 − 194.00 = 1826.00, so 5000.00 is declined for
+        // insufficient funds with the account and the customer found: `05`/`4100`.
+        let xref = harness.xref(1).await?;
+        let tran_id = "CP00T02 0000001";
+        let body = auth_request(card_text(&xref.card_num)?, "5000.00", tran_id);
+        let sent = harness.send(&body, &harness.reply_queue, "decline").await?;
 
-    let (session, mut worker) = harness.open_worker().await?;
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let (session, mut worker) = harness.open_worker().await?;
+        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    // `declined_auth_amt` is HALTED(H2) (COPAUA0C-096) and is not read.
-    let summary = harness
-        .summary(xref.acct_id)
-        .await?
-        .ok_or("the decline left no summary")?;
-    assert_eq!(summary.declined_auth_cnt.get(), 1, "declined_auth_cnt");
-    assert_eq!(summary.approved_auth_cnt.get(), 0, "approved_auth_cnt");
-    assert_amounts(&[
-        ("credit_limit", summary.credit_limit.as_decimal(), 202_000),
-        ("cash_limit", summary.cash_limit.as_decimal(), 102_000),
-        ("credit_balance", summary.credit_balance.as_decimal(), 0),
-        ("cash_balance", summary.cash_balance.as_decimal(), 0),
-        (
-            "approved_auth_amt",
-            summary.approved_auth_amt.as_decimal(),
-            0,
-        ),
-    ]);
+        // `declined_auth_amt` is HALTED(H2) (COPAUA0C-096) and is not read.
+        let summary = harness
+            .summary(xref.acct_id)
+            .await?
+            .ok_or("the decline left no summary")?;
+        assert_eq!(summary.declined_auth_cnt.get(), 1, "declined_auth_cnt");
+        assert_eq!(summary.approved_auth_cnt.get(), 0, "approved_auth_cnt");
+        assert_amounts(&[
+            ("credit_limit", summary.credit_limit.as_decimal(), 202_000),
+            ("cash_limit", summary.cash_limit.as_decimal(), 102_000),
+            ("credit_balance", summary.credit_balance.as_decimal(), 0),
+            ("cash_balance", summary.cash_balance.as_decimal(), 0),
+            (
+                "approved_auth_amt",
+                summary.approved_auth_amt.as_decimal(),
+                0,
+            ),
+        ]);
 
-    let declined = Decided {
-        resp_code: "05",
-        reason: "4100",
-        match_status: "D",
-        approved_cents: 0,
-    };
-    let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-    assert_decided(&detail, &declined);
-    assert_request_echo(&detail, &xref.card_num, tran_id);
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "a decline logs no cssl_error_log row"
-    );
+        let declined = Decided {
+            resp_code: "05",
+            reason: "4100",
+            match_status: "D",
+            approved_cents: 0,
+        };
+        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+        assert_decided(&detail, &declined);
+        assert_request_echo(&detail, &xref.card_num, tran_id);
+        assert!(
+            harness.log_rows().await?.is_empty(),
+            "a decline logs no cssl_error_log row"
+        );
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the declined request was acknowledged");
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the declined request was acknowledged");
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-021
@@ -1310,183 +1395,189 @@ async fn insufficient_funds_decline_counts_declined() -> TestResult {
 // audit: COPAUA0C-082
 // audit: COPAUA0C-110
 // audit: COPAUA0C-114
-#[tokio::test]
-async fn card_not_in_xref_logs_a001_without_writes() -> TestResult {
-    let harness = Harness::start().await?;
-    let card = CardNumber::parse(UNKNOWN_CARD)?;
-    let mut store = harness.store();
-    let found = CardXrefRepository::find_by_id(&mut store, &card).await?;
-    assert!(found.is_none(), "the unknown card is absent from card_xref");
-    let body = auth_request(UNKNOWN_CARD, "100.00", "CP00T03 0000001");
-    let sent = harness.send(&body, &harness.reply_queue, "no-xref").await?;
+#[test]
+fn card_not_in_xref_logs_a001_without_writes() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let card = CardNumber::parse(UNKNOWN_CARD)?;
+        let mut store = harness.store();
+        let found = CardXrefRepository::find_by_id(&mut store, &card).await?;
+        assert!(found.is_none(), "the unknown card is absent from card_xref");
+        let body = auth_request(UNKNOWN_CARD, "100.00", "CP00T03 0000001");
+        let sent = harness.send(&body, &harness.reply_queue, "no-xref").await?;
 
-    let (session, mut worker) = harness.open_worker().await?;
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let (session, mut worker) = harness.open_worker().await?;
+        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    // No summary at all, and so no detail, which the foreign key keeps under a summary.
-    assert!(
-        harness.summaries().await?.is_empty(),
-        "a card with no card_xref row writes no summary and no detail"
-    );
-    let rows = harness.log_rows().await?;
-    assert_keys_redacted(&rows, &protected_cards(&[UNKNOWN_CARD])?);
-    let row = single(rows, "cssl_error_log row")?;
-    let a001 = LogExpectation {
-        location: "A001",
-        level: "W",
-        subsystem: "A",
-        message: "CARD NOT FOUND IN XREF",
-        event_key: Some(redacted_key(&card)),
-    };
-    assert_log_row(&row, &a001);
+        // No summary at all, and so no detail, which the foreign key keeps under a summary.
+        assert!(
+            harness.summaries().await?.is_empty(),
+            "a card with no card_xref row writes no summary and no detail"
+        );
+        let rows = harness.log_rows().await?;
+        assert_keys_redacted(&rows, &protected_cards(&[UNKNOWN_CARD])?);
+        let row = single(rows, "cssl_error_log row")?;
+        let a001 = LogExpectation {
+            location: "A001",
+            level: "W",
+            subsystem: "A",
+            message: "CARD NOT FOUND IN XREF",
+            event_key: Some(redacted_key(&card)),
+        };
+        assert_log_row(&row, &a001);
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the answered request was acknowledged");
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the answered request was acknowledged");
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-066
 // audit: COPAUA0C-110
 // audit: COPAUA0C-117
-#[tokio::test]
-async fn m004_unroutable_reply_dead_letters_request() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T04 0000001");
-    harness.send(&body, NO_SUCH_REPLY_QUEUE, "m004").await?;
+#[test]
+fn m004_unroutable_reply_dead_letters_request() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T04 0000001");
+        harness.send(&body, NO_SUCH_REPLY_QUEUE, "m004").await?;
 
-    let (session, mut worker) = harness.open_worker().await?;
-    assert_eq!(
-        process(&mut worker, &session).await?,
-        Processed::DeadLettered
-    );
+        let (session, mut worker) = harness.open_worker().await?;
+        assert_eq!(
+            process(&mut worker, &session).await?,
+            Processed::DeadLettered
+        );
 
-    // The rollback removed the summary `lock_or_create` had created, so neither table changed.
-    assert!(
-        harness.summary(xref.acct_id).await?.is_none(),
-        "no summary after M004"
-    );
-    assert!(
-        harness.details(xref.acct_id).await?.is_empty(),
-        "no detail after M004"
-    );
-    // The event key is COPAUA0C-113's interim value and the codes HALTED(H4): neither is
-    // compared, and the key is only checked for a full card number.
-    let rows = harness.log_rows().await?;
-    assert_keys_redacted(&rows, &protected_cards(&[])?);
-    let row = single(rows, "cssl_error_log row")?;
-    let m004 = LogExpectation {
-        location: "M004",
-        level: "C",
-        subsystem: "M",
-        message: "FAILED TO PUT ON REPLY MQ",
-        event_key: None,
-    };
-    assert_log_row(&row, &m004);
+        // The rollback removed the summary `lock_or_create` had created, so neither table changed.
+        assert!(
+            harness.summary(xref.acct_id).await?.is_none(),
+            "no summary after M004"
+        );
+        assert!(
+            harness.details(xref.acct_id).await?.is_empty(),
+            "no detail after M004"
+        );
+        // The event key is COPAUA0C-113's interim value and the codes HALTED(H4): neither is
+        // compared, and the key is only checked for a full card number.
+        let rows = harness.log_rows().await?;
+        assert_keys_redacted(&rows, &protected_cards(&[])?);
+        let row = single(rows, "cssl_error_log row")?;
+        let m004 = LogExpectation {
+            location: "M004",
+            level: "C",
+            subsystem: "M",
+            message: "FAILED TO PUT ON REPLY MQ",
+            event_key: None,
+        };
+        assert_log_row(&row, &m004);
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the request was rejected, not requeued");
-    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
-    assert_eq!(
-        dead, 1,
-        "the rejected request is retained on the dead-letter queue"
-    );
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the request was rejected, not requeued");
+        let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
+        assert_eq!(
+            dead, 1,
+            "the rejected request is retained on the dead-letter queue"
+        );
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-001
 // audit: COPAUA0C-067
 // audit: COPAUA0C-081
 // audit: COPAUA0C-118
-#[tokio::test]
-async fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T05 0000001");
-    let sent = harness
-        .send(&body, &harness.reply_queue, "ack-fails")
-        .await?;
+#[test]
+fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T05 0000001");
+        let sent = harness
+            .send(&body, &harness.reply_queue, "ack-fails")
+            .await?;
 
-    // First delivery: the reply is confirmed, then the acknowledgement fails, so the worker
-    // rolls back and closes its consumer channel, and the broker requeues the request.
-    let calls = Arc::new(CallOrder::default());
-    let (first_session, first) = harness.open_worker().await?;
-    let mut first = first.with_acknowledger(StandInAcknowledger::new(true, &calls));
-    assert_eq!(
-        process(&mut first, &first_session).await?,
-        Processed::Requeued
-    );
-    // The reply confirmed before the failed acknowledgement, taken at once, inside its
-    // five-second expiry.
-    let first_reply = harness.next_reply().await?;
-    assert_cp00_properties(&first_reply, &sent.correlation_id, &sent.message_id);
-    assert!(
-        CallOrder::at(&calls.ack) > 0,
-        "the acknowledgement was tried"
-    );
-    assert_eq!(
-        CallOrder::at(&calls.reject),
-        0,
-        "the request was not rejected"
-    );
-    assert!(
-        harness.summary(xref.acct_id).await?.is_none(),
-        "no summary before a successful acknowledgement"
-    );
-    assert!(
-        harness.details(xref.acct_id).await?.is_empty(),
-        "no detail before a successful acknowledgement"
-    );
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "a confirmed reply logs no M004"
-    );
-    close_worker(first_session, first).await;
-    let requeued = harness.settled_count(harness.request_queue(), 1).await?;
-    assert_eq!(
-        requeued, 1,
-        "the broker requeued the unacknowledged request"
-    );
+        // First delivery: the reply is confirmed, then the acknowledgement fails, so the worker
+        // rolls back and closes its consumer channel, and the broker requeues the request.
+        let calls = Arc::new(CallOrder::default());
+        let (first_session, first) = harness.open_worker().await?;
+        let mut first = first.with_acknowledger(StandInAcknowledger::new(true, &calls));
+        assert_eq!(
+            process(&mut first, &first_session).await?,
+            Processed::Requeued
+        );
+        // The reply confirmed before the failed acknowledgement, taken at once, inside its
+        // five-second expiry.
+        let first_reply = harness.next_reply().await?;
+        assert_cp00_properties(&first_reply, &sent.correlation_id, &sent.message_id);
+        assert!(
+            CallOrder::at(&calls.ack) > 0,
+            "the acknowledgement was tried"
+        );
+        assert_eq!(
+            CallOrder::at(&calls.reject),
+            0,
+            "the request was not rejected"
+        );
+        assert!(
+            harness.summary(xref.acct_id).await?.is_none(),
+            "no summary before a successful acknowledgement"
+        );
+        assert!(
+            harness.details(xref.acct_id).await?.is_empty(),
+            "no detail before a successful acknowledgement"
+        );
+        assert!(
+            harness.log_rows().await?.is_empty(),
+            "a confirmed reply logs no M004"
+        );
+        close_worker(first_session, first).await;
+        let requeued = harness.settled_count(harness.request_queue(), 1).await?;
+        assert_eq!(
+            requeued, 1,
+            "the broker requeued the unacknowledged request"
+        );
 
-    // Redelivery: processed once, as a new request. Each delivery was answered once, the
-    // first by the reply confirmed before its acknowledgement failed (AAP 0.3.4.2), and each
-    // reply carries a message_id of its own.
-    let (second_session, mut second) = harness.open_worker().await?;
-    assert_eq!(
-        process(&mut second, &second_session).await?,
-        Processed::Replied
-    );
-    let second_reply = harness.next_reply().await?;
-    assert_cp00_properties(&second_reply, &sent.correlation_id, &sent.message_id);
-    let reply_ids = [
-        reply_message_id(&first_reply)?,
-        reply_message_id(&second_reply)?,
-    ];
-    assert_fresh_reply_ids(&reply_ids, [&sent]);
-    assert!(
-        harness.remaining_replies().await?.is_empty(),
-        "one reply per delivery: the redelivery was processed once"
-    );
-    let summary = harness
-        .summary(xref.acct_id)
-        .await?
-        .ok_or("the redelivered approval left no summary")?;
-    assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
-    assert_amounts(&[(
-        "approved_auth_amt",
-        summary.approved_auth_amt.as_decimal(),
-        10_000,
-    )]);
-    let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-    assert_decided(&detail, &APPROVED);
-    close_worker(second_session, second).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the redelivered request was acknowledged");
-    harness.finish().await
+        // Redelivery: processed once, as a new request. Each delivery was answered once, the
+        // first by the reply confirmed before its acknowledgement failed (AAP 0.3.4.2), and each
+        // reply carries a message_id of its own.
+        let (second_session, mut second) = harness.open_worker().await?;
+        assert_eq!(
+            process(&mut second, &second_session).await?,
+            Processed::Replied
+        );
+        let second_reply = harness.next_reply().await?;
+        assert_cp00_properties(&second_reply, &sent.correlation_id, &sent.message_id);
+        let reply_ids = [
+            reply_message_id(&first_reply)?,
+            reply_message_id(&second_reply)?,
+        ];
+        assert_fresh_reply_ids(&reply_ids, [&sent]);
+        assert!(
+            harness.remaining_replies().await?.is_empty(),
+            "one reply per delivery: the redelivery was processed once"
+        );
+        let summary = harness
+            .summary(xref.acct_id)
+            .await?
+            .ok_or("the redelivered approval left no summary")?;
+        assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
+        assert_amounts(&[(
+            "approved_auth_amt",
+            summary.approved_auth_amt.as_decimal(),
+            10_000,
+        )]);
+        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+        assert_decided(&detail, &APPROVED);
+        close_worker(second_session, second).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the redelivered request was acknowledged");
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-041
@@ -1498,80 +1589,82 @@ async fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> T
 // audit: COPAUA0C-099
 // audit: COPAUA0C-110
 // audit: COPAUA0C-120
-#[tokio::test]
-async fn two_approvals_same_instant_commit_summary_and_log_i004() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let card = card_text(&xref.card_num)?;
-    let first_tran_id = "CP00T06 0000001";
-    let first_sent = harness
-        .send(
-            &auth_request(card, "100.00", first_tran_id),
-            &harness.reply_queue,
-            "same-instant-1",
-        )
-        .await?;
-    let second_sent = harness
-        .send(
-            &auth_request(card, "100.00", "CP00T06 0000002"),
-            &harness.reply_queue,
-            "same-instant-2",
-        )
-        .await?;
+#[test]
+fn two_approvals_same_instant_commit_summary_and_log_i004() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let card = card_text(&xref.card_num)?;
+        let first_tran_id = "CP00T06 0000001";
+        let first_sent = harness
+            .send(
+                &auth_request(card, "100.00", first_tran_id),
+                &harness.reply_queue,
+                "same-instant-1",
+            )
+            .await?;
+        let second_sent = harness
+            .send(
+                &auth_request(card, "100.00", "CP00T06 0000002"),
+                &harness.reply_queue,
+                "same-instant-2",
+            )
+            .await?;
 
-    // The second decision takes the found-summary path: 2020.00 − 100.00 available, and the
-    // guard's 194.00 + 100.00 + 100.00 is within the limit. Under one clock instant both
-    // details get the same key, so the second insert fails. The summary then counts 200.00
-    // and the details 100.00, and the third decision, `summary_guard_declines_past_the_details`
-    // after these assertions, tells the two apart: only a guard over the summary declines it.
-    let (session, mut worker) = harness.open_worker().await?;
-    let mut reply_ids = Vec::new();
-    for sent in [&first_sent, &second_sent] {
-        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-        let reply = harness.next_reply().await?;
-        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
-        reply_ids.push(reply_message_id(&reply)?);
-    }
+        // The second decision takes the found-summary path: 2020.00 − 100.00 available, and the
+        // guard's 194.00 + 100.00 + 100.00 is within the limit. Under one clock instant both
+        // details get the same key, so the second insert fails. The summary then counts 200.00
+        // and the details 100.00, and the third decision, `summary_guard_declines_past_the_details`
+        // after these assertions, tells the two apart: only a guard over the summary declines it.
+        let (session, mut worker) = harness.open_worker().await?;
+        let mut reply_ids = Vec::new();
+        for sent in [&first_sent, &second_sent] {
+            assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+            let reply = harness.next_reply().await?;
+            assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+            reply_ids.push(reply_message_id(&reply)?);
+        }
 
-    let summary = harness
-        .summary(xref.acct_id)
-        .await?
-        .ok_or("the approvals left no summary")?;
-    assert_eq!(summary.approved_auth_cnt.get(), 2, "approved_auth_cnt");
-    assert_amounts(&[
-        (
-            "approved_auth_amt",
-            summary.approved_auth_amt.as_decimal(),
-            20_000,
-        ),
-        (
-            "credit_balance",
-            summary.credit_balance.as_decimal(),
-            20_000,
-        ),
-    ]);
-    let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-    assert_decided(&detail, &APPROVED);
-    let row = single(harness.log_rows().await?, "cssl_error_log row")?;
-    let i004 = LogExpectation {
-        location: "I004",
-        level: "C",
-        subsystem: "I",
-        message: "IMS INSERT DETL FAILED",
-        event_key: Some(redacted_key(&xref.card_num)),
-    };
-    assert_log_row(&row, &i004);
+        let summary = harness
+            .summary(xref.acct_id)
+            .await?
+            .ok_or("the approvals left no summary")?;
+        assert_eq!(summary.approved_auth_cnt.get(), 2, "approved_auth_cnt");
+        assert_amounts(&[
+            (
+                "approved_auth_amt",
+                summary.approved_auth_amt.as_decimal(),
+                20_000,
+            ),
+            (
+                "credit_balance",
+                summary.credit_balance.as_decimal(),
+                20_000,
+            ),
+        ]);
+        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+        assert_decided(&detail, &APPROVED);
+        let row = single(harness.log_rows().await?, "cssl_error_log row")?;
+        let i004 = LogExpectation {
+            location: "I004",
+            level: "C",
+            subsystem: "I",
+            message: "IMS INSERT DETL FAILED",
+            event_key: Some(redacted_key(&xref.card_num)),
+        };
+        assert_log_row(&row, &i004);
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "both requests were acknowledged and none requeued");
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "both requests were acknowledged and none requeued");
 
-    let (third_sent, third_reply_id) =
-        summary_guard_declines_past_the_details(&harness, &xref, first_tran_id, &i004).await?;
-    // Two replies under one clock instant and a third under another: three message_ids.
-    reply_ids.push(third_reply_id);
-    assert_fresh_reply_ids(&reply_ids, [&first_sent, &second_sent, &third_sent]);
-    harness.finish().await
+        let (third_sent, third_reply_id) =
+            summary_guard_declines_past_the_details(&harness, &xref, first_tran_id, &i004).await?;
+        // Two replies under one clock instant and a third under another: three message_ids.
+        reply_ids.push(third_reply_id);
+        assert_fresh_reply_ids(&reply_ids, [&first_sent, &second_sent, &third_sent]);
+        harness.finish().await
+    })
 }
 
 /// The third decision of [`two_approvals_same_instant_commit_summary_and_log_i004`], once its
@@ -1683,51 +1776,53 @@ async fn summary_guard_declines_past_the_details(
 // audit: COPAUA0C-067
 // audit: COPAUA0C-110
 // audit: COPAUA0C-119
-#[tokio::test]
-async fn summary_write_failure_logs_i003_and_writes_nothing() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T07 0000001");
-    let sent = harness.send(&body, &harness.reply_queue, "i003").await?;
+#[test]
+fn summary_write_failure_logs_i003_and_writes_nothing() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T07 0000001");
+        let sent = harness.send(&body, &harness.reply_queue, "i003").await?;
 
-    let calls = Arc::new(CallOrder::default());
-    let (session, worker) = harness.open_worker().await?;
-    let mut worker = worker.with_store(harness.injected(StoreFault::SummaryUpdate, &calls));
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let calls = Arc::new(CallOrder::default());
+        let (session, worker) = harness.open_worker().await?;
+        let mut worker = worker.with_store(harness.injected(StoreFault::SummaryUpdate, &calls));
+        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    // The rollback also undid the summary `lock_or_create` inserted, and no detail was tried.
-    assert!(
-        harness.summary(xref.acct_id).await?.is_none(),
-        "no summary after I003"
-    );
-    assert!(
-        harness.details(xref.acct_id).await?.is_empty(),
-        "no detail after I003"
-    );
-    assert_eq!(
-        CallOrder::at(&calls.insert),
-        0,
-        "the detail insert was not attempted"
-    );
-    // The event key is COPAUA0C-113's interim value: only checked for a full card number.
-    let rows = harness.log_rows().await?;
-    assert_keys_redacted(&rows, &protected_cards(&[])?);
-    let row = single(rows, "cssl_error_log row")?;
-    let i003 = LogExpectation {
-        location: "I003",
-        level: "C",
-        subsystem: "I",
-        message: "IMS UPDATE SUMRY FAILED",
-        event_key: None,
-    };
-    assert_log_row(&row, &i003);
+        // The rollback also undid the summary `lock_or_create` inserted, and no detail was tried.
+        assert!(
+            harness.summary(xref.acct_id).await?.is_none(),
+            "no summary after I003"
+        );
+        assert!(
+            harness.details(xref.acct_id).await?.is_empty(),
+            "no detail after I003"
+        );
+        assert_eq!(
+            CallOrder::at(&calls.insert),
+            0,
+            "the detail insert was not attempted"
+        );
+        // The event key is COPAUA0C-113's interim value: only checked for a full card number.
+        let rows = harness.log_rows().await?;
+        assert_keys_redacted(&rows, &protected_cards(&[])?);
+        let row = single(rows, "cssl_error_log row")?;
+        let i003 = LogExpectation {
+            location: "I003",
+            level: "C",
+            subsystem: "I",
+            message: "IMS UPDATE SUMRY FAILED",
+            event_key: None,
+        };
+        assert_log_row(&row, &i003);
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the request was acknowledged and not requeued");
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the request was acknowledged and not requeued");
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-020
@@ -1735,192 +1830,200 @@ async fn summary_write_failure_logs_i003_and_writes_nothing() -> TestResult {
 // audit: COPAUA0C-067
 // audit: COPAUA0C-080
 // audit: COPAUA0C-081
-#[tokio::test]
-async fn writes_follow_the_acknowledgement_inside_the_locking_transaction() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T08 0000001");
-    let sent = harness.send(&body, &harness.reply_queue, "order").await?;
+#[test]
+fn writes_follow_the_acknowledgement_inside_the_locking_transaction() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T08 0000001");
+        let sent = harness.send(&body, &harness.reply_queue, "order").await?;
 
-    let calls = Arc::new(CallOrder::default());
-    let gate = harness.broker.confirm_gate().await?;
-    let (session, worker) = harness.open_worker_through(&gate).await?;
-    let mut worker = worker
-        .with_store(harness.injected(StoreFault::Healthy, &calls))
-        .with_acknowledger(StandInAcknowledger::new(false, &calls));
-    // The worker answers while the test holds the reply's confirmation, then releases it.
-    let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::release);
-    let (processed, held) = tokio::join!(process(&mut worker, &session), held);
-    // Queue presence is not confirmation: the reply was on its queue throughout the hold.
-    assert_eq!(
-        held?,
-        Held::unconfirmed(),
-        "while the reply's confirmation was held: the reply queued after the locking reads, \
-         and nothing settled, written, logged or committed"
-    );
-    assert_eq!(processed?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let calls = Arc::new(CallOrder::default());
+        let gate = harness.broker.confirm_gate().await?;
+        let (session, worker) = harness.open_worker_through(&gate).await?;
+        let mut worker = worker
+            .with_store(harness.injected(StoreFault::Healthy, &calls))
+            .with_acknowledger(StandInAcknowledger::new(false, &calls));
+        // The worker answers while the test holds the reply's confirmation, then releases it.
+        let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::release);
+        // Boxed: the worker step's future exceeds the stack budget of `clippy::large_futures`.
+        let (processed, held) = Box::pin(join(process(&mut worker, &session), held)).await;
+        // Queue presence is not confirmation: the reply was on its queue throughout the hold.
+        assert_eq!(
+            held?,
+            Held::unconfirmed(),
+            "while the reply's confirmation was held: the reply queued after the locking reads, \
+             and nothing settled, written, logged or committed"
+        );
+        assert_eq!(processed?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    // The cross-reference read, the transaction, the summary lock, the account and customer
-    // reads, then the reply's confirmation, the acknowledgement of the confirmed reply, and
-    // only then the writes and the commit.
-    let order = [
-        ("card_xref read", CallOrder::at(&calls.xref)),
-        ("begin", CallOrder::at(&calls.begin)),
-        ("summary lock", CallOrder::at(&calls.lock)),
-        ("account read", CallOrder::at(&calls.account)),
-        ("customer read", CallOrder::at(&calls.customer)),
-        ("confirmation", CallOrder::at(&calls.confirm)),
-        ("acknowledgement", CallOrder::at(&calls.ack)),
-        ("summary update", CallOrder::at(&calls.update)),
-        ("detail insert", CallOrder::at(&calls.insert)),
-        ("commit", CallOrder::at(&calls.commit)),
-    ];
-    for pair in order.windows(2) {
-        if let [(earlier, before), (later, after)] = pair {
-            assert!(
-                *before > 0 && before < after,
-                "{earlier} comes before {later}: {order:?}"
-            );
+        // The cross-reference read, the transaction, the summary lock, the account and customer
+        // reads, then the reply's confirmation, the acknowledgement of the confirmed reply, and
+        // only then the writes and the commit.
+        let order = [
+            ("card_xref read", CallOrder::at(&calls.xref)),
+            ("begin", CallOrder::at(&calls.begin)),
+            ("summary lock", CallOrder::at(&calls.lock)),
+            ("account read", CallOrder::at(&calls.account)),
+            ("customer read", CallOrder::at(&calls.customer)),
+            ("confirmation", CallOrder::at(&calls.confirm)),
+            ("acknowledgement", CallOrder::at(&calls.ack)),
+            ("summary update", CallOrder::at(&calls.update)),
+            ("detail insert", CallOrder::at(&calls.insert)),
+            ("commit", CallOrder::at(&calls.commit)),
+        ];
+        for pair in order.windows(2) {
+            if let [(earlier, before), (later, after)] = pair {
+                assert!(
+                    *before > 0 && before < after,
+                    "{earlier} comes before {later}: {order:?}"
+                );
+            }
         }
-    }
-    assert_eq!(CallOrder::at(&calls.rollback), 0, "nothing was rolled back");
-    assert_eq!(CallOrder::at(&calls.reject), 0, "nothing was rejected");
-    let summary = harness
-        .summary(xref.acct_id)
-        .await?
-        .ok_or("the committed approval left no summary")?;
-    assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
-    let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-    assert_decided(&detail, &APPROVED);
+        assert_eq!(CallOrder::at(&calls.rollback), 0, "nothing was rolled back");
+        assert_eq!(CallOrder::at(&calls.reject), 0, "nothing was rejected");
+        let summary = harness
+            .summary(xref.acct_id)
+            .await?
+            .ok_or("the committed approval left no summary")?;
+        assert_eq!(summary.approved_auth_cnt.get(), 1, "approved_auth_cnt");
+        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+        assert_decided(&detail, &APPROVED);
 
-    // The stand-in settled nothing, so the request returns to its queue with the connection.
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 1).await?;
-    assert_eq!(
-        left, 1,
-        "only the stand-in acknowledger settled the request"
-    );
-    harness.finish().await
+        // The stand-in settled nothing, so the request returns to its queue with the connection.
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 1).await?;
+        assert_eq!(
+            left, 1,
+            "only the stand-in acknowledger settled the request"
+        );
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-066
 // audit: COPAUA0C-110
 // audit: COPAUA0C-117
-#[tokio::test]
-async fn refused_reply_confirmation_logs_m004_writes_nothing_and_dead_letters() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T10 0000001");
-    harness.send(&body, &harness.reply_queue, "refused").await?;
+#[test]
+fn refused_reply_confirmation_logs_m004_writes_nothing_and_dead_letters() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T10 0000001");
+        harness.send(&body, &harness.reply_queue, "refused").await?;
 
-    // The consumer channel settles the request; the healthy store only records its calls.
-    let calls = Arc::new(CallOrder::default());
-    let gate = harness.broker.confirm_gate().await?;
-    let (session, worker) = harness.open_worker_through(&gate).await?;
-    let mut worker = worker.with_store(harness.injected(StoreFault::Healthy, &calls));
-    // The worker answers while the test holds the reply's confirmation, then refuses it.
-    let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::refuse);
-    let (processed, held) = tokio::join!(process(&mut worker, &session), held);
-    // The broker queued the reply and only the worker was told Nack, so the reply is on the
-    // reply queue: a refused confirmation, not an unroutable reply.
-    assert_eq!(
-        held?,
-        Held::unconfirmed(),
-        "while the reply's confirmation was held: no row, no write, the request unsettled"
-    );
-    // Only Ack(None) is a confirmed reply: the refused one takes the M004 path.
-    assert_eq!(processed?, Processed::DeadLettered);
-    assert!(
-        CallOrder::at(&calls.confirm) < CallOrder::at(&calls.log),
-        "the M004 row follows the refused confirmation"
-    );
-
-    // The rollback removed the summary `lock_or_create` had created, so neither table changed.
-    assert!(
-        harness.summary(xref.acct_id).await?.is_none(),
-        "no summary after a refused confirmation"
-    );
-    assert!(
-        harness.details(xref.acct_id).await?.is_empty(),
-        "no detail after a refused confirmation"
-    );
-    for (call, slot) in [
-        ("summary update", &calls.update),
-        ("detail insert", &calls.insert),
-        ("commit", &calls.commit),
-    ] {
+        // The consumer channel settles the request; the healthy store only records its calls.
+        let calls = Arc::new(CallOrder::default());
+        let gate = harness.broker.confirm_gate().await?;
+        let (session, worker) = harness.open_worker_through(&gate).await?;
+        let mut worker = worker.with_store(harness.injected(StoreFault::Healthy, &calls));
+        // The worker answers while the test holds the reply's confirmation, then refuses it.
+        let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::refuse);
+        // Boxed: the worker step's future exceeds the stack budget of `clippy::large_futures`.
+        let (processed, held) = Box::pin(join(process(&mut worker, &session), held)).await;
+        // The broker queued the reply and only the worker was told Nack, so the reply is on the
+        // reply queue: a refused confirmation, not an unroutable reply.
         assert_eq!(
-            CallOrder::at(slot),
-            0,
-            "{call} after a refused confirmation"
+            held?,
+            Held::unconfirmed(),
+            "while the reply's confirmation was held: no row, no write, the request unsettled"
         );
-    }
-    assert!(
-        CallOrder::at(&calls.rollback) > 0,
-        "the authorization transaction was rolled back"
-    );
-    // The event key is COPAUA0C-113's interim value and the codes HALTED(H4): neither is
-    // compared, and the key is only checked for a full card number.
-    let rows = harness.log_rows().await?;
-    assert_keys_redacted(&rows, &protected_cards(&[])?);
-    let row = single(rows, "cssl_error_log row")?;
-    let m004 = LogExpectation {
-        location: "M004",
-        level: "C",
-        subsystem: "M",
-        message: "FAILED TO PUT ON REPLY MQ",
-        event_key: None,
-    };
-    assert_log_row(&row, &m004);
+        // Only Ack(None) is a confirmed reply: the refused one takes the M004 path.
+        assert_eq!(processed?, Processed::DeadLettered);
+        assert!(
+            CallOrder::at(&calls.confirm) < CallOrder::at(&calls.log),
+            "the M004 row follows the refused confirmation"
+        );
 
-    // Rejected without requeue on the consumer channel, never acknowledged: dead-lettered.
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the request was rejected, not requeued");
-    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
-    assert_eq!(
-        dead, 1,
-        "the rejected request is retained on the dead-letter queue"
-    );
-    harness.finish().await
+        // The rollback removed the summary `lock_or_create` had created, so neither table changed.
+        assert!(
+            harness.summary(xref.acct_id).await?.is_none(),
+            "no summary after a refused confirmation"
+        );
+        assert!(
+            harness.details(xref.acct_id).await?.is_empty(),
+            "no detail after a refused confirmation"
+        );
+        for (call, slot) in [
+            ("summary update", &calls.update),
+            ("detail insert", &calls.insert),
+            ("commit", &calls.commit),
+        ] {
+            assert_eq!(
+                CallOrder::at(slot),
+                0,
+                "{call} after a refused confirmation"
+            );
+        }
+        assert!(
+            CallOrder::at(&calls.rollback) > 0,
+            "the authorization transaction was rolled back"
+        );
+        // The event key is COPAUA0C-113's interim value and the codes HALTED(H4): neither is
+        // compared, and the key is only checked for a full card number.
+        let rows = harness.log_rows().await?;
+        assert_keys_redacted(&rows, &protected_cards(&[])?);
+        let row = single(rows, "cssl_error_log row")?;
+        let m004 = LogExpectation {
+            location: "M004",
+            level: "C",
+            subsystem: "M",
+            message: "FAILED TO PUT ON REPLY MQ",
+            event_key: None,
+        };
+        assert_log_row(&row, &m004);
+
+        // Rejected without requeue on the consumer channel, never acknowledged: dead-lettered.
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the request was rejected, not requeued");
+        let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
+        assert_eq!(
+            dead, 1,
+            "the rejected request is retained on the dead-letter queue"
+        );
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-067
 // audit: COPAUA0C-121
-#[tokio::test]
-async fn failed_commit_leaves_the_confirmed_reply_unrecorded() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T09 0000001");
-    let sent = harness.send(&body, &harness.reply_queue, "commit").await?;
+#[test]
+fn failed_commit_leaves_the_confirmed_reply_unrecorded() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T09 0000001");
+        let sent = harness.send(&body, &harness.reply_queue, "commit").await?;
 
-    let calls = Arc::new(CallOrder::default());
-    let (session, worker) = harness.open_worker().await?;
-    let mut worker = worker.with_store(harness.injected(StoreFault::Commit, &calls));
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-    let reply = harness.next_reply().await?;
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let calls = Arc::new(CallOrder::default());
+        let (session, worker) = harness.open_worker().await?;
+        let mut worker = worker.with_store(harness.injected(StoreFault::Commit, &calls));
+        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+        let reply = harness.next_reply().await?;
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
-    assert!(CallOrder::at(&calls.commit) > 0, "the commit was tried");
-    assert!(
-        harness.summary(xref.acct_id).await?.is_none(),
-        "no summary after a failed commit"
-    );
-    assert!(
-        harness.details(xref.acct_id).await?.is_empty(),
-        "no detail after a failed commit"
-    );
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "a failed commit logs no cssl_error_log row"
-    );
+        assert!(CallOrder::at(&calls.commit) > 0, "the commit was tried");
+        assert!(
+            harness.summary(xref.acct_id).await?.is_none(),
+            "no summary after a failed commit"
+        );
+        assert!(
+            harness.details(xref.acct_id).await?.is_empty(),
+            "no detail after a failed commit"
+        );
+        assert!(
+            harness.log_rows().await?.is_empty(),
+            "a failed commit logs no cssl_error_log row"
+        );
 
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the acknowledged request is not redelivered");
-    harness.finish().await
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the acknowledged request is not redelivered");
+        harness.finish().await
+    })
 }
 
 /// Where the event key of an asserted log row comes from (COPAUA0C-110 to COPAUA0C-126).
@@ -2079,38 +2182,41 @@ async fn declined_after_failed_read(
 // audit: COPAUA0C-124
 // audit: COPAUA0C-125
 // audit: COPAUA0C-126
-#[tokio::test]
-async fn store_read_failures_log_their_critical_rows_and_decline_without_writes() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let cards = protected_cards(&[])?;
-    let mut requests = Vec::new();
-    let mut reply_ids = Vec::new();
-    for (written, case) in critical_reads().iter().enumerate() {
-        let tran_id = format!("CP00T10 000000{written}");
-        let (calls, sent, reply_id) =
-            declined_after_failed_read(&harness, &xref, case, Failure::Server, &tran_id).await?;
-        requests.push(sent);
-        reply_ids.push(reply_id);
-        assert!(
-            CallOrder::at(&calls.log) > 0,
-            "{}: the row was written",
-            case.location
-        );
+#[test]
+fn store_read_failures_log_their_critical_rows_and_decline_without_writes() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let cards = protected_cards(&[])?;
+        let mut requests = Vec::new();
+        let mut reply_ids = Vec::new();
+        for (written, case) in critical_reads().iter().enumerate() {
+            let tran_id = format!("CP00T10 000000{written}");
+            let (calls, sent, reply_id) =
+                declined_after_failed_read(&harness, &xref, case, Failure::Server, &tran_id)
+                    .await?;
+            requests.push(sent);
+            reply_ids.push(reply_id);
+            assert!(
+                CallOrder::at(&calls.log) > 0,
+                "{}: the row was written",
+                case.location
+            );
 
-        let rows = harness.log_rows().await?;
-        assert_keys_redacted(&rows, &cards);
-        assert_eq!(
-            rows.len(),
-            written + 1,
-            "{}: one row per failure",
-            case.location
-        );
-        let row = rows.last().ok_or("no cssl_error_log row")?;
-        assert_log_row(row, &case.expectation(&xref));
-    }
-    assert_fresh_reply_ids(&reply_ids, &requests);
-    harness.finish().await
+            let rows = harness.log_rows().await?;
+            assert_keys_redacted(&rows, &cards);
+            assert_eq!(
+                rows.len(),
+                written + 1,
+                "{}: one row per failure",
+                case.location
+            );
+            let row = rows.last().ok_or("no cssl_error_log row")?;
+            assert_log_row(row, &case.expectation(&xref));
+        }
+        assert_fresh_reply_ids(&reply_ids, &requests);
+        harness.finish().await
+    })
 }
 
 /// The text of the `ERROR` event that stands for a `cssl_error_log` row not written.
@@ -2132,81 +2238,83 @@ fn rows_not_written(capture: &TraceCapture) -> usize {
 // audit: COPAUA0C-124
 // audit: COPAUA0C-125
 // audit: COPAUA0C-126
-#[tokio::test]
-async fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() -> TestResult {
-    let harness = Harness::start().await?;
-    let xref = harness.xref(1).await?;
-    let capture = trace_capture::capture();
-    let mut requests = Vec::new();
-    let mut reply_ids = Vec::new();
-    for (nth, case) in critical_reads().iter().enumerate() {
-        let location = case.location;
-        let tran_id = format!("CP00T12 000000{nth}");
+#[test]
+fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let xref = harness.xref(1).await?;
+        let capture = trace_capture::capture();
+        let mut requests = Vec::new();
+        let mut reply_ids = Vec::new();
+        for (nth, case) in critical_reads().iter().enumerate() {
+            let location = case.location;
+            let tran_id = format!("CP00T12 000000{nth}");
+            capture.clear();
+            let (calls, sent, reply_id) =
+                declined_after_failed_read(&harness, &xref, case, Failure::Unavailable, &tran_id)
+                    .await?;
+            requests.push(sent);
+            reply_ids.push(reply_id);
+            assert_eq!(
+                CallOrder::at(&calls.log),
+                0,
+                "{location}: no cssl_error_log write was attempted"
+            );
+            assert_eq!(
+                rows_not_written(&capture),
+                1,
+                "{location}: one ERROR event stands for the row"
+            );
+            assert!(
+                !capture.contains("the cssl_error_log row could not be written"),
+                "{location}: no write failed"
+            );
+        }
+        assert_fresh_reply_ids(&reply_ids, &requests);
+        assert!(
+            harness.log_rows().await?.is_empty(),
+            "an unavailable database leaves no cssl_error_log row"
+        );
+
+        // A decline that cannot be delivered takes the M004 path, and its row is skipped too.
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T12 0000009");
+        harness.send(&body, NO_SUCH_REPLY_QUEUE, "m004").await?;
+        let calls = Arc::new(CallOrder::default());
+        let (session, worker) = harness.open_worker().await?;
+        let mut worker = worker.with_store(harness.injected_failing(
+            StoreFault::XrefRead,
+            Failure::Unavailable,
+            &calls,
+        ));
         capture.clear();
-        let (calls, sent, reply_id) =
-            declined_after_failed_read(&harness, &xref, case, Failure::Unavailable, &tran_id)
-                .await?;
-        requests.push(sent);
-        reply_ids.push(reply_id);
+        assert_eq!(
+            process(&mut worker, &session).await?,
+            Processed::DeadLettered
+        );
         assert_eq!(
             CallOrder::at(&calls.log),
             0,
-            "{location}: no cssl_error_log write was attempted"
+            "neither the C001 nor the M004 row was attempted"
         );
         assert_eq!(
             rows_not_written(&capture),
-            1,
-            "{location}: one ERROR event stands for the row"
+            2,
+            "one ERROR event stands for each of the C001 and M004 rows"
+        );
+        close_worker(session, worker).await;
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the request was rejected, not requeued");
+        let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
+        assert_eq!(
+            dead, 1,
+            "the undelivered decline's request is retained on the dead-letter queue"
         );
         assert!(
-            !capture.contains("the cssl_error_log row could not be written"),
-            "{location}: no write failed"
+            harness.log_rows().await?.is_empty(),
+            "no cssl_error_log row after the M004 path either"
         );
-    }
-    assert_fresh_reply_ids(&reply_ids, &requests);
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "an unavailable database leaves no cssl_error_log row"
-    );
-
-    // A decline that cannot be delivered takes the M004 path, and its row is skipped too.
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T12 0000009");
-    harness.send(&body, NO_SUCH_REPLY_QUEUE, "m004").await?;
-    let calls = Arc::new(CallOrder::default());
-    let (session, worker) = harness.open_worker().await?;
-    let mut worker = worker.with_store(harness.injected_failing(
-        StoreFault::XrefRead,
-        Failure::Unavailable,
-        &calls,
-    ));
-    capture.clear();
-    assert_eq!(
-        process(&mut worker, &session).await?,
-        Processed::DeadLettered
-    );
-    assert_eq!(
-        CallOrder::at(&calls.log),
-        0,
-        "neither the C001 nor the M004 row was attempted"
-    );
-    assert_eq!(
-        rows_not_written(&capture),
-        2,
-        "one ERROR event stands for each of the C001 and M004 rows"
-    );
-    close_worker(session, worker).await;
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the request was rejected, not requeued");
-    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
-    assert_eq!(
-        dead, 1,
-        "the undelivered decline's request is retained on the dead-letter queue"
-    );
-    assert!(
-        harness.log_rows().await?.is_empty(),
-        "no cssl_error_log row after the M004 path either"
-    );
-    harness.finish().await
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-043
@@ -2215,88 +2323,90 @@ async fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() 
 // audit: COPAUA0C-110
 // audit: COPAUA0C-115
 // audit: COPAUA0C-116
-#[tokio::test]
-async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> TestResult {
-    let harness = Harness::start().await?;
-    let warning = |fault, location, message, key| FaultRow {
-        fault,
-        location,
-        level: "W",
-        subsystem: "A",
-        message,
-        key,
-    };
-    // Account 2 (no summary, account missing): declined with reason 3100. Account 3
-    // (balance 147.00, limit 4909.00, customer missing): 100.00 is approved.
-    let declined = Decided {
-        resp_code: "05",
-        reason: "3100",
-        match_status: "D",
-        approved_cents: 0,
-    };
-    let cases = [
-        (
-            2,
-            warning(
-                StoreFault::AccountMissing,
-                "A002",
-                "ACCT NOT FOUND IN XREF",
-                KeySource::Account,
+#[test]
+fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let warning = |fault, location, message, key| FaultRow {
+            fault,
+            location,
+            level: "W",
+            subsystem: "A",
+            message,
+            key,
+        };
+        // Account 2 (no summary, account missing): declined with reason 3100. Account 3
+        // (balance 147.00, limit 4909.00, customer missing): 100.00 is approved.
+        let declined = Decided {
+            resp_code: "05",
+            reason: "3100",
+            match_status: "D",
+            approved_cents: 0,
+        };
+        let cases = [
+            (
+                2,
+                warning(
+                    StoreFault::AccountMissing,
+                    "A002",
+                    "ACCT NOT FOUND IN XREF",
+                    KeySource::Account,
+                ),
+                declined,
             ),
-            declined,
-        ),
-        (
-            3,
-            warning(
-                StoreFault::CustomerMissing,
-                "A003",
-                "CUST NOT FOUND IN XREF",
-                KeySource::Customer,
+            (
+                3,
+                warning(
+                    StoreFault::CustomerMissing,
+                    "A003",
+                    "CUST NOT FOUND IN XREF",
+                    KeySource::Customer,
+                ),
+                APPROVED,
             ),
-            APPROVED,
-        ),
-    ];
-    let mut requests = Vec::new();
-    let mut reply_ids = Vec::new();
-    for (written, (acct_id, case, decided)) in cases.iter().enumerate() {
-        let xref = harness.xref(*acct_id).await?;
-        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T11 0000001");
-        let sent = harness
-            .send(&body, &harness.reply_queue, case.location)
-            .await?;
-        let calls = Arc::new(CallOrder::default());
-        let (session, worker) = harness.open_worker().await?;
-        let mut worker = worker.with_store(harness.injected(case.fault, &calls));
-        assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
-        let reply = harness.next_reply().await?;
-        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
-        reply_ids.push(reply_message_id(&reply)?);
-        requests.push(sent);
+        ];
+        let mut requests = Vec::new();
+        let mut reply_ids = Vec::new();
+        for (written, (acct_id, case, decided)) in cases.iter().enumerate() {
+            let xref = harness.xref(*acct_id).await?;
+            let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T11 0000001");
+            let sent = harness
+                .send(&body, &harness.reply_queue, case.location)
+                .await?;
+            let calls = Arc::new(CallOrder::default());
+            let (session, worker) = harness.open_worker().await?;
+            let mut worker = worker.with_store(harness.injected(case.fault, &calls));
+            assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+            let reply = harness.next_reply().await?;
+            assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+            reply_ids.push(reply_message_id(&reply)?);
+            requests.push(sent);
 
-        let rows = harness.log_rows().await?;
-        assert_eq!(
-            rows.len(),
-            written + 1,
-            "{}: one warning row",
-            case.location
-        );
-        let row = rows.last().ok_or("no cssl_error_log row")?;
-        assert_log_row(row, &case.expectation(&xref));
-        // The warning lets the request go on to its summary update and detail insert.
-        assert!(
-            harness.summary(xref.acct_id).await?.is_some(),
-            "{}: the summary was written",
-            case.location
-        );
-        let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
-        assert_decided(&detail, decided);
+            let rows = harness.log_rows().await?;
+            assert_eq!(
+                rows.len(),
+                written + 1,
+                "{}: one warning row",
+                case.location
+            );
+            let row = rows.last().ok_or("no cssl_error_log row")?;
+            assert_log_row(row, &case.expectation(&xref));
+            // The warning lets the request go on to its summary update and detail insert.
+            assert!(
+                harness.summary(xref.acct_id).await?.is_some(),
+                "{}: the summary was written",
+                case.location
+            );
+            let detail = single(harness.details(xref.acct_id).await?, "detail row")?;
+            assert_decided(&detail, decided);
 
-        close_worker(session, worker).await;
-        let left = harness.settled_count(harness.request_queue(), 0).await?;
-        assert_eq!(left, 0, "{}: the request was acknowledged", case.location);
-    }
-    assert_fresh_reply_ids(&reply_ids, &requests);
-    harness.finish().await
+            close_worker(session, worker).await;
+            let left = harness.settled_count(harness.request_queue(), 0).await?;
+            assert_eq!(left, 0, "{}: the request was acknowledged", case.location);
+        }
+        assert_fresh_reply_ids(&reply_ids, &requests);
+        harness.finish().await
+    })
 }
 
 /// `messaging::run` started while no broker listens at `CARDDEMO_AMQP_URL` keeps running
@@ -2304,53 +2414,55 @@ async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> 
 /// after it is logged and retried after a backoff delay. A stop then ends the run with `Ok`,
 /// although it never connected. No event shows the URL or its password, only the value-free
 /// failure.
-#[tokio::test]
-async fn run_retries_a_refused_first_connection_until_it_is_stopped() -> TestResult {
-    let harness = Harness::start().await?;
-    // A password assembled at run time, in a URL whose port nothing listens on.
-    let password = ["no-broker", "-", "secret"].concat();
-    let amqp_url = format!(
-        "amqp://carddemo:{password}@127.0.0.1:{}/%2f",
-        closed_port()?
-    );
-    let config = Config {
-        amqp_url: amqp_url.clone(),
-        ..harness.run_config()
-    };
-    let capture = trace_capture::capture();
-    let driver = captured(&capture, CONNECT_RETRIED, 3);
-    let (outcome, stop_took, retried) = harness.run_beside(&config, &capture, driver).await?;
-    let lines = capture.lines();
-    drop(capture);
-
-    if let Err(error) = outcome {
-        return Err(format!("run ended with {error} instead of retrying").into());
-    }
-    assert!(
-        stop_took < RUN_RETURN_BOUND,
-        "run returned {stop_took:?} after the stop"
-    );
-    assert!(retried >= 3, "{retried} failed attempts were logged");
-    let first = matching(&lines, r#""outcome":"connect failed""#);
-    assert_eq!(first.len(), 1, "the first attempt logs one event");
-    let later = matching(&lines, r#""outcome":"reconnect failed""#);
-    assert!(later.len() >= 2, "{} reconnect events", later.len());
-    for line in first.iter().chain(&later) {
-        assert!(line.contains(r#""level":"ERROR""#), "{line}");
-        assert!(line.contains("cannot connect to the AMQP broker"), "{line}");
-    }
-    assert!(
-        matching(&lines, WORKERS_CONSUME).is_empty(),
-        "no worker opened without a broker"
-    );
-    for line in &lines {
-        assert!(!line.contains(&amqp_url), "an event shows the AMQP URL");
-        assert!(
-            !line.contains(&password),
-            "an event shows the AMQP password"
+#[test]
+fn run_retries_a_refused_first_connection_until_it_is_stopped() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // A password assembled at run time, in a URL whose port nothing listens on.
+        let password = ["no-broker", "-", "secret"].concat();
+        let amqp_url = format!(
+            "amqp://carddemo:{password}@127.0.0.1:{}/%2f",
+            closed_port()?
         );
-    }
-    harness.finish().await
+        let config = Config {
+            amqp_url: amqp_url.clone(),
+            ..harness.run_config()
+        };
+        let capture = trace_capture::capture();
+        let driver = captured(&capture, CONNECT_RETRIED, 3);
+        let (outcome, stop_took, retried) = harness.run_beside(&config, &capture, driver).await?;
+        let lines = capture.lines();
+        drop(capture);
+
+        if let Err(error) = outcome {
+            return Err(format!("run ended with {error} instead of retrying").into());
+        }
+        assert!(
+            stop_took < RUN_RETURN_BOUND,
+            "run returned {stop_took:?} after the stop"
+        );
+        assert!(retried >= 3, "{retried} failed attempts were logged");
+        let first = matching(&lines, r#""outcome":"connect failed""#);
+        assert_eq!(first.len(), 1, "the first attempt logs one event");
+        let later = matching(&lines, r#""outcome":"reconnect failed""#);
+        assert!(later.len() >= 2, "{} reconnect events", later.len());
+        for line in first.iter().chain(&later) {
+            assert!(line.contains(r#""level":"ERROR""#), "{line}");
+            assert!(line.contains("cannot connect to the AMQP broker"), "{line}");
+        }
+        assert!(
+            matching(&lines, WORKERS_CONSUME).is_empty(),
+            "no worker opened without a broker"
+        );
+        for line in &lines {
+            assert!(!line.contains(&amqp_url), "an event shows the AMQP URL");
+            assert!(
+                !line.contains(&password),
+                "an event shows the AMQP password"
+            );
+        }
+        harness.finish().await
+    })
 }
 
 /// A queue missing from the broker when `messaging::run` starts, here `CARD.DEMO.ERROR`, which
@@ -2358,63 +2470,65 @@ async fn run_retries_a_refused_first_connection_until_it_is_stopped() -> TestRes
 /// closed and replaced after a backoff delay, and no worker declares the queue. Once the
 /// operator declares it as `rabbitmq/definitions.json` does, the next session opens the three
 /// workers, and CP00 answers a request and acknowledges it.
-#[tokio::test]
-async fn run_opens_the_workers_once_a_missing_queue_is_declared() -> TestResult {
-    let harness = Harness::start().await?;
-    // Account 1 approves 100.00 (see `approval_creates_summary_and_pending_detail`).
-    let xref = harness.xref(1).await?;
-    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T20 0000001");
-    harness.delete_queue(ERROR_QUEUE).await?;
-    let config = harness.run_config();
-    let capture = trace_capture::capture();
-    let driver = async {
-        let failed = captured(&capture, OPEN_RETRIED, 2).await?;
-        harness.declare_durable(ERROR_QUEUE).await?;
-        captured(&capture, WORKERS_CONSUME, 1).await?;
-        let sent = harness
-            .send(&body, &harness.reply_queue, "run-reopened")
-            .await?;
-        let reply = harness.next_reply().await?;
-        Ok::<_, BoxError>((failed, sent, reply))
-    };
-    let (outcome, stop_took, (failed, sent, reply)) =
-        harness.run_beside(&config, &capture, driver).await?;
-    let lines = capture.lines();
-    drop(capture);
+#[test]
+fn run_opens_the_workers_once_a_missing_queue_is_declared() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        // Account 1 approves 100.00 (see `approval_creates_summary_and_pending_detail`).
+        let xref = harness.xref(1).await?;
+        let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T20 0000001");
+        harness.delete_queue(ERROR_QUEUE).await?;
+        let config = harness.run_config();
+        let capture = trace_capture::capture();
+        let driver = async {
+            let failed = captured(&capture, OPEN_RETRIED, 2).await?;
+            harness.declare_durable(ERROR_QUEUE).await?;
+            captured(&capture, WORKERS_CONSUME, 1).await?;
+            let sent = harness
+                .send(&body, &harness.reply_queue, "run-reopened")
+                .await?;
+            let reply = harness.next_reply().await?;
+            Ok::<_, BoxError>((failed, sent, reply))
+        };
+        let (outcome, stop_took, (failed, sent, reply)) =
+            harness.run_beside(&config, &capture, driver).await?;
+        let lines = capture.lines();
+        drop(capture);
 
-    if let Err(error) = outcome {
-        return Err(format!("run ended with {error} instead of retrying").into());
-    }
-    assert!(
-        stop_took < RUN_RETURN_BOUND,
-        "run returned {stop_took:?} after the stop"
-    );
-    assert!(failed >= 2, "{failed} failed sessions were logged");
-    for line in matching(&lines, OPEN_RETRIED) {
-        assert!(line.contains(r#""level":"ERROR""#), "{line}");
-        assert!(line.contains(r#""outcome":"open failed""#), "{line}");
+        if let Err(error) = outcome {
+            return Err(format!("run ended with {error} instead of retrying").into());
+        }
         assert!(
-            line.contains(
-                "passive declare of queue CARD.DEMO.ERROR failed: AMQP soft error NOT-FOUND \
-                 (reply code 404)"
-            ),
-            "{line}"
+            stop_took < RUN_RETURN_BOUND,
+            "run returned {stop_took:?} after the stop"
         );
-    }
-    assert_eq!(
-        matching(&lines, WORKERS_CONSUME).len(),
-        1,
-        "the workers opened once, on the first session after the declare"
-    );
-    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
-    let amqp_url = harness.broker.amqp_url();
-    assert!(
-        lines.iter().all(|line| !line.contains(amqp_url)),
-        "an event shows the AMQP URL"
-    );
-    let left = harness.settled_count(harness.request_queue(), 0).await?;
-    assert_eq!(left, 0, "the answered request was acknowledged");
-    harness.finish().await
+        assert!(failed >= 2, "{failed} failed sessions were logged");
+        for line in matching(&lines, OPEN_RETRIED) {
+            assert!(line.contains(r#""level":"ERROR""#), "{line}");
+            assert!(line.contains(r#""outcome":"open failed""#), "{line}");
+            assert!(
+                line.contains(
+                    "passive declare of queue CARD.DEMO.ERROR failed: AMQP soft error NOT-FOUND \
+                     (reply code 404)"
+                ),
+                "{line}"
+            );
+        }
+        assert_eq!(
+            matching(&lines, WORKERS_CONSUME).len(),
+            1,
+            "the workers opened once, on the first session after the declare"
+        );
+        assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        let amqp_url = harness.broker.amqp_url();
+        assert!(
+            lines.iter().all(|line| !line.contains(amqp_url)),
+            "an event shows the AMQP URL"
+        );
+        let left = harness.settled_count(harness.request_queue(), 0).await?;
+        assert_eq!(left, 0, "the answered request was acknowledged");
+        harness.finish().await
+    })
 }
 
 /// A configuration error ends `messaging::run` at once with that error, because no retry cures
@@ -2422,76 +2536,78 @@ async fn run_opens_the_workers_once_a_missing_queue_is_declared() -> TestResult 
 /// `CARDDEMO_QUEUE_REQUEST_ACCT`, which CDRA refuses on the live broker because its error body
 /// names the request queue in 48 bytes. Neither is retried, and neither the error nor any event
 /// shows the configured value.
-#[tokio::test]
-async fn run_returns_a_configuration_error_without_retrying() -> TestResult {
-    let harness = Harness::start().await?;
-    let invalid_url = "amqp:carddemo-invalid-url".to_owned();
-    let long_queue = "Q".repeat(49);
-    let cases: [(Config, &str, IsExpected); 2] = [
-        (
-            Config {
-                amqp_url: invalid_url.clone(),
-                ..harness.run_config()
-            },
-            invalid_url.as_str(),
-            |error| matches!(error, StartupError::Connect(AmqpError::InvalidUrl)),
-        ),
-        (
-            Config {
-                queue_request_acct: long_queue.clone(),
-                ..harness.run_config()
-            },
-            long_queue.as_str(),
-            |error| {
-                matches!(
-                    error,
-                    StartupError::Declare(AmqpError::QueueName {
-                        variable: "CARDDEMO_QUEUE_REQUEST_ACCT",
-                        max_len: 48,
-                    })
+#[test]
+fn run_returns_a_configuration_error_without_retrying() -> TestResult {
+    block_on(async {
+        let harness = Harness::start().await?;
+        let invalid_url = "amqp:carddemo-invalid-url".to_owned();
+        let long_queue = "Q".repeat(49);
+        let cases: [(Config, &str, IsExpected); 2] = [
+            (
+                Config {
+                    amqp_url: invalid_url.clone(),
+                    ..harness.run_config()
+                },
+                invalid_url.as_str(),
+                |error| matches!(error, StartupError::Connect(AmqpError::InvalidUrl)),
+            ),
+            (
+                Config {
+                    queue_request_acct: long_queue.clone(),
+                    ..harness.run_config()
+                },
+                long_queue.as_str(),
+                |error| {
+                    matches!(
+                        error,
+                        StartupError::Declare(AmqpError::QueueName {
+                            variable: "CARDDEMO_QUEUE_REQUEST_ACCT",
+                            max_len: 48,
+                        })
+                    )
+                },
+            ),
+        ];
+        for (config, value, expected) in cases {
+            let capture = trace_capture::capture();
+            // Held until `run` returns: dropping every handle would request the stop.
+            let handle = StopHandle::new();
+            let running = Box::pin(
+                run(
+                    &config,
+                    harness.store(),
+                    Arc::clone(&harness.clock),
+                    handle.subscribe(),
                 )
-            },
-        ),
-    ];
-    for (config, value, expected) in cases {
-        let capture = trace_capture::capture();
-        // Held until `run` returns: dropping every handle would request the stop.
-        let handle = StopHandle::new();
-        let running = Box::pin(
-            run(
-                &config,
-                harness.store(),
-                Arc::clone(&harness.clock),
-                handle.subscribe(),
-            )
-            .with_subscriber(capture.dispatch()),
-        );
-        let outcome = timeout(RUN_RETURN_BOUND, running).await?;
-        drop(handle);
-        let lines = capture.lines();
-        drop(capture);
+                .with_subscriber(capture.dispatch()),
+            );
+            let outcome = timeout(RUN_RETURN_BOUND, running).await?;
+            drop(handle);
+            let lines = capture.lines();
+            drop(capture);
 
-        let Err(error) = outcome else {
-            return Err(format!("run returned Ok with {value:?} configured").into());
-        };
-        assert!(
-            expected(&error),
-            "unexpected error for {value:?}: {error:?}"
-        );
-        let shown = format!("{error} | {error:?}");
-        assert!(!shown.contains(value), "the error shows {value:?}: {shown}");
-        for needle in [CONNECT_RETRIED, OPEN_RETRIED, WORKERS_CONSUME] {
+            let Err(error) = outcome else {
+                return Err(format!("run returned Ok with {value:?} configured").into());
+            };
             assert!(
-                matching(&lines, needle).is_empty(),
-                "{value:?}: \"{needle}\" was logged"
+                expected(&error),
+                "unexpected error for {value:?}: {error:?}"
+            );
+            let shown = format!("{error} | {error:?}");
+            assert!(!shown.contains(value), "the error shows {value:?}: {shown}");
+            for needle in [CONNECT_RETRIED, OPEN_RETRIED, WORKERS_CONSUME] {
+                assert!(
+                    matching(&lines, needle).is_empty(),
+                    "{value:?}: \"{needle}\" was logged"
+                );
+            }
+            assert!(
+                lines.iter().all(|line| !line.contains(value)),
+                "an event shows {value:?}"
             );
         }
-        assert!(
-            lines.iter().all(|line| !line.contains(value)),
-            "an event shows {value:?}"
-        );
-    }
-    harness.finish().await
+        harness.finish().await
+    })
 }
 
 // audit: COPAUA0C-065

@@ -51,9 +51,9 @@ use persistence::{
     TransactionCategoryRepository, TransactionRepository, TransactionTypeRepository,
     UserRepository,
 };
-use proptest::strategy::{Just, Strategy};
+use proptest::prop_assert;
+use proptest::strategy::{Just, Strategy, Union};
 use proptest::test_runner::{Config, TestCaseError, TestRunner};
-use proptest::{prop_assert, prop_oneof};
 use rust_decimal::Decimal;
 use test_support::fixtures::{dusrsecj_path, fixture_path};
 use test_support::postgres::start_postgres;
@@ -477,33 +477,46 @@ impl Stored for TransactionRecord {
 // audit: CSUSR01Y-004
 // audit: CSUSR01Y-005
 // audit: CSUSR01Y-006
-#[tokio::test]
-async fn fixtures_round_trip_through_postgres() {
-    let guard = start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let mut store = PgStore::new(guard.pool().clone());
-
-    let lines = [
-        accounts(&mut store).await,
-        cards(&mut store).await,
-        card_xrefs(&mut store).await,
-        customers(&mut store).await,
-        round_trip::<DisclosureGroupRecord>(&mut store).await.len(),
-        tran_cat_balances(&mut store).await,
-        round_trip::<TransactionCategoryRecord>(&mut store)
+#[test]
+fn fixtures_round_trip_through_postgres() {
+    block_on(async {
+        let guard = start_postgres()
             .await
-            .len(),
-        round_trip::<TransactionTypeRecord>(&mut store).await.len(),
-        daily_transactions(&mut store).await,
-    ];
-    assert_eq!(
-        lines.iter().sum::<usize>(),
-        CORPUS_LINES,
-        "fixture lines that round-tripped"
-    );
+            .expect("start a migrated postgres:16 container");
+        let mut store = PgStore::new(guard.pool().clone());
 
-    users(&mut store).await;
+        let lines = [
+            accounts(&mut store).await,
+            cards(&mut store).await,
+            card_xrefs(&mut store).await,
+            customers(&mut store).await,
+            round_trip::<DisclosureGroupRecord>(&mut store).await.len(),
+            tran_cat_balances(&mut store).await,
+            round_trip::<TransactionCategoryRecord>(&mut store)
+                .await
+                .len(),
+            round_trip::<TransactionTypeRecord>(&mut store).await.len(),
+            daily_transactions(&mut store).await,
+        ];
+        assert_eq!(
+            lines.iter().sum::<usize>(),
+            CORPUS_LINES,
+            "fixture lines that round-tripped"
+        );
+
+        users(&mut store).await;
+    });
+}
+
+/// Runs `test` to completion on a current-thread Tokio runtime of its own with every driver
+/// enabled, which stays current while the body's values drop, on unwinding too. The fixture test
+/// calls it rather than take Tokio's test attribute, whose expansion suppresses lints.
+fn block_on<F: Future>(test: F) -> F::Output {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a current-thread Tokio runtime")
+        .block_on(test)
 }
 
 /// The d9 steps every load fixture shares, over the fixture of `R`, returning its records in line
@@ -1126,30 +1139,32 @@ async fn write_and_read<R: Stored>(
 /// spaces only with probability 0.26 to the power `N`, about 0.07 for two bytes and under 0.005
 /// from four bytes up, so the all-space arm is what makes all-space values of wide fields occur.
 ///
-/// The bytes are drawn as a `Vec`, whose value tree lives on the heap: an array of `N` union
-/// value trees, nested in a record's tuples, overflows a test thread's stack in a debug build.
+/// The bytes are drawn as a `Vec`, whose value tree lives on the heap, so the `N` per-byte union
+/// value trees of a wide field never sit inline in a record's nested tuples on a test thread's
+/// stack.
 fn pic_x<const N: usize>() -> impl Strategy<Value = PicX<N>> {
-    let bytes = proptest::collection::vec(prop_oneof![1 => Just(b' '), 3 => 0x20_u8..=0x7E], N);
-    prop_oneof![
-        1 => Just(vec![b' '; N]),
-        9 => bytes,
-    ]
-    .prop_map(|bytes| {
-        let bytes = <[u8; N]>::try_from(bytes)
-            .unwrap_or_else(|_| panic!("the strategy draws exactly N bytes"));
-        PicX::from_array(bytes)
-    })
+    let bytes = proptest::collection::vec(
+        Union::new_weighted(vec![(1, Just(b' ').boxed()), (3, (0x20_u8..=0x7E).boxed())]),
+        N,
+    );
+    Union::new_weighted(vec![(1, Just(vec![b' '; N]).boxed()), (9, bytes.boxed())]).prop_map(
+        |bytes| {
+            let bytes = <[u8; N]>::try_from(bytes)
+                .unwrap_or_else(|_| panic!("the strategy draws exactly N bytes"));
+            PicX::from_array(bytes)
+        },
+    )
 }
 
 /// `PIC 9(N)`: every value from 0 to `N` nines, zero and `N` nines weighted in (PIC-003,
 /// PIC-023).
 fn pic_u<const N: u32>() -> impl Strategy<Value = PicU<N>> {
     let max = PicU::<N>::MAX;
-    prop_oneof![
-        1 => Just(0),
-        1 => Just(max),
-        8 => 0..=max,
-    ]
+    Union::new_weighted(vec![
+        (1, Just(0).boxed()),
+        (1, Just(max).boxed()),
+        (8, (0..=max).boxed()),
+    ])
     .prop_map(|value| PicU::new(value).expect("a value of at most N nines"))
 }
 
@@ -1157,12 +1172,12 @@ fn pic_u<const N: u32>() -> impl Strategy<Value = PicU<N>> {
 /// zero and both extremes weighted in.
 fn scaled(int_digits: u32) -> impl Strategy<Value = Decimal> {
     let max = 10_i64.pow(int_digits + 2) - 1;
-    prop_oneof![
-        1 => Just(-max),
-        1 => Just(0),
-        1 => Just(max),
-        7 => -max..=max,
-    ]
+    Union::new_weighted(vec![
+        (1, Just(-max).boxed()),
+        (1, Just(0).boxed()),
+        (1, Just(max).boxed()),
+        (7, (-max..=max).boxed()),
+    ])
     .prop_map(|cents| Decimal::new(cents, 2))
 }
 
@@ -1188,12 +1203,17 @@ fn card_number() -> impl Strategy<Value = CardNumber> {
 /// A calendar date with a four-digit year, `0000-01-01` to `9999-12-31`: every day of every year,
 /// one draw in five taken from `calendar_boundaries`.
 fn calendar_date() -> impl Strategy<Value = NaiveDate> {
-    prop_oneof![
-        1 => proptest::sample::select(calendar_boundaries()),
-        4 => (0_i32..=9999, 1_u32..=366).prop_filter_map("a day of that year", |(year, ordinal)| {
-            NaiveDate::from_yo_opt(year, ordinal)
-        }),
-    ]
+    Union::new_weighted(vec![
+        (1, proptest::sample::select(calendar_boundaries()).boxed()),
+        (
+            4,
+            (0_i32..=9999, 1_u32..=366)
+                .prop_filter_map("a day of that year", |(year, ordinal)| {
+                    NaiveDate::from_yo_opt(year, ordinal)
+                })
+                .boxed(),
+        ),
+    ])
 }
 
 /// The calendar boundaries and leap days a `DATE` or `TIMESTAMP(6)` column must keep: the first
@@ -1223,24 +1243,33 @@ fn calendar_boundaries() -> Vec<NaiveDate> {
 /// microsecond of the day weighted in.
 fn time_of_day() -> impl Strategy<Value = NaiveTime> {
     let last = NaiveTime::from_hms_micro_opt(23, 59, 59, 999_999).expect("a time of day");
-    prop_oneof![
-        1 => Just(NaiveTime::MIN),
-        1 => Just(last),
-        8 => (0_u32..=23, 0_u32..=59, 0_u32..=59, 0_u32..=999_999).prop_map(
-            |(hour, minute, second, micro)| {
-                NaiveTime::from_hms_micro_opt(hour, minute, second, micro).expect("a time of day")
-            },
+    Union::new_weighted(vec![
+        (1, Just(NaiveTime::MIN).boxed()),
+        (1, Just(last).boxed()),
+        (
+            8,
+            (0_u32..=23, 0_u32..=59, 0_u32..=59, 0_u32..=999_999)
+                .prop_map(|(hour, minute, second, micro)| {
+                    NaiveTime::from_hms_micro_opt(hour, minute, second, micro)
+                        .expect("a time of day")
+                })
+                .boxed(),
         ),
-    ]
+    ])
 }
 
 /// A `PIC X(10)` date: blank (`NULL`) one time in five, otherwise a calendar date (`DATE`)
 /// (PIC-015).
 fn date() -> impl Strategy<Value = PicDate> {
-    prop_oneof![
-        1 => Just(PicDate::BLANK),
-        4 => calendar_date().prop_map(|day| PicDate::new(Some(day)).expect("a four-digit year")),
-    ]
+    Union::new_weighted(vec![
+        (1, Just(PicDate::BLANK).boxed()),
+        (
+            4,
+            calendar_date()
+                .prop_map(|day| PicDate::new(Some(day)).expect("a four-digit year"))
+                .boxed(),
+        ),
+    ])
 }
 
 /// A `PIC X(26)` timestamp: blank one time in five (PIC-017), otherwise a value on a
@@ -1249,16 +1278,21 @@ fn date() -> impl Strategy<Value = PicDate> {
 /// `S`, which carries no other time (PIC-020).
 fn timestamp() -> impl Strategy<Value = PicTimestamp> {
     let form = proptest::sample::select(vec![TsForm::Iso, TsForm::Db2, TsForm::ScreenDate]);
-    prop_oneof![
-        1 => Just(PicTimestamp::BLANK),
-        4 => (calendar_date(), time_of_day(), form).prop_map(|(day, clock, form)| {
-            let clock = match form {
-                TsForm::ScreenDate => NaiveTime::MIN,
-                TsForm::Iso | TsForm::Db2 => clock,
-            };
-            stamp(day.and_time(clock), form)
-        }),
-    ]
+    Union::new_weighted(vec![
+        (1, Just(PicTimestamp::BLANK).boxed()),
+        (
+            4,
+            (calendar_date(), time_of_day(), form)
+                .prop_map(|(day, clock, form)| {
+                    let clock = match form {
+                        TsForm::ScreenDate => NaiveTime::MIN,
+                        TsForm::Iso | TsForm::Db2 => clock,
+                    };
+                    stamp(day.and_time(clock), form)
+                })
+                .boxed(),
+        ),
+    ])
 }
 
 /// The non-blank timestamp `value` in layout `form`.

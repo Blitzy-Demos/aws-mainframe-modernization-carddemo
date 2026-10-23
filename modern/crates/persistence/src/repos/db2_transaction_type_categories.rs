@@ -340,174 +340,191 @@ mod tests {
         }
     }
 
+    /// Runs `test` to completion on a current-thread Tokio runtime built here, with no lint
+    /// attribute.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The migration's seed reads back by key and by type, every byte as the CTL member wrote
     /// it, and a key nothing holds reads as `None` or as no rows.
-    #[tokio::test]
-    async fn seeded_rows_read_back_by_key_and_by_type() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn seeded_rows_read_back_by_key_and_by_type() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
 
-        for (type_code, type_category, text) in SEED {
-            let found = store
-                .find_by_id(&code(type_code)?, &category(type_category)?)
-                .await?;
-            assert_eq!(found, Some(record(type_code, type_category, text)?));
-        }
-        for type_code in SEEDED_TYPES {
-            assert_eq!(
-                store.find_all_by_type(&code(type_code)?).await?,
-                seeded(type_code)?,
-                "type {type_code}"
-            );
-        }
-        let expected: Vec<_> = SEED
-            .iter()
-            .map(|(seed_code, seed_category, seed_text)| {
-                record(seed_code, seed_category, seed_text)
-            })
-            .collect::<Result<_, _>>()?;
-        assert_eq!(every_seeded_type(&mut store).await?, expected);
+            for (type_code, type_category, text) in SEED {
+                let found = store
+                    .find_by_id(&code(type_code)?, &category(type_category)?)
+                    .await?;
+                assert_eq!(found, Some(record(type_code, type_category, text)?));
+            }
+            for type_code in SEEDED_TYPES {
+                assert_eq!(
+                    store.find_all_by_type(&code(type_code)?).await?,
+                    seeded(type_code)?,
+                    "type {type_code}"
+                );
+            }
+            let expected: Vec<_> = SEED
+                .iter()
+                .map(|(seed_code, seed_category, seed_text)| {
+                    record(seed_code, seed_category, seed_text)
+                })
+                .collect::<Result<_, _>>()?;
+            assert_eq!(every_seeded_type(&mut store).await?, expected);
 
-        // Keys that nothing holds, a padded type code among them: `1 ` is not `01`.
-        for (type_code, type_category) in [("01", "0006"), ("08", "0001"), ("1 ", "0001")] {
-            let found = store
-                .find_by_id(&code(type_code)?, &category(type_category)?)
-                .await?;
-            assert_eq!(found, None, "{type_code}/{type_category}");
-        }
-        for type_code in ["08", "  ", "1 "] {
-            assert!(store.find_all_by_type(&code(type_code)?).await?.is_empty());
-        }
-        Ok(())
+            // Keys that nothing holds, a padded type code among them: `1 ` is not `01`.
+            for (type_code, type_category) in [("01", "0006"), ("08", "0001"), ("1 ", "0001")] {
+                let found = store
+                    .find_by_id(&code(type_code)?, &category(type_category)?)
+                    .await?;
+                assert_eq!(found, None, "{type_code}/{type_category}");
+            }
+            for type_code in ["08", "  ", "1 "] {
+                assert!(store.find_all_by_type(&code(type_code)?).await?.is_empty());
+            }
+            Ok(())
+        })
     }
 
     /// An insert keeps its bytes verbatim; a duplicate key is `Duplicate`, an unknown type is
     /// `Restrict` through foreign key `trc_type_code`, and neither changes the table.
-    #[tokio::test]
-    async fn inserts_keep_bytes_and_report_duplicate_and_restrict() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
+    #[test]
+    fn inserts_keep_bytes_and_report_duplicate_and_restrict() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
 
-        let added = [
-            record("07", "0002", "  Spaced text, mixed Case  ")?,
-            record("07", "A   ", "")?,
-            record("07", "0003", &"X".repeat(50))?,
-        ];
-        for row in &added {
-            store.insert(row).await?;
-            let found = store
-                .find_by_id(row.type_code(), row.type_category())
-                .await?;
-            assert_eq!(found.as_ref(), Some(row));
-        }
-        // Byte order: the digits sort before `A`.
-        let [spaced, letter, longest] = added;
-        let mut expected = seeded("07")?;
-        expected.extend([spaced.clone(), longest, letter]);
-        assert_eq!(store.find_all_by_type(&code("07")?).await?, expected);
+            let added = [
+                record("07", "0002", "  Spaced text, mixed Case  ")?,
+                record("07", "A   ", "")?,
+                record("07", "0003", &"X".repeat(50))?,
+            ];
+            for row in &added {
+                store.insert(row).await?;
+                let found = store
+                    .find_by_id(row.type_code(), row.type_category())
+                    .await?;
+                assert_eq!(found.as_ref(), Some(row));
+            }
+            // Byte order: the digits sort before `A`.
+            let [spaced, letter, longest] = added;
+            let mut expected = seeded("07")?;
+            expected.extend([spaced.clone(), longest, letter]);
+            assert_eq!(store.find_all_by_type(&code("07")?).await?, expected);
 
-        let before = every_seeded_type(&mut store).await?;
-        for (row, error) in [
-            (record("01", "0001", "ANOTHER TEXT")?, duplicate()),
-            (spaced, duplicate()),
-            (record("99", "0001", "NO SUCH TYPE")?, restrict()),
-            (record("1 ", "0001", "PADDED TYPE")?, restrict()),
-        ] {
-            assert_eq!(store.insert(&row).await, Err(error));
-        }
-        assert_eq!(every_seeded_type(&mut store).await?, before);
-        assert!(store.find_all_by_type(&code("99")?).await?.is_empty());
-        Ok(())
+            let before = every_seeded_type(&mut store).await?;
+            for (row, error) in [
+                (record("01", "0001", "ANOTHER TEXT")?, duplicate()),
+                (spaced, duplicate()),
+                (record("99", "0001", "NO SUCH TYPE")?, restrict()),
+                (record("1 ", "0001", "PADDED TYPE")?, restrict()),
+            ] {
+                assert_eq!(store.insert(&row).await, Err(error));
+            }
+            assert_eq!(every_seeded_type(&mut store).await?, before);
+            assert!(store.find_all_by_type(&code("99")?).await?.is_empty());
+            Ok(())
+        })
     }
 
     /// Inside a transaction the insert is visible to that transaction alone until it commits; a
     /// failed insert inside a savepoint rolls back to it and leaves the transaction usable.
-    #[tokio::test]
-    async fn transactions_see_their_inserts_and_recover_through_savepoints() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let first = record("05", "0002", "REFUND DEBIT")?;
-        let second = record("05", "0003", "REFUND REVERSAL")?;
+    #[test]
+    fn transactions_see_their_inserts_and_recover_through_savepoints() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let first = record("05", "0002", "REFUND DEBIT")?;
+            let second = record("05", "0003", "REFUND REVERSAL")?;
 
-        let mut tx = store.begin().await?;
-        tx.insert(&first).await?;
-        assert_eq!(
-            tx.find_by_id(first.type_code(), first.type_category())
-                .await?,
-            Some(first.clone())
-        );
-        assert_eq!(
-            store
-                .find_by_id(first.type_code(), first.type_category())
-                .await?,
-            None
-        );
-        tx.rollback().await?;
-        assert_eq!(store.find_all_by_type(&code("05")?).await?, seeded("05")?);
+            let mut tx = store.begin().await?;
+            tx.insert(&first).await?;
+            assert_eq!(
+                tx.find_by_id(first.type_code(), first.type_category())
+                    .await?,
+                Some(first.clone())
+            );
+            assert_eq!(
+                store
+                    .find_by_id(first.type_code(), first.type_category())
+                    .await?,
+                None
+            );
+            tx.rollback().await?;
+            assert_eq!(store.find_all_by_type(&code("05")?).await?, seeded("05")?);
 
-        let mut tx = store.begin().await?;
-        tx.insert(&first).await?;
-        let mut savepoint: PgTx<'_> = tx.savepoint().await?;
-        assert_eq!(savepoint.insert(&first).await, Err(duplicate()));
-        savepoint.rollback().await?;
-        let mut savepoint = tx.savepoint().await?;
-        assert_eq!(
-            savepoint
-                .insert(&record("98", "0001", "NO SUCH TYPE")?)
-                .await,
-            Err(restrict())
-        );
-        savepoint.rollback().await?;
-        tx.insert(&second).await?;
-        assert_eq!(
-            tx.find_all_by_type(&code("05")?).await?.len(),
-            seeded("05")?.len() + 2
-        );
-        tx.commit().await?;
+            let mut tx = store.begin().await?;
+            tx.insert(&first).await?;
+            let mut savepoint: PgTx<'_> = tx.savepoint().await?;
+            assert_eq!(savepoint.insert(&first).await, Err(duplicate()));
+            savepoint.rollback().await?;
+            let mut savepoint = tx.savepoint().await?;
+            assert_eq!(
+                savepoint
+                    .insert(&record("98", "0001", "NO SUCH TYPE")?)
+                    .await,
+                Err(restrict())
+            );
+            savepoint.rollback().await?;
+            tx.insert(&second).await?;
+            assert_eq!(
+                tx.find_all_by_type(&code("05")?).await?.len(),
+                seeded("05")?.len() + 2
+            );
+            tx.commit().await?;
 
-        let mut expected = seeded("05")?;
-        expected.extend([first, second]);
-        assert_eq!(store.find_all_by_type(&code("05")?).await?, expected);
-        Ok(())
+            let mut expected = seeded("05")?;
+            expected.extend([first, second]);
+            assert_eq!(store.find_all_by_type(&code("05")?).await?, expected);
+            Ok(())
+        })
     }
 
     /// A key byte no text column can hold fails before any statement runs, naming its column and
     /// no value. The pool is closed, so any statement would fail as `Unavailable` instead.
-    #[tokio::test]
-    async fn keys_no_column_can_hold_fail_before_the_query() -> TestResult {
-        use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    #[test]
+    fn keys_no_column_can_hold_fail_before_the_query() -> TestResult {
+        block_on(async {
+            use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
-        let options = PgConnectOptions::new().host("127.0.0.1").port(9);
-        let mut store = PgStore::new(PgPoolOptions::new().connect_lazy_with(options));
-        store.pool().close().await;
-        let invalid = PersistenceError::decode;
+            let options = PgConnectOptions::new().host("127.0.0.1").port(9);
+            let mut store = PgStore::new(PgPoolOptions::new().connect_lazy_with(options));
+            store.pool().close().await;
+            let invalid = PersistenceError::decode;
 
-        let nul_code = PicX::<2>::from_array(*b"0\0");
-        let nul_category = PicX::<4>::from_array([b'0', 0, b'0', b'1']);
-        assert_eq!(
-            store.find_by_id(&nul_code, &category("0001")?).await,
-            Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
-        );
-        assert_eq!(
-            store.find_by_id(&code("01")?, &nul_category).await,
-            Err(invalid(TRC_TYPE_CATEGORY, DecodeKind::InvalidByte))
-        );
-        assert_eq!(
-            store
-                .find_all_by_type(&PicX::from_array([b'0', 0xC9]))
-                .await,
-            Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
-        );
-        let row = Db2TransactionCategory::new(nul_code, category("0001")?, "TEXT".to_owned())?;
-        assert_eq!(
-            store.insert(&row).await,
-            Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
-        );
-        // With valid keys the statement runs and meets the closed pool.
-        assert_eq!(
-            store.find_by_id(&code("01")?, &category("0001")?).await,
-            Err(PersistenceError::Unavailable)
-        );
-        Ok(())
+            let nul_code = PicX::<2>::from_array(*b"0\0");
+            let nul_category = PicX::<4>::from_array([b'0', 0, b'0', b'1']);
+            assert_eq!(
+                store.find_by_id(&nul_code, &category("0001")?).await,
+                Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
+            );
+            assert_eq!(
+                store.find_by_id(&code("01")?, &nul_category).await,
+                Err(invalid(TRC_TYPE_CATEGORY, DecodeKind::InvalidByte))
+            );
+            assert_eq!(
+                store
+                    .find_all_by_type(&PicX::from_array([b'0', 0xC9]))
+                    .await,
+                Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
+            );
+            let row = Db2TransactionCategory::new(nul_code, category("0001")?, "TEXT".to_owned())?;
+            assert_eq!(
+                store.insert(&row).await,
+                Err(invalid(TRC_TYPE_CODE, DecodeKind::InvalidByte))
+            );
+            // With valid keys the statement runs and meets the closed pool.
+            assert_eq!(
+                store.find_by_id(&code("01")?, &category("0001")?).await,
+                Err(PersistenceError::Unavailable)
+            );
+            Ok(())
+        })
     }
 }

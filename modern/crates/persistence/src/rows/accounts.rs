@@ -23,9 +23,9 @@ use crate::error::PersistenceError;
 
 /// One row of `accounts`: a field per column, with the column's name, in the migration's order.
 ///
-/// Only the nullable `DATE` columns are `Option`. No account field is cardholder data, but the
-/// row leaves `Debug`, `Clone` and `Serialize` underived like every codec B row, so that no row
-/// value reaches a log or a response by accident.
+/// Only the nullable `DATE` columns are `Option`. No account field is cardholder data, but, like
+/// every codec B row, the row derives neither `Debug` nor `Serialize`, and it leaves `Clone`
+/// underived too, so that no row value reaches a log or a response by accident.
 pub struct AccountRow {
     /// `ACCT-ID PIC 9(11)`: `BIGINT` range-checked to `0..=99999999999`, 64-bit end to end
     /// (CVACT01Y-001, PIC-003, PIC-023).

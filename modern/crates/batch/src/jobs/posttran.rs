@@ -19,14 +19,14 @@
 //!      runs every statement of the run, and claims `transactions` for writing on it
 //!      (CBTRN02C-046); then `transactions` must hold no row, the only state in which the
 //!      `OPEN OUTPUT` of the cluster, defined without `REUSE`, succeeds (CBTRN02C-030).
-//!    - `XREFFILE`, `ACCTFILE` and `TCATBALF`: `card_xref`, `accounts` and `tran_cat_balances`
-//!      are read whole into [`Posttran::new`], which serves the program's keyed reads and holds
-//!      the values each posting leaves for the next record (CBTRN02C-004, CBTRN02C-005,
-//!      CBTRN02C-016, CBTRN02C-022). The `OPEN I-O` of `ACCTFILE` and of `TCATBALF` claims
-//!      `accounts` and `tran_cat_balances` for writing on the session before the table is read
-//!      (CBTRN02C-046); `XREFFILE` is opened for input, which claims nothing.
+//!    - `XREFFILE`: `card_xref` is read whole; the open is for input, which claims nothing.
 //!    - `DALYREJS`: the next `DALYREJS` generation in `Config::dalyrejs_dir`, created before the
 //!      first record is read, so that it exists, empty, when nothing is rejected (CBTRN02C-028).
+//!    - `ACCTFILE`, then `TCATBALF`: the `OPEN I-O` of each claims its table, `accounts` and
+//!      `tran_cat_balances`, for writing on the session before the table is read whole
+//!      (CBTRN02C-046). With `card_xref`, the two tables go into [`Posttran::new`], which serves
+//!      the program's keyed reads and holds the values each posting leaves for the next record
+//!      (CBTRN02C-004, CBTRN02C-005, CBTRN02C-016, CBTRN02C-022).
 //! 2. The processing pass reads the rewound handle again, line n as record n (CBTRN02C-001), a
 //!    few records at a time, each line checked as the validation pass checked it, so the job
 //!    holds one line and at most [`READ_AHEAD`] decoded records whatever the size of the input.
@@ -179,7 +179,11 @@ use persistence::{
     AccountRepository, CardXrefRepository, Dataset, PersistenceError, PgSession, PgStore,
     TranCatBalanceRepository, TransactionRepository,
 };
-use runtime::telemetry::JobCounter;
+use runtime::telemetry::{JobCounter, event_enabled};
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{self, FieldSet, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use super::{
     DALYREJS_DIR_SETTING, JobContext, JobError, JobOutcome, OutputFile, READING_INPUT, blocking, io,
@@ -461,7 +465,7 @@ const TCATBALF: WriterOpen = WriterOpen {
 ///   statement's path (CBTRN02C-046).
 /// - [`JobError::Posttran`] when a run counter outgrows 64 bits (CBTRN02C-036).
 pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutcome, JobError> {
-    tracing::info!("{START_LINE}");
+    display_line(START_LINE);
     let mut records = open_dalytran(dalytran).await?;
     // Every statement of the run goes to its one session, the one holding its writer claims, so
     // that a session the server ends takes the claims and the run's next statement with it, and
@@ -492,7 +496,7 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     // Unlike jobs that discard their program's job log, this one emits it: the POSTTRAN audit
     // maps every `DISPLAY` to one event, and these lines carry counts only (CBTRN02C-034).
     for line in summary.sysout_lines() {
-        tracing::info!("{line}");
+        display_line(&line);
     }
     close_claimed_files(session).await;
     Ok(JobOutcome {
@@ -521,9 +525,9 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
 /// (CBTRN02C-045). Nothing else has happened then.
 ///
 /// The open, the reads and the decoding block, so the pass runs as one step on the blocking
-/// pool, awaited at once; the step only returns the handle or what failed, and the events of
-/// the failure are emitted here, in the job's span, as when the step ran inline (W011-F05). A
-/// step the runtime cancels before it runs is the failed open.
+/// pool, awaited at once. The step emits nothing and returns the handle or what failed; this
+/// function emits the failure's events itself, on the job's task, so that they carry the job's
+/// span. A step the runtime cancels before it runs is the failed open.
 async fn open_dalytran(path: &Path) -> Result<Dalytran, JobError> {
     let path = path.to_path_buf();
     match blocking(READING_INPUT, move || read_dalytran(&path)).await {
@@ -849,11 +853,22 @@ async fn open_dalyrejs(dir: &Path) -> Result<OutputFile, JobError> {
 /// answered, which ends the locks on the server. The failure is reported in one warning event
 /// naming the closes and the error, and the run keeps its outcome.
 async fn close_claimed_files(session: PgSession) {
+    // Written out: `tracing`'s `warn!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "writer claim release failed",
+        Level::WARN,
+        &["message", "operation", "error"],
+        &SITE,
+    );
     if let Err(error) = session.close().await {
-        tracing::warn!(
-            operation = CLOSE_CLAIMED_FILES_OP,
-            error = %error,
-            "CBTRN02C writer claim release failed; the closed session ends the claim"
+        emit(
+            &SITE,
+            [
+                &"CBTRN02C writer claim release failed; the closed session ends the claim",
+                &CLOSE_CLAIMED_FILES_OP,
+                &field::display(&error),
+            ],
         );
     }
 }
@@ -886,7 +901,7 @@ async fn write_category_balance(
     match write {
         TcatbalWrite::Create(record) => {
             if let Some(line) = write.sysout_line() {
-                tracing::info!("{line}");
+                display_line(&line);
             }
             TranCatBalanceRepository::insert(session, record)
                 .await
@@ -896,16 +911,30 @@ async fn write_category_balance(
             match TranCatBalanceRepository::update(session, record).await {
                 Ok(true) => Ok(()),
                 Ok(false) => {
-                    tracing::error!(
-                        operation = REWRITE_TCATBALF_OP,
-                        "CBTRN02C rewrite found no row"
-                    );
+                    rewrite_found_no_row();
                     Err(abend(Failure::shown(REWRITE_TCATBAL, Status::NotFound)))
                 }
                 Err(error) => Err(shown_failure(REWRITE_TCATBALF_OP, REWRITE_TCATBAL, &error)),
             }
         }
     }
+}
+
+/// The event of a category balance rewrite that matched no row: `ERROR`, naming the file
+/// operation, before the path's lines (CBTRN02C-038).
+fn rewrite_found_no_row() {
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "rewrite found no row",
+        Level::ERROR,
+        &["message", "operation"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [&"CBTRN02C rewrite found no row", &REWRITE_TCATBALF_OP],
+    );
 }
 
 /// `2800-UPDATE-ACCOUNT-REC`: the account rewritten with its new balance and cycle fields
@@ -977,11 +1006,22 @@ async fn close_dalyrejs(rejects: OutputFile) -> Result<PathBuf, JobError> {
 /// line and `kind`, the rule it breaks, a field, an offset and a width, never a byte of the
 /// line, then the abend (CBTRN02C-032).
 fn refused(line: usize, kind: LoadErrorKind) -> JobError {
-    tracing::error!(
-        file = DALYTRAN,
-        line,
-        rule = %kind,
-        "DALYTRAN line refused by codec A"
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<4> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "line refused",
+        Level::ERROR,
+        &["message", "file", "line", "rule"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            &"DALYTRAN line refused by codec A",
+            &DALYTRAN,
+            &line,
+            &field::display(&kind),
+        ],
     );
     abend(Failure::unshown(LINE_REFUSED))
 }
@@ -989,12 +1029,23 @@ fn refused(line: usize, kind: LoadErrorKind) -> JobError {
 /// A `DALYTRAN` line whose body is not the 350-byte record: one event naming the file, the line
 /// and the body's length against the record's, then the abend (CBTRN02C-045).
 fn not_a_record(line: usize, body_len: usize) -> JobError {
-    tracing::error!(
-        file = DALYTRAN,
-        line,
-        body_len,
-        record_len = DailyTransactionRecord::WIDTH,
-        "DALYTRAN line is not one 350-byte record"
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<5> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "line not a record",
+        Level::ERROR,
+        &["message", "file", "line", "body_len", "record_len"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            &"DALYTRAN line is not one 350-byte record",
+            &DALYTRAN,
+            &line,
+            &body_len,
+            &DailyTransactionRecord::WIDTH,
+        ],
     );
     abend(Failure::unshown(LINE_NOT_A_RECORD))
 }
@@ -1032,14 +1083,44 @@ fn file_failure(operation: &'static str, line: &'static str, error: &JobError) -
 /// the error's text, which names an SQLSTATE, a constraint or a column only (Cardholder Data
 /// Redaction).
 fn report(operation: &'static str, error: &PersistenceError) {
-    tracing::error!(operation, error = %error, "CBTRN02C database call failed");
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "database call failed",
+        Level::ERROR,
+        &["message", "operation", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            &"CBTRN02C database call failed",
+            &operation,
+            &field::display(error),
+        ],
+    );
 }
 
 /// Reports why a local-file call failed: the file operation and the error's text, a static step
 /// and the I/O error kind, with the setting of the reject directory for a step on it, or the
 /// generation limit and the `DALYREJS` base, never the path.
 fn report_file(operation: &'static str, error: &JobError) {
-    tracing::error!(operation, error = %error, "CBTRN02C file operation failed");
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "file operation failed",
+        Level::ERROR,
+        &["message", "operation", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            &"CBTRN02C file operation failed",
+            &operation,
+            &field::display(error),
+        ],
+    );
 }
 
 /// `9999-ABEND-PROGRAM` after `failure`: its failure and status lines, then `ABENDING PROGRAM`
@@ -1047,23 +1128,102 @@ fn report_file(operation: &'static str, error: &JobError) {
 /// at once, which drops the unfinished reject generation and so removes it (CBTRN02C-044).
 fn abend(failure: Failure) -> JobError {
     if let Some((line, status)) = failure.shown {
-        tracing::error!("{line}");
-        tracing::error!("{}", status.line());
+        display_failure_line(line);
+        display_failure_line(status.line());
     }
-    tracing::error!("{ABEND_LINE}");
+    display_failure_line(ABEND_LINE);
     JobError::Abend {
         code: Some(ABEND_EXIT_STATUS),
         reason: failure.reason,
     }
 }
 
+/// A job-log line of a run, the text of one `DISPLAY`: an `INFO` event whose message is `line`
+/// exactly (CBTRN02C-016, CBTRN02C-034, X-POSTTRAN-4).
+fn display_line(line: &str) {
+    // Written out: `tracing`'s `info!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<1> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> =
+        event_metadata("job log line", Level::INFO, &["message"], &SITE);
+    emit(&SITE, [&line]);
+}
+
+/// A job-log line a failure path adds, the text of one `DISPLAY`: an `ERROR` event whose
+/// message is `line` exactly (CBTRN02C-041, CBTRN02C-043, X-POSTTRAN-4).
+fn display_failure_line(line: &str) {
+    // Written out: `tracing`'s `error!` expands to an `allow(unused_imports)` lint suppression.
+    static SITE: EventSite<1> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> =
+        event_metadata("job log failure line", Level::ERROR, &["message"], &SITE);
+    emit(&SITE, [&line]);
+}
+
+/// The callsite of one event of this module written without a `tracing` macro, whose metadata
+/// names `N` fields, `message` first.
+///
+/// Every `tracing` event macro expands to an attribute that allows `unused_imports`, and no
+/// source of this workspace, generated source included, holds a lint suppression. Each event of
+/// this module is therefore written out as two statics, an `EventSite` and the
+/// [`event_metadata`] it holds, and emitted with [`emit`]. All three take the same `N`, so an
+/// event always carries exactly one value per field it declares, in the order it declares them.
+struct EventSite<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> EventSite<N> {
+    /// The callsite of the event that `metadata` describes.
+    const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the event `name` at `level`, with the field `names`, for the callsite `site`.
+///
+/// The target and the module path are this module's path, the target a `tracing` macro gives an
+/// event here, so `RUST_LOG` directives and a filter on the target select the event as they
+/// would select a macro's. No source file or line is given: the JSON output and the span export
+/// print neither.
+const fn event_metadata<const N: usize>(
+    name: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        module_path!(),
+        level,
+        None,
+        None,
+        Some(module_path!()),
+        FieldSet::new(names, Identifier(&site.0)),
+        Kind::EVENT,
+    )
+}
+
+/// Emits one event of `site` in the current span with `values`, one per field the site names
+/// and in that order, when the current subscriber enables it.
+///
+/// The decision is `runtime::telemetry::event_enabled`, which takes the steps an event macro
+/// takes, so the level filters, the JSON layer and the span export treat the event exactly as
+/// they treat a macro's.
+fn emit<const N: usize>(site: &'static EventSite<N>, values: [&dyn Value; N]) {
+    let callsite = &site.0;
+    if !event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    let values = values.map(Some);
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+}
+
 #[cfg(test)]
 mod tests {
     use std::error::Error;
     use std::fs;
+    use std::future::poll_fn;
     use std::io;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::task::Poll;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use chrono::NaiveDate;
@@ -1275,6 +1435,50 @@ mod tests {
         }
     }
 
+    /// Runs `test` to completion on a current-thread runtime with I/O and time enabled, the
+    /// runtime tokio's test attribute builds, without the lint attributes that attribute's
+    /// expansion carries. The test runs on the calling thread, so a trace capture the test
+    /// starts sees every event of it.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
+    /// Drives `first` and `second` together on the calling task until both have finished and
+    /// returns their outputs in that order. Every wake polls each future not yet finished and
+    /// never a finished one again, so neither waits for the other to end, as tokio's join macro
+    /// drives its futures, without the pinning and lint attributes that macro's expansion
+    /// carries.
+    async fn join<A: Future, B: Future>(first: A, second: B) -> (A::Output, B::Output) {
+        let mut first = Box::pin(first);
+        let mut second = Box::pin(second);
+        let mut first_output = None;
+        let mut second_output = None;
+        poll_fn(|cx| {
+            if first_output.is_none() {
+                if let Poll::Ready(output) = first.as_mut().poll(cx) {
+                    first_output = Some(output);
+                }
+            }
+            if second_output.is_none() {
+                if let Poll::Ready(output) = second.as_mut().poll(cx) {
+                    second_output = Some(output);
+                }
+            }
+            match (first_output.take(), second_output.take()) {
+                (Some(first), Some(second)) => Poll::Ready((first, second)),
+                (first, second) => {
+                    first_output = first;
+                    second_output = second;
+                    Poll::Pending
+                }
+            }
+        })
+        .await
+    }
+
     // audit: CBTRN02C-025
     // audit: CBTRN02C-040
     // audit: CBTRN02C-041
@@ -1344,26 +1548,30 @@ mod tests {
 
     // audit: CBTRN02C-001
     // audit: CBTRN02C-033
-    #[tokio::test]
-    async fn the_daily_fixture_decodes_whole_in_input_order() -> TestResult {
-        let before = fs::read(dailytran())?;
-        let records = drain(open_dalytran(&dailytran()).await?).await?;
-        assert_eq!(records.len(), 300);
-        for (n, record) in [(1, records.first()), (300, records.last())] {
-            let record = record.ok_or("a record is missing")?;
-            assert!(record.encode() == fixture_line(n)?, "line {n}");
-        }
-        assert!(fs::read(dailytran())? == before, "the input was changed");
-        Ok(())
+    #[test]
+    fn the_daily_fixture_decodes_whole_in_input_order() -> TestResult {
+        block_on(async {
+            let before = fs::read(dailytran())?;
+            let records = drain(open_dalytran(&dailytran()).await?).await?;
+            assert_eq!(records.len(), 300);
+            for (n, record) in [(1, records.first()), (300, records.last())] {
+                let record = record.ok_or("a record is missing")?;
+                assert!(record.encode() == fixture_line(n)?, "line {n}");
+            }
+            assert!(fs::read(dailytran())? == before, "the input was changed");
+            Ok(())
+        })
     }
 
     // audit: CBTRN02C-029
-    #[tokio::test]
-    async fn an_empty_input_holds_no_record() -> TestResult {
-        let scratch = Scratch::new()?;
-        let empty = scratch.file("empty.txt", b"")?;
-        assert!(open_dalytran(&empty).await?.next().await?.is_none());
-        Ok(())
+    #[test]
+    fn an_empty_input_holds_no_record() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let empty = scratch.file("empty.txt", b"")?;
+            assert!(open_dalytran(&empty).await?.next().await?.is_none());
+            Ok(())
+        })
     }
 
     /// Both passes read the input line by line, each line framed and decoded exactly as
@@ -1372,50 +1580,52 @@ mod tests {
     /// input is unchanged afterwards (CBTRN02C-001, CBTRN02C-033).
     // audit: CBTRN02C-001
     // audit: CBTRN02C-033
-    #[tokio::test]
-    async fn streamed_records_and_framing_equal_the_whole_file_decode() -> TestResult {
-        let scratch = Scratch::new()?;
-        // The file's name, its number of lines, the terminator of every line but the last, and
-        // the last line's.
-        let cases = [
-            ("lf.txt", 300, Terminator::Lf, Terminator::Lf),
-            ("crlf.txt", 300, Terminator::CrLf, Terminator::CrLf),
-            ("no-final-lf.txt", 300, Terminator::Lf, Terminator::None),
-            ("read-ahead.txt", READ_AHEAD, Terminator::Lf, Terminator::Lf),
-        ];
-        for (name, count, terminator, last_terminator) in cases {
-            let lines = fixture_lines(count)?;
-            let mut input = Vec::new();
-            for (index, line) in lines.iter().enumerate() {
-                input.extend_from_slice(line);
-                let end = if index + 1 == count {
-                    last_terminator
-                } else {
-                    terminator
-                };
-                input.extend_from_slice(end.as_bytes());
+    #[test]
+    fn streamed_records_and_framing_equal_the_whole_file_decode() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            // The file's name, its number of lines, the terminator of every line but the last, and
+            // the last line's.
+            let cases = [
+                ("lf.txt", 300, Terminator::Lf, Terminator::Lf),
+                ("crlf.txt", 300, Terminator::CrLf, Terminator::CrLf),
+                ("no-final-lf.txt", 300, Terminator::Lf, Terminator::None),
+                ("read-ahead.txt", READ_AHEAD, Terminator::Lf, Terminator::Lf),
+            ];
+            for (name, count, terminator, last_terminator) in cases {
+                let lines = fixture_lines(count)?;
+                let mut input = Vec::new();
+                for (index, line) in lines.iter().enumerate() {
+                    input.extend_from_slice(line);
+                    let end = if index + 1 == count {
+                        last_terminator
+                    } else {
+                        terminator
+                    };
+                    input.extend_from_slice(end.as_bytes());
+                }
+                let path = scratch.file(name, &input)?;
+                let expected = decode_fixture::<DailyTransactionRecord>(&input)?;
+                assert_eq!(expected.len(), count, "{name}");
+                assert_eq!(
+                    expected.last().map(|framed| framed.framing.terminator),
+                    Some(last_terminator),
+                    "{name}"
+                );
+                assert!(
+                    framed_lines(&path)? == expected,
+                    "{name}: the framing differs"
+                );
+                let records: Vec<DailyTransactionRecord> =
+                    expected.into_iter().map(|framed| framed.record).collect();
+                assert!(
+                    drain(open_dalytran(&path).await?).await? == records,
+                    "{name}: the records differ"
+                );
+                assert!(fs::read(&path)? == input, "{name}: the input was changed");
             }
-            let path = scratch.file(name, &input)?;
-            let expected = decode_fixture::<DailyTransactionRecord>(&input)?;
-            assert_eq!(expected.len(), count, "{name}");
-            assert_eq!(
-                expected.last().map(|framed| framed.framing.terminator),
-                Some(last_terminator),
-                "{name}"
-            );
-            assert!(
-                framed_lines(&path)? == expected,
-                "{name}: the framing differs"
-            );
-            let records: Vec<DailyTransactionRecord> =
-                expected.into_iter().map(|framed| framed.record).collect();
-            assert!(
-                drain(open_dalytran(&path).await?).await? == records,
-                "{name}: the records differ"
-            );
-            assert!(fs::read(&path)? == input, "{name}: the input was changed");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// A file rewritten in place after the validation pass, one of its later lines refused by
@@ -1425,136 +1635,143 @@ mod tests {
     /// are the second, the last of the first step, the first of the second step and the last.
     // audit: CBTRN02C-001
     // audit: CBTRN02C-037
-    #[tokio::test]
-    async fn a_line_refused_after_the_open_ends_the_job_after_the_records_before_it() -> TestResult
-    {
-        let scratch = Scratch::new()?;
-        let all = fixture_lines(300)?;
-        let card = card_number(all.first().ok_or("the fixture is empty")?)?;
-        let mut valid = Vec::new();
-        for line in &all {
-            valid.extend_from_slice(line);
-            valid.push(b'\n');
-        }
-        for bad in [2, READ_AHEAD, READ_AHEAD + 1, all.len()] {
-            let name = format!("rewritten-{bad}.txt");
-            let path = scratch.file(&name, &valid)?;
-            let mut records = open_dalytran(&path).await?;
-            let mut rewritten = Vec::new();
-            for (index, line) in all.iter().enumerate() {
-                if index + 1 == bad {
-                    rewritten.extend_from_slice(b"QQQ-not-a-record");
-                } else {
-                    rewritten.extend_from_slice(line);
-                }
-                rewritten.push(b'\n');
+    #[test]
+    fn a_line_refused_after_the_open_ends_the_job_after_the_records_before_it() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let all = fixture_lines(300)?;
+            let card = card_number(all.first().ok_or("the fixture is empty")?)?;
+            let mut valid = Vec::new();
+            for line in &all {
+                valid.extend_from_slice(line);
+                valid.push(b'\n');
             }
-            fs::write(&path, &rewritten)?;
-            let capture = trace_capture::capture();
-            let mut yielded = Vec::new();
-            let error = loop {
-                match records.next().await {
-                    Ok(Some(record)) => yielded.push(record),
-                    Ok(None) => return Err(format!("line {bad}: the refused line was read").into()),
-                    Err(error) => break error,
+            for bad in [2, READ_AHEAD, READ_AHEAD + 1, all.len()] {
+                let name = format!("rewritten-{bad}.txt");
+                let path = scratch.file(&name, &valid)?;
+                let mut records = open_dalytran(&path).await?;
+                let mut rewritten = Vec::new();
+                for (index, line) in all.iter().enumerate() {
+                    if index + 1 == bad {
+                        rewritten.extend_from_slice(b"QQQ-not-a-record");
+                    } else {
+                        rewritten.extend_from_slice(line);
+                    }
+                    rewritten.push(b'\n');
                 }
-            };
-            assert_eq!(yielded.len(), bad - 1, "line {bad}");
-            for (record, line) in yielded.iter().zip(&all) {
-                assert!(record.encode() == *line, "line {bad}: a record differs");
+                fs::write(&path, &rewritten)?;
+                let capture = trace_capture::capture();
+                let mut yielded = Vec::new();
+                let error = loop {
+                    match records.next().await {
+                        Ok(Some(record)) => yielded.push(record),
+                        Ok(None) => {
+                            return Err(format!("line {bad}: the refused line was read").into());
+                        }
+                        Err(error) => break error,
+                    }
+                };
+                assert_eq!(yielded.len(), bad - 1, "line {bad}");
+                for (record, line) in yielded.iter().zip(&all) {
+                    assert!(record.encode() == *line, "line {bad}: a record differs");
+                }
+                assert_eq!(
+                    abend_of(&error),
+                    Some((Some(12), LINE_REFUSED)),
+                    "line {bad}"
+                );
+                assert_eq!(
+                    messages(&capture),
+                    ["DALYTRAN line refused by codec A", ABEND_LINE],
+                    "line {bad}"
+                );
+                assert!(capture.contains(&format!(r#""line":{bad}"#)), "line {bad}");
+                assert!(capture.contains(r#""file":"DALYTRAN""#), "line {bad}");
+                assert!(
+                    !capture.contains("QQQ"),
+                    "line {bad}: the line's bytes are shown"
+                );
+                assert!(
+                    !capture.contains(&card),
+                    "line {bad}: a card number is shown"
+                );
+                assert!(!capture.contains(&name), "line {bad}: the path is shown");
+                drop(capture);
+                assert!(
+                    records.next().await?.is_none(),
+                    "line {bad}: a read followed"
+                );
             }
-            assert_eq!(
-                abend_of(&error),
-                Some((Some(12), LINE_REFUSED)),
-                "line {bad}"
-            );
-            assert_eq!(
-                messages(&capture),
-                ["DALYTRAN line refused by codec A", ABEND_LINE],
-                "line {bad}"
-            );
-            assert!(capture.contains(&format!(r#""line":{bad}"#)), "line {bad}");
-            assert!(capture.contains(r#""file":"DALYTRAN""#), "line {bad}");
-            assert!(
-                !capture.contains("QQQ"),
-                "line {bad}: the line's bytes are shown"
-            );
-            assert!(
-                !capture.contains(&card),
-                "line {bad}: a card number is shown"
-            );
-            assert!(!capture.contains(&name), "line {bad}: the path is shown");
-            drop(capture);
-            assert!(
-                records.next().await?.is_none(),
-                "line {bad}: a read followed"
-            );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// A line codec A refuses ends the job naming the file, the line and the rule only, never a
     /// byte of the input, with no reject generation created (CBTRN02C-032, CBTRN02C-037).
     // audit: CBTRN02C-032
     // audit: CBTRN02C-037
-    #[tokio::test]
-    async fn a_refused_line_ends_the_job_naming_its_number_only() -> TestResult {
-        let scratch = Scratch::new()?;
-        let first = fixture_line(1)?;
-        let card = card_number(&first)?;
-        let mut long = first.clone();
-        long.push(b'X');
-        for (name, bad) in [
-            ("short.txt", b"QQQ-not-a-record".to_vec()),
-            ("long.txt", long),
-        ] {
-            let mut input = first.clone();
-            input.push(b'\n');
-            input.extend_from_slice(&bad);
-            input.push(b'\n');
-            let path = scratch.file(name, &input)?;
-            let capture = trace_capture::capture();
-            let error = open_dalytran(&path)
-                .await
-                .err()
-                .ok_or("a refused line was decoded")?;
-            assert_eq!(abend_of(&error), Some((Some(12), LINE_REFUSED)), "{name}");
-            assert_eq!(
-                messages(&capture),
-                ["DALYTRAN line refused by codec A", ABEND_LINE],
-                "{name}"
-            );
-            assert!(capture.contains(r#""line":2"#), "{name}");
-            assert!(capture.contains(r#""file":"DALYTRAN""#), "{name}");
-            assert!(!capture.contains("QQQ"), "{name} shows the line's bytes");
-            assert!(!capture.contains(&card), "{name} shows a card number");
-            assert!(!capture.contains(name), "{name} shows the path");
-        }
-        Ok(())
+    #[test]
+    fn a_refused_line_ends_the_job_naming_its_number_only() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let first = fixture_line(1)?;
+            let card = card_number(&first)?;
+            let mut long = first.clone();
+            long.push(b'X');
+            for (name, bad) in [
+                ("short.txt", b"QQQ-not-a-record".to_vec()),
+                ("long.txt", long),
+            ] {
+                let mut input = first.clone();
+                input.push(b'\n');
+                input.extend_from_slice(&bad);
+                input.push(b'\n');
+                let path = scratch.file(name, &input)?;
+                let capture = trace_capture::capture();
+                let error = open_dalytran(&path)
+                    .await
+                    .err()
+                    .ok_or("a refused line was decoded")?;
+                assert_eq!(abend_of(&error), Some((Some(12), LINE_REFUSED)), "{name}");
+                assert_eq!(
+                    messages(&capture),
+                    ["DALYTRAN line refused by codec A", ABEND_LINE],
+                    "{name}"
+                );
+                assert!(capture.contains(r#""line":2"#), "{name}");
+                assert!(capture.contains(r#""file":"DALYTRAN""#), "{name}");
+                assert!(!capture.contains("QQQ"), "{name} shows the line's bytes");
+                assert!(!capture.contains(&card), "{name} shows a card number");
+                assert!(!capture.contains(name), "{name} shows the path");
+            }
+            Ok(())
+        })
     }
 
     // audit: CBTRN02C-031
-    #[tokio::test]
-    async fn an_unreadable_input_is_the_failed_dalytran_open() -> TestResult {
-        let scratch = Scratch::new()?;
-        let missing = scratch.path().join("missing-dailytran.txt");
-        let capture = trace_capture::capture();
-        let error = open_dalytran(&missing)
-            .await
-            .err()
-            .ok_or("a missing input was read")?;
-        assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYTRAN)));
-        assert_eq!(
-            messages(&capture),
-            [
-                "CBTRN02C file operation failed",
-                OPEN_DALYTRAN,
-                "FILE STATUS IS: NNNN0030",
-                ABEND_LINE,
-            ]
-        );
-        assert!(!capture.contains("missing-dailytran"));
-        Ok(())
+    #[test]
+    fn an_unreadable_input_is_the_failed_dalytran_open() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let missing = scratch.path().join("missing-dailytran.txt");
+            let capture = trace_capture::capture();
+            let error = open_dalytran(&missing)
+                .await
+                .err()
+                .ok_or("a missing input was read")?;
+            assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYTRAN)));
+            assert_eq!(
+                messages(&capture),
+                [
+                    "CBTRN02C file operation failed",
+                    OPEN_DALYTRAN,
+                    "FILE STATUS IS: NNNN0030",
+                    ABEND_LINE,
+                ]
+            );
+            assert!(!capture.contains("missing-dailytran"));
+            Ok(())
+        })
     }
 
     /// A file in place of the reject directory, or of `CARDDEMO_VAR_DIR` above it, is the failed
@@ -1562,58 +1779,60 @@ mod tests {
     /// kind, never the path, and its lines, the abend and exit status 12 are those of every
     /// failed open. The file is left as it was (CBTRN02C-031).
     // audit: CBTRN02C-031
-    #[tokio::test]
-    async fn a_file_in_place_of_the_reject_directory_names_its_setting() -> TestResult {
-        let scratch = Scratch::new()?;
-        let var_file = scratch.file("var", b"sentinel\n")?;
-        let var_dir = scratch.path().join("var-dir");
-        fs::create_dir_all(&var_dir)?;
-        let rejects_file = var_dir.join("dalyrejs");
-        fs::write(&rejects_file, b"sentinel\n")?;
-        let scratch_name = scratch
-            .path()
-            .file_name()
-            .ok_or("the scratch directory has no name")?
-            .to_string_lossy()
-            .into_owned();
-        for dir in [var_file.join("dalyrejs"), rejects_file.clone()] {
-            let shown = dir.display().to_string();
-            let capture = trace_capture::capture();
-            let error = open_dalyrejs(&dir)
-                .await
-                .err()
-                .ok_or("a reject generation was created")?;
-            assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYREJS)), "{shown}");
-            assert_eq!(
-                error.to_string(),
-                "ABEND: ERROR OPENING DALY REJECTS FILE (return code 12)"
-            );
-            assert_eq!(
-                messages(&capture),
-                [
-                    "CBTRN02C file operation failed",
-                    OPEN_DALYREJS,
-                    "FILE STATUS IS: NNNN0030",
-                    ABEND_LINE,
-                ],
-                "{shown}"
-            );
-            assert!(
-                capture.contains(r#""operation":"OPEN DALYREJS""#),
-                "{shown}"
-            );
-            assert!(
+    #[test]
+    fn a_file_in_place_of_the_reject_directory_names_its_setting() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let var_file = scratch.file("var", b"sentinel\n")?;
+            let var_dir = scratch.path().join("var-dir");
+            fs::create_dir_all(&var_dir)?;
+            let rejects_file = var_dir.join("dalyrejs");
+            fs::write(&rejects_file, b"sentinel\n")?;
+            let scratch_name = scratch
+                .path()
+                .file_name()
+                .ok_or("the scratch directory has no name")?
+                .to_string_lossy()
+                .into_owned();
+            for dir in [var_file.join("dalyrejs"), rejects_file.clone()] {
+                let shown = dir.display().to_string();
+                let capture = trace_capture::capture();
+                let error = open_dalyrejs(&dir)
+                    .await
+                    .err()
+                    .ok_or("a reject generation was created")?;
+                assert_eq!(abend_of(&error), Some((Some(12), OPEN_DALYREJS)), "{shown}");
+                assert_eq!(
+                    error.to_string(),
+                    "ABEND: ERROR OPENING DALY REJECTS FILE (return code 12)"
+                );
+                assert_eq!(
+                    messages(&capture),
+                    [
+                        "CBTRN02C file operation failed",
+                        OPEN_DALYREJS,
+                        "FILE STATUS IS: NNNN0030",
+                        ABEND_LINE,
+                    ],
+                    "{shown}"
+                );
+                assert!(
+                    capture.contains(r#""operation":"OPEN DALYREJS""#),
+                    "{shown}"
+                );
+                assert!(
                 capture.contains(
                     r#""error":"allocating generation (dalyrejs under CARDDEMO_VAR_DIR): not a directory""#
                 ),
                 "{shown}"
             );
-            assert!(!capture.contains(&scratch_name), "{shown} is shown");
-        }
-        for file in [var_file, rejects_file] {
-            assert_eq!(fs::read(&file)?, b"sentinel\n", "{}", file.display());
-        }
-        Ok(())
+                assert!(!capture.contains(&scratch_name), "{shown} is shown");
+            }
+            for file in [var_file, rejects_file] {
+                assert_eq!(fs::read(&file)?, b"sentinel\n", "{}", file.display());
+            }
+            Ok(())
+        })
     }
 
     /// The reject generation holds each reject record as its 350 input bytes, the four-digit
@@ -1621,34 +1840,37 @@ mod tests {
     /// CBTRN02C-028).
     // audit: CBTRN02C-027
     // audit: CBTRN02C-028
-    #[tokio::test]
-    async fn reject_records_are_430_bytes_and_lf_in_the_next_generation() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.path().join("dalyrejs");
-        let lines = [fixture_line(16)?, fixture_line(32)?];
-        let mut rejects = OutputFile::next_generation(&dir, REJECTS_BASE).await?;
-        let mut expected = Vec::new();
-        for line in &lines {
-            let daily = DailyTransactionRecord::decode(line)?;
-            write_reject(
-                &mut rejects,
-                &reject_record(&daily, RejectReason::Overlimit),
-            )
-            .await?;
-            expected.extend_from_slice(line);
-            expected.extend_from_slice(b"0102");
-            expected.extend_from_slice(format!("{:<76}", "OVERLIMIT TRANSACTION").as_bytes());
-            expected.push(b'\n');
-        }
-        let path = close_dalyrejs(rejects).await?;
-        assert_eq!(path, dir.join("DALYREJS.G0001"));
-        let written = fs::read(&path)?;
-        assert_eq!(written.len(), 2 * 431);
-        assert!(written == expected, "the reject records differ");
-        let empty = close_dalyrejs(OutputFile::next_generation(&dir, REJECTS_BASE).await?).await?;
-        assert_eq!(empty, dir.join("DALYREJS.G0002"));
-        assert!(fs::read(&empty)?.is_empty());
-        Ok(())
+    #[test]
+    fn reject_records_are_430_bytes_and_lf_in_the_next_generation() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.path().join("dalyrejs");
+            let lines = [fixture_line(16)?, fixture_line(32)?];
+            let mut rejects = OutputFile::next_generation(&dir, REJECTS_BASE).await?;
+            let mut expected = Vec::new();
+            for line in &lines {
+                let daily = DailyTransactionRecord::decode(line)?;
+                write_reject(
+                    &mut rejects,
+                    &reject_record(&daily, RejectReason::Overlimit),
+                )
+                .await?;
+                expected.extend_from_slice(line);
+                expected.extend_from_slice(b"0102");
+                expected.extend_from_slice(format!("{:<76}", "OVERLIMIT TRANSACTION").as_bytes());
+                expected.push(b'\n');
+            }
+            let path = close_dalyrejs(rejects).await?;
+            assert_eq!(path, dir.join("DALYREJS.G0001"));
+            let written = fs::read(&path)?;
+            assert_eq!(written.len(), 2 * 431);
+            assert!(written == expected, "the reject records differ");
+            let empty =
+                close_dalyrejs(OutputFile::next_generation(&dir, REJECTS_BASE).await?).await?;
+            assert_eq!(empty, dir.join("DALYREJS.G0002"));
+            assert!(fs::read(&empty)?.is_empty());
+            Ok(())
+        })
     }
 
     /// Each open for output or update meets the claim another run holds on its table: the run
@@ -1659,116 +1881,120 @@ mod tests {
     // audit: CBTRN02C-031
     // audit: CBTRN02C-044
     // audit: CBTRN02C-046
-    #[tokio::test]
-    async fn an_open_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
-        let guard = start_loaded_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let scratch = Scratch::new()?;
-        let config = var_config(scratch.path())?;
-        let clock = fixture_clock()?;
-        let ctx = JobContext {
-            store: &store,
-            config: &config,
-            clock: &clock,
-        };
-        let before = tables(&store).await?;
-        assert_eq!(before.2, 0, "the loaded database holds no transaction");
+    #[test]
+    fn an_open_another_run_holds_ends_the_job_before_any_effect() -> TestResult {
+        block_on(async {
+            let guard = start_loaded_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let scratch = Scratch::new()?;
+            let config = var_config(scratch.path())?;
+            let clock = fixture_clock()?;
+            let ctx = JobContext {
+                store: &store,
+                config: &config,
+                clock: &clock,
+            };
+            let before = tables(&store).await?;
+            assert_eq!(before.2, 0, "the loaded database holds no transaction");
 
-        for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
-            let mut held = store.session().await?;
-            assert!(
-                held.claim_writer(open.dataset).await?,
-                "the test claims a free {:?}",
-                open.dataset
-            );
-            let capture = trace_capture::capture();
-            let error = run(&ctx, &dailytran())
-                .await
-                .err()
-                .ok_or("a run passed an open another run holds")?;
-            assert_eq!(
-                abend_of(&error),
-                Some((Some(12), open.in_use)),
-                "{}",
-                open.line
-            );
-            assert_eq!(
-                job_messages(&capture),
-                [START_LINE, open.line, IN_USE_STATUS, ABEND_LINE],
-                "{}",
-                open.line
-            );
-            drop(capture);
-            assert!(
-                tables(&store).await? == before,
-                "{} changed a table",
-                open.line
-            );
-            assert!(
-                generations(&config.dalyrejs_dir())?.is_empty(),
-                "{}",
-                open.line
-            );
-            held.close().await?;
-        }
+            for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
+                let mut held = store.session().await?;
+                assert!(
+                    held.claim_writer(open.dataset).await?,
+                    "the test claims a free {:?}",
+                    open.dataset
+                );
+                let capture = trace_capture::capture();
+                let error = run(&ctx, &dailytran())
+                    .await
+                    .err()
+                    .ok_or("a run passed an open another run holds")?;
+                assert_eq!(
+                    abend_of(&error),
+                    Some((Some(12), open.in_use)),
+                    "{}",
+                    open.line
+                );
+                assert_eq!(
+                    job_messages(&capture),
+                    [START_LINE, open.line, IN_USE_STATUS, ABEND_LINE],
+                    "{}",
+                    open.line
+                );
+                drop(capture);
+                assert!(
+                    tables(&store).await? == before,
+                    "{} changed a table",
+                    open.line
+                );
+                assert!(
+                    generations(&config.dalyrejs_dir())?.is_empty(),
+                    "{}",
+                    open.line
+                );
+                held.close().await?;
+            }
 
-        let outcome = run(&ctx, &dailytran()).await?;
-        assert_eq!(outcome.return_code, 4);
-        assert_eq!(
-            outcome.written,
-            [config.dalyrejs_dir().join("DALYREJS.G0001")]
-        );
-        assert_eq!(tables(&store).await?.2, POSTED);
-        let mut free = store.session().await?;
-        for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
-            assert!(
-                free.claim_writer(open.dataset).await?,
-                "a finished run still holds {:?}",
-                open.dataset
+            let outcome = run(&ctx, &dailytran()).await?;
+            assert_eq!(outcome.return_code, 4);
+            assert_eq!(
+                outcome.written,
+                [config.dalyrejs_dir().join("DALYREJS.G0001")]
             );
-        }
-        free.close().await?;
-        Ok(())
+            assert_eq!(tables(&store).await?.2, POSTED);
+            let mut free = store.session().await?;
+            for open in [&TRANFILE, &ACCTFILE, &TCATBALF] {
+                assert!(
+                    free.claim_writer(open.dataset).await?,
+                    "a finished run still holds {:?}",
+                    open.dataset
+                );
+            }
+            free.close().await?;
+            Ok(())
+        })
     }
 
     /// Two runs started together over the same database: one claims the transaction cluster
     /// and posts the fixtures, the other meets that claim at its first open and ends before it
     /// reads a table, so the tables hold one run's postings and one reject generation exists.
     // audit: CBTRN02C-046
-    #[tokio::test]
-    async fn of_two_runs_at_once_one_posts_and_the_other_is_refused() -> TestResult {
-        let guard = start_loaded_postgres().await?;
-        let store = PgStore::new(guard.pool().clone());
-        let scratch = Scratch::new()?;
-        let config = var_config(scratch.path())?;
-        let clock = fixture_clock()?;
-        let ctx = JobContext {
-            store: &store,
-            config: &config,
-            clock: &clock,
-        };
-        let input = dailytran();
+    #[test]
+    fn of_two_runs_at_once_one_posts_and_the_other_is_refused() -> TestResult {
+        block_on(async {
+            let guard = start_loaded_postgres().await?;
+            let store = PgStore::new(guard.pool().clone());
+            let scratch = Scratch::new()?;
+            let config = var_config(scratch.path())?;
+            let clock = fixture_clock()?;
+            let ctx = JobContext {
+                store: &store,
+                config: &config,
+                clock: &clock,
+            };
+            let input = dailytran();
 
-        let (first, second) = tokio::join!(run(&ctx, &input), run(&ctx, &input));
-        let (posted, refused) = match (first, second) {
-            (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
-            (first, second) => {
-                return Err(format!(
-                    "one run must post and one be refused: {:?}, {:?}",
-                    first.map(|outcome| outcome.return_code),
-                    second.map(|outcome| outcome.return_code)
-                )
-                .into());
-            }
-        };
-        assert_eq!(posted.return_code, 4);
-        assert_eq!(
-            posted.written,
-            [config.dalyrejs_dir().join("DALYREJS.G0001")]
-        );
-        assert_eq!(abend_of(&refused), Some((Some(12), TRANFILE.in_use)));
-        assert_eq!(tables(&store).await?.2, POSTED);
-        assert_eq!(generations(&config.dalyrejs_dir())?, ["DALYREJS.G0001"]);
-        Ok(())
+            let (first, second) = join(run(&ctx, &input), run(&ctx, &input)).await;
+            let (posted, refused) = match (first, second) {
+                (Ok(posted), Err(refused)) | (Err(refused), Ok(posted)) => (posted, refused),
+                (first, second) => {
+                    return Err(format!(
+                        "one run must post and one be refused: {:?}, {:?}",
+                        first.map(|outcome| outcome.return_code),
+                        second.map(|outcome| outcome.return_code)
+                    )
+                    .into());
+                }
+            };
+            assert_eq!(posted.return_code, 4);
+            assert_eq!(
+                posted.written,
+                [config.dalyrejs_dir().join("DALYREJS.G0001")]
+            );
+            assert_eq!(abend_of(&refused), Some((Some(12), TRANFILE.in_use)));
+            assert_eq!(tables(&store).await?.2, POSTED);
+            assert_eq!(generations(&config.dalyrejs_dir())?, ["DALYREJS.G0001"]);
+            Ok(())
+        })
     }
 }

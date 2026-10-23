@@ -1126,6 +1126,7 @@ mod tests {
     use chrono::NaiveDate;
     use copybook::{Count, FixedRecord, PicS, PicU, PicX};
     use proptest::prelude::*;
+    use proptest::strategy::Union;
 
     use super::{
         ABEND_RETURN_CODE, CheckpointAction, DEFAULT_SYSIN, DebugFlag, DetailAction,
@@ -1420,7 +1421,7 @@ mod tests {
     /// punctuation alone, as a password or a well-formed custom card is.
     fn near_the_default_card() -> impl Strategy<Value = Vec<u8>> {
         let byte = || proptest::sample::select(NEAR_DEFAULT_BYTES.to_vec());
-        prop_oneof![
+        Union::new([
             (
                 proptest::collection::vec((0..PRM_INFO_LEN, byte()), 0..=3),
                 proptest::collection::vec(0x20_u8..=0x7e, 0..=SYSIN_RECORD_LEN - PRM_INFO_LEN),
@@ -1434,9 +1435,10 @@ mod tests {
                     }
                     card.extend(tail);
                     card
-                }),
-            proptest::collection::vec(byte(), 0..=PRM_INFO_LEN),
-        ]
+                })
+                .boxed(),
+            proptest::collection::vec(byte(), 0..=PRM_INFO_LEN).boxed(),
+        ])
     }
 
     proptest! {
@@ -1446,10 +1448,10 @@ mod tests {
         // flag, and its PARM RECEIVED line is the masked line.
         #[test]
         fn the_shown_form_is_a_public_value_or_the_mask(
-            bytes in prop_oneof![
-                proptest::collection::vec(0x20_u8..=0x7e, 0..=SYSIN_RECORD_LEN),
-                near_the_default_card(),
-            ]
+            bytes in Union::new([
+                proptest::collection::vec(0x20_u8..=0x7e, 0..=SYSIN_RECORD_LEN).boxed(),
+                near_the_default_card().boxed(),
+            ])
         ) {
             let Ok(params) = PurgeParams::parse(&bytes) else {
                 return Err(TestCaseError::fail("a printable card was refused"));

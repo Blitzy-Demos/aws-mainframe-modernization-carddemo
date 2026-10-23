@@ -57,15 +57,17 @@ posttran, then the pending-authorization seed frontend/e2e/fixtures/pending-auth
 then starts carddemo-api on CARDDEMO_API_BIND and the Vite dev server on
 127.0.0.1:CARDDEMO_WEB_PORT (default 5173), and stops both and removes the stack
 (docker compose down -v) on every exit. It changes to its own modern/ directory first and
-exports modern/.env when present; CARDDEMO_JWT_SECRET must be set. The output of posttran and of
-both servers goes to var/e2e/*.log.
+exports modern/.env when present; CARDDEMO_JWT_SECRET must hold a local value of at least 32
+bytes that is not only whitespace. The output of posttran and of both servers goes to
+var/e2e/*.log.
 
 Exit status:
   0    NAV passed, and the cleanup stopped both servers and removed the stack
-  1    CARDDEMO_JWT_SECRET is empty; posttran's exit status or a row count differs from the
-       audited one; a server exited or did not answer within 120 s; its URL already answered
-       before it was started; or, after an otherwise successful run, the cleanup could not stop
-       a server or remove the stack (docker compose down -v failed 3 times)
+  1    CARDDEMO_JWT_SECRET is empty, blank or shorter than 32 bytes; posttran's exit status or a
+       row count differs from the audited one; a server exited or did not answer within 120 s;
+       its URL already answered before it was started; or, after an otherwise successful run,
+       the cleanup could not stop a server or remove the stack (docker compose down -v failed 3
+       times)
   2    usage error: an unexpected argument
   130  interrupted (SIGINT); 143 terminated (SIGTERM)
   Any other non-zero status is that of the docker, cargo, pnpm or Playwright command that failed.
@@ -98,10 +100,27 @@ if ! [[ $EXPECTED_POSTED_COUNT =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-# Checked before any Docker command: carddemo-api refuses to start without it.
-if [ -z "${CARDDEMO_JWT_SECRET:-}" ]; then
-  echo 'e2e: CARDDEMO_JWT_SECRET is empty or unset; carddemo-api refuses to start without it.' >&2
-  echo 'e2e: in modern/, run cp .env.example .env and set CARDDEMO_JWT_SECRET to a local value.' >&2
+# Checked before any Docker command, by the rule carddemo-api applies at startup
+# (runtime::config::MIN_JWT_SECRET_BYTES): a secret that is unset, empty or only whitespace, or
+# that holds fewer than 32 bytes, keeps the API from starting. Bytes are counted in the C locale;
+# for a value of other whitespace the API's own refusal decides. Neither message shows the value
+# or its length.
+JWT_SECRET_REFUSAL=$(
+  LC_ALL=C
+  secret=${CARDDEMO_JWT_SECRET:-}
+  if [[ $secret =~ ^[[:space:]]*$ ]]; then
+    echo 'is empty, blank or unset; carddemo-api refuses to start without it'
+  elif ((${#secret} < 32)); then
+    echo 'is shorter than 32 bytes; carddemo-api refuses to start with it'
+  fi
+)
+if [ -n "$JWT_SECRET_REFUSAL" ]; then
+  echo "e2e: CARDDEMO_JWT_SECRET $JWT_SECRET_REFUSAL." >&2
+  cat >&2 <<'EOF'
+e2e: in modern/, run cp .env.example .env when .env is missing, then set CARDDEMO_JWT_SECRET in
+e2e: .env to a local value of at least 32 bytes, such as the output of
+e2e:   node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+EOF
   exit 1
 fi
 
@@ -244,9 +263,15 @@ require_unanswered() {
   fi
 }
 
-# Polls URL once a second until it answers, for at most 120 s, printing progress every 10 s.
-# Fails at once when PID, the server started for URL, has exited. Names LOG on failure, never its
-# contents, which can hold request data.
+# Probes URL until it answers with a 2xx status. Each probe waits at most 5 s for an answer, and
+# a failed one is followed by a 1 s pause. After each failed probe it fails at once when PID, the
+# server started for URL, has exited, and gives up when 120 s, counted in whole seconds, have
+# passed since the wait began. Time is checked only then, so a probe that succeeds after the
+# 120 s mark still counts, and the wait can exceed 120 s by about one probe and one pause.
+# Progress is printed after the first failed probe, then after the first failed probe at least
+# 10 s after the previous progress line. Once URL answers it fails when PID has exited, because
+# another process then serves URL. Names LOG on failure, never its contents, which can hold
+# request data.
 wait_for() {
   local url=$1 pid=$2 name=$3 log=$4 start=$SECONDS next=0 elapsed
   until probe "$url"; do

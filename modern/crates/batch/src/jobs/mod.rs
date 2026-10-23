@@ -24,8 +24,12 @@
 //!   (Local-Only Runtime: files only through `std::fs`, under the directories `Config` names).
 //! - The current date and time come only from the injected `Clock` of [`JobContext`].
 //! - No job applies the schema (Single Schema Executor): that is the schema executor binary of
-//!   the `runtime` crate, run before any job, and a job started against a database whose schema
-//!   has not been applied fails at its first query with [`JobError::Persistence`].
+//!   the `runtime` crate, run before any job. A job started against a database whose schema has
+//!   not been applied fails at its first query of a table, through the path its module
+//!   documents: `loads` and `dusrsecj` return [`JobError::Persistence`] (LOADS-021); each `A`,
+//!   `U` and `D` record of `mnttrdb2` fails its statement and the run exits 4 (COBTUPDT-026);
+//!   every other job abends with [`JobError::Abend`], as its program does when an open or a
+//!   read fails.
 //!
 //! # Outputs
 //!
@@ -77,6 +81,8 @@ pub(crate) mod mnttrdb2;
 pub(crate) mod posttran;
 pub(crate) mod tranrept;
 
+#[cfg(target_os = "linux")]
+use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 #[cfg(target_os = "linux")]
@@ -104,6 +110,10 @@ use domain::clock::Clock;
 use persistence::{PersistenceError, PgStore};
 use runtime::config::Config;
 use runtime::telemetry::JobCounter;
+use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
+use tracing::field::{FieldSet, Value};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::pdf::RenderError;
 
@@ -458,12 +468,12 @@ fn load_refused(input: &Path) -> impl FnOnce(LoadError) -> JobError + '_ {
 
 /// Runs `work` on the runtime's blocking pool and waits for its result, so that a step that
 /// blocks its thread, file I/O, a password hash or the PDF rendering, never stalls the job's
-/// task (W011-F05).
+/// task.
 ///
 /// The call is awaited where it is made, never left running: the job goes on only once `work`
 /// has finished, so its steps keep the program's order, and the caller maps what `work`
-/// returns exactly as it did when the step ran inline. `work` emits no tracing event, which
-/// would fall outside the job's span; the caller reports its outcome once back on the task.
+/// returns as its own result. `work` emits no tracing event, which would fall outside the job's
+/// span; the caller reports its outcome once back on the task.
 ///
 /// # Errors
 ///
@@ -472,7 +482,7 @@ fn load_refused(input: &Path) -> impl FnOnce(LoadError) -> JobError + '_ {
 ///
 /// # Panics
 ///
-/// When `work` panics, the panic is resumed here, as it would have panicked inline.
+/// When `work` panics, the panic is resumed here, in the caller.
 async fn blocking<T: Send + 'static>(
     context: &'static str,
     work: impl FnOnce() -> T + Send + 'static,
@@ -573,9 +583,9 @@ const REMOVING_UNFINISHED_OUTPUT: &str = "removing unfinished output";
 /// The cleanup operation of the entries of an output directory's [`DirectoryLock`].
 const REMOVING_DIRECTORY_LOCK: &str = "removing output directory lock";
 
-/// Bytes an [`OutputFile`] buffers before they reach the file: the default capacity of
-/// `std::io::BufWriter`, which the outputs were written through before their I/O moved to the
-/// blocking pool, so that a write fails at the call it failed at then.
+/// Bytes an [`OutputFile`] buffers before they reach the file: 8 KiB, the default capacity of
+/// `std::io::BufWriter`, whose write policy [`OutputFile`] follows, so that a write reaches the
+/// file, and can fail, at the call at which a `BufWriter` would pass it on.
 const BUFFER_CAPACITY: usize = 8 * 1024;
 
 /// The shortest time between two attempts of a run waiting for a held output directory.
@@ -584,20 +594,21 @@ const LOCK_RETRY: Duration = Duration::from_millis(100);
 /// The name of the entry that is the [`DirectoryLock`] of an output directory.
 const LOCK_NAME: &str = ".carddemo-batch.lock";
 
-/// The first part of the name at which a run binds its lock socket before linking it as
-/// [`LOCK_NAME`].
+/// The first part of the name of the directory with which a run claims the lock, binding its
+/// socket inside it before renaming it to [`LOCK_NAME`].
 #[cfg(target_os = "linux")]
 const CLAIM_PREFIX: &str = ".carddemo-batch.claim.";
 
-/// The first part of the name to which a lock whose holder has ended is moved to be removed.
+/// The name of a run's listening socket inside its claim directory, which keeps the name inside
+/// the lock directory the claim becomes.
 #[cfg(target_os = "linux")]
-const STALE_PREFIX: &str = ".carddemo-batch.stale.";
+const HOLDER_SOCKET: &str = "holder";
 
-/// Tells apart the claim and stale names one process makes.
+/// Tells apart the claim names one process makes.
 #[cfg(target_os = "linux")]
 static ENTRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The Unix mode of an output file: read and write for its owner only (W005-F06).
+/// The Unix mode of an output file: read and write for its owner only.
 #[cfg(unix)]
 const OWNER_ONLY_FILE: u32 = 0o600;
 
@@ -610,9 +621,9 @@ const OWNER_ONLY_DIR: u32 = 0o700;
 /// back (`creastmt`).
 ///
 /// On Unix the file is created with mode `0600`, which the process umask can only narrow: its
-/// owner may read and write it, the group and others never (W005-F06). On other platforms it
-/// takes the default access control its directory gives. The content is never altered for this:
-/// it keeps the full card numbers and personal data the COBOL writes.
+/// owner may read and write it, the group and others never. On other platforms it takes the
+/// default access control its directory gives. The content is never altered for this: it keeps
+/// the full card numbers and personal data the COBOL writes.
 fn output_file_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create_new(true);
@@ -651,9 +662,9 @@ fn create_output_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// Which file a directory entry names, so that a cleanup removes a name only while it still
-/// names the file the run created (W005-F01): on Unix the device and inode numbers, which no
-/// other file shares while the file exists. Elsewhere it holds nothing and every entry counts as
-/// the file, so cleanup there goes by name.
+/// names the file the run created: on Unix the device and inode numbers, which no other file
+/// shares while the file exists. Elsewhere it holds nothing and every entry counts as the file,
+/// so cleanup there goes by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileIdentity {
     /// The device of the file system holding the file.
@@ -702,9 +713,10 @@ fn remove_output(path: &Path, identity: FileIdentity) -> Result<(), ErrorKind> {
     }
 }
 
-/// Removes `path` by name: a file whose identity is checked already, or one the calling step
-/// created a moment ago under a name no other run uses, such as a claim name or a file whose
-/// identity could not be read. A file already gone is no failure.
+/// Removes `path` by name: a file whose identity is checked already, one the calling step
+/// created under a name no other run uses, such as a file whose identity could not be read or
+/// the socket of this run's claim or lock directory, or an entry of a dead lock directory, which
+/// no run binds again. A file already gone is no failure.
 ///
 /// # Errors
 ///
@@ -718,11 +730,108 @@ fn remove_by_name(path: &Path) -> Result<(), ErrorKind> {
 }
 
 /// Reports that cleanup `operation` could not remove an output, so that the operator learns a
-/// partial or abandoned file may remain (W015-F02). The event names the static operation and
-/// the error kind only, never the path, which a job builds from its directories, nor a byte of
-/// the file (Cardholder Data Redaction).
+/// partial or abandoned file may remain. The event names the static operation and the error
+/// kind only, never the path, which a job builds from its directories, nor a byte of the file
+/// (Cardholder Data Redaction).
 fn cleanup_failed(operation: &'static str, kind: ErrorKind) {
-    tracing::error!(operation, error_kind = %kind, "output file cleanup failed");
+    /// The callsite of the event.
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    /// The event's metadata: `ERROR`, this module's target, and its three fields.
+    static METADATA: Metadata<'static> = event_metadata(
+        CLEANUP_FAILED,
+        module_path!(),
+        Level::ERROR,
+        &["message", "operation", "error_kind"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&CLEANUP_FAILED),
+            Some(&operation),
+            Some(&tracing::field::display(kind)),
+        ],
+    );
+}
+
+/// The message of the `ERROR` event of [`cleanup_failed`].
+const CLEANUP_FAILED: &str = "output file cleanup failed";
+
+/// Announces that a live run holds the output directory and that this run waits for it to end:
+/// one `WARN` event, which names no path.
+fn waiting_for_holder() {
+    /// The callsite of the event.
+    static SITE: EventSite<1> = EventSite::new(&METADATA);
+    /// The event's metadata: `WARN`, this module's target, and the message alone.
+    static METADATA: Metadata<'static> = event_metadata(
+        WAITING_FOR_HOLDER,
+        module_path!(),
+        Level::WARN,
+        &["message"],
+        &SITE,
+    );
+    emit(&SITE, [Some(&WAITING_FOR_HOLDER)]);
+}
+
+/// The message of the `WARN` event of [`waiting_for_holder`].
+const WAITING_FOR_HOLDER: &str = "another run holds the output directory; waiting for it to end";
+
+/// The callsite of one event of the jobs written without a `tracing` macro, whose metadata names
+/// `N` fields, `message` first.
+///
+/// Every `tracing` event macro expands to an attribute that allows `unused_imports`, and no
+/// source of this workspace, generated source included, holds a lint suppression. Such an event
+/// is therefore written out as two statics in the module that emits it, an `EventSite` and the
+/// [`event_metadata`] it holds, and emitted with [`emit`]. All three take the same `N`, so an
+/// event always carries exactly one value, or `None`, per field it declares.
+struct EventSite<const N: usize>(DefaultCallsite);
+
+impl<const N: usize> EventSite<N> {
+    /// The callsite of the event that `metadata` describes.
+    const fn new(metadata: &'static Metadata<'static>) -> Self {
+        Self(DefaultCallsite::new(metadata))
+    }
+}
+
+/// The metadata of the event `name` at `level`, with the field `names`, for the callsite `site`
+/// in the module `module_path`.
+///
+/// The target and the module path are both `module_path`, which a caller passes as
+/// `module_path!()`: the target a `tracing` macro gives an event, so `RUST_LOG` directives select
+/// the event exactly as they would select a macro's. No source file or line is given: the JSON
+/// output and the span export print neither.
+const fn event_metadata<const N: usize>(
+    name: &'static str,
+    module_path: &'static str,
+    level: Level,
+    names: &'static [&'static str; N],
+    site: &'static EventSite<N>,
+) -> Metadata<'static> {
+    Metadata::new(
+        name,
+        module_path,
+        level,
+        None,
+        None,
+        Some(module_path),
+        FieldSet::new(names, Identifier(&site.0)),
+        Kind::EVENT,
+    )
+}
+
+/// Emits one event of `site` in the current span with `values`, one per field the site names
+/// and in that order, a `None` leaving its field out, when the current subscriber enables it.
+///
+/// The decision is `runtime::telemetry::event_enabled`, which takes the steps an event macro
+/// takes, so the level filters, the JSON layer and the span export treat the event exactly as
+/// they treat a macro's.
+fn emit<const N: usize>(site: &'static EventSite<N>, values: [Option<&dyn Value>; N]) {
+    let callsite = &site.0;
+    if !runtime::telemetry::event_enabled(callsite) {
+        return;
+    }
+    let metadata = callsite.metadata();
+    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
 }
 
 /// The failure of a [`blocking`] step that may leave behind an entry it created: the error the
@@ -804,17 +913,17 @@ async fn remove_outputs(operation: &'static str, outputs: Vec<(PathBuf, FileIden
 /// [`OutputFile::finish`], as when a job returns an error, removes its file; `finish` flushes
 /// it, keeps it and returns its path.
 ///
-/// The file is created exclusively and owner-only (W005-F06), and its identity is recorded at
-/// creation: its guard, and a failed [`OutputFile::finish`], remove the path only while it
-/// still names that file, so a cleanup leaves a file another run has put under the name (see
-/// [`remove_output`]). A fixed name is replaced only under the directory's
-/// [`DirectoryLock`], so no other `carddemo-batch` run replaces the file meanwhile (W005-F01).
+/// The file is created exclusively and owner-only, and its identity is recorded at creation: its
+/// guard, and a failed [`OutputFile::finish`], remove the path only while it still names that
+/// file, so a cleanup leaves a file another run has put under the name (see [`remove_output`]).
+/// A fixed name is replaced only under the directory's [`DirectoryLock`], so no other
+/// `carddemo-batch` run replaces the file meanwhile.
 ///
-/// Every file operation runs as a [`blocking`] step the call awaits (W011-F05). Writes are
-/// buffered as `std::io::BufWriter` buffers them, [`BUFFER_CAPACITY`] bytes at most, so a write
-/// reaches the file, and can fail, at the same call as when the file was written inline. The
-/// guard is the flag `armed` rather than the handle, which a step in flight may still share when
-/// a cancelled job drops the value: the file is removed all the same.
+/// Every file operation runs as a [`blocking`] step the call awaits. Writes are buffered as
+/// `std::io::BufWriter` buffers them, [`BUFFER_CAPACITY`] bytes at most, so a write reaches the
+/// file, and can fail, at the call at which a `BufWriter` would pass it on. The guard is the
+/// flag `armed` rather than the handle, which a step in flight may still share when a cancelled
+/// job drops the value: the file is removed all the same.
 pub(crate) struct OutputFile {
     /// Where the file is, as built from the directory the job passed.
     path: PathBuf,
@@ -859,7 +968,7 @@ impl OutputFile {
     /// fixed-name replacement of `CREASTMT.JCL`, whose `STEP030` deletes the previous
     /// `STATEMNT.PS` and `STATEMNT.HTML` with `IEFBR14` and `DISP=(MOD,DELETE,DELETE)` before
     /// `STEP040` writes them again (`creastmt`; CBSTM03A-002). Requiring the lock makes the
-    /// removal by name safe: no other run can be writing that file (W005-F01).
+    /// removal by name safe: no other run can be writing that file.
     ///
     /// # Errors
     ///
@@ -986,8 +1095,8 @@ impl OutputFile {
     ///
     /// [`JobError::Io`] with context `finishing output` when the buffered bytes cannot be
     /// written or synced. The file is removed then, as the job ends without it, while its path
-    /// still names it; a removal that fails is reported as cleanup `removing unfinished output`
-    /// (W015-F02), and the error returned is still the write's.
+    /// still names it; a removal that fails is reported as cleanup `removing unfinished output`,
+    /// and the error returned is still the write's.
     pub(crate) async fn finish(mut self) -> Result<PathBuf, JobError> {
         let pending = std::mem::take(&mut self.pending);
         let file = Arc::clone(&self.file);
@@ -1063,8 +1172,8 @@ impl Drop for OutputFile {
             // the file is removed in place. The buffered bytes are discarded with the value; the
             // handle closes once its last owner drops it, and removing a file still open is
             // allowed on Unix, while Windows std opens every file with delete sharing. The path
-            // is removed only while it still names this file (W005-F01), and a failed removal is
-            // reported like every other cleanup failure (W015-F02).
+            // is removed only while it still names this file, and a failed removal is reported
+            // like every other cleanup failure.
             if let Err(kind) = remove_output(&self.path, self.identity) {
                 cleanup_failed(REMOVING_UNFINISHED_OUTPUT, kind);
             }
@@ -1073,8 +1182,8 @@ impl Drop for OutputFile {
 }
 
 /// The exclusive use of one output directory by one run at a time, across processes and
-/// namespaces: the guard of the three fixed-name statement files of `creastmt` (W005-F01;
-/// CBSTM03A-002, CBSTM03A-049, CBSTM03A-050).
+/// namespaces: the guard of the three fixed-name statement files of `creastmt` (CBSTM03A-002,
+/// CBSTM03A-049, CBSTM03A-050).
 ///
 /// `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PDF` keep their names from run to run: a run
 /// removes the previous run's files by name. Two runs over one directory could therefore remove
@@ -1088,28 +1197,39 @@ impl Drop for OutputFile {
 /// waits until the holder ends, as a z/OS job waits on the enqueue of a data set another job has
 /// allocated, rather than failing.
 ///
-/// - Linux: the lock name is a Unix socket file that listens while its run holds the lock and
-///   never accepts a connection. A connection to a socket file reaches the socket through the
-///   file's inode, from any namespace that sees the directory, and succeeds exactly while the
-///   holding process keeps the socket open, which the kernel ends when the process ends, however
-///   it ends. A run takes the lock by binding a listening socket at a claim name of its own,
-///   `.carddemo-batch.claim.<pid>.<nanos>.<sequence>`, linking that file as the lock name, which
-///   fails while the name exists, and removing the claim name. As the socket listens before the
-///   lock name exists, a refused connection to a lock name that names the same file before and
-///   after proves its holder ended without releasing it, as a killed run does: that lock is
-///   broken, moved to a `.carddemo-batch.stale.` name and removed there, and taken at once,
-///   without waiting. A run that finds a live holder keeps its connection, which the kernel ends
-///   when the holder's socket closes, and tries again then, at most once per [`LOCK_RETRY`]; so
-///   each waiting run queues one connection on the holder's socket, which `std` listens with at
-///   the system's maximum backlog, and once that many runs wait, a further run's connection
-///   blocks until the holder ends, which is the same wait, though without its warning. Every
-///   entry is addressed as
-///   `/proc/self/fd/<descriptor>/<name>` through a handle on the directory kept for the lock's
-///   lifetime, so that a socket path fits the 108 bytes of a socket address whatever the length
-///   of the directory's own path: a Linux run needs `/proc` mounted. One race remains: when a
-///   lock is broken just as a second run takes the freed name, the breaking run finds the moved
-///   file is not the dead one and links it back, unless a third run has taken the name
-///   meanwhile; it needs a killed holder and three runs within one probe.
+/// - Linux: the lock name is a directory holding its run's Unix socket `holder`, which listens
+///   while the run holds the lock and never accepts a connection. The directory is held exactly
+///   while the lock name is a directory with entries, one of them a listening socket. A
+///   connection to a socket file reaches the socket through the file's inode, from any
+///   namespace that sees the directory, and succeeds exactly while the holding process keeps
+///   the socket open, which the kernel ends when the process ends, however it ends: the kernel
+///   releases a killed run's lock by closing its socket. A run claims the lock with a directory
+///   of its own, `.carddemo-batch.claim.<pid>.<nanos>.<sequence>`, accessible to its owner only,
+///   binds its listening socket inside it, and renames the claim to the lock name. The kernel
+///   renames a directory onto an existing name only when that name is an empty directory, so
+///   the rename takes a free lock and never displaces a held one, and the socket listens before
+///   its directory can become the lock. A run whose rename finds the name held opens the lock
+///   directory and connects to each of its entries. A connection made proves a live holder: the
+///   run removes its claim, keeps the connection, which the kernel ends when the holder's socket
+///   closes, and tries again then, at most once per [`LOCK_RETRY`]; so each waiting run queues
+///   one connection on the holder's socket, which `std` listens with at the system's maximum
+///   backlog, and once that many runs wait, a further run's connection blocks until the holder
+///   ends, which is the same wait, though without its warning. Every connection refused proves
+///   the holder ended without giving the lock up, as a killed run does: the run removes the
+///   entries through its own handle on the directory it probed, which reaches that directory
+///   alone, never one renamed to the lock name since, and renames its claim onto the emptied
+///   directory at once, without waiting. A lock directory gains no socket after its rename, so
+///   a refused entry never comes back to life, and of two runs that found one lock dead, the
+///   first to rename takes the lock and the other finds it held. A run gives the lock up by
+///   removing its socket, then the lock name, which the kernel removes only while it is an empty
+///   directory, so a run that has renamed its claim there meanwhile keeps its lock. An entry at
+///   the lock name that is no directory, such as the socket file or the regular file of an
+///   earlier lock, holds nothing: it is removed by name, which never removes a directory, and
+///   the rename tried again. Every entry is addressed as `/proc/self/fd/<descriptor>/<name>`
+///   through a handle on its directory, kept for the lock's lifetime, so that a socket path fits
+///   the 108 bytes of a socket address whatever the length of the directory's own path: a Linux
+///   run needs `/proc` mounted. A run killed while it claims leaves its claim directory behind,
+///   which holds no lock.
 /// - Other platforms: the lock is the file `.carddemo-batch.lock`, created exclusively and
 ///   removed at release while it is still the file the run created. A run killed before its end
 ///   leaves the file behind, and the next run then waits until an operator removes it.
@@ -1134,7 +1254,7 @@ impl DirectoryLock {
     /// [`JobError::Io`] with context `creating output directory` when `dir` cannot be created,
     /// and with context `locking output directory` when the lock cannot be taken for any other
     /// reason than another run holding it; a lock entry the attempt made and could not remove
-    /// again is reported as cleanup `removing output directory lock` (W015-F02).
+    /// again is reported as cleanup `removing output directory lock`.
     pub(crate) async fn acquire(dir: &Path) -> Result<Self, JobError> {
         let dir = dir.to_path_buf();
         let target = dir.clone();
@@ -1147,7 +1267,7 @@ impl DirectoryLock {
         let held = match first {
             Attempt::Taken(held) => held,
             Attempt::Busy(busy) => {
-                tracing::warn!("another run holds the output directory; waiting for it to end");
+                waiting_for_holder();
                 blocking(LOCKING_OUTPUT_DIRECTORY, move || Held::wait(busy))
                     .await?
                     .map_err(Failure::reported)?
@@ -1164,11 +1284,11 @@ impl DirectoryLock {
         &self.dir
     }
 
-    /// Gives the lock up in a [`blocking`] step: removes the lock entry while it is still this
+    /// Gives the lock up in a [`blocking`] step: removes this run's lock entry, never another
     /// run's, then closes it, so that a waiting run takes the lock. `creastmt` calls this once
     /// its files are completed or removed. A removal that fails is reported as cleanup
-    /// `removing output directory lock` (W015-F02); on Linux the entry left is the lock of a run
-    /// that has ended, which the next run breaks.
+    /// `removing output directory lock`; on Linux the entry left is then the lock of a run that
+    /// has ended, which the next run takes over at once.
     pub(crate) async fn release(mut self) {
         let Some(held) = self.held.take() else {
             return;
@@ -1188,7 +1308,7 @@ impl Drop for DirectoryLock {
             // The last-resort release of a run that returns early or is cancelled before
             // `release`. A drop cannot await a blocking step, and a step spawned here would be
             // one nobody waits for, so the lock is given up in place. A failed removal is
-            // reported like every other cleanup failure (W015-F02).
+            // reported like every other cleanup failure.
             if let Err(kind) = held.release() {
                 cleanup_failed(REMOVING_DIRECTORY_LOCK, kind);
             }
@@ -1204,35 +1324,60 @@ enum Attempt {
     Busy(Busy),
 }
 
-/// The lock of an output directory on Linux, while this run holds it.
+/// The lock of an output directory on Linux, while this run holds it: the lock name is this
+/// run's lock directory, the claim it renamed there, with its listening socket inside.
 #[cfg(target_os = "linux")]
 struct Held {
-    /// The open directory, through which every lock entry is addressed.
+    /// The open output directory, through which the lock name is addressed.
     directory: File,
-    /// The socket the lock name names, listening until this value drops; it never accepts.
+    /// The open lock directory, through which the release reaches this run's socket.
+    lock: File,
+    /// The socket inside the lock directory, listening until this value drops; it never accepts.
     _listener: UnixListener,
-    /// The identity of the socket file, by which the release knows the lock name is its own.
-    identity: FileIdentity,
 }
 
 /// What a run that found a live holder of the lock waits with, on Linux.
 #[cfg(target_os = "linux")]
 struct Busy {
-    /// The open directory, as the lock keeps it.
+    /// The open output directory, as the lock keeps it.
     directory: File,
     /// The connection to the holder's socket, which the kernel ends when that socket closes.
     holder: UnixStream,
 }
 
-/// What a probe of an existing lock name found, on Linux.
+/// One attempt's claim on the lock of an output directory, on Linux: a directory of a name no
+/// other attempt uses, accessible to its owner only, with the run's listening socket inside,
+/// which [`Claim::take`] renames to the lock name.
+#[cfg(target_os = "linux")]
+struct Claim {
+    /// The claim directory's name in the output directory.
+    name: String,
+    /// The open claim directory, the lock directory once renamed.
+    handle: File,
+    /// The socket [`HOLDER_SOCKET`] inside the claim directory, listening since before the claim
+    /// can become the lock; it never accepts.
+    listener: UnixListener,
+}
+
+/// What a probe of the lock name found, on Linux.
 #[cfg(target_os = "linux")]
 enum Probe {
     /// A live run holds the lock: the connection made to its socket.
     Live(UnixStream),
-    /// The name is gone, or names another file than before: link again.
+    /// The name is gone, names no directory, or named one removed meanwhile: rename again.
     Changed,
-    /// The name still names the socket of a run that ended without giving the lock up.
-    Dead(FileIdentity),
+    /// The name named a directory with no live socket, a lock whose run ended without giving it
+    /// up, or an emptied one.
+    Dead(Dead),
+}
+
+/// A lock directory that a probe found with no live socket, on Linux.
+#[cfg(target_os = "linux")]
+struct Dead {
+    /// The open directory the probe connected through.
+    handle: File,
+    /// The names of its entries, each of which refused the connection.
+    entries: Vec<OsString>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1249,165 +1394,139 @@ impl Held {
         Self::attempt_in(directory)
     }
 
-    /// One attempt at the lock of the open `directory`: binds a listening socket at a claim name
-    /// of its own, links it as the lock name, breaking on the way a lock whose holder has ended,
-    /// and removes the claim name, which leaves the socket reachable through the lock name alone.
+    /// One attempt at the lock of the open `directory`: a new claim contends for the lock
+    /// ([`Held::contend`]), and the outcome is settled ([`Held::settle`]).
     ///
     /// # Errors
     ///
-    /// [`JobError::Io`] with context `locking output directory` for the step that failed. A lock
-    /// taken whose claim name cannot be removed is released again; a lock entry the attempt made
-    /// and could not remove is reported as cleanup `removing output directory lock`.
+    /// As [`Claim::new`] and [`Held::settle`].
     fn attempt_in(directory: File) -> Result<Attempt, Failure> {
-        let (listener, claim) =
-            Self::bind_claim(&directory).map_err(io(LOCKING_OUTPUT_DIRECTORY))?;
-        let lock = Self::entry(&directory, LOCK_NAME);
-        let linked = fs::symlink_metadata(&claim).and_then(|metadata| {
-            let identity = FileIdentity::of(&metadata);
-            Self::link(&directory, &claim, &lock).map(|holder| (identity, holder))
-        });
-        let unclaimed = remove_by_name(&claim);
-        match (linked, unclaimed) {
-            (Ok((identity, None)), Ok(())) => Ok(Attempt::Taken(Self {
+        let claim = Claim::new(&directory)?;
+        let contended = Self::contend(&directory, &claim);
+        Self::settle(directory, claim, contended)
+    }
+
+    /// The path of the directory open as `directory`, through this process's descriptor of it,
+    /// which reaches that directory wherever it has since been renamed.
+    fn handle_path(directory: &File) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", directory.as_raw_fd()))
+    }
+
+    /// The path of entry `name` of the directory open as `directory`, through
+    /// [`Held::handle_path`], which a socket address holds whatever the length of the
+    /// directory's own path.
+    fn entry(directory: &File, name: impl AsRef<Path>) -> PathBuf {
+        Self::handle_path(directory).join(name)
+    }
+
+    /// Contends for the lock of `directory` with `claim` until the lock is taken or found held:
+    /// renames the claim to the lock name ([`Claim::take`]) and, while the name is held, probes
+    /// the lock ([`Held::probe`]) and clears a dead one ([`Dead::clear`]) before renaming
+    /// again. `None` once the lock is taken, or the connection to the socket of the live run
+    /// that holds it.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a rename, probe or clearing that failed.
+    fn contend(directory: &File, claim: &Claim) -> io::Result<Option<UnixStream>> {
+        loop {
+            if claim.take(directory)? {
+                return Ok(None);
+            }
+            match Self::probe(directory)? {
+                Probe::Live(holder) => return Ok(Some(holder)),
+                Probe::Changed => {}
+                Probe::Dead(dead) => dead.clear()?,
+            }
+        }
+    }
+
+    /// What the contention `contended` of `claim` for the lock of `directory` comes to: the
+    /// lock, once the claim is the lock name, or, when a live run holds it, the wait for that
+    /// run, once the claim is removed.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Io`] with context `locking output directory` when the contention failed, or
+    /// when the claim of a run that found the lock held cannot be removed. The claim of a failed
+    /// contention is removed, with cleanup `removing output directory lock` when that fails.
+    fn settle(
+        directory: File,
+        claim: Claim,
+        contended: io::Result<Option<UnixStream>>,
+    ) -> Result<Attempt, Failure> {
+        match contended {
+            Ok(None) => Ok(Attempt::Taken(Self {
                 directory,
-                _listener: listener,
-                identity,
+                lock: claim.handle,
+                _listener: claim.listener,
             })),
-            (Ok((identity, None)), Err(kind)) => {
-                let held = Self {
-                    directory,
-                    _listener: listener,
-                    identity,
-                };
-                Err(Failure::after_cleanup(
-                    JobError::Io {
-                        context: LOCKING_OUTPUT_DIRECTORY,
-                        kind,
-                    },
-                    REMOVING_DIRECTORY_LOCK,
-                    held.release(),
-                ))
-            }
-            (Ok((_, Some(holder))), Ok(())) => Ok(Attempt::Busy(Busy { directory, holder })),
-            (Ok((_, Some(_))), Err(kind)) => Err(JobError::Io {
-                context: LOCKING_OUTPUT_DIRECTORY,
-                kind,
-            }
-            .into()),
-            (Err(error), unclaimed) => Err(Failure::after_cleanup(
+            Ok(Some(holder)) => match claim.withdraw(&directory) {
+                Ok(()) => Ok(Attempt::Busy(Busy { directory, holder })),
+                Err(kind) => Err(JobError::Io {
+                    context: LOCKING_OUTPUT_DIRECTORY,
+                    kind,
+                }
+                .into()),
+            },
+            Err(error) => Err(Failure::after_cleanup(
                 io(LOCKING_OUTPUT_DIRECTORY)(error),
                 REMOVING_DIRECTORY_LOCK,
-                unclaimed,
+                claim.withdraw(&directory),
             )),
         }
     }
 
-    /// The path of entry `name` of `directory` through this process's descriptor of it, which
-    /// a socket address holds whatever the length of the directory's own path.
-    fn entry(directory: &File, name: &str) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}/{name}", directory.as_raw_fd()))
-    }
-
-    /// Binds a listening socket at a new claim name in `directory`, and gives it with the claim
-    /// name's path. A name already bound, as one of the same process ID in another PID namespace
-    /// may be, is passed over for the next.
+    /// Finds out whether a live run holds the lock of `directory`: opens the lock name as a
+    /// directory, then connects to each of its entries through that handle. A connection
+    /// succeeds while its socket listens, and is refused once the socket has closed and by an
+    /// entry that is no socket.
     ///
     /// # Errors
     ///
-    /// The I/O error of a bind that failed for another reason.
-    fn bind_claim(directory: &File) -> io::Result<(UnixListener, PathBuf)> {
-        loop {
-            let claim = Self::entry(directory, &unique_name(CLAIM_PREFIX));
-            match UnixListener::bind(&claim) {
-                Ok(listener) => return Ok((listener, claim)),
-                Err(error) if error.kind() == ErrorKind::AddrInUse => {}
-                Err(error) => return Err(error),
+    /// The I/O error of an open, a listing or a connection that failed otherwise.
+    fn probe(directory: &File) -> io::Result<Probe> {
+        // The trailing `.` resolves only through a directory, so the open fails for any other
+        // kind of entry rather than opening it.
+        let lock = match File::open(Self::entry(directory, LOCK_NAME).join(".")) {
+            Ok(lock) => lock,
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
+                return Ok(Probe::Changed);
             }
-        }
-    }
-
-    /// Links `claim` as the lock name `lock`: `None` once linked, or the connection to the
-    /// socket of the live run that holds the lock. A lock whose holder has ended is broken on the
-    /// way and the link tried again, as it is when the lock name changed during the probe.
-    ///
-    /// # Errors
-    ///
-    /// The I/O error of a link, probe or break that failed.
-    fn link(directory: &File, claim: &Path, lock: &Path) -> io::Result<Option<UnixStream>> {
-        loop {
-            match fs::hard_link(claim, lock) {
-                Ok(()) => return Ok(None),
-                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            match Self::probe(lock)? {
-                Probe::Live(holder) => return Ok(Some(holder)),
-                Probe::Changed => {}
-                Probe::Dead(dead) => Self::break_dead(directory, lock, dead)?,
-            }
-        }
-    }
-
-    /// Finds out whether the run whose socket the existing lock name `lock` names still runs: a
-    /// connection succeeds while that socket listens and is refused once it has closed. The name
-    /// is read before and after a refused connection, so that the refusal counts only for the
-    /// file the name named throughout.
-    ///
-    /// # Errors
-    ///
-    /// The I/O error of a read of the name, or of a connection that failed otherwise.
-    fn probe(lock: &Path) -> io::Result<Probe> {
-        let before = match fs::symlink_metadata(lock) {
-            Ok(metadata) => FileIdentity::of(&metadata),
+            Err(error) => return Err(error),
+        };
+        let listing = match fs::read_dir(Self::handle_path(&lock)) {
+            Ok(listing) => listing,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Probe::Changed),
             Err(error) => return Err(error),
         };
-        match UnixStream::connect(lock) {
-            Ok(holder) => Ok(Probe::Live(holder)),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(Probe::Changed),
-            Err(error) if error.kind() == ErrorKind::ConnectionRefused => {
-                match fs::symlink_metadata(lock) {
-                    Ok(metadata) if FileIdentity::of(&metadata) == before => {
-                        Ok(Probe::Dead(before))
-                    }
-                    Ok(_) => Ok(Probe::Changed),
-                    Err(error) if error.kind() == ErrorKind::NotFound => Ok(Probe::Changed),
-                    Err(error) => Err(error),
+        let mut entries = Vec::new();
+        for entry in listing {
+            let name = match entry {
+                Ok(entry) => entry.file_name(),
+                // A directory removed since it was opened lists nothing.
+                Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Probe::Changed),
+                Err(error) => return Err(error),
+            };
+            match UnixStream::connect(Self::entry(&lock, &name)) {
+                Ok(holder) => return Ok(Probe::Live(holder)),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::ConnectionRefused | ErrorKind::NotFound
+                    ) =>
+                {
+                    entries.push(name);
                 }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
         }
-    }
-
-    /// Breaks the lock whose name `lock` still names `dead`, the socket of a run that ended
-    /// without giving the lock up: moves the name to a new stale name, then removes that. When
-    /// the moved file is not `dead`, a run took the freed name between the probe and the move,
-    /// and its lock is linked back under the lock name, unless a third run has taken the name
-    /// meanwhile: the one race [`DirectoryLock`] leaves.
-    ///
-    /// # Errors
-    ///
-    /// The I/O error of a move, a link back or a removal that failed. The stale name is removed
-    /// whatever happened before it.
-    fn break_dead(directory: &File, lock: &Path, dead: FileIdentity) -> io::Result<()> {
-        let stale = Self::entry(directory, &unique_name(STALE_PREFIX));
-        match fs::rename(lock, &stale) {
-            Ok(()) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
-        }
-        let moved_dead =
-            fs::symlink_metadata(&stale).is_ok_and(|moved| FileIdentity::of(&moved) == dead);
-        let restored = if moved_dead {
-            Ok(())
-        } else {
-            match fs::hard_link(&stale, lock) {
-                Err(error) if error.kind() != ErrorKind::AlreadyExists => Err(error),
-                _ => Ok(()),
-            }
-        };
-        let removed = remove_by_name(&stale).map_err(io::Error::from);
-        restored.and(removed)
+        Ok(Probe::Dead(Dead {
+            handle: lock,
+            entries,
+        }))
     }
 
     /// Waits until the live holder `busy` found ends, then tries again, waiting the same way for
@@ -1445,15 +1564,165 @@ impl Held {
         }
     }
 
-    /// Gives the lock up: removes the lock name while it still names this lock's socket, then
-    /// closes the socket and the directory handle as `self` drops. The name goes first, while
-    /// the socket still listens, so that no run finds the lock dead and breaks it meanwhile.
+    /// Gives the lock up: removes this run's socket through the lock directory's own handle,
+    /// then the lock name, which the kernel removes only while it is an empty directory, then
+    /// closes the socket and the handles as `self` drops. A run that renamed its claim onto the
+    /// emptied directory in between holds the lock name by then and keeps it, as does any other
+    /// entry there.
+    ///
+    /// # Errors
+    ///
+    /// The kind of a removal that failed otherwise.
+    fn release(self) -> Result<(), ErrorKind> {
+        remove_by_name(&Self::entry(&self.lock, HOLDER_SOCKET))?;
+        match fs::remove_dir(Self::entry(&self.directory, LOCK_NAME)) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    ErrorKind::NotFound
+                        | ErrorKind::DirectoryNotEmpty
+                        | ErrorKind::AlreadyExists
+                        | ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(error.kind()),
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Claim {
+    /// Makes a claim in `directory`: creates a claim directory under a new name, owner-only,
+    /// opens it, and binds the listening socket [`HOLDER_SOCKET`] inside it. A name already
+    /// taken, as one of the same process ID in another PID namespace may be, is passed over for
+    /// the next.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Io`] with context `locking output directory` for the step that failed; a
+    /// claim directory made and not removed again is reported as cleanup `removing output
+    /// directory lock`.
+    fn new(directory: &File) -> Result<Self, Failure> {
+        let mut builder = DirBuilder::new();
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, OWNER_ONLY_DIR);
+        let name = loop {
+            let name = unique_name(CLAIM_PREFIX);
+            match builder.create(Held::entry(directory, &name)) {
+                Ok(()) => break name,
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(io(LOCKING_OUTPUT_DIRECTORY)(error).into()),
+            }
+        };
+        let path = Held::entry(directory, &name);
+        let bound = File::open(&path).and_then(|handle| {
+            UnixListener::bind(Held::entry(&handle, HOLDER_SOCKET))
+                .map(|listener| (handle, listener))
+        });
+        match bound {
+            Ok((handle, listener)) => Ok(Self {
+                name,
+                handle,
+                listener,
+            }),
+            Err(error) => {
+                // A bind that failed only to listen leaves its socket file.
+                let removed = remove_by_name(&path.join(HOLDER_SOCKET))
+                    .and_then(|()| remove_claim_dir(&path));
+                Err(Failure::after_cleanup(
+                    io(LOCKING_OUTPUT_DIRECTORY)(error),
+                    REMOVING_DIRECTORY_LOCK,
+                    removed,
+                ))
+            }
+        }
+    }
+
+    /// Renames the claim directory to the lock name of `directory`: `true` once the claim is
+    /// the lock, and `false` when a directory with entries holds the name. The kernel renames a
+    /// directory onto an existing name only when that is an empty directory, which it replaces,
+    /// so the rename takes a free lock and never displaces a held one. A name that holds no
+    /// directory holds no lock, such as the socket file or the regular file of an earlier lock:
+    /// it is removed by name, which never removes a directory, and the rename tried again.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a rename or a removal that failed otherwise.
+    fn take(&self, directory: &File) -> io::Result<bool> {
+        let lock = Held::entry(directory, LOCK_NAME);
+        loop {
+            match fs::rename(Held::entry(directory, &self.name), &lock) {
+                Ok(()) => return Ok(true),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        ErrorKind::DirectoryNotEmpty | ErrorKind::AlreadyExists
+                    ) =>
+                {
+                    return Ok(false);
+                }
+                Err(error) if error.kind() == ErrorKind::NotADirectory => {
+                    match fs::remove_file(&lock) {
+                        Ok(()) => {}
+                        // Gone, or a directory by now: the next rename finds out which.
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                ErrorKind::NotFound | ErrorKind::IsADirectory
+                            ) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Removes the claim of a run that found the lock held, or failed to contend: its socket,
+    /// through the claim directory's own handle, then the claim directory, whose name no other
+    /// attempt uses; the socket closes as `self` drops.
     ///
     /// # Errors
     ///
     /// The kind of a removal that failed.
-    fn release(self) -> Result<(), ErrorKind> {
-        remove_output(&Self::entry(&self.directory, LOCK_NAME), self.identity)
+    fn withdraw(self, directory: &File) -> Result<(), ErrorKind> {
+        remove_by_name(&Held::entry(&self.handle, HOLDER_SOCKET))?;
+        remove_claim_dir(&Held::entry(directory, &self.name))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Dead {
+    /// Removes the entries the probe found refused, through the probed directory's own handle,
+    /// so that the removal reaches that directory alone, whatever the lock name holds by now.
+    /// An entry already gone is passed over. The emptied directory is the next rename's to
+    /// replace.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error of a removal that failed otherwise.
+    fn clear(self) -> io::Result<()> {
+        for name in &self.entries {
+            remove_by_name(&Held::entry(&self.handle, name)).map_err(io::Error::from)?;
+        }
+        Ok(())
+    }
+}
+
+/// Removes the empty claim directory at `path`, of a name only the calling attempt uses. A
+/// directory already gone is no failure.
+///
+/// # Errors
+///
+/// The kind of any other failure.
+#[cfg(target_os = "linux")]
+fn remove_claim_dir(path: &Path) -> Result<(), ErrorKind> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.kind()),
     }
 }
 
@@ -1554,8 +1823,14 @@ mod tests {
     use std::error::Error;
     use std::fs;
     use std::io::{ErrorKind, Read as _};
+    #[cfg(target_os = "linux")]
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+    #[cfg(target_os = "linux")]
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(target_os = "linux")]
+    use std::sync::{Barrier, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use copybook::PicU;
@@ -1568,8 +1843,33 @@ mod tests {
         Attempt, DirectoryLock, Failure, Held, JobError, LOCK_NAME, LOCK_RETRY, OutputFile,
         blocking, read_input, read_named_input, remove_outputs,
     };
+    #[cfg(target_os = "linux")]
+    use super::{Claim, Dead, FileIdentity, HOLDER_SOCKET, Probe};
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// What a thread of a test returns: an error that can cross back to the test's thread.
+    #[cfg(target_os = "linux")]
+    type ThreadResult = Result<(), Box<dyn Error + Send + Sync>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the runtime tokio's test attribute
+    /// builds by default, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
+    /// Runs `test` to completion on a multi-thread runtime of two workers, for a test whose
+    /// spawned run must make progress while the test's own thread blocks.
+    fn block_on_two_workers(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// The entry names of `dir`, sorted.
     fn names(dir: &Path) -> Result<Vec<String>, Box<dyn Error>> {
@@ -1592,14 +1892,15 @@ mod tests {
         }
     }
 
-    /// A socket listening at the lock name of the existing directory `dir`, bound as a run in
-    /// another network namespace binds it: the two meet only through the directory.
+    /// A lock directory in the existing directory `dir` with a socket listening inside, bound
+    /// through the lock directory as a run in another network namespace binds it: the two meet
+    /// only through the directory.
     #[cfg(target_os = "linux")]
-    fn foreign_holder(dir: &Path) -> Result<std::os::unix::net::UnixListener, Box<dyn Error>> {
-        let directory = fs::File::open(dir)?;
-        Ok(std::os::unix::net::UnixListener::bind(Held::entry(
-            &directory, LOCK_NAME,
-        ))?)
+    fn foreign_holder(dir: &Path) -> Result<UnixListener, Box<dyn Error>> {
+        let lock = dir.join(LOCK_NAME);
+        fs::create_dir(&lock)?;
+        let directory = fs::File::open(&lock)?;
+        Ok(UnixListener::bind(Held::entry(&directory, HOLDER_SOCKET))?)
     }
 
     /// Tells apart the scratch directories of the tests of one process.
@@ -1634,296 +1935,316 @@ mod tests {
 
     /// Records keep their order and LF whether they stay within one buffer or cross it many
     /// times: 2 short records, then 100 records of 430 bytes, five buffers' worth.
-    #[tokio::test]
-    async fn records_end_with_lf() -> TestResult {
-        let long: &[u8] = &[b'R'; 430];
-        let cases: [&[&[u8]]; 2] = [&[b"rec1", b"rec2"], &[long; 100]];
-        for records in cases {
-            let scratch = Scratch::new()?;
-            let mut output = OutputFile::next_generation(scratch.path(), "DALYREJS").await?;
-            let mut expected = Vec::new();
-            for record in records {
-                output.write_record(record).await?;
-                expected.extend_from_slice(record);
-                expected.push(b'\n');
+    #[test]
+    fn records_end_with_lf() -> TestResult {
+        block_on(async {
+            let long: &[u8] = &[b'R'; 430];
+            let cases: [&[&[u8]]; 2] = [&[b"rec1", b"rec2"], &[long; 100]];
+            for records in cases {
+                let scratch = Scratch::new()?;
+                let mut output = OutputFile::next_generation(scratch.path(), "DALYREJS").await?;
+                let mut expected = Vec::new();
+                for record in records {
+                    output.write_record(record).await?;
+                    expected.extend_from_slice(record);
+                    expected.push(b'\n');
+                }
+                let path = output.finish().await?;
+                assert!(fs::read(&path)? == expected, "{} records", records.len());
             }
-            let path = output.finish().await?;
-            assert!(fs::read(&path)? == expected, "{} records", records.len());
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Raw bytes get no terminator, and bytes larger than the buffer, written at once, still
     /// follow the bytes buffered before them.
-    #[tokio::test]
-    async fn raw_bytes_get_no_terminator() -> TestResult {
-        let scratch = Scratch::new()?;
-        let lock = DirectoryLock::acquire(scratch.path()).await?;
-        let mut output = OutputFile::replace(&lock, "STATEMNT.PDF").await?;
-        let large = vec![b'x'; 3 * super::BUFFER_CAPACITY];
-        output.write_bytes(b"%PDF-1.3".to_vec()).await?;
-        output.write_bytes(large.clone()).await?;
-        output.write_bytes(b" %%EOF".to_vec()).await?;
-        let path = output.finish().await?;
-        let mut expected = b"%PDF-1.3".to_vec();
-        expected.extend_from_slice(&large);
-        expected.extend_from_slice(b" %%EOF");
-        assert!(fs::read(&path)? == expected, "the bytes differ");
-        Ok(())
+    #[test]
+    fn raw_bytes_get_no_terminator() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let lock = DirectoryLock::acquire(scratch.path()).await?;
+            let mut output = OutputFile::replace(&lock, "STATEMNT.PDF").await?;
+            let large = vec![b'x'; 3 * super::BUFFER_CAPACITY];
+            output.write_bytes(b"%PDF-1.3".to_vec()).await?;
+            output.write_bytes(large.clone()).await?;
+            output.write_bytes(b" %%EOF".to_vec()).await?;
+            let path = output.finish().await?;
+            let mut expected = b"%PDF-1.3".to_vec();
+            expected.extend_from_slice(&large);
+            expected.extend_from_slice(b" %%EOF");
+            assert!(fs::read(&path)? == expected, "the bytes differ");
+            Ok(())
+        })
     }
 
     /// A job reads back every byte it appended, the buffered ones included, through its own
     /// handle, and a later append still follows them.
-    #[tokio::test]
-    async fn reread_gives_the_bytes_so_far_and_appends_follow_them() -> TestResult {
-        let scratch = Scratch::new()?;
-        let mut output = OutputFile::next_generation(scratch.path(), "TRANREPT").await?;
-        output.write_record(b"first").await?;
-        output.write_record(b"second").await?;
-        let read = output
-            .reread("reading back", |mut reader| {
-                let mut bytes = Vec::new();
-                reader.read_to_end(&mut bytes).map(|_| bytes)
-            })
-            .await??;
-        assert_eq!(read, b"first\nsecond\n");
-        output.write_record(b"third").await?;
-        let path = output.finish().await?;
-        assert_eq!(fs::read(&path)?, b"first\nsecond\nthird\n");
-        Ok(())
+    #[test]
+    fn reread_gives_the_bytes_so_far_and_appends_follow_them() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let mut output = OutputFile::next_generation(scratch.path(), "TRANREPT").await?;
+            output.write_record(b"first").await?;
+            output.write_record(b"second").await?;
+            let read = output
+                .reread("reading back", |mut reader| {
+                    let mut bytes = Vec::new();
+                    reader.read_to_end(&mut bytes).map(|_| bytes)
+                })
+                .await??;
+            assert_eq!(read, b"first\nsecond\n");
+            output.write_record(b"third").await?;
+            let path = output.finish().await?;
+            assert_eq!(fs::read(&path)?, b"first\nsecond\nthird\n");
+            Ok(())
+        })
     }
 
     /// A file dropped unfinished is removed, whichever constructor made it, and its generation
     /// number is free again, as a data set deleted at abend is never catalogued.
-    #[tokio::test]
-    async fn guard_deletes_an_unfinished_file() -> TestResult {
-        let scratch = Scratch::new()?;
-        let lock = DirectoryLock::acquire(scratch.path()).await?;
-        let outputs = [
-            OutputFile::next_generation(scratch.path(), "SYSTRAN").await?,
-            OutputFile::replace(&lock, "STATEMNT.HTML").await?,
-        ];
-        for mut output in outputs {
-            output.write_record(b"partial").await?;
-            let path = output.path.clone();
-            assert!(path.exists(), "{}", path.display());
-            drop(output);
-            assert!(!path.exists(), "{}", path.display());
-        }
-        let again = OutputFile::next_generation(scratch.path(), "SYSTRAN")
-            .await?
-            .finish()
-            .await?;
-        assert_eq!(again, scratch.path().join("SYSTRAN.G0001"));
-        Ok(())
+    #[test]
+    fn guard_deletes_an_unfinished_file() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let lock = DirectoryLock::acquire(scratch.path()).await?;
+            let outputs = [
+                OutputFile::next_generation(scratch.path(), "SYSTRAN").await?,
+                OutputFile::replace(&lock, "STATEMNT.HTML").await?,
+            ];
+            for mut output in outputs {
+                output.write_record(b"partial").await?;
+                let path = output.path.clone();
+                assert!(path.exists(), "{}", path.display());
+                drop(output);
+                assert!(!path.exists(), "{}", path.display());
+            }
+            let again = OutputFile::next_generation(scratch.path(), "SYSTRAN")
+                .await?
+                .finish()
+                .await?;
+            assert_eq!(again, scratch.path().join("SYSTRAN.G0001"));
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn replace_removes_the_previous_file() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.path().join("statements");
-        let lock = DirectoryLock::acquire(&dir).await?;
-        let mut first = OutputFile::replace(&lock, "STATEMNT.PS").await?;
-        first.write_record(b"old").await?;
-        let first = first.finish().await?;
-        let mut second = OutputFile::replace(&lock, "STATEMNT.PS").await?;
-        second.write_record(b"new").await?;
-        let second = second.finish().await?;
-        assert_eq!(first, dir.join("STATEMNT.PS"));
-        assert_eq!(second, first);
-        assert_eq!(fs::read(&second)?, b"new\n");
-        Ok(())
+    #[test]
+    fn replace_removes_the_previous_file() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.path().join("statements");
+            let lock = DirectoryLock::acquire(&dir).await?;
+            let mut first = OutputFile::replace(&lock, "STATEMNT.PS").await?;
+            first.write_record(b"old").await?;
+            let first = first.finish().await?;
+            let mut second = OutputFile::replace(&lock, "STATEMNT.PS").await?;
+            second.write_record(b"new").await?;
+            let second = second.finish().await?;
+            assert_eq!(first, dir.join("STATEMNT.PS"));
+            assert_eq!(second, first);
+            assert_eq!(fs::read(&second)?, b"new\n");
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn generation_numbers_increase() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.path().join("dalyrejs");
-        let first = OutputFile::next_generation(&dir, "DALYREJS")
-            .await?
-            .finish()
-            .await?;
-        let second = OutputFile::next_generation(&dir, "DALYREJS")
-            .await?
-            .finish()
-            .await?;
-        assert_eq!(first, dir.join("DALYREJS.G0001"));
-        assert_eq!(second, dir.join("DALYREJS.G0002"));
-        assert!(first.exists() && second.exists());
-        Ok(())
+    #[test]
+    fn generation_numbers_increase() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.path().join("dalyrejs");
+            let first = OutputFile::next_generation(&dir, "DALYREJS")
+                .await?
+                .finish()
+                .await?;
+            let second = OutputFile::next_generation(&dir, "DALYREJS")
+                .await?
+                .finish()
+                .await?;
+            assert_eq!(first, dir.join("DALYREJS.G0001"));
+            assert_eq!(second, dir.join("DALYREJS.G0002"));
+            assert!(first.exists() && second.exists());
+            Ok(())
+        })
     }
 
     /// No generation is named past generation 9999, whose file is left as it was: the error
     /// names the limit and the base, never the directory. Any other failure of the generation
     /// naming, such as a refused base name, stays an I/O error that keeps the kind only.
-    #[tokio::test]
-    async fn a_reached_generation_limit_is_named_and_overwrites_nothing() -> TestResult {
-        let cases = [
-            (
-                "SYSTRAN",
-                "allocating generation: generation limit 9999 reached for SYSTRAN",
-            ),
-            (
-                "SYSTRAN/G",
-                "allocating generation: invalid input parameter",
-            ),
-        ];
-        for (base, text) in cases {
-            let scratch = Scratch::new()?;
-            let last = scratch.path().join("SYSTRAN.G9999");
-            fs::write(&last, b"sentinel\n")?;
-            let error = OutputFile::next_generation(scratch.path(), base)
-                .await
-                .err()
-                .ok_or("a generation was allocated")?;
-            let limit = matches!(error, JobError::GenerationLimit { base: "SYSTRAN" });
-            assert_eq!(limit, base == "SYSTRAN", "{error}");
-            assert_eq!(error.to_string(), text);
-            assert_eq!(fs::read(&last)?, b"sentinel\n");
-            assert_eq!(names(scratch.path())?, ["SYSTRAN.G9999"]);
-        }
-        Ok(())
+    #[test]
+    fn a_reached_generation_limit_is_named_and_overwrites_nothing() -> TestResult {
+        block_on(async {
+            let cases = [
+                (
+                    "SYSTRAN",
+                    "allocating generation: generation limit 9999 reached for SYSTRAN",
+                ),
+                (
+                    "SYSTRAN/G",
+                    "allocating generation: invalid input parameter",
+                ),
+            ];
+            for (base, text) in cases {
+                let scratch = Scratch::new()?;
+                let last = scratch.path().join("SYSTRAN.G9999");
+                fs::write(&last, b"sentinel\n")?;
+                let error = OutputFile::next_generation(scratch.path(), base)
+                    .await
+                    .err()
+                    .ok_or("a generation was allocated")?;
+                let limit = matches!(error, JobError::GenerationLimit { base: "SYSTRAN" });
+                assert_eq!(limit, base == "SYSTRAN", "{error}");
+                assert_eq!(error.to_string(), text);
+                assert_eq!(fs::read(&last)?, b"sentinel\n");
+                assert_eq!(names(scratch.path())?, ["SYSTRAN.G9999"]);
+            }
+            Ok(())
+        })
     }
 
     /// A regular file in place of an output directory, or of one of its ancestors, is reported
     /// as not a directory by the step that met it, whichever way the job writes, and the file is
     /// left as it was; `main` then names the directory's setting.
-    #[tokio::test]
-    async fn a_file_in_place_of_an_output_directory_is_not_a_directory() -> TestResult {
-        let scratch = Scratch::new()?;
-        let file = scratch.path().join("var");
-        fs::write(&file, b"sentinel\n")?;
-        for dir in [file.clone(), file.join("reports")] {
-            let generation = OutputFile::next_generation(&dir, "TRANREPT")
-                .await
-                .err()
-                .ok_or("a generation was allocated")?;
-            let lock = DirectoryLock::acquire(&dir)
-                .await
-                .err()
-                .ok_or("a directory lock was taken")?;
-            assert_eq!(
-                [generation.to_string(), lock.to_string()],
-                [
-                    "allocating generation: not a directory",
-                    "creating output directory: not a directory"
-                ],
-                "{}",
-                dir.display()
-            );
-            let named = lock.naming_output_dir("statements under CARDDEMO_VAR_DIR");
-            assert!(
-                matches!(
-                    named,
-                    JobError::OutputDirectory {
-                        context: "creating output directory",
-                        setting: "statements under CARDDEMO_VAR_DIR",
-                        kind: ErrorKind::NotADirectory,
-                    }
-                ),
-                "{named}"
-            );
-            assert_eq!(named.exit_code(), None);
-        }
-        assert_eq!(fs::read(&file)?, b"sentinel\n");
-        assert_eq!(names(scratch.path())?, ["var"]);
-        Ok(())
+    #[test]
+    fn a_file_in_place_of_an_output_directory_is_not_a_directory() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let file = scratch.path().join("var");
+            fs::write(&file, b"sentinel\n")?;
+            for dir in [file.clone(), file.join("reports")] {
+                let generation = OutputFile::next_generation(&dir, "TRANREPT")
+                    .await
+                    .err()
+                    .ok_or("a generation was allocated")?;
+                let lock = DirectoryLock::acquire(&dir)
+                    .await
+                    .err()
+                    .ok_or("a directory lock was taken")?;
+                assert_eq!(
+                    [generation.to_string(), lock.to_string()],
+                    [
+                        "allocating generation: not a directory",
+                        "creating output directory: not a directory"
+                    ],
+                    "{}",
+                    dir.display()
+                );
+                let named = lock.naming_output_dir("statements under CARDDEMO_VAR_DIR");
+                assert!(
+                    matches!(
+                        named,
+                        JobError::OutputDirectory {
+                            context: "creating output directory",
+                            setting: "statements under CARDDEMO_VAR_DIR",
+                            kind: ErrorKind::NotADirectory,
+                        }
+                    ),
+                    "{named}"
+                );
+                assert_eq!(named.exit_code(), None);
+            }
+            assert_eq!(fs::read(&file)?, b"sentinel\n");
+            assert_eq!(names(scratch.path())?, ["var"]);
+            Ok(())
+        })
     }
 
     /// Generation and statement files are created readable and writable by their owner only,
     /// and every directory a job creates is accessible to its owner only, under any umask that
-    /// leaves the owner's bits (W005-F06).
+    /// leaves the owner's bits.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn outputs_and_their_new_directories_are_owner_only() -> TestResult {
-        use std::os::unix::fs::PermissionsExt as _;
+    #[test]
+    fn outputs_and_their_new_directories_are_owner_only() -> TestResult {
+        block_on(async {
+            use std::os::unix::fs::PermissionsExt as _;
 
-        let scratch = Scratch::new()?;
-        let generations = scratch.path().join("var").join("dalyrejs");
-        let statements = scratch.path().join("stmt").join("statements");
-        let generation = OutputFile::next_generation(&generations, "DALYREJS")
-            .await?
-            .finish()
-            .await?;
-        let lock = DirectoryLock::acquire(&statements).await?;
-        let statement = OutputFile::replace(&lock, "STATEMNT.PS")
-            .await?
-            .finish()
-            .await?;
-        let expected = [
-            (generation, 0o600),
-            (statement, 0o600),
-            (generations, 0o700),
-            (scratch.path().join("var"), 0o700),
-            (statements, 0o700),
-            (scratch.path().join("stmt"), 0o700),
-        ];
-        for (path, owner) in expected {
-            let mode = fs::metadata(&path)?.permissions().mode();
-            assert_eq!(
-                mode & 0o077,
-                0,
-                "{} is open to others: {mode:o}",
-                path.display()
-            );
-            assert_eq!(mode & 0o700, owner, "{}: {mode:o}", path.display());
-        }
-        Ok(())
+            let scratch = Scratch::new()?;
+            let generations = scratch.path().join("var").join("dalyrejs");
+            let statements = scratch.path().join("stmt").join("statements");
+            let generation = OutputFile::next_generation(&generations, "DALYREJS")
+                .await?
+                .finish()
+                .await?;
+            let lock = DirectoryLock::acquire(&statements).await?;
+            let statement = OutputFile::replace(&lock, "STATEMNT.PS")
+                .await?
+                .finish()
+                .await?;
+            let expected = [
+                (generation, 0o600),
+                (statement, 0o600),
+                (generations, 0o700),
+                (scratch.path().join("var"), 0o700),
+                (statements, 0o700),
+                (scratch.path().join("stmt"), 0o700),
+            ];
+            for (path, owner) in expected {
+                let mode = fs::metadata(&path)?.permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} is open to others: {mode:o}",
+                    path.display()
+                );
+                assert_eq!(mode & 0o700, owner, "{}: {mode:o}", path.display());
+            }
+            Ok(())
+        })
     }
 
     /// A held output directory is held once: another attempt finds it busy, through any path
     /// to it, while another directory stays free; a second run waits, announced by one warning
     /// that names no path, and takes the lock once the holder ends. The lock is the one entry
-    /// `.carddemo-batch.lock` of the directory (W005-F01).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn one_run_at_a_time_holds_an_output_directory() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.path().join("statements");
-        let held = DirectoryLock::acquire(&dir).await?;
-        assert_eq!(held.dir(), dir);
-        for path in [dir.clone(), dir.join(".")] {
-            assert!(
-                held_elsewhere(&path)?,
-                "{} was locked twice",
-                path.display()
-            );
-        }
-        let other = DirectoryLock::acquire(&scratch.path().join("other")).await?;
-        assert_eq!(names(&dir)?, [LOCK_NAME], "the lock is not the one entry");
-
-        let capture = trace_capture::capture();
-        let target = dir.clone();
-        let waiting = tokio::spawn(
-            async move { DirectoryLock::acquire(&target).await }
-                .with_subscriber(capture.dispatch()),
-        );
-        let mut announced = false;
-        for _ in 0..1000 {
-            if capture.contains(WAITING) {
-                announced = true;
-                break;
+    /// `.carddemo-batch.lock` of the directory.
+    #[test]
+    fn one_run_at_a_time_holds_an_output_directory() -> TestResult {
+        block_on_two_workers(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.path().join("statements");
+            let held = DirectoryLock::acquire(&dir).await?;
+            assert_eq!(held.dir(), dir);
+            for path in [dir.clone(), dir.join(".")] {
+                assert!(
+                    held_elsewhere(&path)?,
+                    "{} was locked twice",
+                    path.display()
+                );
             }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(announced, "the waiting run gave no warning");
-        assert!(!waiting.is_finished(), "a held directory was taken");
-        drop(held);
-        let taken = waiting.await??;
-        assert_eq!(taken.dir(), dir);
-        let warnings: Vec<String> = capture
-            .lines()
-            .into_iter()
-            .filter(|line| line.contains(WAITING))
-            .collect();
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(
-            warnings
-                .iter()
-                .all(|line| line.contains(r#""level":"WARN""#))
-        );
-        assert!(!capture.contains(&scratch.path().display().to_string()));
-        drop(other);
-        Ok(())
+            let other = DirectoryLock::acquire(&scratch.path().join("other")).await?;
+            assert_eq!(names(&dir)?, [LOCK_NAME], "the lock is not the one entry");
+
+            let capture = trace_capture::capture();
+            let target = dir.clone();
+            let waiting = tokio::spawn(
+                async move { DirectoryLock::acquire(&target).await }
+                    .with_subscriber(capture.dispatch()),
+            );
+            let mut announced = false;
+            for _ in 0..1000 {
+                if capture.contains(WAITING) {
+                    announced = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(announced, "the waiting run gave no warning");
+            assert!(!waiting.is_finished(), "a held directory was taken");
+            drop(held);
+            let taken = waiting.await??;
+            assert_eq!(taken.dir(), dir);
+            let warnings: Vec<String> = capture
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(WAITING))
+                .collect();
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|line| line.contains(r#""level":"WARN""#))
+            );
+            assert!(!capture.contains(&scratch.path().display().to_string()));
+            drop(other);
+            Ok(())
+        })
     }
 
     /// The warning of a run that waits for a held output directory.
@@ -1931,68 +2252,70 @@ mod tests {
 
     /// A file that cannot be removed is reported with the static cleanup operation and the
     /// error kind, never the path, by a guard and by an explicit cleanup alike; a file already
-    /// gone is no failure and reports nothing (W015-F02).
-    #[tokio::test]
-    async fn a_failed_cleanup_is_reported_without_the_path() -> TestResult {
-        let scratch = Scratch::new()?;
-        let capture = trace_capture::capture();
-        let gone = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
-        let identity = gone.identity();
-        fs::remove_file(&gone.path)?;
-        drop(gone);
-        remove_outputs(
-            COMPLETED,
-            vec![(scratch.path().join("STATEMNT.PS"), identity)],
-        )
-        .await;
-        assert!(
-            !capture.contains(CLEANUP_FAILED),
-            "a missing file was reported"
-        );
+    /// gone is no failure and reports nothing.
+    #[test]
+    fn a_failed_cleanup_is_reported_without_the_path() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let capture = trace_capture::capture();
+            let gone = OutputFile::next_generation(scratch.path(), "SYSTRAN").await?;
+            let identity = gone.identity();
+            fs::remove_file(&gone.path)?;
+            drop(gone);
+            remove_outputs(
+                COMPLETED,
+                vec![(scratch.path().join("STATEMNT.PS"), identity)],
+            )
+            .await;
+            assert!(
+                !capture.contains(CLEANUP_FAILED),
+                "a missing file was reported"
+            );
 
-        // A file in place of the output's directory: the path can no longer be read, so the
-        // output it named may remain.
-        let dir = scratch.path().join("dalyrejs");
-        let stuck = OutputFile::next_generation(&dir, "DALYREJS").await?;
-        let path = stuck.path.clone();
-        let identity = stuck.identity();
-        let moved = scratch.path().join("moved");
-        fs::rename(&dir, &moved)?;
-        fs::write(&dir, b"")?;
-        let kind = fs::symlink_metadata(&path)
-            .err()
-            .as_ref()
-            .map(std::io::Error::kind)
-            .ok_or("a path through a file was read")?;
-        drop(stuck);
-        remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
-        let reported: Vec<String> = capture
-            .lines()
-            .into_iter()
-            .filter(|line| line.contains(CLEANUP_FAILED))
-            .collect();
-        assert_eq!(reported.len(), 2, "{reported:?}");
-        for (line, operation) in reported
-            .iter()
-            .zip(["removing unfinished output", COMPLETED])
-        {
+            // A file in place of the output's directory: the path can no longer be read, so the
+            // output it named may remain.
+            let dir = scratch.path().join("dalyrejs");
+            let stuck = OutputFile::next_generation(&dir, "DALYREJS").await?;
+            let path = stuck.path.clone();
+            let identity = stuck.identity();
+            let moved = scratch.path().join("moved");
+            fs::rename(&dir, &moved)?;
+            fs::write(&dir, b"")?;
+            let kind = fs::symlink_metadata(&path)
+                .err()
+                .as_ref()
+                .map(std::io::Error::kind)
+                .ok_or("a path through a file was read")?;
+            drop(stuck);
+            remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
+            let reported: Vec<String> = capture
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(CLEANUP_FAILED))
+                .collect();
+            assert_eq!(reported.len(), 2, "{reported:?}");
+            for (line, operation) in reported
+                .iter()
+                .zip(["removing unfinished output", COMPLETED])
+            {
+                assert!(
+                    line.contains(&format!(r#""operation":"{operation}""#)),
+                    "{line}"
+                );
+                assert!(
+                    line.contains(&format!(r#""error_kind":"{kind}""#)),
+                    "{line}"
+                );
+                assert!(line.contains(r#""level":"ERROR""#), "{line}");
+            }
+            assert!(!capture.contains(&scratch.path().display().to_string()));
+            assert!(!capture.contains("DALYREJS"), "an event names the file");
             assert!(
-                line.contains(&format!(r#""operation":"{operation}""#)),
-                "{line}"
+                moved.join("DALYREJS.G0001").exists(),
+                "the moved output was removed"
             );
-            assert!(
-                line.contains(&format!(r#""error_kind":"{kind}""#)),
-                "{line}"
-            );
-            assert!(line.contains(r#""level":"ERROR""#), "{line}");
-        }
-        assert!(!capture.contains(&scratch.path().display().to_string()));
-        assert!(!capture.contains("DALYREJS"), "an event names the file");
-        assert!(
-            moved.join("DALYREJS.G0001").exists(),
-            "the moved output was removed"
-        );
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The message of a failed cleanup.
@@ -2044,163 +2367,450 @@ mod tests {
     /// run put under the name, bytes included, or a directory stays, whether the guard of an
     /// unfinished file of either constructor or the removal of a completed file, as `creastmt`
     /// makes it, cleans up; nothing is reported, and the run's own file is removed once its
-    /// name names it again (W005-F01).
-    #[tokio::test]
-    async fn a_cleanup_leaves_what_another_run_put_under_the_name() -> TestResult {
-        let scratch = Scratch::new()?;
-        let lock = DirectoryLock::acquire(scratch.path()).await?;
-        let capture = trace_capture::capture();
-        let aside = scratch.path().join("aside");
-        for intruder in [Intruder::File, Intruder::Directory] {
-            let unfinished = [
-                OutputFile::next_generation(scratch.path(), "SYSTRAN").await?,
-                OutputFile::replace(&lock, "STATEMNT.PS").await?,
-            ];
-            for mut output in unfinished {
-                output.write_record(b"partial").await?;
-                let path = output.path.clone();
-                intruder.take_place(&path, &aside)?;
-                drop(output);
-                assert!(intruder.intact(&path)?, "{intruder:?}: {}", path.display());
-                intruder.remove(&path)?;
-                fs::remove_file(&aside)?;
-            }
+    /// name names it again.
+    #[test]
+    fn a_cleanup_leaves_what_another_run_put_under_the_name() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let lock = DirectoryLock::acquire(scratch.path()).await?;
+            let capture = trace_capture::capture();
+            let aside = scratch.path().join("aside");
+            for intruder in [Intruder::File, Intruder::Directory] {
+                let unfinished = [
+                    OutputFile::next_generation(scratch.path(), "SYSTRAN").await?,
+                    OutputFile::replace(&lock, "STATEMNT.PS").await?,
+                ];
+                for mut output in unfinished {
+                    output.write_record(b"partial").await?;
+                    let path = output.path.clone();
+                    intruder.take_place(&path, &aside)?;
+                    drop(output);
+                    assert!(intruder.intact(&path)?, "{intruder:?}: {}", path.display());
+                    intruder.remove(&path)?;
+                    fs::remove_file(&aside)?;
+                }
 
-            let completed = OutputFile::replace(&lock, "STATEMNT.HTML").await?;
-            let identity = completed.identity();
-            let path = completed.finish().await?;
-            intruder.take_place(&path, &aside)?;
-            remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
-            assert!(intruder.intact(&path)?, "{intruder:?}: a completed file");
-            intruder.remove(&path)?;
-            fs::rename(&aside, &path)?;
-            remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
-            assert!(!path.exists(), "{intruder:?}: the run's own file stayed");
-        }
-        assert!(!capture.contains(CLEANUP_FAILED), "{:?}", capture.lines());
-        lock.release().await;
-        assert!(
-            names(scratch.path())?.is_empty(),
-            "{:?}",
-            names(scratch.path())?
-        );
-        Ok(())
+                let completed = OutputFile::replace(&lock, "STATEMNT.HTML").await?;
+                let identity = completed.identity();
+                let path = completed.finish().await?;
+                intruder.take_place(&path, &aside)?;
+                remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
+                assert!(intruder.intact(&path)?, "{intruder:?}: a completed file");
+                intruder.remove(&path)?;
+                fs::rename(&aside, &path)?;
+                remove_outputs(COMPLETED, vec![(path.clone(), identity)]).await;
+                assert!(!path.exists(), "{intruder:?}: the run's own file stayed");
+            }
+            assert!(!capture.contains(CLEANUP_FAILED), "{:?}", capture.lines());
+            lock.release().await;
+            assert!(
+                names(scratch.path())?.is_empty(),
+                "{:?}",
+                names(scratch.path())?
+            );
+            Ok(())
+        })
     }
 
     /// Holding a directory adds exactly the lock entry, whatever the length of the directory's
     /// path, beyond the 108 bytes of a socket address included; one more attempt finds it held
     /// and leaves no entry of its own; the release removes the entry, and the lock is free
-    /// again (W005-F01).
-    #[tokio::test]
-    async fn a_held_directory_has_one_entry_that_the_release_removes() -> TestResult {
-        let scratch = Scratch::new()?;
-        let long = scratch.path().join("d".repeat(120)).join("statements");
-        assert!(long.as_os_str().len() > 108, "{}", long.display());
-        for dir in [scratch.path().join("statements"), long] {
-            let lock = DirectoryLock::acquire(&dir).await?;
-            assert_eq!(names(&dir)?, [LOCK_NAME], "{}", dir.display());
-            assert!(held_elsewhere(&dir)?, "{} was locked twice", dir.display());
-            assert_eq!(names(&dir)?, [LOCK_NAME], "{}", dir.display());
-            let mut output = OutputFile::replace(&lock, "STATEMNT.PS").await?;
-            output.write_record(b"statement").await?;
-            let path = output.finish().await?;
-            lock.release().await;
-            assert_eq!(names(&dir)?, ["STATEMNT.PS"], "{}", dir.display());
-            DirectoryLock::acquire(&dir).await?.release().await;
-            assert_eq!(names(&dir)?, ["STATEMNT.PS"], "{}", dir.display());
-            assert_eq!(fs::read(&path)?, b"statement\n");
-        }
-        Ok(())
+    /// again.
+    #[test]
+    fn a_held_directory_has_one_entry_that_the_release_removes() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let long = scratch.path().join("d".repeat(120)).join("statements");
+            assert!(long.as_os_str().len() > 108, "{}", long.display());
+            for dir in [scratch.path().join("statements"), long] {
+                let lock = DirectoryLock::acquire(&dir).await?;
+                assert_eq!(names(&dir)?, [LOCK_NAME], "{}", dir.display());
+                assert!(held_elsewhere(&dir)?, "{} was locked twice", dir.display());
+                assert_eq!(names(&dir)?, [LOCK_NAME], "{}", dir.display());
+                let mut output = OutputFile::replace(&lock, "STATEMNT.PS").await?;
+                output.write_record(b"statement").await?;
+                let path = output.finish().await?;
+                lock.release().await;
+                assert_eq!(names(&dir)?, ["STATEMNT.PS"], "{}", dir.display());
+                DirectoryLock::acquire(&dir).await?.release().await;
+                assert_eq!(names(&dir)?, ["STATEMNT.PS"], "{}", dir.display());
+                assert_eq!(fs::read(&path)?, b"statement\n");
+            }
+            Ok(())
+        })
     }
 
     /// Leaves the lock name of a run that has ended in the existing directory it is given.
     #[cfg(target_os = "linux")]
     type Leave = fn(&Path) -> TestResult;
 
-    /// A lock whose holder ended without releasing it, as a killed run leaves its socket, or an
-    /// entry of the lock name that is no socket, is taken over at once: no warning, no wait,
-    /// and no claim or stale entry left behind; the lock taken over is held (W005-F01).
+    /// A lock whose holder ended without releasing it, as a killed run leaves its lock directory
+    /// with its socket closed, or an entry of the lock name that is no directory, such as the
+    /// socket file or the regular file of an earlier lock, is taken over at once: no warning, no
+    /// wait, and no claim entry left behind; the lock taken over is held, by this run's socket
+    /// alone.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn a_lock_left_by_an_ended_run_is_taken_over_at_once() -> TestResult {
-        let leftovers: [(&str, Leave); 2] = [
-            ("a socket no process listens on", |dir| {
-                drop(foreign_holder(dir)?);
-                Ok(())
-            }),
-            ("a file", |dir| Ok(fs::write(dir.join(LOCK_NAME), b"")?)),
-        ];
-        for (leftover, leave) in leftovers {
-            let scratch = Scratch::new()?;
-            let dir = scratch.path().join("statements");
-            fs::create_dir(&dir)?;
-            leave(&dir)?;
-            assert_eq!(names(&dir)?, [LOCK_NAME], "{leftover}");
-            let capture = trace_capture::capture();
-            let lock = DirectoryLock::acquire(&dir)
-                .with_subscriber(capture.dispatch())
-                .await?;
-            assert!(!capture.contains(WAITING), "{leftover} was waited for");
-            assert_eq!(names(&dir)?, [LOCK_NAME], "{leftover}");
-            assert!(held_elsewhere(&dir)?, "{leftover}: the lock is not held");
-            lock.release().await;
-            assert!(names(&dir)?.is_empty(), "{leftover}: {:?}", names(&dir)?);
-        }
-        Ok(())
+    #[test]
+    fn a_lock_left_by_an_ended_run_is_taken_over_at_once() -> TestResult {
+        block_on(async {
+            let leftovers: [(&str, Leave); 3] = [
+                (
+                    "a lock directory whose socket no process listens on",
+                    |dir| {
+                        drop(foreign_holder(dir)?);
+                        Ok(())
+                    },
+                ),
+                ("a socket file no process listens on", |dir| {
+                    let directory = fs::File::open(dir)?;
+                    drop(UnixListener::bind(Held::entry(&directory, LOCK_NAME))?);
+                    Ok(())
+                }),
+                ("a file", |dir| Ok(fs::write(dir.join(LOCK_NAME), b"")?)),
+            ];
+            for (leftover, leave) in leftovers {
+                let scratch = Scratch::new()?;
+                let dir = scratch.path().join("statements");
+                fs::create_dir(&dir)?;
+                leave(&dir)?;
+                assert_eq!(names(&dir)?, [LOCK_NAME], "{leftover}");
+                let capture = trace_capture::capture();
+                let lock = DirectoryLock::acquire(&dir)
+                    .with_subscriber(capture.dispatch())
+                    .await?;
+                assert!(!capture.contains(WAITING), "{leftover} was waited for");
+                assert_eq!(names(&dir)?, [LOCK_NAME], "{leftover}");
+                assert_eq!(names(&dir.join(LOCK_NAME))?, [HOLDER_SOCKET], "{leftover}");
+                assert!(held_elsewhere(&dir)?, "{leftover}: the lock is not held");
+                lock.release().await;
+                assert!(names(&dir)?.is_empty(), "{leftover}: {:?}", names(&dir)?);
+            }
+            Ok(())
+        })
     }
 
     /// A live holder that the waiting run meets only through the directory, as a run of another
     /// network namespace, is waited for, announced by one warning, and the lock is taken once
-    /// the holder's socket closes, though its name stays (W005-F01).
+    /// the holder's socket closes, though the holder never removes its lock directory.
     #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_live_holder_met_only_through_the_directory_is_waited_for() -> TestResult {
+    #[test]
+    fn a_live_holder_met_only_through_the_directory_is_waited_for() -> TestResult {
+        block_on_two_workers(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.path().join("statements");
+            fs::create_dir(&dir)?;
+            let holder = foreign_holder(&dir)?;
+            let capture = trace_capture::capture();
+            let target = dir.clone();
+            let waiting = tokio::spawn(
+                async move { DirectoryLock::acquire(&target).await }
+                    .with_subscriber(capture.dispatch()),
+            );
+            let mut announced = false;
+            for _ in 0..1000 {
+                if capture.contains(WAITING) {
+                    announced = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(announced, "the waiting run gave no warning");
+            std::thread::sleep(LOCK_RETRY * 3);
+            assert!(!waiting.is_finished(), "a held directory was taken");
+            drop(holder);
+            let taken = waiting.await??;
+            assert_eq!(names(&dir)?, [LOCK_NAME]);
+            let warnings = capture
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(WAITING))
+                .count();
+            assert_eq!(warnings, 1, "{:?}", capture.lines());
+            taken.release().await;
+            assert!(names(&dir)?.is_empty(), "{:?}", names(&dir)?);
+            Ok(())
+        })
+    }
+
+    /// The parties of `a_takeover_of_a_dead_lock_never_removes_a_live_one`: the runs A, B and C,
+    /// and the test, which checks the lock between their turns.
+    #[cfg(target_os = "linux")]
+    const PARTIES: usize = 4;
+
+    /// The turns of that test's schedule, each ended by every party at the shared barrier.
+    #[cfg(target_os = "linux")]
+    const TURNS: usize = 5;
+
+    /// The three statement files each run of that test writes.
+    #[cfg(target_os = "linux")]
+    const STATEMENT_FILES: [&str; 3] = ["STATEMNT.PS", "STATEMNT.HTML", "STATEMNT.PDF"];
+
+    /// One party of a schedule that a shared barrier alone orders: every party waits at the
+    /// barrier once at the end of each of the [`TURNS`] turns, so the steps of a turn run only
+    /// once every party has ended the turn before. A party that ends early, by an error or a
+    /// panic, waits out its turns left as it drops, so it never leaves the others waiting.
+    #[cfg(target_os = "linux")]
+    struct Party<'a> {
+        /// The barrier the parties share.
+        barrier: &'a Barrier,
+        /// The turns this party has ended.
+        ended: usize,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl<'a> Party<'a> {
+        /// A party of the schedule `barrier` orders, in its first turn.
+        fn new(barrier: &'a Barrier) -> Self {
+            Self { barrier, ended: 0 }
+        }
+
+        /// Ends this party's turns up to turn `turn`, counted from 1, each once every party has
+        /// ended it.
+        fn end_turns_to(&mut self, turn: usize) {
+            while self.ended < turn {
+                self.barrier.wait();
+                self.ended += 1;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Party<'_> {
+        fn drop(&mut self) {
+            self.end_turns_to(TURNS);
+        }
+    }
+
+    /// The runs of that test writing statement files at one time, and the most there ever were.
+    #[cfg(target_os = "linux")]
+    #[derive(Default)]
+    struct Writers {
+        /// The runs writing now.
+        active: AtomicUsize,
+        /// The most runs that were writing at once.
+        peak: AtomicUsize,
+    }
+
+    /// Leaves in the existing directory `dir` the lock of a run killed while it held it: the
+    /// run's lock directory stays, with its socket closed.
+    #[cfg(target_os = "linux")]
+    fn leave_killed_lock(dir: &Path) -> TestResult {
+        let Attempt::Taken(killed) = Held::attempt(dir).map_err(Failure::reported)? else {
+            return Err("a free directory was found held".into());
+        };
+        let Held {
+            _listener: listener,
+            ..
+        } = killed;
+        drop(listener);
+        Ok(())
+    }
+
+    /// The first steps of a run at the lock a killed run left in `directory`: its rename finds
+    /// the lock name held, and its probe finds the killed run's socket refused.
+    #[cfg(target_os = "linux")]
+    fn find_dead(
+        directory: &fs::File,
+        claim: &Claim,
+    ) -> Result<Dead, Box<dyn Error + Send + Sync>> {
+        if claim.take(directory)? {
+            return Err("a lock with a socket in it was taken".into());
+        }
+        match Held::probe(directory)? {
+            Probe::Dead(dead) if dead.entries == [HOLDER_SOCKET] => Ok(dead),
+            _ => Err("the killed run's lock was not found dead".into()),
+        }
+    }
+
+    /// Writes the three statement files with the record `marker` as the run that holds `held`,
+    /// the lock of `dir`, which it wraps as its [`DirectoryLock`] and releases once the files
+    /// are completed; `writers` counts it while it writes.
+    #[cfg(target_os = "linux")]
+    fn write_as_holder(dir: &Path, held: Held, marker: &[u8], writers: &Writers) -> ThreadResult {
+        let lock = DirectoryLock {
+            dir: dir.to_path_buf(),
+            held: Some(held),
+        };
+        block_on(async move {
+            let before = writers.active.fetch_add(1, Ordering::SeqCst);
+            writers.peak.fetch_max(before + 1, Ordering::SeqCst);
+            for name in STATEMENT_FILES {
+                let mut file = OutputFile::replace(&lock, name).await?;
+                file.write_record(marker).await?;
+                file.finish().await?;
+            }
+            writers.active.fetch_sub(1, Ordering::SeqCst);
+            lock.release().await;
+            Ok(())
+        })
+        .map_err(|error| error.to_string().into())
+    }
+
+    /// Run A: finds the killed run's lock dead alongside B; once B has taken the lock, clears
+    /// with its own stale probe and renames again, which must find B live and leave B's lock;
+    /// then waits for the lock and writes.
+    #[cfg(target_os = "linux")]
+    fn run_a(dir: &Path, barrier: &Barrier, writers: &Writers) -> ThreadResult {
+        let mut party = Party::new(barrier);
+        let directory = fs::File::open(dir)?;
+        let claim = Claim::new(&directory).map_err(Failure::reported)?;
+        let dead = find_dead(&directory, &claim)?;
+        // Turn 1 ends once B has found the lock dead too; turn 2 is B's, which takes it.
+        party.end_turns_to(2);
+        dead.clear()?;
+        if claim.take(&directory)? {
+            return Err("A took the lock B holds".into());
+        }
+        let Probe::Live(holder) = Held::probe(&directory)? else {
+            return Err("A did not find B live".into());
+        };
+        let settled = Held::settle(directory, claim, Ok(Some(holder)));
+        let Attempt::Busy(busy) = settled.map_err(Failure::reported)? else {
+            return Err("A was given the lock B holds".into());
+        };
+        // Turn 4 is C's attempt, turn 5 the test's check of the one holder.
+        party.end_turns_to(TURNS);
+        let held = Held::wait(busy).map_err(Failure::reported)?;
+        write_as_holder(dir, held, b"A", writers)
+    }
+
+    /// Run B: finds the killed run's lock dead alongside A, clears it and takes the lock,
+    /// recording its lock directory's identity in `holder`; once A and C have tried and the
+    /// test has checked, writes.
+    #[cfg(target_os = "linux")]
+    fn run_b(
+        dir: &Path,
+        barrier: &Barrier,
+        writers: &Writers,
+        holder: &OnceLock<FileIdentity>,
+    ) -> ThreadResult {
+        let mut party = Party::new(barrier);
+        let directory = fs::File::open(dir)?;
+        let claim = Claim::new(&directory).map_err(Failure::reported)?;
+        let dead = find_dead(&directory, &claim)?;
+        party.end_turns_to(1);
+        dead.clear()?;
+        if !claim.take(&directory)? {
+            return Err("B did not take the cleared lock".into());
+        }
+        let settled = Held::settle(directory, claim, Ok(None));
+        let Attempt::Taken(held) = settled.map_err(Failure::reported)? else {
+            return Err("B was left waiting".into());
+        };
+        if holder
+            .set(FileIdentity::of(&held.lock.metadata()?))
+            .is_err()
+        {
+            return Err("a second holder was recorded".into());
+        }
+        // A renames again in turn 3, C tries in turn 4, and the test checks in turn 5.
+        party.end_turns_to(TURNS);
+        write_as_holder(dir, held, b"B", writers)
+    }
+
+    /// Run C: tries the lock once A has renamed again, which must find it held; then waits for
+    /// the lock and writes.
+    #[cfg(target_os = "linux")]
+    fn run_c(dir: &Path, barrier: &Barrier, writers: &Writers) -> ThreadResult {
+        let mut party = Party::new(barrier);
+        party.end_turns_to(3);
+        let Attempt::Busy(busy) = Held::attempt(dir).map_err(Failure::reported)? else {
+            return Err("C took the lock B holds".into());
+        };
+        party.end_turns_to(TURNS);
+        let held = Held::wait(busy).map_err(Failure::reported)?;
+        write_as_holder(dir, held, b"C", writers)
+    }
+
+    /// The test's turn of the schedule, turn 5, once A and C have found the lock held: B is the
+    /// one holder of the lock of `dir`. Its lock directory, which `holder` identifies, is the
+    /// lock name, with its live socket alone inside, and no claim is left.
+    #[cfg(target_os = "linux")]
+    fn check_one_holder(
+        dir: &Path,
+        barrier: &Barrier,
+        holder: &OnceLock<FileIdentity>,
+    ) -> TestResult {
+        let mut party = Party::new(barrier);
+        party.end_turns_to(TURNS - 1);
+        let lock = dir.join(LOCK_NAME);
+        assert_eq!(names(dir)?, [LOCK_NAME], "a claim or a second lock is left");
+        assert_eq!(names(&lock)?, [HOLDER_SOCKET]);
+        let found = FileIdentity::of(&fs::symlink_metadata(&lock)?);
+        assert_eq!(holder.get(), Some(&found), "B's lock is not the lock name");
+        UnixStream::connect(Held::entry(&fs::File::open(&lock)?, HOLDER_SOCKET))?;
+        Ok(())
+    }
+
+    /// Three runs meet the lock of a killed run in the schedule that took a live lock away from
+    /// a takeover by name: A and B both find the lock dead; B clears it and takes the lock; A
+    /// then clears with its stale probe and renames again; C tries last. A finds B live and
+    /// leaves B's lock, C finds it held, and B is the one holder. Each run then writes the three
+    /// statement files with its own marker while it holds the lock, A and C once they have
+    /// waited for it: never two at once, and the directory ends with one run's three files and
+    /// nothing else.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_takeover_of_a_dead_lock_never_removes_a_live_one() -> TestResult {
         let scratch = Scratch::new()?;
         let dir = scratch.path().join("statements");
         fs::create_dir(&dir)?;
-        let holder = foreign_holder(&dir)?;
-        let capture = trace_capture::capture();
-        let target = dir.clone();
-        let waiting = tokio::spawn(
-            async move { DirectoryLock::acquire(&target).await }
-                .with_subscriber(capture.dispatch()),
-        );
-        let mut announced = false;
-        for _ in 0..1000 {
-            if capture.contains(WAITING) {
-                announced = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+        leave_killed_lock(&dir)?;
+        let barrier = Barrier::new(PARTIES);
+        let writers = Writers::default();
+        let holder = OnceLock::new();
+        let (checked, runs) = std::thread::scope(|scope| {
+            let runs = [
+                scope.spawn(|| run_a(&dir, &barrier, &writers)),
+                scope.spawn(|| run_b(&dir, &barrier, &writers, &holder)),
+                scope.spawn(|| run_c(&dir, &barrier, &writers)),
+            ];
+            let checked = check_one_holder(&dir, &barrier, &holder);
+            (checked, runs.map(std::thread::ScopedJoinHandle::join))
+        });
+        checked?;
+        for (run, joined) in ["A", "B", "C"].into_iter().zip(runs) {
+            joined
+                .map_err(|_| format!("run {run} panicked"))?
+                .map_err(|error| format!("run {run}: {error}"))?;
         }
-        assert!(announced, "the waiting run gave no warning");
-        std::thread::sleep(LOCK_RETRY * 3);
-        assert!(!waiting.is_finished(), "a held directory was taken");
-        drop(holder);
-        let taken = waiting.await??;
-        assert_eq!(names(&dir)?, [LOCK_NAME]);
-        let warnings = capture
-            .lines()
-            .into_iter()
-            .filter(|line| line.contains(WAITING))
-            .count();
-        assert_eq!(warnings, 1, "{:?}", capture.lines());
-        taken.release().await;
-        assert!(names(&dir)?.is_empty(), "{:?}", names(&dir)?);
+        assert_eq!(
+            writers.peak.load(Ordering::SeqCst),
+            1,
+            "two runs wrote at once"
+        );
+        assert_eq!(
+            names(&dir)?,
+            ["STATEMNT.HTML", "STATEMNT.PDF", "STATEMNT.PS"]
+        );
+        let text = fs::read(dir.join("STATEMNT.PS"))?;
+        assert!(text == b"A\n" || text == b"C\n", "B wrote last: {text:?}");
+        for name in ["STATEMNT.HTML", "STATEMNT.PDF"] {
+            assert_eq!(fs::read(dir.join(name))?, text, "{name} is another run's");
+        }
         Ok(())
     }
 
     /// The cleanup operation the tests pass to `remove_outputs`, as `creastmt` does.
     const COMPLETED: &str = "removing completed statement file";
 
-    /// Work on the blocking pool gives its value, and work that panics panics its caller, as it
-    /// would have inline.
-    #[tokio::test]
+    /// Work on the blocking pool gives its value, and work that panics panics its caller.
+    #[test]
     #[should_panic(expected = "blocking work failed")]
-    async fn blocking_work_that_panics_panics_its_caller() {
-        assert!(matches!(blocking("testing", || 7).await, Ok(7)));
-        let _never: Result<(), JobError> =
-            blocking("testing", || panic!("blocking work failed")).await;
+    fn blocking_work_that_panics_panics_its_caller() {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            // A panic of another message fails the test, as no panic would.
+            Err(error) => panic!("the test runtime could not be built: {error}"),
+        };
+        runtime.block_on(async {
+            assert!(matches!(blocking("testing", || 7).await, Ok(7)));
+            let _never: Result<(), JobError> =
+                blocking("testing", || panic!("blocking work failed")).await;
+        });
     }
 
     /// An unreadable input is an I/O error that names the step and the kind, never the path.

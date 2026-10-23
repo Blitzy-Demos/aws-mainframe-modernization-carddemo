@@ -44,9 +44,10 @@
 //!   [`UserPage`] to `UserListResponse`; every branch on the plan and the read lives here.
 
 use domain::online::cousr00c::{self as rules, Direction, Plan, UserListFailure, UserPage};
-use persistence::UserRepository;
+use persistence::{PersistenceError, UserRepository};
+use tracing::{Level, Metadata, field};
 
-use crate::app::AppState;
+use crate::app::{AppState, EventSite, emit, event_metadata};
 use crate::auth::extract::AdminUser;
 use crate::dto::cousr00c::UserListQuery;
 use crate::error::ServiceError;
@@ -96,11 +97,31 @@ async fn browse<R: UserRepository>(
         Direction::Backward => UserRepository::page_before(repo, read.key(), limit).await,
     };
     let entries = fetched.map_err(|error| {
-        tracing::error!(error = %error, "COUSR00C user browse failed");
+        browse_failed(&error);
         ServiceError::Rule(UserListFailure::LookupFailed)
     })?;
     let rows = entries.into_iter().map(rules::UserListRow::from).collect();
     rules::page(read, rows).map_err(ServiceError::Rule)
+}
+
+/// The `ERROR` event of a failed page query (COUSR00C-026): the store's `error` alone, by its
+/// `Display`, which names an SQLSTATE and a constraint at most and never a key or a row.
+fn browse_failed(error: &PersistenceError) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "browse_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"COUSR00C user browse failed"),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -123,6 +144,15 @@ mod tests {
     use crate::error::{ScreenError, ServiceError};
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// The ten in-stream users of `DUSRSECJ.jcl:35-44`, in key order: user ID, first name, last
     /// name, type.
@@ -311,138 +341,149 @@ mod tests {
     // audit: COUSR00C-013
     // audit: COUSR00C-014
     // audit: COUSR00C-028
-    #[tokio::test]
-    async fn enter_without_a_search_value_reads_ten_users_and_one_ahead_from_the_low_key()
-    -> TestResult {
-        let mut store = ListStore::new(fixture());
-        let page = browse(&mut store, UserListQuery::default()).await?;
-        assert_eq!(store.calls, [Call::PageAfter(LOW_KEY, 11)]);
-        let ids: Vec<&str> = FIXTURE.iter().map(|&(id, ..)| id).collect();
-        assert_eq!(filled_ids(&page), ids);
-        let first = page.rows.filled().next().ok_or("row 1 is filled")?;
-        assert_eq!(first.first_name.to_text(), "MARGARET");
-        assert_eq!(first.last_name.to_text(), "GOLD");
-        assert_eq!(first.user_type.to_text(), "A");
-        assert_eq!(page.state.page_no.get(), 1);
-        assert_eq!(page.state.first_key, key("ADMIN001"));
-        assert_eq!(page.state.last_key, key("USER0005"));
-        assert_eq!(page.state.next_page, NextPage::No);
-        assert_eq!(page.message, Some(ListMessage::ReachedBottom));
-        Ok(())
+    #[test]
+    fn enter_without_a_search_value_reads_ten_users_and_one_ahead_from_the_low_key() -> TestResult {
+        block_on(async {
+            let mut store = ListStore::new(fixture());
+            let page = browse(&mut store, UserListQuery::default()).await?;
+            assert_eq!(store.calls, [Call::PageAfter(LOW_KEY, 11)]);
+            let ids: Vec<&str> = FIXTURE.iter().map(|&(id, ..)| id).collect();
+            assert_eq!(filled_ids(&page), ids);
+            let first = page.rows.filled().next().ok_or("row 1 is filled")?;
+            assert_eq!(first.first_name.to_text(), "MARGARET");
+            assert_eq!(first.last_name.to_text(), "GOLD");
+            assert_eq!(first.user_type.to_text(), "A");
+            assert_eq!(page.state.page_no.get(), 1);
+            assert_eq!(page.state.first_key, key("ADMIN001"));
+            assert_eq!(page.state.last_key, key("USER0005"));
+            assert_eq!(page.state.next_page, NextPage::No);
+            assert_eq!(page.message, Some(ListMessage::ReachedBottom));
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-012
     // audit: COUSR00C-015
-    #[tokio::test]
-    async fn enter_reads_from_the_search_value_as_typed() -> TestResult {
-        let mut store = ListStore::new(fixture());
-        let query = UserListQuery {
-            start_user_id: Some("USER0001".to_owned()),
-            ..UserListQuery::default()
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(store.calls, [Call::PageAfter(key("USER0001"), 11)]);
-        assert_eq!(
-            filled_ids(&page),
-            ["USER0001", "USER0002", "USER0003", "USER0004", "USER0005"]
-        );
-        assert_eq!(page.state.page_no.get(), 1);
-        assert_eq!(page.message, Some(ListMessage::ReachedBottom));
-        Ok(())
+    #[test]
+    fn enter_reads_from_the_search_value_as_typed() -> TestResult {
+        block_on(async {
+            let mut store = ListStore::new(fixture());
+            let query = UserListQuery {
+                start_user_id: Some("USER0001".to_owned()),
+                ..UserListQuery::default()
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(store.calls, [Call::PageAfter(key("USER0001"), 11)]);
+            assert_eq!(
+                filled_ids(&page),
+                ["USER0001", "USER0002", "USER0003", "USER0004", "USER0005"]
+            );
+            assert_eq!(page.state.page_no.get(), 1);
+            assert_eq!(page.message, Some(ListMessage::ReachedBottom));
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-017
     // audit: COUSR00C-014
-    #[tokio::test]
-    async fn f8_reads_the_discarded_record_the_page_and_one_ahead_at_the_page_size() -> TestResult {
-        let mut store = ListStore::new(eleven_users());
-        let query = UserListQuery {
-            page_size: Some(5),
-            ..paging(PageDirection::Forward, "ADMIN005", 1)
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(store.calls, [Call::PageAfter(key("ADMIN005"), 7)]);
-        assert_eq!(
-            filled_ids(&page),
-            ["USER0001", "USER0002", "USER0003", "USER0004", "USER0005"]
-        );
-        assert_eq!(page.state.page_no.get(), 2);
-        assert_eq!(page.state.next_page, NextPage::Yes);
-        assert_eq!(page.message, None);
-        Ok(())
+    #[test]
+    fn f8_reads_the_discarded_record_the_page_and_one_ahead_at_the_page_size() -> TestResult {
+        block_on(async {
+            let mut store = ListStore::new(eleven_users());
+            let query = UserListQuery {
+                page_size: Some(5),
+                ..paging(PageDirection::Forward, "ADMIN005", 1)
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(store.calls, [Call::PageAfter(key("ADMIN005"), 7)]);
+            assert_eq!(
+                filled_ids(&page),
+                ["USER0001", "USER0002", "USER0003", "USER0004", "USER0005"]
+            );
+            assert_eq!(page.state.page_no.get(), 2);
+            assert_eq!(page.state.next_page, NextPage::Yes);
+            assert_eq!(page.message, None);
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-022
     // audit: COUSR00C-023
-    #[tokio::test]
-    async fn f7_reads_backward_from_the_first_user_id_shown() -> TestResult {
-        let mut store = ListStore::new(eleven_users());
-        let query = UserListQuery {
-            page_size: Some(5),
-            ..paging(PageDirection::Backward, "USER0001", 2)
-        };
-        let page = browse(&mut store, query).await?;
-        assert_eq!(store.calls, [Call::PageBefore(key("USER0001"), 7)]);
-        assert_eq!(
-            filled_ids(&page),
-            ["ADMIN001", "ADMIN002", "ADMIN003", "ADMIN004", "ADMIN005"]
-        );
-        assert_eq!(page.state.page_no.get(), 1);
-        assert_eq!(page.state.next_page, NextPage::Yes);
-        assert_eq!(page.message, Some(ListMessage::ReachedTop));
-        Ok(())
+    #[test]
+    fn f7_reads_backward_from_the_first_user_id_shown() -> TestResult {
+        block_on(async {
+            let mut store = ListStore::new(eleven_users());
+            let query = UserListQuery {
+                page_size: Some(5),
+                ..paging(PageDirection::Backward, "USER0001", 2)
+            };
+            let page = browse(&mut store, query).await?;
+            assert_eq!(store.calls, [Call::PageBefore(key("USER0001"), 7)]);
+            assert_eq!(
+                filled_ids(&page),
+                ["ADMIN001", "ADMIN002", "ADMIN003", "ADMIN004", "ADMIN005"]
+            );
+            assert_eq!(page.state.page_no.get(), 1);
+            assert_eq!(page.state.next_page, NextPage::Yes);
+            assert_eq!(page.message, Some(ListMessage::ReachedTop));
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-020
     // audit: COUSR00C-021
-    #[tokio::test]
-    async fn f8_without_a_next_page_and_f7_on_page_one_read_nothing() -> TestResult {
-        let cases = [
-            (
-                UserListQuery {
-                    has_next_page: Some(false),
-                    ..paging(PageDirection::Forward, "USER0005", 1)
-                },
-                ListMessage::AlreadyAtBottom,
-            ),
-            (
-                paging(PageDirection::Backward, "ADMIN001", 1),
-                ListMessage::AlreadyAtTop,
-            ),
-        ];
-        for (query, message) in cases {
-            let mut store = ListStore::new(fixture());
-            let page = browse(&mut store, query).await?;
-            assert_eq!(store.calls, []);
-            assert_eq!(page.rows, PageRows::Keep);
-            assert_eq!(page.message, Some(message));
-        }
-        Ok(())
+    #[test]
+    fn f8_without_a_next_page_and_f7_on_page_one_read_nothing() -> TestResult {
+        block_on(async {
+            let cases = [
+                (
+                    UserListQuery {
+                        has_next_page: Some(false),
+                        ..paging(PageDirection::Forward, "USER0005", 1)
+                    },
+                    ListMessage::AlreadyAtBottom,
+                ),
+                (
+                    paging(PageDirection::Backward, "ADMIN001", 1),
+                    ListMessage::AlreadyAtTop,
+                ),
+            ];
+            for (query, message) in cases {
+                let mut store = ListStore::new(fixture());
+                let page = browse(&mut store, query).await?;
+                assert_eq!(store.calls, []);
+                assert_eq!(page.rows, PageRows::Keep);
+                assert_eq!(page.message, Some(message));
+            }
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-026
-    #[tokio::test]
-    async fn a_failing_page_read_is_the_cobol_lookup_failure_with_status_500() -> TestResult {
-        let cases = [
-            (UserListQuery::default(), Call::PageAfter(LOW_KEY, 11)),
-            (
-                paging(PageDirection::Backward, "USER0001", 2),
-                Call::PageBefore(key("USER0001"), 12),
-            ),
-        ];
-        for (query, call) in cases {
-            let mut store = ListStore::failing();
-            let failure = browse(&mut store, query)
-                .await
-                .err()
-                .ok_or("a failing read answers a failure")?;
-            assert_eq!(store.calls, [call]);
-            assert_eq!(failure, ServiceError::Rule(UserListFailure::LookupFailed));
-            let error = ScreenError::from(failure);
-            assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(error.message(), "Unable to lookup User...");
-            assert_eq!(error.field(), None);
-        }
-        Ok(())
+    #[test]
+    fn a_failing_page_read_is_the_cobol_lookup_failure_with_status_500() -> TestResult {
+        block_on(async {
+            let cases = [
+                (UserListQuery::default(), Call::PageAfter(LOW_KEY, 11)),
+                (
+                    paging(PageDirection::Backward, "USER0001", 2),
+                    Call::PageBefore(key("USER0001"), 12),
+                ),
+            ];
+            for (query, call) in cases {
+                let mut store = ListStore::failing();
+                let failure = browse(&mut store, query)
+                    .await
+                    .err()
+                    .ok_or("a failing read answers a failure")?;
+                assert_eq!(store.calls, [call]);
+                assert_eq!(failure, ServiceError::Rule(UserListFailure::LookupFailed));
+                let error = ScreenError::from(failure);
+                assert_eq!(error.status(), StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(error.message(), "Unable to lookup User...");
+                assert_eq!(error.field(), None);
+            }
+            Ok(())
+        })
     }
 }

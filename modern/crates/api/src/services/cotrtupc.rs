@@ -85,8 +85,9 @@ use domain::online::cotrtupc::{
 };
 use domain::records::Db2TransactionType;
 use persistence::{Db2TransactionTypeRepository, PersistenceError, PgStore};
+use tracing::{Level, Metadata, field};
 
-use crate::app::AppState;
+use crate::app::{AppState, EventSite, emit, event_metadata};
 use crate::auth::extract::AdminUser;
 use crate::dto::cotrtupc::TranTypeActionRequest;
 use crate::error::ServiceError;
@@ -318,7 +319,22 @@ fn store_result(error: &PersistenceError) -> StoreResult {
 
 /// Records a store error for the operator; the response carries only the program's message.
 fn log_store_error(paragraph: &'static str, error: &PersistenceError) {
-    tracing::error!(paragraph, error = %error, "COTRTUPC store call failed");
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "store_call_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "paragraph", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"COTRTUPC store call failed"),
+            Some(&paragraph),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 /// The service's answer to a step: a failure becomes the error, which carries its audited
@@ -350,6 +366,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     // The audited literals, written out apart from the domain's constants.
     const SEARCH: &str = "Enter transaction type to be maintained";
@@ -590,96 +615,100 @@ mod tests {
     // audit: COTRTUPC-032
     // audit: COTRTUPC-033
     // audit: COTRTUPC-034
-    #[tokio::test]
-    async fn each_write_binds_the_domain_values_and_reports_its_result() -> TestResult {
-        let description = padded("New type");
-        let update = MaintEffect::Update {
-            code: code("05")?,
-            description: description.clone(),
-        };
-        let insert = MaintEffect::Insert {
-            code: code("05")?,
-            description: description.clone(),
-        };
-        let delete = MaintEffect::Delete { code: code("05")? };
-        let written = row("05", &description)?;
-        let cases = [
-            (&update, Ok(true), Ok(()), Ok(true), StoreResult::Done),
-            (&update, Ok(false), Ok(()), Ok(true), StoreResult::NoRow),
-            (
-                &update,
-                Err(database("40P01")),
-                Ok(()),
-                Ok(true),
-                StoreResult::LockNotAvailable,
-            ),
-            (
-                &update,
-                Err(database("55P03")),
-                Ok(()),
-                Ok(true),
-                StoreResult::LockNotAvailable,
-            ),
-            (
-                &update,
-                Err(database("23502")),
-                Ok(()),
-                Ok(true),
-                StoreResult::OtherError,
-            ),
-            (&insert, Ok(true), Ok(()), Ok(true), StoreResult::Done),
-            (
-                &insert,
-                Ok(true),
-                Err(PersistenceError::Duplicate {
-                    constraint: Some("xtran_type".to_owned()),
-                }),
-                Ok(true),
-                StoreResult::OtherError,
-            ),
-            (&delete, Ok(true), Ok(()), Ok(true), StoreResult::Done),
-            (&delete, Ok(true), Ok(()), Ok(false), StoreResult::NoRow),
-            (
-                &delete,
-                Ok(true),
-                Ok(()),
-                Err(restricted()),
-                StoreResult::ForeignKeyViolation,
-            ),
-            (
-                &delete,
-                Ok(true),
-                Ok(()),
-                Err(PersistenceError::Unavailable),
-                StoreResult::OtherError,
-            ),
-        ];
-        for (effect, updated, inserted, deleted, expected) in cases {
-            let mut repo = Scripted::answering(updated, inserted, deleted);
-            assert_eq!(run(&mut repo, effect).await, Ok(expected), "{effect:?}");
-            let call = match effect {
-                MaintEffect::Update { .. } => Call::Update(written.clone()),
-                MaintEffect::Insert { .. } => Call::Insert(written.clone()),
-                MaintEffect::Delete { code } => Call::Delete(code.clone()),
+    #[test]
+    fn each_write_binds_the_domain_values_and_reports_its_result() -> TestResult {
+        block_on(async {
+            let description = padded("New type");
+            let update = MaintEffect::Update {
+                code: code("05")?,
+                description: description.clone(),
             };
-            assert_eq!(repo.calls, vec![call], "{effect:?}");
-        }
-        Ok(())
+            let insert = MaintEffect::Insert {
+                code: code("05")?,
+                description: description.clone(),
+            };
+            let delete = MaintEffect::Delete { code: code("05")? };
+            let written = row("05", &description)?;
+            let cases = [
+                (&update, Ok(true), Ok(()), Ok(true), StoreResult::Done),
+                (&update, Ok(false), Ok(()), Ok(true), StoreResult::NoRow),
+                (
+                    &update,
+                    Err(database("40P01")),
+                    Ok(()),
+                    Ok(true),
+                    StoreResult::LockNotAvailable,
+                ),
+                (
+                    &update,
+                    Err(database("55P03")),
+                    Ok(()),
+                    Ok(true),
+                    StoreResult::LockNotAvailable,
+                ),
+                (
+                    &update,
+                    Err(database("23502")),
+                    Ok(()),
+                    Ok(true),
+                    StoreResult::OtherError,
+                ),
+                (&insert, Ok(true), Ok(()), Ok(true), StoreResult::Done),
+                (
+                    &insert,
+                    Ok(true),
+                    Err(PersistenceError::Duplicate {
+                        constraint: Some("xtran_type".to_owned()),
+                    }),
+                    Ok(true),
+                    StoreResult::OtherError,
+                ),
+                (&delete, Ok(true), Ok(()), Ok(true), StoreResult::Done),
+                (&delete, Ok(true), Ok(()), Ok(false), StoreResult::NoRow),
+                (
+                    &delete,
+                    Ok(true),
+                    Ok(()),
+                    Err(restricted()),
+                    StoreResult::ForeignKeyViolation,
+                ),
+                (
+                    &delete,
+                    Ok(true),
+                    Ok(()),
+                    Err(PersistenceError::Unavailable),
+                    StoreResult::OtherError,
+                ),
+            ];
+            for (effect, updated, inserted, deleted, expected) in cases {
+                let mut repo = Scripted::answering(updated, inserted, deleted);
+                assert_eq!(run(&mut repo, effect).await, Ok(expected), "{effect:?}");
+                let call = match effect {
+                    MaintEffect::Update { .. } => Call::Update(written.clone()),
+                    MaintEffect::Insert { .. } => Call::Insert(written.clone()),
+                    MaintEffect::Delete { code } => Call::Delete(code.clone()),
+                };
+                assert_eq!(repo.calls, vec![call], "{effect:?}");
+            }
+            Ok(())
+        })
     }
 
-    #[tokio::test]
-    async fn a_write_that_does_not_fit_the_row_runs_nothing() -> TestResult {
-        let oversized = MaintEffect::Update {
-            code: code("05")?,
-            description: "X".repeat(51),
-        };
-        let mut repo = Scripted::answering(Ok(true), Ok(()), Ok(true));
-        assert_eq!(
-            run(&mut repo, &oversized).await,
-            Err(ServiceError::Internal)
-        );
-        assert!(repo.calls.is_empty());
-        Ok(())
+    #[test]
+    fn a_write_that_does_not_fit_the_row_runs_nothing() -> TestResult {
+        block_on(async {
+            let oversized = MaintEffect::Update {
+                code: code("05")?,
+                description: "X".repeat(51),
+            };
+            let mut repo = Scripted::answering(Ok(true), Ok(()), Ok(true));
+            assert_eq!(
+                run(&mut repo, &oversized).await,
+                Err(ServiceError::Internal)
+            );
+            assert!(repo.calls.is_empty());
+            Ok(())
+        })
     }
 
     #[test]
@@ -884,13 +913,15 @@ mod tests {
     // audit: COTRTUPC-033
     // audit: COTRTUPC-034
     // audit: COTRTUPC-043
-    #[tokio::test]
-    async fn the_maintenance_flow_reads_writes_and_commits_the_db2_version() -> TestResult {
-        let (_guard, store) = seeded().await?;
-        fetches(&store).await?;
-        validates(&store).await?;
-        saves(&store).await?;
-        deletes(&store).await?;
-        refuses_unserved_keys_and_blank_codes(&store).await
+    #[test]
+    fn the_maintenance_flow_reads_writes_and_commits_the_db2_version() -> TestResult {
+        block_on(async {
+            let (_guard, store) = seeded().await?;
+            fetches(&store).await?;
+            validates(&store).await?;
+            saves(&store).await?;
+            deletes(&store).await?;
+            refuses_unserved_keys_and_blank_codes(&store).await
+        })
     }
 }

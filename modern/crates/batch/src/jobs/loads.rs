@@ -174,9 +174,11 @@ pub(crate) async fn run(
 }
 
 /// The one body of every fixture load: read `input`, decode and check it, then replace the
-/// table of `R` in one transaction (LOADS-014 to LOADS-019). The read and the decoding block,
-/// so they run as one step on the blocking pool, awaited before the transaction opens
-/// (W011-F05); their errors are those of an inline run, in the same order.
+/// table of `R` in one transaction (LOADS-014 to LOADS-019). The read blocks its thread, so it
+/// runs with the decoding and the key-sequence check (LOADS-017) as one step on the blocking
+/// pool, which finishes before the transaction opens. That step stops at its first failure: an
+/// unreadable input, then the first line codec A refuses, then the first key out of sequence.
+/// Each ends the load before any database statement, so the table keeps its previous rows.
 async fn load<R: Table + Send + 'static>(
     ctx: &JobContext<'_>,
     input: &Path,

@@ -80,7 +80,7 @@ type TestResult = Result<(), Box<dyn Error>>;
 type Fallible<T> = Result<T, Box<dyn Error>>;
 
 /// The local-only secret the tests' API signs and verifies tokens with.
-const SECRET: &str = "endpoints-accounts-local-secret";
+const SECRET: &str = "endpoints-accounts-local-only-test-secret";
 /// The password of every fixture user (`app/jcl/DUSRSECJ.jcl`, `README.md`).
 const PASSWORD: &str = "PASSWORD";
 /// The server setting of the impatient pool: a row lock another transaction holds fails the

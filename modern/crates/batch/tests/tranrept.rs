@@ -98,6 +98,16 @@ use test_support::postgres::PostgresGuard;
 
 type TestResult = Result<(), Box<dyn Error>>;
 
+/// Runs `test` to completion on a multi-thread runtime with every driver enabled and the default
+/// worker count, the one Tokio's test attribute builds for its `multi_thread` flavour, without the
+/// lint attributes, `expect` and unchecked pin that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// Bytes of a report record, `FD-REPTFILE-REC PIC X(133)`, each followed by LF (CBTRN03C-032).
 const RECORD_LEN: usize = 133;
 
@@ -2288,80 +2298,85 @@ fn assert_vsam_descriptions(report: &[u8]) -> TestResult {
 /// POSTED over a window around today: `tranrept` writes the report of FIXRPT-001 to FIXRPT-905
 /// with the passed dates in its name headers, shows the job log of the run with those dates,
 /// leaves `transactions` as it was and adds no file but its generation.
-#[tokio::test(flavor = "multi_thread")]
-async fn report_over_posted_transactions_matches_audit() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&guard, &scratch).await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
-    let (start, end) = window_around_today()?;
-    let run = run_report(&guard, &scratch, Some((start.as_str(), end.as_str())), 1).await?;
-    // audit: CBTRN03C-001
-    // audit: CBTRN03C-004
-    assert_posted_report(&run.report, &start, &end)?;
-    let reporting_line = format!("{REPORTING_FROM}{start}{REPORTING_TO}{end}");
-    assert_posted_job_log(&run.job_log, &reporting_line, &run.report, ProcTs::Clock)?;
-    // audit: CBTRN03C-003
-    assert!(
-        TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
-        "tranrept changed `transactions`"
-    );
-    assert_eq!(
-        var_files(&scratch)?,
-        ["dalyrejs/DALYREJS.G0001", "reports/TRANREPT.G0001"],
-        "files under CARDDEMO_VAR_DIR"
-    );
-    Ok(())
+#[test]
+fn report_over_posted_transactions_matches_audit() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&guard, &scratch).await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
+        let (start, end) = window_around_today()?;
+        let run = run_report(&guard, &scratch, Some((start.as_str(), end.as_str())), 1).await?;
+        // audit: CBTRN03C-001
+        // audit: CBTRN03C-004
+        assert_posted_report(&run.report, &start, &end)?;
+        let reporting_line = format!("{REPORTING_FROM}{start}{REPORTING_TO}{end}");
+        assert_posted_job_log(&run.job_log, &reporting_line, &run.report, ProcTs::Clock)?;
+        // audit: CBTRN03C-003
+        assert!(
+            TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
+            "tranrept changed `transactions`"
+        );
+        assert_eq!(
+            var_files(&scratch)?,
+            ["dalyrejs/DALYREJS.G0001", "reports/TRANREPT.G0001"],
+            "files under CARDDEMO_VAR_DIR"
+        );
+        Ok(())
+    })
 }
 
 /// The default window over POSTED as `fixtures.md` states it, the rows `posttran` wrote carrying
 /// the POSTED processing timestamp: the name headers and the job log's window line show
 /// `2022-01-01` and `2022-07-06`, and the report is FIXRPT-001 to FIXRPT-905.
-#[tokio::test(flavor = "multi_thread")]
-async fn default_window() -> TestResult {
-    // The rows are posted in a database of their own and copied, with the POSTED stamp, into the
-    // one the report reads.
-    let posted = {
-        let source = start_loaded_postgres().await?;
+#[test]
+fn default_window() -> TestResult {
+    block_on(async {
+        // The rows are posted in a database of their own and copied, with the POSTED stamp, into
+        // the one the report reads.
+        let posted = {
+            let source = start_loaded_postgres().await?;
+            let scratch = Scratch::new()?;
+            post_fixture_transactions(&source, &scratch).await?;
+            // The default window over rows stamped today selects none of them.
+            // BLOCKED(X-TRANREPT-H2): that empty selection has no single COBOL result, so the run's
+            // outcome is reported, never asserted.
+            // audit: CBTRN03C-037
+            let empty =
+                run_batch(&source, &scratch, &[OsStr::new("tranrept")], Log::Errors).await?;
+            // audit: CBTRN03C-039
+            assert_no_fixture_card_number(&empty)?;
+            eprintln!(
+                "CBTRN03C-037 BLOCKED (X-TRANREPT-H2): exit status {:?}, {} path(s) printed",
+                empty.status.code(),
+                written_paths(&empty).len()
+            );
+            TransactionRepository::find_all_in_card_order(&mut PgStore::new(source.pool().clone()))
+                .await?
+        };
+        // audit: FIXPOST-901
+        assert_eq!(posted.len(), POSTED_ROWS, "rows posttran wrote");
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let stamp = PicTimestamp::decode(POSTED_PROC_TS)?;
+        for mut row in posted {
+            row.proc_ts = stamp;
+            TransactionRepository::insert(&mut store, &row).await?;
+        }
         let scratch = Scratch::new()?;
-        post_fixture_transactions(&source, &scratch).await?;
-        // The default window over rows stamped today selects none of them.
-        // BLOCKED(X-TRANREPT-H2): that empty selection has no single COBOL result, so the run's
-        // outcome is reported, never asserted.
-        // audit: CBTRN03C-037
-        let empty = run_batch(&source, &scratch, &[OsStr::new("tranrept")], Log::Errors).await?;
-        // audit: CBTRN03C-039
-        assert_no_fixture_card_number(&empty)?;
-        eprintln!(
-            "CBTRN03C-037 BLOCKED (X-TRANREPT-H2): exit status {:?}, {} path(s) printed",
-            empty.status.code(),
-            written_paths(&empty).len()
-        );
-        TransactionRepository::find_all_in_card_order(&mut PgStore::new(source.pool().clone()))
-            .await?
-    };
-    // audit: FIXPOST-901
-    assert_eq!(posted.len(), POSTED_ROWS, "rows posttran wrote");
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let stamp = PicTimestamp::decode(POSTED_PROC_TS)?;
-    for mut row in posted {
-        row.proc_ts = stamp;
-        TransactionRepository::insert(&mut store, &row).await?;
-    }
-    let scratch = Scratch::new()?;
-    let run = run_report(&guard, &scratch, None, 1).await?;
-    // audit: CBTRN03C-001
-    // audit: CBTRN03C-004
-    // audit: FIXRPT-901
-    assert_posted_report(&run.report, DEFAULT_START, DEFAULT_END)?;
-    assert_posted_job_log(
-        &run.job_log,
-        DEFAULT_REPORTING_LINE,
-        &run.report,
-        ProcTs::Stored(POSTED_PROC_TS),
-    )
+        let run = run_report(&guard, &scratch, None, 1).await?;
+        // audit: CBTRN03C-001
+        // audit: CBTRN03C-004
+        // audit: FIXRPT-901
+        assert_posted_report(&run.report, DEFAULT_START, DEFAULT_END)?;
+        assert_posted_job_log(
+            &run.job_log,
+            DEFAULT_REPORTING_LINE,
+            &run.report,
+            ProcTs::Stored(POSTED_PROC_TS),
+        )
+    })
 }
 
 /// Transaction IDs that are card numbers: two `dailytran.txt` records of two cards that
@@ -2371,178 +2386,184 @@ async fn default_window() -> TestResult {
 /// included ([`run_report`]), and each row's `TRAN-RECORD` line shows its transaction ID as
 /// twelve `*` and the ID's last four digits and every other byte as CBTRN03C-012 gives it.
 /// Failures name no line and no number.
-#[tokio::test(flavor = "multi_thread")]
-async fn card_numbers_in_transaction_ids_are_redacted() -> TestResult {
-    let cards = fixture_card_numbers()?
-        .into_iter()
-        .map(|text| Ok((CardNumber::parse(&text)?, text)))
-        .collect::<Result<Vec<(CardNumber, String)>, Box<dyn Error>>>()?;
-    let card_of =
-        |row: &TransactionRecord| cards.iter().position(|(card, _)| *card == row.card_num);
-    let mut daily = daily_transactions()?.into_iter();
-    let (own_row, own_card) = daily
-        .find_map(|row| card_of(&row).map(|index| (row, index)))
-        .ok_or("no dailytran.txt record of a card in card_xref")?;
-    let (other_row, other_card) = daily
-        .find_map(|row| {
-            card_of(&row)
-                .filter(|&index| index != own_card)
-                .map(|index| (row, index))
-        })
-        .ok_or("no dailytran.txt record of a second card in card_xref")?;
-    let third_card = (0..cards.len())
-        .find(|&index| index != own_card && index != other_card)
-        .ok_or("fewer than three fixture cards")?;
-    let guard = start_loaded_postgres().await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let stamp = PicTimestamp::decode(POSTED_PROC_TS)?;
-    let mut expected = Vec::new();
-    for (mut row, id_card) in [(own_row, own_card), (other_row, third_card)] {
-        let (_, id) = cards.get(id_card).ok_or("no such fixture card")?;
-        row.id = PicX::from_text(id)?;
-        row.proc_ts = stamp;
-        TransactionRepository::insert(&mut store, &row).await?;
-        expected.push(id_redacted_tran_record_line(&row)?);
-    }
-    let scratch = Scratch::new()?;
-    // audit: CBTRN03C-039
-    let run = run_report(&guard, &scratch, None, 1).await?;
-    let mut shown: Vec<&str> = run
-        .job_log
-        .iter()
-        .filter(|line| is_tran_record_line(line))
-        .map(String::as_str)
-        .collect();
-    shown.sort_unstable();
-    expected.sort_unstable();
-    // audit: CBTRN03C-012
-    // audit: CBTRN03C-039
-    assert!(
-        shown == expected,
-        "the TRAN-RECORD lines are not the two rows with their transaction IDs redacted"
-    );
-    Ok(())
+#[test]
+fn card_numbers_in_transaction_ids_are_redacted() -> TestResult {
+    block_on(async {
+        let cards = fixture_card_numbers()?
+            .into_iter()
+            .map(|text| Ok((CardNumber::parse(&text)?, text)))
+            .collect::<Result<Vec<(CardNumber, String)>, Box<dyn Error>>>()?;
+        let card_of =
+            |row: &TransactionRecord| cards.iter().position(|(card, _)| *card == row.card_num);
+        let mut daily = daily_transactions()?.into_iter();
+        let (own_row, own_card) = daily
+            .find_map(|row| card_of(&row).map(|index| (row, index)))
+            .ok_or("no dailytran.txt record of a card in card_xref")?;
+        let (other_row, other_card) = daily
+            .find_map(|row| {
+                card_of(&row)
+                    .filter(|&index| index != own_card)
+                    .map(|index| (row, index))
+            })
+            .ok_or("no dailytran.txt record of a second card in card_xref")?;
+        let third_card = (0..cards.len())
+            .find(|&index| index != own_card && index != other_card)
+            .ok_or("fewer than three fixture cards")?;
+        let guard = start_loaded_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let stamp = PicTimestamp::decode(POSTED_PROC_TS)?;
+        let mut expected = Vec::new();
+        for (mut row, id_card) in [(own_row, own_card), (other_row, third_card)] {
+            let (_, id) = cards.get(id_card).ok_or("no such fixture card")?;
+            row.id = PicX::from_text(id)?;
+            row.proc_ts = stamp;
+            TransactionRepository::insert(&mut store, &row).await?;
+            expected.push(id_redacted_tran_record_line(&row)?);
+        }
+        let scratch = Scratch::new()?;
+        // audit: CBTRN03C-039
+        let run = run_report(&guard, &scratch, None, 1).await?;
+        let mut shown: Vec<&str> = run
+            .job_log
+            .iter()
+            .filter(|line| is_tran_record_line(line))
+            .map(String::as_str)
+            .collect();
+        shown.sort_unstable();
+        expected.sort_unstable();
+        // audit: CBTRN03C-012
+        // audit: CBTRN03C-039
+        assert!(
+            shown == expected,
+            "the TRAN-RECORD lines are not the two rows with their transaction IDs redacted"
+        );
+        Ok(())
+    })
 }
 
 /// A reports directory that cannot be created, because `reports` is a file, fails the open of
 /// `REPTFILE` and ends the run on the abend path: `ERROR OPENING REPTFILE`, the status line and
 /// `ABENDING PROGRAM` after the start line, a non-zero exit status, no path printed, no
 /// generation file, and `transactions` as it was.
-#[tokio::test(flavor = "multi_thread")]
-async fn uncreatable_reports_directory_abends_the_run() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&guard, &scratch).await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
-    fs::write(scratch.var_dir().join("reports"), b"")?;
-    let (start, end) = window_around_today()?;
-    let output = run_batch(&guard, &scratch, &tranrept_args(&start, &end), Log::JobLog).await?;
-    // audit: CBTRN03C-039
-    assert_no_fixture_card_number(&output)?;
-    // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
-    // audit: CBTRN03C-007
-    // audit: CBTRN03C-035
-    assert!(
-        output.status.code().is_some_and(|code| code != 0),
-        "tranrept ended with {:?}",
-        output.status.code()
-    );
-    // audit: CBTRN03C-007
-    assert_abend_log(&job_log(&output), OPEN_REPTFILE, "CBTRN03C-007");
-    // The event of the failed open names the setting of the directory, never its path.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let shown = scratch.var_dir().display().to_string();
-    assert!(
-        stdout.lines().any(|line| {
-            line.contains(r#""operation":"OPEN REPTFILE""#)
-                && line.contains(&format!("({REPORTS_DIR_SETTING})"))
-        }),
-        "no event of the failed open names the reports setting"
-    );
-    assert!(
-        !stdout.contains(&shown),
-        "standard output shows the var directory"
-    );
-    assert!(written_paths(&output).is_empty(), "tranrept printed a path");
-    assert_eq!(
-        var_files(&scratch)?,
-        ["dalyrejs/DALYREJS.G0001", "reports"],
-        "files under CARDDEMO_VAR_DIR"
-    );
-    // audit: CBTRN03C-003
-    assert!(
-        TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
-        "tranrept changed `transactions`"
-    );
-    Ok(())
+#[test]
+fn uncreatable_reports_directory_abends_the_run() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&guard, &scratch).await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
+        fs::write(scratch.var_dir().join("reports"), b"")?;
+        let (start, end) = window_around_today()?;
+        let output = run_batch(&guard, &scratch, &tranrept_args(&start, &end), Log::JobLog).await?;
+        // audit: CBTRN03C-039
+        assert_no_fixture_card_number(&output)?;
+        // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
+        // audit: CBTRN03C-007
+        // audit: CBTRN03C-035
+        assert!(
+            output.status.code().is_some_and(|code| code != 0),
+            "tranrept ended with {:?}",
+            output.status.code()
+        );
+        // audit: CBTRN03C-007
+        assert_abend_log(&job_log(&output), OPEN_REPTFILE, "CBTRN03C-007");
+        // The event of the failed open names the setting of the directory, never its path.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let shown = scratch.var_dir().display().to_string();
+        assert!(
+            stdout.lines().any(|line| {
+                line.contains(r#""operation":"OPEN REPTFILE""#)
+                    && line.contains(&format!("({REPORTS_DIR_SETTING})"))
+            }),
+            "no event of the failed open names the reports setting"
+        );
+        assert!(
+            !stdout.contains(&shown),
+            "standard output shows the var directory"
+        );
+        assert!(written_paths(&output).is_empty(), "tranrept printed a path");
+        assert_eq!(
+            var_files(&scratch)?,
+            ["dalyrejs/DALYREJS.G0001", "reports"],
+            "files under CARDDEMO_VAR_DIR"
+        );
+        // audit: CBTRN03C-003
+        assert!(
+            TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
+            "tranrept changed `transactions`"
+        );
+        Ok(())
+    })
 }
 
 /// E23: a COBTUPDT update of type `01` in the Db2 data version leaves the VSAM version untouched,
 /// every type `01` detail still shows `Purchase`, and the report written after the update equals
 /// the one written before it byte for byte.
-#[tokio::test(flavor = "multi_thread")]
-async fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&guard, &scratch).await?;
-    let (start, end) = window_around_today()?;
-    let window = Some((start.as_str(), end.as_str()));
-    let before = run_report(&guard, &scratch, window, 1).await?.report;
-    let code = PicX::<2>::from_text("01")?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let vsam = TransactionTypeRepository::find_by_id(&mut store, &code)
-        .await?
-        .ok_or("no VSAM type 01")?;
-    let seeded = Db2TransactionTypeRepository::find_by_id(&mut store, &code)
-        .await?
-        .ok_or("no Db2 type 01")?;
-    // audit: COBTUPDT-103
-    assert_eq!(
-        seeded.tr_description(),
-        DB2_SEED_PURCHASE,
-        "Db2 seed of type 01"
-    );
+#[test]
+fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&guard, &scratch).await?;
+        let (start, end) = window_around_today()?;
+        let window = Some((start.as_str(), end.as_str()));
+        let before = run_report(&guard, &scratch, window, 1).await?.report;
+        let code = PicX::<2>::from_text("01")?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let vsam = TransactionTypeRepository::find_by_id(&mut store, &code)
+            .await?
+            .ok_or("no VSAM type 01")?;
+        let seeded = Db2TransactionTypeRepository::find_by_id(&mut store, &code)
+            .await?
+            .ok_or("no Db2 type 01")?;
+        // audit: COBTUPDT-103
+        assert_eq!(
+            seeded.tr_description(),
+            DB2_SEED_PURCHASE,
+            "Db2 seed of type 01"
+        );
 
-    let input = mnttrdb2_input(&scratch, &[format!("U01{RENAMED:<50}")])?;
-    let args = [
-        OsStr::new("mnttrdb2"),
-        OsStr::new("--input"),
-        input.as_os_str(),
-    ];
-    let output = run_batch(&guard, &scratch, &args, Log::Errors).await?;
-    // audit: COBTUPDT-027
-    assert_eq!(
-        output.status.code(),
-        Some(0),
-        "mnttrdb2: {}",
-        stderr(&output)
-    );
-    assert!(written_paths(&output).is_empty(), "mnttrdb2 printed a path");
-    let updated = Db2TransactionTypeRepository::find_by_id(&mut store, &code)
-        .await?
-        .ok_or("no Db2 type 01 after the update")?;
-    // audit: COBTUPDT-012
-    assert_eq!(
-        updated.tr_description(),
-        format!("{RENAMED:<50}"),
-        "Db2 type 01 after the update"
-    );
-    // audit: COBTUPDT-026
-    assert_eq!(vsam.desc, PicX::from_text("Purchase")?, "VSAM type 01");
-    assert!(
-        TransactionTypeRepository::find_by_id(&mut store, &code).await? == Some(vsam),
-        "mnttrdb2 changed the VSAM type 01"
-    );
+        let input = mnttrdb2_input(&scratch, &[format!("U01{RENAMED:<50}")])?;
+        let args = [
+            OsStr::new("mnttrdb2"),
+            OsStr::new("--input"),
+            input.as_os_str(),
+        ];
+        let output = run_batch(&guard, &scratch, &args, Log::Errors).await?;
+        // audit: COBTUPDT-027
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "mnttrdb2: {}",
+            stderr(&output)
+        );
+        assert!(written_paths(&output).is_empty(), "mnttrdb2 printed a path");
+        let updated = Db2TransactionTypeRepository::find_by_id(&mut store, &code)
+            .await?
+            .ok_or("no Db2 type 01 after the update")?;
+        // audit: COBTUPDT-012
+        assert_eq!(
+            updated.tr_description(),
+            format!("{RENAMED:<50}"),
+            "Db2 type 01 after the update"
+        );
+        // audit: COBTUPDT-026
+        assert_eq!(vsam.desc, PicX::from_text("Purchase")?, "VSAM type 01");
+        assert!(
+            TransactionTypeRepository::find_by_id(&mut store, &code).await? == Some(vsam),
+            "mnttrdb2 changed the VSAM type 01"
+        );
 
-    let after = run_report(&guard, &scratch, window, 2).await?.report;
-    assert_vsam_descriptions(&after)?;
-    // audit: CBTRN03C-038
-    assert!(
-        after == before,
-        "the report written after the update differs from the one before it"
-    );
-    Ok(())
+        let after = run_report(&guard, &scratch, window, 2).await?.report;
+        assert_vsam_descriptions(&after)?;
+        // audit: CBTRN03C-038
+        assert!(
+            after == before,
+            "the report written after the update differs from the one before it"
+        );
+        Ok(())
+    })
 }
 
 /// A connection lost inside the read loop: the [`Relay`] closes the connection of the selection
@@ -2550,61 +2571,63 @@ async fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
 /// The run ends on the abend path of `1000-TRANFILE-GET-NEXT`: `ERROR READING TRANSACTION FILE`,
 /// the status line and `ABENDING PROGRAM`, a non-zero exit status, no path printed, no generation
 /// file and `transactions` as it was.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_selection_lost_after_its_first_row_abends_the_read() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&guard, &scratch).await?;
-    let mut store = PgStore::new(guard.pool().clone());
-    let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
-    let (start, end) = window_around_today()?;
-    let relay = Relay::start(
-        guard.database_url(),
-        Cut::AfterFirstRow(TRANSACTIONS_COLUMN),
-    )?;
-    let args = tranrept_args(&start, &end);
-    let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
-    let cut = relay.cut_made();
-    drop(relay);
-    assert!(cut, "the relay never met the selection's row description");
-    // audit: CBTRN03C-039
-    assert_no_fixture_card_number(&output)?;
-    // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
-    // audit: CBTRN03C-035
-    assert!(
-        output.status.code().is_some_and(|code| code != 0),
-        "tranrept ended with {:?}",
-        output.status.code()
-    );
-    assert_eq!(
-        first_stderr_line(&output),
-        format!("carddemo-batch tranrept: ABEND: {READ_TRANFILE}"),
-        "standard error"
-    );
-    let log = job_log(&output);
-    // Status `00` for the first row, read when the selection opened and shown before it was
-    // reported; the fetch of the second fails.
-    // audit: CBTRN03C-010
-    assert_eq!(
-        log.iter().filter(|line| is_tran_record_line(line)).count(),
-        1,
-        "TRAN-RECORD lines before the failed fetch"
-    );
-    // audit: CBTRN03C-010
-    assert_abend_log(&log, READ_TRANFILE, "CBTRN03C-010");
-    // audit: CBTRN03C-035
-    assert!(written_paths(&output).is_empty(), "tranrept printed a path");
-    assert_eq!(
-        var_files(&scratch)?,
-        ["dalyrejs/DALYREJS.G0001"],
-        "files under CARDDEMO_VAR_DIR"
-    );
-    // audit: CBTRN03C-003
-    assert!(
-        TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
-        "tranrept changed `transactions`"
-    );
-    Ok(())
+#[test]
+fn a_selection_lost_after_its_first_row_abends_the_read() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&guard, &scratch).await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let posted = TransactionRepository::find_all_in_card_order(&mut store).await?;
+        let (start, end) = window_around_today()?;
+        let relay = Relay::start(
+            guard.database_url(),
+            Cut::AfterFirstRow(TRANSACTIONS_COLUMN),
+        )?;
+        let args = tranrept_args(&start, &end);
+        let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
+        let cut = relay.cut_made();
+        drop(relay);
+        assert!(cut, "the relay never met the selection's row description");
+        // audit: CBTRN03C-039
+        assert_no_fixture_card_number(&output)?;
+        // The exit status is only required to be non-zero until the reviewer settles X-TRANREPT-4.
+        // audit: CBTRN03C-035
+        assert!(
+            output.status.code().is_some_and(|code| code != 0),
+            "tranrept ended with {:?}",
+            output.status.code()
+        );
+        assert_eq!(
+            first_stderr_line(&output),
+            format!("carddemo-batch tranrept: ABEND: {READ_TRANFILE}"),
+            "standard error"
+        );
+        let log = job_log(&output);
+        // Status `00` for the first row, read when the selection opened and shown before it was
+        // reported; the fetch of the second fails.
+        // audit: CBTRN03C-010
+        assert_eq!(
+            log.iter().filter(|line| is_tran_record_line(line)).count(),
+            1,
+            "TRAN-RECORD lines before the failed fetch"
+        );
+        // audit: CBTRN03C-010
+        assert_abend_log(&log, READ_TRANFILE, "CBTRN03C-010");
+        // audit: CBTRN03C-035
+        assert!(written_paths(&output).is_empty(), "tranrept printed a path");
+        assert_eq!(
+            var_files(&scratch)?,
+            ["dalyrejs/DALYREJS.G0001"],
+            "files under CARDDEMO_VAR_DIR"
+        );
+        // audit: CBTRN03C-003
+        assert!(
+            TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
+            "tranrept changed `transactions`"
+        );
+        Ok(())
+    })
 }
 
 /// One run of [`report_writes_past_a_size_limit_abend_the_run`]: the bytes its file-size limit
@@ -2620,56 +2643,58 @@ struct LimitCase {
 /// write, when the file is closed, fails (CBTRN03C-034). Each run ends on the abend path: its
 /// failure line, the status line and `ABENDING PROGRAM`, a non-zero exit status, no path printed
 /// and no generation file.
-#[tokio::test(flavor = "multi_thread")]
-async fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let posting = Scratch::new()?;
-    post_fixture_transactions(&guard, &posting).await?;
-    let (start, end) = window_around_today()?;
-    let cases = [
-        LimitCase {
-            limit: FIRST_WRITE_LIMIT,
-            failure_line: WRITE_REPTFILE,
-            rule: "CBTRN03C-033",
-        },
-        LimitCase {
-            limit: CLOSE_LIMIT,
-            failure_line: CLOSE_REPTFILE,
-            rule: "CBTRN03C-034",
-        },
-    ];
-    for case in cases {
-        let rule = case.rule;
-        let scratch = Scratch::new()?;
-        let args = tranrept_args(&start, &end);
-        let output = run_size_limited(&guard, &scratch, &args, case.limit).await?;
-        // audit: CBTRN03C-039
-        assert_no_fixture_card_number(&output)?;
-        // audit: CBTRN03C-035
-        assert!(
-            output.status.code().is_some_and(|code| code != 0),
-            "{rule}: tranrept ended with {:?}",
-            output.status.code()
-        );
-        assert_eq!(
-            first_stderr_line(&output),
-            format!("carddemo-batch tranrept: ABEND: {}", case.failure_line),
-            "{rule}: standard error"
-        );
-        // audit: CBTRN03C-033
-        // audit: CBTRN03C-034
-        assert_abend_log(&job_log(&output), case.failure_line, rule);
-        // audit: CBTRN03C-035
-        assert!(
-            written_paths(&output).is_empty(),
-            "{rule}: tranrept printed a path"
-        );
-        assert!(
-            var_files(&scratch)?.is_empty(),
-            "{rule}: a file remains under CARDDEMO_VAR_DIR"
-        );
-    }
-    Ok(())
+#[test]
+fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let posting = Scratch::new()?;
+        post_fixture_transactions(&guard, &posting).await?;
+        let (start, end) = window_around_today()?;
+        let cases = [
+            LimitCase {
+                limit: FIRST_WRITE_LIMIT,
+                failure_line: WRITE_REPTFILE,
+                rule: "CBTRN03C-033",
+            },
+            LimitCase {
+                limit: CLOSE_LIMIT,
+                failure_line: CLOSE_REPTFILE,
+                rule: "CBTRN03C-034",
+            },
+        ];
+        for case in cases {
+            let rule = case.rule;
+            let scratch = Scratch::new()?;
+            let args = tranrept_args(&start, &end);
+            let output = run_size_limited(&guard, &scratch, &args, case.limit).await?;
+            // audit: CBTRN03C-039
+            assert_no_fixture_card_number(&output)?;
+            // audit: CBTRN03C-035
+            assert!(
+                output.status.code().is_some_and(|code| code != 0),
+                "{rule}: tranrept ended with {:?}",
+                output.status.code()
+            );
+            assert_eq!(
+                first_stderr_line(&output),
+                format!("carddemo-batch tranrept: ABEND: {}", case.failure_line),
+                "{rule}: standard error"
+            );
+            // audit: CBTRN03C-033
+            // audit: CBTRN03C-034
+            assert_abend_log(&job_log(&output), case.failure_line, rule);
+            // audit: CBTRN03C-035
+            assert!(
+                written_paths(&output).is_empty(),
+                "{rule}: tranrept printed a path"
+            );
+            assert!(
+                var_files(&scratch)?.is_empty(),
+                "{rule}: a file remains under CARDDEMO_VAR_DIR"
+            );
+        }
+        Ok(())
+    })
 }
 
 /// The lookup reads that fail other than by a missing key, `HALTED(X-TRANREPT-H5)`
@@ -2679,57 +2704,59 @@ async fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
 /// printed as the rule's `BLOCKED` report, never asserted. The replacement reads each table
 /// whole when it opens it, before the first record, so the failure takes the open path of
 /// CBTRN03C-007 (X-TRANREPT-10).
-#[tokio::test(flavor = "multi_thread")]
-async fn lookup_reads_that_fail_are_reported_blocked() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let posting = Scratch::new()?;
-    post_fixture_transactions(&guard, &posting).await?;
-    let (start, end) = window_around_today()?;
-    let cases = [
-        ("CBTRN03C-040", "card_xref", CARD_XREF_COLUMN, OPEN_CARDXREF),
-        (
-            "CBTRN03C-041",
-            "transaction_types",
-            TRANSACTION_TYPES_COLUMN,
-            OPEN_TRANTYPE,
-        ),
-        (
-            "CBTRN03C-042",
-            "transaction_categories",
-            TRANSACTION_CATEGORIES_COLUMN,
-            OPEN_TRANCATG,
-        ),
-    ];
-    for (rule, table, column, open_line) in cases {
-        let scratch = Scratch::new()?;
-        let relay = Relay::start(guard.database_url(), Cut::AtDescription(column))?;
-        let args = tranrept_args(&start, &end);
-        let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
-        let cut = relay.cut_made();
-        drop(relay);
-        // Only the relay's own working and the run's redaction, which no halt covers, are
-        // checked; the run's outcome is reported.
-        assert!(
-            cut,
-            "{rule}: the relay never met the row description of {table}"
-        );
-        // audit: CBTRN03C-039
-        assert_no_fixture_card_number(&output)?;
-        let log = job_log(&output);
-        // BLOCKED(X-TRANREPT-H5): no parity assertion.
-        // audit: CBTRN03C-040
-        // audit: CBTRN03C-041
-        // audit: CBTRN03C-042
-        println!(
-            "BLOCKED {rule} (X-TRANREPT-H5): a failed read of {table}, no parity asserted; \
-             observed: exit status {:?}, {} path(s) printed, {} file(s) under \
-             CARDDEMO_VAR_DIR, open line shown: {}, ABENDING PROGRAM last: {}",
-            output.status.code(),
-            written_paths(&output).len(),
-            var_files(&scratch).map_or(0, |files| files.len()),
-            log.iter().any(|line| line == open_line),
-            log.last().is_some_and(|line| line == ABEND_LINE)
-        );
-    }
-    Ok(())
+#[test]
+fn lookup_reads_that_fail_are_reported_blocked() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let posting = Scratch::new()?;
+        post_fixture_transactions(&guard, &posting).await?;
+        let (start, end) = window_around_today()?;
+        let cases = [
+            ("CBTRN03C-040", "card_xref", CARD_XREF_COLUMN, OPEN_CARDXREF),
+            (
+                "CBTRN03C-041",
+                "transaction_types",
+                TRANSACTION_TYPES_COLUMN,
+                OPEN_TRANTYPE,
+            ),
+            (
+                "CBTRN03C-042",
+                "transaction_categories",
+                TRANSACTION_CATEGORIES_COLUMN,
+                OPEN_TRANCATG,
+            ),
+        ];
+        for (rule, table, column, open_line) in cases {
+            let scratch = Scratch::new()?;
+            let relay = Relay::start(guard.database_url(), Cut::AtDescription(column))?;
+            let args = tranrept_args(&start, &end);
+            let output = run_against(relay.database_url(), &scratch, &args, Log::JobLog).await?;
+            let cut = relay.cut_made();
+            drop(relay);
+            // Only the relay's own working and the run's redaction, which no halt covers, are
+            // checked; the run's outcome is reported.
+            assert!(
+                cut,
+                "{rule}: the relay never met the row description of {table}"
+            );
+            // audit: CBTRN03C-039
+            assert_no_fixture_card_number(&output)?;
+            let log = job_log(&output);
+            // BLOCKED(X-TRANREPT-H5): no parity assertion.
+            // audit: CBTRN03C-040
+            // audit: CBTRN03C-041
+            // audit: CBTRN03C-042
+            println!(
+                "BLOCKED {rule} (X-TRANREPT-H5): a failed read of {table}, no parity asserted; \
+                 observed: exit status {:?}, {} path(s) printed, {} file(s) under \
+                 CARDDEMO_VAR_DIR, open line shown: {}, ABENDING PROGRAM last: {}",
+                output.status.code(),
+                written_paths(&output).len(),
+                var_files(&scratch).map_or(0, |files| files.len()),
+                log.iter().any(|line| line == open_line),
+                log.last().is_some_and(|line| line == ABEND_LINE)
+            );
+        }
+        Ok(())
+    })
 }

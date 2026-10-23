@@ -56,10 +56,12 @@ use super::{JobContext, JobError, JobOutcome};
 ///
 /// The deck is read in place and never copied (LOADS-011). Every record is decoded and hashed
 /// before the transaction opens, so the transaction holds only the delete and the inserts.
-/// The read, the decoding and the argon2id hashes block, so they run as one step on the
-/// blocking pool, awaited before the transaction opens; their errors are those of an inline
-/// run, in the same order (W011-F05). The outcome reports the number of rows written as
-/// `records`, writes no file and returns 0 (LOADS-038).
+/// The read, the decoding and the argon2id hashes block their thread, so they run as one step
+/// on the blocking pool, which finishes before the transaction opens. That step stops at its
+/// first failure, in the order of the errors below: an unreadable deck, then a deck, card or
+/// key sequence the decoding refuses, then a password that cannot be hashed. Only a step that
+/// succeeded reaches the transaction and its errors. The outcome reports the number of rows
+/// written as `records`, writes no file and returns 0 (LOADS-038).
 ///
 /// # Errors
 ///

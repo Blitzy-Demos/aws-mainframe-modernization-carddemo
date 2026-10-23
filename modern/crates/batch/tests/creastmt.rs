@@ -41,6 +41,16 @@ use test_support::postgres::{PostgresGuard, start_postgres};
 type Outcome<T> = Result<T, Box<dyn Error>>;
 type TestResult = Outcome<()>;
 
+/// Runs `test` to completion on a multi-thread runtime with the default number of workers, the
+/// runtime tokio's test attribute builds for its multi-thread flavour, without the lint
+/// attributes that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// The text statement, `STMTFILE` (CBSTM03A-002).
 const TEXT_FILE: &str = "STATEMNT.PS";
 
@@ -1061,147 +1071,155 @@ fn schema_less_database(database_url: &str) -> Outcome<String> {
 /// `POSTED`: `creastmt` writes the 50 statements of FIXSTMT-001 to FIXSTMT-050 as 80-byte text
 /// records, 100-byte HTML records and a PDF whose text is the text records, prints the three
 /// paths, ends with status 0 and leaves `transactions` as it found it.
-#[tokio::test(flavor = "multi_thread")]
-async fn statements_match_audit() -> TestResult {
-    let expected = Expected::from_audit()?;
-    let db = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    let posted = post_fixture_transactions(&scratch, &db).await?;
-    let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    assert_normal_end(&scratch, &run)?;
-    assert_statement_files(&scratch, &expected)?;
-    // The job requests no write or rewrite of any file it reads.
-    // audit: CBSTM03B-007
-    assert!(
-        transactions(&db).await? == posted,
-        "creastmt writes no table: the transactions are as posttran left them"
-    );
-    Ok(())
+#[test]
+fn statements_match_audit() -> TestResult {
+    block_on(async {
+        let expected = Expected::from_audit()?;
+        let db = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        let posted = post_fixture_transactions(&scratch, &db).await?;
+        let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        assert_normal_end(&scratch, &run)?;
+        assert_statement_files(&scratch, &expected)?;
+        // The job requests no write or rewrite of any file it reads.
+        // audit: CBSTM03B-007
+        assert!(
+            transactions(&db).await? == posted,
+            "creastmt writes no table: the transactions are as posttran left them"
+        );
+        Ok(())
+    })
 }
 
 /// `LOADED`, whose `transactions` is empty: the first read is at end of file, so the run shows
 /// `ERROR READING TRNXFILE`, `RETURN CODE: 10` and `ABENDING PROGRAM`, removes the previous
 /// run's files and its own, prints no path and exits non-zero. Halt candidate X-CREASTMT-H1
 /// blocks this case's parity, so it is the replacement's behaviour that is asserted.
-#[tokio::test(flavor = "multi_thread")]
-async fn empty_transactions_abend() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    assert!(
-        transactions(&db).await?.is_empty(),
-        "LOADED holds no transaction"
-    );
-    plant_previous_run(&scratch)?;
-    let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    // audit: CBSTM03A-002
-    // audit: CBSTM03A-007
-    // audit: CBSTM03A-049
-    // audit: CBSTM03B-006
-    assert_abend(
-        &scratch,
-        &run,
-        [
-            "ERROR READING TRNXFILE",
-            "RETURN CODE: 10",
-            ABENDING_PROGRAM,
-        ],
-    )?;
-    blocked("CBSTM03A-007", "X-CREASTMT-H1");
-    blocked("CBSTM03A-049", "X-CREASTMT-H1");
-    Ok(())
+#[test]
+fn empty_transactions_abend() -> TestResult {
+    block_on(async {
+        let db = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        assert!(
+            transactions(&db).await?.is_empty(),
+            "LOADED holds no transaction"
+        );
+        plant_previous_run(&scratch)?;
+        let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        // audit: CBSTM03A-002
+        // audit: CBSTM03A-007
+        // audit: CBSTM03A-049
+        // audit: CBSTM03B-006
+        assert_abend(
+            &scratch,
+            &run,
+            [
+                "ERROR READING TRNXFILE",
+                "RETURN CODE: 10",
+                ABENDING_PROGRAM,
+            ],
+        )?;
+        blocked("CBSTM03A-007", "X-CREASTMT-H1");
+        blocked("CBSTM03A-049", "X-CREASTMT-H1");
+        Ok(())
+    })
 }
 
 /// Two `POSTED` runs into one statement directory: the second replaces the three fixed-name
 /// files, so the directory holds only them, `STATEMNT.PS` and `STATEMNT.HTML` hold the first
 /// run's bytes again although the first run's files were made longer in between, and the PDF
 /// text is still the text records. No generation is kept.
-#[tokio::test(flavor = "multi_thread")]
-async fn rerun_replaces_fixed_name_files() -> TestResult {
-    let db = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&scratch, &db).await?;
-    let first = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    assert_normal_end(&scratch, &first)?;
-    let [text_path, html_path, pdf_path] = scratch.statement_paths();
-    let text = fs::read(&text_path)?;
-    let html = fs::read(&html_path)?;
-    // A second run that appended to the first run's files, or left one in place, would leave
-    // these bytes behind.
-    for path in [&text_path, &html_path, &pdf_path] {
-        OpenOptions::new()
-            .append(true)
-            .open(path)?
-            .write_all(PREVIOUS_RUN)?;
-    }
-    let second = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    // audit: CBSTM03A-002
-    assert_normal_end(&scratch, &second)?;
-    assert!(
-        fs::read(&text_path)? == text,
-        "{TEXT_FILE}: the second run's bytes differ from the first run's"
-    );
-    assert!(
-        fs::read(&html_path)? == html,
-        "{HTML_FILE}: the second run's bytes differ from the first run's"
-    );
-    let records = fixed_records(TEXT_FILE, &text, TEXT_RECORD_LEN)?;
-    // audit: CBSTM03A-051
-    // audit: CBSTM03A-052
-    assert_pdf_lines(&pdf_lines(&fs::read(&pdf_path)?)?, &records);
-    Ok(())
+#[test]
+fn rerun_replaces_fixed_name_files() -> TestResult {
+    block_on(async {
+        let db = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&scratch, &db).await?;
+        let first = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        assert_normal_end(&scratch, &first)?;
+        let [text_path, html_path, pdf_path] = scratch.statement_paths();
+        let text = fs::read(&text_path)?;
+        let html = fs::read(&html_path)?;
+        // A second run that appended to the first run's files, or left one in place, would leave
+        // these bytes behind.
+        for path in [&text_path, &html_path, &pdf_path] {
+            OpenOptions::new()
+                .append(true)
+                .open(path)?
+                .write_all(PREVIOUS_RUN)?;
+        }
+        let second = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        // audit: CBSTM03A-002
+        assert_normal_end(&scratch, &second)?;
+        assert!(
+            fs::read(&text_path)? == text,
+            "{TEXT_FILE}: the second run's bytes differ from the first run's"
+        );
+        assert!(
+            fs::read(&html_path)? == html,
+            "{HTML_FILE}: the second run's bytes differ from the first run's"
+        );
+        let records = fixed_records(TEXT_FILE, &text, TEXT_RECORD_LEN)?;
+        // audit: CBSTM03A-051
+        // audit: CBSTM03A-052
+        assert_pdf_lines(&pdf_lines(&fs::read(&pdf_path)?)?, &records);
+        Ok(())
+    })
 }
 
 /// `POSTED` with one added cross-reference whose customer no `customers` row holds, then with
 /// one more, sorting before it, whose account no `accounts` row holds: each run writes every
 /// fixture statement, reaches the added record, shows the failed read with status `23` and
 /// `ABENDING PROGRAM`, and leaves no statement file, those already written included.
-#[tokio::test(flavor = "multi_thread")]
-async fn missing_customer_or_account_abends() -> TestResult {
-    assert!(
-        fixture_card_numbers()?
-            .iter()
-            .all(|card| card.as_bytes() < NEXT_TO_LAST_CARD.as_slice()),
-        "the added cards sort after every fixture card"
-    );
-    let db = start_loaded_postgres().await?;
-    let scratch = Scratch::new()?;
-    post_fixture_transactions(&scratch, &db).await?;
-    let mut store = PgStore::new(db.pool().clone());
-    let no_customer = added_xref(LAST_CARD, MISSING_CUSTOMER, FIXTURE_ACCOUNT)?;
-    CardXrefRepository::insert(&mut store, &no_customer).await?;
-    plant_previous_run(&scratch)?;
-    let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    // audit: CBSTM03A-010
-    // audit: CBSTM03A-049
-    // audit: CBSTM03B-004
-    // audit: CBSTM03B-006
-    assert_abend(
-        &scratch,
-        &run,
-        [
-            "ERROR READING CUSTFILE",
-            "RETURN CODE: 23",
-            ABENDING_PROGRAM,
-        ],
-    )?;
-    let no_account = added_xref(NEXT_TO_LAST_CARD, FIXTURE_CUSTOMER, MISSING_ACCOUNT)?;
-    CardXrefRepository::insert(&mut store, &no_account).await?;
-    plant_previous_run(&scratch)?;
-    let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
-    // audit: CBSTM03A-011
-    // audit: CBSTM03A-049
-    // audit: CBSTM03B-005
-    // audit: CBSTM03B-006
-    assert_abend(
-        &scratch,
-        &run,
-        [
-            "ERROR READING ACCTFILE",
-            "RETURN CODE: 23",
-            ABENDING_PROGRAM,
-        ],
-    )?;
-    Ok(())
+#[test]
+fn missing_customer_or_account_abends() -> TestResult {
+    block_on(async {
+        assert!(
+            fixture_card_numbers()?
+                .iter()
+                .all(|card| card.as_bytes() < NEXT_TO_LAST_CARD.as_slice()),
+            "the added cards sort after every fixture card"
+        );
+        let db = start_loaded_postgres().await?;
+        let scratch = Scratch::new()?;
+        post_fixture_transactions(&scratch, &db).await?;
+        let mut store = PgStore::new(db.pool().clone());
+        let no_customer = added_xref(LAST_CARD, MISSING_CUSTOMER, FIXTURE_ACCOUNT)?;
+        CardXrefRepository::insert(&mut store, &no_customer).await?;
+        plant_previous_run(&scratch)?;
+        let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        // audit: CBSTM03A-010
+        // audit: CBSTM03A-049
+        // audit: CBSTM03B-004
+        // audit: CBSTM03B-006
+        assert_abend(
+            &scratch,
+            &run,
+            [
+                "ERROR READING CUSTFILE",
+                "RETURN CODE: 23",
+                ABENDING_PROGRAM,
+            ],
+        )?;
+        let no_account = added_xref(NEXT_TO_LAST_CARD, FIXTURE_CUSTOMER, MISSING_ACCOUNT)?;
+        CardXrefRepository::insert(&mut store, &no_account).await?;
+        plant_previous_run(&scratch)?;
+        let run = run_batch(&scratch, db.database_url(), &["creastmt"]).await?;
+        // audit: CBSTM03A-011
+        // audit: CBSTM03A-049
+        // audit: CBSTM03B-005
+        // audit: CBSTM03B-006
+        assert_abend(
+            &scratch,
+            &run,
+            [
+                "ERROR READING ACCTFILE",
+                "RETURN CODE: 23",
+                ABENDING_PROGRAM,
+            ],
+        )?;
+        Ok(())
+    })
 }
 
 /// A database without the schema: the read of `transactions` fails, so the run shows
@@ -1209,24 +1227,26 @@ async fn missing_customer_or_account_abends() -> TestResult {
 /// run's files and exits non-zero. The DD name, the order of the lines, the removal and the
 /// non-zero status are parity; the status characters `30` are the replacement's, which halt
 /// candidate X-CREASTMT-H3 blocks.
-#[tokio::test(flavor = "multi_thread")]
-async fn unreadable_transactions_abend() -> TestResult {
-    let db = start_postgres().await?;
-    let scratch = Scratch::new()?;
-    let schema_less = schema_less_database(db.database_url())?;
-    plant_previous_run(&scratch)?;
-    let run = run_batch(&scratch, &schema_less, &["creastmt"]).await?;
-    // audit: CBSTM03A-012
-    // audit: CBSTM03A-049
-    assert_abend(
-        &scratch,
-        &run,
-        [
-            "ERROR READING TRNXFILE",
-            "RETURN CODE: 30",
-            ABENDING_PROGRAM,
-        ],
-    )?;
-    blocked("CBSTM03A-012", "X-CREASTMT-H3");
-    Ok(())
+#[test]
+fn unreadable_transactions_abend() -> TestResult {
+    block_on(async {
+        let db = start_postgres().await?;
+        let scratch = Scratch::new()?;
+        let schema_less = schema_less_database(db.database_url())?;
+        plant_previous_run(&scratch)?;
+        let run = run_batch(&scratch, &schema_less, &["creastmt"]).await?;
+        // audit: CBSTM03A-012
+        // audit: CBSTM03A-049
+        assert_abend(
+            &scratch,
+            &run,
+            [
+                "ERROR READING TRNXFILE",
+                "RETURN CODE: 30",
+                ABENDING_PROGRAM,
+            ],
+        )?;
+        blocked("CBSTM03A-012", "X-CREASTMT-H3");
+        Ok(())
+    })
 }

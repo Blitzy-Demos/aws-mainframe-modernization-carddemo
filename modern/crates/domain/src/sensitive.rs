@@ -34,16 +34,19 @@
 //! A stored text field that is no protected field can still hold a protected value: the text
 //! fields of a pending authorization are copied from the CP00 request, so the 22 bytes of
 //! `PA-MERCHANT-NAME` can hold a 16-digit card number and the 9 of `PA-MERCHANT-ZIP` an SSN.
-//! [`redact_free_text`] masks such values where that text leaves a service. It reads a written
-//! number as a run of ASCII digits whose groups may be joined by one space or one hyphen, and
-//! masks each written number of nine or more digits, nine being the fewest a protected value
-//! holds (an SSN). Nine digits show as the SSN redacted form `***-**-1234` and sixteen as the
-//! card redacted form `************5740`, whatever separators they are written with. Any other
-//! count of nine or more, for which no redacted form exists, shows `*` for each digit but the
-//! last four, its separators kept. A run of eight or fewer digits, such as a ZIP code or a store
-//! number, shows as it is. The text keeps its width where its trailing spaces allow: a form
-//! longer than the number it replaces takes its room from the trailing spaces, and a shorter
-//! one is padded with spaces at the end.
+//! [`redact_free_text`] masks the SSN- and card-number-shaped numbers of that text where it
+//! leaves a service. It reads a written number as a run of ASCII digits whose groups may be
+//! joined by one space or one hyphen, and masks each written number of nine or more digits, nine
+//! being the digits of an SSN and sixteen those of a card number. Nine digits show as the SSN
+//! redacted form `***-**-1234` and sixteen as the card redacted form `************5740`,
+//! whatever separators they are written with. Any other count of nine or more, for which no
+//! redacted form exists, shows `*` for each digit but the last four, its separators kept. A run
+//! of eight or fewer digits, such as a ZIP code or a store number, shows as it is. The text keeps
+//! its width where its trailing spaces allow: a form longer than the number it replaces takes its
+//! room from the trailing spaces, and a shorter one is padded with spaces at the end.
+//!
+//! It is no general secret scrubber: a password, a three-digit CVV or any other secret written
+//! in free text that is no number of nine or more digits shows as it is.
 //!
 //! # API schemas
 //!
@@ -105,8 +108,9 @@ const NUMBER_SEPARATORS: [char; 2] = [' ', '-'];
 /// number of this many digits shows as the SSN redacted form in [`redact_free_text`].
 const SSN_TEXT_DIGITS: usize = 9;
 
-/// The fewest digits of a written number that [`redact_free_text`] masks: the nine of an SSN,
-/// the shortest protected value (a card number holds [`CARD_WIDTH`]).
+/// The fewest digits of a written number that [`redact_free_text`] masks: the nine of an SSN (a
+/// card number holds [`CARD_WIDTH`]). A shorter protected value written in free text, such as
+/// the three digits of a [`Cvv`] or the eight bytes of a [`Password`], is not masked.
 const PROTECTED_MIN_DIGITS: usize = SSN_TEXT_DIGITS;
 
 /// Why external text is not a protected value.
@@ -479,14 +483,18 @@ impl fmt::Display for Password {
     }
 }
 
-/// `text` with every protected value it may hold masked, for a stored free-text field that
-/// leaves a service, such as the request text of a pending authorization (`E32`).
+/// `text` with each written number of nine or more digits masked, the shape of an SSN or a card
+/// number, for a stored free-text field that leaves a service, such as the request text of a
+/// pending authorization (`E32`).
+///
+/// It is no general secret scrubber: a password, a three-digit CVV or any other secret that is
+/// no such number is kept as it is.
 ///
 /// A written number is a maximal run of ASCII digits whose digit groups may be joined by one
 /// space or one hyphen. A separator joins only when a digit follows it, so a separator before
 /// any other character, or a second separator, ends the number. A written number of fewer than
-/// nine digits is kept as it is. One of nine or more digits, the fewest a protected value holds
-/// (an SSN; a card number holds 16), is masked by its count of digits:
+/// nine digits is kept as it is. One of nine or more digits, nine being the digits of an SSN (a
+/// card number holds 16), is masked by its count of digits:
 ///
 /// - nine digits, an SSN however it is written (`123456789`, `123-45-6789`, `123 45 6789`),
 ///   become the redacted form of an [`Ssn`], `***-**-` and the last four digits, such as

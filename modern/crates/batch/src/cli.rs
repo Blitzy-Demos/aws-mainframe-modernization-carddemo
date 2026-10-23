@@ -36,10 +36,31 @@
 //!   may hold a protected value (`CBPAUP0J.md`, CBPAUP0C-002), so `--sysin` is kept as typed and
 //!   parsed by [`Cbpaup0jArgs::purge_params`], whose error names only a length or an offset. The
 //!   other options carry no protected data.
+//!
+//! # Construction
+//!
+//! The command is built with `clap`'s builder (`Command`, `Arg`, `ArgGroup`), and [`Cli`]
+//! implements `CommandFactory`, `FromArgMatches` and `Parser` by hand. `clap`'s derive macros are
+//! not used because the code they generate carries lint suppressions, which this workspace admits
+//! nowhere, generated code included. The command keeps the shape the derive gives a parser: the
+//! options of each subcommand form an `ArgGroup` named after the struct that holds them, each
+//! option's id is its field name and its long name that name in kebab case, and an update
+//! (`Parser::try_update_from`) replaces only the values its command line holds, defaults
+//! included, or the whole job when it names another subcommand. An update needs no subcommand,
+//! but the subcommand it names is built as for a parse, so `clap` refuses the update for what
+//! it refuses a parse, `mnttrdb2` without `--input` included, and the job stays as it was.
+//! Values leave the matches through `ArgMatches::try_remove_one`, so a reading that does not fit
+//! its option is a typed `clap` error, never a panic.
 
+use std::any::Any;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use chrono::NaiveDate;
+use clap::builder::ValueParser;
+use clap::error::ErrorKind;
+use clap::parser::MatchesError;
+use clap::{Arg, ArgAction, ArgGroup, ArgMatches, Command};
 use domain::batch::cbact04c::{DEFAULT_PARM_DATE, ParmDate};
 use domain::batch::cbpaup0c::{DEFAULT_SYSIN, PurgeParams, SysinError};
 use domain::batch::cbtrn03c::{DateParm, DateParmError};
@@ -227,76 +248,110 @@ const MNTTRDB2_HELP: &str = concat!(
     job_example!("mnttrdb2 --input maintenance.txt"),
 );
 
+/// The line that heads the help of `carddemo-batch`.
+const CLI_ABOUT: &str =
+    "Run one batch job of the COBOL replacement: each subcommand stands in for one JCL job";
+
 /// Run one batch job of the COBOL replacement: each subcommand stands in for one JCL job
-#[derive(Debug, clap::Parser)]
-#[command(
-    name = "carddemo-batch",
-    version,
-    disable_help_subcommand = true,
-    after_help = CLI_HELP
-)]
+#[derive(Debug)]
 pub(crate) struct Cli {
     /// The job to run.
-    #[command(subcommand)]
     pub(crate) job: Job,
 }
 
+impl Cli {
+    /// The command of `carddemo-batch`, with the 15 subcommands in the order of the `Job`
+    /// variants. Built for an update (`for_update`), it requires no subcommand, so an update
+    /// without one leaves the job as it is. The subcommands are the same in both commands, so
+    /// an update that names one is held to the options its parse requires.
+    fn build(for_update: bool) -> Command {
+        // `Cli` holds no option of its own, so its group has no member.
+        let command = Command::new("carddemo-batch").group(ArgGroup::new("Cli").multiple(true));
+        JOB_COMMANDS
+            .iter()
+            .fold(command, |command, job| command.subcommand(job.command()))
+            .subcommand_required(!for_update)
+            .arg_required_else_help(!for_update)
+            .about(CLI_ABOUT)
+            .version(env!("CARGO_PKG_VERSION"))
+            .disable_help_subcommand(true)
+            .after_help(CLI_HELP)
+    }
+}
+
+impl clap::CommandFactory for Cli {
+    fn command() -> Command {
+        Self::build(false)
+    }
+
+    fn command_for_update() -> Command {
+        Self::build(true)
+    }
+}
+
+impl clap::FromArgMatches for Cli {
+    fn from_arg_matches(matches: &ArgMatches) -> Result<Self, clap::Error> {
+        Self::from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn from_arg_matches_mut(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Job::read(matches).map(|job| Self { job })
+    }
+
+    fn update_from_arg_matches(&mut self, matches: &ArgMatches) -> Result<(), clap::Error> {
+        self.update_from_arg_matches_mut(&mut matches.clone())
+    }
+
+    fn update_from_arg_matches_mut(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        self.job.update(matches)
+    }
+}
+
+/// `Parser` provides every one of its methods, `parse`, `try_parse_from` and `try_update_from`
+/// among them, over the `CommandFactory` and `FromArgMatches` implementations above.
+impl clap::Parser for Cli {}
+
 /// The 15 jobs. Each name is written out, never derived from the variant, so the digits of
 /// `cbpaup0j` and `mnttrdb2` stay where the JCL member names have them.
-#[derive(Debug, clap::Subcommand)]
+#[derive(Debug)]
 pub(crate) enum Job {
     /// ACCTFILE (IDCAMS REPRO): replace the accounts with acctdata.txt
-    #[command(name = "acctfile", after_help = ACCTFILE_HELP)]
     Acctfile(LoadArgs),
     /// CARDFILE (IDCAMS REPRO): replace the cards with carddata.txt
-    #[command(name = "cardfile", after_help = CARDFILE_HELP)]
     Cardfile(LoadArgs),
     /// XREFFILE (IDCAMS REPRO): replace the card cross-references with cardxref.txt
-    #[command(name = "xreffile", after_help = XREFFILE_HELP)]
     Xreffile(LoadArgs),
     /// CUSTFILE (IDCAMS REPRO): replace the customers with custdata.txt
-    #[command(name = "custfile", after_help = CUSTFILE_HELP)]
     Custfile(LoadArgs),
     /// DISCGRP (IDCAMS REPRO): replace the disclosure groups with discgrp.txt
-    #[command(name = "discgrp", after_help = DISCGRP_HELP)]
     Discgrp(LoadArgs),
     /// TCATBALF (IDCAMS REPRO): replace the transaction category balances with tcatbal.txt
-    #[command(name = "tcatbalf", after_help = TCATBALF_HELP)]
     Tcatbalf(LoadArgs),
     /// TRANCATG (IDCAMS REPRO): replace the VSAM version of the transaction categories with
     /// trancatg.txt
-    #[command(name = "trancatg", after_help = TRANCATG_HELP)]
     Trancatg(LoadArgs),
     /// TRANTYPE (IDCAMS REPRO): replace the VSAM version of the transaction types with
     /// trantype.txt
-    #[command(name = "trantype", after_help = TRANTYPE_HELP)]
     Trantype(LoadArgs),
     /// DUSRSECJ (IEBGENER): replace the users with the in-stream records of the DUSRSECJ deck,
     /// passwords stored hashed
-    #[command(name = "dusrsecj", after_help = DUSRSECJ_HELP)]
     Dusrsecj(DusrsecjArgs),
     /// POSTTRAN (CBTRN02C): post the daily transactions; rejects go to a new DALYREJS
     /// generation, and the exit code is 4 when any record is rejected
-    #[command(name = "posttran", after_help = POSTTRAN_HELP)]
     Posttran(PosttranArgs),
     /// INTCALC (CBACT04C): compute the monthly interest into a new SYSTRAN generation and
     /// update the account balances
-    #[command(name = "intcalc", after_help = INTCALC_HELP)]
     Intcalc(IntcalcArgs),
     /// CREASTMT (CBSTM03A, CBSTM03B): write the account statements STATEMNT.PS, STATEMNT.HTML
     /// and STATEMNT.PDF
-    #[command(name = "creastmt", after_help = CREASTMT_HELP)]
     Creastmt,
     /// TRANREPT (CBTRN03C): write the transaction detail report for a processing-date window
     /// to a new TRANREPT generation
-    #[command(name = "tranrept", after_help = TRANREPT_HELP)]
     Tranrept(TranreptArgs),
     /// CBPAUP0J (CBPAUP0C): purge the expired pending authorizations
-    #[command(name = "cbpaup0j", after_help = CBPAUP0J_HELP)]
     Cbpaup0j(Cbpaup0jArgs),
     /// MNTTRDB2 (COBTUPDT): apply transaction type maintenance records to the Db2 version of
     /// the transaction types
-    #[command(name = "mnttrdb2", after_help = MNTTRDB2_HELP)]
     Mnttrdb2(Mnttrdb2Args),
 }
 
@@ -323,16 +378,346 @@ impl Job {
             Self::Mnttrdb2(_) => "mnttrdb2",
         }
     }
+
+    /// The job of the subcommand the matches hold.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::MissingSubcommand` when the matches hold no subcommand, and any error of
+    /// [`Job::read_subcommand`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        let Some((name, mut subcommand)) = matches.remove_subcommand() else {
+            return Err(clap::Error::raw(
+                ErrorKind::MissingSubcommand,
+                "a subcommand is required but one was not provided",
+            ));
+        };
+        Self::read_subcommand(&name, &mut subcommand)
+    }
+
+    /// The job of subcommand `name`, from the subcommand's own matches.
+    ///
+    /// # Errors
+    ///
+    /// `ErrorKind::InvalidSubcommand` for a name no job has, and any error of reading the job's
+    /// options.
+    fn read_subcommand(name: &str, matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        match JOB_COMMANDS.iter().find(|job| job.name == name) {
+            Some(job) => (job.read)(matches),
+            None => Err(clap::Error::raw(
+                ErrorKind::InvalidSubcommand,
+                format!("the subcommand '{name}' wasn't recognized"),
+            )),
+        }
+    }
+
+    /// Updates the job from the matches of an update: a subcommand naming this job replaces the
+    /// options its matches hold, a subcommand naming another job replaces the job, and matches
+    /// without a subcommand leave the job as it is.
+    ///
+    /// # Errors
+    ///
+    /// Any error of reading the options or the other job. Another job that cannot be read never
+    /// replaces this one.
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        let Some((name, mut subcommand)) = matches.remove_subcommand() else {
+            return Ok(());
+        };
+        let matches = &mut subcommand;
+        if name != self.name() {
+            *self = Self::read_subcommand(&name, matches)?;
+            return Ok(());
+        }
+        match self {
+            Self::Acctfile(args)
+            | Self::Cardfile(args)
+            | Self::Xreffile(args)
+            | Self::Custfile(args)
+            | Self::Discgrp(args)
+            | Self::Tcatbalf(args)
+            | Self::Trancatg(args)
+            | Self::Trantype(args) => args.update(matches),
+            Self::Dusrsecj(args) => args.update(matches),
+            Self::Posttran(args) => args.update(matches),
+            Self::Intcalc(args) => args.update(matches),
+            // `creastmt` takes no option, so its matches hold nothing to replace.
+            Self::Creastmt => Ok(()),
+            Self::Tranrept(args) => args.update(matches),
+            Self::Cbpaup0j(args) => args.update(matches),
+            Self::Mnttrdb2(args) => args.update(matches),
+        }
+    }
+}
+
+/// One subcommand: the job it selects, its help and its options.
+struct JobCommand {
+    /// The subcommand, as [`Job::name`] returns it for the job it selects.
+    name: &'static str,
+    /// The line the help lists for the subcommand.
+    about: &'static str,
+    /// The help printed after the subcommand's options.
+    after_help: &'static str,
+    /// Adds the subcommand's options to its command; `None` for a job that takes no option.
+    options: Option<fn(Command) -> Command>,
+    /// The job, from the matches of the subcommand.
+    read: fn(&mut ArgMatches) -> Result<Job, clap::Error>,
+}
+
+impl JobCommand {
+    /// The subcommand's command, the same for a parse and for an update.
+    fn command(&self) -> Command {
+        let command = Command::new(self.name);
+        let command = match self.options {
+            Some(options) => options(command),
+            None => command,
+        };
+        command.about(self.about).after_help(self.after_help)
+    }
+}
+
+/// The 15 subcommands, in the order of the `Job` variants, which is the order the help lists.
+static JOB_COMMANDS: [JobCommand; 15] = [
+    JobCommand {
+        name: "acctfile",
+        about: "ACCTFILE (IDCAMS REPRO): replace the accounts with acctdata.txt",
+        after_help: ACCTFILE_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Acctfile),
+    },
+    JobCommand {
+        name: "cardfile",
+        about: "CARDFILE (IDCAMS REPRO): replace the cards with carddata.txt",
+        after_help: CARDFILE_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Cardfile),
+    },
+    JobCommand {
+        name: "xreffile",
+        about: "XREFFILE (IDCAMS REPRO): replace the card cross-references with cardxref.txt",
+        after_help: XREFFILE_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Xreffile),
+    },
+    JobCommand {
+        name: "custfile",
+        about: "CUSTFILE (IDCAMS REPRO): replace the customers with custdata.txt",
+        after_help: CUSTFILE_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Custfile),
+    },
+    JobCommand {
+        name: "discgrp",
+        about: "DISCGRP (IDCAMS REPRO): replace the disclosure groups with discgrp.txt",
+        after_help: DISCGRP_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Discgrp),
+    },
+    JobCommand {
+        name: "tcatbalf",
+        about: concat!(
+            "TCATBALF (IDCAMS REPRO): replace the transaction category balances with ",
+            "tcatbal.txt",
+        ),
+        after_help: TCATBALF_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Tcatbalf),
+    },
+    JobCommand {
+        name: "trancatg",
+        about: concat!(
+            "TRANCATG (IDCAMS REPRO): replace the VSAM version of the transaction categories ",
+            "with trancatg.txt",
+        ),
+        after_help: TRANCATG_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Trancatg),
+    },
+    JobCommand {
+        name: "trantype",
+        about: concat!(
+            "TRANTYPE (IDCAMS REPRO): replace the VSAM version of the transaction types with ",
+            "trantype.txt",
+        ),
+        after_help: TRANTYPE_HELP,
+        options: Some(LoadArgs::options),
+        read: |matches| LoadArgs::read(matches).map(Job::Trantype),
+    },
+    JobCommand {
+        name: "dusrsecj",
+        about: concat!(
+            "DUSRSECJ (IEBGENER): replace the users with the in-stream records of the DUSRSECJ ",
+            "deck, passwords stored hashed",
+        ),
+        after_help: DUSRSECJ_HELP,
+        options: Some(DusrsecjArgs::options),
+        read: |matches| DusrsecjArgs::read(matches).map(Job::Dusrsecj),
+    },
+    JobCommand {
+        name: "posttran",
+        about: concat!(
+            "POSTTRAN (CBTRN02C): post the daily transactions; rejects go to a new DALYREJS ",
+            "generation, and the exit code is 4 when any record is rejected",
+        ),
+        after_help: POSTTRAN_HELP,
+        options: Some(PosttranArgs::options),
+        read: |matches| PosttranArgs::read(matches).map(Job::Posttran),
+    },
+    JobCommand {
+        name: "intcalc",
+        about: concat!(
+            "INTCALC (CBACT04C): compute the monthly interest into a new SYSTRAN generation and ",
+            "update the account balances",
+        ),
+        after_help: INTCALC_HELP,
+        options: Some(IntcalcArgs::options),
+        read: |matches| IntcalcArgs::read(matches).map(Job::Intcalc),
+    },
+    JobCommand {
+        name: "creastmt",
+        about: concat!(
+            "CREASTMT (CBSTM03A, CBSTM03B): write the account statements STATEMNT.PS, ",
+            "STATEMNT.HTML and STATEMNT.PDF",
+        ),
+        after_help: CREASTMT_HELP,
+        options: None,
+        read: |_| Ok(Job::Creastmt),
+    },
+    JobCommand {
+        name: "tranrept",
+        about: concat!(
+            "TRANREPT (CBTRN03C): write the transaction detail report for a processing-date ",
+            "window to a new TRANREPT generation",
+        ),
+        after_help: TRANREPT_HELP,
+        options: Some(TranreptArgs::options),
+        read: |matches| TranreptArgs::read(matches).map(Job::Tranrept),
+    },
+    JobCommand {
+        name: "cbpaup0j",
+        about: "CBPAUP0J (CBPAUP0C): purge the expired pending authorizations",
+        after_help: CBPAUP0J_HELP,
+        options: Some(Cbpaup0jArgs::options),
+        read: |matches| Cbpaup0jArgs::read(matches).map(Job::Cbpaup0j),
+    },
+    JobCommand {
+        name: "mnttrdb2",
+        about: concat!(
+            "MNTTRDB2 (COBTUPDT): apply transaction type maintenance records to the Db2 version ",
+            "of the transaction types",
+        ),
+        after_help: MNTTRDB2_HELP,
+        options: Some(Mnttrdb2Args::options),
+        read: |matches| Mnttrdb2Args::read(matches).map(Job::Mnttrdb2),
+    },
+];
+
+/// Option `--<long>` with id `id`, the name of the field it fills: it takes one value, which the
+/// help names `value_name` and `parser` turns into the field's type.
+fn option(
+    id: &'static str,
+    long: &'static str,
+    value_name: &'static str,
+    parser: ValueParser,
+) -> Arg {
+    Arg::new(id)
+        .long(long)
+        .value_name(value_name)
+        .value_parser(parser)
+        .action(ArgAction::Set)
+}
+
+/// `command` with the options of one struct and the group `group`, the struct's name, that holds
+/// them all.
+fn with_options<const N: usize>(
+    command: Command,
+    group: &'static str,
+    options: [Arg; N],
+) -> Command {
+    let members = options.each_ref().map(Arg::get_id);
+    let command = command.group(ArgGroup::new(group).multiple(true).args(members));
+    options.into_iter().fold(command, Command::arg)
+}
+
+/// The error of a reading that does not fit option `id`: an id the command does not define, or a
+/// value of another type than the reading asks for. It names no value.
+fn unreadable(id: &str, error: &MatchesError) -> clap::Error {
+    clap::Error::raw(
+        ErrorKind::ValueValidation,
+        format!(
+            "the value of {id} cannot be read: {}",
+            error.to_string().trim_end()
+        ),
+    )
+}
+
+/// Whether the matches hold option `id`, from the command line or from its default.
+///
+/// # Errors
+///
+/// The error of [`unreadable`] when the command defines no option `id`.
+fn holds(matches: &ArgMatches, id: &str) -> Result<bool, clap::Error> {
+    matches
+        .try_contains_id(id)
+        .map_err(|error| unreadable(id, &error))
+}
+
+/// The value of option `id`, taken out of the matches; `None` when they hold none.
+///
+/// # Errors
+///
+/// The error of [`unreadable`] when the option is undefined or its value is no `T`.
+fn take<T: Any + Clone + Send + Sync>(
+    matches: &mut ArgMatches,
+    id: &str,
+) -> Result<Option<T>, clap::Error> {
+    matches
+        .try_remove_one(id)
+        .map_err(|error| unreadable(id, &error))
+}
+
+/// The value of option `id`, which every parse yields through the command line, the option's
+/// default or its being required.
+///
+/// # Errors
+///
+/// `ErrorKind::MissingRequiredArgument` when the matches hold no value, and any error of
+/// [`take`]. Matches of this command always hold one: `clap` refuses a command line without a
+/// required option, an update's included, before any value is read.
+fn take_required<T: Any + Clone + Send + Sync>(
+    matches: &mut ArgMatches,
+    id: &str,
+) -> Result<T, clap::Error> {
+    take(matches, id)?.ok_or_else(|| {
+        clap::Error::raw(
+            ErrorKind::MissingRequiredArgument,
+            format!("the following required argument was not provided: {id}"),
+        )
+    })
+}
+
+/// Replaces `value` with the value of option `id` when the matches of an update hold the option.
+///
+/// # Errors
+///
+/// Any error of [`holds`] or [`take_required`]; `value` is then left as it was.
+fn update_value<T: Any + Clone + Send + Sync>(
+    value: &mut T,
+    matches: &mut ArgMatches,
+    id: &str,
+) -> Result<(), clap::Error> {
+    if holds(matches, id)? {
+        *value = take_required(matches, id)?;
+    }
+    Ok(())
 }
 
 /// The input of a fixture load
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct LoadArgs {
     // No `clap` default: the default lies in `CARDDEMO_FIXTURE_DIR`, which `Config` reads only
     // after parsing; `input_path` joins the two (LOADS-010).
     /// Fixture file to load [default: the job's file in `CARDDEMO_FIXTURE_DIR`, ../app/data/ASCII
     /// when unset]
-    #[arg(long, value_name = "PATH")]
     input: Option<PathBuf>,
 }
 
@@ -349,67 +734,185 @@ impl LoadArgs {
             (None, None) => PathBuf::from(DUSRSECJ_DECK),
         }
     }
+
+    /// `command` with `--input`, the option of every fixture load.
+    fn options(command: Command) -> Command {
+        let input = option("input", "input", "PATH", ValueParser::path_buf()).help(concat!(
+            "Fixture file to load [default: the job's file in `CARDDEMO_FIXTURE_DIR`, ",
+            "../app/data/ASCII when unset]",
+        ));
+        with_options(command, "LoadArgs", [input])
+    }
+
+    /// The input, from the matches of a fixture load.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            input: take(matches, "input")?,
+        })
+    }
+
+    /// Replaces the input when the matches of an update hold `--input`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`holds`] or [`take`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        if holds(matches, "input")? {
+            self.input = take(matches, "input")?;
+        }
+        Ok(())
+    }
 }
 
 /// The input of `dusrsecj`
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct DusrsecjArgs {
     /// JCL deck whose SYSUT1 in-stream records are the user security records
-    #[arg(long, value_name = "PATH", default_value = DUSRSECJ_DECK)]
     pub(crate) input: PathBuf,
 }
 
+impl DusrsecjArgs {
+    /// `command` with `--input`, the deck `dusrsecj` reads.
+    fn options(command: Command) -> Command {
+        let input = option("input", "input", "PATH", ValueParser::path_buf())
+            .help("JCL deck whose SYSUT1 in-stream records are the user security records")
+            .default_value(DUSRSECJ_DECK);
+        with_options(command, "DusrsecjArgs", [input])
+    }
+
+    /// The input, from the matches of `dusrsecj`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            input: take_required(matches, "input")?,
+        })
+    }
+
+    /// Replaces the input when the matches of an update hold `--input`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.input, matches, "input")
+    }
+}
+
 /// The input of `posttran`
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct PosttranArgs {
     // CBTRN02C-001: line n of the file is the n-th daily transaction.
     /// Daily transaction file, one 350-byte record per line
-    #[arg(long, value_name = "PATH", default_value = DAILY_TRANSACTIONS)]
     pub(crate) dalytran: PathBuf,
 }
 
+impl PosttranArgs {
+    /// `command` with `--dalytran`, the daily transaction file `posttran` posts.
+    fn options(command: Command) -> Command {
+        let dalytran = option("dalytran", "dalytran", "PATH", ValueParser::path_buf())
+            .help("Daily transaction file, one 350-byte record per line")
+            .default_value(DAILY_TRANSACTIONS);
+        with_options(command, "PosttranArgs", [dalytran])
+    }
+
+    /// The input, from the matches of `posttran`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            dalytran: take_required(matches, "dalytran")?,
+        })
+    }
+
+    /// Replaces the input when the matches of an update hold `--dalytran`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.dalytran, matches, "dalytran")
+    }
+}
+
 /// The PARM of `intcalc`, parsed into the domain's `ParmDate` while the command line is read.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct IntcalcArgs {
     // CBACT04C-001: a value of 10 or more printable ASCII bytes, of which the first 10 are
     // `PARM-DATE`; anything else is a usage error before any table is read.
     /// PARM of CBACT04C: 10 or more printable ASCII characters, the first 10 of which begin every
     /// interest transaction ID
-    #[arg(
-        long,
-        value_name = "PARM",
-        default_value = DEFAULT_PARM_DATE,
-        value_parser = parse_parm_date
-    )]
     pub(crate) parm_date: ParmDate,
+}
+
+impl IntcalcArgs {
+    /// `command` with `--parm-date`, decoded by [`parse_parm_date`] (CBACT04C-001).
+    fn options(command: Command) -> Command {
+        let parm_date = option(
+            "parm_date",
+            "parm-date",
+            "PARM",
+            ValueParser::new(parse_parm_date),
+        )
+        .help(concat!(
+            "PARM of CBACT04C: 10 or more printable ASCII characters, the first 10 of which ",
+            "begin every interest transaction ID",
+        ))
+        .default_value(DEFAULT_PARM_DATE);
+        with_options(command, "IntcalcArgs", [parm_date])
+    }
+
+    /// The PARM, from the matches of `intcalc`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            parm_date: take_required(matches, "parm_date")?,
+        })
+    }
+
+    /// Replaces the PARM when the matches of an update hold `--parm-date`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.parm_date, matches, "parm_date")
+    }
 }
 
 /// The reporting window of `tranrept`, both dates inclusive.
 ///
 /// No order between the two is required: CBTRN03C checks none, and a start after the end selects
 /// nothing (CBTRN03C-002).
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct TranreptArgs {
     // CBTRN03C-001, CBTRN03C-002: the date rule of PIC-015; anything else is a usage error
     // before any table is read.
     /// First processing date reported, YYYY-MM-DD
-    #[arg(
-        long,
-        value_name = "YYYY-MM-DD",
-        default_value_t = DateParm::DEFAULT.start(),
-        value_parser = parse_iso_date
-    )]
     start_date: NaiveDate,
     // CBTRN03C-001, CBTRN03C-002, as `start_date`.
     /// Last processing date reported, YYYY-MM-DD
-    #[arg(
-        long,
-        value_name = "YYYY-MM-DD",
-        default_value_t = DateParm::DEFAULT.end(),
-        value_parser = parse_iso_date
-    )]
     end_date: NaiveDate,
 }
+
+/// The default of `--start-date`, the start of `DateParm::DEFAULT` as `YYYY-MM-DD`. `clap` takes
+/// a default only as text that lives as long as the program, so the date is written out once.
+static START_DATE_DEFAULT: OnceLock<String> = OnceLock::new();
+
+/// The default of `--end-date`, the end of `DateParm::DEFAULT`, written out as
+/// [`START_DATE_DEFAULT`] is.
+static END_DATE_DEFAULT: OnceLock<String> = OnceLock::new();
 
 impl TranreptArgs {
     /// The DATEPARM window of CBTRN03C from the two dates (CBTRN03C-001).
@@ -422,15 +925,61 @@ impl TranreptArgs {
     pub(crate) fn date_parm(&self) -> Result<DateParm, DateParmError> {
         DateParm::new(self.start_date, self.end_date)
     }
+
+    /// `command` with `--start-date` and `--end-date`, each decoded by [`parse_iso_date`] and
+    /// defaulting to its end of `DateParm::DEFAULT` (CBTRN03C-001).
+    fn options(command: Command) -> Command {
+        let date = |id, long, help| {
+            option(id, long, "YYYY-MM-DD", ValueParser::new(parse_iso_date)).help(help)
+        };
+        let start_default =
+            START_DATE_DEFAULT.get_or_init(|| DateParm::DEFAULT.start().to_string());
+        let end_default = END_DATE_DEFAULT.get_or_init(|| DateParm::DEFAULT.end().to_string());
+        let start_date = date(
+            "start_date",
+            "start-date",
+            "First processing date reported, YYYY-MM-DD",
+        )
+        .default_value(start_default.as_str());
+        let end_date = date(
+            "end_date",
+            "end-date",
+            "Last processing date reported, YYYY-MM-DD",
+        )
+        .default_value(end_default.as_str());
+        with_options(command, "TranreptArgs", [start_date, end_date])
+    }
+
+    /// The window, from the matches of `tranrept`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            start_date: take_required(matches, "start_date")?,
+            end_date: take_required(matches, "end_date")?,
+        })
+    }
+
+    /// Replaces each date whose option the matches of an update hold.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.start_date, matches, "start_date")?;
+        update_value(&mut self.end_date, matches, "end_date")
+    }
 }
 
 /// The SYSIN record of `cbpaup0j`, kept exactly as typed until the job parses it.
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct Cbpaup0jArgs {
-    // CBPAUP0C-002: no `value_parser`, so a rejected record never reaches a `clap` message.
+    // CBPAUP0C-002: read as text by `ValueParser::string()` and parsed by no option parser, so a
+    // rejected record never reaches a `clap` message.
     /// SYSIN record of CBPAUP0C: expiry days, checkpoint frequency, display frequency and debug
     /// flag, at most 80 printable ASCII characters
-    #[arg(long, value_name = "RECORD", default_value = DEFAULT_SYSIN)]
     sysin: String,
 }
 
@@ -445,17 +994,83 @@ impl Cbpaup0jArgs {
     pub(crate) fn purge_params(&self) -> Result<PurgeParams, SysinError> {
         PurgeParams::parse(self.sysin.as_bytes())
     }
+
+    /// `command` with `--sysin`, kept as typed: `ValueParser::string()` turns no record into a
+    /// usage error that would repeat it (CBPAUP0C-002).
+    fn options(command: Command) -> Command {
+        let sysin = option("sysin", "sysin", "RECORD", ValueParser::string())
+            .help(concat!(
+                "SYSIN record of CBPAUP0C: expiry days, checkpoint frequency, display frequency ",
+                "and debug flag, at most 80 printable ASCII characters",
+            ))
+            .default_value(DEFAULT_SYSIN);
+        with_options(command, "Cbpaup0jArgs", [sysin])
+    }
+
+    /// The SYSIN record, from the matches of `cbpaup0j`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            sysin: take_required(matches, "sysin")?,
+        })
+    }
+
+    /// Replaces the SYSIN record when the matches of an update hold `--sysin`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.sysin, matches, "sysin")
+    }
 }
 
 /// The input of `mnttrdb2`
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Debug, Clone)]
 pub(crate) struct Mnttrdb2Args {
     // COBTUPDT-001: required and without default, so its absence is a usage error before any
     // database access; COBTUPDT-002 and COBTUPDT-003 give the record layout.
     /// Maintenance records, one 53-byte record per line: action, type code, description; required,
     /// as no repository source holds the INPFILE dataset
-    #[arg(long, value_name = "PATH")]
     pub(crate) input: PathBuf,
+}
+
+impl Mnttrdb2Args {
+    /// `command` with `--input`, required and without default (COBTUPDT-001).
+    fn options(command: Command) -> Command {
+        let input = option("input", "input", "PATH", ValueParser::path_buf())
+            .help(concat!(
+                "Maintenance records, one 53-byte record per line: action, type code, ",
+                "description; required, as no repository source holds the INPFILE dataset",
+            ))
+            .required(true);
+        with_options(command, "Mnttrdb2Args", [input])
+    }
+
+    /// The input, from the matches of `mnttrdb2`. `clap` refuses `mnttrdb2` without `--input`,
+    /// in a parse and in an update alike, while it matches the command line, so the matches of
+    /// this command always hold the input.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`take_required`].
+    fn read(matches: &mut ArgMatches) -> Result<Self, clap::Error> {
+        Ok(Self {
+            input: take_required(matches, "input")?,
+        })
+    }
+
+    /// Replaces the input when the matches of an update hold `--input`.
+    ///
+    /// # Errors
+    ///
+    /// Any error of [`update_value`].
+    fn update(&mut self, matches: &mut ArgMatches) -> Result<(), clap::Error> {
+        update_value(&mut self.input, matches, "input")
+    }
 }
 
 /// `--parm-date` through the domain's total parser (CBACT04C-001). Its error text names only the
@@ -720,6 +1335,70 @@ mod tests {
     #[test]
     fn no_subcommand_is_a_usage_error() {
         assert!(parse(&[]).is_err());
+    }
+
+    // An update replaces the values its command line holds, defaults included, or the whole job
+    // when it names another subcommand; a refused update leaves the job as it was. The
+    // subcommand an update names requires what its parse requires.
+    #[test]
+    fn an_update_replaces_the_values_or_the_job_it_names() -> TestResult {
+        let end_date = |job: &Job| match job {
+            Job::Tranrept(args) => Ok(args.end_date.to_string()),
+            other => Err(format!("updated to {other:?}")),
+        };
+        let mut cli = Cli::try_parse_from([BIN, "intcalc"])?;
+        cli.try_update_from([BIN, "intcalc", "--parm-date", "2023010199XYZ"])?;
+        match &cli.job {
+            Job::Intcalc(args) => assert_eq!(args.parm_date.as_bytes(), b"2023010199"),
+            other => return Err(format!("updated to {other:?}").into()),
+        }
+        cli.try_update_from([BIN, "intcalc"])?;
+        match &cli.job {
+            Job::Intcalc(args) => assert_eq!(args.parm_date, ParmDate::DEFAULT),
+            other => return Err(format!("updated to {other:?}").into()),
+        }
+        cli.try_update_from([BIN, "tranrept", "--end-date", "2022-02-28"])?;
+        match &cli.job {
+            Job::Tranrept(args) => assert_eq!(args.start_date, DateParm::DEFAULT.start()),
+            other => return Err(format!("updated to {other:?}").into()),
+        }
+        assert_eq!(end_date(&cli.job)?, "2022-02-28");
+        cli.try_update_from([BIN])?;
+        assert_eq!(end_date(&cli.job)?, "2022-02-28");
+
+        let refused: [(&[&str], ErrorKind); 3] = [
+            (&["intcalc", "--parm-date", "1"], ErrorKind::ValueValidation),
+            (&["mnttrdb2"], ErrorKind::MissingRequiredArgument),
+            (&["help"], ErrorKind::InvalidSubcommand),
+        ];
+        for (args, kind) in refused {
+            let err = cli
+                .try_update_from(std::iter::once(BIN).chain(args.iter().copied()))
+                .err();
+            assert_eq!(err.map(|e| e.kind()), Some(kind), "{args:?}");
+            assert_eq!(end_date(&cli.job)?, "2022-02-28", "{args:?}");
+        }
+
+        // An update naming `mnttrdb2` without `--input` is refused as its parse is, with the
+        // subcommand's usage, whether the job is `mnttrdb2` already or another one.
+        let jobs: [&[&str]; 2] = [&["mnttrdb2", "--input", "maint.txt"], &["intcalc"]];
+        for args in jobs {
+            let mut cli = Cli::try_parse_from(std::iter::once(BIN).chain(args.iter().copied()))?;
+            let job = format!("{:?}", cli.job);
+            let err = cli
+                .try_update_from([BIN, "mnttrdb2"])
+                .err()
+                .ok_or_else(|| format!("{args:?}: update accepted"))?;
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
+            assert_eq!(err.exit_code(), 2, "{args:?}");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("Usage: carddemo-batch mnttrdb2 --input <PATH>"),
+                "{args:?}:\n{rendered}"
+            );
+            assert_eq!(format!("{:?}", cli.job), job, "{args:?}");
+        }
+        Ok(())
     }
 
     #[test]

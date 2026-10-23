@@ -28,10 +28,15 @@
 //!   `FUNCTION UPPER-CASE` is the domain's, E26), trims or pads. A key is the 8 bytes of
 //!   `SEC-USR-ID`, leading spaces and case included, so `admin001` does not find `ADMIN001`
 //!   (COUSR02C-011).
-//! - `usr_id` is `CHAR(8) COLLATE "C"`, so the pages run in key byte order, the KSDS order. The
-//!   `CHAR(n)` comparison ignores trailing spaces, so a key of eight spaces, the domain's
-//!   stand-in for `LOW-VALUES`, compares as the empty key, below every stored user ID
-//!   (COUSR00C-012).
+//! - `usr_id` is `CHAR(8) COLLATE "C"`, so the pages run in the ASCII byte order of the stored
+//!   keys. The USRSEC KSDS ordered EBCDIC bytes. The two orders agree for the fixture user IDs,
+//!   `ADMIN001` to `ADMIN005` and `USER0001` to `USER0005`, which are upper-case letters then
+//!   digits, so where two of them first differ, a letter meets a letter or a digit meets a digit.
+//!   They need not agree for arbitrary IDs, where a digit can meet a letter or lower case meet
+//!   upper case at that byte (escalation candidate `X-COUSR00C-2` in
+//!   `modern/audit/online/COUSR00C.md`). The `CHAR(n)` comparison ignores trailing spaces, so a
+//!   key of eight spaces, the domain's stand-in for `LOW-VALUES`, compares as the empty key, below
+//!   every stored user ID (COUSR00C-012).
 //! - Every statement casts its key parameter to `bpchar`, as the page queries do. `sqlx` binds
 //!   a `String` as `text`, and `usr_id = $1` against `text` compares `usr_id::text`, whose
 //!   trailing spaces are dropped, with the padded key: a user ID shorter than 8 bytes, such as
@@ -363,7 +368,6 @@ fn entries(rows: Vec<UserListRow>) -> Result<Vec<UserListEntry>, PersistenceErro
     rows.into_iter().map(UserListRow::into_entry).collect()
 }
 
-/// [`UserRepository::find_by_id`] on `executor`.
 async fn find_in<'e, E: PgExecutor<'e>>(
     executor: E,
     id: &PicX<8>,
@@ -377,7 +381,6 @@ async fn find_in<'e, E: PgExecutor<'e>>(
         .transpose()
 }
 
-/// [`UserRepository::lock_by_id`] on `executor`.
 async fn lock_in<'e, E: PgExecutor<'e>>(
     executor: E,
     id: &PicX<8>,
@@ -391,7 +394,6 @@ async fn lock_in<'e, E: PgExecutor<'e>>(
         .transpose()
 }
 
-/// [`UserRepository::page_after`] on `executor`.
 async fn page_after_in<'e, E: PgExecutor<'e>>(
     executor: E,
     start: &PicX<8>,
@@ -401,7 +403,6 @@ async fn page_after_in<'e, E: PgExecutor<'e>>(
     entries(select_page_forward(executor, &start, limit).await?)
 }
 
-/// [`UserRepository::page_before`] on `executor`.
 async fn page_before_in<'e, E: PgExecutor<'e>>(
     executor: E,
     start: &PicX<8>,
@@ -411,7 +412,6 @@ async fn page_before_in<'e, E: PgExecutor<'e>>(
     entries(select_page_backward(executor, &start, limit).await?)
 }
 
-/// [`UserRepository::insert`] on `executor`.
 async fn insert_in<'e, E: PgExecutor<'e>>(
     executor: E,
     entry: &UserEntry,
@@ -421,7 +421,6 @@ async fn insert_in<'e, E: PgExecutor<'e>>(
     Ok(())
 }
 
-/// [`UserRepository::update`] on `executor`.
 async fn update_in<'e, E: PgExecutor<'e>>(
     executor: E,
     entry: &UserEntry,
@@ -433,7 +432,6 @@ async fn update_in<'e, E: PgExecutor<'e>>(
     Ok(update_row(executor, &row).await? == 1)
 }
 
-/// [`UserRepository::delete`] on `executor`.
 async fn delete_in<'e, E: PgExecutor<'e>>(
     executor: E,
     id: &PicX<8>,
@@ -444,7 +442,6 @@ async fn delete_in<'e, E: PgExecutor<'e>>(
     Ok(delete_row(executor, &key).await? == 1)
 }
 
-/// [`UserRepository::replace_all`] inside the transaction `conn` is in.
 async fn replace_all_in(
     conn: &mut PgConnection,
     users: &[HashedUser],
@@ -596,6 +593,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// PHC-shaped stand-ins for the strings `domain::password::hash` computes, one per load run:
     /// the repository stores whatever hash it is given, so no test calls argon2.
     const RUN_ONE: &str = "$argon2id$v=19$m=19456,t=2,p=1$cnVub25lc2FsdA$cnVub25lZmFrZWhhc2g";
@@ -697,125 +703,129 @@ mod tests {
     // audit: LOADS-018
     // audit: LOADS-033
     // audit: LOADS-034
-    #[tokio::test]
-    async fn replace_all_loads_the_deck_and_reloads_it_whole() -> TestResult {
-        let (_guard, mut store) = store().await?;
-        let first = deck(RUN_ONE)?;
-        assert_eq!(first.len(), DECK_IDS.len());
+    #[test]
+    fn replace_all_loads_the_deck_and_reloads_it_whole() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = store().await?;
+            let first = deck(RUN_ONE)?;
+            assert_eq!(first.len(), DECK_IDS.len());
 
-        // The first run meets an empty table, which is no error.
-        assert_eq!(store.replace_all(&first).await?, 10);
-        assert_eq!(everyone(&mut store).await?, DECK_IDS);
-        assert!(holds_deck(&mut store, &first, RUN_ONE).await?);
+            // The first run meets an empty table, which is no error.
+            assert_eq!(store.replace_all(&first).await?, 10);
+            assert_eq!(everyone(&mut store).await?, DECK_IDS);
+            assert!(holds_deck(&mut store, &first, RUN_ONE).await?);
 
-        // A rerun removes a row the deck lacks and stores the new hashes.
-        store.insert(&entry("ZZTEMP01", RUN_ONE)?).await?;
-        let second = deck(RUN_TWO)?;
-        assert_eq!(store.replace_all(&second).await?, 10);
-        assert_eq!(everyone(&mut store).await?, DECK_IDS);
-        assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
+            // A rerun removes a row the deck lacks and stores the new hashes.
+            store.insert(&entry("ZZTEMP01", RUN_ONE)?).await?;
+            let second = deck(RUN_TWO)?;
+            assert_eq!(store.replace_all(&second).await?, 10);
+            assert_eq!(everyone(&mut store).await?, DECK_IDS);
+            assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
 
-        // A failed replacement leaves the previous contents: a duplicate key rolls the
-        // transaction back, and a value no column can store stops it before any statement.
-        let mut duplicated = deck(RUN_ONE)?;
-        duplicated.push(duplicated.first().cloned().ok_or("empty deck")?);
-        assert_eq!(
-            store.replace_all(&duplicated).await,
-            Err(PersistenceError::Duplicate {
-                constraint: Some("users_pkey".to_owned()),
-            })
-        );
-        let mut unstorable = deck(RUN_ONE)?;
-        unstorable
-            .last_mut()
-            .ok_or("empty deck")?
-            .password_hash
-            .push('\0');
-        assert_eq!(
-            store.replace_all(&unstorable).await,
-            Err(PersistenceError::decode(
-                "password_hash",
-                DecodeKind::InvalidByte
-            ))
-        );
-        assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
+            // A failed replacement leaves the previous contents: a duplicate key rolls the
+            // transaction back, and a value no column can store stops it before any statement.
+            let mut duplicated = deck(RUN_ONE)?;
+            duplicated.push(duplicated.first().cloned().ok_or("empty deck")?);
+            assert_eq!(
+                store.replace_all(&duplicated).await,
+                Err(PersistenceError::Duplicate {
+                    constraint: Some("users_pkey".to_owned()),
+                })
+            );
+            let mut unstorable = deck(RUN_ONE)?;
+            unstorable
+                .last_mut()
+                .ok_or("empty deck")?
+                .password_hash
+                .push('\0');
+            assert_eq!(
+                store.replace_all(&unstorable).await,
+                Err(PersistenceError::decode(
+                    "password_hash",
+                    DecodeKind::InvalidByte
+                ))
+            );
+            assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
 
-        // On a transaction the replacement joins it: rolled back, nothing of it remains.
-        let mut tx = store.begin().await?;
-        let two = deck(RUN_ONE)?.get(..2).ok_or("short deck")?.to_vec();
-        assert_eq!(tx.replace_all(&two).await?, 2);
-        assert_eq!(
-            ids(&tx.page_after(&PicX::spaces(), 100).await?),
-            ["ADMIN001", "ADMIN002"]
-        );
-        tx.rollback().await?;
-        assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
-        Ok(())
+            // On a transaction the replacement joins it: rolled back, nothing of it remains.
+            let mut tx = store.begin().await?;
+            let two = deck(RUN_ONE)?.get(..2).ok_or("short deck")?.to_vec();
+            assert_eq!(tx.replace_all(&two).await?, 2);
+            assert_eq!(
+                ids(&tx.page_after(&PicX::spaces(), 100).await?),
+                ["ADMIN001", "ADMIN002"]
+            );
+            tx.rollback().await?;
+            assert!(holds_deck(&mut store, &second, RUN_TWO).await?);
+            Ok(())
+        })
     }
 
     // audit: COUSR00C-012
     // audit: COUSR00C-013
     // audit: COUSR00C-022
     // audit: COUSR00C-028
-    #[tokio::test]
-    async fn pages_run_in_key_byte_order_from_an_inclusive_start_key() -> TestResult {
-        let (_guard, mut store) = store().await?;
-        store.replace_all(&deck(RUN_ONE)?).await?;
-        let blank = PicX::spaces();
+    #[test]
+    fn pages_run_in_key_byte_order_from_an_inclusive_start_key() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = store().await?;
+            store.replace_all(&deck(RUN_ONE)?).await?;
+            let blank = PicX::spaces();
 
-        // Forward from the blank key: every user, ascending, at most `limit` of them.
-        assert_eq!(ids(&store.page_after(&blank, 11).await?), DECK_IDS);
-        assert_eq!(
-            ids(&store.page_after(&blank, 3).await?).as_slice(),
-            DECK_IDS.get(..3).ok_or("short deck")?
-        );
-        // The start key is included; a key between two IDs starts at the next one.
-        assert_eq!(
-            ids(&store.page_after(&key("USER0004")?, 11).await?),
-            ["USER0004", "USER0005"]
-        );
-        assert_eq!(
-            ids(&store.page_after(&key("ADMIN00Z")?, 2).await?),
-            ["USER0001", "USER0002"]
-        );
-        assert!(store.page_after(&key("ZZZZZZZZ")?, 11).await?.is_empty());
+            // Forward from the blank key: every user, ascending, at most `limit` of them.
+            assert_eq!(ids(&store.page_after(&blank, 11).await?), DECK_IDS);
+            assert_eq!(
+                ids(&store.page_after(&blank, 3).await?).as_slice(),
+                DECK_IDS.get(..3).ok_or("short deck")?
+            );
+            // The start key is included; a key between two IDs starts at the next one.
+            assert_eq!(
+                ids(&store.page_after(&key("USER0004")?, 11).await?),
+                ["USER0004", "USER0005"]
+            );
+            assert_eq!(
+                ids(&store.page_after(&key("ADMIN00Z")?, 2).await?),
+                ["USER0001", "USER0002"]
+            );
+            assert!(store.page_after(&key("ZZZZZZZZ")?, 11).await?.is_empty());
 
-        // Backward: descending from the start key, itself included; nothing is below blank.
-        assert_eq!(
-            ids(&store.page_before(&key("USER0001")?, 3).await?),
-            ["USER0001", "ADMIN005", "ADMIN004"]
-        );
-        assert!(store.page_before(&blank, 11).await?.is_empty());
+            // Backward: descending from the start key, itself included; nothing is below blank.
+            assert_eq!(
+                ids(&store.page_before(&key("USER0001")?, 3).await?),
+                ["USER0001", "ADMIN005", "ADMIN004"]
+            );
+            assert!(store.page_before(&blank, 11).await?.is_empty());
 
-        // A page carries the four listed fields as stored.
-        assert_eq!(
-            store.page_after(&key("USER0001")?, 1).await?,
-            vec![UserListEntry {
-                id: key("USER0001")?,
-                fname: PicX::from_text("LAWRENCE")?,
-                lname: PicX::from_text("THOMAS")?,
-                usr_type: PicX::from_text("U")?,
-            }]
-        );
+            // A page carries the four listed fields as stored.
+            assert_eq!(
+                store.page_after(&key("USER0001")?, 1).await?,
+                vec![UserListEntry {
+                    id: key("USER0001")?,
+                    fname: PicX::from_text("LAWRENCE")?,
+                    lname: PicX::from_text("THOMAS")?,
+                    usr_type: PicX::from_text("U")?,
+                }]
+            );
 
-        // Byte order, not a locale's: a leading space sorts first and lower case last.
-        store.insert(&entry("admin009", RUN_ONE)?).await?;
-        store.insert(&entry(" LEADING", RUN_ONE)?).await?;
-        let all = everyone(&mut store).await?;
-        assert_eq!(all.first().map(String::as_str), Some(" LEADING"));
-        assert_eq!(all.last().map(String::as_str), Some("admin009"));
-        let mut tx = store.begin().await?;
-        assert_eq!(
-            ids(&tx.page_before(&key("ADMIN002")?, 11).await?),
-            ["ADMIN002", "ADMIN001", " LEADING"]
-        );
-        tx.commit().await?;
+            // Byte order, not a locale's: a leading space sorts first and lower case last.
+            store.insert(&entry("admin009", RUN_ONE)?).await?;
+            store.insert(&entry(" LEADING", RUN_ONE)?).await?;
+            let all = everyone(&mut store).await?;
+            assert_eq!(all.first().map(String::as_str), Some(" LEADING"));
+            assert_eq!(all.last().map(String::as_str), Some("admin009"));
+            let mut tx = store.begin().await?;
+            assert_eq!(
+                ids(&tx.page_before(&key("ADMIN002")?, 11).await?),
+                ["ADMIN002", "ADMIN001", " LEADING"]
+            );
+            tx.commit().await?;
 
-        // A start key no stored ID can hold has no position: a typed error, never a page.
-        let invalid = Err(PersistenceError::decode("usr_id", DecodeKind::InvalidByte));
-        assert_eq!(store.page_after(&UNSTORABLE, 11).await, invalid);
-        assert_eq!(store.page_before(&UNSTORABLE, 11).await, invalid);
-        Ok(())
+            // A start key no stored ID can hold has no position: a typed error, never a page.
+            let invalid = Err(PersistenceError::decode("usr_id", DecodeKind::InvalidByte));
+            assert_eq!(store.page_after(&UNSTORABLE, 11).await, invalid);
+            assert_eq!(store.page_before(&UNSTORABLE, 11).await, invalid);
+            Ok(())
+        })
     }
 
     // audit: COSGN00C-013
@@ -827,146 +837,152 @@ mod tests {
     // audit: COUSR02C-031
     // audit: COUSR03C-019
     // audit: COUSR03C-021
-    #[tokio::test]
-    async fn writes_report_duplicate_and_missing_keys() -> TestResult {
-        let (_guard, mut store) = store().await?;
-        let added = entry("NEWUSR01", RUN_ONE)?;
-        assert_eq!(store.find_by_id(&added.id).await?, None);
-        store.insert(&added).await?;
-        assert_eq!(store.find_by_id(&added.id).await?, Some(added.clone()));
-        // Keys are bound as given: another case or a leading space is another key.
-        assert_eq!(store.find_by_id(&key("newusr01")?).await?, None);
-        assert_eq!(store.find_by_id(&key(" NEWUSR0")?).await?, None);
+    #[test]
+    fn writes_report_duplicate_and_missing_keys() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = store().await?;
+            let added = entry("NEWUSR01", RUN_ONE)?;
+            assert_eq!(store.find_by_id(&added.id).await?, None);
+            store.insert(&added).await?;
+            assert_eq!(store.find_by_id(&added.id).await?, Some(added.clone()));
+            // Keys are bound as given: another case or a leading space is another key.
+            assert_eq!(store.find_by_id(&key("newusr01")?).await?, None);
+            assert_eq!(store.find_by_id(&key(" NEWUSR0")?).await?, None);
 
-        // A second write of the key is `DUPKEY`, and the stored row is unchanged.
-        let again = entry("NEWUSR01", RUN_TWO)?;
-        let duplicate = Err(PersistenceError::Duplicate {
-            constraint: Some("users_pkey".to_owned()),
-        });
-        assert_eq!(store.insert(&again).await, duplicate);
-        assert_eq!(store.find_by_id(&added.id).await?, Some(added.clone()));
-        // Inside a transaction the failed insert runs in a savepoint, and the rest goes on.
-        let mut tx = store.begin().await?;
-        let mut savepoint = tx.savepoint().await?;
-        assert_eq!(savepoint.insert(&again).await, duplicate);
-        savepoint.rollback().await?;
-        assert_eq!(tx.find_by_id(&added.id).await?, Some(added.clone()));
-        tx.commit().await?;
+            // A second write of the key is `DUPKEY`, and the stored row is unchanged.
+            let again = entry("NEWUSR01", RUN_TWO)?;
+            let duplicate = Err(PersistenceError::Duplicate {
+                constraint: Some("users_pkey".to_owned()),
+            });
+            assert_eq!(store.insert(&again).await, duplicate);
+            assert_eq!(store.find_by_id(&added.id).await?, Some(added.clone()));
+            // Inside a transaction the failed insert runs in a savepoint, and the rest goes on.
+            let mut tx = store.begin().await?;
+            let mut savepoint = tx.savepoint().await?;
+            assert_eq!(savepoint.insert(&again).await, duplicate);
+            savepoint.rollback().await?;
+            assert_eq!(tx.find_by_id(&added.id).await?, Some(added.clone()));
+            tx.commit().await?;
 
-        // The rewrite stores every non-key column as given, `FILLER` byte for byte.
-        let mut changed = added.clone();
-        changed.fname = PicX::from_text("AUGUSTA")?;
-        changed.lname = PicX::from_text("KING")?;
-        changed.password_hash = RUN_TWO.to_owned();
-        changed.usr_type = PicX::from_text("A")?;
-        changed.filler = PicX::from_array(*b"kept byte for byte 0123");
-        assert!(store.update(&changed).await?);
-        assert_eq!(store.find_by_id(&changed.id).await?, Some(changed.clone()));
-        assert!(!store.update(&entry("NOSUCH01", RUN_ONE)?).await?);
-        assert_eq!(store.find_by_id(&key("NOSUCH01")?).await?, None);
+            // The rewrite stores every non-key column as given, `FILLER` byte for byte.
+            let mut changed = added.clone();
+            changed.fname = PicX::from_text("AUGUSTA")?;
+            changed.lname = PicX::from_text("KING")?;
+            changed.password_hash = RUN_TWO.to_owned();
+            changed.usr_type = PicX::from_text("A")?;
+            changed.filler = PicX::from_array(*b"kept byte for byte 0123");
+            assert!(store.update(&changed).await?);
+            assert_eq!(store.find_by_id(&changed.id).await?, Some(changed.clone()));
+            assert!(!store.update(&entry("NOSUCH01", RUN_ONE)?).await?);
+            assert_eq!(store.find_by_id(&key("NOSUCH01")?).await?, None);
 
-        assert!(store.delete(&changed.id).await?);
-        assert_eq!(store.find_by_id(&changed.id).await?, None);
-        assert!(!store.delete(&changed.id).await?);
+            assert!(store.delete(&changed.id).await?);
+            assert_eq!(store.find_by_id(&changed.id).await?, None);
+            assert!(!store.delete(&changed.id).await?);
 
-        // A key no stored row can hold is not found, and no statement runs.
-        assert_eq!(store.find_by_id(&UNSTORABLE).await?, None);
-        assert_eq!(store.lock_by_id(&UNSTORABLE).await?, None);
-        assert!(!store.delete(&UNSTORABLE).await?);
-        let mut unstorable_key = entry("NEWUSR02", RUN_ONE)?;
-        unstorable_key.id = UNSTORABLE;
-        assert!(!store.update(&unstorable_key).await?);
-        let invalid_id = Err(PersistenceError::decode("usr_id", DecodeKind::InvalidByte));
-        assert_eq!(store.insert(&unstorable_key).await, invalid_id);
-        // A value no column can store is a typed error, and nothing is written.
-        let mut nul_hash = entry("NEWUSR02", RUN_ONE)?;
-        nul_hash.password_hash.push('\0');
-        let invalid_hash = Err(PersistenceError::decode(
-            "password_hash",
-            DecodeKind::InvalidByte,
-        ));
-        assert_eq!(store.insert(&nul_hash).await, invalid_hash);
-        assert_eq!(store.find_by_id(&nul_hash.id).await?, None);
-        Ok(())
+            // A key no stored row can hold is not found, and no statement runs.
+            assert_eq!(store.find_by_id(&UNSTORABLE).await?, None);
+            assert_eq!(store.lock_by_id(&UNSTORABLE).await?, None);
+            assert!(!store.delete(&UNSTORABLE).await?);
+            let mut unstorable_key = entry("NEWUSR02", RUN_ONE)?;
+            unstorable_key.id = UNSTORABLE;
+            assert!(!store.update(&unstorable_key).await?);
+            let invalid_id = Err(PersistenceError::decode("usr_id", DecodeKind::InvalidByte));
+            assert_eq!(store.insert(&unstorable_key).await, invalid_id);
+            // A value no column can store is a typed error, and nothing is written.
+            let mut nul_hash = entry("NEWUSR02", RUN_ONE)?;
+            nul_hash.password_hash.push('\0');
+            let invalid_hash = Err(PersistenceError::decode(
+                "password_hash",
+                DecodeKind::InvalidByte,
+            ));
+            assert_eq!(store.insert(&nul_hash).await, invalid_hash);
+            assert_eq!(store.find_by_id(&nul_hash.id).await?, None);
+            Ok(())
+        })
     }
 
     // audit: COUSR02C-011
     // audit: COUSR02C-030
-    #[tokio::test]
-    async fn a_key_shorter_than_its_field_is_found_by_every_point_access() -> TestResult {
-        let (_guard, mut store) = store().await?;
-        // COUSR01C stores a user ID as typed, so `AB CD` is kept padded to `AB CD   `.
-        let short = entry("AB CD", RUN_ONE)?;
-        store.insert(&short).await?;
-        assert_eq!(store.find_by_id(&short.id).await?, Some(short.clone()));
-        // The padding is the key's: the unpadded prefix and a leading space are other keys.
-        assert_eq!(store.find_by_id(&key("AB")?).await?, None);
-        assert_eq!(store.find_by_id(&key(" AB CD")?).await?, None);
+    #[test]
+    fn a_key_shorter_than_its_field_is_found_by_every_point_access() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = store().await?;
+            // COUSR01C stores a user ID as typed, so `AB CD` is kept padded to `AB CD   `.
+            let short = entry("AB CD", RUN_ONE)?;
+            store.insert(&short).await?;
+            assert_eq!(store.find_by_id(&short.id).await?, Some(short.clone()));
+            // The padding is the key's: the unpadded prefix and a leading space are other keys.
+            assert_eq!(store.find_by_id(&key("AB")?).await?, None);
+            assert_eq!(store.find_by_id(&key(" AB CD")?).await?, None);
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.lock_by_id(&short.id).await?, Some(short.clone()));
-        let mut changed = short.clone();
-        changed.fname = PicX::from_text("RENAMED")?;
-        assert!(tx.update(&changed).await?);
-        tx.commit().await?;
-        assert_eq!(store.find_by_id(&short.id).await?, Some(changed));
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.lock_by_id(&short.id).await?, Some(short.clone()));
+            let mut changed = short.clone();
+            changed.fname = PicX::from_text("RENAMED")?;
+            assert!(tx.update(&changed).await?);
+            tx.commit().await?;
+            assert_eq!(store.find_by_id(&short.id).await?, Some(changed));
 
-        assert!(store.delete(&short.id).await?);
-        assert_eq!(store.find_by_id(&short.id).await?, None);
-        Ok(())
+            assert!(store.delete(&short.id).await?);
+            assert_eq!(store.find_by_id(&short.id).await?, None);
+            Ok(())
+        })
     }
 
     // audit: COUSR02C-024
     // audit: COUSR03C-017
-    #[tokio::test]
-    async fn lock_by_id_holds_the_row_until_the_transaction_ends() -> TestResult {
-        let (_guard, mut store) = store().await?;
-        store.replace_all(&deck(RUN_ONE)?).await?;
-        let id = key("USER0001")?;
+    #[test]
+    fn lock_by_id_holds_the_row_until_the_transaction_ends() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = store().await?;
+            store.replace_all(&deck(RUN_ONE)?).await?;
+            let id = key("USER0001")?;
 
-        // Through the pool the lock ends with its statement.
-        assert!(store.lock_by_id(&id).await?.is_some());
-        assert!(store.lock_by_id(&id).await?.is_some());
+            // Through the pool the lock ends with its statement.
+            assert!(store.lock_by_id(&id).await?.is_some());
+            assert!(store.lock_by_id(&id).await?.is_some());
 
-        let mut holder = store.begin().await?;
-        let held = holder.lock_by_id(&id).await?.ok_or("USER0001 not loaded")?;
-        assert_eq!(held.id, id);
-        // A plain read does not wait for the lock.
-        assert_eq!(store.find_by_id(&id).await?, Some(held.clone()));
-        // Another transaction cannot take it while the holder's transaction is open.
-        let mut waiter = store.begin().await?;
-        lock_timeout(&mut waiter).await?;
-        assert_eq!(
-            waiter.lock_by_id(&id).await,
-            Err(PersistenceError::Database {
-                sqlstate: Some("55P03".to_owned()),
-                constraint: None,
-            })
-        );
-        waiter.rollback().await?;
+            let mut holder = store.begin().await?;
+            let held = holder.lock_by_id(&id).await?.ok_or("USER0001 not loaded")?;
+            assert_eq!(held.id, id);
+            // A plain read does not wait for the lock.
+            assert_eq!(store.find_by_id(&id).await?, Some(held.clone()));
+            // Another transaction cannot take it while the holder's transaction is open.
+            let mut waiter = store.begin().await?;
+            lock_timeout(&mut waiter).await?;
+            assert_eq!(
+                waiter.lock_by_id(&id).await,
+                Err(PersistenceError::Database {
+                    sqlstate: Some("55P03".to_owned()),
+                    constraint: None,
+                })
+            );
+            waiter.rollback().await?;
 
-        // The holder rewrites the row and commits, which releases the lock.
-        let mut changed = held.clone();
-        changed.fname = PicX::from_text("RENAMED")?;
-        assert!(holder.update(&changed).await?);
-        holder.commit().await?;
+            // The holder rewrites the row and commits, which releases the lock.
+            let mut changed = held.clone();
+            changed.fname = PicX::from_text("RENAMED")?;
+            assert!(holder.update(&changed).await?);
+            holder.commit().await?;
 
-        // A delete in a transaction that rolls back leaves the row.
-        let mut undone = store.begin().await?;
-        lock_timeout(&mut undone).await?;
-        assert_eq!(undone.lock_by_id(&id).await?, Some(changed.clone()));
-        assert!(undone.delete(&id).await?);
-        assert_eq!(undone.lock_by_id(&id).await?, None);
-        undone.rollback().await?;
-        assert_eq!(store.find_by_id(&id).await?, Some(changed));
+            // A delete in a transaction that rolls back leaves the row.
+            let mut undone = store.begin().await?;
+            lock_timeout(&mut undone).await?;
+            assert_eq!(undone.lock_by_id(&id).await?, Some(changed.clone()));
+            assert!(undone.delete(&id).await?);
+            assert_eq!(undone.lock_by_id(&id).await?, None);
+            undone.rollback().await?;
+            assert_eq!(store.find_by_id(&id).await?, Some(changed));
 
-        // Committed, it removes the row.
-        let mut done = store.begin().await?;
-        assert!(done.lock_by_id(&id).await?.is_some());
-        assert!(done.delete(&id).await?);
-        assert!(!done.delete(&id).await?);
-        done.commit().await?;
-        assert_eq!(store.find_by_id(&id).await?, None);
-        Ok(())
+            // Committed, it removes the row.
+            let mut done = store.begin().await?;
+            assert!(done.lock_by_id(&id).await?.is_some());
+            assert!(done.delete(&id).await?);
+            assert!(!done.delete(&id).await?);
+            done.commit().await?;
+            assert_eq!(store.find_by_id(&id).await?, None);
+            Ok(())
+        })
     }
 }

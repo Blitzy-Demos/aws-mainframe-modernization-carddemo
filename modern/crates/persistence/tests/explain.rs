@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 use sqlx::{PgConnection, Row};
+use tokio::runtime::Builder;
 
 /// Every paginated query of `queries/`, sorted. A new paginated query is added here deliberately,
 /// so that it cannot ship without its plan being checked.
@@ -80,154 +81,171 @@ const XREF_ACCT_ID_INDEX: &str = "card_xref_acct_id_idx";
 /// The plan node of an explicit sort, which an ordered index read makes unnecessary.
 const SORT: &str = "Sort";
 
-#[tokio::test]
-async fn paginated_queries_are_served_by_an_index() {
-    let dir = queries_dir();
-    assert_eq!(
-        file_names(&dir, is_sql_file),
-        QUERY_FILES,
-        "queries/ and QUERY_FILES list different paginated queries"
-    );
-
-    let guard = test_support::postgres::start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let mut conn = guard
-        .pool()
-        .acquire()
-        .await
-        .expect("acquire a connection on the migrated database");
-    // A session setting: every plan below runs on this one connection.
-    sqlx::raw_sql("SET enable_seqscan = off")
-        .execute(&mut *conn)
-        .await
-        .expect("disable sequential scans for this session");
-
-    for name in QUERY_FILES {
-        let text = fs::read_to_string(dir.join(name))
-            .unwrap_or_else(|err| panic!("read queries/{name}: {err}"));
-        let types = plan_node_types(&mut conn, name, &text).await;
-        assert!(
-            types
-                .iter()
-                .any(|node| INDEX_NODES.contains(&node.as_str())),
-            "{name}: no index scan in plan {types:?}"
+#[test]
+fn paginated_queries_are_served_by_an_index() {
+    block_on(async {
+        let dir = queries_dir();
+        assert_eq!(
+            file_names(&dir, is_sql_file),
+            QUERY_FILES,
+            "queries/ and QUERY_FILES list different paginated queries"
         );
-        assert!(
-            types.iter().all(|node| node != SEQ_SCAN),
-            "{name}: sequential scan in plan {types:?}"
-        );
-    }
-}
 
-#[tokio::test]
-async fn previous_release_queries_plan_against_the_migrated_schema() {
-    let dir = previous_dir();
-    assert!(
-        dir.is_dir(),
-        "compat/previous/ is missing: it must hold the previous release's query-*.json copies \
-         or BASELINE.md"
-    );
-    let copies = file_names(&dir, is_query_copy);
+        let guard = test_support::postgres::start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let mut conn = guard
+            .pool()
+            .acquire()
+            .await
+            .expect("acquire a connection on the migrated database");
+        // A session setting: every plan below runs on this one connection.
+        sqlx::raw_sql("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .expect("disable sequential scans for this session");
 
-    let guard = test_support::postgres::start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let mut conn = guard
-        .pool()
-        .acquire()
-        .await
-        .expect("acquire a connection on the migrated database");
-
-    if copies.is_empty() {
-        assert_baseline_declared(&dir);
-    } else {
-        for name in &copies {
-            plan_previous_query(&mut conn, &dir, name).await;
+        for name in QUERY_FILES {
+            let text = fs::read_to_string(dir.join(name))
+                .unwrap_or_else(|err| panic!("read queries/{name}: {err}"));
+            let types = plan_node_types(&mut conn, name, &text).await;
+            assert!(
+                types
+                    .iter()
+                    .any(|node| INDEX_NODES.contains(&node.as_str())),
+                "{name}: no index scan in plan {types:?}"
+            );
+            assert!(
+                types.iter().all(|node| node != SEQ_SCAN),
+                "{name}: sequential scan in plan {types:?}"
+            );
         }
-    }
+    });
 }
 
-#[tokio::test]
-async fn card_xref_account_path_reads_its_index_in_card_order() {
-    let dir = sqlx_metadata_dir();
-    let queries: Vec<(String, String)> = file_names(&dir, is_query_copy)
-        .into_iter()
-        .filter_map(|name| {
-            let query = metadata_query(&dir, ".sqlx", &name);
-            XREF_ACCOUNT_PATH
-                .iter()
-                .all(|part| query.contains(part))
-                .then_some((name, query))
-        })
-        .collect();
-    assert_eq!(
-        queries.len(),
-        XREF_ACCOUNT_PATH_QUERIES,
-        ".sqlx/ holds a different number of card_xref account-path statements than \
+#[test]
+fn previous_release_queries_plan_against_the_migrated_schema() {
+    block_on(async {
+        let dir = previous_dir();
+        assert!(
+            dir.is_dir(),
+            "compat/previous/ is missing: it must hold the previous release's query-*.json copies \
+         or BASELINE.md"
+        );
+        let copies = file_names(&dir, is_query_copy);
+
+        let guard = test_support::postgres::start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let mut conn = guard
+            .pool()
+            .acquire()
+            .await
+            .expect("acquire a connection on the migrated database");
+
+        if copies.is_empty() {
+            assert_baseline_declared(&dir);
+        } else {
+            for name in &copies {
+                plan_previous_query(&mut conn, &dir, name).await;
+            }
+        }
+    });
+}
+
+#[test]
+fn card_xref_account_path_reads_its_index_in_card_order() {
+    block_on(async {
+        let dir = sqlx_metadata_dir();
+        let queries: Vec<(String, String)> = file_names(&dir, is_query_copy)
+            .into_iter()
+            .filter_map(|name| {
+                let query = metadata_query(&dir, ".sqlx", &name);
+                XREF_ACCOUNT_PATH
+                    .iter()
+                    .all(|part| query.contains(part))
+                    .then_some((name, query))
+            })
+            .collect();
+        assert_eq!(
+            queries.len(),
+            XREF_ACCOUNT_PATH_QUERIES,
+            ".sqlx/ holds a different number of card_xref account-path statements than \
          XREF_ACCOUNT_PATH_QUERIES"
-    );
+        );
 
-    let guard = test_support::postgres::start_postgres()
-        .await
-        .expect("start a migrated postgres:16 container");
-    let mut conn = guard
-        .pool()
-        .acquire()
-        .await
-        .expect("acquire a connection on the migrated database");
-    // Session settings: every plan below runs on this one connection. On the empty tables of a
-    // fresh container the planner estimates two rows per account, which it would rather sort
-    // than read in index order; with sorts disabled as well, it picks an ordered index read
-    // whenever one can serve the statement, as it does for an account that holds many rows.
-    sqlx::raw_sql("SET enable_seqscan = off")
-        .execute(&mut *conn)
-        .await
-        .expect("disable sequential scans for this session");
-    sqlx::raw_sql("SET enable_sort = off")
-        .execute(&mut *conn)
-        .await
-        .expect("disable explicit sorts for this session");
+        let guard = test_support::postgres::start_postgres()
+            .await
+            .expect("start a migrated postgres:16 container");
+        let mut conn = guard
+            .pool()
+            .acquire()
+            .await
+            .expect("acquire a connection on the migrated database");
+        // Session settings: every plan below runs on this one connection. On the empty tables of a
+        // fresh container the planner estimates two rows per account, which it would rather sort
+        // than read in index order; with sorts disabled as well, it picks an ordered index read
+        // whenever one can serve the statement, as it does for an account that holds many rows.
+        sqlx::raw_sql("SET enable_seqscan = off")
+            .execute(&mut *conn)
+            .await
+            .expect("disable sequential scans for this session");
+        sqlx::raw_sql("SET enable_sort = off")
+            .execute(&mut *conn)
+            .await
+            .expect("disable explicit sorts for this session");
 
-    for (name, query) in &queries {
-        let name = format!(".sqlx/{name}");
-        let plan = explain_json(&mut conn, &name, query).await;
-        let mut types = Vec::new();
-        node_types(&plan, &mut types);
-        assert!(
-            types.iter().all(|node| node != SORT),
-            "{name}: sort in plan {types:?}"
-        );
-        let top = plan
-            .get("Plan")
-            .unwrap_or_else(|| panic!("{name}: the plan has no top node"));
-        assert_eq!(
-            node_field(top, "Node Type"),
-            Some("Limit"),
-            "{name}: the top node is not a Limit in plan {types:?}"
-        );
-        let inputs = top
-            .get("Plans")
-            .and_then(Value::as_array)
-            .map(Vec::as_slice);
-        let Some([scan]) = inputs else {
-            panic!("{name}: the Limit node has no single input in plan {types:?}");
-        };
-        assert_eq!(
-            node_field(scan, "Node Type"),
-            Some("Index Scan"),
-            "{name}: the Limit node does not read an Index Scan in plan {types:?}"
-        );
-        assert_eq!(
-            node_field(scan, "Index Name"),
-            Some(XREF_ACCT_ID_INDEX),
-            "{name}: the Index Scan reads another index"
-        );
-        assert!(
-            node_field(scan, "Index Cond").is_some_and(|cond| cond.contains("acct_id")),
-            "{name}: the Index Scan of {XREF_ACCT_ID_INDEX} has no acct_id condition"
-        );
-    }
+        for (name, query) in &queries {
+            let name = format!(".sqlx/{name}");
+            let plan = explain_json(&mut conn, &name, query).await;
+            let mut types = Vec::new();
+            node_types(&plan, &mut types);
+            assert!(
+                types.iter().all(|node| node != SORT),
+                "{name}: sort in plan {types:?}"
+            );
+            let top = plan
+                .get("Plan")
+                .unwrap_or_else(|| panic!("{name}: the plan has no top node"));
+            assert_eq!(
+                node_field(top, "Node Type"),
+                Some("Limit"),
+                "{name}: the top node is not a Limit in plan {types:?}"
+            );
+            let inputs = top
+                .get("Plans")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice);
+            let Some([scan]) = inputs else {
+                panic!("{name}: the Limit node has no single input in plan {types:?}");
+            };
+            assert_eq!(
+                node_field(scan, "Node Type"),
+                Some("Index Scan"),
+                "{name}: the Limit node does not read an Index Scan in plan {types:?}"
+            );
+            assert_eq!(
+                node_field(scan, "Index Name"),
+                Some(XREF_ACCT_ID_INDEX),
+                "{name}: the Index Scan reads another index"
+            );
+            assert!(
+                node_field(scan, "Index Cond").is_some_and(|cond| cond.contains("acct_id")),
+                "{name}: the Index Scan of {XREF_ACCT_ID_INDEX} has no acct_id condition"
+            );
+        }
+    });
+}
+
+/// Runs `test` to completion on a current-thread Tokio runtime of its own with every driver
+/// enabled, which stays current while the body's values drop, on unwinding too. The tests call it
+/// rather than take Tokio's test attribute, whose expansion suppresses lints.
+fn block_on<F: Future>(test: F) -> F::Output {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build a current-thread Tokio runtime")
+        .block_on(test)
 }
 
 /// Plans `text`, the committed file `name`, with `EXPLAIN (GENERIC_PLAN, FORMAT JSON)` and returns

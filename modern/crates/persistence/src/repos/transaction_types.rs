@@ -68,8 +68,10 @@ pub trait TransactionTypeRepository: Send {
         code: &PicX<2>,
     ) -> impl Future<Output = Result<Option<TransactionTypeRecord>, PersistenceError>> + Send;
 
-    /// Every type, in ascending key order, the order of the KSDS: the `C` collation of
-    /// `tran_type` compares bytes. Unbounded, for batch callers only.
+    /// Every type, in ascending key order: the `C` collation of `tran_type` compares the stored
+    /// ASCII bytes. That order is the one the KSDS gave its EBCDIC keys for the two-digit type
+    /// codes the fixtures hold, as digits order alike in both codes. Unbounded, for batch callers
+    /// only.
     ///
     /// # Errors
     ///
@@ -303,6 +305,15 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
     /// The primary key every duplicate names.
     const PKEY: &str = "transaction_types_pkey";
 
@@ -366,115 +377,119 @@ mod tests {
     // audit: CBTRN03C-015
     // audit: CBTRN03C-016
     // audit: FIXLOAD-008
-    #[tokio::test]
-    async fn store_replaces_reads_and_reloads_the_vsam_version() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let db2_seed = db2_version(guard.pool()).await?;
-        assert!(
-            !db2_seed.is_empty(),
-            "migration 0006 seeds the Db2 data version"
-        );
-
-        let (bytes, lines) = trantype_fixture()?;
-        let records: Vec<TransactionTypeRecord> =
-            lines.iter().map(|line| line.record.clone()).collect();
-        let first = records.first().ok_or("trantype.txt holds no record")?;
-        assert_eq!(records.len(), 7);
-
-        assert!(store.find_all().await?.is_empty());
-        assert_eq!(store.find_by_id(&first.tran_type).await?, None);
-
-        assert_eq!(store.replace_all(&records).await?, 7);
-        let loaded = store.find_all().await?;
-        assert_eq!(loaded, records);
-        let restored: Vec<Framed<TransactionTypeRecord>> = loaded
-            .iter()
-            .zip(&lines)
-            .map(|(record, line)| Framed {
-                record: record.clone(),
-                framing: line.framing,
-            })
-            .collect();
-        assert_eq!(encode_all(&restored), bytes, "every byte, FILLER included");
-
-        for record in &records {
-            assert_eq!(
-                store.find_by_id(&record.tran_type).await?.as_ref(),
-                Some(record)
+    #[test]
+    fn store_replaces_reads_and_reloads_the_vsam_version() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let db2_seed = db2_version(guard.pool()).await?;
+            assert!(
+                !db2_seed.is_empty(),
+                "migration 0006 seeds the Db2 data version"
             );
-        }
-        for absent in [*b"99", *b"00", *b"  ", *b"1 "] {
-            assert_eq!(store.find_by_id(&PicX::from_array(absent)).await?, None);
-        }
 
-        assert_eq!(store.replace_all(&records).await?, 7);
-        assert_eq!(
-            store.find_all().await?,
-            loaded,
-            "a rerun leaves identical contents"
-        );
+            let (bytes, lines) = trantype_fixture()?;
+            let records: Vec<TransactionTypeRecord> =
+                lines.iter().map(|line| line.record.clone()).collect();
+            let first = records.first().ok_or("trantype.txt holds no record")?;
+            assert_eq!(records.len(), 7);
 
-        let subset = records.get(1..3).ok_or("fewer than three records")?;
-        assert_eq!(store.replace_all(subset).await?, 2);
-        assert_eq!(
-            store.find_all().await?,
-            subset,
-            "no row the input lacks remains"
-        );
-        assert_eq!(store.find_by_id(&first.tran_type).await?, None);
+            assert!(store.find_all().await?.is_empty());
+            assert_eq!(store.find_by_id(&first.tran_type).await?, None);
 
-        assert_eq!(store.replace_all(&[]).await?, 0);
-        assert!(store.find_all().await?.is_empty());
+            assert_eq!(store.replace_all(&records).await?, 7);
+            let loaded = store.find_all().await?;
+            assert_eq!(loaded, records);
+            let restored: Vec<Framed<TransactionTypeRecord>> = loaded
+                .iter()
+                .zip(&lines)
+                .map(|(record, line)| Framed {
+                    record: record.clone(),
+                    framing: line.framing,
+                })
+                .collect();
+            assert_eq!(encode_all(&restored), bytes, "every byte, FILLER included");
 
-        assert_eq!(db2_version(guard.pool()).await?, db2_seed, "E23");
-        Ok(())
+            for record in &records {
+                assert_eq!(
+                    store.find_by_id(&record.tran_type).await?.as_ref(),
+                    Some(record)
+                );
+            }
+            for absent in [*b"99", *b"00", *b"  ", *b"1 "] {
+                assert_eq!(store.find_by_id(&PicX::from_array(absent)).await?, None);
+            }
+
+            assert_eq!(store.replace_all(&records).await?, 7);
+            assert_eq!(
+                store.find_all().await?,
+                loaded,
+                "a rerun leaves identical contents"
+            );
+
+            let subset = records.get(1..3).ok_or("fewer than three records")?;
+            assert_eq!(store.replace_all(subset).await?, 2);
+            assert_eq!(
+                store.find_all().await?,
+                subset,
+                "no row the input lacks remains"
+            );
+            assert_eq!(store.find_by_id(&first.tran_type).await?, None);
+
+            assert_eq!(store.replace_all(&[]).await?, 0);
+            assert!(store.find_all().await?.is_empty());
+
+            assert_eq!(db2_version(guard.pool()).await?, db2_seed, "E23");
+            Ok(())
+        })
     }
 
     /// A duplicate code, on its own or inside a replacement, and a record codec B cannot store
     /// leave the previous contents in place.
     // audit: LOADS-018
-    #[tokio::test]
-    async fn failed_writes_through_the_store_leave_the_previous_contents() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let records = fixture_records()?;
-        let first = records.first().ok_or("trantype.txt holds no record")?;
-        store.replace_all(&records).await?;
+    #[test]
+    fn failed_writes_through_the_store_leave_the_previous_contents() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let records = fixture_records()?;
+            let first = records.first().ok_or("trantype.txt holds no record")?;
+            store.replace_all(&records).await?;
 
-        assert_eq!(store.insert(first).await, Err(duplicate()));
-        let added = with_code(first, *b"08");
-        store.insert(&added).await?;
-        assert_eq!(
-            store.find_by_id(&added.tran_type).await?,
-            Some(added.clone())
-        );
-        let before = store.find_all().await?;
-        assert_eq!(before.len(), 8);
+            assert_eq!(store.insert(first).await, Err(duplicate()));
+            let added = with_code(first, *b"08");
+            store.insert(&added).await?;
+            assert_eq!(
+                store.find_by_id(&added.tran_type).await?,
+                Some(added.clone())
+            );
+            let before = store.find_all().await?;
+            assert_eq!(before.len(), 8);
 
-        let twice = [first.clone(), first.clone()];
-        assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
-        assert_eq!(store.find_all().await?, before);
+            let twice = [first.clone(), first.clone()];
+            assert_eq!(store.replace_all(&twice).await, Err(duplicate()));
+            assert_eq!(store.find_all().await?, before);
 
-        let unstorable = TransactionTypeRecord {
-            filler: PicX::from_array(*b"0000000\0"),
-            ..added.clone()
-        };
-        let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
-        assert_eq!(store.insert(&unstorable).await, invalid);
-        assert_eq!(
-            store.replace_all(&[first.clone(), unstorable]).await,
-            Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
-        );
-        assert_eq!(
-            store.find_by_id(&PicX::from_array(*b"0\0")).await,
-            Err(PersistenceError::decode(
-                "tran_type",
-                DecodeKind::InvalidByte
-            ))
-        );
-        assert_eq!(store.find_all().await?, before);
-        Ok(())
+            let unstorable = TransactionTypeRecord {
+                filler: PicX::from_array(*b"0000000\0"),
+                ..added.clone()
+            };
+            let invalid = Err(PersistenceError::decode("filler", DecodeKind::InvalidByte));
+            assert_eq!(store.insert(&unstorable).await, invalid);
+            assert_eq!(
+                store.replace_all(&[first.clone(), unstorable]).await,
+                Err(PersistenceError::decode("filler", DecodeKind::InvalidByte))
+            );
+            assert_eq!(
+                store.find_by_id(&PicX::from_array(*b"0\0")).await,
+                Err(PersistenceError::decode(
+                    "tran_type",
+                    DecodeKind::InvalidByte
+                ))
+            );
+            assert_eq!(store.find_all().await?, before);
+            Ok(())
+        })
     }
 
     /// Through a caller's transaction: its own writes are visible to it alone until it commits,
@@ -482,50 +497,52 @@ mod tests {
     /// savepoint lets it go on.
     // audit: LOADS-014
     // audit: LOADS-018
-    #[tokio::test]
-    async fn transaction_executor_runs_inside_the_callers_transaction() -> TestResult {
-        let guard = test_support::postgres::start_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let records = fixture_records()?;
-        let first = records.first().ok_or("trantype.txt holds no record")?;
-        let subset = records.get(..2).ok_or("fewer than two records")?;
-        store.replace_all(&records).await?;
+    #[test]
+    fn transaction_executor_runs_inside_the_callers_transaction() -> TestResult {
+        block_on(async {
+            let guard = test_support::postgres::start_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let records = fixture_records()?;
+            let first = records.first().ok_or("trantype.txt holds no record")?;
+            let subset = records.get(..2).ok_or("fewer than two records")?;
+            store.replace_all(&records).await?;
 
-        let mut tx: PgTx<'static> = store.begin().await?;
-        assert_eq!(tx.replace_all(subset).await?, 2);
-        assert_eq!(tx.find_all().await?, subset);
-        assert_eq!(
-            store.find_all().await?,
-            records,
-            "uncommitted work stays invisible"
-        );
-        tx.rollback().await?;
-        assert_eq!(store.find_all().await?, records);
+            let mut tx: PgTx<'static> = store.begin().await?;
+            assert_eq!(tx.replace_all(subset).await?, 2);
+            assert_eq!(tx.find_all().await?, subset);
+            assert_eq!(
+                store.find_all().await?,
+                records,
+                "uncommitted work stays invisible"
+            );
+            tx.rollback().await?;
+            assert_eq!(store.find_all().await?, records);
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.insert(first).await, Err(duplicate()));
-        let aborted = tx.find_by_id(&first.tran_type).await;
-        assert_eq!(
-            aborted.as_ref().map_err(PersistenceError::sqlstate),
-            Err(Some(IN_FAILED_SQL_TRANSACTION))
-        );
-        tx.rollback().await?;
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.insert(first).await, Err(duplicate()));
+            let aborted = tx.find_by_id(&first.tran_type).await;
+            assert_eq!(
+                aborted.as_ref().map_err(PersistenceError::sqlstate),
+                Err(Some(IN_FAILED_SQL_TRANSACTION))
+            );
+            tx.rollback().await?;
 
-        let mut tx = store.begin().await?;
-        let mut savepoint = tx.savepoint().await?;
-        assert_eq!(savepoint.insert(first).await, Err(duplicate()));
-        savepoint.rollback().await?;
-        let added = with_code(first, *b"09");
-        tx.insert(&added).await?;
-        assert_eq!(tx.find_by_id(&added.tran_type).await?, Some(added.clone()));
-        assert_eq!(store.find_by_id(&added.tran_type).await?, None);
-        tx.commit().await?;
-        assert_eq!(store.find_by_id(&added.tran_type).await?, Some(added));
+            let mut tx = store.begin().await?;
+            let mut savepoint = tx.savepoint().await?;
+            assert_eq!(savepoint.insert(first).await, Err(duplicate()));
+            savepoint.rollback().await?;
+            let added = with_code(first, *b"09");
+            tx.insert(&added).await?;
+            assert_eq!(tx.find_by_id(&added.tran_type).await?, Some(added.clone()));
+            assert_eq!(store.find_by_id(&added.tran_type).await?, None);
+            tx.commit().await?;
+            assert_eq!(store.find_by_id(&added.tran_type).await?, Some(added));
 
-        let mut tx = store.begin().await?;
-        assert_eq!(tx.replace_all(subset).await?, 2);
-        tx.commit().await?;
-        assert_eq!(store.find_all().await?, subset);
-        Ok(())
+            let mut tx = store.begin().await?;
+            assert_eq!(tx.replace_all(subset).await?, 2);
+            tx.commit().await?;
+            assert_eq!(store.find_all().await?, subset);
+            Ok(())
+        })
     }
 }

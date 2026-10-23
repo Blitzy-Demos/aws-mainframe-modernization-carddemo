@@ -127,9 +127,9 @@ pub enum DecodeKind {
 
 impl PersistenceError {
     /// A [`PersistenceError::Decode`] for `column`.
-    // Public rather than crate-only: the variant it builds is public, so this grants nothing
-    // new, and a crate-only constructor that no row conversion calls is dead code, which
-    // `warnings = "deny"` makes a build error that no lint attribute may silence (R15).
+    // Public, as the `Decode` variant it builds is: code outside the crate, such as a test that
+    // maps a decode failure to its outcome, builds the same value through it, so it grants
+    // nothing the variant does not.
     #[must_use]
     pub const fn decode(column: &'static str, kind: DecodeKind) -> Self {
         Self::Decode { column, kind }

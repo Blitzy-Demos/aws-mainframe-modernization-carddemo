@@ -63,6 +63,10 @@ use domain::records::transaction::TransactionRecord;
 use persistence::{
     AccountRepository, CardXrefRepository, PersistenceError, PgTx, TransactionRepository,
 };
+use tracing::callsite::{Callsite as _, DefaultCallsite};
+use tracing::field::{Value, display};
+use tracing::metadata::Kind;
+use tracing::{Event, Level, Metadata};
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
@@ -312,24 +316,60 @@ async fn rewrite_account(
 /// constraint or column name, never a key, an amount or a card number (Cardholder Data
 /// Redaction).
 fn traced(paragraph: &'static str, error: &PersistenceError) {
-    tracing::error!(
-        program = PROGRAM,
-        paragraph,
-        error = %error,
-        "COBIL00C file statement failed"
-    );
+    // Written out: `tracing`'s `error!` and `warn!` expand to an `allow(unused_imports)` lint
+    // suppression.
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::ERROR,
+        fields: FAILED_STATEMENT_FIELDS,
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    failed_statement(&EVENT, paragraph, error);
 }
 
 /// [`traced`] for the failed statement of `paragraph` that the payment carries on past, the
 /// cross-reference read, whose message never reaches the answer (COBIL00C-021, COBIL00C-022,
 /// X-COBIL00C-1): a `WARN`, since the payment can still succeed.
 fn traced_unanswered(paragraph: &'static str, error: &PersistenceError) {
-    tracing::warn!(
-        program = PROGRAM,
-        paragraph,
-        error = %error,
-        "COBIL00C file statement failed"
-    );
+    static EVENT: DefaultCallsite = DefaultCallsite::new(&EVENT_METADATA);
+    static EVENT_METADATA: Metadata<'static> = tracing::metadata! {
+        name: concat!("event ", file!(), ":", line!()),
+        target: module_path!(),
+        level: Level::WARN,
+        fields: FAILED_STATEMENT_FIELDS,
+        callsite: &EVENT,
+        kind: Kind::EVENT,
+    };
+    failed_statement(&EVENT, paragraph, error);
+}
+
+/// The fields of the events of [`traced`] and [`traced_unanswered`], in the order
+/// [`failed_statement`] gives their values.
+const FAILED_STATEMENT_FIELDS: &[&str] = &["message", "program", "paragraph", "error"];
+
+/// Emits the event of `callsite`, [`traced`]'s or [`traced_unanswered`]'s, in the current span
+/// when `runtime::telemetry::event_enabled` says so: the message `COBIL00C file statement
+/// failed`, the program, `paragraph` and the error's `Display`.
+fn failed_statement(
+    callsite: &'static DefaultCallsite,
+    paragraph: &'static str,
+    error: &PersistenceError,
+) {
+    if runtime::telemetry::event_enabled(callsite) {
+        let metadata = callsite.metadata();
+        Event::dispatch(
+            metadata,
+            &metadata.fields().value_set_all(&[
+                Some(&"COBIL00C file statement failed" as &dyn Value),
+                Some(&PROGRAM as &dyn Value),
+                Some(&paragraph as &dyn Value),
+                Some(&display(error) as &dyn Value),
+            ]),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -360,6 +400,15 @@ mod tests {
     use crate::error::ServiceError;
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+    /// without the lint attributes that macro's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A local-only signing secret for these tests.
     const SECRET: &str = "services-cobil00c-test-secret";
@@ -458,67 +507,69 @@ mod tests {
     /// ID is not a number ends the payment with `Unable to lookup Transaction...` and writes
     /// nothing, and the one event it leaves names the browse and the error, never the account,
     /// the transaction ID or a card number.
-    #[tokio::test]
-    async fn a_failed_browse_is_logged_once_and_the_payment_writes_nothing() -> TestResult {
-        let guard = start_loaded_postgres().await?;
-        let mut store = PgStore::new(guard.pool().clone());
-        let mut highest = first_fixture_record()?;
-        highest.id = PicX::from_text(BAD_TRAN_ID)?;
-        TransactionRepository::insert(&mut store, &highest).await?;
-        let key = PicU::<11>::new(1)?;
-        let before = AccountRepository::find_by_id(&mut store, key)
-            .await?
-            .ok_or("account 1 is not loaded")?;
-        let state = AppState::new(
-            store.clone(),
-            JwtKeys::new(SECRET, 3600),
-            Arc::new(SystemClock),
-            PathBuf::from("var/jobs"),
-        );
-        let user = SignedOnUser {
-            user_id: PicX::from_text("USER0001")?,
-            user_type: UserType::USER,
-        };
-        let request = BillPaymentRequest {
-            acct_id: ACCOUNT.to_owned(),
-            confirm: "Y".to_owned(),
-        };
-
-        let traces = trace_capture::capture();
-        let outcome = pay(&state, &user, request).await;
-        assert_eq!(
-            outcome,
-            Err(ServiceError::Rule(cobil00c::transaction_lookup_failed()))
-        );
-        let events: Vec<String> = traces
-            .lines()
-            .into_iter()
-            .filter(|line| line.contains(r#""program":"COBIL00C""#))
-            .collect();
-        let [event] = events.as_slice() else {
-            return Err(format!("{} COBIL00C events: {events:?}", events.len()).into());
-        };
-        let browse = format!(r#""paragraph":"{BROWSE_TRANSACT}""#);
-        assert!(event.contains(&browse), "{event}");
-        assert!(event.contains("not all digits"), "{event}");
-
-        let after = AccountRepository::find_by_id(&mut store, key)
-            .await?
-            .ok_or("account 1 is gone")?;
-        assert!(after == before, "the account changed");
-        let last = TransactionRepository::find_last(&mut store)
-            .await?
-            .ok_or("no transaction")?;
-        assert_eq!(last.id, highest.id, "a payment record was written");
-
-        let mut needles = fixture_card_numbers()?;
-        needles.extend([ACCOUNT.to_owned(), BAD_TRAN_ID.to_owned()]);
-        for needle in &needles {
-            assert!(
-                !traces.contains(needle),
-                "the trace holds a protected value"
+    #[test]
+    fn a_failed_browse_is_logged_once_and_the_payment_writes_nothing() -> TestResult {
+        block_on(async {
+            let guard = start_loaded_postgres().await?;
+            let mut store = PgStore::new(guard.pool().clone());
+            let mut highest = first_fixture_record()?;
+            highest.id = PicX::from_text(BAD_TRAN_ID)?;
+            TransactionRepository::insert(&mut store, &highest).await?;
+            let key = PicU::<11>::new(1)?;
+            let before = AccountRepository::find_by_id(&mut store, key)
+                .await?
+                .ok_or("account 1 is not loaded")?;
+            let state = AppState::new(
+                store.clone(),
+                JwtKeys::new(SECRET, 3600),
+                Arc::new(SystemClock),
+                PathBuf::from("var/jobs"),
             );
-        }
-        Ok(())
+            let user = SignedOnUser {
+                user_id: PicX::from_text("USER0001")?,
+                user_type: UserType::USER,
+            };
+            let request = BillPaymentRequest {
+                acct_id: ACCOUNT.to_owned(),
+                confirm: "Y".to_owned(),
+            };
+
+            let traces = trace_capture::capture();
+            let outcome = pay(&state, &user, request).await;
+            assert_eq!(
+                outcome,
+                Err(ServiceError::Rule(cobil00c::transaction_lookup_failed()))
+            );
+            let events: Vec<String> = traces
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(r#""program":"COBIL00C""#))
+                .collect();
+            let [event] = events.as_slice() else {
+                return Err(format!("{} COBIL00C events: {events:?}", events.len()).into());
+            };
+            let browse = format!(r#""paragraph":"{BROWSE_TRANSACT}""#);
+            assert!(event.contains(&browse), "{event}");
+            assert!(event.contains("not all digits"), "{event}");
+
+            let after = AccountRepository::find_by_id(&mut store, key)
+                .await?
+                .ok_or("account 1 is gone")?;
+            assert!(after == before, "the account changed");
+            let last = TransactionRepository::find_last(&mut store)
+                .await?
+                .ok_or("no transaction")?;
+            assert_eq!(last.id, highest.id, "a payment record was written");
+
+            let mut needles = fixture_card_numbers()?;
+            needles.extend([ACCOUNT.to_owned(), BAD_TRAN_ID.to_owned()]);
+            for needle in &needles {
+                assert!(
+                    !traces.contains(needle),
+                    "the trace holds a protected value"
+                );
+            }
+            Ok(())
+        })
     }
 }

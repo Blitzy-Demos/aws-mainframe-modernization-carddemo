@@ -452,9 +452,11 @@ fn store_error(job: LoadJob, step: &str, err: &dyn fmt::Display) -> HarnessError
 mod tests {
     use std::collections::BTreeSet;
     use std::error::Error;
+    use std::future;
     use std::path::Path;
     use std::ptr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::Poll;
     use std::thread::{self, ThreadId};
 
     use copybook::lines;
@@ -473,6 +475,7 @@ mod tests {
         start_loaded_postgres,
     };
     use crate::HarnessError;
+    use crate::tests::block_on;
 
     type TestResult = Result<(), Box<dyn Error>>;
 
@@ -700,27 +703,29 @@ mod tests {
 
     /// The users are hashed once per process, and every stored hash verifies its record's
     /// password.
-    #[tokio::test]
-    async fn hashed_users_are_computed_once_and_verify() -> TestResult {
-        let first = hashed_users().await?;
-        let again = hashed_users().await?;
-        assert!(ptr::eq(first, again));
-        assert_eq!(first.len(), 10);
-        for user in first {
-            assert!(user.password_hash.starts_with("$argon2id$"));
-            assert!(password::verify(
-                user.record.pwd.expose(),
-                &user.password_hash
-            )?);
-        }
-        Ok(())
+    #[test]
+    fn hashed_users_are_computed_once_and_verify() -> TestResult {
+        block_on(async {
+            let first = hashed_users().await?;
+            let again = hashed_users().await?;
+            assert!(ptr::eq(first, again));
+            assert_eq!(first.len(), 10);
+            for user in first {
+                assert!(user.password_hash.starts_with("$argon2id$"));
+                assert!(password::verify(
+                    user.record.pwd.expose(),
+                    &user.password_hash
+                )?);
+            }
+            Ok(())
+        })
     }
 
     /// A failed or panicking computation leaves the cell empty and the next call computes
     /// again; concurrent first callers then share one computation, which runs on the blocking
     /// pool rather than on the thread of this current-thread runtime.
-    #[tokio::test]
-    async fn init_once_computes_once_off_the_caller_thread() -> TestResult {
+    #[test]
+    fn init_once_computes_once_off_the_caller_thread() -> TestResult {
         /// A computation for [`init_once`], counted in `CALLS`.
         type Compute = fn() -> Result<ThreadId, HarnessError>;
         static CELL: OnceCell<ThreadId> = OnceCell::const_new();
@@ -739,45 +744,66 @@ mod tests {
             Ok(thread::current().id())
         };
 
-        for (compute, expected) in [
-            (refuses, "load fixtures: refused"),
-            (panics, "load fixtures: dusrsecj blocking task panicked"),
-        ] {
-            let failed = init_once(&CELL, LoadJob::Dusrsecj, compute).await.copied();
-            assert_eq!(
-                failed.map_err(|err| err.to_string()),
-                Err(expected.to_owned())
-            );
-            assert!(CELL.get().is_none(), "{expected}");
-        }
-        assert_eq!(CALLS.load(Ordering::SeqCst), 2);
+        block_on(async {
+            for (compute, expected) in [
+                (refuses, "load fixtures: refused"),
+                (panics, "load fixtures: dusrsecj blocking task panicked"),
+            ] {
+                let failed = init_once(&CELL, LoadJob::Dusrsecj, compute).await.copied();
+                assert_eq!(
+                    failed.map_err(|err| err.to_string()),
+                    Err(expected.to_owned())
+                );
+                assert!(CELL.get().is_none(), "{expected}");
+            }
+            assert_eq!(CALLS.load(Ordering::SeqCst), 2);
 
-        let (first, second, third, fourth) = tokio::join!(
-            init_once(&CELL, LoadJob::Dusrsecj, computes),
-            init_once(&CELL, LoadJob::Dusrsecj, computes),
-            init_once(&CELL, LoadJob::Dusrsecj, computes),
-            init_once(&CELL, LoadJob::Dusrsecj, computes),
-        );
-        let first = first?;
-        for other in [second?, third?, fourth?] {
-            assert!(ptr::eq(first, other));
-        }
-        assert_eq!(CALLS.load(Ordering::SeqCst), 3);
-        assert_ne!(*first, thread::current().id());
-        Ok(())
+            // Four first callers in this one task: each poll polls every caller that has no
+            // value yet, so all four wait on the cell at the same time.
+            let mut callers =
+                [(); 4].map(|()| Box::pin(init_once(&CELL, LoadJob::Dusrsecj, computes)));
+            let mut values = [(); 4].map(|()| None);
+            future::poll_fn(|cx| {
+                for (caller, value) in callers.iter_mut().zip(&mut values) {
+                    if value.is_none() {
+                        if let Poll::Ready(outcome) = caller.as_mut().poll(cx) {
+                            *value = Some(outcome);
+                        }
+                    }
+                }
+                if values.iter().all(Option::is_some) {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let [Some(first), Some(second), Some(third), Some(fourth)] = values else {
+                panic!("the join ended before every caller had its value");
+            };
+            let first = first?;
+            for other in [second?, third?, fourth?] {
+                assert!(ptr::eq(first, other));
+            }
+            assert_eq!(CALLS.load(Ordering::SeqCst), 3);
+            assert_ne!(*first, thread::current().id());
+            Ok(())
+        })
     }
 
     /// The loaded database reports the nine counts, and a second run over the same database
     /// reports them again.
-    #[tokio::test]
-    async fn the_loads_fill_the_nine_tables_and_rerun() -> Result<(), Box<dyn Error>> {
-        let guard = start_loaded_postgres().await?;
-        let expected: Vec<(String, u64)> = LOADED
-            .iter()
-            .map(|&(subcommand, rows)| (subcommand.to_owned(), rows))
-            .collect();
-        assert_eq!(load_fixtures(guard.pool()).await?, expected);
-        assert_eq!(load_fixtures(guard.pool()).await?, expected);
-        Ok(())
+    #[test]
+    fn the_loads_fill_the_nine_tables_and_rerun() -> Result<(), Box<dyn Error>> {
+        block_on(async {
+            let guard = start_loaded_postgres().await?;
+            let expected: Vec<(String, u64)> = LOADED
+                .iter()
+                .map(|&(subcommand, rows)| (subcommand.to_owned(), rows))
+                .collect();
+            assert_eq!(load_fixtures(guard.pool()).await?, expected);
+            assert_eq!(load_fixtures(guard.pool()).await?, expected);
+            Ok(())
+        })
     }
 }

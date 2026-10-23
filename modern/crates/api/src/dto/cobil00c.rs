@@ -15,13 +15,15 @@
 //! (COBIL00C-033), is a `rules::BillPayFailure`, answered as a `ScreenError` by
 //! `api::error`; it is never a member of [`BillPaymentResult`].
 
+use serde::de::{self, Deserializer, MapAccess};
+use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
 use domain::online::cobil00c as rules;
 
-use super::{digits, text};
+use super::{Member, ObjectMembers, digits, field_if_present, read_object, skip_member, text};
 
 /// The two inputs of `COBIL0A`, each the raw text of its map field.
 ///
@@ -34,7 +36,7 @@ use super::{digits, text};
 /// (COBIL00C-007). The values are neither trimmed nor upper-cased: COBIL00C reads them as typed.
 // The schema name `BillPaymentRequest` is the frontend's
 // `components["schemas"]["BillPaymentRequest"]` (Generated API Types Only).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema, Validate)]
 #[schema(example = json!({"acct_id": "00000000001", "confirm": ""}))]
 pub struct BillPaymentRequest {
     /// `ACTIDIN`, `PIC X(11)`, the account ID, at most 11 bytes of printable ASCII
@@ -51,6 +53,52 @@ pub struct BillPaymentRequest {
     #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     #[schema(max_length = 1)]
     pub confirm: String,
+}
+
+/// `acct_id` and `confirm`, as typed.
+impl Serialize for BillPaymentRequest {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("BillPaymentRequest", 2)?;
+        state.serialize_field("acct_id", &self.acct_id)?;
+        state.serialize_field("confirm", &self.confirm)?;
+        state.end()
+    }
+}
+
+/// A JSON object whose absent members are the empty text. An unknown member is skipped; a
+/// repeated one is an error.
+impl<'de> Deserialize<'de> for BillPaymentRequest {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, BillPaymentRequestMembers>(deserializer)
+    }
+}
+
+/// The members of a [`BillPaymentRequest`] being read.
+#[derive(Default)]
+struct BillPaymentRequestMembers {
+    acct_id: Member<String>,
+    confirm: Member<String>,
+}
+
+impl ObjectMembers for BillPaymentRequestMembers {
+    type Object = BillPaymentRequest;
+    const NAME: &'static str = "BillPaymentRequest";
+    const FIELDS: &'static [&'static str] = &["acct_id", "confirm"];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "acct_id" => self.acct_id.read(map, "acct_id"),
+            "confirm" => self.confirm.read(map, "confirm"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<BillPaymentRequest, E> {
+        Ok(BillPaymentRequest {
+            acct_id: self.acct_id.or_default(),
+            confirm: self.confirm.or_default(),
+        })
+    }
 }
 
 /// The request as the inputs `rules::edit` and its parts read, borrowed unchanged.
@@ -72,7 +120,7 @@ impl<'a> From<&'a BillPaymentRequest> for rules::BillPayInput<'a> {
 // The schema name `BillPaymentResult` is the frontend's
 // `components["schemas"]["BillPaymentResult"]` (Generated API Types Only). An absent optional
 // member is omitted from the body, as in `ScreenError`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, ToSchema)]
 #[schema(example = json!({
     "acct_id": "00000000001",
     "current_balance": "+0000000843.00",
@@ -102,6 +150,74 @@ pub struct BillPaymentResult {
     /// Whether the screen empties its inputs and balance: after `N` (COBIL00C-010) and after a
     /// payment (COBIL00C-028).
     pub cleared: bool,
+}
+
+/// Every member in declaration order, an absent optional one left out.
+impl Serialize for BillPaymentResult {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let len = 2
+            + usize::from(self.current_balance.is_some())
+            + usize::from(self.message.is_some())
+            + usize::from(self.new_tran_id.is_some());
+        let mut state = serializer.serialize_struct("BillPaymentResult", len)?;
+        state.serialize_field("acct_id", &self.acct_id)?;
+        field_if_present(&mut state, "current_balance", self.current_balance.as_ref())?;
+        field_if_present(&mut state, "message", self.message.as_ref())?;
+        field_if_present(&mut state, "new_tran_id", self.new_tran_id.as_ref())?;
+        state.serialize_field("cleared", &self.cleared)?;
+        state.end()
+    }
+}
+
+/// A JSON object whose `acct_id` and `cleared` are required and whose other members may be
+/// absent or `null`. An unknown member is skipped; a repeated one is an error.
+impl<'de> Deserialize<'de> for BillPaymentResult {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        read_object::<D, BillPaymentResultMembers>(deserializer)
+    }
+}
+
+/// The members of a [`BillPaymentResult`] being read.
+#[derive(Default)]
+struct BillPaymentResultMembers {
+    acct_id: Member<String>,
+    current_balance: Member<Option<String>>,
+    message: Member<Option<String>>,
+    new_tran_id: Member<Option<String>>,
+    cleared: Member<bool>,
+}
+
+impl ObjectMembers for BillPaymentResultMembers {
+    type Object = BillPaymentResult;
+    const NAME: &'static str = "BillPaymentResult";
+    const FIELDS: &'static [&'static str] = &[
+        "acct_id",
+        "current_balance",
+        "message",
+        "new_tran_id",
+        "cleared",
+    ];
+
+    fn read<'de, A: MapAccess<'de>>(&mut self, key: &str, map: &mut A) -> Result<(), A::Error> {
+        match key {
+            "acct_id" => self.acct_id.read(map, "acct_id"),
+            "current_balance" => self.current_balance.read(map, "current_balance"),
+            "message" => self.message.read(map, "message"),
+            "new_tran_id" => self.new_tran_id.read(map, "new_tran_id"),
+            "cleared" => self.cleared.read(map, "cleared"),
+            _ => skip_member(map),
+        }
+    }
+
+    fn finish<E: de::Error>(self) -> Result<BillPaymentResult, E> {
+        Ok(BillPaymentResult {
+            acct_id: self.acct_id.required("acct_id")?,
+            current_balance: self.current_balance.optional(),
+            message: self.message.optional(),
+            new_tran_id: self.new_tran_id.optional(),
+            cleared: self.cleared.required("cleared")?,
+        })
+    }
 }
 
 /// The outcome the service returns, field by field; every text is the domain's.

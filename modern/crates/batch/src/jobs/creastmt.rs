@@ -22,8 +22,7 @@
 //! 1. The run takes the statement directory's `DirectoryLock`, creating the directory
 //!    owner-only when it is missing, and releases it only once its files are completed or
 //!    removed: another run over the same directory, from any process or container that shares
-//!    the directory, waits until then, so the three files are one set no two runs touch at once
-//!    (W005-F01).
+//!    the directory, waits until then, so the three files are one set no two runs touch at once.
 //! 2. The three files are replaced, so the previous run's are gone before any table is read, as
 //!    `STEP030` deletes them and `CBSTM03A` opens its outputs before its first read
 //!    (CBSTM03A-002, CBSTM03A-004). The names are fixed, not `(+1)` generations.
@@ -40,15 +39,14 @@
 //!    records go to `STATEMNT.PS` and HTML records to `STATEMNT.HTML`, each followed by LF. So at
 //!    most one card's transactions are held at a time. The keyed master reads are served from
 //!    `customers` and `accounts` each read whole, once, the first time a statement needs one of
-//!    their records, so a run makes two master reads rather than two per cross-reference record
-//!    (W011-F04).
+//!    their records, so a run makes two master reads rather than two per cross-reference record.
 //! 5. After the last statement the PDF is rendered from the text records read back from
 //!    `STATEMNT.PS` through the run's own handle, one at a time, and written; then
 //!    `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PDF` are completed in that order and their
 //!    paths returned in that order, which `main` prints; return code 0 (CBSTM03A-050,
-//!    CBSTM03A-051). No text record is held beyond its statement (W011-F06). The PDF document is
-//!    the one part of the run that still grows with it: `printpdf` builds the whole document in
-//!    memory before it is written (escalation candidate X-CREASTMT-9).
+//!    CBSTM03A-051). No text record is held beyond its statement. The PDF document is the one
+//!    part of the run that still grows with it: `printpdf` builds the whole document in memory
+//!    before it is written (escalation candidate X-CREASTMT-9).
 //!
 //! Every read is read-only and outside any transaction: the job writes no table.
 //!
@@ -64,11 +62,10 @@
 //! abend, so after any failure none of the three files remains and no path is printed; a
 //! failure while completing them removes the ones already completed, so a run leaves all three
 //! or none (CBSTM03A-002); a file that cannot be removed is reported by a cleanup event naming
-//! the operation and the error kind only (W015-F02). The run still holds the directory's lock
-//! then, and removes each path only while it names the file the run created, so every file it
-//! removes is its own (W005-F01). The empty-table outcome itself is halt candidate
-//! X-CREASTMT-H1: the replacement takes the CBSTM03A-007 path, which claims no parity for that
-//! case.
+//! the operation and the error kind only. The run still holds the directory's lock then, and
+//! removes each path only while it names the file the run created, so every file it removes is
+//! its own. The empty-table outcome itself is halt candidate X-CREASTMT-H1: the replacement
+//! takes the CBSTM03A-007 path, which claims no parity for that case.
 //!
 //! A transaction set beyond the 51 cards of 10 transactions of `WS-TRNX-TABLE` is printed in
 //! full, as the domain keeps every card and transaction, and reported with a warning event,
@@ -83,9 +80,9 @@
 //!   SQLSTATE or a constraint name only, and every [`JobError`] reason is static.
 //! - Local-Only Runtime: files are written only under `Config::statement_dir` (default
 //!   `./var/statements/`), with no object storage; the only network use is the `PostgreSQL`
-//!   pool. The directory lock is an entry of the statement directory, on Linux a Unix socket
-//!   file that other runs connect to only to learn whether its run still holds it, and that
-//!   carries no data.
+//!   pool. The directory lock is an entry of the statement directory, on Linux a directory
+//!   holding a Unix socket that other runs connect to only to learn whether its run still holds
+//!   the lock; the entry carries no data.
 //! - Single Schema Executor: no schema work here; against a database whose schema has not been
 //!   applied, the first read fails and the job abends as CBSTM03A-012 states.
 //! - R1: this module handles only record bytes; the page coordinates are `crate::pdf`'s.
@@ -104,8 +101,13 @@ use persistence::{
     TransactionRepository,
 };
 use runtime::telemetry::JobCounter;
+use tracing::field::Value;
+use tracing::{Level, Metadata};
 
-use super::{DirectoryLock, FileIdentity, JobContext, JobError, JobOutcome, OutputFile, count};
+use super::{
+    DirectoryLock, EventSite, FileIdentity, JobContext, JobError, JobOutcome, OutputFile, count,
+    emit, event_metadata,
+};
 
 /// The text statement, `STMTFILE` `DSN=AWS.M2.CARDDEMO.STATEMNT.PS` (CBSTM03A-002).
 const TEXT_FILE: &str = "STATEMNT.PS";
@@ -128,7 +130,7 @@ const ABEND_RETURN_CODE: u8 = 16;
 const READING_STATEMENT_TEXT: &str = "reading statement text";
 
 /// The cleanup operation of a completed statement file removed because a later one could not
-/// be completed (CBSTM03A-002; W015-F02).
+/// be completed (CBSTM03A-002).
 const REMOVING_COMPLETED_STATEMENT: &str = "removing completed statement file";
 
 /// Runs CREASTMT: writes `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PDF` under
@@ -150,7 +152,7 @@ const REMOVING_COMPLETED_STATEMENT: &str = "removing completed statement file";
 pub(crate) async fn run(ctx: &JobContext<'_>) -> Result<JobOutcome, JobError> {
     let lock = DirectoryLock::acquire(&ctx.config.statement_dir).await?;
     let outcome = replace_statements(ctx, &lock).await;
-    // Released only now, once the files are completed or removed (W005-F01).
+    // Released only now, once the files are completed or removed.
     lock.release().await;
     outcome
 }
@@ -211,8 +213,7 @@ where
 
 /// The two master files a statement reads by key, `CUSTFILE` and `ACCTFILE` (CBSTM03B-004,
 /// CBSTM03B-005): `customers` and `accounts`, each read whole the first time a statement needs
-/// one of its records and kept by key for the rest of the run, rather than read once per key
-/// (W011-F04).
+/// one of its records and kept by key for the rest of the run, rather than read once per key.
 #[derive(Default)]
 struct Masters {
     /// `customers` by `CUST-ID`, once read.
@@ -293,13 +294,31 @@ async fn transaction_census<S: TransactionRepository>(
         StatementError::NoTransactions => abend(ReadFailure::TransactionsEmpty, None),
     })?;
     if !census.within_cobol_bounds() {
-        tracing::warn!(
-            cards = census.card_count(),
-            "the transactions exceed the 51 cards of 10 transactions of the CBSTM03A table: \
-             every statement is written in full, and its parity is BLOCKED (X-CREASTMT-H2)"
-        );
+        beyond_the_cobol_table(census.card_count());
     }
     Ok(census)
+}
+
+/// The message of the warning of a transaction set beyond the CBSTM03A table.
+const BEYOND_THE_COBOL_TABLE: &str = "the transactions exceed the 51 cards of 10 transactions of \
+                                      the CBSTM03A table: every statement is written in full, \
+                                      and its parity is BLOCKED (X-CREASTMT-H2)";
+
+/// Warns that the transaction set exceeds the 51 cards of 10 transactions of the CBSTM03A
+/// table: one `WARN` event with the number of cards, `cards`, and no card number (halt
+/// candidate X-CREASTMT-H2).
+fn beyond_the_cobol_table(cards: usize) {
+    /// The callsite of the event.
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    /// The event's metadata: `WARN`, this module's target, the message and `cards`.
+    static METADATA: Metadata<'static> = event_metadata(
+        BEYOND_THE_COBOL_TABLE,
+        module_path!(),
+        Level::WARN,
+        &["message", "cards"],
+        &SITE,
+    );
+    emit(&SITE, [Some(&BEYOND_THE_COBOL_TABLE), Some(&cards)]);
 }
 
 /// The cross-reference records, from the read that stands for `XREFFILE`, in the key order of
@@ -431,19 +450,33 @@ impl ReadFailure {
 /// return code 16 (CBSTM03A-049, X-CREASTMT-2). The first event of a failed read also carries the
 /// persistence error's text, an SQLSTATE, a constraint or a column only.
 fn abend(failure: ReadFailure, cause: Option<&PersistenceError>) -> JobError {
-    let error_line = failure.error_line();
-    if let Some(cause) = cause {
-        tracing::error!(cause = %cause, "{error_line}");
-    } else {
-        tracing::error!("{error_line}");
-    }
-    let return_code_line = failure.return_code_line();
-    tracing::error!("{return_code_line}");
-    tracing::error!("{ABENDING_PROGRAM}");
+    display_line(failure.error_line(), cause);
+    display_line(failure.return_code_line(), None);
+    display_line(ABENDING_PROGRAM, None);
     JobError::Abend {
         code: Some(ABEND_RETURN_CODE),
         reason: failure.reason(),
     }
+}
+
+/// One `DISPLAY` line of 9999-ABEND-PROGRAM: an `ERROR` event whose message is `line` exactly,
+/// with the field `cause`, the persistence error's text, only when `cause` is given.
+fn display_line(line: &'static str, cause: Option<&PersistenceError>) {
+    /// The callsite of the event, shared by every `DISPLAY` line.
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    /// The event's metadata: `ERROR`, this module's target, the message and `cause`.
+    static METADATA: Metadata<'static> = event_metadata(
+        "DISPLAY",
+        module_path!(),
+        Level::ERROR,
+        &["message", "cause"],
+        &SITE,
+    );
+    let cause = cause.map(tracing::field::display);
+    emit(
+        &SITE,
+        [Some(&line), cause.as_ref().map(|cause| cause as &dyn Value)],
+    );
 }
 
 /// The three statement files of one run, open from before the first read to the end of the
@@ -460,8 +493,7 @@ struct StatementFiles {
     /// `STATEMNT.PDF`, written only once every text record is known.
     pdf: OutputFile,
     /// Text records written so far, the records the PDF is rendered from once they are all
-    /// written: they are read back from `STATEMNT.PS` then, never kept here (CBSTM03A-051,
-    /// W011-F06).
+    /// written: they are read back from `STATEMNT.PS` then, never kept here (CBSTM03A-051).
     text_records: usize,
     /// Statements written so far, one per cross-reference record (CBSTM03A-009).
     statements: usize,
@@ -473,7 +505,7 @@ impl StatementFiles {
     /// Replaces the three files in the directory `lock` holds: `STEP030` deletes the previous
     /// run's statement files and `CBSTM03A` opens both outputs before its first read; the PDF of
     /// the previous run goes with them (CBSTM03A-002, CBSTM03A-004). Holding the lock, the run
-    /// removes no file another run is writing (W005-F01).
+    /// removes no file another run is writing.
     ///
     /// # Errors
     ///
@@ -514,8 +546,7 @@ impl StatementFiles {
     /// through the run's own handle one at a time, then completes `STATEMNT.PS`, `STATEMNT.HTML`
     /// and `STATEMNT.PDF` in that order, and returns the outcome of a normal end (CBSTM03A-050,
     /// CBSTM03A-051). With no statement the text and HTML files are empty and the PDF has one
-    /// empty page. The reading and the rendering block, so they run as one blocking step
-    /// (W011-F05).
+    /// empty page. The reading and the rendering block, so they run as one blocking step.
     ///
     /// # Errors
     ///
@@ -569,8 +600,8 @@ impl StatementFiles {
 
 /// The `STATEMNT.PDF` bytes, rendered from the text records `reader` reads back from
 /// `STATEMNT.PS`, streamed into `crate::pdf::render` one at a time, so that the PDF shows what
-/// the file holds and no more than one record is in memory (CBSTM03A-051; W011-F06). Runs
-/// inside a blocking step.
+/// the file holds and no more than one record is in memory (CBSTM03A-051). Runs inside a
+/// blocking step.
 ///
 /// # Errors
 ///
@@ -664,10 +695,9 @@ fn next_text_record(reader: &mut impl BufRead) -> io::Result<Option<[u8; STMT_RE
 /// Removes the files of this run already completed when a later one could not be, so that the
 /// run leaves none of the three (CBSTM03A-002, CBSTM03A-049). The run still holds the
 /// directory's lock, and each path is removed only while it names the file of its identity,
-/// the one the run completed, so a file another process put under the name stays (W005-F01).
-/// Best effort: the job fails with the completion error whatever happens here, and each file
-/// that could not be removed is reported as cleanup `removing completed statement file`
-/// (W015-F02).
+/// the one the run completed, so a file another process put under the name stays. Best effort:
+/// the job fails with the completion error whatever happens here, and each file that could not
+/// be removed is reported as cleanup `removing completed statement file`.
 async fn discard(completed: Vec<(PathBuf, FileIdentity)>) {
     super::remove_outputs(REMOVING_COMPLETED_STATEMENT, completed).await;
 }
@@ -704,6 +734,25 @@ mod tests {
     use crate::pdf::RenderError;
 
     type TestResult = Result<(), Box<dyn Error>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the runtime tokio's test attribute
+    /// builds by default, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
+
+    /// Runs `test` to completion on a multi-thread runtime of two workers, for a test whose
+    /// spawned run must make progress while the test's own thread blocks.
+    fn block_on_two_workers(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// Tells apart the scratch directories of the tests of one process.
     static SCRATCH_SEQUENCE: AtomicU32 = AtomicU32::new(0);
@@ -868,105 +917,110 @@ mod tests {
     // audit: CBSTM03A-007
     // audit: CBSTM03A-008
     // audit: CBSTM03A-012
-    #[tokio::test]
-    async fn the_census_counts_every_transaction_or_abends_at_trnxfile() -> TestResult {
-        let held = vec![
-            transaction(CARD_1, 1)?,
-            transaction(CARD_1, 2)?,
-            transaction(CARD_2, 3)?,
-        ];
-        let mut store = CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
-        let census = transaction_census(&mut store).await?;
-        assert_eq!(census.card_count(), 2);
-        assert!(census.within_cobol_bounds());
-        assert_eq!(
-            (store.census_reads, store.card_reads, store.other_calls),
-            (1, 0, 0)
-        );
-
-        let cases = [
-            (
-                Vec::new(),
-                CensusEnd::Normally,
-                ReadFailure::TransactionsEmpty,
-            ),
-            (
-                vec![transaction(CARD_1, 1)?],
-                CensusEnd::AtStart,
-                ReadFailure::TransactionsUnreadable,
-            ),
-            (
-                vec![transaction(CARD_1, 1)?],
-                CensusEnd::AtRow,
-                ReadFailure::TransactionsUnreadable,
-            ),
-        ];
-        for (held, end, failure) in cases {
-            let mut store = CountingStore::holding(None)?.with_transactions(held, end);
-            let error = transaction_census(&mut store)
-                .await
-                .err()
-                .ok_or("a census of no readable transaction")?;
-            assert_eq!(error.exit_code(), Some(16), "{end:?}");
+    #[test]
+    fn the_census_counts_every_transaction_or_abends_at_trnxfile() -> TestResult {
+        block_on(async {
+            let held = vec![
+                transaction(CARD_1, 1)?,
+                transaction(CARD_1, 2)?,
+                transaction(CARD_2, 3)?,
+            ];
+            let mut store =
+                CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
+            let census = transaction_census(&mut store).await?;
+            assert_eq!(census.card_count(), 2);
+            assert!(census.within_cobol_bounds());
             assert_eq!(
-                error.to_string(),
-                format!("ABEND: {} (return code 16)", failure.reason()),
-                "{end:?}"
+                (store.census_reads, store.card_reads, store.other_calls),
+                (1, 0, 0)
             );
-            assert_eq!((store.census_reads, store.other_calls), (1, 0), "{end:?}");
-        }
-        Ok(())
+
+            let cases = [
+                (
+                    Vec::new(),
+                    CensusEnd::Normally,
+                    ReadFailure::TransactionsEmpty,
+                ),
+                (
+                    vec![transaction(CARD_1, 1)?],
+                    CensusEnd::AtStart,
+                    ReadFailure::TransactionsUnreadable,
+                ),
+                (
+                    vec![transaction(CARD_1, 1)?],
+                    CensusEnd::AtRow,
+                    ReadFailure::TransactionsUnreadable,
+                ),
+            ];
+            for (held, end, failure) in cases {
+                let mut store = CountingStore::holding(None)?.with_transactions(held, end);
+                let error = transaction_census(&mut store)
+                    .await
+                    .err()
+                    .ok_or("a census of no readable transaction")?;
+                assert_eq!(error.exit_code(), Some(16), "{end:?}");
+                assert_eq!(
+                    error.to_string(),
+                    format!("ABEND: {} (return code 16)", failure.reason()),
+                    "{end:?}"
+                );
+                assert_eq!((store.census_reads, store.other_calls), (1, 0), "{end:?}");
+            }
+            Ok(())
+        })
     }
 
     /// A transaction set beyond the 51 cards of the COBOL table, or beyond 10 transactions on a
     /// card, is counted in full and reported by one warning that carries the card count and no
     /// card number; a set within the bounds gives no warning.
     // audit: CBSTM03A-008
-    #[tokio::test]
-    async fn a_census_beyond_the_cobol_table_warns_of_blocked_parity() -> TestResult {
-        let cases: [(u64, u64, bool); 4] = [
-            (51, 1, false),
-            (51, 10, false),
-            (52, 1, true),
-            (1, 11, true),
-        ];
-        for (cards, per_card, warned) in cases {
-            let mut held = Vec::new();
-            for card in 1..=cards {
-                for n in 1..=per_card {
-                    held.push(transaction(numbered_card(card)?, card * 100 + n)?);
+    #[test]
+    fn a_census_beyond_the_cobol_table_warns_of_blocked_parity() -> TestResult {
+        block_on(async {
+            let cases: [(u64, u64, bool); 4] = [
+                (51, 1, false),
+                (51, 10, false),
+                (52, 1, true),
+                (1, 11, true),
+            ];
+            for (cards, per_card, warned) in cases {
+                let mut held = Vec::new();
+                for card in 1..=cards {
+                    for n in 1..=per_card {
+                        held.push(transaction(numbered_card(card)?, card * 100 + n)?);
+                    }
                 }
+                let mut store =
+                    CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
+                let capture = trace_capture::capture();
+                let census = transaction_census(&mut store).await?;
+                let warnings: Vec<String> = capture
+                    .lines()
+                    .into_iter()
+                    .filter(|line| line.contains(r#""level":"WARN""#))
+                    .collect();
+                let shown = capture.text();
+                drop(capture);
+                let label = format!("{cards} x {per_card}");
+                assert_eq!(census.card_count(), usize::try_from(cards)?, "{label}");
+                assert_eq!(census.within_cobol_bounds(), !warned, "{label}");
+                if warned {
+                    let [warning] = warnings.as_slice() else {
+                        return Err(format!("{label}: {} warnings", warnings.len()).into());
+                    };
+                    assert!(warning.contains("(X-CREASTMT-H2)"), "{label}: {warning}");
+                    assert!(
+                        warning.contains(&format!(r#""cards":{cards}"#)),
+                        "{label}: {warning}"
+                    );
+                } else {
+                    assert!(warnings.is_empty(), "{label}: {warnings:?}");
+                }
+                let first = String::from_utf8(numbered_card(1)?.to_vec())?;
+                assert!(!shown.contains(&first), "{label}: a card number was traced");
             }
-            let mut store =
-                CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
-            let capture = trace_capture::capture();
-            let census = transaction_census(&mut store).await?;
-            let warnings: Vec<String> = capture
-                .lines()
-                .into_iter()
-                .filter(|line| line.contains(r#""level":"WARN""#))
-                .collect();
-            let shown = capture.text();
-            drop(capture);
-            let label = format!("{cards} x {per_card}");
-            assert_eq!(census.card_count(), usize::try_from(cards)?, "{label}");
-            assert_eq!(census.within_cobol_bounds(), !warned, "{label}");
-            if warned {
-                let [warning] = warnings.as_slice() else {
-                    return Err(format!("{label}: {} warnings", warnings.len()).into());
-                };
-                assert!(warning.contains("(X-CREASTMT-H2)"), "{label}: {warning}");
-                assert!(
-                    warning.contains(&format!(r#""cards":{cards}"#)),
-                    "{label}: {warning}"
-                );
-            } else {
-                assert!(warnings.is_empty(), "{label}: {warnings:?}");
-            }
-            let first = String::from_utf8(numbered_card(1)?.to_vec())?;
-            assert!(!shown.contains(&first), "{label}: a card number was traced");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Each statement reads its card's transactions by key once its customer and account are
@@ -975,64 +1029,66 @@ mod tests {
     // audit: CBSTM03A-012
     // audit: CBSTM03A-013
     // audit: CBSTM03A-049
-    #[tokio::test]
-    async fn each_statement_reads_its_card_by_key_after_its_masters() -> TestResult {
-        let held = vec![
-            transaction(CARD_1, 1)?,
-            transaction(CARD_1, 3)?,
-            transaction(CARD_2, 2)?,
-        ];
-        let xrefs = vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?];
-        let scratch = Scratch::new()?;
-        let dir = scratch.statements();
-        let lock = DirectoryLock::acquire(&dir).await?;
-        let mut files = StatementFiles::replace(&lock).await?;
-        let mut store =
-            CountingStore::holding(None)?.with_transactions(held.clone(), CensusEnd::Normally);
-        write_statements(&mut store, &xrefs, &mut files).await?;
-        assert_eq!(
-            (store.customer_reads, store.account_reads, store.card_reads),
-            (1, 1, 3)
-        );
-        assert_eq!((store.census_reads, store.other_calls), (0, 0));
-        // 19 text records a statement, and one more for each of its transactions.
-        assert_eq!((files.statements, files.text_records), (3, 19 * 3 + 3));
-        files.finish().await?;
-        let text = fs::read(dir.join(TEXT_FILE))?;
-        let ids: Vec<&[u8]> = [16, 17, 21 + 16]
-            .iter()
-            .filter_map(|&at| text.chunks(STMT_RECORD_LEN + 1).nth(at)?.get(..16))
-            .collect();
-        assert_eq!(
-            ids,
-            [
-                b"0000000000000001",
-                b"0000000000000003",
-                b"0000000000000002"
-            ]
-        );
+    #[test]
+    fn each_statement_reads_its_card_by_key_after_its_masters() -> TestResult {
+        block_on(async {
+            let held = vec![
+                transaction(CARD_1, 1)?,
+                transaction(CARD_1, 3)?,
+                transaction(CARD_2, 2)?,
+            ];
+            let xrefs = vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?];
+            let scratch = Scratch::new()?;
+            let dir = scratch.statements();
+            let lock = DirectoryLock::acquire(&dir).await?;
+            let mut files = StatementFiles::replace(&lock).await?;
+            let mut store =
+                CountingStore::holding(None)?.with_transactions(held.clone(), CensusEnd::Normally);
+            write_statements(&mut store, &xrefs, &mut files).await?;
+            assert_eq!(
+                (store.customer_reads, store.account_reads, store.card_reads),
+                (1, 1, 3)
+            );
+            assert_eq!((store.census_reads, store.other_calls), (0, 0));
+            // 19 text records a statement, and one more for each of its transactions.
+            assert_eq!((files.statements, files.text_records), (3, 19 * 3 + 3));
+            files.finish().await?;
+            let text = fs::read(dir.join(TEXT_FILE))?;
+            let ids: Vec<&[u8]> = [16, 17, 21 + 16]
+                .iter()
+                .filter_map(|&at| text.chunks(STMT_RECORD_LEN + 1).nth(at)?.get(..16))
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    b"0000000000000001",
+                    b"0000000000000003",
+                    b"0000000000000002"
+                ]
+            );
 
-        let mut files = StatementFiles::replace(&lock).await?;
-        let mut store = CountingStore::holding(Some(Unreadable::Transactions))?
-            .with_transactions(held, CensusEnd::Normally);
-        let error = write_statements(&mut store, &xrefs, &mut files)
-            .await
-            .err()
-            .ok_or("a statement was written without its transactions")?;
-        let failure = ReadFailure::TransactionsUnreadable;
-        assert_eq!(failure.error_line(), "ERROR READING TRNXFILE");
-        assert_eq!(
-            error.to_string(),
-            format!("ABEND: {} (return code 16)", failure.reason())
-        );
-        assert_eq!(
-            (store.customer_reads, store.account_reads, store.card_reads),
-            (1, 1, 1)
-        );
-        assert_eq!(files.statements, 0);
-        drop(files);
-        lock.release().await;
-        Ok(())
+            let mut files = StatementFiles::replace(&lock).await?;
+            let mut store = CountingStore::holding(Some(Unreadable::Transactions))?
+                .with_transactions(held, CensusEnd::Normally);
+            let error = write_statements(&mut store, &xrefs, &mut files)
+                .await
+                .err()
+                .ok_or("a statement was written without its transactions")?;
+            let failure = ReadFailure::TransactionsUnreadable;
+            assert_eq!(failure.error_line(), "ERROR READING TRNXFILE");
+            assert_eq!(
+                error.to_string(),
+                format!("ABEND: {} (return code 16)", failure.reason())
+            );
+            assert_eq!(
+                (store.customer_reads, store.account_reads, store.card_reads),
+                (1, 1, 1)
+            );
+            assert_eq!(files.statements, 0);
+            drop(files);
+            lock.release().await;
+            Ok(())
+        })
     }
 
     /// Cross-reference records are taken in EBCDIC key order, whatever order the read returns:
@@ -1072,188 +1128,196 @@ mod tests {
     // audit: CBSTM03A-047
     // audit: CBSTM03A-050
     // audit: CBSTM03A-051
-    #[tokio::test]
-    async fn a_run_replaces_the_three_files_with_its_own() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.statements();
-        previous_run(&dir)?;
-        let lock = DirectoryLock::acquire(&dir).await?;
-        let mut files = StatementFiles::replace(&lock).await?;
-        assert_eq!(
-            names(&dir)?,
-            [LOCK_NAME, HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from)
-        );
-        for name in [TEXT_FILE, HTML_FILE, PDF_FILE] {
-            assert!(
-                fs::read(dir.join(name))?.is_empty(),
-                "{name} kept old bytes"
+    #[test]
+    fn a_run_replaces_the_three_files_with_its_own() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.statements();
+            previous_run(&dir)?;
+            let lock = DirectoryLock::acquire(&dir).await?;
+            let mut files = StatementFiles::replace(&lock).await?;
+            assert_eq!(
+                names(&dir)?,
+                [LOCK_NAME, HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from)
             );
-        }
-        files.write(&statement(b"AB", b"<")).await?;
-        files.write(&statement(b"C", b">")).await?;
-        let outcome = files.finish().await?;
-        assert_eq!(
-            outcome.written,
-            [TEXT_FILE, HTML_FILE, PDF_FILE].map(|name| dir.join(name))
-        );
-        assert_eq!(outcome.return_code, 0);
-        assert_eq!(
-            outcome.counts,
-            [
-                (JobCounter::Statements, 2),
-                (JobCounter::TextRecords, 3),
-                (JobCounter::HtmlRecords, 2)
-            ]
-        );
-        let text = [b'A', b'B', b'C'].map(|byte| [byte; STMT_RECORD_LEN]);
-        assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&text));
-        let html = [b'<', b'>'].map(|byte| [byte; HTML_RECORD_LEN]);
-        assert_eq!(fs::read(dir.join(HTML_FILE))?, lf_records(&html));
-        assert!(fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"));
-        lock.release().await;
-        assert_eq!(
-            names(&dir)?,
-            [HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from)
-        );
-        Ok(())
+            for name in [TEXT_FILE, HTML_FILE, PDF_FILE] {
+                assert!(
+                    fs::read(dir.join(name))?.is_empty(),
+                    "{name} kept old bytes"
+                );
+            }
+            files.write(&statement(b"AB", b"<")).await?;
+            files.write(&statement(b"C", b">")).await?;
+            let outcome = files.finish().await?;
+            assert_eq!(
+                outcome.written,
+                [TEXT_FILE, HTML_FILE, PDF_FILE].map(|name| dir.join(name))
+            );
+            assert_eq!(outcome.return_code, 0);
+            assert_eq!(
+                outcome.counts,
+                [
+                    (JobCounter::Statements, 2),
+                    (JobCounter::TextRecords, 3),
+                    (JobCounter::HtmlRecords, 2)
+                ]
+            );
+            let text = [b'A', b'B', b'C'].map(|byte| [byte; STMT_RECORD_LEN]);
+            assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&text));
+            let html = [b'<', b'>'].map(|byte| [byte; HTML_RECORD_LEN]);
+            assert_eq!(fs::read(dir.join(HTML_FILE))?, lf_records(&html));
+            assert!(fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"));
+            lock.release().await;
+            assert_eq!(
+                names(&dir)?,
+                [HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from)
+            );
+            Ok(())
+        })
     }
 
     /// With no cross-reference record the run ends normally with two empty statement files and
     /// a PDF of one empty page.
     // audit: CBSTM03A-009
     // audit: CBSTM03A-051
-    #[tokio::test]
-    async fn no_cross_reference_gives_empty_statement_files() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.statements();
-        let lock = DirectoryLock::acquire(&dir).await?;
-        let outcome = StatementFiles::replace(&lock).await?.finish().await?;
-        assert_eq!(outcome.written.len(), 3);
-        assert!(fs::read(dir.join(TEXT_FILE))?.is_empty());
-        assert!(fs::read(dir.join(HTML_FILE))?.is_empty());
-        assert!(fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"));
-        assert_eq!(
-            outcome.counts,
-            [
-                (JobCounter::Statements, 0),
-                (JobCounter::TextRecords, 0),
-                (JobCounter::HtmlRecords, 0)
-            ]
-        );
-        Ok(())
+    #[test]
+    fn no_cross_reference_gives_empty_statement_files() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.statements();
+            let lock = DirectoryLock::acquire(&dir).await?;
+            let outcome = StatementFiles::replace(&lock).await?.finish().await?;
+            assert_eq!(outcome.written.len(), 3);
+            assert!(fs::read(dir.join(TEXT_FILE))?.is_empty());
+            assert!(fs::read(dir.join(HTML_FILE))?.is_empty());
+            assert!(fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"));
+            assert_eq!(
+                outcome.counts,
+                [
+                    (JobCounter::Statements, 0),
+                    (JobCounter::TextRecords, 0),
+                    (JobCounter::HtmlRecords, 0)
+                ]
+            );
+            Ok(())
+        })
     }
 
     /// A run that ends early, as every abend returns, and a run whose PDF cannot be rendered
     /// both leave none of the three files, the previous run's included.
     // audit: CBSTM03A-002
     // audit: CBSTM03A-049
-    #[tokio::test]
-    async fn a_failed_run_leaves_no_statement_file() -> TestResult {
-        let scratch = Scratch::new()?;
-        let dir = scratch.statements();
-        previous_run(&dir)?;
-        let lock = DirectoryLock::acquire(&dir).await?;
-        let mut files = StatementFiles::replace(&lock).await?;
-        files.write(&statement(b"A", b"<")).await?;
-        drop(files);
-        assert_eq!(names(&dir)?, [LOCK_NAME], "an abended run left a file");
+    #[test]
+    fn a_failed_run_leaves_no_statement_file() -> TestResult {
+        block_on(async {
+            let scratch = Scratch::new()?;
+            let dir = scratch.statements();
+            previous_run(&dir)?;
+            let lock = DirectoryLock::acquire(&dir).await?;
+            let mut files = StatementFiles::replace(&lock).await?;
+            files.write(&statement(b"A", b"<")).await?;
+            drop(files);
+            assert_eq!(names(&dir)?, [LOCK_NAME], "an abended run left a file");
 
-        previous_run(&dir)?;
-        let mut files = StatementFiles::replace(&lock).await?;
-        files.write(&statement(b"AB", b"<")).await?;
-        files.write(&statement(&[0x01], b">")).await?;
-        let error = files
-            .finish()
-            .await
-            .err()
-            .ok_or("a record of no text was rendered")?;
-        assert!(
-            matches!(error, JobError::Render(RenderError::NonText { line: 3 })),
-            "{error}"
-        );
-        assert_eq!(names(&dir)?, [LOCK_NAME], "a failed render left a file");
-        lock.release().await;
-        assert!(names(&dir)?.is_empty(), "the lock stayed");
-        Ok(())
+            previous_run(&dir)?;
+            let mut files = StatementFiles::replace(&lock).await?;
+            files.write(&statement(b"AB", b"<")).await?;
+            files.write(&statement(&[0x01], b">")).await?;
+            let error = files
+                .finish()
+                .await
+                .err()
+                .ok_or("a record of no text was rendered")?;
+            assert!(
+                matches!(error, JobError::Render(RenderError::NonText { line: 3 })),
+                "{error}"
+            );
+            assert_eq!(names(&dir)?, [LOCK_NAME], "a failed render left a file");
+            lock.release().await;
+            assert!(names(&dir)?.is_empty(), "the lock stayed");
+            Ok(())
+        })
     }
 
     /// A second run over the same directory waits for the first, announced by one warning, so
     /// it neither removes nor reports the first run's files while that run writes them, whether
     /// the first completes them or fails and removes them; once the first has ended, the second
-    /// replaces them with its own, and its three files are all it leaves (W005-F01).
+    /// replaces them with its own, and its three files are all it leaves.
     // audit: CBSTM03A-002
     // audit: CBSTM03A-049
     // audit: CBSTM03A-050
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_second_run_waits_for_the_first_then_replaces_its_files() -> TestResult {
-        for first_completes in [true, false] {
-            let scratch = Scratch::new()?;
-            let dir = scratch.statements();
-            let first_lock = DirectoryLock::acquire(&dir).await?;
-            let mut first = StatementFiles::replace(&first_lock).await?;
-            first.write(&statement(b"A", b"<")).await?;
+    #[test]
+    fn a_second_run_waits_for_the_first_then_replaces_its_files() -> TestResult {
+        block_on_two_workers(async {
+            for first_completes in [true, false] {
+                let scratch = Scratch::new()?;
+                let dir = scratch.statements();
+                let first_lock = DirectoryLock::acquire(&dir).await?;
+                let mut first = StatementFiles::replace(&first_lock).await?;
+                first.write(&statement(b"A", b"<")).await?;
 
-            let capture = trace_capture::capture();
-            let target = dir.clone();
-            let second = tokio::spawn(
-                async move {
-                    let lock = DirectoryLock::acquire(&target).await?;
-                    let mut files = StatementFiles::replace(&lock).await?;
-                    files.write(&statement(b"B", b">")).await?;
-                    let outcome = files.finish().await;
-                    lock.release().await;
-                    outcome
+                let capture = trace_capture::capture();
+                let target = dir.clone();
+                let second = tokio::spawn(
+                    async move {
+                        let lock = DirectoryLock::acquire(&target).await?;
+                        let mut files = StatementFiles::replace(&lock).await?;
+                        files.write(&statement(b"B", b">")).await?;
+                        let outcome = files.finish().await;
+                        lock.release().await;
+                        outcome
+                    }
+                    .with_subscriber(capture.dispatch()),
+                );
+                let mut waiting = false;
+                for _ in 0..1000 {
+                    if capture.contains("waiting for it to end") {
+                        waiting = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
                 }
-                .with_subscriber(capture.dispatch()),
-            );
-            let mut waiting = false;
-            for _ in 0..1000 {
-                if capture.contains("waiting for it to end") {
-                    waiting = true;
-                    break;
+                assert!(waiting, "the second run did not wait");
+                let label = if first_completes {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                if first_completes {
+                    first.finish().await?;
+                    let a = [[b'A'; STMT_RECORD_LEN]];
+                    assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&a));
+                } else {
+                    drop(first);
+                    assert_eq!(names(&dir)?, [LOCK_NAME], "the failed run left a file");
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                assert!(
+                    !second.is_finished(),
+                    "{label}: the second run went on under the lock"
+                );
+                first_lock.release().await;
+                let second = second.await??;
+                assert_eq!(
+                    second.written,
+                    [TEXT_FILE, HTML_FILE, PDF_FILE].map(|name| dir.join(name)),
+                    "{label}"
+                );
+                let b = [[b'B'; STMT_RECORD_LEN]];
+                assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&b), "{label}");
+                let html = [[b'>'; HTML_RECORD_LEN]];
+                assert_eq!(fs::read(dir.join(HTML_FILE))?, lf_records(&html), "{label}");
+                assert!(
+                    fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"),
+                    "{label}"
+                );
+                assert_eq!(
+                    names(&dir)?,
+                    [HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from),
+                    "{label}"
+                );
             }
-            assert!(waiting, "the second run did not wait");
-            let label = if first_completes {
-                "completed"
-            } else {
-                "failed"
-            };
-            if first_completes {
-                first.finish().await?;
-                let a = [[b'A'; STMT_RECORD_LEN]];
-                assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&a));
-            } else {
-                drop(first);
-                assert_eq!(names(&dir)?, [LOCK_NAME], "the failed run left a file");
-            }
-            assert!(
-                !second.is_finished(),
-                "{label}: the second run went on under the lock"
-            );
-            first_lock.release().await;
-            let second = second.await??;
-            assert_eq!(
-                second.written,
-                [TEXT_FILE, HTML_FILE, PDF_FILE].map(|name| dir.join(name)),
-                "{label}"
-            );
-            let b = [[b'B'; STMT_RECORD_LEN]];
-            assert_eq!(fs::read(dir.join(TEXT_FILE))?, lf_records(&b), "{label}");
-            let html = [[b'>'; HTML_RECORD_LEN]];
-            assert_eq!(fs::read(dir.join(HTML_FILE))?, lf_records(&html), "{label}");
-            assert!(
-                fs::read(dir.join(PDF_FILE))?.starts_with(b"%PDF-"),
-                "{label}"
-            );
-            assert_eq!(
-                names(&dir)?,
-                [HTML_FILE, PDF_FILE, TEXT_FILE].map(String::from),
-                "{label}"
-            );
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// The text records read back for the PDF are taken whole, in order; a short last record,
@@ -1302,78 +1366,80 @@ mod tests {
     // audit: CBSTM03B-004
     // audit: CBSTM03B-005
     // audit: CBSTM03B-006
-    #[tokio::test]
-    async fn masters_are_read_whole_once_in_customer_then_account_order() -> TestResult {
-        let cases = [
-            MasterCase {
-                xrefs: vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?],
-                unreadable: None,
-                outcome: Ok(3),
-                reads: (1, 1),
-                card_reads: 3,
-            },
-            MasterCase {
-                xrefs: Vec::new(),
-                unreadable: None,
-                outcome: Ok(0),
-                reads: (0, 0),
-                card_reads: 0,
-            },
-            MasterCase {
-                xrefs: vec![xref(CARD_1, 999)?, xref(CARD_2, 1)?],
-                unreadable: None,
-                outcome: Err(ReadFailure::CustomerNotFound),
-                reads: (1, 0),
-                card_reads: 0,
-            },
-            MasterCase {
-                xrefs: vec![xref(CARD_1, 1)?, xref_to(CARD_2, 2, 999)?],
-                unreadable: None,
-                outcome: Err(ReadFailure::AccountNotFound),
-                reads: (1, 1),
-                card_reads: 1,
-            },
-            MasterCase {
-                xrefs: vec![xref(CARD_1, 1)?],
-                unreadable: Some(Unreadable::Customers),
-                outcome: Err(ReadFailure::CustomerUnreadable),
-                reads: (1, 0),
-                card_reads: 0,
-            },
-            MasterCase {
-                xrefs: vec![xref(CARD_1, 1)?],
-                unreadable: Some(Unreadable::Accounts),
-                outcome: Err(ReadFailure::AccountUnreadable),
-                reads: (1, 1),
-                card_reads: 0,
-            },
-        ];
-        for case in cases {
-            let scratch = Scratch::new()?;
-            let lock = DirectoryLock::acquire(&scratch.statements()).await?;
-            let mut files = StatementFiles::replace(&lock).await?;
-            let mut store = CountingStore::holding(case.unreadable)?
-                .with_transactions(vec![transaction(CARD_1, 1)?], CensusEnd::Normally);
-            let written = write_statements(&mut store, &case.xrefs, &mut files).await;
-            let label = format!("{:?} of {} records", case.outcome, case.xrefs.len());
-            match (written, case.outcome) {
-                (Ok(()), Ok(statements)) => assert_eq!(files.statements, statements, "{label}"),
-                (Err(error), Err(failure)) => assert_eq!(
-                    error.to_string(),
-                    format!("ABEND: {} (return code 16)", failure.reason()),
+    #[test]
+    fn masters_are_read_whole_once_in_customer_then_account_order() -> TestResult {
+        block_on(async {
+            let cases = [
+                MasterCase {
+                    xrefs: vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?],
+                    unreadable: None,
+                    outcome: Ok(3),
+                    reads: (1, 1),
+                    card_reads: 3,
+                },
+                MasterCase {
+                    xrefs: Vec::new(),
+                    unreadable: None,
+                    outcome: Ok(0),
+                    reads: (0, 0),
+                    card_reads: 0,
+                },
+                MasterCase {
+                    xrefs: vec![xref(CARD_1, 999)?, xref(CARD_2, 1)?],
+                    unreadable: None,
+                    outcome: Err(ReadFailure::CustomerNotFound),
+                    reads: (1, 0),
+                    card_reads: 0,
+                },
+                MasterCase {
+                    xrefs: vec![xref(CARD_1, 1)?, xref_to(CARD_2, 2, 999)?],
+                    unreadable: None,
+                    outcome: Err(ReadFailure::AccountNotFound),
+                    reads: (1, 1),
+                    card_reads: 1,
+                },
+                MasterCase {
+                    xrefs: vec![xref(CARD_1, 1)?],
+                    unreadable: Some(Unreadable::Customers),
+                    outcome: Err(ReadFailure::CustomerUnreadable),
+                    reads: (1, 0),
+                    card_reads: 0,
+                },
+                MasterCase {
+                    xrefs: vec![xref(CARD_1, 1)?],
+                    unreadable: Some(Unreadable::Accounts),
+                    outcome: Err(ReadFailure::AccountUnreadable),
+                    reads: (1, 1),
+                    card_reads: 0,
+                },
+            ];
+            for case in cases {
+                let scratch = Scratch::new()?;
+                let lock = DirectoryLock::acquire(&scratch.statements()).await?;
+                let mut files = StatementFiles::replace(&lock).await?;
+                let mut store = CountingStore::holding(case.unreadable)?
+                    .with_transactions(vec![transaction(CARD_1, 1)?], CensusEnd::Normally);
+                let written = write_statements(&mut store, &case.xrefs, &mut files).await;
+                let label = format!("{:?} of {} records", case.outcome, case.xrefs.len());
+                match (written, case.outcome) {
+                    (Ok(()), Ok(statements)) => assert_eq!(files.statements, statements, "{label}"),
+                    (Err(error), Err(failure)) => assert_eq!(
+                        error.to_string(),
+                        format!("ABEND: {} (return code 16)", failure.reason()),
+                        "{label}"
+                    ),
+                    (written, _) => return Err(format!("{label}: {written:?}").into()),
+                }
+                assert_eq!(
+                    (store.customer_reads, store.account_reads),
+                    case.reads,
                     "{label}"
-                ),
-                (written, _) => return Err(format!("{label}: {written:?}").into()),
+                );
+                assert_eq!(store.card_reads, case.card_reads, "{label}");
+                assert_eq!(store.other_calls, 0, "{label}: a keyed read or a write");
             }
-            assert_eq!(
-                (store.customer_reads, store.account_reads),
-                case.reads,
-                "{label}"
-            );
-            assert_eq!(store.card_reads, case.card_reads, "{label}");
-            assert_eq!(store.other_calls, 0, "{label}: a keyed read or a write");
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Three synthetic card numbers, in no fixture file.

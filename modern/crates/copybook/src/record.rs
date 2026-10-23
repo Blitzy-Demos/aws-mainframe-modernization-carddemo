@@ -85,11 +85,16 @@ pub trait FixedRecord: Sized {
     /// `RECLN` comment: 50 for `CVACT03Y` `CARD-XREF-RECORD`, 80 for `CSUSR01Y` `SEC-USER-DATA`.
     const WIDTH: usize;
 
-    /// Length in bytes of the record's trailing `FILLER`; 0 when its last field carries data.
+    /// Short-body allowance: the number of trailing bytes, read as spaces, that a line body may
+    /// omit. The default, 0, accepts no short body, and an implementation may keep it even when
+    /// its layout ends in `FILLER`, so that every short body is a typed error (R7). A non-zero
+    /// value is at most the width of the layout's trailing `FILLER`, so no omitted byte belongs
+    /// to a field that carries data.
     ///
     /// `framing::Framed::decode` accepts a line body shorter than [`WIDTH`](Self::WIDTH) by at
     /// most this many bytes: it supplies the missing tail as spaces and re-emits the body at its
-    /// own length (PIC-013). The value never exceeds `WIDTH`. For example:
+    /// own length (PIC-013). The value never exceeds `WIDTH`. For example, two layouts that allow
+    /// their whole trailing `FILLER` to be omitted:
     ///
     /// - `CVACT03Y` ends with `FILLER PIC X(14)` (CVACT03Y-004), so the 36-byte lines of
     ///   `cardxref.txt` decode against the 50-byte record (E04). They are the only short bodies in

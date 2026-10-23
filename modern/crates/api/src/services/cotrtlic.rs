@@ -71,8 +71,9 @@ use domain::online::cotrtlic::{
 };
 use domain::records::Db2TransactionType;
 use persistence::{Db2TransactionTypeRepository, PersistenceError, PgStore, PgTx};
+use tracing::{Level, Metadata, field};
 
-use crate::app::AppState;
+use crate::app::{AppState, EventSite, emit, event_metadata};
 use crate::auth::extract::AdminUser;
 use crate::dto::cotrtlic::{TranTypeListActionRequest, TranTypeListQuery};
 use crate::dto::resolve_page_size;
@@ -467,7 +468,22 @@ fn read_failure<T>(
 /// One event for a store failure whose cause the response does not carry. The error's text is
 /// its SQLSTATE and constraint name, never a stored or request value.
 fn report(call: &'static str, error: &PersistenceError) {
-    tracing::error!(call, %error, "COTRTLIC store call failed");
+    static SITE: EventSite<3> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "store_call_failed",
+        module_path!(),
+        Level::ERROR,
+        &["message", "call", "error"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"COTRTLIC store call failed"),
+            Some(&call),
+            Some(&field::display(error)),
+        ],
+    );
 }
 
 #[cfg(test)]
@@ -491,6 +507,15 @@ mod tests {
     use crate::error::{ScreenError, ServiceError};
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+    /// builds, without the lint attributes that attribute's expansion carries.
+    fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(test)
+    }
 
     /// A migrated database holding the Db2 seed of migration 0006, types `01` to `07`, each with
     /// categories, plus `extra` types without categories.
@@ -657,77 +682,81 @@ mod tests {
     // audit: COTRTLIC-004
     // audit: COTRTLIC-007
     // audit: COTRTLIC-011
-    #[tokio::test]
-    async fn the_load_and_the_page_moves_read_the_db2_version_by_key() -> TestResult {
-        let (_guard, store) =
-            database(&[("08", "FEE"), ("09", "INTEREST"), ("10", "CASHBACK")]).await?;
+    #[test]
+    fn the_load_and_the_page_moves_read_the_db2_version_by_key() -> TestResult {
+        block_on(async {
+            let (_guard, store) =
+                database(&[("08", "FEE"), ("09", "INTEREST"), ("10", "CASHBACK")]).await?;
 
-        let loaded = load(&store).await?;
-        assert_eq!(loaded.status(), StatusCode::OK);
-        assert_eq!(
-            codes(&loaded.rows, |row| row.type_code.as_str()),
-            listed(["01", "02", "03", "04", "05", "06", "07"])
-        );
-        assert_eq!((loaded.page_no, loaded.has_next_page), (1, true));
-        assert_eq!(
-            loaded.info_message.as_deref(),
-            Some("Type U to update, D to delete any record")
-        );
+            let loaded = load(&store).await?;
+            assert_eq!(loaded.status(), StatusCode::OK);
+            assert_eq!(
+                codes(&loaded.rows, |row| row.type_code.as_str()),
+                listed(["01", "02", "03", "04", "05", "06", "07"])
+            );
+            assert_eq!((loaded.page_no, loaded.has_next_page), (1, true));
+            assert_eq!(
+                loaded.info_message.as_deref(),
+                Some("Type U to update, D to delete any record")
+            );
 
-        let forward = page_move(&store, &loaded, PageDirection::Forward).await?;
-        assert_eq!(forward.status(), StatusCode::OK);
-        assert_eq!(
-            codes(&forward.rows, |row| row.type_code.as_str()),
-            listed(["08", "09", "10", "", "", "", ""])
-        );
-        assert_eq!((forward.page_no, forward.has_next_page), (2, false));
-        assert_eq!(
-            forward.message.as_deref(),
-            Some("No more pages for these search conditions")
-        );
+            let forward = page_move(&store, &loaded, PageDirection::Forward).await?;
+            assert_eq!(forward.status(), StatusCode::OK);
+            assert_eq!(
+                codes(&forward.rows, |row| row.type_code.as_str()),
+                listed(["08", "09", "10", "", "", "", ""])
+            );
+            assert_eq!((forward.page_no, forward.has_next_page), (2, false));
+            assert_eq!(
+                forward.message.as_deref(),
+                Some("No more pages for these search conditions")
+            );
 
-        let backward = page_move(&store, &forward, PageDirection::Backward).await?;
-        assert_eq!(backward.status(), StatusCode::OK);
-        assert_eq!(
-            codes(&backward.rows, |row| row.type_code.as_str()),
-            listed(["01", "02", "03", "04", "05", "06", "07"])
-        );
-        assert_eq!((backward.page_no, backward.has_next_page), (1, true));
-        Ok(())
+            let backward = page_move(&store, &forward, PageDirection::Backward).await?;
+            assert_eq!(backward.status(), StatusCode::OK);
+            assert_eq!(
+                codes(&backward.rows, |row| row.type_code.as_str()),
+                listed(["01", "02", "03", "04", "05", "06", "07"])
+            );
+            assert_eq!((backward.page_no, backward.has_next_page), (1, true));
+            Ok(())
+        })
     }
 
     // audit: COTRTLIC-005
     // audit: COTRTLIC-029
     // audit: COTRTLIC-030
     // audit: COTRTLIC-031
-    #[tokio::test]
-    async fn valid_filters_are_counted_then_read_and_a_filter_matching_nothing_is_an_input_error()
+    #[test]
+    fn valid_filters_are_counted_then_read_and_a_filter_matching_nothing_is_an_input_error()
     -> TestResult {
-        let (_guard, store) = database(&[]).await?;
-        let state = load(&store).await?.state;
+        block_on(async {
+            let (_guard, store) = database(&[]).await?;
+            let state = load(&store).await?.state;
 
-        let by_type = act(&store, request(Aid::Enter, &state, ("03", ""), &[])).await?;
-        assert_eq!(by_type.status(), StatusCode::OK);
-        assert_eq!(
-            codes(&by_type.rows, |row| row.type_code.as_str()),
-            listed(["03", "", "", "", "", "", ""])
-        );
-        assert_eq!(by_type.state.type_filter, "03");
+            let by_type = act(&store, request(Aid::Enter, &state, ("03", ""), &[])).await?;
+            assert_eq!(by_type.status(), StatusCode::OK);
+            assert_eq!(
+                codes(&by_type.rows, |row| row.type_code.as_str()),
+                listed(["03", "", "", "", "", "", ""])
+            );
+            assert_eq!(by_type.state.type_filter, "03");
 
-        let by_description = act(&store, request(Aid::Enter, &state, ("", "PAY"), &[])).await?;
-        assert_eq!(by_description.status(), StatusCode::OK);
-        assert_eq!(
-            codes(&by_description.rows, |row| row.type_code.as_str()),
-            listed(["02", "", "", "", "", "", ""])
-        );
+            let by_description = act(&store, request(Aid::Enter, &state, ("", "PAY"), &[])).await?;
+            assert_eq!(by_description.status(), StatusCode::OK);
+            assert_eq!(
+                codes(&by_description.rows, |row| row.type_code.as_str()),
+                listed(["02", "", "", "", "", "", ""])
+            );
 
-        let nothing = act(&store, request(Aid::Enter, &state, ("", "NOTHING"), &[])).await?;
-        assert_eq!(nothing.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            nothing.message.as_deref(),
-            Some("No Records found for these filter conditions")
-        );
-        Ok(())
+            let nothing = act(&store, request(Aid::Enter, &state, ("", "NOTHING"), &[])).await?;
+            assert_eq!(nothing.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                nothing.message.as_deref(),
+                Some("No Records found for these filter conditions")
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRTLIC-036
@@ -735,180 +764,186 @@ mod tests {
     // audit: COTRTLIC-042
     // audit: COTRTLIC-049
     // audit: COTRTLIC-050
-    #[tokio::test]
-    async fn f10_deletes_a_type_without_categories_and_restrict_keeps_one_with_them() -> TestResult
-    {
-        let (_guard, store) = database(&[("08", "OBSOLETE")]).await?;
-        let state = load(&store).await?.state;
+    #[test]
+    fn f10_deletes_a_type_without_categories_and_restrict_keeps_one_with_them() -> TestResult {
+        block_on(async {
+            let (_guard, store) = database(&[("08", "OBSOLETE")]).await?;
+            let state = load(&store).await?.state;
 
-        let prompted = act(
-            &store,
-            request(Aid::Enter, &state, ("", ""), &[(2, "D", "")]),
-        )
-        .await?;
-        assert_eq!(
-            (prompted.state.pending_action, prompted.state.selected_row),
-            (TranTypeListPendingAction::Delete, Some(2))
-        );
-        let restricted = act(
-            &store,
-            request(Aid::Pf10, &prompted.state, ("", ""), &[(2, "D", "")]),
-        )
-        .await?;
-        assert_eq!(restricted.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            restricted.message.as_deref(),
-            Some("Please delete associated child records first: SQLCODE:")
-        );
-        assert_eq!(restricted.committed, TranTypeListCommitted::Nothing);
-        assert_eq!(
-            restricted.state.pending_action,
-            TranTypeListPendingAction::Delete
-        );
-        assert_eq!(stored(&store, "02").await?.as_deref(), Some("PAYMENT"));
+            let prompted = act(
+                &store,
+                request(Aid::Enter, &state, ("", ""), &[(2, "D", "")]),
+            )
+            .await?;
+            assert_eq!(
+                (prompted.state.pending_action, prompted.state.selected_row),
+                (TranTypeListPendingAction::Delete, Some(2))
+            );
+            let restricted = act(
+                &store,
+                request(Aid::Pf10, &prompted.state, ("", ""), &[(2, "D", "")]),
+            )
+            .await?;
+            assert_eq!(restricted.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                restricted.message.as_deref(),
+                Some("Please delete associated child records first: SQLCODE:")
+            );
+            assert_eq!(restricted.committed, TranTypeListCommitted::Nothing);
+            assert_eq!(
+                restricted.state.pending_action,
+                TranTypeListPendingAction::Delete
+            );
+            assert_eq!(stored(&store, "02").await?.as_deref(), Some("PAYMENT"));
 
-        let filtered = act(&store, request(Aid::Enter, &state, ("08", ""), &[])).await?;
-        assert_eq!(
-            codes(&filtered.rows, |row| row.type_code.as_str()),
-            listed(["08", "", "", "", "", "", ""])
-        );
-        let prompted = act(
-            &store,
-            request(Aid::Enter, &filtered.state, ("08", ""), &[(1, "D", "")]),
-        )
-        .await?;
-        assert_eq!(
-            prompted.info_message.as_deref(),
-            Some("Delete HIGHLIGHTED row ? Press F10 to confirm")
-        );
-        let deleted = act(
-            &store,
-            request(Aid::Pf10, &prompted.state, ("08", ""), &[(1, "D", "")]),
-        )
-        .await?;
-        assert_eq!(deleted.status(), StatusCode::OK);
-        assert_eq!(deleted.committed, TranTypeListCommitted::Deleted);
-        assert_eq!(
-            deleted.info_message.as_deref(),
-            Some("HIGHLIGHTED row deleted.Hit Enter to continue")
-        );
-        assert_eq!(stored(&store, "08").await?, None);
-        assert_eq!(
-            (deleted.state.pending_action, deleted.state.page_no),
-            (TranTypeListPendingAction::None, 1)
-        );
-        Ok(())
+            let filtered = act(&store, request(Aid::Enter, &state, ("08", ""), &[])).await?;
+            assert_eq!(
+                codes(&filtered.rows, |row| row.type_code.as_str()),
+                listed(["08", "", "", "", "", "", ""])
+            );
+            let prompted = act(
+                &store,
+                request(Aid::Enter, &filtered.state, ("08", ""), &[(1, "D", "")]),
+            )
+            .await?;
+            assert_eq!(
+                prompted.info_message.as_deref(),
+                Some("Delete HIGHLIGHTED row ? Press F10 to confirm")
+            );
+            let deleted = act(
+                &store,
+                request(Aid::Pf10, &prompted.state, ("08", ""), &[(1, "D", "")]),
+            )
+            .await?;
+            assert_eq!(deleted.status(), StatusCode::OK);
+            assert_eq!(deleted.committed, TranTypeListCommitted::Deleted);
+            assert_eq!(
+                deleted.info_message.as_deref(),
+                Some("HIGHLIGHTED row deleted.Hit Enter to continue")
+            );
+            assert_eq!(stored(&store, "08").await?, None);
+            assert_eq!(
+                (deleted.state.pending_action, deleted.state.page_no),
+                (TranTypeListPendingAction::None, 1)
+            );
+            Ok(())
+        })
     }
 
     // audit: COTRTLIC-040
     // audit: COTRTLIC-044
     // audit: COTRTLIC-045
     // audit: COTRTLIC-046
-    #[tokio::test]
-    async fn f10_writes_the_trimmed_description_and_a_row_deleted_by_others_is_not_found()
-    -> TestResult {
-        let (_guard, mut store) = database(&[("00", "TEMPORARY")]).await?;
-        let state = load(&store).await?.state;
+    #[test]
+    fn f10_writes_the_trimmed_description_and_a_row_deleted_by_others_is_not_found() -> TestResult {
+        block_on(async {
+            let (_guard, mut store) = database(&[("00", "TEMPORARY")]).await?;
+            let state = load(&store).await?.state;
 
-        let opened = act(
-            &store,
-            request(Aid::Enter, &state, ("", ""), &[(2, "U", "")]),
-        )
-        .await?;
-        assert_eq!(opened.state.description_entry, Some(2));
-        let edited = act(
-            &store,
-            request(
-                Aid::Enter,
-                &opened.state,
-                ("", ""),
-                &[(2, "U", "Bought goods")],
-            ),
-        )
-        .await?;
-        assert_eq!(edited.status(), StatusCode::OK);
-        let saved = act(
-            &store,
-            request(
-                Aid::Pf10,
-                &edited.state,
-                ("", ""),
-                &[(2, "U", "Bought goods")],
-            ),
-        )
-        .await?;
-        assert_eq!(saved.status(), StatusCode::OK);
-        assert_eq!(saved.committed, TranTypeListCommitted::Updated);
-        assert_eq!(
-            saved.info_message.as_deref(),
-            Some("HIGHLIGHTED row was updated")
-        );
-        assert_eq!(
-            stored(&store, "01").await?,
-            Some(format!("{:<50}", "Bought goods"))
-        );
+            let opened = act(
+                &store,
+                request(Aid::Enter, &state, ("", ""), &[(2, "U", "")]),
+            )
+            .await?;
+            assert_eq!(opened.state.description_entry, Some(2));
+            let edited = act(
+                &store,
+                request(
+                    Aid::Enter,
+                    &opened.state,
+                    ("", ""),
+                    &[(2, "U", "Bought goods")],
+                ),
+            )
+            .await?;
+            assert_eq!(edited.status(), StatusCode::OK);
+            let saved = act(
+                &store,
+                request(
+                    Aid::Pf10,
+                    &edited.state,
+                    ("", ""),
+                    &[(2, "U", "Bought goods")],
+                ),
+            )
+            .await?;
+            assert_eq!(saved.status(), StatusCode::OK);
+            assert_eq!(saved.committed, TranTypeListCommitted::Updated);
+            assert_eq!(
+                saved.info_message.as_deref(),
+                Some("HIGHLIGHTED row was updated")
+            );
+            assert_eq!(
+                stored(&store, "01").await?,
+                Some(format!("{:<50}", "Bought goods"))
+            );
 
-        let opened = act(
-            &store,
-            request(Aid::Enter, &state, ("", ""), &[(1, "U", "")]),
-        )
-        .await?;
-        let edited = act(
-            &store,
-            request(Aid::Enter, &opened.state, ("", ""), &[(1, "U", "Kept")]),
-        )
-        .await?;
-        assert!(Db2TransactionTypeRepository::delete(&mut store, &PicX::from_text("00")?).await?);
-        let gone = act(
-            &store,
-            request(Aid::Pf10, &edited.state, ("", ""), &[(1, "U", "Kept")]),
-        )
-        .await?;
-        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            gone.message.as_deref(),
-            Some("Record not found. Deleted by others ? SQLCODE:")
-        );
-        assert_eq!(gone.committed, TranTypeListCommitted::Nothing);
-        assert_eq!(gone.state.pending_action, TranTypeListPendingAction::Update);
-        Ok(())
+            let opened = act(
+                &store,
+                request(Aid::Enter, &state, ("", ""), &[(1, "U", "")]),
+            )
+            .await?;
+            let edited = act(
+                &store,
+                request(Aid::Enter, &opened.state, ("", ""), &[(1, "U", "Kept")]),
+            )
+            .await?;
+            assert!(
+                Db2TransactionTypeRepository::delete(&mut store, &PicX::from_text("00")?).await?
+            );
+            let gone = act(
+                &store,
+                request(Aid::Pf10, &edited.state, ("", ""), &[(1, "U", "Kept")]),
+            )
+            .await?;
+            assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+            assert_eq!(
+                gone.message.as_deref(),
+                Some("Record not found. Deleted by others ? SQLCODE:")
+            );
+            assert_eq!(gone.committed, TranTypeListCommitted::Nothing);
+            assert_eq!(gone.state.pending_action, TranTypeListPendingAction::Update);
+            Ok(())
+        })
     }
 
     // audit: COTRTLIC-053
-    #[tokio::test]
-    async fn a_database_the_service_cannot_reach_ends_the_request_without_a_screen() -> TestResult {
-        let (guard, store) = database(&[]).await?;
-        let state = load(&store).await?.state;
-        let prompted = act(
-            &store,
-            request(Aid::Enter, &state, ("", ""), &[(2, "D", "")]),
-        )
-        .await?;
-        guard.pool().close().await;
-
-        let unread = list_on(&store, TranTypeListQuery::default()).await;
-        assert_eq!(
-            unread.map(drop),
-            Err(ServiceError::Rule(ListError::Unreachable))
-        );
-        let uncommitted = act_on(
-            &store,
-            request(Aid::Pf10, &prompted.state, ("", ""), &[(2, "D", "")]),
-        )
-        .await;
-        assert_eq!(
-            uncommitted.map(drop),
-            Err(ServiceError::Rule(ListError::Unreachable))
-        );
-        let screen = ScreenError::from(ListError::Unreachable);
-        assert_eq!(
-            (screen.status(), screen.message(), screen.field()),
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Db2 access failure. SQLCODE:",
-                None
+    #[test]
+    fn a_database_the_service_cannot_reach_ends_the_request_without_a_screen() -> TestResult {
+        block_on(async {
+            let (guard, store) = database(&[]).await?;
+            let state = load(&store).await?.state;
+            let prompted = act(
+                &store,
+                request(Aid::Enter, &state, ("", ""), &[(2, "D", "")]),
             )
-        );
-        Ok(())
+            .await?;
+            guard.pool().close().await;
+
+            let unread = list_on(&store, TranTypeListQuery::default()).await;
+            assert_eq!(
+                unread.map(drop),
+                Err(ServiceError::Rule(ListError::Unreachable))
+            );
+            let uncommitted = act_on(
+                &store,
+                request(Aid::Pf10, &prompted.state, ("", ""), &[(2, "D", "")]),
+            )
+            .await;
+            assert_eq!(
+                uncommitted.map(drop),
+                Err(ServiceError::Rule(ListError::Unreachable))
+            );
+            let screen = ScreenError::from(ListError::Unreachable);
+            assert_eq!(
+                (screen.status(), screen.message(), screen.field()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Db2 access failure. SQLCODE:",
+                    None
+                )
+            );
+            Ok(())
+        })
     }
 }
