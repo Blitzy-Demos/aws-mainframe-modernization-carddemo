@@ -12,7 +12,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useCosgn00cSignon } from "@/api/hooks";
 import { clearSession, setSession } from "@/auth/session";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -68,13 +68,15 @@ const KEY_ITEMS = keyRowItems(KEY_ROWS.COSGN00);
  * foreground. A grid column is wider than a character, so a literal fills only part of its cell:
  * the centred note and instruction keep their place on the screen, the labels end next to their
  * input as `User ID     :` ends one column before `USERID`, and the `(8 Char)` hints start
- * right after it. `whitespace-pre` keeps every literal's inner spacing.
+ * right after it. `whitespace-pre` keeps every literal's inner spacing. COSGN00C recolours no
+ * field or literal, so a label keeps the foreground while its input is in error.
  */
 const LITERAL = "flex h-full items-center whitespace-pre";
 const CENTRED = `${LITERAL} justify-center`;
 const BLUE = "text-muted-foreground";
 const FOREGROUND = "text-foreground";
-const INPUT_LABEL = `h-full justify-end whitespace-pre ${FOREGROUND}`;
+const INPUT_LABEL =
+  `h-full justify-end whitespace-pre ${FOREGROUND} data-[error=true]:text-foreground`;
 
 /** The form input a `ScreenError.field` names, by its wire name (COSGN00C-011). */
 function formFieldOf(field: string | null | undefined): keyof Cosgn00Values | undefined {
@@ -296,6 +298,7 @@ export function COSGN00(): ReactNode {
                         autoFocus
                         autoComplete="off"
                         spellCheck={false}
+                        className={fieldBox(COSGN00_LENGTHS.userId)}
                       />
                     </FormControl>
                   </GridCell>
@@ -328,6 +331,7 @@ export function COSGN00(): ReactNode {
                         type="password"
                         maxLength={COSGN00_LENGTHS.password}
                         autoComplete="off"
+                        className={fieldBox(COSGN00_LENGTHS.password)}
                       />
                     </FormControl>
                   </GridCell>

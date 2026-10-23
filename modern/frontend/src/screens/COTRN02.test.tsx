@@ -486,6 +486,41 @@ function fieldError(name: keyof typeof LABELS): {
   };
 }
 
+/** Every id an `aria-describedby` on the page names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/**
+ * How assistive technology reads the input of form member `name`: its `aria-invalid`, and the
+ * element each id of its `aria-describedby` names, as its text and whether `sr-only` hides it
+ * (`null` for an id that resolves to nothing). `described` is `null` when the input has no
+ * `aria-describedby`.
+ */
+function readOut(name: keyof typeof LABELS): {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+} {
+  const input = field(name);
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
 /** The form members whose input is marked invalid, in map order. */
 function markedInputs(): string[] {
   return NAMES.filter((name) => field(name).getAttribute("aria-invalid") === "true");
@@ -1245,6 +1280,56 @@ describe("COTRN02 Add Transaction screen", () => {
     ).toEqual([true]);
     expect(requests).toHaveLength(1);
   });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. The four inputs the map gives a hint are described by
+  // it, the ten others by nothing while they are valid, and the input a `ScreenError` names also
+  // by its field message, which holds the server's text, hidden.
+  it.each([
+    { state: "on entry", typed: null, error: null, marked: null },
+    {
+      state: "after ENTER on the blank screen, answered by the 400 naming acct_id",
+      typed: BLANK,
+      error: keyMissing,
+      marked: "acctId",
+    },
+    {
+      state: "after the 400 naming amount",
+      typed: { ...TYPED_BY_ACCOUNT, amount: "12.34" },
+      error: amountFormat,
+      marked: "amount",
+    },
+  ])("describes each input by rendered elements only, $state", async (row) => {
+    stubApi(row.error === null ? [] : [json(400, row.error)]);
+    renderScreen({ from: PATHS.COMEN01 });
+    if (row.typed === null || row.error === null) {
+      await settle();
+    } else {
+      typeInto(row.typed);
+      fireEvent.click(keyButton("ENTER=Continue"));
+    }
+
+    const expected = Object.fromEntries(
+      NAMES.map((name) => {
+        const hint = HINTS.find((candidate) => candidate.name === name);
+        const own = name === row.marked && row.error !== null;
+        const described = [
+          ...(hint === undefined ? [] : [{ text: hint.text, hidden: false }]),
+          ...(own ? [{ text: row.error?.message ?? "", hidden: true }] : []),
+        ];
+        return [
+          name,
+          { invalid: own ? "true" : "false", described: described.length > 0 ? described : null },
+        ];
+      }),
+    );
+    await waitFor(() => {
+      expect(messageRow().text).toBe(row.error?.message ?? "");
+      expect(Object.fromEntries(NAMES.map((name) => [name, readOut(name)]))).toEqual(expected);
+    });
+    expect(danglingDescriptions()).toEqual([]);
+  });
+
 
   it.each([
     {

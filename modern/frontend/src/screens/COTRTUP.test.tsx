@@ -432,6 +432,67 @@ function marks(): { code: string | null; description: string | null } {
   return { code: markOf(field(LABELS.code)), description: markOf(field(LABELS.description)) };
 }
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `input`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(input: HTMLElement): ReadOut {
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** How the type code and the description read. */
+function readOuts(): { code: ReadOut; description: ReadOut } {
+  return { code: readOut(field(LABELS.code)), description: readOut(field(LABELS.description)) };
+}
+
+/**
+ * How the two inputs read when only `marked` holds the error `message`. The map gives neither a
+ * hint, so an unmarked input is described by nothing, and the marked one only by its field
+ * message, hidden. On the search screen the description is a bare output with no
+ * `aria-invalid`; elsewhere it is a form field, `aria-invalid="false"` while unmarked.
+ */
+function readOutsWith(
+  marked: "code" | "description" | undefined,
+  message: string,
+  searching: boolean,
+): { code: ReadOut; description: ReadOut } {
+  const read = (name: "code" | "description"): ReadOut => {
+    if (name === marked) {
+      return { invalid: "true", described: [{ text: message, hidden: true }] };
+    }
+    return { invalid: name === "description" && searching ? null : "false", described: null };
+  };
+  return { code: read("code"), description: read("description") };
+}
+
 /** The marks a screen with the error row `error` and the red fields `red` gives the inputs. */
 function marksFor(
   red: { code: boolean; description: boolean },
@@ -1045,6 +1106,95 @@ describe("COTRTUP states", () => {
       expect(allKeys()).toEqual(ALL_KEYS);
     },
   );
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. Neither input has a hint, so an unmarked input is
+  // described by nothing, and an input the screen marks red only by its field message, which
+  // holds the error row's text for assistive technology alone.
+  it.each([
+    {
+      state: "fresh",
+      replies: {},
+      reach: open,
+      error: "",
+      marked: undefined,
+      searching: true,
+    },
+    {
+      state: "after ENTER with a blank code",
+      replies: {},
+      reach: async () => {
+        await open();
+        press("ENTER=Process");
+      },
+      error: MSG.codeNotSupplied,
+      marked: "code",
+      searching: true,
+    },
+    {
+      state: "after ENTER answered by the 400 of a code that is not numeric",
+      replies: { "GET /api/v1/transaction-types/A1": [reply(400, codeNotNumeric)] },
+      reach: async () => {
+        await open();
+        fireEvent.change(field(LABELS.code), { target: { value: "A1" } });
+        press("ENTER=Process");
+      },
+      error: codeNotNumeric.message,
+      marked: "code",
+      searching: true,
+    },
+    {
+      state: "X, the code no row holds",
+      replies: { [FETCH_NEW]: [reply(200, notFound)] },
+      reach: showNotFound,
+      error: MSG.notFound,
+      marked: "code",
+      searching: false,
+    },
+    {
+      state: "after ENTER answered by the 400 of a description not alphanumeric",
+      replies: {
+        [FETCH]: [reply(200, found)],
+        [ACTIONS]: [reply(400, descriptionNotAlphanumeric)],
+      },
+      reach: async () => {
+        await showFound();
+        fireEvent.change(field(LABELS.description), { target: { value: "PURCHASE!" } });
+        press("ENTER=Process");
+      },
+      error: descriptionNotAlphanumeric.message,
+      marked: "description",
+      searching: false,
+    },
+    {
+      state: "after ENTER answered by the 400 of no change, which marks no input",
+      replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(400, noChange)] },
+      reach: async () => {
+        await showFound();
+        press("ENTER=Process");
+      },
+      error: noChange.message,
+      marked: undefined,
+      searching: false,
+    },
+  ] satisfies {
+    state: string;
+    replies: Parameters<typeof stubApi>[0];
+    reach: () => Promise<unknown>;
+    error: string;
+    marked: "code" | "description" | undefined;
+    searching: boolean;
+  }[])("describes each input by rendered elements only, $state", async (row) => {
+    stubApi(row.replies);
+    await row.reach();
+    await waitFor(() => {
+      expect(errorText()).toBe(row.error);
+    });
+    await settle();
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect(readOuts()).toEqual(readOutsWith(row.marked, row.error, row.searching));
+  });
 });
 
 describe("COTRTUP fetch, endpoint 26", () => {

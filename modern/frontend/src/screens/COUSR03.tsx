@@ -12,17 +12,11 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCousr02cFetch, useCousr03cDelete } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -144,14 +138,18 @@ type OutputFieldProps = {
   inputClassName?: string;
   /** The text of a red `ScreenError` that names this field, while the message row shows it. */
   error?: string;
+  /** The id of the rendered map hint that describes this field, where the map has one. */
+  hintId?: string;
 };
 
 /**
  * One protected (`ASKIP`) output field with its TURQUOISE label: a read-only `Input` in the BLUE
  * value colour, bound to its `Label`. It is out of the Tab order, as the 3270 Tab key skips
- * protected fields, and still takes the cursor the screen places on it. While a red `ScreenError`
- * names it, the field is marked invalid and described by that text, which only assistive
- * technology reads: the message row is the screen's one visible message.
+ * protected fields, and still takes the cursor the screen places on it. The input is described
+ * by its map hint, where `hintId` names one, and, while a red `ScreenError` names the field, also
+ * by that text, which marks it invalid and which only assistive technology reads: the message
+ * row is the screen's one visible message. `aria-describedby` names only these rendered
+ * elements, and is absent without them.
  */
 function OutputField({
   row,
@@ -164,10 +162,12 @@ function OutputField({
   inputRef,
   inputClassName,
   error,
+  hintId,
 }: OutputFieldProps): ReactNode {
   const id = useId();
   const messageId = `${id}-message`;
   const invalid = error !== undefined;
+  const describedBy = [hintId ?? "", invalid ? messageId : ""].filter((name) => name !== "");
   return (
     <>
       <GridCell row={row} col={labelCol} span={labelSpan}>
@@ -185,7 +185,7 @@ function OutputField({
           maxLength={span}
           size={span}
           aria-invalid={invalid || undefined}
-          aria-describedby={invalid ? messageId : undefined}
+          aria-describedby={describedBy.length > 0 ? describedBy.join(" ") : undefined}
           className={inputClassName ?? `${FIELD_WIDTH} text-muted-foreground`}
         />
         {invalid && (
@@ -224,6 +224,7 @@ export function COUSR03(): ReactNode {
   // Route state is read once, at the first display, as COUSR03C reads its COMMAREA on first entry.
   const [entry] = useState(() => entryState(location.state));
   const formId = useId();
+  const userTypeHintId = useId();
   // The cursor is placed through the screen's own element refs: `form.reset` drops the field refs
   // `form.setFocus` relies on, which would leave the cursor on the pressed key after F4 or F5.
   // The schema runs when ENTER or F5 is answered, never while the operator types, so its refusal
@@ -456,7 +457,8 @@ export function COUSR03(): ReactNode {
                     <FormLabel className="h-full text-foreground">Enter User ID:</FormLabel>
                   </GridCell>
                   <GridCell row={6} col={21} span={COUSR03_LENGTHS.userId}>
-                    <FormControl>
+                    {/* The user ID has no hint, so its control names only a message it shows. */}
+                    <FieldControl>
                       <Input
                         {...field}
                         ref={(element) => {
@@ -480,10 +482,14 @@ export function COUSR03(): ReactNode {
                         spellCheck={false}
                         className={FIELD_WIDTH}
                       />
-                    </FormControl>
-                    {/* For assistive technology only: the message row is the visible message. */}
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  {/*
+                   * For assistive technology only: the message row is the visible message. The
+                   * item's direct child rather than a cell's: an `sr-only` grid item takes no cell
+                   * and sits at the grid's origin.
+                   */}
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -525,9 +531,14 @@ export function COUSR03(): ReactNode {
               inputRef={userTypeRef}
               inputClassName={USER_TYPE_INPUT_CLASS}
               error={outputErrorOf("user_type")}
+              hintId={userTypeHintId}
             />
+            {/* The map's BLUE hint after USRTYPE, which describes the user type it follows. */}
             <GridCell row={15} col={19} span={17}>
-              <span className="flex h-full items-center whitespace-pre text-muted-foreground">
+              <span
+                id={userTypeHintId}
+                className="flex h-full items-center whitespace-pre text-muted-foreground"
+              >
                 (A=Admin, U=User)
               </span>
             </GridCell>

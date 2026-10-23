@@ -703,6 +703,62 @@ describe("COSGN00 sign-on screen", () => {
     expect(getSession()).toBeNull();
   });
 
+  it("keeps the label and the text colour of the input a failure names; only its mark changes", async () => {
+    const wrongPassword: components["schemas"]["ScreenError"] = {
+      message: "Wrong Password. Try again ...",
+      field: "password",
+    };
+    stubFetch({ status: 401, body: wrongPassword });
+    renderScreen();
+    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+
+    fireEvent.click(enterButton());
+    await waitFor(() => {
+      expect(passwordInput().getAttribute("aria-invalid")).toBe("true");
+    });
+    const label = screen.getByText("Password    :", exactText);
+    expect(label.getAttribute("data-error")).toBe("true");
+    expect(label.classList.contains("data-[error=true]:text-foreground")).toBe(true);
+    expect(label.classList.contains("data-[error=true]:text-destructive")).toBe(false);
+    expect(passwordInput().className).not.toContain("text-destructive");
+  });
+
+  it.each([
+    { name: "User ID", box: userIdInput },
+    { name: "Password", box: passwordInput },
+  ])("gives the $name input the shared text-sm field box of its 8 characters", ({ box }) => {
+    stubFetch();
+    renderScreen();
+    expect(box().classList.contains("field-length-8")).toBe(true);
+    expect(box().classList.contains("text-sm")).toBe(true);
+    expect(box().classList.contains("text-base")).toBe(false);
+  });
+
+  it("gives every header value the shared text-sm box of its LENGTH, each title exactly that wide", () => {
+    stubFetch();
+    const { container } = renderScreen();
+    const boxes = Array.from(
+      container.querySelectorAll<HTMLInputElement>('[data-slot="card-header"] input'),
+    );
+    expect(
+      boxes.map((box) => ({
+        field: box.dataset.field,
+        sized: box.classList.contains(`field-length-${box.size}`),
+        small: box.classList.contains("text-sm"),
+        width: ["w-full", "w-(--field-width)"].filter((width) => box.classList.contains(width)),
+      })),
+    ).toEqual(
+      ["TRNNAME", "TITLE01", "CURDATE", "PGMNAME", "TITLE02", "CURTIME", "APPLID", "SYSID"].map(
+        (field) => ({
+          field,
+          sized: true,
+          small: true,
+          width: [field.startsWith("TITLE") ? "w-(--field-width)" : "w-full"],
+        }),
+      ),
+    );
+  });
+
   // audit: COSGN00C-001
   // audit: COSGN00C-005
   it("shows the invalid-key message for an unserved F-key and clears it on ENTER", async () => {

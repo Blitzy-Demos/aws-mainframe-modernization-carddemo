@@ -738,6 +738,20 @@ describe("COCRDLI", () => {
   });
 
   it.each([
+    { name: "the account filter", box: accountFilter, length: 11 },
+    { name: "the card filter", box: cardFilter, length: 16 },
+    { name: "the page number", box: pageNo, length: 3 },
+  ])("gives $name the shared text-sm field box of LENGTH $length", async ({ box, length }) => {
+    stubReplies([200, FIRST_PAGE]);
+    renderScreen();
+    await firstPageShown();
+
+    expect(box().classList.contains(`field-length-${length}`)).toBe(true);
+    expect(box().classList.contains("text-sm")).toBe(true);
+    expect(box().classList.contains("text-base")).toBe(false);
+  });
+
+  it.each([
     { shown: "seven cards", page: FIRST_PAGE, cards: 7 },
     { shown: "one card", page: ONE_CARD_PAGE, cards: 1 },
     { shown: "no card", page: NO_RECORDS_PAGE, cards: 0 },
@@ -1508,6 +1522,205 @@ describe("COCRDLI", () => {
     expect(accountFilter()).toHaveProperty("value", "00000000050");
   });
 });
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: its `aria-invalid` and what describes it. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `element`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLElement): ReadOut {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (content) => content })
+    .filter((element) => element.closest(".sr-only") === null);
+}
+
+/** The messages that mark inputs: a filter's, and each marked row's code (1 to 7). */
+type Marks = {
+  readonly acctId?: string;
+  readonly cardNum?: string;
+  readonly codes?: Readonly<Record<number, string>>;
+};
+
+/**
+ * An input as assistive technology reads it: unmarked, valid and described by nothing, as no
+ * input of the map has a hint; or marked by `message`, invalid and described by its hidden
+ * field message.
+ */
+function readOutOf(message: string | undefined): ReadOut {
+  return message === undefined
+    ? { invalid: "false", described: null }
+    : { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
+/** How assistive technology reads both filters and the seven codes. */
+function readOuts(): { acctId: ReadOut; cardNum: ReadOut; codes: ReadOut[] } {
+  return {
+    acctId: readOut(accountFilter()),
+    cardNum: readOut(cardFilter()),
+    codes: [1, 2, 3, 4, 5, 6, 7].map((row) => readOut(selector(row))),
+  };
+}
+
+// The replacement's accessibility wiring, which no audit row states: each filter and each row's
+// code names in `aria-describedby` only elements the screen renders. A filter the schema or the
+// server rejects, and a code the selection edit marks (also after a failed re-read that keeps the
+// marks), is invalid and described by its hidden field message, which repeats the error line;
+// every other input is described by nothing.
+describe("COCRDLI input descriptions", () => {
+  it.each<{
+    state: string;
+    second: readonly [number, unknown];
+    reach: () => Promise<void>;
+    marks: Marks;
+  }>([
+    { state: "on entry", second: [200, FIRST_PAGE], reach: async () => undefined, marks: {} },
+    {
+      state: "after the schema rejects a short account filter",
+      second: [200, FIRST_PAGE],
+      reach: async () => {
+        type(accountFilter(), "123");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(ACCOUNT_FILTER_MESSAGE);
+        });
+      },
+      marks: { acctId: ACCOUNT_FILTER_MESSAGE },
+    },
+    {
+      state: "after the schema rejects both filters",
+      second: [200, FIRST_PAGE],
+      reach: async () => {
+        type(accountFilter(), "0000000005A");
+        type(cardFilter(), "12");
+        press("F7=Backward");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(ACCOUNT_FILTER_MESSAGE);
+        });
+      },
+      marks: { acctId: ACCOUNT_FILTER_MESSAGE, cardNum: ACCOUNT_FILTER_MESSAGE },
+    },
+    {
+      state: "after the server's 400 naming card_num",
+      second: [400, { message: CARD_FILTER_MESSAGE, field: "card_num" }],
+      reach: async () => {
+        type(accountFilter(), "00000000050");
+        type(cardFilter(), "1111222233334444");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(CARD_FILTER_MESSAGE);
+        });
+      },
+      marks: { cardNum: CARD_FILTER_MESSAGE },
+    },
+    {
+      state: "after an unknown code X on row 1",
+      second: [200, FIRST_PAGE],
+      reach: async () => {
+        type(selector(1), "X");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(INVALID_ACTION_CODE);
+        });
+      },
+      marks: { codes: { 1: INVALID_ACTION_CODE } },
+    },
+    {
+      state: "after S on rows 2 and 5",
+      second: [200, FIRST_PAGE],
+      reach: async () => {
+        typeCodes(["", "S", "", "", "S", "", ""]);
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(MORE_THAN_ONE_ACTION);
+        });
+      },
+      marks: { codes: { 2: MORE_THAN_ONE_ACTION, 5: MORE_THAN_ONE_ACTION } },
+    },
+    {
+      state: "after a failed re-read that keeps the mark of row 4",
+      second: [500, { message: FILE_ERROR }],
+      reach: async () => {
+        type(selector(4), "X");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(FILE_ERROR);
+        });
+      },
+      marks: { codes: { 4: FILE_ERROR } },
+    },
+    {
+      state: "after an ENTER that follows a marked code, with the code cleared",
+      second: [200, FIRST_PAGE],
+      reach: async () => {
+        type(selector(1), "X");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe(INVALID_ACTION_CODE);
+        });
+        type(selector(1), "");
+        press("ENTER");
+        await waitFor(() => {
+          expect(messageRow("error").textContent).toBe("");
+        });
+      },
+      marks: {},
+    },
+  ])("describes each input by rendered elements only, $state", async ({ second, reach, marks }) => {
+    stubReplies([200, FIRST_PAGE], second);
+    renderScreen();
+    await firstPageShown();
+    await reach();
+
+    await waitFor(() => {
+      expect(readOuts()).toEqual({
+        acctId: readOutOf(marks.acctId),
+        cardNum: readOutOf(marks.cardNum),
+        codes: [1, 2, 3, 4, 5, 6, 7].map((row) => readOutOf(marks.codes?.[row])),
+      });
+    });
+    expect(danglingDescriptions()).toEqual([]);
+    // The error line stays the one visible copy of each text that marks an input.
+    const texts = [marks.acctId, marks.cardNum, ...Object.values(marks.codes ?? {})];
+    for (const text of new Set(texts.filter((shown) => shown !== undefined))) {
+      const visible = visibleCopies(text);
+      expect(visible).toHaveLength(1);
+      expect(messageRow("error").contains(visible[0] ?? null)).toBe(true);
+    }
+  });
+});
+
 
 /** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */
 const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {

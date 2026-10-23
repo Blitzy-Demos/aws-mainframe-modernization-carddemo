@@ -247,6 +247,66 @@ function marks(): (string | null)[] {
   return inputs().map(markOf);
 }
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `input`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(input: HTMLElement): ReadOut {
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/**
+ * How the five inputs, in map order, read when only the input labelled `marked` holds the error
+ * `message`: the map's BLUE hints shown and read with User ID, Password and User Type, and the
+ * marked input's field message after its hint, hidden.
+ */
+function readOutWith(marked?: string, message = ""): ReadOut[] {
+  const hints: Readonly<Record<string, string>> = {
+    [LABELS.userId]: "(8 Char)",
+    [LABELS.password]: "(8 Char)",
+    [LABELS.userType]: "(A=Admin, U=User)",
+  };
+  return Object.values(LABELS).map((label) => {
+    const hint = hints[label];
+    const described = [
+      ...(hint === undefined ? [] : [{ text: hint, hidden: false }]),
+      ...(label === marked ? [{ text: message, hidden: true }] : []),
+    ];
+    return {
+      invalid: String(label === marked),
+      described: described.length > 0 ? described : null,
+    };
+  });
+}
+
 /**
  * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
  * of that name in the `CardHeader`, failing when there is not exactly one.
@@ -712,6 +772,57 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       expect(document.activeElement).toBe(inputFor(LABELS.firstName));
     });
     expect(marks()).toEqual([null, null, null, null, null]);
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. User ID, Password and User Type are described by
+  // their BLUE hints; First and Last Name, which have none, by nothing while valid; and the input
+  // a `ScreenError` names also by its field message, which holds the error row's text, hidden.
+  it.each([
+    { state: "on entry", entry: undefined, failure: undefined, marked: undefined },
+    {
+      state: "after the 400 of a blank First Name",
+      entry: { ...typed, first_name: "" },
+      failure: { message: "First Name can NOT be empty...", field: "first_name" },
+      marked: LABELS.firstName,
+    },
+    {
+      state: "after the 400 of a blank Last Name",
+      entry: { ...typed, last_name: "" },
+      failure: { message: "Last Name can NOT be empty...", field: "last_name" },
+      marked: LABELS.lastName,
+    },
+    {
+      state: "after the 400 of a duplicate User ID",
+      entry: typed,
+      failure: duplicate,
+      marked: LABELS.userId,
+    },
+    {
+      state: "after the 400 of an empty User Type",
+      entry: typedWithoutType,
+      failure: typeEmpty,
+      marked: LABELS.userType,
+    },
+  ] satisfies {
+    state: string;
+    entry?: components["schemas"]["UserAddRequest"];
+    failure?: components["schemas"]["ScreenError"];
+    marked?: string;
+  }[])("describes each input by rendered elements only, $state", async (row) => {
+    stubFetch(row.failure === undefined ? undefined : { status: 400, body: row.failure });
+    renderScreen();
+    if (row.entry !== undefined && row.failure !== undefined) {
+      const { message } = row.failure;
+      typeEntry(row.entry);
+      fireEvent.click(key("ENTER=Add User"));
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe(message);
+      });
+    }
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect(inputs().map(readOut)).toEqual(readOutWith(row.marked, row.failure?.message));
   });
 
   // audit: COUSR01C-005

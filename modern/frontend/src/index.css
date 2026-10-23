@@ -20,6 +20,17 @@
  */
 @source inline("col-start-{1..80} col-span-{1..80} row-start-{1..24} row-span-{1..24}");
 
+/*
+ * The width of a map field's LENGTH characters of the monospace font (1ch each), plus the field
+ * box's px-0.5 padding (one spacing step in all) and its 1px border on each side, as
+ * --field-width for FieldGrid's fieldBox. The class is computed from map data, so it is
+ * generated here for every LENGTH from 1 to 80.
+ */
+@utility field-length-* {
+  --field-width: calc(--value(integer) * 1ch + var(--spacing) + 2px);
+}
+@source inline("field-length-{1..80}");
+
 :root {
   --radius: 0.625rem;
   --background: oklch(1 0 0);

@@ -349,6 +349,54 @@ function messageRow(): HTMLElement {
   return row;
 }
 
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (content) => content })
+    .filter((element) => element.closest(".sr-only") === null);
+}
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/**
+ * How assistive technology reads the input: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLInputElement): {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+} {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** The confirmation's `(Y/N)` hint (COBIL00-022), shown and read as its description. */
+const CONFIRM_HINT = { text: "(Y/N)", hidden: false };
+
+/** The field message of an input `message` marks, read with the input and visually hidden. */
+function fieldMessage(message: string): { text: string; hidden: boolean } {
+  return { text: message, hidden: true };
+}
+
 /**
  * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
  * of that name in the `CardHeader`, failing the test when there is not exactly one.
@@ -927,12 +975,16 @@ describe("COBIL00 bill payment screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(inputNamed(row.error.field));
     });
-    // The input the error names, and only it, is marked invalid; the text shows once, in ERRMSG.
+    // The input the error names, and only it, is marked invalid; the text shows once, in ERRMSG,
+    // and the named input's field message repeats it for assistive technology only.
     const named = inputNamed(row.error.field);
     for (const field of [acctInput(), confirmInput()]) {
       expect(field.getAttribute("aria-invalid")).toBe(String(field === named));
     }
-    expect(screen.getAllByText(row.error.message)).toHaveLength(1);
+    const visible = visibleCopies(row.error.message);
+    expect(visible).toHaveLength(1);
+    expect(errorRow?.contains(visible[0] ?? null)).toBe(true);
+    expect(readOut(named).described).toContainEqual(fieldMessage(row.error.message));
 
     expect(await bodies(requests)).toStrictEqual([
       { acct_id: ACCT, confirm: "" },
@@ -1079,6 +1131,54 @@ describe("COBIL00 bill payment screen", () => {
       expect(confirmInput().getAttribute("aria-invalid")).toBe("false");
     });
     expect(requests).toHaveLength(row.sent);
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. The confirmation is described by its `(Y/N)` hint
+  // (COBIL00-022); the account, which has no hint, by nothing while it is valid; and the input a
+  // `ScreenError` names also by its field message, which holds the server's text, hidden.
+  it.each([
+    {
+      state: "on entry",
+      acct: "",
+      confirm: "",
+      reach: settle,
+      expected: {
+        acct: { invalid: "false", described: null },
+        confirm: { invalid: "false", described: [CONFIRM_HINT] },
+      },
+    },
+    {
+      state: "after the 400 of a blank account",
+      acct: "",
+      confirm: "",
+      reach: enterUntil(emptyAcct.message),
+      expected: {
+        acct: { invalid: "true", described: [fieldMessage(emptyAcct.message)] },
+        confirm: { invalid: "false", described: [CONFIRM_HINT] },
+      },
+    },
+    {
+      state: "after the 400 of confirmation X",
+      acct: ACCT,
+      confirm: "X",
+      reach: enterUntil(invalidConfirm.message),
+      expected: {
+        acct: { invalid: "false", described: null },
+        confirm: {
+          invalid: "true",
+          described: [CONFIRM_HINT, fieldMessage(invalidConfirm.message)],
+        },
+      },
+    },
+  ])("describes each input by rendered elements only, $state", async (row) => {
+    stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    typeInputs(row.acct, row.confirm);
+    await row.reach();
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect({ acct: readOut(acctInput()), confirm: readOut(confirmInput()) }).toEqual(row.expected);
   });
 
   // A failure of the replacement alone, which no audit row covers: a reply without a JSON object

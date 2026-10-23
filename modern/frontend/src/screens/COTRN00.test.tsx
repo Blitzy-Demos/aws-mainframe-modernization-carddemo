@@ -534,6 +534,39 @@ function fieldMessage(field: HTMLElement): HTMLElement | undefined {
   return message ?? undefined;
 }
 
+/** Every id an `aria-describedby` on the page names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/**
+ * How assistive technology reads `field`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(field: HTMLElement): {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+} {
+  const ids = field.getAttribute("aria-describedby");
+  return {
+    invalid: field.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
 /** Asserts that `text` is visible once, in the error row; any other copy is `sr-only`. */
 function expectShownOnceInErrorRow(text: string): void {
   const visible = screen
@@ -1284,6 +1317,41 @@ describe("COTRN00 List Transactions", () => {
       expect(fieldMessage(searchField())).toBeUndefined();
       // The error row keeps the server's message until the next answer replaces it.
       expect(errorRow().textContent).toBe(shown);
+    },
+  );
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. The map gives the search field and the ten selectors
+  // no hint, so each is described by nothing while it is valid, and the search field a
+  // `ScreenError` names by its field message, which holds the server's text, hidden.
+  it.each([
+    { state: "on entry", replies: [], search: null, described: null },
+    {
+      state: "after the 400 naming start_tran_id",
+      replies: [json(400, NOT_NUMERIC_ERROR)],
+      search: "12AB",
+      described: [{ text: NOT_NUMERIC, hidden: true }],
+    },
+  ])(
+    "describes each input by rendered elements only, $state",
+    async ({ replies, search, described }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE), ...replies);
+      renderList();
+      await answered(sent, 1);
+      if (search !== null) {
+        typeInto(searchField(), search);
+        press("ENTER=Continue");
+        await answered(sent, 2);
+        expect(errorRow().textContent).toBe(NOT_NUMERIC);
+      }
+
+      expect(danglingDescriptions()).toEqual([]);
+      expect(readOut(searchField())).toEqual({
+        invalid: search === null ? "false" : "true",
+        described,
+      });
+      const selectors = Array.from({ length: 10 }, (_, index) => readOut(selector(index + 1)));
+      expect(selectors).toEqual(Array(10).fill({ invalid: "false", described: null }));
     },
   );
 

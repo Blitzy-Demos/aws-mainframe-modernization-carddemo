@@ -361,6 +361,73 @@ function marks(): Record<keyof typeof INPUT_LABELS, string | null> {
 /** No input marked. */
 const UNMARKED = { userId: null, firstName: null, lastName: null, password: null, userType: null };
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads the input `name`: its `aria-invalid`, and the element each id of
+ * its `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(name: keyof typeof INPUT_LABELS): ReadOut {
+  const element = input(name);
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/**
+ * How the five inputs read when only the input `marked` holds the error `message`: Password and
+ * User Type described by their BLUE hints (COUSR02-024, COUSR02-027), the others by nothing, and
+ * the marked input also by its field message, after its hint and hidden.
+ */
+function readOutWith(
+  marked?: keyof typeof INPUT_LABELS,
+  message = "",
+): Record<keyof typeof INPUT_LABELS, ReadOut> {
+  const hints: Partial<Record<keyof typeof INPUT_LABELS, string>> = {
+    password: "(8 Char)",
+    userType: "(A=Admin, U=User)",
+  };
+  const read = (name: keyof typeof INPUT_LABELS): ReadOut => {
+    const hint = hints[name];
+    const described = [
+      ...(hint === undefined ? [] : [{ text: hint, hidden: false }]),
+      ...(name === marked ? [{ text: message, hidden: true }] : []),
+    ];
+    return { invalid: String(name === marked), described: described.length > 0 ? described : null };
+  };
+  return {
+    userId: read("userId"),
+    firstName: read("firstName"),
+    lastName: read("lastName"),
+    password: read("password"),
+    userType: read("userType"),
+  };
+}
+
 /**
  * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
  * of that name in the `CardHeader`, failing when there is not exactly one.
@@ -1598,6 +1665,75 @@ describe("COUSR02 user update screen", () => {
       expect(shownMessage()).toEqual({ kind: "error", text: INVALID_KEY_TEXT });
     });
     expect(marks()).toEqual(UNMARKED);
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. Password and User Type are described by their BLUE
+  // hints; the user ID and the names, which have none, by nothing while valid; and the input an
+  // error marks also by its field message, which holds the error row's text, hidden.
+  it.each([
+    { state: "once the selected user is shown", act: undefined, marked: undefined, message: "" },
+    {
+      state: "after ENTER with a blank user ID",
+      act: () => {
+        typeInto("userId", "");
+        fireEvent.click(key("ENTER=Fetch"));
+      },
+      marked: "userId",
+      message: USER_ID_EMPTY,
+    },
+    {
+      state: "after F5's 400 for a blank last name",
+      update: () => json(400, lastNameEmpty),
+      act: () => {
+        fireEvent.click(key("F5=Save"));
+      },
+      marked: "lastName",
+      message: lastNameEmpty.message,
+    },
+    {
+      state: "after F5's 400 for a blank password",
+      update: () => json(400, { message: "Password can NOT be empty...", field: "password" }),
+      act: () => {
+        fireEvent.click(key("F5=Save"));
+      },
+      marked: "password",
+      message: "Password can NOT be empty...",
+    },
+    {
+      state: "after F5's 400 for a blank user type",
+      update: () => json(400, { message: "User Type can NOT be empty...", field: "user_type" }),
+      act: () => {
+        fireEvent.click(key("F5=Save"));
+      },
+      marked: "userType",
+      message: "User Type can NOT be empty...",
+    },
+  ] satisfies {
+    state: string;
+    update?: () => Response;
+    act: (() => void) | undefined;
+    marked: keyof typeof INPUT_LABELS | undefined;
+    message: string;
+  }[])("describes each input by rendered elements only, $state", async (row) => {
+    stubApi(row.update);
+    renderScreen(FROM_LIST);
+    await selectedShown();
+    if (row.act !== undefined) {
+      row.act();
+      await waitFor(() => {
+        expect(shownMessage()).toEqual({ kind: "error", text: row.message });
+      });
+    }
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect({
+      userId: readOut("userId"),
+      firstName: readOut("firstName"),
+      lastName: readOut("lastName"),
+      password: readOut("password"),
+      userType: readOut("userType"),
+    }).toEqual(readOutWith(row.marked, row.message));
   });
 });
 

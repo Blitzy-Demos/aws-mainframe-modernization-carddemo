@@ -14,10 +14,11 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { cn } from "cn";
 import type { components } from "@/api/schema";
 import { useCoactvwcView } from "@/api/hooks";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KEY_ROWS, keyRowItems, type PfKeyOptions } from "@/lib/pfkeys";
@@ -73,13 +74,6 @@ const ACCOUNT_FIELD = "acct_id";
  * keeps the padding that aligns the colons, and `h-full` centres the text on its grid line.
  */
 const LABEL_CLASS = "h-full whitespace-pre text-foreground";
-
-/*
- * BLITZY [LAYOUT]: an input spans its cell, and grows to its `size` (the map LENGTH in characters)
- * where the cell is narrower than that, so the 1- to 5-character fields stay readable at every
- * column pitch instead of being clipped by the input's padding.
- */
-const FIELD_CLASS = "w-auto min-w-full";
 
 /** ENTER, served by COACTVWC but unlabelled on the map, as a bare `ENTER` button (COACTVW-108). */
 const ENTER_KEY: PfKeyBarEntry = { key: "ENTER", label: "ENTER", dark: false };
@@ -382,6 +376,21 @@ const OUTPUT_FIELDS: readonly OutputField[] = [
   },
 ];
 
+/** Map row of the NEUTRAL `Customer Details` caption between the two blocks (COACTVW-045). */
+const CUSTOMER_DETAILS_ROW = 11;
+
+/*
+ * The two blocks of output fields either side of the caption, each in macro order, so the body
+ * reads in map row order: the account block, the caption, then the customer block, whose row-14
+ * literals stay with the row-15 name fields they caption.
+ */
+const ACCOUNT_OUTPUTS: readonly OutputField[] = OUTPUT_FIELDS.filter(
+  (output) => output.row < CUSTOMER_DETAILS_ROW,
+);
+const CUSTOMER_OUTPUTS: readonly OutputField[] = OUTPUT_FIELDS.filter(
+  (output) => output.row > CUSTOMER_DETAILS_ROW,
+);
+
 /** A map field at its `POS` and `LENGTH`, on the body grid that starts at map row 5. */
 function MapCell({
   row,
@@ -574,8 +583,9 @@ export function COACTVW(): ReactNode {
   };
 
   // The program turns the field red when its message names it (COACTVWC-028); a MUSTFILL
-  // rejection shows the same way.
+  // rejection shows the same way. The message that names the field also describes it.
   const accountInError = shown.error?.field === ACCOUNT_FIELD;
+  const accountMessage = accountInError ? (shown.error?.message ?? "") : "";
   const messageText = shown.error?.message ?? form.formState.errors.acctId?.message;
 
   return (
@@ -597,7 +607,14 @@ export function COACTVW(): ReactNode {
               control={form.control}
               name="acctId"
               render={({ field, fieldState }) => (
-                // `contents` puts the label and the input on the grid themselves.
+                // `contents` puts the label and the input on the grid themselves. The error row is
+                // the map's one visible message, so the field's own message is for assistive
+                // technology only, read with the input it marks: the schema's MUSTFILL message, or
+                // the server's message that names the field, which the screen keeps outside
+                // react-hook-form. It is the item's direct child, not a cell's: being `sr-only`,
+                // it takes no grid cell, and as a grid item it is placed at the grid's origin,
+                // inside the screen. The account number has no hint, so its control names no
+                // description.
                 <FormItem className="contents">
                   <MapCell row={5} col={19} span={16}>
                     {/*
@@ -609,7 +626,7 @@ export function COACTVW(): ReactNode {
                     </FormLabel>
                   </MapCell>
                   <MapCell row={5} col={38} span={COACTVW_LENGTHS.acctId}>
-                    <FormControl>
+                    <FieldControl messaged={accountMessage !== ""}>
                       <Input
                         {...field}
                         readOnly={pending}
@@ -621,16 +638,25 @@ export function COACTVW(): ReactNode {
                         spellCheck={false}
                         aria-invalid={accountInError || fieldState.invalid}
                         className={cn(
-                          FIELD_CLASS,
+                          fieldBox(COACTVW_LENGTHS.acctId),
                           (accountInError || fieldState.invalid) && "text-destructive",
                         )}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </MapCell>
+                  <FormMessage className="sr-only">{accountMessage}</FormMessage>
                 </FormItem>
               )}
             />
-            <MapCell row={11} col={32} span={16}>
+            {ACCOUNT_OUTPUTS.map((output) => (
+              <OutputCell
+                key={output.name}
+                output={output}
+                id={`${fieldId}-${output.name}`}
+                value={shownValue(output, shown)}
+              />
+            ))}
+            <MapCell row={CUSTOMER_DETAILS_ROW} col={32} span={16}>
               <span
                 role="heading"
                 aria-level={2}
@@ -639,7 +665,7 @@ export function COACTVW(): ReactNode {
                 Customer Details
               </span>
             </MapCell>
-            {OUTPUT_FIELDS.map((output) => (
+            {CUSTOMER_OUTPUTS.map((output) => (
               <OutputCell
                 key={output.name}
                 output={output}
@@ -657,6 +683,11 @@ export function COACTVW(): ReactNode {
 /**
  * One output field and its caption. The field is `ASKIP` on the map, so it is read-only and the
  * Tab key passes over it, as the terminal's cursor skips it.
+ *
+ * BLITZY [LAYOUT]: every input of the screen, this one and the account number, has the shared
+ * field box of its map LENGTH (`fieldBox`): it spans its cell and is never narrower than its
+ * characters, so the 1- to 5-character fields stay readable at every column pitch, and each box
+ * ends within its field's columns, the column-78 `ACSPFLG` inside the frame.
  */
 function OutputCell({
   output,
@@ -685,7 +716,7 @@ function OutputCell({
           size={output.length}
           value={value}
           aria-label={output.ariaLabel}
-          className={FIELD_CLASS}
+          className={fieldBox(output.length)}
         />
       </MapCell>
     </>

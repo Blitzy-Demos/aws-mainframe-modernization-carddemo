@@ -5,17 +5,10 @@ import { useForm, type ControllerRenderProps } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrtupcAction, useCotrtupcFetch } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-  useFormField,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -517,7 +510,8 @@ function MapInput({ row, label, ...cell }: MapInputProps): ReactNode {
  * The input cell of a {@link MapInput}, inside its `FormItem`. An input the step's screen marks
  * (`Mark`) or the form edit refuses is invalid and described by an `sr-only` `FormMessage`, which
  * holds the form edit's message, else the error row's text: the error row stays the screen's one
- * visible message, and the marks stay the screen's.
+ * visible message, and the marks stay the screen's. The control names that message while it
+ * shows text, and nothing else: the map gives neither input a hint.
  */
 function MapInputCell({
   row,
@@ -530,13 +524,11 @@ function MapInputCell({
   message,
   autoFocus = false,
 }: Omit<MapInputProps, "label">): ReactNode {
-  const { formMessageId } = useFormField();
   const red = mark !== "none";
-  // The cases in which `FormMessage` has text to render.
-  const described = invalid || (red && message !== "");
   return (
     <GridCell row={row} col={INPUT_COLUMN} span={length}>
-      <FormControl>
+      {/* A screen mark's text is the `FormMessage` children below; a form edit's error wins. */}
+      <FieldControl messaged={red && message !== ""}>
         <Input
           {...input}
           maxLength={length}
@@ -546,13 +538,12 @@ function MapInputCell({
           readOnly={!editable || locked}
           tabIndex={editable ? undefined : -1}
           aria-invalid={red || invalid}
-          aria-describedby={described ? formMessageId : undefined}
           className={cn(
             length === COTRTUP_LENGTHS.typeCode && CODE_INPUT_CLASS,
             red && "text-destructive",
           )}
         />
-      </FormControl>
+      </FieldControl>
       <FormMessage className="sr-only">{red ? message : undefined}</FormMessage>
     </GridCell>
   );

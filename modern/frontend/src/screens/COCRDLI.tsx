@@ -2,12 +2,21 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useEffect, useId, useRef, useState, type ReactNode } from "react";
 import { useForm, type FieldErrors, type FieldPath } from "react-hook-form";
 import { useNavigate } from "react-router";
+import { cn } from "cn";
 import { useCocrdlicList } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
-import { FieldGrid, GridCell, GridTable, LIST_CELL, LIST_ROW } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import {
+  FieldGrid,
+  GridCell,
+  GridTable,
+  LIST_CELL,
+  LIST_ROW,
+  fieldBox,
+} from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -462,6 +471,8 @@ export function COCRDLI(): ReactNode {
       press("ENTER");
     },
   };
+  // The error line's text, which also describes each selector it marks.
+  const errorText = message?.text ?? "";
 
   return (
     <ScreenShell
@@ -498,11 +509,18 @@ export function COCRDLI(): ReactNode {
                 id={pageNoId}
                 readOnly
                 value={page === undefined ? "" : String(page.page_no)}
-                className="px-1"
+                className={fieldBox(3)}
               />
             </GridCell>
 
-            {/* COCRDLI-014, COCRDLI-015: the account filter, the initial cursor (`IC`). */}
+            {/*
+             * COCRDLI-014, COCRDLI-015: the account filter, the initial cursor (`IC`). The error
+             * line is the map's one visible message, so a filter's own message, the schema's or
+             * the server's, is for assistive technology only, read with the input it marks. It is
+             * the item's direct child, not a cell's: being `sr-only`, it takes no grid cell, and
+             * as a grid item it is placed at the grid's origin, inside the screen. The filters
+             * have no hint, so their controls name no description.
+             */}
             <FormField
               control={form.control}
               name="acctId"
@@ -512,22 +530,23 @@ export function COCRDLI(): ReactNode {
                     <FormLabel className={FILTER_LABEL}>{"Account Number    :"}</FormLabel>
                   </GridCell>
                   <GridCell row={6} col={44} span={COCRDLI_LENGTHS.acctId}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COCRDLI_LENGTHS.acctId}
                         readOnly={pending}
                         autoFocus
                         autoComplete="off"
-                        className={MARKED}
+                        className={cn(fieldBox(COCRDLI_LENGTHS.acctId), MARKED)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
 
-            {/* COCRDLI-017, COCRDLI-018: the card filter, request input only. */}
+            {/* COCRDLI-017, COCRDLI-018: the card filter, request input only; wired as above. */}
             <FormField
               control={form.control}
               name="cardNum"
@@ -537,16 +556,17 @@ export function COCRDLI(): ReactNode {
                     <FormLabel className={FILTER_LABEL}>{"Credit Card Number:"}</FormLabel>
                   </GridCell>
                   <GridCell row={7} col={44} span={COCRDLI_LENGTHS.cardNum}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COCRDLI_LENGTHS.cardNum}
                         readOnly={pending}
                         autoComplete="off"
-                        className={MARKED}
+                        className={cn(fieldBox(COCRDLI_LENGTHS.cardNum), MARKED)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -595,6 +615,10 @@ export function COCRDLI(): ReactNode {
                 <TableBody>
                   {POSITIONS.map((position) => {
                     const card = cardAt(page, position);
+                    // A code the selection edit marks is invalid, and its hidden field message, in
+                    // the code's own item, repeats the error line. The marks are kept outside
+                    // react-hook-form, so the control is told the message shows.
+                    const marked = marks.at(position) ?? false;
                     return (
                       // A row without a card shows nothing and keeps its line and height
                       // (COCRDLIC-035).
@@ -610,17 +634,20 @@ export function COCRDLI(): ReactNode {
                               name={`selections.${position}`}
                               render={({ field }) => (
                                 <FormItem>
-                                  <FormControl>
+                                  <FieldControl messaged={marked && errorText !== ""}>
                                     <Input
                                       {...field}
                                       maxLength={COCRDLI_LENGTHS.selection}
                                       readOnly={selectorsProtected || pending}
                                       autoComplete="off"
                                       aria-label={`Select row ${position + 1}`}
-                                      aria-invalid={marks.at(position) ?? false}
+                                      aria-invalid={marked}
                                       className={`relative left-2/12 ${ONE_CHARACTER}`}
                                     />
-                                  </FormControl>
+                                  </FieldControl>
+                                  <FormMessage className="sr-only">
+                                    {marked ? errorText : undefined}
+                                  </FormMessage>
                                 </FormItem>
                               )}
                             />

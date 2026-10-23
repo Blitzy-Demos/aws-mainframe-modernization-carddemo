@@ -2,19 +2,14 @@ import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } fr
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldPath } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
+import { cn } from "cn";
 import { useCocrdupcFetch, useCocrdupcSave } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import {
   KEY_ROWS,
@@ -74,9 +69,9 @@ type MapFieldSpec = {
   /**
    * Utilities the literal's box needs beside `LABEL`: the `/` of `EXPYEAR` has a one-column cell,
    * narrower than its glyph at every width, so its box is as wide as the glyph (`min-w-max`). The
-   * shared map-field box of `EXPMON` grows past its two-column cell to its two characters and, on
-   * the narrowest frame, ends within half a pixel of the `/` cell; the `pl-1` inset keeps the
-   * glyph clear of that box, between the month and year boxes as the map's attribute columns do.
+   * shared field box of `EXPMON` extends past its two-column cell to its two characters and, on
+   * the narrowest frame, ends a few pixels before the `/` cell; the `pl-1` inset keeps the glyph
+   * clear of that box, between the month and year boxes as the map's attribute columns do.
    */
   readonly labelClass?: string;
 };
@@ -148,9 +143,16 @@ const BLANK_VALUES: CocrdupValues = {
 
 /**
  * TURQUOISE map literals snap to the foreground token (AAP 0.4.3). `h-full` centres each label on
- * its line beside the inputs; `whitespace-pre` keeps their spacing.
+ * its line beside the inputs; `whitespace-pre` keeps their spacing. COCRDUPC recolours a field,
+ * never its literal (COCRDUPC-046), so a label keeps the foreground while its field is in error.
  */
-const LABEL = "h-full whitespace-pre text-foreground";
+const LABEL = "h-full whitespace-pre text-foreground data-[error=true]:text-foreground";
+
+/**
+ * The field the error names is shown red, its text and a blank field's `*` included
+ * (COCRDUPC-046), through the `aria-invalid` its `FormControl` sets.
+ */
+const MARKED = "aria-invalid:text-destructive";
 
 /** `KEY_ROWS.COCRDUP.foldShifted`: COCRDUPC folds PF13–PF24 onto PF1–PF12 (`CSSTRPFY`). */
 const KEY_OPTIONS = { foldShifted: KEY_ROWS.COCRDUP.foldShifted };
@@ -375,13 +377,17 @@ function stateAfterSaveError(
 }
 
 /**
- * The `Input` attributes of one map field: its `LENGTH`, protection and accessible name. A field
- * the state protects (`enterable` false) is read-only and out of the Tab order, as the 3270 Tab
- * key skips protected fields; it still takes the cursor the program places on it. While `busy`, a
- * request holds the keyboard: every field is read-only, and an enterable one keeps its Tab stop.
- * Every field takes the shared map-field box (`fieldInputClass` with `size` = the `LENGTH`), so
- * each one, the read-only redacted card number included, shows a full-length value on the
- * narrowest frame.
+ * The `Input` attributes of one map field: its `LENGTH`, protection, accessible name and box. A
+ * field the state protects (`enterable` false) is read-only and out of the Tab order, as the 3270
+ * Tab key skips protected fields; it still takes the cursor the program places on it. While
+ * `busy`, a request holds the keyboard: every field is read-only, and an enterable one keeps its
+ * Tab stop.
+ *
+ * BLITZY [LAYOUT]: every input has the shared field box of its map LENGTH (`fieldBox`, with
+ * `size` = the `LENGTH`): it fills its cell and is never narrower than its characters, so the
+ * 11-digit account, the 16-character card number (redacted or not), the 50-character name and the
+ * 1-, 2- and 4-column `CRDSTCD`, `EXPMON` and `EXPYEAR` show whole on the narrowest frame; any
+ * extra width falls into the empty attribute column to their right.
  */
 function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, busy: boolean) {
   const spec: MapFieldSpec = FIELDS[name];
@@ -394,16 +400,17 @@ function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, bus
     spellCheck: false,
     "aria-label": spec.accessibleName,
     size: length,
-    className: fieldInputClass(length),
+    className: cn(fieldBox(length), MARKED),
   };
 }
 
 /**
  * One map field as two grid cells: its literal as the `FormLabel` and its `Input` in the
- * `FormControl`. `FormItem` is `contents`, so both cells sit on the `FieldGrid` itself. The
- * field's error is its `FormMessage`, which the input's `aria-describedby` names while the field
- * is invalid. The `ERRMSG` row is the map's one visible message, so the `FormMessage` is for
- * assistive technology only: `sr-only` takes it out of the grid flow, and it fills no cell.
+ * `FieldControl`. `FormItem` is `contents`, so both cells sit on the `FieldGrid` itself. The
+ * field's error is its `FormMessage`, which the input's `aria-describedby` names while it shows
+ * the error's text; no field of the map has a hint, so no description is named. The `ERRMSG` row
+ * is the map's one visible message, so the `FormMessage` is for assistive technology only:
+ * `sr-only` takes it out of the grid flow, and it fills no cell.
  */
 function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNode }): ReactNode {
   const labelClass = spec.labelClass === undefined ? LABEL : `${LABEL} ${spec.labelClass}`;
@@ -413,7 +420,7 @@ function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNod
         <FormLabel className={labelClass}>{spec.label}</FormLabel>
       </GridCell>
       <GridCell {...spec.inputCell}>
-        <FormControl>{children}</FormControl>
+        <FieldControl>{children}</FieldControl>
       </GridCell>
       <FormMessage className="sr-only" />
     </FormItem>

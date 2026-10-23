@@ -387,6 +387,66 @@ async function lingers(): Promise<void> {
   });
 }
 
+/** Types `entry`, clicks `ENTER=Continue` and waits until the `kind` row shows `text`. */
+async function enterUntil(entry: string, kind: "error" | "info", text: string): Promise<void> {
+  enter(entry);
+  await waitFor(() => {
+    expect(messageRow(kind)?.textContent).toBe(text);
+  });
+}
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/**
+ * How assistive technology reads the input: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLInputElement): {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+} {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (content) => content })
+    .filter((element) => element.closest(".sr-only") === null);
+}
+
+/** The option input unmarked: valid, and described by nothing, as it has no hint. */
+const UNMARKED = { invalid: "false", described: null };
+
+/** The option input marked by `message`: invalid, described by its hidden field message. */
+function markedBy(message: string): {
+  invalid: string;
+  described: { text: string; hidden: boolean }[];
+} {
+  return { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
+
 describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
   beforeEach(() => {
     requests = [];
@@ -666,6 +726,16 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
       await expectMenuRequests(1);
     },
   );
+
+  it("gives the option input the shared text-sm field box of its 2 characters", async () => {
+    stubMenu(200, menu);
+    renderAdminMenu();
+    await loaded();
+
+    expect(optionInput().classList.contains("field-length-2")).toBe(true);
+    expect(optionInput().classList.contains("text-sm")).toBe(true);
+    expect(optionInput().classList.contains("text-base")).toBe(false);
+  });
 
   // audit: COADM01C-015
   // audit: COADM01C-017
@@ -1080,6 +1150,9 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
       expectBusy(false);
       expectNoTransfer();
       await expectMenuRequests(2);
+      // The reload's refusal marks the input as the first load's would, by the rendered message.
+      expect(readOut(optionInput())).toEqual(markedBy(INVALID_OPTION));
+      expect(danglingDescriptions()).toEqual([]);
     },
   );
 
@@ -1277,6 +1350,90 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
     await expectMenuRequests(2);
   });
+
+  // The replacement's accessibility wiring, which no audit row states: the option input names in
+  // `aria-describedby` only elements the screen renders. It has no hint, so it is described by
+  // nothing while unmarked. The invalid-option refusal (COADM01C-016), of a digits entry or of one
+  // the numeric field refuses, marks it invalid, described by its hidden field message, which
+  // repeats the row's text; the not-installed information, an invalid key and an edit of the
+  // entry leave it unmarked. The label follows the mark but keeps its colour, as COADM01C never
+  // recolours it.
+  it.each<{
+    state: string;
+    reach: () => Promise<void>;
+    expected: { invalid: string; described: { text: string; hidden: boolean }[] | null };
+  }>([
+    { state: "on entry", reach: async () => undefined, expected: UNMARKED },
+    {
+      state: "after ENTER with 99",
+      reach: () => enterUntil("99", "error", INVALID_OPTION),
+      expected: markedBy(INVALID_OPTION),
+    },
+    {
+      state: "after ENTER with the entry the numeric field refuses, 1.",
+      reach: () => enterUntil("1.", "error", INVALID_OPTION),
+      expected: markedBy(INVALID_OPTION),
+    },
+    {
+      state: "after ENTER with the not-installed option 6",
+      reach: () => enterUntil("6", "info", NOT_INSTALLED),
+      expected: UNMARKED,
+    },
+    {
+      state: "after an invalid key that follows an invalid option",
+      reach: async () => {
+        await enterUntil("99", "error", INVALID_OPTION);
+        fireEvent.keyDown(optionInput(), { key: "F5" });
+        await waitFor(() => {
+          expect(messageRow("error")?.textContent).toBe(INVALID_KEY_TEXT);
+        });
+      },
+      expected: UNMARKED,
+    },
+    {
+      state: "after the not-installed option that follows an invalid option",
+      reach: async () => {
+        await enterUntil("99", "error", INVALID_OPTION);
+        await enterUntil("6", "info", NOT_INSTALLED);
+      },
+      expected: UNMARKED,
+    },
+    {
+      state: "after an edit of the entry that follows an invalid option",
+      reach: async () => {
+        await enterUntil("99", "error", INVALID_OPTION);
+        fireEvent.change(optionInput(), { target: { value: "1" } });
+      },
+      expected: UNMARKED,
+    },
+  ])(
+    "describes the option input by rendered elements only, $state",
+    async ({ reach, expected }) => {
+      stubMenu(200, menu);
+      renderAdminMenu();
+      await loaded();
+      await reach();
+
+      await waitFor(() => {
+        expect(readOut(optionInput())).toEqual(expected);
+      });
+      expect(danglingDescriptions()).toEqual([]);
+      // The message row stays the one visible copy of the text that marks the input.
+      for (const { text } of expected.described ?? []) {
+        const visible = visibleCopies(text);
+        expect(visible).toHaveLength(1);
+        expect(messageRow("error")?.contains(visible[0] ?? null)).toBe(true);
+      }
+      const label = screen.getByText("Please select an option :");
+      expect(label.getAttribute("data-error")).toBe(expected.invalid);
+      expect(label.className.split(" ")).toEqual(
+        expect.arrayContaining(["text-foreground", "data-[error=true]:text-foreground"]),
+      );
+      expect(label.className).not.toContain("text-destructive");
+      expectNoTransfer();
+      await expectMenuRequests(1);
+    },
+  );
 });
 
 // CA00 entered without a COMMAREA transfers to whatever the uninitialised `CDEMO-TO-PROGRAM`

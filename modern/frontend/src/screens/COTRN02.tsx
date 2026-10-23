@@ -4,12 +4,12 @@ import { useForm, useFormContext, type Control, type FieldErrors } from "react-h
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn02cAdd } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
   Form,
-  FormControl,
   FormDescription,
   FormField,
   FormItem,
@@ -290,7 +290,8 @@ interface MapFieldProps {
  * field's `FormMessage`, which repeats the text of the error that marks the input invalid, is for
  * assistive technology only; being absolutely positioned, it takes no cell of the grid. The input
  * takes the shared map-field box (`fieldInputClass` with `size` = its `LENGTH`), so a full-length
- * value shows on the narrowest frame.
+ * value shows on the narrowest frame. The control names the hint only for a field the map gives
+ * one, and the message only while it shows, so every id an input names resolves.
  */
 function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
   const length = COTRN02_LENGTHS[input.name];
@@ -306,7 +307,7 @@ function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
             <FormLabel className={LABEL}>{label.text}</FormLabel>
           </GridCell>
           <GridCell row={label.row} col={input.col} span={length}>
-            <FormControl>
+            <FieldControl described={hint !== undefined}>
               <Input
                 {...field}
                 readOnly={readOnly}
@@ -327,7 +328,7 @@ function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
                 spellCheck={false}
                 className={fieldInputClass(length)}
               />
-            </FormControl>
+            </FieldControl>
           </GridCell>
           {hint !== undefined && (
             <GridCell row={hint.row} col={hint.col} span={hint.span}>

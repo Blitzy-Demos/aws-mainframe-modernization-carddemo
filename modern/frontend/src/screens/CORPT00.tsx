@@ -1,19 +1,13 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Fragment, useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCorpt00cSubmit } from "@/api/hooks";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 // The unserved-key text of CSMSG01Y is shared by every screen through the header module, so it
 // is imported rather than restated here.
@@ -36,6 +30,9 @@ import { CORPT00_LENGTHS, corpt00Schema, type Corpt00Values } from "@/schemas/CO
 
 /** The ten inputs of the map, in `POS` order, by their form names. */
 type Corpt00Field = keyof Corpt00Values;
+
+/** The map's three hints: the format of the start and of the end date, and the `(Y/N)`. */
+type HintName = "startDate" | "endDate" | "confirm";
 
 /**
  * Colour tokens of AAP 0.4.3 for the map's literals. TURQUOISE maps to the foreground and `BRT`
@@ -62,6 +59,8 @@ type InputSpec = {
    * `/`; the name says which part of which date the field holds.
    */
   readonly accessibleName?: string;
+  /** The hint read with the input as its description: its date's format, or the `(Y/N)`. */
+  readonly hint?: HintName;
   /** The literal bound to the input: its `POS`, `LENGTH`, `INITIAL` and colour classes. */
   readonly label: {
     readonly row: number;
@@ -74,9 +73,11 @@ type InputSpec = {
 
 /**
  * The map's inputs in field order (`modern/audit/screens.md` rows `CORPT00-012` to `CORPT00-038`),
- * each with the literal `screens.md` binds to it. The three report labels stand after their
- * selectors at column 15; `Start Date :`, `  End Date :` and the confirmation prompt stand before
- * their fields. The leading spaces of `  End Date :` are the map's and keep the colons aligned.
+ * each with the literal `screens.md` binds to it and the hint that describes it, if any: the six
+ * date parts their line's `(MM/DD/YYYY)`, the confirmation the `(Y/N)`. The three report labels
+ * stand after their selectors at column 15; `Start Date :`, `  End Date :` and the confirmation
+ * prompt stand before their fields. The leading spaces of `  End Date :` are the map's and keep
+ * the colons aligned.
  */
 const INPUTS: readonly InputSpec[] = [
   {
@@ -106,6 +107,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 29,
     numeric: true,
     accessibleName: "Start Date month",
+    hint: "startDate",
     label: { row: 13, col: 15, span: 12, text: "Start Date :", className: TURQUOISE },
   },
   {
@@ -114,6 +116,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 34,
     numeric: true,
     accessibleName: "Start Date day",
+    hint: "startDate",
     label: { row: 13, col: 32, span: 1, text: "/", className: BLUE },
   },
   {
@@ -122,6 +125,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 39,
     numeric: true,
     accessibleName: "Start Date year",
+    hint: "startDate",
     label: { row: 13, col: 37, span: 1, text: "/", className: BLUE },
   },
   {
@@ -130,6 +134,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 29,
     numeric: true,
     accessibleName: "End Date month",
+    hint: "endDate",
     label: { row: 14, col: 15, span: 12, text: "  End Date :", className: TURQUOISE },
   },
   {
@@ -138,6 +143,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 34,
     numeric: true,
     accessibleName: "End Date day",
+    hint: "endDate",
     label: { row: 14, col: 32, span: 1, text: "/", className: BLUE },
   },
   {
@@ -146,6 +152,7 @@ const INPUTS: readonly InputSpec[] = [
     col: 39,
     numeric: true,
     accessibleName: "End Date year",
+    hint: "endDate",
     label: { row: 14, col: 37, span: 1, text: "/", className: BLUE },
   },
   {
@@ -153,6 +160,7 @@ const INPUTS: readonly InputSpec[] = [
     row: 19,
     col: 66,
     numeric: false,
+    hint: "confirm",
     label: {
       row: 19,
       col: 6,
@@ -163,18 +171,54 @@ const INPUTS: readonly InputSpec[] = [
   },
 ];
 
-/** The literals bound to no input: the two date-format hints and the `(Y/N)` hint. */
+/**
+ * The literals that label no input: the date-format hint of each date line and the `(Y/N)` hint,
+ * at their `POS` and `LENGTH`. Each describes the inputs whose `hint` names it, whose
+ * `aria-describedby` names its id, and follows `after`, the last of those inputs, in the DOM, so
+ * the reading order keeps the map's lines; the grid places it by `POS` alone.
+ */
 const HINTS: readonly {
+  readonly name: HintName;
+  readonly after: Corpt00Field;
   readonly row: number;
   readonly col: number;
   readonly span: number;
   readonly text: string;
   readonly className: string;
 }[] = [
-  { row: 13, col: 46, span: 12, text: "(MM/DD/YYYY)", className: HINT_BLUE },
-  { row: 14, col: 46, span: 12, text: "(MM/DD/YYYY)", className: HINT_BLUE },
-  { row: 19, col: 69, span: 5, text: "(Y/N)", className: HINT_NEUTRAL },
+  {
+    name: "startDate",
+    after: "startYear",
+    row: 13,
+    col: 46,
+    span: 12,
+    text: "(MM/DD/YYYY)",
+    className: HINT_BLUE,
+  },
+  {
+    name: "endDate",
+    after: "endYear",
+    row: 14,
+    col: 46,
+    span: 12,
+    text: "(MM/DD/YYYY)",
+    className: HINT_BLUE,
+  },
+  {
+    name: "confirm",
+    after: "confirm",
+    row: 19,
+    col: 69,
+    span: 5,
+    text: "(Y/N)",
+    className: HINT_NEUTRAL,
+  },
 ];
+
+/** The hint that follows `input` in the DOM, the one whose `after` it is, if any. */
+function hintAfter(input: Corpt00Field): (typeof HINTS)[number] | undefined {
+  return HINTS.find((hint) => hint.after === input);
+}
 
 /**
  * Every input empty: the map as CORPT00C first sends it (`MOVE LOW-VALUES TO CORPT0AO`,
@@ -250,6 +294,8 @@ function focusTarget(field: string | null | undefined): Corpt00Field {
 export function CORPT00(): ReactNode {
   const navigate = useNavigate();
   const formId = useId();
+  // One prefix for the three hint ids, unique to this screen instance and stable across renders.
+  const hintIdPrefix = useId();
   const submit = useCorpt00cSubmit();
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
   const form = useForm<Corpt00Values>({
@@ -351,6 +397,11 @@ export function CORPT00(): ReactNode {
     );
   }
 
+  /** The id of the hint `name`, which the inputs it describes name in `aria-describedby`. */
+  function hintId(name: HintName): string {
+    return `${hintIdPrefix}-${name}-hint`;
+  }
+
   /** Shows the first schema message in map order; react-hook-form focuses that field. */
   function onInvalid(errors: FieldErrors<Corpt00Values>): void {
     release();
@@ -374,56 +425,74 @@ export function CORPT00(): ReactNode {
       <Form {...form}>
         <form id={formId} noValidate aria-busy={pending} onSubmit={onSubmit}>
           <FieldGrid>
-            {INPUTS.map((input) => (
-              <FormField
-                key={input.name}
-                control={form.control}
-                name={input.name}
-                render={({ field }) => (
-                  // `contents` lets the label's cell and the input's cell sit on the map grid
-                  // itself while the item still binds the label to the input. The message row is
-                  // the map's only visible message, so the field's own message, the schema's or
-                  // the server's, is for assistive technology only, read with the input it marks;
-                  // being `sr-only`, it takes no grid cell.
-                  <FormItem className="contents">
-                    <GridCell row={input.label.row} col={input.label.col} span={input.label.span}>
-                      <FormLabel className={input.label.className}>{input.label.text}</FormLabel>
+            {INPUTS.map((input) => {
+              const hint = hintAfter(input.name);
+              return (
+                <Fragment key={input.name}>
+                  <FormField
+                    control={form.control}
+                    name={input.name}
+                    render={({ field }) => (
+                      // `contents` lets the label's cell and the input's cell sit on the map grid
+                      // itself while the item still binds the label to the input. The message row
+                      // is the map's only visible message, so the field's own message, the
+                      // schema's or the server's, is for assistive technology only, read with the
+                      // input it marks; being `sr-only`, it takes no grid cell. The control names
+                      // the input's hint, which stands outside the item, and the message only
+                      // while it shows, so every id it names resolves.
+                      <FormItem className="contents">
+                        <GridCell
+                          row={input.label.row}
+                          col={input.label.col}
+                          span={input.label.span}
+                        >
+                          <FormLabel className={input.label.className}>
+                            {input.label.text}
+                          </FormLabel>
+                        </GridCell>
+                        <GridCell
+                          row={input.row}
+                          col={input.col}
+                          span={CORPT00_LENGTHS[input.name]}
+                        >
+                          {/*
+                           * The shared map-field box (`fieldInputClass` with `size` = the
+                           * `LENGTH`): a full-length value shows on the narrowest frame, and the
+                           * box still ends before the `/` or hint that follows it.
+                           */}
+                          <FieldControl
+                            hintIds={input.hint === undefined ? [] : [hintId(input.hint)]}
+                          >
+                            <Input
+                              {...field}
+                              className={fieldInputClass(CORPT00_LENGTHS[input.name])}
+                              size={CORPT00_LENGTHS[input.name]}
+                              maxLength={CORPT00_LENGTHS[input.name]}
+                              inputMode={input.numeric ? "numeric" : undefined}
+                              autoFocus={input.name === "monthly"}
+                              autoComplete="off"
+                              aria-label={input.accessibleName}
+                              readOnly={pending}
+                            />
+                          </FieldControl>
+                        </GridCell>
+                        <FormMessage className="sr-only" />
+                      </FormItem>
+                    )}
+                  />
+                  {/*
+                   * A hint follows the last input it describes, so a linear reading meets each
+                   * date's format after its year and the `(Y/N)` after the confirmation, as the
+                   * map's lines run.
+                   */}
+                  {hint !== undefined && (
+                    <GridCell row={hint.row} col={hint.col} span={hint.span}>
+                      <span id={hintId(hint.name)} className={hint.className}>{hint.text}</span>
                     </GridCell>
-                    <GridCell row={input.row} col={input.col} span={CORPT00_LENGTHS[input.name]}>
-                      {/*
-                       * The shared map-field box (`fieldInputClass` with `size` = the `LENGTH`):
-                       * a full-length value shows on the narrowest frame, and the box still ends
-                       * before the `/` or hint that follows it.
-                       */}
-                      <FormControl>
-                        <Input
-                          {...field}
-                          className={fieldInputClass(CORPT00_LENGTHS[input.name])}
-                          size={CORPT00_LENGTHS[input.name]}
-                          maxLength={CORPT00_LENGTHS[input.name]}
-                          inputMode={input.numeric ? "numeric" : undefined}
-                          autoFocus={input.name === "monthly"}
-                          autoComplete="off"
-                          aria-label={input.accessibleName}
-                          readOnly={pending}
-                        />
-                      </FormControl>
-                    </GridCell>
-                    <FormMessage className="sr-only" />
-                  </FormItem>
-                )}
-              />
-            ))}
-            {HINTS.map((hint) => (
-              <GridCell
-                key={`${hint.row}-${hint.col}`}
-                row={hint.row}
-                col={hint.col}
-                span={hint.span}
-              >
-                <span className={hint.className}>{hint.text}</span>
-              </GridCell>
-            ))}
+                  )}
+                </Fragment>
+              );
+            })}
           </FieldGrid>
         </form>
       </Form>

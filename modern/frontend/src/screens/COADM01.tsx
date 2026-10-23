@@ -4,9 +4,10 @@ import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCoadm01cAdminMenu } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 // The common invalid-key text of `CSMSG01Y` has one home for all 21 screens, beside the header
@@ -109,7 +110,9 @@ function enterOutcome(menu: components["schemas"]["MenuResponse"], option: strin
  * - First entry requests endpoint 3 once and shows its options, in table order, on lines 6 to 17;
  *   the lines without an option stay blank (COADM01C-003, COADM01C-005).
  * - ENTER and every other key are served from that response, with no further request. Each key
- *   replaces the message of the one before (COADM01C-004).
+ *   replaces the message of the one before (COADM01C-004). An invalid option marks the option
+ *   input invalid, described by the row's text, until an edit of the entry re-validates it or
+ *   the next key decides again.
  * - ENTER after a failed load, the reload on a return to `/admin` included, requests endpoint 3
  *   again with the keyboard locked as for the first load. Its table decides the entry ENTER
  *   carried, as above, and replaces the failure's message; a new failure, the gate's included,
@@ -191,6 +194,21 @@ export function COADM01(): ReactNode {
   }
 
   /**
+   * The menu sent again with `message` by ENTER, decided from the option table. An error is the
+   * invalid-option refusal, which marks the input invalid with the row's text for its `sr-only`
+   * field message, replacing any schema issue; the not-installed information leaves the input
+   * unmarked.
+   */
+  function stay(message: ShellMessage): void {
+    sendAgain(message);
+    if (message.kind === "error") {
+      form.setError("option", { type: "server", message: message.text });
+    } else {
+      form.clearErrors("option");
+    }
+  }
+
+  /**
    * ENTER served from the option table: `serve` decides from the table the screen holds, or, after
    * a failed load, from the table endpoint 3 answers when it is requested again. A new failure
    * shows its own message, the gate's included. `refetch` settles with the query's result and
@@ -232,7 +250,7 @@ export function COADM01(): ReactNode {
       }
       // `MOVE WS-OPTION TO OPTIONO`: the input shows the two-digit option it was read as.
       form.setValue("option", option);
-      sendAgain(outcome.message);
+      stay(outcome.message);
     });
   }
 
@@ -242,7 +260,7 @@ export function COADM01(): ReactNode {
    */
   function onRefusedEntry(): void {
     onTable((table) => {
-      sendAgain({ kind: "error", text: table.invalid_option_message });
+      stay({ kind: "error", text: table.invalid_option_message });
     });
   }
 
@@ -253,6 +271,8 @@ export function COADM01(): ReactNode {
       form.setValue("option", justified(entry));
     }
     sendAgain({ kind: "error", text: INVALID_KEY });
+    // The key, not the option, is in error: the input loses the mark of an earlier ENTER.
+    form.clearErrors("option");
   }
 
   const loadError = menuQuery.error?.message;
@@ -319,20 +339,30 @@ export function COADM01(): ReactNode {
               control={form.control}
               name="option"
               render={({ field }) => (
-                // `contents` lets the label and the input each take their own map position.
+                // `contents` lets the label and the input each take their own map position. The
+                // message row is the map's one visible message, so the field's own message is for
+                // assistive technology only, read with the input it marks. It is the item's direct
+                // child, not a cell's: being `sr-only`, it takes no grid cell, and as a grid item
+                // it is placed at the grid's origin, inside the screen. The option has no hint, so
+                // its control names no description.
                 <FormItem className="contents">
                   <GridCell row={20} col={15} span={25}>
-                    {/* `h-full` centres the text on the line, level with the input's text. */}
-                    <FormLabel className="h-full whitespace-pre font-semibold text-foreground">
+                    {/*
+                     * `h-full` centres the text on the line, level with the input's text. COADM01C
+                     * never recolours the literal, so the label keeps its colour while the option
+                     * is in error.
+                     */}
+                    <FormLabel className="h-full whitespace-pre font-semibold text-foreground data-[error=true]:text-foreground">
                       Please select an option :
                     </FormLabel>
                   </GridCell>
                   <GridCell row={20} col={41} span={COADM01_LENGTHS.option}>
-                    <FormControl>
+                    <FieldControl>
                       {/*
-                       * Two grid columns are narrower than two digits and the input's padding, so
-                       * the box is sized by its map LENGTH (`size`) and extends over the empty
-                       * columns after the field.
+                       * Two grid columns can be narrower than two digits and the input's padding,
+                       * so the box is the shared field box of its map LENGTH (`fieldBox`), never
+                       * narrower than its two digits, and extends over the empty column after the
+                       * field.
                        */}
                       <Input
                         {...field}
@@ -343,10 +373,11 @@ export function COADM01(): ReactNode {
                         inputMode="numeric"
                         autoComplete="off"
                         autoFocus
-                        className="w-auto"
+                        className={fieldBox(COADM01_LENGTHS.option)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />

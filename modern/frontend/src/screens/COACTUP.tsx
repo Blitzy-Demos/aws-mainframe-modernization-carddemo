@@ -7,9 +7,10 @@ import {
   type FieldErrors,
 } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
+import { cn } from "cn";
 import { useCoactupcFetch, useCoactupcSave } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -442,19 +443,25 @@ const MAP_INPUTS: readonly MapInput[] = [...ACCOUNT_INPUTS, ...CUSTOMER_INPUTS];
 /*
  * TURQUOISE literals and the DEFAULT-colour separators take the foreground token (AAP 0.4.3);
  * `whitespace-pre` keeps the literals' inner and trailing spaces, and `h-7` centres them on the
- * height of the inputs beside them.
+ * height of the inputs beside them. COACTUPC recolours a field, never its literal (COACTUPC-081),
+ * so a label keeps the foreground while its field is in error.
  */
-const LABEL_CLASS = "h-7 whitespace-pre text-foreground";
+const LABEL_CLASS = "h-7 whitespace-pre text-foreground data-[error=true]:text-foreground";
 
 /*
- * BLITZY [LAYOUT]: the Input's `h-9` and `px-3` are overridden with `h-7` and `px-1`, and its
- * `w-full min-w-0` with `w-auto min-w-full` beside `size` = LENGTH, so each box is as wide as its
- * map LENGTH of characters or its grid cell, whichever is wider: a 1- or 2-column cell of the
- * 80-column grid is narrower than the characters it holds.
+ * The class of an input of `length` characters. The field a response names is shown red, its
+ * text and a blank field's `*` included (COACTUPC-081), through the `aria-invalid` its
+ * `FormControl` sets.
+ * BLITZY [LAYOUT]: each input has the shared field box of its map LENGTH (`fieldBox`), as wide as
+ * its grid cell or its LENGTH of characters, whichever is wider: a 1- or 2-column cell of the
+ * 80-column grid is narrower than the characters it holds, and the box ends before the `-`
+ * separator or literal after it.
  * BLITZY [A11Y]: the Input's default focus ring (`ring-ring/50`) measures about 1.5:1 against the
  * card, below the 3:1 of WCAG 1.4.11. Kept as the system token; flagged for designer review.
  */
-const INPUT_CLASS = "h-7 w-auto min-w-full px-1 py-0";
+function inputClass(length: number): string {
+  return cn(fieldBox(length), "aria-invalid:text-destructive");
+}
 
 /**
  * How the screen replaces the form values. `keepFieldsRef` keeps the inputs registered, so the
@@ -818,7 +825,8 @@ type MapFieldProps = {
 /**
  * One input of the map and the literal bound to it, each in its own `GridCell`. The `FormItem`
  * is `display: contents`, so both cells are items of the screen's `FieldGrid` while the label
- * stays bound to the input and turns red with it when a response names the field (COACTUPC-081).
+ * stays bound to the input. When a response names the field, the input turns red and the label
+ * keeps its colour (COACTUPC-081).
  */
 function MapField({ control, input, readOnly }: MapFieldProps): ReactNode {
   return (
@@ -872,7 +880,7 @@ function FieldInput({ field, input, readOnly }: FieldInputProps): ReactNode {
           autoComplete="off"
           spellCheck={false}
           aria-label={input.ariaLabel}
-          className={INPUT_CLASS}
+          className={inputClass(length)}
         />
       </FormControl>
       <FormDescription className="sr-only">{fieldDescription(input.name)}</FormDescription>

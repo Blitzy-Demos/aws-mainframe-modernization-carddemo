@@ -39,13 +39,14 @@ const CARDS_EDIT = "GET /api/v1/cards/edit";
 const CARD_PUT = `PUT /api/v1/cards/${CARD_REF}`;
 
 /**
- * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
- * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
- * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
- * contract imports no module beside the screen, the session, the routes and the generated types,
- * so a box is checked against this list rather than against the constant that renders it.
+ * The classes of the shared map-field box COCRDUP takes, FieldGrid's `fieldBox`: the box fills its
+ * cell (`w-full`) and is never narrower than its LENGTH of characters (`min-w-(--field-width)`,
+ * set per LENGTH by a `field-length-*` class), with the shared `h-7` height and `px-0.5` inset and
+ * the inputs' `text-sm` type size. Restated here because the render-test contract imports no
+ * module beside the screen, the session, the routes and the generated types, so a box is checked
+ * against this list rather than against the function that renders it.
  */
-const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+const MAP_FIELD_BOX = ["h-7", "w-full", "min-w-(--field-width)", "px-0.5", "text-sm"] as const;
 
 /** COCRDUPC `3250-SETUP-INFOMSG`: the info line of each state (`COCRDUPC.md`). */
 const INFO_SEARCH = "Please enter Account and Card Number";
@@ -832,6 +833,28 @@ describe("COCRDUP rendering", () => {
     expectNoFullCardDigits();
   });
 
+  it.each([
+    { label: LABELS.account, length: 11 },
+    { label: LABELS.card, length: 16 },
+    { label: LABELS.name, length: 50 },
+    { label: LABELS.status, length: 1 },
+    { label: LABELS.month, length: 2 },
+    { label: LABELS.year, length: 4 },
+  ])(
+    "the input of $label is the shared text-sm field box of LENGTH $length",
+    async ({ label, length }) => {
+      stubApi({});
+      renderScreen();
+      await settle();
+
+      const box = field(label);
+      expect(box.maxLength).toBe(length);
+      expect(box.classList.contains(`field-length-${length}`)).toBe(true);
+      expect(box.classList.contains("text-sm")).toBe(true);
+      expect(box.classList.contains("text-base")).toBe(false);
+    },
+  );
+
   /** The account and `card_ref` a card-list visit leaves in the route state. */
   const listKeys = { acct_id: ACCT_ID, card_ref: CARD_REF };
   /** COCRDUPC-001: the empty search screen, with nothing sent. */
@@ -947,34 +970,33 @@ describe("COCRDUP rendering", () => {
   // jsdom has no layout: these are the classes that place each literal and box on its line, and
   // the browser measures the geometry they give.
   it.each([
-    { name: "ACCTSID", label: LABELS.account, glyphWide: false, short: false, size: "11" },
-    { name: "CARDSID", label: LABELS.card, glyphWide: false, short: false, size: "16" },
-    { name: "CRDNAME", label: LABELS.name, glyphWide: false, short: false, size: "50" },
-    { name: "CRDSTCD", label: LABELS.status, glyphWide: false, short: true, size: "1" },
-    { name: "EXPMON", label: LABELS.month, glyphWide: false, short: true, size: "2" },
-    { name: "EXPYEAR", label: LABELS.year, glyphWide: true, short: false, size: "4" },
+    { name: "ACCTSID", label: LABELS.account, glyphWide: false, size: "11" },
+    { name: "CARDSID", label: LABELS.card, glyphWide: false, size: "16" },
+    { name: "CRDNAME", label: LABELS.name, glyphWide: false, size: "50" },
+    { name: "CRDSTCD", label: LABELS.status, glyphWide: false, size: "1" },
+    { name: "EXPMON", label: LABELS.month, glyphWide: false, size: "2" },
+    { name: "EXPYEAR", label: LABELS.year, glyphWide: true, size: "4" },
   ])(
     "the literal '$label' of $name centres beside its input, and both boxes fit their text",
-    async ({ label, glyphWide, short, size }) => {
+    async ({ label, glyphWide, size }) => {
       stubApi({});
       renderScreen();
       await settle();
 
-      // The label is as tall as the line, which the 36px input sets, and centres its text in it.
+      // The label is as tall as the line, which the 28px input sets, and centres its text in it.
       // The one-column `/` keeps a box as wide as its glyph instead of its cell's, inset clear of
-      // the month box that grows to its value.
+      // the month box, which is as wide as its two characters.
       const literal = screen.getByText(label, { ...exactText, selector: "label" });
       expect(literal.classList.contains("h-full")).toBe(true);
       expect(literal.classList.contains("items-center")).toBe(true);
       expect(literal.classList.contains("min-w-max")).toBe(glyphWide);
       expect(literal.classList.contains("pl-1")).toBe(glyphWide);
 
-      // The input is the shared map-field box sized to its value (`size` is the fallback): a
-      // field of one or two characters takes the `w-6` short box, a longer one fills its cell.
+      // The input is the shared map-field box of its LENGTH: it fills its cell and is never
+      // narrower than its characters, whatever the LENGTH, and `size` states the LENGTH.
       const input = field(label);
       expect(MAP_FIELD_BOX.filter((name) => !input.classList.contains(name))).toEqual([]);
-      expect(input.classList.contains("w-6")).toBe(short);
-      expect(input.classList.contains("w-full")).toBe(!short);
+      expect(input.classList.contains(`field-length-${size}`)).toBe(true);
       expect(input.getAttribute("size")).toBe(size);
     },
   );
@@ -1943,6 +1965,25 @@ describe("COCRDUP messages", () => {
     },
   );
 
+  it("shows the field a search error names red, its * included, while its label keeps its colour", async () => {
+    stubApi({ [CARDS_EDIT]: [{ status: 400, body: accountMissing }] });
+    renderScreen();
+    typeSearchKeys("", "");
+
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(errorText()).toBe(accountMissing.message);
+    });
+    const account = field(LABELS.account);
+    expect(account.value).toBe("*");
+    expect(account.getAttribute("aria-invalid")).toBe("true");
+    expect(account.classList.contains("aria-invalid:text-destructive")).toBe(true);
+    const label = screen.getByText(LABELS.account, exactText);
+    expect(label.getAttribute("data-error")).toBe("true");
+    expect(label.classList.contains("data-[error=true]:text-foreground")).toBe(true);
+    expect(label.classList.contains("data-[error=true]:text-destructive")).toBe(false);
+  });
+
   /**
    * The 500 of a failed card read (COCRDUPC-019): `WS-FILE-ERROR-MESSAGE` in its 75 bytes, the
    * RESP and RESP2 fields left blank, as their values are halted (COCRDUPC-047).
@@ -2172,6 +2213,159 @@ describe("COCRDUP messages", () => {
     expect(infoText()).toBe(INFO_SHOWN);
   });
 });
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: its `aria-invalid` and what describes it. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads the input `label` labels: its `aria-invalid`, and the element
+ * each id of its `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for
+ * an id that resolves to nothing). `described` is `null` when it has no `aria-describedby`.
+ */
+function readOut(label: string): ReadOut {
+  const input = field(label);
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/**
+ * An input as assistive technology reads it: unmarked, valid and described by nothing, as no
+ * input of the map has a hint; or marked by `message`, invalid and described by its hidden
+ * field message.
+ */
+function readOutOf(message: string | undefined): ReadOut {
+  return message === undefined
+    ? { invalid: "false", described: null }
+    : { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
+// The replacement's accessibility wiring, which no audit row states: the six inputs, the search
+// keys and the details, enterable or protected, name in `aria-describedby` only elements the
+// screen renders. None has a hint, so each is described by nothing while valid; the field an
+// error names, the server's or the schema's, is invalid and described by its hidden field
+// message, which repeats the error row's text (`expectFieldMessage` checks the one visible copy).
+describe("COCRDUP input descriptions", () => {
+  it.each<{
+    state: string;
+    fetched: { status: number; body: unknown };
+    puts: { status: number; body: unknown }[];
+    reach: () => Promise<void>;
+    marks: { readonly [name in keyof typeof LABELS]?: string };
+  }>([
+    {
+      state: "on entry from the menu",
+      fetched: { status: 200, body: view },
+      puts: [],
+      reach: async () => {
+        renderScreen();
+        await settle();
+      },
+      marks: {},
+    },
+    {
+      state: "after the 400 of a blank account",
+      fetched: { status: 400, body: accountMissing },
+      puts: [],
+      reach: async () => {
+        renderScreen();
+        fireEvent.click(key("ENTER=Process"));
+        await waitFor(() => {
+          expect(errorText()).toBe(accountMissing.message);
+        });
+      },
+      marks: { account: accountMissing.message },
+    },
+    {
+      state: "with the card shown from the list",
+      fetched: { status: 200, body: view },
+      puts: [],
+      reach: showFromList,
+      marks: {},
+    },
+    {
+      state: "after the 400 of a blank name",
+      fetched: { status: 200, body: view },
+      puts: [{ status: 400, body: nameMissing }],
+      reach: async () => {
+        await showFromList();
+        await failNameEdit();
+        await waitFor(() => {
+          expect(errorText()).toBe(nameMissing.message);
+        });
+      },
+      marks: { name: nameMissing.message },
+    },
+    {
+      state: "after the schema refuses a name over its 50 characters",
+      fetched: { status: 200, body: view },
+      puts: [],
+      reach: async () => {
+        await showFromList();
+        fireEvent.change(field(LABELS.name), { target: { value: "A".repeat(51) } });
+        fireEvent.click(key("ENTER=Process"));
+        await waitFor(() => {
+          expect(errorText()).toBe("String must contain at most 50 character(s)");
+        });
+      },
+      marks: { name: "String must contain at most 50 character(s)" },
+    },
+    {
+      state: "with the changes validated and every field protected",
+      fetched: { status: 200, body: view },
+      puts: [{ status: 200, body: validated }],
+      reach: async () => {
+        await showFromList();
+        await validate();
+      },
+      marks: {},
+    },
+  ])(
+    "describes each input by rendered elements only, $state",
+    async ({ fetched, puts, reach, marks }) => {
+      stubApi({ [CARDS_EDIT]: [fetched], [CARD_PUT]: puts });
+      await reach();
+
+      const marked = new Map<string, string>(Object.entries(marks));
+      const inputs = Object.entries(LABELS);
+      await waitFor(() => {
+        expect(Object.fromEntries(inputs.map(([name, label]) => [name, readOut(label)]))).toEqual(
+          Object.fromEntries(inputs.map(([name]) => [name, readOutOf(marked.get(name))])),
+        );
+      });
+      expect(danglingDescriptions()).toEqual([]);
+      for (const [name, label] of inputs) {
+        const message = marked.get(name);
+        if (message !== undefined) {
+          expectFieldMessage(label, message);
+        }
+      }
+    },
+  );
+});
+
 
 // Every endpoint 10 request carries the stored session's token, and none a query: the path's
 // `card_ref` alone names the card.

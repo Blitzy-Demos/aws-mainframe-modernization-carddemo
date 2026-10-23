@@ -1,9 +1,10 @@
 import { createContext, useContext, useId, useLayoutEffect, useMemo, type ReactNode } from "react";
+import { cn } from "cn";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { TITLE01, TITLE02, formatHeaderDate, formatHeaderTime } from "@/lib/header";
-import { GridCell } from "./FieldGrid";
+import { GridCell, fieldBox } from "./FieldGrid";
 import { MessageLine, type MessageKind } from "./MessageLine";
 import { PfKeyBar, type PfKeyBarProps } from "./PfKeyBar";
 
@@ -116,19 +117,21 @@ type HeaderCell = {
  * expressed as emphasis on the foreground. The value fields are BLUE on the map, snapped by role
  * to the foreground token of value fields.
  *
- * Each value is a read-only `Input` as wide as its `LENGTH` (`size`, so `w-auto` replaces the
- * input's full width) at its `POS` column: a grid column is narrower than a character at some
- * widths and wider at others, so a box filling its cell would cut a value or stretch past it.
- * `h-full` centres each label on its line beside the boxes; `whitespace-pre` keeps its spacing.
+ * Each value is a read-only `Input` in the shared field box of `fieldBox`, with the classes below
+ * merged after it: the box fills its `POS` cell and is never narrower than its `LENGTH` of
+ * characters, so a value is never cut where a grid column is narrower than a character, and the
+ * box ends before the next literal. `size` still states the `LENGTH`. `h-full` centres each label
+ * on its line beside the boxes; `whitespace-pre` keeps its spacing.
  *
  * `TITLE01` and `TITLE02` keep the padding that centres them in their 40 characters
- * (`app/cpy/COTTL01Y.cpy:18-22`). Their 40-character box is centred in its 40-column cell
- * (`block mx-auto`), which keeps the titles centred on the screen as the padded fields are on the
- * terminal, instead of drifting left of the screen title.
+ * (`app/cpy/COTTL01Y.cpy:18-22`). Their box is exactly 40 characters wide (`w-(--field-width)`
+ * replaces the box's full width) and centred in its 40-column cell (`block mx-auto`), which keeps
+ * the titles centred on the screen as the padded fields are on the terminal, instead of drifting
+ * left of the screen title.
  */
 const LABEL = "h-full whitespace-pre text-muted-foreground";
-const VALUE = "w-auto text-foreground";
-const TITLE = "mx-auto block w-auto font-semibold text-foreground";
+const VALUE = "text-foreground";
+const TITLE = "mx-auto block w-(--field-width) font-semibold text-foreground";
 
 /** The accessible names of the two titles, which no map literal labels. */
 const TITLE01_NAME = "Title row 1";
@@ -289,8 +292,9 @@ export function ScreenShell({
 
   return (
     // The 80 columns need a minimum width (`min-w-3xl`); below it the page scrolls sideways
-    // rather than overlapping fields. Above `max-w-7xl` the frame stops widening and is centred.
-    <main className="mx-auto w-full max-w-7xl overflow-x-auto p-4">
+    // rather than overlapping fields. The side padding starts at `lg`, so the minimum-width frame
+    // fits a 768px viewport whole. Above `max-w-7xl` the frame stops widening and is centred.
+    <main className="mx-auto w-full max-w-7xl overflow-x-auto py-4 lg:px-4">
       <a href={`#${bodyId}`} className="sr-only underline focus-visible:not-sr-only">
         Skip to main content
       </a>
@@ -322,7 +326,7 @@ export function ScreenShell({
                     tabIndex={-1}
                     value={values[cell.field]}
                     size={cell.span}
-                    className={cell.className}
+                    className={cn(fieldBox(cell.span), cell.className)}
                   />
                 )}
               </GridCell>

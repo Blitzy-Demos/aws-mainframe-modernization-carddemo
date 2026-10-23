@@ -12,10 +12,18 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCobil00cPay } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import {
+  Form,
+  FormDescription,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 // The shared `CSMSG01Y` texts of the frontend live in `@/lib/header`, one source for all screens.
@@ -296,7 +304,9 @@ export function COBIL00(): ReactNode {
           setMessage({ text: error.message, kind: "error" });
           const field = fieldOf(error.field);
           if (field !== undefined) {
-            // The named input is marked invalid; its text stays in the map's one message row.
+            // The named input is marked invalid with the row's text, which its `sr-only`
+            // `FormMessage` repeats for assistive technology; the message row stays the map's
+            // one visible message.
             setError(field, { type: "server", message: error.message });
             setFocus(field);
           }
@@ -335,13 +345,18 @@ export function COBIL00(): ReactNode {
               control={form.control}
               name="acctId"
               render={({ field }) => (
-                // `contents` lets the label and the input sit in their own grid cells.
+                // `contents` lets the label and the input sit in their own grid cells. The message
+                // row is the map's one visible message, so the field's own message, the schema's
+                // or the server's, is for assistive technology only, read with the input it
+                // marks. It is the item's direct child, not a cell's: being `sr-only`, it takes no
+                // grid cell, and as a grid item it is placed at the grid's origin, inside the
+                // screen. The account has no hint, so its control names no description.
                 <FormItem className="contents">
                   <GridCell row={6} col={6} span={ACCT_LABEL.length}>
                     <FormLabel className={LABEL_CLASS}>{ACCT_LABEL}</FormLabel>
                   </GridCell>
                   <GridCell row={6} col={21} span={COBIL00_LENGTHS.acctId}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COBIL00_LENGTHS.acctId}
@@ -352,8 +367,9 @@ export function COBIL00(): ReactNode {
                         readOnly={pending}
                         className={ACCT_CLASS}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -382,12 +398,15 @@ export function COBIL00(): ReactNode {
               control={form.control}
               name="confirm"
               render={({ field }) => (
+                // As the account's item, with the map's `(Y/N)` hint in its own cell as the
+                // item's `FormDescription`, which the confirmation's control names. `TEXT_CLASS`
+                // replaces the description's muted colour with the NEUTRAL foreground.
                 <FormItem className="contents">
                   <GridCell row={15} col={6} span={CONFIRM_LABEL.length}>
                     <FormLabel className={LABEL_CLASS}>{CONFIRM_LABEL}</FormLabel>
                   </GridCell>
                   <GridCell row={15} col={60} span={COBIL00_LENGTHS.confirm}>
-                    <FormControl>
+                    <FieldControl described>
                       <Input
                         {...field}
                         maxLength={COBIL00_LENGTHS.confirm}
@@ -397,14 +416,15 @@ export function COBIL00(): ReactNode {
                         readOnly={pending}
                         className={CONFIRM_CLASS}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <GridCell row={15} col={63} span={CONFIRM_HINT.length}>
+                    <FormDescription className={TEXT_CLASS}>{CONFIRM_HINT}</FormDescription>
+                  </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
-            <GridCell row={15} col={63} span={CONFIRM_HINT.length}>
-              <span className={TEXT_CLASS}>{CONFIRM_HINT}</span>
-            </GridCell>
           </FieldGrid>
         </form>
       </Form>

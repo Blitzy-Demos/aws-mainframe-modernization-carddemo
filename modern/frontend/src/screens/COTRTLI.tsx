@@ -13,6 +13,7 @@ import { useNavigate } from "react-router";
 import { cn } from "cn";
 import { useCotrtlicList, useCotrtlicListActions } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import {
   FIELD_INPUT,
   FieldGrid,
@@ -24,14 +25,7 @@ import {
 } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -589,7 +583,12 @@ export function COTRTLI(): ReactNode {
                     <FormLabel className={LINE_LABEL}>Type Filter:</FormLabel>
                   </GridCell>
                   <GridCell row={6} col={44} span={COTRTLI_LENGTHS.typeFilter}>
-                    <FormControl>
+                    {/*
+                     * No input of the map has a hint, so each control names only its field's
+                     * message, while that shows text: a filter the page puts in error with no
+                     * message is marked invalid and described by nothing.
+                     */}
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COTRTLI_LENGTHS.typeFilter}
@@ -604,9 +603,15 @@ export function COTRTLI(): ReactNode {
                           filtersLocked && "text-muted-foreground",
                         )}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  {/*
+                   * For assistive technology only: the error line is the visible message. Each
+                   * filter's message is its item's direct child rather than a cell's: an `sr-only`
+                   * grid item takes no cell and sits at the grid's origin, while one in a cell
+                   * past the edge of a narrow viewport would widen the page.
+                   */}
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -620,7 +625,7 @@ export function COTRTLI(): ReactNode {
                     <FormLabel className={LINE_LABEL}>Description Filter:</FormLabel>
                   </GridCell>
                   <GridCell row={8} col={25} span={COTRTLI_LENGTHS.descFilter}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COTRTLI_LENGTHS.descFilter}
@@ -634,9 +639,9 @@ export function COTRTLI(): ReactNode {
                           filtersLocked && "text-muted-foreground",
                         )}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -700,7 +705,7 @@ export function COTRTLI(): ReactNode {
                             name={`rows.${index}.selection`}
                             render={({ field }) => (
                               <FormItem>
-                                <FormControl>
+                                <FieldControl>
                                   <Input
                                     {...field}
                                     aria-label={`Select ${name}`}
@@ -715,7 +720,7 @@ export function COTRTLI(): ReactNode {
                                       "aria-invalid:text-destructive",
                                     )}
                                   />
-                                </FormControl>
+                                </FieldControl>
                                 <FormMessage className="sr-only" />
                               </FormItem>
                             )}
@@ -730,7 +735,7 @@ export function COTRTLI(): ReactNode {
                             name={`rows.${index}.description`}
                             render={({ field }) => (
                               <FormItem>
-                                <FormControl>
+                                <FieldControl>
                                   <Input
                                     {...field}
                                     aria-label={`Description ${name}`}
@@ -741,7 +746,7 @@ export function COTRTLI(): ReactNode {
                                     tabIndex={descriptionOpen ? undefined : -1}
                                     className={cn(FIELD_INPUT, "aria-invalid:text-destructive")}
                                   />
-                                </FormControl>
+                                </FieldControl>
                                 <FormMessage className="sr-only" />
                               </FormItem>
                             )}

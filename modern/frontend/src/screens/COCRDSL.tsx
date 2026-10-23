@@ -11,12 +11,14 @@ import {
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
+import { cn } from "cn";
 import { errorStatus, useCocrdslcView } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { KEY_ROWS, keyRowItems } from "@/lib/pfkeys";
@@ -66,27 +68,13 @@ const KNOWN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
 const LABEL_CLASS = "h-full whitespace-pre text-foreground";
 
 /**
- * Every field box is as wide as its `LENGTH` (`size`), at the field's `POS` column, instead of
- * filling its cell: at wide viewports a grid column is wider than a character, and the 1-, 2-
- * and 4-column cells of the outputs are narrower than the characters they must show.
+ * The class of a field box of `length` characters (its map `LENGTH`): the shared field box of
+ * `fieldBox`, at the field's `POS` column, which fills its cell and is never narrower than its
+ * characters, so the 1-, 2- and 4-column outputs show whole and the month box ends before the `/`
+ * at column 28 at every column pitch. Its text is red once the response marks it (COCRDSLC-027).
  */
-const FIELD_CLASS = "w-auto";
-
-/**
- * The status, month and year boxes fit their characters exactly (`field-sizing-content`, with a
- * `size` fallback where it is unsupported) on a narrow padding, and keep their width when empty
- * through the nearest `min-w` step. Sized by `size` alone, Chrome widens a box by the font's
- * widest glyph, and below about 1024px the month box would run over the `/` at column 28.
- */
-const SHORT_FIELD_CLASS = {
-  status: "w-auto min-w-4 px-0.5 field-sizing-content",
-  month: "w-auto min-w-6 px-0.5 field-sizing-content",
-  year: "w-auto min-w-10 px-0.5 field-sizing-content",
-} as const;
-
-/** The class of an input box: red text once the response marks it (COCRDSLC-027). */
-function inputClass(marked: boolean): string {
-  return marked ? `${FIELD_CLASS} text-destructive` : FIELD_CLASS;
+function inputClass(length: number, marked = false): string {
+  return cn(fieldBox(length), marked && "text-destructive");
 }
 
 /** A member of the route state, which is whatever the navigating screen passed. */
@@ -409,6 +397,8 @@ export function COCRDSL(): ReactNode {
 
   const view = display.view;
   const expiry = expiryParts(view?.expiration_date);
+  // The error row's text, which also describes each input it marks.
+  const errorText = display.message ?? "";
 
   return (
     <ScreenShell
@@ -437,6 +427,14 @@ export function COCRDSL(): ReactNode {
            * as empty space; `gap-y-2` keeps the blank lines visible between the field groups.
            */}
           <FieldGrid className="grid-rows-none gap-y-2">
+            {/*
+             * The error row is the map's one visible message, so an input's own message is for
+             * assistive technology only, read with the input it marks: the schema's message, or
+             * the row's text for a mark the screen keeps outside react-hook-form. It is the
+             * item's direct child, not a cell's: being `sr-only`, it takes no grid cell, and as a
+             * grid item it is placed at the grid's origin, inside the screen. The inputs have no
+             * hint, so their controls name no description.
+             */}
             <FormField
               control={form.control}
               name="acctId"
@@ -446,7 +444,7 @@ export function COCRDSL(): ReactNode {
                     <FormLabel className={LABEL_CLASS}>{LABELS.acctId}</FormLabel>
                   </GridCell>
                   <GridCell row={7} col={45} span={COCRDSL_LENGTHS.acctId}>
-                    <FormControl>
+                    <FieldControl messaged={display.acctMarked && errorText !== ""}>
                       <Input
                         {...field}
                         data-field="ACCTSID"
@@ -457,10 +455,13 @@ export function COCRDSL(): ReactNode {
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.acctMarked || fieldState.invalid}
-                        className={inputClass(display.acctMarked)}
+                        className={inputClass(COCRDSL_LENGTHS.acctId, display.acctMarked)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only">
+                    {display.acctMarked ? errorText : undefined}
+                  </FormMessage>
                 </FormItem>
               )}
             />
@@ -473,7 +474,7 @@ export function COCRDSL(): ReactNode {
                     <FormLabel className={LABEL_CLASS}>{LABELS.cardNum}</FormLabel>
                   </GridCell>
                   <GridCell row={8} col={45} span={COCRDSL_LENGTHS.cardNum}>
-                    <FormControl>
+                    <FieldControl messaged={display.cardMarked && errorText !== ""}>
                       <Input
                         {...field}
                         data-field="CARDSID"
@@ -483,10 +484,13 @@ export function COCRDSL(): ReactNode {
                         autoComplete="off"
                         spellCheck={false}
                         aria-invalid={display.cardMarked || fieldState.invalid}
-                        className={inputClass(display.cardMarked)}
+                        className={inputClass(COCRDSL_LENGTHS.cardNum, display.cardMarked)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only">
+                    {display.cardMarked ? errorText : undefined}
+                  </FormMessage>
                 </FormItem>
               )}
             />
@@ -503,7 +507,7 @@ export function COCRDSL(): ReactNode {
                 readOnly
                 value={view?.embossed_name ?? ""}
                 size={OUTPUT_LENGTHS.name}
-                className={FIELD_CLASS}
+                className={inputClass(OUTPUT_LENGTHS.name)}
               />
             </GridCell>
 
@@ -519,7 +523,7 @@ export function COCRDSL(): ReactNode {
                 readOnly
                 value={view?.status ?? ""}
                 size={OUTPUT_LENGTHS.status}
-                className={SHORT_FIELD_CLASS.status}
+                className={inputClass(OUTPUT_LENGTHS.status)}
               />
             </GridCell>
 
@@ -535,7 +539,7 @@ export function COCRDSL(): ReactNode {
                 readOnly
                 value={expiry.month}
                 size={OUTPUT_LENGTHS.month}
-                className={SHORT_FIELD_CLASS.month}
+                className={inputClass(OUTPUT_LENGTHS.month)}
               />
             </GridCell>
             <GridCell row={15} col={28} span={1}>
@@ -552,7 +556,7 @@ export function COCRDSL(): ReactNode {
                 readOnly
                 value={expiry.year}
                 size={OUTPUT_LENGTHS.year}
-                className={SHORT_FIELD_CLASS.year}
+                className={inputClass(OUTPUT_LENGTHS.year)}
               />
             </GridCell>
           </FieldGrid>

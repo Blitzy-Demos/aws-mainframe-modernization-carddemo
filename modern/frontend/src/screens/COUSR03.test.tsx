@@ -38,6 +38,11 @@ const FAILING_ID = "LOCK0001";
 const VANISHED_ID = "GONE0001";
 /** A user ID whose delete the admin gate refuses. */
 const REFUSED_ID = "DENY0001";
+/**
+ * A user ID whose read fails with a `ScreenError` naming `user_type`. No audited reply of
+ * endpoint 18 names that field, but `ScreenError.field` may, and the screen then marks USRTYPE.
+ */
+const TYPE_MARKED_ID = "TYPE0001";
 
 /** The route state of a COUSR00 `D` selection of {@link SELECTED_ID}, as COUSR00 sends it. */
 const FROM_LIST = { from: PATHS.COUSR00, user_id: SELECTED_ID };
@@ -104,12 +109,19 @@ const adminRequired: components["schemas"]["ScreenError"] = {
   message: "No access - Admin Only function ...",
 };
 
+/** The read of {@link TYPE_MARKED_ID}: COUSR03C-014's text, naming the user type. */
+const readFailedOnType: components["schemas"]["ScreenError"] = {
+  message: "Unable to lookup User...",
+  field: "user_type",
+};
+
 /** Endpoint 18 and 20 replies by method and user ID; any other request gets a 500. */
 const REPLIES: ReadonlyMap<string, { status: number; body: unknown }> = new Map([
   [`GET ${SELECTED_ID}`, { status: 200, body: selectedView }],
   [`GET ${TYPED_ID}`, { status: 200, body: typedView }],
   [`GET ${UNKNOWN_ID}`, { status: 404, body: readNotFound }],
   [`GET ${FAILING_ID}`, { status: 500, body: readFailed }],
+  [`GET ${TYPE_MARKED_ID}`, { status: 500, body: readFailedOnType }],
   [`DELETE ${SELECTED_ID}`, { status: 200, body: deletedSelected }],
   [`DELETE ${UNFETCHED_ID}`, { status: 200, body: deletedUnfetched }],
   [`DELETE ${VANISHED_ID}`, { status: 404, body: deleteNotFound }],
@@ -332,6 +344,82 @@ function marks(): {
 
 /** No control marked. */
 const UNMARKED = { userId: null, firstName: null, lastName: null, userType: null };
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads a control: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `element`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the control has no `aria-describedby`.
+ */
+function readOut(element: HTMLElement): ReadOut {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** How the user ID input and the three output fields read, by their names in {@link marks}. */
+function readOuts(): Record<keyof typeof UNMARKED, ReadOut> {
+  const { firstName, lastName, userType } = outputs();
+  return {
+    userId: readOut(userIdInput()),
+    firstName: readOut(firstName),
+    lastName: readOut(lastName),
+    userType: readOut(userType),
+  };
+}
+
+/**
+ * How the four controls read when only `marked` holds the error `message`. The user ID is a
+ * form field, `aria-invalid="false"` while valid; an output field carries `aria-invalid` only
+ * while marked. USRTYPE is always described by the map's BLUE hint (COUSR03-024); a marked
+ * control also by its field message, after the hint and hidden.
+ */
+function readOutsWith(
+  marked?: keyof typeof UNMARKED,
+  message = "",
+): Record<keyof typeof UNMARKED, ReadOut> {
+  const read = (name: keyof typeof UNMARKED): ReadOut => {
+    const described = [
+      ...(name === "userType" ? [{ text: "(A=Admin, U=User)", hidden: false }] : []),
+      ...(name === marked ? [{ text: message, hidden: true }] : []),
+    ];
+    const unmarked = name === "userId" ? "false" : null;
+    return {
+      invalid: name === marked ? "true" : unmarked,
+      described: described.length > 0 ? described : null,
+    };
+  };
+  return {
+    userId: read("userId"),
+    firstName: read("firstName"),
+    lastName: read("lastName"),
+    userType: read("userType"),
+  };
+}
 
 /**
  * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
@@ -1486,6 +1574,62 @@ describe("COUSR03 user delete screen", () => {
       `GET ${ENDPOINT}${TYPED_ID}`,
       `DELETE ${ENDPOINT}${UNFETCHED_ID}`,
     ]);
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. USRTYPE is described by the map's BLUE hint
+  // (COUSR03-024); the user ID and the names, which have none, by nothing while unmarked; and
+  // the control a red error marks also by its field message, which holds the row's text, hidden.
+  it.each([
+    { state: "on entry with no selection", selected: false, userId: undefined, error: undefined },
+    { state: "with a fetched user", selected: true, userId: undefined, error: undefined },
+    {
+      state: "after ENTER with a blank user ID",
+      selected: true,
+      userId: "        ",
+      error: { message: USER_ID_EMPTY, marked: "userId" },
+    },
+    {
+      state: "after ENTER answered by the 404 of COUSR03C-013",
+      selected: true,
+      userId: UNKNOWN_ID,
+      error: { message: readNotFound.message, marked: "userId" },
+    },
+    {
+      state: "after ENTER answered by the 500 of COUSR03C-014",
+      selected: true,
+      userId: FAILING_ID,
+      error: { message: readFailed.message, marked: "firstName" },
+    },
+    {
+      state: "after ENTER answered by an error naming the user type",
+      selected: true,
+      userId: TYPE_MARKED_ID,
+      error: { message: readFailedOnType.message, marked: "userType" },
+    },
+  ] satisfies {
+    state: string;
+    selected: boolean;
+    userId: string | undefined;
+    error: { message: string; marked: keyof typeof UNMARKED } | undefined;
+  }[])("describes each control by rendered elements only, $state", async (row) => {
+    if (row.selected) {
+      await renderSelected();
+    } else {
+      stubApi();
+      renderScreen();
+    }
+    if (row.userId !== undefined && row.error !== undefined) {
+      const { message } = row.error;
+      typeUserId(row.userId);
+      fireEvent.click(key("ENTER=Fetch"));
+      await waitFor(() => {
+        expect(messageRow()).toEqual(errorRow(message));
+      });
+    }
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect(readOuts()).toEqual(readOutsWith(row.error?.marked, row.error?.message));
   });
 });
 

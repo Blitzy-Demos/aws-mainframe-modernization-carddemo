@@ -4,17 +4,11 @@ import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCousr00cList } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -435,7 +429,8 @@ export function COUSR00(): ReactNode {
                     </FormLabel>
                   </GridCell>
                   <GridCell row={6} col={21} span={COUSR00_LENGTHS.startUserId}>
-                    <FormControl>
+                    {/* The field has no hint, so its control names only a message it shows. */}
+                    <FieldControl>
                       <Input
                         {...field}
                         maxLength={COUSR00_LENGTHS.startUserId}
@@ -445,7 +440,7 @@ export function COUSR00(): ReactNode {
                         readOnly={pending}
                         className={FIELD_INPUT}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
                   {/*
                    * The error row is the map's only visible message, so a field's own message is
@@ -493,7 +488,7 @@ export function COUSR00(): ReactNode {
                               <FormLabel className="sr-only">
                                 {`Selection for row ${index + 1}`}
                               </FormLabel>
-                              <FormControl>
+                              <FieldControl>
                                 <Input
                                   {...field}
                                   maxLength={COUSR00_LENGTHS.selection}
@@ -502,7 +497,7 @@ export function COUSR00(): ReactNode {
                                   readOnly={pending}
                                   className={`${FIELD_INPUT} w-10 text-center`}
                                 />
-                              </FormControl>
+                              </FieldControl>
                               <FormMessage className="sr-only" />
                             </FormItem>
                           )}

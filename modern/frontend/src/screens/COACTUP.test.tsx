@@ -1241,6 +1241,41 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     expect(document.activeElement).toBe(acct);
   });
 
+  it("shows the field a failure names red, its * included, while its label keeps its colour", async () => {
+    stubApi(get(400, NO_INPUT, `/api/v1/accounts/${" ".repeat(11)}`));
+    renderScreen();
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(NO_INPUT.message);
+    });
+    await settled();
+
+    const acct = input("Account Number :");
+    expect(acct.value).toBe("*".padEnd(11, " "));
+    expect(acct.getAttribute("aria-invalid")).toBe("true");
+    expect(acct.classList.contains("aria-invalid:text-destructive")).toBe(true);
+    const label = labelOf(acct);
+    expect(label.getAttribute("data-error")).toBe("true");
+    expect(label.classList.contains("data-[error=true]:text-foreground")).toBe(true);
+    expect(label.classList.contains("data-[error=true]:text-destructive")).toBe(false);
+  });
+
+  it("gives every map input the shared text-sm field box of its LENGTH", () => {
+    stubApi();
+    renderScreen();
+    const boxes = mapInputs();
+    expect(boxes).toHaveLength(43);
+    expect(
+      boxes
+        .filter(
+          (box) =>
+            !box.classList.contains(`field-length-${box.maxLength}`) ||
+            !box.classList.contains("text-sm"),
+        )
+        .map((box) => box.getAttribute("aria-label") ?? box.id),
+    ).toEqual([]);
+  });
+
   it("a fetch 404 with state S and details shows them beside the message, enterable, and ENTER echoes their snapshot", async () => {
     // audit: COACTUPC-080
     // audit: COACTUPC-081

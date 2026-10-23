@@ -4,12 +4,12 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCousr02cFetch, useCousr02cUpdate } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
   Form,
-  FormControl,
   FormDescription,
   FormField,
   FormItem,
@@ -470,7 +470,11 @@ export function COUSR02(): ReactNode {
                     <FormLabel className={LABEL}>Enter User ID:</FormLabel>
                   </GridCell>
                   <GridCell row={6} col={21} span={COUSR02_LENGTHS.userId}>
-                    <FormControl>
+                    {/*
+                     * Each control names only what its item renders: the hint of the two inputs
+                     * that have one, and the field's message while it shows text.
+                     */}
+                    <FieldControl>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -481,13 +485,16 @@ export function COUSR02(): ReactNode {
                         autoFocus
                         className={VALUE}
                       />
-                    </FormControl>
-                    {/*
-                     * The message row is the only visible message, so each input's own error text
-                     * is for assistive technology only, read with the input it marks.
-                     */}
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  {/*
+                   * The message row is the only visible message, so each input's own error text
+                   * is for assistive technology only, read with the input it marks. Each is its
+                   * item's direct child rather than a cell's: an `sr-only` grid item takes no cell
+                   * and sits at the grid's origin, while one in a cell past the edge of a narrow
+                   * viewport would widen the page.
+                   */}
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -507,7 +514,7 @@ export function COUSR02(): ReactNode {
                     <FormLabel className={LABEL}>First Name:</FormLabel>
                   </GridCell>
                   <GridCell row={11} col={18} span={COUSR02_LENGTHS.firstName}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -517,9 +524,9 @@ export function COUSR02(): ReactNode {
                         spellCheck={false}
                         className={VALUE}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -533,7 +540,7 @@ export function COUSR02(): ReactNode {
                     <FormLabel className={LABEL}>Last Name:</FormLabel>
                   </GridCell>
                   <GridCell row={11} col={56} span={COUSR02_LENGTHS.lastName}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -543,9 +550,9 @@ export function COUSR02(): ReactNode {
                         spellCheck={false}
                         className={VALUE}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -559,7 +566,7 @@ export function COUSR02(): ReactNode {
                     <FormLabel className={LABEL}>Password:</FormLabel>
                   </GridCell>
                   <GridCell row={13} col={16} span={COUSR02_LENGTHS.password}>
-                    <FormControl>
+                    <FieldControl described>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -569,12 +576,12 @@ export function COUSR02(): ReactNode {
                         autoComplete="off"
                         className={VALUE}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
                   <GridCell row={13} col={25} span={8}>
                     <FormDescription className={HINT}>(8 Char)</FormDescription>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />
@@ -588,7 +595,7 @@ export function COUSR02(): ReactNode {
                     <FormLabel className={LABEL}>User Type: </FormLabel>
                   </GridCell>
                   <GridCell row={15} col={17} span={COUSR02_LENGTHS.userType}>
-                    <FormControl>
+                    <FieldControl described>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -598,12 +605,12 @@ export function COUSR02(): ReactNode {
                         spellCheck={false}
                         className={ONE_CHAR_VALUE}
                       />
-                    </FormControl>
-                    <FormMessage className="sr-only" />
+                    </FieldControl>
                   </GridCell>
                   <GridCell row={15} col={19} span={17}>
                     <FormDescription className={HINT}>(A=Admin, U=User)</FormDescription>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />

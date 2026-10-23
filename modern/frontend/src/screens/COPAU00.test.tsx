@@ -461,6 +461,56 @@ function marks(): (string | null)[] {
 /** No input marked. */
 const UNMARKED = [null, null, null, null, null, null];
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `element`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLElement): ReadOut {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/**
+ * How the account field and the five selectors read, in that order, when only the input at
+ * `marked` (0 for the account, 1 to 5 for a selector) holds the error `message`. No input of the
+ * map has a hint, so an unmarked input is described by nothing, and the marked one only by its
+ * field message, hidden.
+ */
+function readOutsWith(marked?: number, message = ""): ReadOut[] {
+  return [0, 1, 2, 3, 4, 5].map((index) =>
+    index === marked
+      ? { invalid: "true", described: [{ text: message, hidden: true }] }
+      : { invalid: "false", described: null },
+  );
+}
+
 /**
  * The value of the header field `name` (`TRNNAME`, `CURDATE`, …): the one read-only `Input` of
  * that name in the `CardHeader`, failing the test when there is not exactly one.
@@ -1797,6 +1847,77 @@ describe("COPAU00 View Authorizations", () => {
     press("ENTER=Continue");
     await answered(sent, 3);
     expect(sent[2].query).toEqual({});
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. No input of the map has a hint, so a valid input is
+  // described by nothing, and the input an error marks only by its field message, which holds
+  // the error row's text for assistive technology alone.
+  it.each([
+    { state: "on entry", replies: [], act: () => undefined, reads: 0, message: "" },
+    {
+      state: "after ENTER with a blank account",
+      replies: [],
+      act: () => {
+        enter("");
+      },
+      reads: 0,
+      marked: 0,
+      message: ENTER_ACCT_ID,
+    },
+    {
+      state: "after ENTER answered by a 404 naming acct_id",
+      replies: [json(404, NOT_FOUND)],
+      act: () => {
+        enter(UNKNOWN_ACCOUNT);
+      },
+      reads: 1,
+      marked: 0,
+      message: XREF_NOT_FOUND,
+    },
+    {
+      state: "after ENTER with a selector longer than its 1 character",
+      replies: [json(200, PAGE_1)],
+      act: async (sent: readonly unknown[]) => {
+        enter(ACCOUNT);
+        await answered(sent, 1);
+        typeInto(selector(2), "SS");
+        press("ENTER=Continue");
+      },
+      reads: 1,
+      marked: 2,
+      message: "String must contain at most 1 character(s)",
+    },
+    {
+      state: "after an invalid selection, which marks no input",
+      replies: [json(200, PAGE_1), json(200, PAGE_1)],
+      act: async (sent: readonly unknown[]) => {
+        enter(ACCOUNT);
+        await answered(sent, 1);
+        typeInto(selector(2), "X");
+        press("ENTER=Continue");
+      },
+      reads: 2,
+      message: INVALID_SELECTION,
+    },
+  ] satisfies {
+    state: string;
+    replies: (() => Response)[];
+    act: (sent: readonly unknown[]) => Promise<void> | void;
+    reads: number;
+    marked?: number;
+    message: string;
+  }[])("describes each input by rendered elements only, $state", async (row) => {
+    const sent = stubFetch(...row.replies);
+    renderScreen();
+    await row.act(sent);
+    await answered(sent, row.reads);
+    await waitFor(() => expect(errorText()).toBe(row.message));
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect([accountField(), ...[1, 2, 3, 4, 5].map(selector)].map(readOut)).toEqual(
+      readOutsWith(row.marked, row.message),
+    );
   });
 });
 

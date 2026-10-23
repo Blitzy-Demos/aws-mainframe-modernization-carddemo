@@ -4,17 +4,11 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCopaus0cSummary } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell, GridTable, LIST_CELL, LIST_ROW } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import {
-  Form,
-  FormControl,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -643,7 +637,8 @@ export function COPAU00(): ReactNode {
                     <FormLabel className={LABEL}>Search Acct Id:</FormLabel>
                   </GridCell>
                   <GridCell row={5} col={19} span={COPAU00_LENGTHS.acctId}>
-                    <FormControl>
+                    {/* No hint on the map: the control names only a message it shows. */}
+                    <FieldControl>
                       {/* COPAUS0C-053: the cursor starts, and stays, on the account field. */}
                       <Input
                         {...field}
@@ -654,7 +649,7 @@ export function COPAU00(): ReactNode {
                         autoFocus
                         className={FIELD}
                       />
-                    </FormControl>
+                    </FieldControl>
                     {/* For assistive technology only: the message row is the visible message. */}
                     <FormMessage className="sr-only" />
                   </GridCell>
@@ -823,7 +818,7 @@ export function COPAU00(): ReactNode {
                             name={`selections.${index}`}
                             render={({ field }) => (
                               <FormItem>
-                                <FormControl>
+                                <FieldControl>
                                   <Input
                                     {...field}
                                     aria-label={`Select row ${index + 1}`}
@@ -833,7 +828,7 @@ export function COPAU00(): ReactNode {
                                     tabIndex={isProtected ? -1 : undefined}
                                     className="relative left-1/6 w-9"
                                   />
-                                </FormControl>
+                                </FieldControl>
                                 <FormMessage className="sr-only" />
                               </FormItem>
                             )}

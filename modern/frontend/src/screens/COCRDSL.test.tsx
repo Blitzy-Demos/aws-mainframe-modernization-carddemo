@@ -284,6 +284,70 @@ function heldReplies(reply: components["schemas"]["CardViewResponse"]) {
   };
 }
 
+/** Clicks `ENTER=Search Cards` and waits until the error row shows `text` and the keys are free. */
+async function enterUntil(text: string): Promise<void> {
+  fireEvent.click(enterButton());
+  await waitFor(() => {
+    expect(messageRow("error").textContent).toBe(text);
+    expect(form().getAttribute("aria-busy")).toBe("false");
+  });
+}
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: its `aria-invalid` and what describes it. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `element`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLElement): ReadOut {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/**
+ * An input as assistive technology reads it: unmarked, valid and described by nothing, as
+ * neither input has a hint; or marked by `message`, invalid and described by its hidden field
+ * message.
+ */
+function readOutOf(message: string | undefined): ReadOut {
+  return message === undefined
+    ? { invalid: "false", described: null }
+    : { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (content) => content })
+    .filter((element) => element.closest(".sr-only") === null);
+}
+
+
 describe("COCRDSL", () => {
   beforeEach(() => {
     setSession(TOKEN, "USER0001", "U");
@@ -424,6 +488,26 @@ describe("COCRDSL", () => {
       expect(output.value).toBe(value);
     },
   );
+
+  it.each([
+    { label: ACCOUNT, length: 11 },
+    { label: CARD, length: 16 },
+    { label: NAME, length: 50 },
+    { label: STATUS, length: 1 },
+    { label: MONTH, length: 2 },
+    { label: YEAR, length: 4 },
+  ])("the box of $label is the shared text-sm field box of LENGTH $length", ({
+    label,
+    length,
+  }) => {
+    stubFetch(unexpected);
+    renderScreen();
+
+    const box = field(label);
+    expect(box.classList.contains(`field-length-${length}`)).toBe(true);
+    expect(box.classList.contains("text-sm")).toBe(true);
+    expect(box.classList.contains("text-base")).toBe(false);
+  });
 
   it("leaves no element at the zero-length stoppers that end the fields", () => {
     stubFetch(unexpected);
@@ -1114,6 +1198,89 @@ describe("COCRDSL", () => {
     // The identity the next screen works with is unchanged.
     expect(getSession()).toEqual({ token: TOKEN, userId: "USER0001", userType: "U" });
   });
+
+  // The replacement's accessibility wiring, which no audit row states: both inputs name in
+  // `aria-describedby` only elements the screen renders. Neither has a hint, so each is described
+  // by nothing while unmarked. An input COCRDSLC marks after a `ScreenError` (COCRDSLC-027) is
+  // invalid and described by its hidden field message, which repeats the error row's text; a
+  // found card leaves both unmarked.
+  it.each<{
+    state: string;
+    answer: (query: URLSearchParams) => Response;
+    reach: () => Promise<void>;
+    marks: { readonly acctId?: string; readonly cardNum?: string };
+  }>([
+    { state: "on entry", answer: unexpected, reach: async () => undefined, marks: {} },
+    {
+      state: "after 'No input received' for both inputs sent blank",
+      answer: () => json(400, noInput),
+      reach: () => enterUntil(noInput.message),
+      marks: { acctId: noInput.message, cardNum: noInput.message },
+    },
+    {
+      state: "after 'Card number not provided'",
+      answer: () => json(400, cardNotProvided),
+      reach: async () => {
+        typeInto(ACCOUNT, ACCT_ID);
+        await enterUntil(cardNotProvided.message);
+      },
+      marks: { cardNum: cardNotProvided.message },
+    },
+    {
+      state: "after the 404 of a search that finds no card",
+      answer: () => json(404, notFound),
+      reach: async () => {
+        typeInto(ACCOUNT, ACCT_ID);
+        typeInto(CARD, TYPED_CARD);
+        await enterUntil(notFound.message);
+      },
+      marks: { acctId: notFound.message, cardNum: notFound.message },
+    },
+    {
+      state: "after the 500 of a file error",
+      answer: () => json(500, fileError),
+      reach: async () => {
+        typeInto(ACCOUNT, ACCT_ID);
+        typeInto(CARD, TYPED_CARD);
+        await enterUntil(fileError.message);
+      },
+      marks: { acctId: fileError.message },
+    },
+    {
+      state: "after a found card that follows 'No input received'",
+      answer: (query) => (query.has("acct_id") ? json(200, typedView) : json(400, noInput)),
+      reach: async () => {
+        await enterUntil(noInput.message);
+        typeInto(ACCOUNT, ACCT_ID);
+        typeInto(CARD, TYPED_CARD);
+        await enterUntil("");
+        await waitFor(() => {
+          expect(field(NAME).value).toBe(typedView.embossed_name);
+        });
+      },
+      marks: {},
+    },
+  ])("describes each input by rendered elements only, $state", async ({ answer, reach, marks }) => {
+    stubFetch(answer);
+    renderScreen();
+    await reach();
+
+    await waitFor(() => {
+      expect({ acctId: readOut(field(ACCOUNT)), cardNum: readOut(field(CARD)) }).toEqual({
+        acctId: readOutOf(marks.acctId),
+        cardNum: readOutOf(marks.cardNum),
+      });
+    });
+    expect(danglingDescriptions()).toEqual([]);
+    // The error row stays the one visible copy of each text that marks an input.
+    const texts = [marks.acctId, marks.cardNum].filter((text) => text !== undefined);
+    for (const text of new Set(texts)) {
+      const visible = visibleCopies(text);
+      expect(visible).toHaveLength(1);
+      expect(messageRow("error").contains(visible[0] ?? null)).toBe(true);
+    }
+  });
+
 });
 
 /** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */

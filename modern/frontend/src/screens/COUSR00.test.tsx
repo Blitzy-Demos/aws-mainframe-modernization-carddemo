@@ -374,6 +374,50 @@ function expectNoFieldMessage(input: HTMLElement): void {
   expect(descriptionsOf(input)).toEqual([]);
 }
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `input`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(input: HTMLElement): ReadOut {
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** A valid input of the map, none of which has a hint: described by nothing. */
+const UNDESCRIBED: ReadOut = { invalid: "false", described: null };
+
+/** An input an error marks: invalid, described only by its hidden field message `text`. */
+function markedWith(text: string): ReadOut {
+  return { invalid: "true", described: [{ text, hidden: true }] };
+}
+
 /**
  * The value of the header field `name` (`TRNNAME`, `CURDATE`, …): the one read-only `Input` of
  * that `data-field` in the `CardHeader`, failing when there is not exactly one.
@@ -1593,6 +1637,66 @@ describe("COUSR00 List Users", () => {
     }
     expectNoFieldMessage(searchField());
   });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. No input of the map has a hint, so a valid input is
+  // described by nothing, and the input an error marks only by its field message, which holds
+  // the error row's text for assistive technology alone.
+  it.each([
+    {
+      state: "on entry",
+      replies: [json(200, FIRST_PAGE)],
+      act: () => undefined,
+      requests: 1,
+      text: "",
+      search: UNDESCRIBED,
+      marked: null,
+    },
+    {
+      state: "after a 400 naming start_user_id",
+      replies: [json(200, FIRST_PAGE), json(400, SEARCH_REFUSED)],
+      act: () => {
+        typeInto(searchField(), "USER0001");
+        press("ENTER=Continue");
+      },
+      requests: 2,
+      text: FIELD_TOO_LONG,
+      search: markedWith(FIELD_TOO_LONG),
+      marked: null,
+    },
+    {
+      state: "after a selector longer than its 1 character",
+      replies: [json(200, FIRST_PAGE)],
+      act: () => {
+        typeInto(selector(3), "UU");
+        press("ENTER=Continue");
+      },
+      requests: 1,
+      text: SELECTION_TOO_LONG,
+      search: UNDESCRIBED,
+      marked: 3,
+    },
+  ])(
+    "describes each input by rendered elements only, $state",
+    async ({ replies, act, requests, text, search, marked }) => {
+      const sent = stubFetch(...replies);
+      renderList();
+      await listed(sent, 1, "ADMIN001");
+      act();
+      await shown(sent, requests, text);
+
+      expect(danglingDescriptions()).toEqual([]);
+      expect({
+        search: readOut(searchField()),
+        selectors: Array.from({ length: 10 }, (_, index) => readOut(selector(index + 1))),
+      }).toEqual({
+        search,
+        selectors: Array.from({ length: 10 }, (_, index) =>
+          index + 1 === marked ? markedWith(text) : UNDESCRIBED,
+        ),
+      });
+    },
+  );
 });
 
 // The sign-on and admin guards live in the application's route tree, not in the screen, so this

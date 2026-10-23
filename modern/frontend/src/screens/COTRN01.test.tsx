@@ -375,6 +375,15 @@ function tranIdErrorState() {
   return { invalid: input.getAttribute("aria-invalid"), described };
 }
 
+/** Every id an `aria-describedby` on the page names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
 /** The Tran ID input marked invalid, its field message holding `message`, visually hidden. */
 function markedWith(message: string) {
   return { invalid: "true", described: [{ text: message, hidden: true }] };
@@ -938,6 +947,42 @@ describe("COTRN01 transaction view screen", () => {
     await settle();
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`]);
   });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. The map gives the Tran ID no hint, so it is described
+  // by nothing while it is valid, and by its field message, hidden, once the schema or a
+  // `ScreenError` rejects it.
+  it.each([
+    { state: "on entry", typed: null, expected: UNMARKED, attribute: false },
+    {
+      state: "after ENTER with a blank Tran ID",
+      typed: "    ",
+      expected: markedWith("Tran ID can NOT be empty..."),
+      attribute: true,
+    },
+    {
+      state: "after the 404 of an ENTER",
+      typed: UNKNOWN_ID,
+      expected: markedWith(notFound.message),
+      attribute: true,
+    },
+  ])(
+    "describes the Tran ID by rendered elements only, $state",
+    async ({ typed, expected, attribute }) => {
+      stubApi();
+      renderScreen({ from: PATHS.COMEN01 });
+      if (typed !== null) {
+        fetchTyped(typed);
+      }
+
+      await waitFor(() => {
+        expect(tranIdErrorState()).toEqual(expected);
+      });
+      await settle();
+      expect(tranIdInput().hasAttribute("aria-describedby")).toBe(attribute);
+      expect(danglingDescriptions()).toEqual([]);
+    },
+  );
 
   // The input's mark is the form's error state, which no audit row records, so none is tagged.
   // A server error marks the value it rejected: an edit of it, or the answer to the next key,

@@ -9,10 +9,11 @@ const SCREEN_ROWS = 24;
 const SCREEN_COLUMNS = 80;
 
 /**
- * The classes every map input adds to the `Input`'s own, with `size` = the field's `LENGTH`. A
- * grid field of one or two characters takes them through {@link fieldInputClass}, as does code
- * that places fields of any length; a list input's width is set by its list: a selector is a
- * one-character box (`w-9`), any other list input fills its table column.
+ * The classes a map input sized to its value adds to the `Input`'s own, with `size` = the field's
+ * `LENGTH`; {@link fieldBox} is the box sized to the `LENGTH` instead. A grid field of one or two
+ * characters takes them through {@link fieldInputClass}, as does code that places fields of any
+ * length; a list input's width is set by its list: a selector is a one-character box (`w-9`), any
+ * other list input fills its table column.
  *
  * BLITZY [LAYOUT]: on narrow frames a grid column is narrower than a character, so a cell of
  * `LENGTH` columns can be narrower than `LENGTH` characters plus the padding. At the 768px minimum
@@ -25,7 +26,8 @@ const SCREEN_COLUMNS = 80;
  *   A box grown past its cell is therefore 8.4N + 10px at most, and for a field of two or more
  *   characters it still ends before the next field's cell, which starts at least N + 1 columns on.
  *   Where `field-sizing` is unsupported, `size` sets the minimum instead.
- * - `px-1` is the one inset every map input shares, in place of the Input's `px-3`.
+ * - `px-1` is the one inset every input taking these classes shares, in place of the Input's
+ *   `px-3`.
  * - `text-sm` is the input type size of AAP 0.4.3. It is set here because below the `md`
  *   breakpoint the Input uses `text-base`, whose wider glyphs would widen the box further.
  */
@@ -80,6 +82,26 @@ export type GridCellProps = {
 /** `value` truncated to an integer and held within `min`..`max`, without branching. */
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, Math.trunc(value)));
+}
+
+/**
+ * The box of a map field's `Input` sized to its map `LENGTH`, for a field of `length` characters
+ * (held within 1 to 80); {@link FIELD_INPUT} is the box sized to the value instead.
+ *
+ * The box fills its {@link GridCell} and is never narrower than `length` characters of the
+ * monospace font plus its padding and border (`field-length-*` of `src/index.css`). A grid column
+ * can be narrower than a character, so at such a pitch the box extends into the field's trailing
+ * attribute column: every character shows at any width, and the box stays within the field's
+ * terminal footprint, `POS` to `POS + LENGTH`, before the next field starts. The text is
+ * `text-sm` at every width (AAP 0.4.3), and the height and padding are shared, so the same
+ * `LENGTH` gives the same box on every screen that takes it.
+ *
+ * Callers merge it with `cn`, which lets it replace the `Input`'s own height, minimum width,
+ * padding and text size.
+ */
+export function fieldBox(length: number): string {
+  const n = clamp(length, 1, SCREEN_COLUMNS);
+  return `h-7 w-full min-w-(--field-width) px-0.5 py-0 text-sm field-length-${n}`;
 }
 
 /**

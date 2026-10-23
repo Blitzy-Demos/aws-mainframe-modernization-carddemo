@@ -12,11 +12,11 @@ import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn01cView } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
   Form,
-  FormControl,
   FormField,
   FormItem,
   FormLabel,
@@ -469,7 +469,9 @@ export function COTRN01(): ReactNode {
               render={({ field }) => (
                 // `contents` lets the label and the input each sit in their own grid cell. The
                 // message row is the one visible message, so the field message `FormMessage`
-                // adds is for assistive technology only, read with the input it rejects.
+                // adds is for assistive technology only, read with the input it rejects. The map
+                // gives the field no hint, so its control names no description, and the message
+                // only while it shows.
                 <FormItem className="contents">
                   <GridCell {...TRAN_ID_LABEL}>
                     <FormLabel className="h-full whitespace-pre text-foreground">
@@ -477,7 +479,7 @@ export function COTRN01(): ReactNode {
                     </FormLabel>
                   </GridCell>
                   <GridCell {...TRAN_ID_INPUT}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         onChange={(event) => {
@@ -498,7 +500,7 @@ export function COTRN01(): ReactNode {
                         spellCheck={false}
                         className={FIELD_INPUT}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
                   <FormMessage className="sr-only" />
                 </FormItem>

@@ -5,10 +5,11 @@ import { useLocation, useNavigate } from "react-router";
 import { useComen01cMainMenu } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { getSession } from "@/auth/session";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldControl } from "@/components/screen/FieldControl";
+import { FieldGrid, GridCell, fieldBox } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
-import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
+import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table";
 // The invalid-key text every screen shares (COMEN01C-007), kept with the header values.
@@ -73,11 +74,17 @@ function normaliseOption(typed: string): string {
 /**
  * What ENTER leads to: a transfer to the option's screen, or the menu shown again with a message
  * and the option input showing the 2-digit value the edit produced, which COMEN01C moves back to
- * `OPTIONO` (COMEN01C-008).
+ * `OPTIONO` (COMEN01C-008). `refused` is set where COMEN01C sets `ERR-FLG`, refusing the option
+ * itself (`app/cbl/COMEN01C.cbl:127-142`): the screen then marks the option input invalid.
  */
 type EnterOutcome =
   | { readonly kind: "transfer"; readonly route: string }
-  | { readonly kind: "stay"; readonly message: string; readonly option: string };
+  | {
+      readonly kind: "stay";
+      readonly message: string;
+      readonly option: string;
+      readonly refused: boolean;
+    };
 
 /**
  * The checks of `PROCESS-ENTER-KEY` in program order, applied to the endpoint 2 response
@@ -95,7 +102,8 @@ type EnterOutcome =
  *    program the route table lacks shows the option's unavailable text instead, as no screen
  *    exists to transfer to; every shipped program has one.
  *
- * A text the response omits shows as an empty message row, never as `undefined`.
+ * A text the response omits shows as an empty message row, never as `undefined`. Checks 1 and 2
+ * refuse the option; checks 3 and 4 accept it, so a text they show does not mark the input.
  */
 function enterOutcome(
   menu: components["schemas"]["MenuResponse"],
@@ -103,24 +111,29 @@ function enterOutcome(
   numeric: boolean,
 ): EnterOutcome {
   const option = normaliseOption(typed);
-  const stay = (message: string): EnterOutcome => ({ kind: "stay", message, option });
+  const stay = (message: string, refused: boolean): EnterOutcome => ({
+    kind: "stay",
+    message,
+    option,
+    refused,
+  });
   const chosen =
     numeric && option !== "00" ? menu.options.find((entry) => entry.number === option) : undefined;
   if (chosen === undefined) {
-    return stay(menu.invalid_option_message);
+    return stay(menu.invalid_option_message, true);
   }
   if (menu.user_type === "U" && chosen.admin_only) {
-    return stay(menu.admin_only_message ?? "");
+    return stay(menu.admin_only_message ?? "", true);
   }
   if (!chosen.installed) {
-    return stay(chosen.unavailable_message ?? "");
+    return stay(chosen.unavailable_message ?? "", false);
   }
   // An own-property check, so a program name such as `constructor` finds no inherited entry.
   const route = Object.hasOwn(PROGRAM_ROUTES, chosen.program)
     ? PROGRAM_ROUTES[chosen.program]
     : undefined;
   return route === undefined
-    ? stay(chosen.unavailable_message ?? "")
+    ? stay(chosen.unavailable_message ?? "", false)
     : { kind: "transfer", route };
 }
 
@@ -161,7 +174,9 @@ const FIRST_ENTRY: MenuSend = { text: undefined, number: 0 };
  *   user to sign-on, where the route guard would send a user with no session (COMEN01C-003).
  * - ENTER: `enterOutcome`, decided from the loaded response; while it loads, or reloads, ENTER
  *   decides nothing and is disabled, the key row and the form are busy and the option input is
- *   read-only. The server's texts win over the schema's messages, so none of zod's is shown.
+ *   read-only. The server's texts win over the schema's messages, so none of zod's is shown. A
+ *   refused option marks the input invalid, described by the row's text, until an edit of the
+ *   entry re-validates it or the next key decides again.
  * - ENTER after a failed load, the reload on a return to `/menu` included: endpoint 2 is requested
  *   again, the keyboard locked as for the first load. Its table decides the entry ENTER carried,
  *   as above, and replaces the failure's message; a new failure shows its own message, and the
@@ -169,8 +184,8 @@ const FIRST_ENTRY: MenuSend = { text: undefined, number: 0 };
  *   nothing.
  * - F3: back to sign-on with no request (COMEN01C-006), at any time, a load in progress included.
  *   The session is not cleared here: the sign-on screen's first entry clears it.
- * - Any other F-key: the invalid-key text, the input left as typed (COMEN01C-007); while endpoint
- *   2 loads or reloads, the busy key row takes it with no message.
+ * - Any other F-key: the invalid-key text, the input left as typed and unmarked (COMEN01C-007);
+ *   while endpoint 2 loads or reloads, the busy key row takes it with no message.
  *
  * Every key clears the message of the previous one first (COMEN01C-001). Whenever the menu is
  * shown again with a message, the cursor returns to the option input, the map's `IC` field, with
@@ -246,6 +261,14 @@ export function COMEN01(): ReactNode {
     // The map is sent again, the input showing the option as the edit produced it.
     sendAgain(outcome.message);
     form.setValue("option", outcome.option);
+    // A refused option marks the input invalid with the row's text, which the field's `sr-only`
+    // message repeats for assistive technology; on a non-digit entry it replaces the schema's
+    // issue, so the server's text wins there as well. An accepted option leaves no mark.
+    if (outcome.refused) {
+      form.setError("option", { type: "server", message: outcome.message });
+    } else {
+      form.clearErrors("option");
+    }
   }
 
   function enter(typed: string, numeric: boolean): void {
@@ -292,14 +315,17 @@ export function COMEN01(): ReactNode {
     [navigate, busy],
   );
 
+  const { clearErrors } = form;
   const keyOptions = useMemo<PfKeyOptions>(
     () => ({
       foldShifted: KEY_ROWS.COMEN01.foldShifted,
       onInvalidKey: () => {
         setSent((previous) => ({ text: INVALID_KEY, number: previous.number + 1 }));
+        // The key, not the option, is in error: the input loses the mark of an earlier ENTER.
+        clearErrors("option");
       },
     }),
-    [],
+    [clearErrors],
   );
 
   const options = menu.data?.options ?? [];
@@ -375,24 +401,32 @@ export function COMEN01(): ReactNode {
               control={form.control}
               name="option"
               render={({ field }) => (
-                // `contents` keeps the label's and the input's cells on the map's grid.
+                // `contents` keeps the label's and the input's cells on the map's grid. The message
+                // row is the map's one visible message, so the field's own message is for
+                // assistive technology only, read with the input it marks. It is the item's direct
+                // child, not a cell's: being `sr-only`, it takes no grid cell, and as a grid item
+                // it is placed at the grid's origin, inside the screen. The option has no hint, so
+                // its control names no description.
                 <FormItem className="contents">
                   {/*
                    * `POS=(20,15) LENGTH=25`, TURQUOISE and BRT (COMEN01-024). `h-full` lets the
                    * label's own centring align its text with the input's on the same line.
+                   * COMEN01C never recolours the literal, so the label keeps its colour while the
+                   * option is in error.
                    */}
                   <GridCell row={20} col={15} span={25}>
-                    <FormLabel className="h-full whitespace-pre font-semibold text-foreground">
+                    <FormLabel className="h-full whitespace-pre font-semibold text-foreground data-[error=true]:text-foreground">
                       Please select an option :
                     </FormLabel>
                   </GridCell>
                   {/*
                    * `POS=(20,41) LENGTH=2`, `NUM`, `IC`, underlined (COMEN01-025). Two grid
-                   * columns are narrower than the input's padding, so the input takes the width
-                   * of its two characters (`size`) rather than its cell's.
+                   * columns can be narrower than two characters and the input's padding, so the
+                   * input has the shared field box of its LENGTH (`fieldBox`), which is never
+                   * narrower than its two characters and extends over the empty column after it.
                    */}
                   <GridCell row={20} col={41} span={OPTION_LENGTH}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -401,10 +435,11 @@ export function COMEN01(): ReactNode {
                         inputMode="numeric"
                         autoComplete="off"
                         autoFocus
-                        className="w-auto"
+                        className={fieldBox(OPTION_LENGTH)}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
+                  <FormMessage className="sr-only" />
                 </FormItem>
               )}
             />

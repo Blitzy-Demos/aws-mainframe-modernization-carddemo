@@ -489,6 +489,26 @@ function cellsOf(grid: Element): string[] {
   }).sort();
 }
 
+/**
+ * Every grid cell placed under the body grid `body`, in document order, which is the reading
+ * order: its map row (the body grid's line plus the four header rows) and its content as
+ * `cellsOf` describes it.
+ */
+function bodyCellsInOrder(body: Element): { row: number; content: string }[] {
+  return Array.from(body.querySelectorAll('[class^="row-start-"]'), (cell) => {
+    const line = /(?:^|\s)row-start-(\d+)(?:\s|$)/.exec(cell.className)?.[1];
+    if (line === undefined) {
+      throw new Error(`no row-start class on ${cell.className}`);
+    }
+    const named = cell.querySelector("[data-field]");
+    const content =
+      named instanceof HTMLElement
+        ? `field ${named.dataset.field ?? ""}`
+        : `text ${cell.textContent ?? ""}`;
+    return { row: Number.parseInt(line, 10) + 4, content };
+  });
+}
+
 /** A grid cell at a map `POS` and `LENGTH`, as `cellsOf` describes it. */
 function cell(gridRow: number, col: number, length: number, content: string): string {
   return `row-start-${gridRow} col-start-${col} col-span-${length} ${content}`;
@@ -590,6 +610,90 @@ async function expectCursorInAccount(): Promise<void> {
     expect([account.selectionStart, account.selectionEnd]).toEqual([0, account.value.length]);
   });
 }
+
+/** Endpoint 4's 400 for an account number sent blank (COACTVWC-007). */
+const NO_INPUT: components["schemas"]["ScreenError"] = {
+  message: "No input received",
+  field: "acct_id",
+};
+
+/** Endpoint 4's 404 of the cross-reference read, which names the account number (COACTVWC-035). */
+const XREF_NOT_FOUND: components["schemas"]["ScreenError"] = {
+  message: `Account:${OTHER_ACCOUNT} not found in Cross ref file.  Resp:000000000  Reas:0000`,
+  field: "acct_id",
+};
+
+/** An account whose customer read fails, answered by {@link CUSTOMER_NOT_FOUND}. */
+const MISSING_CUSTOMER_ACCOUNT = "00000000098";
+
+/** Endpoint 4's 404 of the customer read, which names no field (COACTVWC-044). */
+const CUSTOMER_NOT_FOUND: components["schemas"]["ScreenError"] = {
+  message: "CustId:000000098 not found in customer master.Resp: 000000000  REAS:0000000",
+};
+
+/** The schema's MUSTFILL message for a partly filled account number (COACTVW-013). */
+const MUSTFILL = "String must contain exactly 11 character(s)";
+
+/** Types `typed` as the account number, clicks ENTER and waits until the error row shows `text`. */
+async function enterUntil(typed: string, text: string): Promise<void> {
+  typeAccount(typed);
+  pressEnterButton();
+  await waitFor(() => {
+    expect(messageRow("error").textContent).toBe(text);
+  });
+}
+
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/**
+ * How assistive technology reads the input: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(element: HTMLInputElement): {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+} {
+  const ids = element.getAttribute("aria-describedby");
+  return {
+    invalid: element.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** Every element that shows exactly `text` and is not hidden by `sr-only`. */
+function visibleCopies(text: string): HTMLElement[] {
+  return screen
+    .queryAllByText(text, { normalizer: (content) => content })
+    .filter((element) => element.closest(".sr-only") === null);
+}
+
+/** The account number unmarked: valid, and described by nothing, as it has no hint. */
+const UNMARKED = { invalid: "false", described: null };
+
+/** The account number marked by `message`: invalid, described by its hidden field message. */
+function markedBy(message: string): {
+  invalid: string;
+  described: { text: string; hidden: boolean }[];
+} {
+  return { invalid: "true", described: [{ text: message, hidden: true }] };
+}
+
 
 describe("COACTVW: account view (CAVW, COACTVWC)", () => {
   beforeEach(() => {
@@ -785,6 +889,59 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     expect(field("ACSADL2").getAttribute("aria-label")).toBe("Address line 2");
   });
 
+  it("reads in map row order: the account block, the Customer Details heading, then the customer block, each caption just before its field", () => {
+    stubFetch();
+    const { container } = renderScreen();
+
+    const body = container.querySelector("form")?.firstElementChild;
+    if (body === null || body === undefined) {
+      throw new Error("no body grid");
+    }
+    const cells = bodyCellsInOrder(body);
+    const contents = cells.map((placed) => placed.content);
+    const heading = contents.indexOf("text Customer Details");
+
+    // The heading follows the last account field and precedes the first customer caption and
+    // field, as it stands between the two blocks on the map.
+    expect(contents.slice(heading - 2, heading + 3)).toEqual([
+      "text Current Cycle Debit :",
+      "field ACRCYDB",
+      "text Customer Details",
+      "text Customer id  :",
+      "field ACSTNUM",
+    ]);
+    expect(cells[heading]?.row).toBe(11);
+    expect(cells.slice(0, heading).filter((placed) => placed.row >= 11)).toEqual([]);
+    expect(cells.slice(heading + 1).filter((placed) => placed.row <= 11)).toEqual([]);
+
+    // The fields come in map row order, and each caption is read right before the field it
+    // labels, the row-14 name captions included.
+    const fieldRows = cells
+      .filter((placed) => placed.content.startsWith("field "))
+      .map((placed) => placed.row);
+    expect(fieldRows).toEqual([...fieldRows].sort((a, b) => a - b));
+    const captionsAfterTheirField = cells.flatMap((placed, index) => {
+      if (!placed.content.startsWith("field ")) {
+        return [];
+      }
+      const [label] = Array.from(field(placed.content.slice("field ".length)).labels ?? []);
+      const before = cells[index - 1]?.content;
+      return label === undefined || before === `text ${label.textContent ?? ""}`
+        ? []
+        : [placed.content];
+    });
+    expect(captionsAfterTheirField).toEqual([]);
+
+    // The accessibility tree agrees: the level-2 heading lies between the two fields.
+    const caption = screen.getByRole("heading", { level: 2, name: "Customer Details" });
+    expect(
+      field("ACRCYDB").compareDocumentPosition(caption) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      caption.compareDocumentPosition(field("ACSTNUM")) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it.each([
     // audit: COACTVW-002
     {
@@ -948,6 +1105,18 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     await expectCursorInAccount();
     expect(messageRow("info").textContent).toBe(PROMPT);
     expect(messageRow("error").textContent).toBe("");
+  });
+
+  it("gives the account number and every output the shared text-sm field box of its LENGTH", () => {
+    stubFetch();
+    renderScreen();
+    const boxes = [{ name: "ACCTSID", length: 11 }, ...OUTPUTS].map(({ name, length }) => ({
+      name,
+      sized: field(name).classList.contains(`field-length-${length}`),
+      small: field(name).classList.contains("text-sm"),
+    }));
+    expect(boxes).toHaveLength(OUTPUTS.length + 1);
+    expect(boxes.filter((box) => !box.sized || !box.small)).toEqual([]);
   });
 
   it("shows a date the endpoint sends as null as a blank field", async () => {
@@ -1413,6 +1582,80 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
       ["GET", `/api/v1/accounts/${ACCOUNT}/view`],
     ]);
   });
+
+  // The replacement's accessibility wiring, which no audit row states: the account number names in
+  // `aria-describedby` only elements the screen renders. It has no hint, so it is described by
+  // nothing while unmarked. A message that names it, the server's or the schema's MUSTFILL
+  // message, marks it invalid and describes it by its hidden field message, which repeats the
+  // error row's text; a message that names no field, and a view, leave it unmarked.
+  it.each<{
+    state: string;
+    reach: () => Promise<void>;
+    expected: { invalid: string; described: { text: string; hidden: boolean }[] | null };
+  }>([
+    { state: "on entry", reach: async () => undefined, expected: UNMARKED },
+    {
+      state: "after the 400 'No input received' of a blank entry",
+      reach: () => enterUntil("", NO_INPUT.message),
+      expected: markedBy(NO_INPUT.message),
+    },
+    {
+      state: "after the 404 of the cross-reference, naming acct_id",
+      reach: () => enterUntil(OTHER_ACCOUNT, XREF_NOT_FOUND.message),
+      expected: markedBy(XREF_NOT_FOUND.message),
+    },
+    {
+      state: "after the 404 of the customer, naming no field",
+      reach: () => enterUntil(MISSING_CUSTOMER_ACCOUNT, CUSTOMER_NOT_FOUND.message),
+      expected: UNMARKED,
+    },
+    {
+      state: "after the MUSTFILL rejection of a partly filled number",
+      reach: () => enterUntil("123", MUSTFILL),
+      expected: markedBy(MUSTFILL),
+    },
+    {
+      state: "after a view that follows 'No input received'",
+      reach: async () => {
+        await enterUntil("", NO_INPUT.message);
+        typeAccount(ACCOUNT);
+        pressEnterButton();
+        await waitFor(() => {
+          expect(field("ACSTSSN").value).toBe("***-**-1234");
+        });
+      },
+      expected: UNMARKED,
+    },
+  ])(
+    "describes the account number by rendered elements only, $state",
+    async ({ reach, expected }) => {
+      stubFetch((acctId) => {
+        if (acctId === " ".repeat(11)) {
+          return json(400, NO_INPUT);
+        }
+        if (acctId === OTHER_ACCOUNT) {
+          return json(404, XREF_NOT_FOUND);
+        }
+        return acctId === MISSING_CUSTOMER_ACCOUNT
+          ? json(404, CUSTOMER_NOT_FOUND)
+          : json(200, view);
+      });
+      renderScreen();
+      await reach();
+
+      await waitFor(() => {
+        expect(readOut(field("ACCTSID"))).toEqual(expected);
+      });
+      expect(danglingDescriptions()).toEqual([]);
+      // The error row stays the one visible copy of the text that marks the input.
+      for (const { text } of expected.described ?? []) {
+        const visible = visibleCopies(text);
+        expect(visible).toHaveLength(1);
+        expect(messageRow("error").contains(visible[0] ?? null)).toBe(true);
+      }
+    },
+  );
+
 });
 
 /** The 401 of the `SignedOnUser` extractor for a missing, invalid or expired token. */

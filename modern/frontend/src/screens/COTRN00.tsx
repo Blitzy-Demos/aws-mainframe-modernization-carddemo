@@ -4,6 +4,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn00cList } from "@/api/hooks";
 import type { components } from "@/api/schema";
+import { FieldControl } from "@/components/screen/FieldControl";
 import {
   FIELD_INPUT,
   FieldGrid,
@@ -16,7 +17,6 @@ import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
   Form,
-  FormControl,
   FormField,
   FormItem,
   FormLabel,
@@ -489,7 +489,7 @@ export function COTRN00(): ReactNode {
                     </FormLabel>
                   </GridCell>
                   <GridCell row={6} col={21} span={16}>
-                    <FormControl>
+                    <FieldControl>
                       <Input
                         {...field}
                         readOnly={busy}
@@ -499,12 +499,13 @@ export function COTRN00(): ReactNode {
                         autoFocus
                         className={FIELD_INPUT}
                       />
-                    </FormControl>
+                    </FieldControl>
                   </GridCell>
                   {/*
                    * The error row is the map's only visible message, so the field's message is
                    * for assistive technology only, read with the input it rejects; out of flow,
-                   * it takes no grid cell.
+                   * it takes no grid cell. The map gives the field no hint, so its control, as
+                   * each selector's, names no description, and the message only while it shows.
                    */}
                   <FormMessage className="sr-only" />
                 </FormItem>
@@ -554,7 +555,7 @@ export function COTRN00(): ReactNode {
                                 <FormLabel className="sr-only">
                                   {`Select row ${index + 1}`}
                                 </FormLabel>
-                                <FormControl>
+                                <FieldControl>
                                   <Input
                                     {...field}
                                     readOnly={busy}
@@ -563,7 +564,7 @@ export function COTRN00(): ReactNode {
                                     autoComplete="off"
                                     className={`${FIELD_INPUT} relative left-1/6 w-9 text-center`}
                                   />
-                                </FormControl>
+                                </FieldControl>
                                 <FormMessage className="sr-only" />
                               </FormItem>
                             )}

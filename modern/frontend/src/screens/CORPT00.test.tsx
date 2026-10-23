@@ -508,6 +508,105 @@ function expectUnmarked(): void {
   expect(fieldMessages()).toEqual([]);
 }
 
+/** Every id an `aria-describedby` on the page names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** What an input's `aria-describedby` reads: one entry per id, `null` for an id of no element. */
+type Described = { text: string | null; hidden: boolean; cell: string | null } | null;
+
+/**
+ * How assistive technology reads each input, by request member: its `aria-invalid`, and the
+ * element each id of its `aria-describedby` names, as its text, whether `sr-only` hides it and the
+ * grid cell it stands in (`null` for an element outside any cell). `described` is `null` when the
+ * input has no `aria-describedby`.
+ */
+function readOuts(): Record<string, { invalid: string | null; described: Described[] | null }> {
+  return Object.fromEntries(
+    FIELDS.map((field) => {
+      const input = inputOf(field.name);
+      const ids = input.getAttribute("aria-describedby");
+      const described =
+        ids === null
+          ? null
+          : ids.split(" ").map((id): Described => {
+              const target = id === "" ? null : document.getElementById(id);
+              const parent = target?.parentElement ?? null;
+              return target === null
+                ? null
+                : {
+                    text: target.textContent,
+                    hidden: target.classList.contains("sr-only"),
+                    cell:
+                      parent !== null && /\brow-start-\d+\b/.test(parent.className)
+                        ? parent.className
+                        : null,
+                  };
+            });
+      return [field.wire, { invalid: input.getAttribute("aria-invalid"), described }];
+    }),
+  );
+}
+
+/** The `(MM/DD/YYYY)` of the start date's line (`CORPT00-028`), shown, in its map cell. */
+const START_HINT = {
+  text: "(MM/DD/YYYY)",
+  hidden: false,
+  cell: "row-start-13 col-start-46 col-span-12",
+};
+
+/** The `(MM/DD/YYYY)` of the end date's line (`CORPT00-036`), shown, in its map cell. */
+const END_HINT = {
+  text: "(MM/DD/YYYY)",
+  hidden: false,
+  cell: "row-start-14 col-start-46 col-span-12",
+};
+
+/** The confirmation's `(Y/N)` (`CORPT00-040`), shown, in its map cell. */
+const CONFIRM_HINT = { text: "(Y/N)", hidden: false, cell: "row-start-19 col-start-69 col-span-5" };
+
+/** The hint each input is read with, by request member; the three report selectors have none. */
+const HINTS_OF: Record<string, readonly Described[]> = {
+  monthly: [],
+  yearly: [],
+  custom: [],
+  start_month: [START_HINT],
+  start_day: [START_HINT],
+  start_year: [START_HINT],
+  end_month: [END_HINT],
+  end_day: [END_HINT],
+  end_year: [END_HINT],
+  confirm: [CONFIRM_HINT],
+};
+
+/**
+ * What {@link readOuts} reads when `marked` alone holds `message`: each input described by its
+ * hint, and the marked one also by its field message, hidden and in no cell; an input with
+ * neither has no `aria-describedby`.
+ */
+function expectedReadOuts(
+  marked: { wire: string; message: string } | null,
+): Record<string, { invalid: string; described: Described[] | null }> {
+  return Object.fromEntries(
+    FIELDS.map((field) => {
+      const own = field.wire === marked?.wire;
+      const described = [
+        ...(HINTS_OF[field.wire] ?? []),
+        ...(own ? [{ text: marked.message, hidden: true, cell: null }] : []),
+      ];
+      return [
+        field.wire,
+        { invalid: own ? "true" : "false", described: described.length > 0 ? described : null },
+      ];
+    }),
+  );
+}
+
 /**
  * The value of the header field `name` (`data-field` of `ScreenShell`): the one read-only `Input`
  * of that name in the `CardHeader`, failing the test when there is not exactly one.
@@ -1134,6 +1233,88 @@ describe("CORPT00 transaction reports screen", () => {
       });
     },
   );
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. The six date parts are described by the
+  // `(MM/DD/YYYY)` of their own line, the confirmation by its `(Y/N)`, the three report selectors
+  // by nothing while they are valid, and the input a `ScreenError` names also by its field
+  // message, which holds the server's text, hidden.
+  it.each([
+    { state: "on entry", request: null, error: null },
+    { state: "after the 400 naming start_month", request: badMonthRequest, error: badMonth },
+    { state: "after the 400 naming confirm", request: badConfirmRequest, error: badConfirm },
+    { state: "after the 400 naming monthly", request: noReportRequest, error: noReport },
+  ])("describes each input by rendered elements only, $state", async ({ request, error }) => {
+    stubApi(...(error === null ? [] : [{ status: 400, body: error }]));
+    renderScreen();
+    if (request === null || error === null) {
+      await settle();
+    } else {
+      fill(request);
+      await pressEnter();
+    }
+
+    const marked = error?.field == null ? null : { wire: error.field, message: error.message };
+    await waitFor(() => {
+      expect(messageRow().textContent).toBe(error?.message ?? "");
+      expect(readOuts()).toEqual(expectedReadOuts(marked));
+    });
+    expect(danglingDescriptions()).toEqual([]);
+  });
+
+  it("places each hint after the inputs of its line in the DOM, before the next line", () => {
+    stubApi();
+    const { container } = renderScreen();
+    /** The one element of the grid cell at `POS=(row,col)`. */
+    const cellContent = (row: number, col: number): Element => {
+      const cell = cellAt(container, row, col);
+      expect(cell?.childElementCount).toBe(1);
+      const element = cell?.firstElementChild ?? null;
+      if (element === null) {
+        throw new Error(`no element at (${String(row)},${String(col)})`);
+      }
+      return element;
+    };
+
+    // A linear reading, as a screen reader's, meets the map's lines in order: each date's parts,
+    // then its format; the confirmation's prompt and input, then its `(Y/N)`.
+    const reading = [
+      inputOf("Start Date month"),
+      inputOf("Start Date day"),
+      inputOf("Start Date year"),
+      cellContent(13, 46),
+      cellContent(14, 15),
+      inputOf("End Date month"),
+      inputOf("End Date day"),
+      inputOf("End Date year"),
+      cellContent(14, 46),
+      cellContent(19, 6),
+      inputOf(CONFIRM),
+      cellContent(19, 69),
+    ];
+    expect(reading.map((element) => element.textContent)).toEqual([
+      "",
+      "",
+      "",
+      "(MM/DD/YYYY)",
+      "  End Date :",
+      "",
+      "",
+      "",
+      "(MM/DD/YYYY)",
+      "The Report will be submitted for printing. Please confirm: ",
+      "",
+      "(Y/N)",
+    ]);
+    for (const [index, element] of reading.entries()) {
+      const next = reading[index + 1];
+      if (next !== undefined) {
+        expect(element.compareDocumentPosition(next) & Node.DOCUMENT_POSITION_FOLLOWING).toBe(
+          Node.DOCUMENT_POSITION_FOLLOWING,
+        );
+      }
+    }
+  });
 
   it("drops a server mark when corrected and at the next ENTER; a 200 leaves none", async () => {
     /** {@link noReportRequest} with Custom chosen, its end date still blank. */

@@ -12,12 +12,12 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCousr01cAdd } from "@/api/hooks";
+import { FieldControl } from "@/components/screen/FieldControl";
 import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
   Form,
-  FormControl,
   FormDescription,
   FormField,
   FormItem,
@@ -324,7 +324,8 @@ export function COUSR01(): ReactNode {
                   name={name}
                   render={({ field }) => (
                     // `contents` lets the label, input and hint cells sit on the screen grid while
-                    // the item still ties the label and the hint to the input.
+                    // the item still ties the label and the hint to the input. The control names a
+                    // description only on the fields whose hint renders one.
                     <FormItem className="contents">
                       <GridCell row={row} col={label.col} span={label.span}>
                         {/* `whitespace-pre`: a literal never wraps, as on the terminal. */}
@@ -333,7 +334,7 @@ export function COUSR01(): ReactNode {
                         </FormLabel>
                       </GridCell>
                       <GridCell row={row} col={col} span={layout.span}>
-                        <FormControl>
+                        <FieldControl described={hint !== undefined}>
                           {/*
                            * Every value is data about the user being added, so the browser must
                            * neither fill in the operator's own credentials nor change the case.
@@ -350,12 +351,7 @@ export function COUSR01(): ReactNode {
                             autoCorrect="off"
                             spellCheck={false}
                           />
-                        </FormControl>
-                        {/*
-                         * The message row is the only visible message, so the field's own error
-                         * text is for assistive technology only, read with the input it names.
-                         */}
-                        <FormMessage className="sr-only" />
+                        </FieldControl>
                       </GridCell>
                       {hint !== undefined && (
                         <GridCell row={row} col={hint.col} span={hint.span}>
@@ -364,6 +360,14 @@ export function COUSR01(): ReactNode {
                           </FormDescription>
                         </GridCell>
                       )}
+                      {/*
+                       * The message row is the only visible message, so the field's own error
+                       * text is for assistive technology only, read with the input it names. It
+                       * is the item's direct child rather than a cell's: an `sr-only` grid item
+                       * takes no cell and sits at the grid's origin, while one in a cell past the
+                       * edge of a narrow viewport would widen the page.
+                       */}
+                      <FormMessage className="sr-only" />
                     </FormItem>
                   )}
                 />

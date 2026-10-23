@@ -691,6 +691,71 @@ function rowErrorText(row: number): string | null | undefined {
   return bodyRow(row).querySelector('[data-slot="form-message"]')?.textContent;
 }
 
+/** Each id an `aria-describedby` of the document names that resolves to no element. */
+function danglingDescriptions(): string[] {
+  return [...document.querySelectorAll("[aria-describedby]")].flatMap((element) =>
+    (element.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .filter((id) => id === "" || document.getElementById(id) === null),
+  );
+}
+
+/** How assistive technology reads an input: see {@link readOut}. */
+type ReadOut = {
+  invalid: string | null;
+  described: ({ text: string | null; hidden: boolean } | null)[] | null;
+};
+
+/**
+ * How assistive technology reads `input`: its `aria-invalid`, and the element each id of its
+ * `aria-describedby` names, as its text and whether `sr-only` hides it (`null` for an id that
+ * resolves to nothing). `described` is `null` when the input has no `aria-describedby`.
+ */
+function readOut(input: HTMLElement): ReadOut {
+  const ids = input.getAttribute("aria-describedby");
+  return {
+    invalid: input.getAttribute("aria-invalid"),
+    described:
+      ids === null
+        ? null
+        : ids.split(" ").map((id) => {
+            const target = id === "" ? null : document.getElementById(id);
+            return target === null
+              ? null
+              : { text: target.textContent, hidden: target.classList.contains("sr-only") };
+          }),
+  };
+}
+
+/** The map's sixteen inputs by name: the two filters, then each row's selector and description. */
+function namedInputs(): Record<string, HTMLElement> {
+  const inputs: Record<string, HTMLElement> = {
+    typeFilter: typeFilter(),
+    descFilter: descFilter(),
+  };
+  for (let row = 1; row <= 7; row += 1) {
+    inputs[`selector ${row}`] = selectorAt(row);
+    inputs[`description ${row}`] = descriptionAt(row);
+  }
+  return inputs;
+}
+
+/**
+ * How the sixteen inputs read when only the input `marked` (a name of {@link namedInputs}) holds
+ * the error `message`. No input of the map has a hint, so an unmarked one is described by
+ * nothing, and the marked one only by its field message, hidden.
+ */
+function readOutsWith(marked?: string, message = ""): Record<string, ReadOut> {
+  return Object.fromEntries(
+    Object.keys(namedInputs()).map((name) => [
+      name,
+      name === marked
+        ? { invalid: "true", described: [{ text: message, hidden: true }] }
+        : { invalid: "false", described: null },
+    ]),
+  );
+}
+
 /** The one message row of `kind`, `ERRMSG` (`error`) or `INFOMSG` (`info`). */
 function messageRow(kind: "error" | "info"): HTMLElement {
   const rows = screen
@@ -1738,6 +1803,114 @@ describe("COTRTLI", () => {
     // Only `from` travels: the list state is discarded.
     expect(await arrivedAt(target)).toEqual({ from: PATHS.COTRTLI });
     expect(seen).toHaveLength(1);
+  });
+
+  // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
+  // names only elements the screen renders. No input of the map has a hint, so a valid input is
+  // described by nothing, and the input an error marks only by its field message, which holds
+  // the error line's text for assistive technology alone.
+  it.each([
+    { state: "on entry", replies: [[200, LOADED]], act: async () => undefined, message: "" },
+    {
+      state: "after ENTER answered by the 400 of an invalid action code",
+      replies: [
+        [200, LOADED],
+        [400, INVALID_SELECTION],
+      ],
+      act: async () => {
+        type(selectorAt(2), "X");
+        press("ENTER");
+      },
+      marked: "selector 2",
+      message: INVALID_ACTION_CODE,
+    },
+    {
+      state: "after F10 answered by the 400 of a rejected description",
+      replies: [
+        [200, LOADED],
+        [200, UPDATE_PROMPTED],
+        [400, UPDATE_REJECTED],
+      ],
+      act: async (seen: ReturnType<typeof stubFetch>) => {
+        type(selectorAt(6), "U");
+        press("ENTER");
+        await answered(seen, 2);
+        type(descriptionAt(6), "REVERSAL!");
+        press("F10=Save");
+      },
+      marked: "description 6",
+      message: DESCRIPTION_NOT_ALPHANUMERIC,
+    },
+    {
+      state: "after ENTER answered by a 400 naming a protected description",
+      replies: [
+        [200, LOADED],
+        [400, fieldTooLong("rows[2].description")],
+      ],
+      act: async () => {
+        press("ENTER");
+      },
+      marked: "description 3",
+      message: FIELD_TOO_LONG,
+    },
+    {
+      state: "after F8 answered by the 400 of a type filter in error",
+      replies: [
+        [200, LOADED],
+        [400, TYPE_FILTER_REJECTED],
+      ],
+      act: async () => {
+        type(typeFilter(), "A1");
+        press("F8=Page Dn");
+      },
+      marked: "typeFilter",
+      message: TYPE_FILTER_NOT_NUMERIC,
+    },
+    {
+      state: "after F8 answered by the 400 of a description filter matching nothing",
+      replies: [
+        [200, LOADED],
+        [400, NO_MATCH],
+      ],
+      act: async () => {
+        type(descFilter(), "ZZ");
+        press("F8=Page Dn");
+      },
+      marked: "descFilter",
+      message: NO_RECORDS_FOR_FILTERS,
+    },
+    {
+      state: "after a type filter longer than its map field, with no request",
+      replies: [[200, LOADED]],
+      act: async () => {
+        type(typeFilter(), "A12");
+        press("ENTER");
+      },
+      marked: "typeFilter",
+      message: TYPE_FILTER_TOO_LONG,
+    },
+  ] satisfies {
+    state: string;
+    replies: (readonly [number, unknown])[];
+    act: (seen: ReturnType<typeof stubFetch>) => Promise<void>;
+    marked?: string;
+    message: string;
+  }[])("describes each input by rendered elements only, $state", async (row) => {
+    const seen = stubFetch(row.replies);
+    renderScreen();
+    await answered(seen, 1);
+    await row.act(seen);
+    await answered(seen, row.replies.length);
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(row.message);
+    });
+
+    expect(danglingDescriptions()).toEqual([]);
+    expect(
+      Object.fromEntries(
+        Object.entries(namedInputs()).map(([name, input]) => [name, readOut(input)]),
+      ),
+    ).toEqual(readOutsWith(row.marked, row.message));
   });
 });
 
