@@ -28,16 +28,25 @@ import type { components, paths } from "./schema";
 declare module "@tanstack/react-query" {
   /**
    * Every query and mutation error is typed as the API's `ScreenError` body, which the message
-   * row shows. That is the body the generated error responses of every operation declare except
-   * two of COTRTLIC's, which may answer some error statuses with their page instead:
-   * `cotrtlic_list` (endpoint 24) a `TranTypeListResponse` on 400 and 500, and
-   * `cotrtlic_list_actions` (endpoint 25) a `TranTypeListActionResult` on 400 and 500 and always
-   * on 404; their 401, 403 and 422 are `ScreenError`s. Such a page can lack a string `message`,
-   * so a consumer of those two hooks narrows the thrown body before it reads it as a
-   * `ScreenError`, as COTRTLI's `isListPage` and `isActionResult` guards do. The three failures
-   * without a body, the browser's network `TypeError`, the `TimeoutError` `DOMException` of the
-   * request deadline in `client.ts` and the status `Error` of `settle`, carry a string `message`
-   * too. `errorStatus` gives the HTTP status of every failure `settle` threw.
+   * row shows. That is the body the generated error responses of every operation declare, with
+   * two kinds of exception:
+   * - A `ScreenError` with optional members beside `message` and `field`: `coactvwc_view`
+   *   (endpoint 4) answers 404 and 500 with an `AccountViewError`, which may add the `account`
+   *   and `customer` blocks, and `coactupc_fetch` (endpoint 5) with an `AccountUpdateViewError`,
+   *   which may add `state` and `details`. Its message reads as a `ScreenError`'s; COACTVW's
+   *   `isViewError` and COACTUP's `isFetchError` guards narrow the thrown body before they read
+   *   the members beside it.
+   * - A page in place of the `ScreenError`: `cotrtlic_list` (endpoint 24) answers a
+   *   `TranTypeListResponse` on 400 and 500, and `cotrtlic_list_actions` (endpoint 25) a
+   *   `TranTypeListActionResult` on 400 and 500 and always on 404; their 401, 403 and 422 are
+   *   `ScreenError`s. Such a page can lack a string `message`, so a consumer of those two hooks
+   *   narrows the thrown body before it reads it as a `ScreenError`, as COTRTLI's `isListPage` and
+   *   `isActionResult` guards do.
+   *
+   * The three failures without a body, the browser's network `TypeError`, the `TimeoutError`
+   * `DOMException` of the request deadline in `client.ts` and the status `Error` of `settle`,
+   * carry a string `message` too. `errorStatus` gives the HTTP status of every failure `settle`
+   * threw.
    */
   interface Register {
     defaultError: components["schemas"]["ScreenError"];
@@ -57,8 +66,9 @@ const failureStatus = new WeakMap<object, number>();
  *
  * A failure whose body is a JSON object throws that object unchanged: the body the operation's
  * generated error response declares for the status, the `ScreenError` with the program's message
- * or, for endpoints 24 and 25, the COTRTLIC page `Register` names, which COTRTLI tells apart with
- * its `isListPage` and `isActionResult` guards; the dev proxy's 502 while the API cannot be
+ * and, for endpoints 4 and 5, the members `Register` names beside it, or, for endpoints 24 and 25,
+ * the COTRTLIC page `Register` names, which COTRTLI tells apart with its `isListPage` and
+ * `isActionResult` guards; the dev proxy's 502 while the API cannot be
  * reached is such an object too, whose `message` names CARDDEMO_API_BIND. Any other failure has
  * no object to throw: openapi-fetch hands over an empty or non-JSON error body as its text, and a
  * declared-empty one as `undefined`. Such a failure, and a success without a body, reject with an
@@ -117,7 +127,10 @@ export function useCoadm01cAdminMenu() {
   });
 }
 
-/** Endpoint 4, CAVW / COACTVWC: ENTER shows the account and its customer. */
+/**
+ * Endpoint 4, CAVW / COACTVWC: ENTER shows the account and its customer. A 404 or 500 may carry
+ * a block beside its message (`AccountViewError`).
+ */
 export function useCoactvwcView() {
   return useMutation({
     mutationKey: ["coactvwc_view"],
@@ -127,7 +140,10 @@ export function useCoactvwcView() {
   });
 }
 
-/** Endpoint 5, CAUP / COACTUPC: ENTER fetches the account for update, with its snapshot. */
+/**
+ * Endpoint 5, CAUP / COACTUPC: ENTER fetches the account for update, with its snapshot. A 404 or
+ * 500 may carry state `S` and the details beside its message (`AccountUpdateViewError`).
+ */
 export function useCoactupcFetch() {
   return useMutation({
     mutationKey: ["coactupc_fetch"],

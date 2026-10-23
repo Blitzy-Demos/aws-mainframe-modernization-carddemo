@@ -104,6 +104,8 @@ pub(crate) struct UpdateOperation;
 /// - 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.
 /// - 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when
 ///   the read, the password check or the rewrite fails.
+/// - 503, with `Retry-After` in seconds, when the server's password checking is saturated, so
+///   nothing was rewritten; the same request may be sent again after that delay.
 #[utoipa::path(
     impl_for = UpdateOperation,
     put,
@@ -126,6 +128,17 @@ pub(crate) struct UpdateOperation;
             status = 500,
             description = "The read, the password check or the rewrite failed",
             body = ScreenError
+        ),
+        (
+            status = 503,
+            description = "Password checking is saturated; nothing was rewritten",
+            body = ScreenError,
+            headers(
+                (
+                    "Retry-After" = u64,
+                    description = "Seconds to wait before sending the request again"
+                )
+            )
         )
     ),
     security(("bearer_auth" = []))

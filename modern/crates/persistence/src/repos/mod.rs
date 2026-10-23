@@ -88,10 +88,15 @@
 //! - [`PendingAuthSummaryRepository::lock_next`] reads and locks the summary after a given key,
 //!   as the purge's `GN` reads each root when it reaches it under IMS program isolation, so the
 //!   purge's delete test sees the count CP00 last committed (CBPAUP0C-009).
-//! - All three hold their row lock until the transaction ends only on a [`PgTx`](crate::PgTx); on
-//!   [`PgStore`](crate::PgStore) and [`PgSession`](crate::PgSession) the lock ends with the
-//!   call. No process-local lock is used: only the database serialises, so a second process
-//!   sees every lock the first one holds.
+//! - [`PendingAuthDetailRepository::lock_by_id`] reads a detail with `SELECT … FOR UPDATE` for
+//!   endpoint 23, as the get-hold call COPAUS1C's `REPL` requires would hold the segment
+//!   (X-COPAUS1C-1), so concurrent fraud toggles of one detail run one after the other and each
+//!   flips the flag the one before it committed (COPAUS1C-028). Endpoint 22 reads the same row
+//!   with `find_by_id`, which takes no lock.
+//! - All of them hold their row lock until the transaction ends only on a
+//!   [`PgTx`](crate::PgTx); on [`PgStore`](crate::PgStore) and [`PgSession`](crate::PgSession)
+//!   the lock ends with the call. No process-local lock is used: only the database serialises,
+//!   so a second process sees every lock the first one holds.
 //!
 //! # Two transaction-type data versions (E23)
 //!
@@ -134,20 +139,21 @@
 //! | [`Db2TransactionTypeCategoryRepository`] | `db2.transaction_type_category` | `find_by_id(&PicX<2>, &PicX<4>)`; `find_all_by_type(&PicX<2>)`; `insert` |
 //! | [`Db2TransactionTypeRepository`] | `db2.transaction_type` | `find_by_id(&PicX<2>)`; `page_after`, `page_before` (`&PicX<2>` start, `Option<&PicX<2>>` type filter, `Option<&str>` description pattern, `limit`); `count_matching` (the two filters) → `i64`; `insert`; `update` → `bool`; `delete(&PicX<2>)` → `bool` |
 //! | [`DisclosureGroupRepository`] | `disclosure_groups` | `find_by_id(&PicX<10>, &PicX<2>, PicU<4>)`; `find_all`; `insert`; `replace_all` → `u64` |
-//! | [`PendingAuthDetailRepository`] | `pending_auth_details` | `find_by_id(PicS<11>, PicS<5>, PicS<9>)`; `page_after(PicS<11>, PicS<5>, PicS<9>, limit)`; `find_all_by_acct_id(PicS<11>)`; `insert(PicS<11>, record)`; `update(PicS<11>, record)` → `bool`; `delete(PicS<11>, PicS<5>, PicS<9>)` → `bool` |
+//! | [`PendingAuthDetailRepository`] | `pending_auth_details` | `find_by_id(PicS<11>, PicS<5>, PicS<9>)`, `lock_by_id(PicS<11>, PicS<5>, PicS<9>)`; `page_after(PicS<11>, PicS<5>, PicS<9>, limit)`; `find_all_by_acct_id(PicS<11>)`; `insert(PicS<11>, record)`; `update(PicS<11>, record)` → `bool`; `delete(PicS<11>, PicS<5>, PicS<9>)` → `bool` |
 //! | [`PendingAuthSummaryRepository`] | `pending_auth_summaries` | `find_by_id(PicS<11>)`; `lock_or_create(template)` → locked record and whether this call created it; `lock_next(Option<PicS<11>>)` → the next record in key order, locked; `find_all`; `insert`; `update` → `bool`; `delete(PicS<11>)` → `bool`, its details deleted with it |
 //! | [`TranCatBalanceRepository`] | `tran_cat_balances` | `find_by_id(PicU<11>, &PicX<2>, PicU<4>)`; `find_all`; `insert`; `update` → `bool`; `replace_all` → `u64` |
 //! | [`TransactionCategoryRepository`] | `transaction_categories` | `find_by_id(&PicX<2>, PicU<4>)`; `find_all`; `insert`; `replace_all` → `u64` |
 //! | [`TransactionTypeRepository`] | `transaction_types` | `find_by_id(&PicX<2>)`; `find_all`; `insert`; `replace_all` → `u64` |
-//! | [`TransactionRepository`] | `transactions` | `find_by_id(&PicX<16>)`; `find_last`; `next_id` → `PicX<16>`; `insert`; `page_after(&PicX<16>, limit)`, `page_before(&PicX<16>, limit)`; `find_all_in_card_order`; `find_processed_between(NaiveDate, NaiveDate)`; `stream_processed_between(NaiveDate, NaiveDate)` → [`TransactionRows`] |
+//! | [`TransactionRepository`] | `transactions` | `find_by_id(&PicX<16>)`; `find_last`; `next_id` → `PicX<16>`; `insert`; `page_after(&PicX<16>, limit)`, `page_before(&PicX<16>, limit)`; `find_all_in_card_order`; `stream_in_card_order` → [`TransactionRows`]; `find_by_card(&CardNumber)`; `find_processed_between(NaiveDate, NaiveDate)`; `stream_processed_between(NaiveDate, NaiveDate)` → [`TransactionRows`] |
 //! | [`UserRepository`] | `users` | `find_by_id(&PicX<8>)`, `lock_by_id(&PicX<8>)` → `UserEntry`; `page_after(&PicX<8>, limit)`, `page_before(&PicX<8>, limit)` → `UserListEntry`; `insert(&UserEntry)`; `update(&UserEntry)` → `bool`; `delete(&PicX<8>)` → `bool`; `replace_all(&[HashedUser])` → `u64` |
 //!
 //! Point reads return `Option` of the record, of [`CardEntry`] for cards. Multi-row reads return
-//! a `Vec`, except `stream_processed_between`, whose [`TransactionRows`] yields the rows of
-//! `find_processed_between` one at a time, each decoded as it is read: `find_all_in_card_order`,
+//! a `Vec`, except `stream_processed_between` and `stream_in_card_order`, whose
+//! [`TransactionRows`] yield the rows of `find_processed_between` and `find_all_in_card_order`
+//! one at a time, each decoded as it is read: `find_all_in_card_order`, `stream_in_card_order`,
 //! `find_processed_between` and `stream_processed_between` by card number, then transaction ID;
-//! `page_before` from its start downward, in descending key order; `page_after` and every other
-//! `find_all` read in ascending key order.
+//! `find_by_card` by transaction ID; `page_before` from its start downward, in descending key
+//! order; `page_after` and every other `find_all` read in ascending key order.
 
 pub mod accounts;
 pub mod auth_fraud;

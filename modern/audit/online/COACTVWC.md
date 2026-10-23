@@ -129,6 +129,7 @@ Proposed under R7 — Anomaly handling. The reviewer folds each candidate into `
   - Anomaly class: request-vs-repository.
   - Finding: when the account read finds the account and the customer read then fails, the COBOL shows the account details together with the customer message; when the account read fails and the customer read finds the customer, it shows the customer details together with the account message. AAP 0.3.4.1 gives errors the shape `ScreenError { message, field? }`, which cannot carry either block.
   - Proposed resolution: for these outcomes (COACTVWC-044 at 404, COACTVWC-046 at 500 after an account hit, and COACTVWC-040 or COACTVWC-042 followed by a customer hit) the error body carries, beside `message` and `field`, the blocks of `AccountViewResponse` that COACTVWC-008 names, so the screen shows what the COBOL shows; the DTO module fixes the shape, and the reviewer confirms it.
+  - Shape adopted in `modern/crates/api/src/dto/coactvwc.rs`: `AccountViewError`, the `ScreenError` members unchanged with optional `account` and `customer` blocks beside them (schema `allOf` `ScreenError`); COACTUPC-099 uses `AccountUpdateViewError` in `dto/coactupc.rs`, with optional `state` and `details`.
 
 ## Halt candidates
 

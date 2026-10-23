@@ -27,11 +27,16 @@
 //!   the calls at the lock, the insert and the rewrite, and each test asserts them, so the
 //!   scripted statement is shown reached exactly once. Effects are read back through an unprobed
 //!   store over the same pool.
-//! - The deadlines of the pool `carddemo-api` serves requests from,
+//! - The lock waits of the pool `carddemo-api` serves requests from,
 //!   `runtime::db::connect_for_requests` on the container's URL, are proved over that pool: an
-//!   account read that waits for the row lock a transaction of the test holds, ended by the
-//!   server's `lock_timeout` or `statement_timeout`, is COBIL00C-015's failed read, and once the
-//!   container is removed a payment answers within the pool's acquire timeout.
+//!   account read that meets the row lock a transaction of the test holds waits until that
+//!   transaction commits and then reads the balance it left (COBIL00C-013), and only a
+//!   `lock_timeout` or `statement_timeout` the URL itself sets ends the wait, as COBIL00C-015's
+//!   failed read. Once the container is removed from under a pool holding several idle
+//!   connections, the first payment answers within the pool's acquire timeout, and the payments
+//!   that follow it fail at once, though broken connections are still idle in the pool, because
+//!   the store, built as `carddemo-api` builds its own, fails fast while the pool's refusal watch
+//!   finds the server refusing connections.
 //!
 //! # Halts
 //!
@@ -78,9 +83,7 @@ use persistence::{
     ProbeVerdict, RepositoryProbe, TransactionRepository,
 };
 use runtime::config::Config;
-use runtime::db::{
-    ACQUIRE_TIMEOUT, ErrorSummary, LOCK_TIMEOUT, STATEMENT_TIMEOUT, connect, connect_for_requests,
-};
+use runtime::db::{ACQUIRE_TIMEOUT, ErrorSummary, connect, connect_for_requests};
 use serde_json::{Value, json};
 use test_support::fixtures::{fixture_card_numbers, fixture_path, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
@@ -596,8 +599,10 @@ async fn report_confirmation_rows(api: &Api, dir: &Path) -> TestResult {
     Ok(())
 }
 
-/// The server half of the `CORPT00` `both` rows: each member longer than its map `LENGTH`, and
-/// each date part holding a character other than a digit (`NUM`), is a 400 naming the member,
+/// The server half of the `CORPT00` `both` rows: each member longer than its map `LENGTH` or
+/// holding text its `PIC X(n)` field cannot hold (a character outside ASCII such as `é`, or a
+/// control byte such as TAB), and each date part holding a character
+/// other than a digit apart from spaces around the digits (`NUM`), is a 400 naming the member,
 /// before any program edit, and writes no deck.
 async fn report_map_rows(api: &Api, dir: &Path) -> TestResult {
     let before = deck_names(dir)?;
@@ -613,7 +618,7 @@ async fn report_map_rows(api: &Api, dir: &Path) -> TestResult {
         // audit: CORPT00-022
         ("start_month", "123", Some("1a")),
         // audit: CORPT00-024
-        ("start_day", "123", Some(" 1")),
+        ("start_day", "123", Some("+1")),
         // audit: CORPT00-026
         ("start_year", "20222", Some("20 2")),
         // audit: CORPT00-030
@@ -627,18 +632,23 @@ async fn report_map_rows(api: &Api, dir: &Path) -> TestResult {
     ];
     for (member, too_long, not_digits) in members {
         // A Monthly request with a blank confirmation otherwise, which only the map rule rejects
-        // as anything but the confirmation prompt.
-        let mut body = report("X", "", "", "");
-        body[member] = json!(too_long);
-        assert_eq!(
-            api.post(REPORTS, &body).await?.screen(),
-            (
-                StatusCode::BAD_REQUEST,
-                Some(FIELD_LENGTH_MESSAGE),
-                Some(member)
-            )
-        );
+        // as anything but the confirmation prompt. `{"monthly":"é"}` is not the Monthly report,
+        // and `{"monthly":"X","confirm":"\t"}` is no confirmation the program echoes.
+        for value in [too_long, "é", "\t"] {
+            let mut body = report("X", "", "", "");
+            body[member] = json!(value);
+            assert_eq!(
+                api.post(REPORTS, &body).await?.screen(),
+                (
+                    StatusCode::BAD_REQUEST,
+                    Some(FIELD_LENGTH_MESSAGE),
+                    Some(member)
+                ),
+                "{member} = {value:?}"
+            );
+        }
         if let Some(value) = not_digits {
+            let mut body = report("X", "", "", "");
             body[member] = json!(value);
             assert_eq!(
                 api.post(REPORTS, &body).await?.screen(),
@@ -818,6 +828,7 @@ async fn corpt00c_custom_date_rows() -> TestResult {
     custom_part_edit_rows(&api, &dir).await?;
     custom_date_edit_rows(&api, &dir).await?;
     custom_submission_row(&api, &dir).await?;
+    custom_padded_part_rows(&api).await?;
     assert_no_result_text(&api);
     assert_no_card_number(&api)
 }
@@ -1005,6 +1016,115 @@ async fn custom_submission_row(api: &Api, dir: &Path) -> TestResult {
         assert!([Some(START_DATE_INVALID), Some(END_DATE_INVALID)].contains(&message));
         assert!(deck_names(dir)?.is_empty());
     }
+    Ok(())
+}
+
+/// CORPT00C-017: a date part of digits with spaces before or after them keeps its value, against
+/// a job-deck directory of its own so that the generations start at `G0001`.
+///
+/// - The part edits read the value, not the text: the months `" 5"` and `"5 "` and the day `"4 "`
+///   pass as `05` and `04`, though the texts `"5 "` and `"4 "` are above `12` and `31`, so the
+///   next part decides.
+/// - Parts that normalise to the parts of another request get its answer, whatever CSUTLDTC's
+///   verdict on the dates they build (halt H5), and a blank confirmation gets one of the outcomes
+///   of the date check.
+/// - Confirmed, the space-padded request either writes the Custom deck with the normalised dates
+///   or is refused with a date message and writes none, the verdict deciding which.
+/// - A space between two digits is not NUMVAL-C's format: the DTO's 400 on that part, no deck.
+async fn custom_padded_part_rows(api: &Api) -> TestResult {
+    let dir = fresh_dir("corpt00c_padded_parts")?;
+    let padded = api.sharing(dir.clone(), instant(2022, 7, 18)?)?;
+    let part_edits = [
+        (
+            [" 5", "99", "2022", "07", "06", "2022"],
+            START_DAY_INVALID,
+            "start_day",
+        ),
+        (
+            ["5 ", "99", "2022", "07", "06", "2022"],
+            START_DAY_INVALID,
+            "start_day",
+        ),
+        (
+            ["01", "4 ", "2022", "13", "06", "2022"],
+            END_MONTH_INVALID,
+            "end_month",
+        ),
+    ];
+    for (parts, message, field) in part_edits {
+        // audit: CORPT00C-017
+        assert_eq!(
+            padded.post(REPORTS, &custom(parts, "")).await?.screen(),
+            (StatusCode::BAD_REQUEST, Some(message), Some(field)),
+            "{parts:?}"
+        );
+    }
+
+    let same_dates = [
+        (
+            [" 1", "5 ", "2022", "7 ", " 6", "2022"],
+            ["01", "05", "2022", "07", "06", "2022"],
+        ),
+        (
+            ["01", "05", "  22", "07", "06", "22  "],
+            ["01", "05", "0022", "07", "06", "0022"],
+        ),
+    ];
+    for (spaced, zero_filled) in same_dates {
+        let reply = padded.post(REPORTS, &custom(spaced, "")).await?;
+        assert_date_outcome(&reply);
+        // audit: CORPT00C-017
+        assert_eq!(
+            reply.screen(),
+            padded
+                .post(REPORTS, &custom(zero_filled, ""))
+                .await?
+                .screen(),
+            "{spaced:?}"
+        );
+    }
+
+    let confirmed = padded
+        .post(
+            REPORTS,
+            &custom([" 1", "5 ", "2022", "7 ", " 6", "2022"], "Y"),
+        )
+        .await?;
+    if confirmed.status == StatusCode::OK {
+        // audit: CORPT00C-017
+        assert_eq!(
+            (confirmed.text("message"), confirmed.text("job_deck")),
+            (Some(CUSTOM_SUBMITTED), Some("TRNRPT00.G0001"))
+        );
+        // audit: CORPT00C-017
+        assert_eq!(
+            read_deck(&dir, "TRNRPT00.G0001")?,
+            expected_deck("2022-01-05", "2022-07-06")
+        );
+    } else {
+        let (status, message, _) = confirmed.screen();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!([Some(START_DATE_INVALID), Some(END_DATE_INVALID)].contains(&message));
+        assert!(deck_names(&dir)?.is_empty());
+    }
+    let written = deck_names(&dir)?;
+
+    // audit: CORPT00-026
+    // audit: CORPT00-034
+    for (parts, field) in [
+        (["01", "05", "20 2", "07", "06", "2022"], "start_year"),
+        (["01", "05", "2022", "07", "06", " 2 2"], "end_year"),
+    ] {
+        assert_eq!(
+            padded.post(REPORTS, &custom(parts, "Y")).await?.screen(),
+            (
+                StatusCode::BAD_REQUEST,
+                Some(FIELD_NUMERIC_MESSAGE),
+                Some(field)
+            )
+        );
+    }
+    assert_eq!(deck_names(&dir)?, written);
     Ok(())
 }
 
@@ -1303,13 +1423,24 @@ async fn pay_edit_rows(api: &Api, before: &AccountRecord, seed: &TransactionReco
 }
 
 /// The server half of the `COBIL00` `both` rows: an account or a confirmation longer than its
-/// map `LENGTH` is a 400 naming the member, before any read, and writes nothing.
+/// map `LENGTH`, or holding text its `PIC X(n)` field cannot hold (eleven `é`, 22 bytes in the
+/// 11-byte `ACTIDIN`; a control byte such as TAB), is a 400 naming the member, before any read,
+/// and writes nothing.
 async fn pay_map_rows(api: &Api, before: &AccountRecord, seed: &TransactionRecord) -> TestResult {
+    let wide_acct_id = "é".repeat(11);
     let cases = [
         // audit: COBIL00-013
         (pay("000000000011", "Y"), "acct_id"),
+        // audit: COBIL00-013
+        (pay(&wide_acct_id, ""), "acct_id"),
+        // audit: COBIL00-013
+        (pay("0000000001\t", "Y"), "acct_id"),
         // audit: COBIL00-020
         (pay("00000000001", "YY"), "confirm"),
+        // audit: COBIL00-020
+        (pay("00000000001", "é"), "confirm"),
+        // audit: COBIL00-020
+        (pay("00000000001", "\t"), "confirm"),
     ];
     for (body, member) in cases {
         assert_eq!(
@@ -1318,7 +1449,8 @@ async fn pay_map_rows(api: &Api, before: &AccountRecord, seed: &TransactionRecor
                 StatusCode::BAD_REQUEST,
                 Some(FIELD_LENGTH_MESSAGE),
                 Some(member)
-            )
+            ),
+            "{body}"
         );
     }
     assert_unwritten(api, before, seed).await
@@ -1902,15 +2034,19 @@ fn cobil00c_rewrite_failure_rows() -> TestResult {
     })
 }
 
-/// A store over the pool `carddemo-api` serves requests from, `runtime::db::connect_for_requests`
-/// on `database_url`.
+/// A store over the pool `carddemo-api` serves requests from, built as `carddemo-api` builds
+/// its own: `runtime::db::connect_for_requests` on `database_url`, failing at once while the
+/// pool's refusal watch finds the server refusing connections.
 async fn request_store(database_url: String) -> Outcome<PgStore> {
     let config = Config {
         database_url,
         jwt_secret: SECRET.to_owned(),
         ..Config::default()
     };
-    Ok(PgStore::new(connect_for_requests(&config).await?))
+    let (pool, refusals) = connect_for_requests(&config).await?;
+    Ok(PgStore::new(pool)
+        .failing_fast_while(move || refusals.server_refusing())
+        .await)
 }
 
 /// A current-thread runtime with every driver, the one `#[tokio::test]` would build, made here so
@@ -1921,19 +2057,26 @@ fn current_thread() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-/// COBIL00C-015 through the request deadlines: while a transaction of the test holds the row
-/// lock of account 1, a balance request (blank confirmation) and a payment (`Y`) each wait in
-/// the account read for update until the server ends the read, then answer `Unable to lookup
-/// Account...` with 500, and once the lock is released the account and the transactions are as
-/// they were.
+/// How long a transaction of the test holds account 1's row lock while a request over the
+/// request pool waits for it: longer than the 5 seconds after which a request once gave up, so
+/// a wait that ended before the holder did fails the test.
+const LOCK_HOLD: Duration = Duration::from_secs(6);
+
+/// COBIL00C-013 and COBIL00C-015 over the pool `carddemo-api` serves requests from, while a
+/// transaction of the test holds the row lock of account 1.
 ///
-/// Each case is the query of the request pool's `DATABASE_URL` and the window the wait ends in:
-///
-/// 1. none: the pool's `lock_timeout` ends it (`55P03`), before its `statement_timeout` could;
-/// 2. a `lock_timeout` of 1 second, which prevails and ends it before the pool's own could;
-/// 3. no lock timeout and a `statement_timeout` of 2 seconds, which prevails and cancels the
-///    read (`57014`);
-/// 4. no lock timeout: the pool's own `statement_timeout` cancels the read.
+/// - On the container's own URL, whose sessions keep the server's lock and statement settings,
+///   a balance request (blank confirmation) and then a payment (`Y`) each wait in the account
+///   read for update for as long as the holder keeps the lock, [`LOCK_HOLD`]. The holder then
+///   commits a new balance, and the request reads it: the balance request shows it and the
+///   payment pays it (COBIL00C-013).
+/// - With a `DATABASE_URL` that sets an operator's own bound, which reaches the server
+///   unchanged, the server ends the wait, and both requests answer `Unable to lookup
+///   Account...` with 500 no sooner than that bound and before [`LOCK_HOLD`]; once the lock is
+///   released, nothing is written (COBIL00C-015):
+///   1. a `lock_timeout` of 1 second (`55P03`);
+///   2. no lock timeout and a `statement_timeout` of 2 seconds, which cancels the read
+///      (`57014`).
 #[test]
 fn cobil00c_lock_wait_rows() -> TestResult {
     current_thread()?.block_on(async {
@@ -1943,42 +2086,41 @@ fn cobil00c_lock_wait_rows() -> TestResult {
         let holder = PgStore::new(db.pool().clone());
         let seed = seed_transaction(&holder).await?;
         let before = account(&holder, 1).await?;
-        let cases = [
-            ("", LOCK_TIMEOUT, STATEMENT_TIMEOUT),
+        let bounded = [
             (
                 "options[lock_timeout]=1s",
+                "-c lock_timeout=1s",
                 Duration::from_secs(1),
-                LOCK_TIMEOUT,
             ),
             (
                 "options[lock_timeout]=0&options[statement_timeout]=2s",
+                "-c lock_timeout=0 -c statement_timeout=2s",
                 Duration::from_secs(2),
-                LOCK_TIMEOUT,
-            ),
-            (
-                "options[lock_timeout]=0",
-                STATEMENT_TIMEOUT,
-                STATEMENT_TIMEOUT + LOCK_TIMEOUT,
             ),
         ];
+        let plain = request_store(db.database_url().to_owned()).await?;
+        // The request pool's sessions carry exactly the server options the URL names.
+        assert_eq!(plain.pool().connect_options().get_options(), None);
+        let plain = Api::signed_on_over(plain, dir.clone(), at).await?;
         let mut apis = Vec::new();
-        for (query, _, _) in cases {
-            let database_url = match query {
-                "" => db.database_url().to_owned(),
-                query => format!("{}?{query}", db.database_url()),
-            };
-            let store = request_store(database_url).await?;
+        for (query, options, _) in bounded {
+            let store = request_store(format!("{}?{query}", db.database_url())).await?;
+            assert_eq!(store.pool().connect_options().get_options(), Some(options));
             apis.push(Api::signed_on_over(store, dir.clone(), at).await?);
         }
+
         let mut lock = holder.begin().await?;
         let held = AccountRepository::lock_by_id(&mut lock, PicU::new(1)?).await?;
         assert_eq!(held.as_ref(), Some(&before));
-        for (api, (query, from, until)) in apis.iter().zip(cases) {
+        for (api, (query, _, from)) in apis.iter().zip(bounded) {
             for confirm in ["", "Y"] {
+                let body = pay("00000000001", confirm);
                 let started = Instant::now();
-                let reply = api
-                    .post(BILL_PAYMENTS, &pay("00000000001", confirm))
-                    .await?;
+                let reply = tokio::time::timeout(LOCK_HOLD, api.post(BILL_PAYMENTS, &body))
+                    .await
+                    .map_err(|_| {
+                        format!("{query:?} {confirm:?}: the bound did not end the wait")
+                    })??;
                 let waited = started.elapsed();
                 // audit: COBIL00C-015
                 assert_eq!(
@@ -1991,8 +2133,8 @@ fn cobil00c_lock_wait_rows() -> TestResult {
                     "{query:?} {confirm:?}"
                 );
                 assert!(
-                    from <= waited && waited < until,
-                    "{query:?} {confirm:?}: the read waited {waited:?}, outside [{from:?}, {until:?})"
+                    from <= waited,
+                    "{query:?} {confirm:?}: the read waited {waited:?}, less than {from:?}"
                 );
             }
         }
@@ -2002,8 +2144,101 @@ fn cobil00c_lock_wait_rows() -> TestResult {
             assert_unwritten(api, &before, &seed).await?;
             assert_no_card_number(api)?;
         }
-        Ok(())
+        lock_wait_rows(&plain, &holder, before, &seed, at).await
     })
+}
+
+/// The COBIL00C-013 half of [`cobil00c_lock_wait_rows`], over `plain`, the request pool on the
+/// container's own URL: a balance request and then a payment for account 1, each waiting for the
+/// row lock of `holder` and then reading the balance it committed. `before` is account 1 and
+/// `seed` the last transaction before either.
+async fn lock_wait_rows(
+    plain: &Api,
+    holder: &PgStore,
+    before: AccountRecord,
+    seed: &TransactionRecord,
+    at: NaiveDateTime,
+) -> TestResult {
+    let reply = after_lock_wait(plain, holder, "", "250.00").await?;
+    // audit: COBIL00C-013
+    assert_eq!(
+        (reply.status, reply.body),
+        (
+            StatusCode::OK,
+            json!({
+                "acct_id": "00000000001",
+                "current_balance": "+0000000250.00",
+                "message": PAY_PROMPT,
+                "cleared": false,
+            })
+        )
+    );
+    let left = AccountRecord {
+        curr_bal: money("250.00")?,
+        ..before.clone()
+    };
+    assert_unwritten(plain, &left, seed).await?;
+
+    let new_id = following_id(&seed.id)?;
+    let reply = after_lock_wait(plain, holder, "Y", "300.00").await?;
+    // audit: COBIL00C-013
+    assert_eq!(
+        (reply.status, reply.body),
+        (
+            StatusCode::OK,
+            json!({
+                "acct_id": "",
+                "message": payment_message(&new_id),
+                "new_tran_id": new_id,
+                "cleared": true,
+            })
+        )
+    );
+    let written = transaction(&plain.store, &new_id)
+        .await?
+        .ok_or("the payment was not written")?;
+    // audit: COBIL00C-013
+    assert_payment_record(&written, "300.00", seed, at)?;
+    let paid = AccountRecord {
+        curr_bal: money("0.00")?,
+        ..before
+    };
+    assert_eq!(account(&plain.store, 1).await?, paid);
+    assert_no_card_number(plain)
+}
+
+/// The reply to endpoint 15 for account 1 with `confirm`, sent over `api` while a transaction of
+/// `holder` holds the account's row lock and has set its balance to `balance`: the request
+/// must still be waiting after [`LOCK_HOLD`], and it must answer within another [`LOCK_HOLD`]
+/// once the holder commits.
+async fn after_lock_wait(
+    api: &Api,
+    holder: &PgStore,
+    confirm: &str,
+    balance: &str,
+) -> Outcome<Reply> {
+    let mut lock = holder.begin().await?;
+    let held = AccountRepository::lock_by_id(&mut lock, PicU::new(1)?)
+        .await?
+        .ok_or("account 1 is not stored")?;
+    let left = AccountRecord {
+        curr_bal: money(balance)?,
+        ..held
+    };
+    assert!(AccountRepository::update(&mut lock, &left).await?);
+    let body = pay("00000000001", confirm);
+    let mut request = Box::pin(api.post(BILL_PAYMENTS, &body));
+    // audit: COBIL00C-013
+    assert!(
+        tokio::time::timeout(LOCK_HOLD, request.as_mut())
+            .await
+            .is_err(),
+        "{confirm:?}: the request answered before the row lock was released"
+    );
+    lock.commit().await?;
+    tokio::time::timeout(LOCK_HOLD, request)
+        .await
+        .map_err(|_| format!("{confirm:?}: no answer once the row lock was released"))?
 }
 
 /// Waits, for at most a minute, until a connection to `database_url` is refused, as once its
@@ -2033,11 +2268,83 @@ async fn wait_until_refused(database_url: &str) -> TestResult {
     }
 }
 
-/// A `PostgreSQL` outage: once the server's port refuses connections, a payment's transaction
-/// cannot begin, because the pool retries a refused connection until its acquire timeout,
-/// `runtime::db::ACQUIRE_TIMEOUT`. Endpoint 15 then answers the API's fixed 500 for a store
-/// failure without an audited message after that timeout, rather than after the 30 seconds a
-/// `sqlx` pool waits by default.
+/// How long a payment may take to fail once the request pool's refusal watch has found the
+/// server refusing connections: well under the pool's acquire timeout.
+const FAIL_FAST_BOUND: Duration = Duration::from_secs(1);
+
+/// How many connections the request pool holds idle when the outage of [`cobil00c_outage_row`]
+/// begins, each of which the removed server leaves broken.
+const IDLE_CONNECTIONS: usize = 4;
+
+/// Whether `condition` holds within `within`, tested every 10 milliseconds.
+async fn eventually(within: Duration, condition: impl Fn() -> bool) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Leaves `count` connections idle in the request pool of `api`, as a busy period does: a
+/// transaction of `holder` takes account 1's row lock, and `count` balance requests for account
+/// 1, in flight at once, each wait for it on a connection of their own until the pool holds
+/// `count` connections and none idle. The transaction then ends, and each request shows the
+/// balance and hands its connection back.
+async fn hold_idle_connections(api: &Api, holder: &PgStore, count: usize) -> TestResult {
+    let pool = api.store.pool();
+    let opened = u32::try_from(count)?;
+    let mut lock = holder.begin().await?;
+    AccountRepository::lock_by_id(&mut lock, PicU::new(1)?)
+        .await?
+        .ok_or("account 1 is not stored")?;
+    let body = pay("00000000001", "");
+    let mut requests = Box::pin(api.post_concurrently(BILL_PAYMENTS, &body, count));
+    // Polled once, the requests run as tasks of their own, and none can answer while the lock
+    // is held.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), requests.as_mut())
+            .await
+            .is_err(),
+        "a balance request answered while the row lock was held"
+    );
+    let all_in_use = eventually(LOCK_HOLD, || pool.size() == opened && pool.num_idle() == 0).await;
+    lock.rollback().await?;
+    assert!(
+        all_in_use,
+        "the request pool did not open a connection for each waiting request"
+    );
+    for reply in requests.await? {
+        assert_eq!(
+            (reply.status, reply.text("message")),
+            (StatusCode::OK, Some(PAY_PROMPT))
+        );
+    }
+    let all_idle = eventually(LOCK_HOLD, || {
+        pool.size() == opened && pool.num_idle() == count
+    });
+    assert!(
+        all_idle.await,
+        "the request pool does not hold {count} idle connections"
+    );
+    Ok(())
+}
+
+/// A `PostgreSQL` outage, over a store built as `carddemo-api` builds its own, whose pool holds
+/// [`IDLE_CONNECTIONS`] idle connections when the server goes away. Once the server's port
+/// refuses connections, the first payment's transaction cannot begin: the idle connection it
+/// is handed fails its check, and the pool retries the refused connection it opens instead
+/// until its acquire timeout, `runtime::db::ACQUIRE_TIMEOUT`. The pool's refusal watch
+/// meanwhile finds a caller waiting without the server answering, probes the port and finds it
+/// refusing. Every payment that follows fails at once, without waiting for a connection,
+/// although broken connections are still idle in the pool. Endpoint 15 answers each with the
+/// API's fixed 500 for a store failure without an audited message: the first within twice the
+/// acquire timeout, rather than after the 30 seconds a `sqlx` pool waits by default, and each
+/// of the others, one more than the idle connections, within [`FAIL_FAST_BOUND`].
 ///
 /// The pool connects to `127.0.0.1`, as the local stack's `DATABASE_URL` does, rather than to
 /// the container's `localhost` (see [`wait_until_refused`]).
@@ -2049,23 +2356,32 @@ fn cobil00c_outage_row() -> TestResult {
         let database_url = db.database_url().replacen("@localhost:", "@127.0.0.1:", 1);
         let store = request_store(database_url.clone()).await?;
         let api = Api::signed_on_over(store, fresh_dir("cobil00c_outage_row")?, at).await?;
+        let holder = PgStore::new(db.pool().clone());
+        hold_idle_connections(&api, &holder, IDLE_CONNECTIONS).await?;
+        drop(holder);
         drop(db);
         wait_until_refused(&database_url).await?;
-        let started = Instant::now();
-        let reply = api.post(BILL_PAYMENTS, &pay("00000000001", "Y")).await?;
-        let waited = started.elapsed();
-        assert_eq!(
-            reply.screen(),
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Some(UNABLE_TO_PROCESS),
-                None
-            )
+        let body = pay("00000000001", "Y");
+        let unavailable = (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Some(UNABLE_TO_PROCESS),
+            None,
         );
-        assert!(
-            ACQUIRE_TIMEOUT <= waited && waited < ACQUIRE_TIMEOUT * 2,
-            "the request waited {waited:?} for a connection"
-        );
+        for attempt in 1..=IDLE_CONNECTIONS + 1 {
+            let bound = if attempt == 1 {
+                ACQUIRE_TIMEOUT * 2
+            } else {
+                FAIL_FAST_BOUND
+            };
+            let started = Instant::now();
+            let reply = api.post(BILL_PAYMENTS, &body).await?;
+            let waited = started.elapsed();
+            assert_eq!(reply.screen(), unavailable, "payment {attempt}");
+            assert!(
+                waited < bound,
+                "payment {attempt} waited {waited:?} for a connection, not less than {bound:?}"
+            );
+        }
         assert_no_card_number(&api)
     })
 }

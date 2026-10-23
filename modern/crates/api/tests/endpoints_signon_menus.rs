@@ -106,8 +106,8 @@ const OPTION_11_NOT_INSTALLED: &str = "This option Pending Authorization View is
 const NOT_INSTALLED: &str = "This option is not installed ...";
 
 /// The main menu of `COMEN02Y` in table order: number, the 35-byte name as declared and the
-/// program (COMEN01C-020). Option `08` is the name of line 70; line 69's admin-only variant is a
-/// comment.
+/// program; every option's user type is `U` (COMEN01C-020). Option `08` is the name of line 70;
+/// line 69's admin-only variant is a comment.
 const MAIN_OPTIONS: [(&str, &str, &str); 11] = [
     ("01", "Account View                       ", "COACTVWC"),
     ("02", "Account Update                     ", "COACTUPC"),
@@ -632,8 +632,10 @@ fn assert_main_menu(body: &Value, user_type: &str) -> TestResult {
     for (option, (number, name, program)) in options.iter().zip(MAIN_OPTIONS) {
         let mut expected = json!({
             "number": number,
+            "name": name,
             "text": option_text(number, name),
             "program": program,
+            "user_type": "U",
             "admin_only": false,
             "installed": true,
         });
@@ -645,6 +647,12 @@ fn assert_main_menu(body: &Value, user_type: &str) -> TestResult {
         // audit: COMEN01C-020
         // audit: COMEN01C-021
         assert_eq!(option, &expected, "main option {number}");
+        // audit: COMEN01C-020
+        assert_eq!(
+            option.get("name").and_then(Value::as_str).map(str::len),
+            Some(35),
+            "main option {number}"
+        );
         // audit: COMEN01C-021
         assert_eq!(
             option.get("text").and_then(Value::as_str).map(str::len),
@@ -762,8 +770,10 @@ fn assert_admin_option(options: &[Value], index: usize) -> TestResult {
     let option = options
         .get(index)
         .ok_or_else(|| format!("no admin option {number}"))?;
+    // No `user_type` member: `COADM02Y` has no user-type column (COADM01C-012).
     let expected = json!({
         "number": number,
+        "name": name,
         "text": option_text(number, name),
         "program": program,
         "admin_only": true,
@@ -771,6 +781,11 @@ fn assert_admin_option(options: &[Value], index: usize) -> TestResult {
         "unavailable_message": NOT_INSTALLED,
     });
     assert_eq!(option, &expected, "admin option {number}");
+    assert_eq!(
+        option.get("name").and_then(Value::as_str).map(str::len),
+        Some(35),
+        "admin option {number}"
+    );
     assert_eq!(
         option.get("text").and_then(Value::as_str).map(str::len),
         Some(40),
@@ -806,11 +821,9 @@ fn assert_admin_menu(body: &Value) -> TestResult {
     // audit: COADM01C-011
     assert_admin_option(options, 5)?;
     // audit: COADM01C-012
-    assert!(
-        options
-            .iter()
-            .all(|option| option.get("admin_only") == Some(&json!(true)))
-    );
+    assert!(options.iter().all(|option| {
+        option.get("admin_only") == Some(&json!(true)) && option.get("user_type").is_none()
+    }));
     // audit: COADM01C-013
     assert!(
         options

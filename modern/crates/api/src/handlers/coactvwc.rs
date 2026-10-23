@@ -8,9 +8,9 @@
 //!
 //! [`view`] is a thin handler (Thin Request Handlers): it extracts the signed-on user and the
 //! raw `acct_id` path text ([`RawPath`]), calls `services::coactvwc::view`, and maps the outcome
-//! through `AccountViewResponse::from` and `ScreenError::from`. The path text goes to the service
-//! unparsed and untrimmed, so the program's own edit answers a malformed account number with
-//! its own message (COACTVWC-029 to COACTVWC-032).
+//! through `AccountViewResponse::from` and `AccountViewError::from`. The path text goes to the
+//! service unparsed and untrimmed, so the program's own edit answers a malformed account number
+//! with its own message (COACTVWC-029 to COACTVWC-032).
 //!
 //! The SSN reaches the response only in its redacted form, `***-**-` and the last four digits,
 //! through the `domain::sensitive::Ssn` the DTO carries; this module neither reads nor formats
@@ -22,7 +22,7 @@ use axum::extract::State;
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
 use crate::dto::RawPath;
-use crate::dto::coactvwc::AccountViewResponse;
+use crate::dto::coactvwc::{AccountViewError, AccountViewResponse};
 use crate::error::ScreenError;
 use crate::services;
 
@@ -38,11 +38,14 @@ pub(crate) struct ViewOperation;
 ///
 /// # Errors
 ///
-/// A `ScreenError` with the program's message and the field `acct_id`: 400 when the account
-/// number is missing, not numeric or all zeros; 404 when the cross-reference, the account or
-/// the customer record is not found; 500 when one of those reads fails. 401 when the request
-/// carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a 400
-/// with the API's `Invalid path parameters...` and no field, before the program's edit.
+/// The program's message and, when the account number is in error, the field `acct_id`: a
+/// `ScreenError` with 400 when the account number is missing, not numeric or all zeros; an
+/// `AccountViewError` with 404 when the cross-reference, the account or the customer record is
+/// not found, and 500 when one of those reads fails. Beside the message it carries the account
+/// block when the account was found and the customer was not, and both blocks when the customer
+/// was found and the account was not, the account values then a placeholder. 401 when the
+/// request carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a
+/// 400 with the API's `Invalid path parameters...` and no field, before the program's edit.
 #[utoipa::path(
     impl_for = ViewOperation,
     get,
@@ -75,13 +78,19 @@ pub(crate) struct ViewOperation;
         ),
         (
             status = 404,
-            description = "The cross-reference, account or customer record was not found",
-            body = ScreenError
+            description = "The cross-reference, account or customer record was not found: the \
+                           message and field, with the account block when only the customer is \
+                           missing, and both blocks when the account is missing and the customer \
+                           was found",
+            body = AccountViewError
         ),
         (
             status = 500,
-            description = "The cross-reference, account or customer read failed",
-            body = ScreenError
+            description = "The cross-reference, account or customer read failed: the message \
+                           and field, with the account block when only the customer read \
+                           failed, and both blocks when the account read failed and the \
+                           customer was found",
+            body = AccountViewError
         ),
     ),
     security(("bearer_auth" = [])),
@@ -90,10 +99,10 @@ pub(crate) async fn view(
     State(state): State<AppState>,
     user: SignedOnUser,
     RawPath(acct_id): RawPath<String>,
-) -> Result<Json<AccountViewResponse>, ScreenError> {
+) -> Result<Json<AccountViewResponse>, AccountViewError> {
     services::coactvwc::view(&state, &user, &acct_id)
         .await
         .map(AccountViewResponse::from)
         .map(Json)
-        .map_err(ScreenError::from)
+        .map_err(AccountViewError::from)
 }

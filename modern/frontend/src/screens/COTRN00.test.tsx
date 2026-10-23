@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentType } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -8,6 +9,7 @@ import {
   Routes,
   useLocation,
   useNavigate,
+  type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
@@ -27,6 +29,15 @@ import { COTRN00 } from "./COTRN00";
 
 const TOKEN = "test-token";
 const LIST_PATH = "/api/v1/transactions";
+
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
 
 /*
  * The header titles and the invalid-key message, restated from their copybooks so the screen is
@@ -332,13 +343,13 @@ function press(label: string): void {
 /** The row-24 labels, in map order. */
 const KEY_LABELS = ["ENTER=Continue", "F3=Back", "F7=Backward", "F8=Forward"];
 
-/** Whether the row-24 button labelled `label` is disabled. */
+/** Whether the row-24 button labelled `label` is disabled (`aria-disabled="true"`). */
 function keyDisabled(label: string): boolean {
   const button = screen.getByRole("button", { name: label });
   if (!(button instanceof HTMLButtonElement)) {
     throw new TypeError(`${button.tagName} is not a button`);
   }
-  return button.disabled;
+  return button.getAttribute("aria-disabled") === "true";
 }
 
 /** Whether an `<input>` is read-only. */
@@ -351,8 +362,8 @@ function readOnlyOf(element: HTMLElement): boolean {
 
 /**
  * Whether the screen shows itself waiting for a page: `aria-busy` of the "Function keys" group and
- * of the form, the `disabled` of each row-24 button by label, and whether the search field and
- * the ten selectors are read-only.
+ * of the form, whether each row-24 button is `aria-disabled`, by label, and whether the search
+ * field and the ten selectors are read-only.
  */
 function lockState() {
   return {
@@ -556,6 +567,16 @@ describe("COTRN00 List Transactions", () => {
     // TRNIDIN, POS=(6,21) LENGTH=16.
     expect(searchField().getAttribute("maxlength")).toBe("16");
     expect(searchField().parentElement?.className).toBe("row-start-6 col-start-21 col-span-16");
+    // The page, the search key and the selectors take the shared map-field box, `MAP_FIELD_BOX`
+    // with `size` = their LENGTH, so all eight page digits show on the narrowest frame.
+    for (const [field, length] of [
+      [pageField(), "8"],
+      [searchField(), "16"],
+      [selector(1), "1"],
+    ] as const) {
+      expect(field.getAttribute("size")).toBe(length);
+      expect(MAP_FIELD_BOX.filter((name) => !field.classList.contains(name))).toEqual([]);
+    }
 
     const [head] = rowGroups();
     const [captions, rules] = within(head).getAllByRole("row", { hidden: true });
@@ -1681,3 +1702,90 @@ describe("COTRN00 behind the route guard", () => {
     router.dispose();
   });
 });
+
+/**
+ * A route `lazy` that stays loading until `load` is called, as a screen's module does on a slow
+ * network, then renders `Component`.
+ */
+function slowRoute(Component: ComponentType): {
+  readonly lazy: () => Promise<{ Component: ComponentType }>;
+  readonly load: () => void;
+} {
+  let resolveModule: () => void = () => undefined;
+  const loaded = new Promise<{ Component: ComponentType }>((resolve) => {
+    resolveModule = () => {
+      resolve({ Component });
+    };
+  });
+  return {
+    lazy: () => loaded,
+    load: () => {
+      resolveModule();
+    },
+  };
+}
+
+// An `S` selection leaves the list on screen until COTRN01's module has loaded. The lock ENTER
+// took holds through that wait, as the terminal keyboard stays locked until the next program
+// sends its map, so no key pages the list or selects again meanwhile. The screen sits in a data
+// router without the application's root element, so only the screen's own lock acts.
+describe("COTRN00 while the transaction view loads", () => {
+  it("after S on row 3 and ENTER the keyboard stays locked until COTRN01 replaces the list, and opens row 3", async () => {
+    const sent = stubFetch(json(200, FIRST_PAGE), json(200, SECOND_PAGE));
+    const slow = slowRoute(() => <TransferStub name="View Transaction" />);
+    const screens: RouteObject[] = [
+      { path: PATHS.COTRN00, element: <COTRN00 /> },
+      { path: PATHS.COTRN01, lazy: slow.lazy },
+      { path: PATHS.COMEN01, element: <TransferStub name="Main Menu" /> },
+    ];
+    const router = createMemoryRouter(screens, { initialEntries: [PATHS.COTRN00] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    await answered(sent, 1);
+
+    typeInto(selector(3), "S");
+    press("ENTER=Continue");
+    await waitFor(() => {
+      expect(router.state.navigation.state).toBe("loading");
+      expect(screenForm().getAttribute("aria-busy")).toBe("true");
+    });
+    expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+      "true",
+    );
+    expect(lockState().readOnly).toEqual(Array.from({ length: 11 }, () => true));
+
+    // F8 and F7 would page, F2 would show the invalid-key message, and a second selection with
+    // ENTER would open another transaction.
+    press("F8=Forward");
+    press("F7=Backward");
+    for (const key of ["F8", "F7", "F2", "Enter"]) {
+      fireEvent.keyDown(window, { key });
+    }
+    typeInto(selector(5), "S");
+    press("ENTER=Continue");
+    fireEvent.submit(screenForm());
+    await settle();
+
+    expect(sent).toHaveLength(1);
+    expect(router.state.location.pathname).toBe(PATHS.COTRN00);
+    expect(errorRow().textContent).toBe("");
+
+    slow.load();
+    await screen.findByRole("region", { name: "View Transaction" });
+    expect(router.state.location.pathname).toBe(PATHS.COTRN01);
+    expect(transferState("View Transaction")).toEqual({
+      from: PATHS.COTRN00,
+      tran_id: tranId(3),
+      list: { first_key: tranId(1), last_key: tranId(10), page_no: 1, has_next_page: true },
+    });
+    expect(sent).toHaveLength(1);
+    router.dispose();
+  });
+});
+

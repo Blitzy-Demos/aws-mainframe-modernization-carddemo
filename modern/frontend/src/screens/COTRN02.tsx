@@ -4,7 +4,7 @@ import { useForm, useFormContext, type Control, type FieldErrors } from "react-h
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn02cAdd } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
@@ -175,26 +175,6 @@ const LABEL = "h-full whitespace-pre text-foreground";
 const HINT = "flex h-full items-center whitespace-pre";
 const STATIC = "flex h-full items-center whitespace-pre text-foreground";
 
-/*
- * BLITZY [LAYOUT]: inputs use `px-1` instead of the Input default `px-3`, so a field shows its
- * map LENGTH of characters inside the cell of that many grid columns. The 1-, 2- and 4-character
- * fields (CONFIRM, TTYPCD, TCATCD) also get a minimum width on the spacing scale, because their
- * cell is narrower than their characters plus padding; the extra width falls on columns the map
- * leaves empty after each of them.
- */
-const INPUT = "px-1";
-const MIN_WIDTH: Readonly<Partial<Record<number, string>>> = {
-  1: "min-w-6",
-  2: "min-w-8",
-  4: "min-w-12",
-};
-
-/** The Input classes of a field `length` characters long. */
-function inputClass(length: number): string {
-  const minWidth = MIN_WIDTH[length];
-  return minWidth === undefined ? INPUT : `${INPUT} ${minWidth}`;
-}
-
 /** Blank as COBOL tests it: empty or only spaces (`SPACES` or `LOW-VALUES` on the map). */
 function isBlank(value: string): boolean {
   return value.replaceAll(" ", "") === "";
@@ -308,7 +288,9 @@ interface MapFieldProps {
  * `contents`, so its cells sit on the screen's `FieldGrid` while the label and hint stay bound to
  * the input (`htmlFor`, `aria-describedby`). The message row is the only visible message, so the
  * field's `FormMessage`, which repeats the text of the error that marks the input invalid, is for
- * assistive technology only; being absolutely positioned, it takes no cell of the grid.
+ * assistive technology only; being absolutely positioned, it takes no cell of the grid. The input
+ * takes the shared map-field box (`fieldInputClass` with `size` = its `LENGTH`), so a full-length
+ * value shows on the narrowest frame.
  */
 function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
   const length = COTRN02_LENGTHS[input.name];
@@ -339,10 +321,11 @@ function MapField({ input, control, readOnly }: MapFieldProps): ReactNode {
                   field.onChange(event);
                 }}
                 maxLength={length}
+                size={length}
                 autoFocus={input.name === "acctId"}
                 autoComplete="off"
                 spellCheck={false}
-                className={inputClass(length)}
+                className={fieldInputClass(length)}
               />
             </FormControl>
           </GridCell>

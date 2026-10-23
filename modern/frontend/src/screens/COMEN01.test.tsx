@@ -1,4 +1,4 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import {
   createMemoryRouter,
@@ -81,14 +81,16 @@ const SHIPPED = [
 
 /**
  * Endpoint 2's answer for the shipped table (COMEN01C-013, COMEN01C-015, COMEN01C-020,
- * COMEN01C-021): every option installed and of user type `U`, each text the 2-digit number, `. `,
- * the 35-byte name and one space.
+ * COMEN01C-021): every option installed and of user type `U`, each with its 35-byte name and a
+ * text of the 2-digit number, `. `, the 35-byte name and one space.
  */
 const MENU: components["schemas"]["MenuResponse"] = {
   options: SHIPPED.map(([number, name, program]) => ({
     number,
+    name: name.padEnd(35, " "),
     text: `${number}. ${name.padEnd(35, " ")} `,
     program,
+    user_type: "U",
     admin_only: false,
     installed: true,
     unavailable_message: number === "11" ? NOT_INSTALLED : null,
@@ -110,7 +112,7 @@ const NOT_INSTALLED_MENU: components["schemas"]["MenuResponse"] = {
 const ADMIN_ONLY_MENU: components["schemas"]["MenuResponse"] = {
   ...MENU,
   options: MENU.options.map((option) =>
-    option.number === "05" ? { ...option, admin_only: true } : option,
+    option.number === "05" ? { ...option, user_type: "A", admin_only: true } : option,
   ),
 };
 
@@ -298,8 +300,8 @@ function menuForm(): HTMLFormElement {
  * free either way.
  */
 function expectBusy(busy: boolean): void {
-  expect(enterButton()).toHaveProperty("disabled", busy);
-  expect(screen.getByRole("button", { name: "F3=Exit" })).toHaveProperty("disabled", false);
+  expect(enterButton().getAttribute("aria-disabled")).toBe(busy ? "true" : null);
+  expect(screen.getByRole("button", { name: "F3=Exit" }).getAttribute("aria-disabled")).toBeNull();
   expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
     String(busy),
   );
@@ -1168,5 +1170,64 @@ describe("COMEN01 request deadline: a cancelled load", () => {
       expect(deadlines()).toEqual([true, true]);
     });
     expect(client.isFetching()).toBe(0);
+  });
+});
+
+/** The browser's network `TypeError` message, as Chrome's `fetch` words it with no connection. */
+const NO_NETWORK = "Failed to fetch";
+
+/** The browser's `offline` or `online` event, which TanStack Query's `onlineManager` follows. */
+function fireNetworkEvent(type: "offline" | "online"): void {
+  act(() => {
+    window.dispatchEvent(new Event(type));
+  });
+}
+
+// COMEN01C sends its option table when the menu is entered, and ENTER is decided from the table
+// that load brought (`hooks.ts`). The application's own query client (`App.tsx`), not a test
+// client, decides whether the browser's return to the network reads the table again. It does
+// not: with no key pressed nothing is sent, the table stays as loaded and ENTER stays free.
+describe("COMEN01 in the application: the network drops and returns", () => {
+  afterEach(() => {
+    // The online state lives in TanStack Query's process-wide `onlineManager`: the next test
+    // starts online.
+    onlineManager.setOnline(true);
+  });
+
+  it("loads endpoint 2 once on entry and not again when the network returns", async () => {
+    let up = true;
+    stubFetch(() => (up ? json(200, MENU) : Promise.reject(new TypeError(NO_NETWORK))));
+    const startUrl = window.location.href;
+    window.history.replaceState(null, "", PATHS.COMEN01);
+    try {
+      // `App` creates its router from `window.location` when its module is first evaluated. No
+      // other test in this file imports it, so this import evaluates it here, at `/menu`.
+      const { App } = await import("@/App");
+      render(<App />);
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      await loaded();
+      expect(menuRequests()).toHaveLength(1);
+
+      // The network drops and returns twice, and no key is pressed.
+      for (let round = 1; round <= 2; round += 1) {
+        up = false;
+        fireNetworkEvent("offline");
+        expect(onlineManager.isOnline()).toBe(false);
+        up = true;
+        fireNetworkEvent("online");
+        expect(onlineManager.isOnline()).toBe(true);
+        await lingers();
+      }
+
+      expect(menuRequests()).toHaveLength(1);
+      expect(requests).toHaveLength(1);
+      await loaded();
+      expect(errorRow().textContent).toBe("");
+      expectBusy(false);
+    } finally {
+      window.history.replaceState(null, "", startUrl);
+    }
   });
 });

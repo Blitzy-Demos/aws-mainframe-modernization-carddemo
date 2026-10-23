@@ -246,8 +246,8 @@ function signonForm(): HTMLFormElement {
  * row and the form busy, both inputs read-only; or, with `locked` false, all of them free.
  */
 function expectLocked(locked: boolean): void {
-  expect(enterButton()).toHaveProperty("disabled", locked);
-  expect(exitButton()).toHaveProperty("disabled", locked);
+  expect(enterButton().getAttribute("aria-disabled")).toBe(locked ? "true" : null);
+  expect(exitButton().getAttribute("aria-disabled")).toBe(locked ? "true" : null);
   expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
     String(locked),
   );
@@ -741,6 +741,35 @@ describe("COSGN00 sign-on screen", () => {
     });
   });
 
+  // audit: COSGN00-036
+  it.each([
+    { what: "all spaces", text: " ".repeat(78), blank: true },
+    { what: "a program message", text: "User not found. Try again ...", blank: false },
+  ])(
+    "marks the error row empty, with no visible box, exactly while it shows no text: $what",
+    async ({ text, blank }) => {
+      const failure: components["schemas"]["ScreenError"] = { message: text };
+      stubFetch({ status: 401, body: failure });
+      renderScreen();
+
+      // First entry: no message yet, so the live region exists with no box.
+      expect(errorRow().textContent).toBe("");
+      expect(errorRow().getAttribute("data-message-empty")).toBe("true");
+      expect(errorRow().className).toContain("border-transparent");
+
+      typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+      fireEvent.click(enterButton());
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(text);
+      });
+
+      // The marker `src/index.css` selects in forced-colors mode agrees with the transparent
+      // border the row has outside that mode.
+      expect(errorRow().getAttribute("data-message-empty")).toBe(blank ? "true" : null);
+      expect(errorRow().className.includes("border-transparent")).toBe(blank);
+    },
+  );
+
   // audit: COSGN00C-004
   // audit: COSGN00-047
   it("F3 replaces the screen with the session-end text and ends the session", () => {
@@ -955,6 +984,26 @@ describe("COSGN00 session storage", () => {
 
     expect(getSession()).toEqual({ token: "test-token", userId: "USER0001", userType: "U" });
     expect(sessionStorage).toHaveLength(1);
+  });
+
+  // Endpoint 1 is the one operation that takes no bearer token, so the client sends none on it
+  // whatever session is stored, without relying on entry having ended that session.
+  it("ENTER sends no bearer token while an earlier session is stored, after one POST with no query", async () => {
+    stubFetch({ status: 200, body: userSignon });
+    renderScreen();
+    // Stored after entry, which itself ends any session.
+    setSession("test-token-earlier", "ADMIN001", "A");
+    expect(getToken()).toBe("test-token-earlier");
+
+    await signOnAsUser();
+
+    const typed: components["schemas"]["SignonRequest"] = {
+      user_id: TYPED_USER_ID,
+      password: TYPED_PASSWORD,
+    };
+    expect(await sentRequests()).toEqual([
+      { method: "POST", path: "/api/v1/signon", query: {}, authorization: null, body: typed },
+    ]);
   });
 
   it("a refused write leaves no session, earlier or new, and sign-on still completes", async () => {

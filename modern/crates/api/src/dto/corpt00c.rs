@@ -2,9 +2,10 @@
 //! `CORPT0A`): the request that submits the transaction report and the result it answers with.
 //!
 //! - [`ReportRequest`] carries the ten inputs of the map as typed: the three report selectors,
-//!   the six date parts and the confirmation (CORPT00C-042). Its rules are the map's `LENGTH`
-//!   and `NUM` attributes only, the server half of the `both` rows `CORPT00-012` to
-//!   `CORPT00-038` of `modern/audit/screens.md`. Every content message, from
+//!   the six date parts and the confirmation (CORPT00C-042). Its rules are only the map's
+//!   `LENGTH` and `NUM` attributes, the server half of the `both` rows `CORPT00-012` to
+//!   `CORPT00-038` of `modern/audit/screens.md`, and the `PIC X(n)` storage of each input
+//!   (`super::pic_x`, X-COUSR01C-3). Every content message, from
 //!   `Select a report type to print report...` (CORPT00C-029) through the blank-part and range
 //!   edits (CORPT00C-011 to CORPT00C-023) to `Please confirm to print the Monthly report...`
 //!   (CORPT00C-030), is CORPT00C's own and comes from `domain::online::corpt00c`.
@@ -31,10 +32,13 @@ use validator::Validate;
 /// The confirmation is read only once the report and its dates are set (CORPT00C-030 to
 /// CORPT00C-033).
 ///
-/// A member longer than its map field is a 400 naming it, with the field-length message
-/// `FIELD_LENGTH_MESSAGE`. A date part holding a character other than a digit, unless every
-/// character is a space, is a 400 naming it, with the digits-only message
-/// `FIELD_NUMERIC_MESSAGE` (X-CORPT00C-5).
+/// A member that does not fit its `PIC X(n)` map field byte for byte as printable ASCII, being
+/// longer than the field or holding a character outside ASCII or a control byte, is a 400 naming
+/// it, with the field-length message `FIELD_LENGTH_MESSAGE` (X-COUSR01C-3). A date part that
+/// fits, but holds a character other than a digit apart from spaces before and after the
+/// digits, is a 400 naming it, with the digits-only message `FIELD_NUMERIC_MESSAGE`
+/// (X-CORPT00C-5); a part of digits with surrounding spaces, such as `" 5"`, reaches the
+/// program, which reads it as the value of its digits (CORPT00C-017).
 // The schema name `ReportRequest` is the frontend's `components["schemas"]["ReportRequest"]`
 // (Generated API Types Only). The domain's own `ReportRequest`, the edited report, is a different
 // type, so `api::services::corpt00c` imports this one under an alias.
@@ -56,63 +60,87 @@ pub struct ReportRequest {
     /// report of the current month (CORPT00C-007, CORPT00C-008).
     #[serde(default)]
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub monthly: String,
 
     /// `YEARLY`, `PIC X(1)` (`CORPT00-015`): selects the report of the current year when
     /// `monthly` is blank (CORPT00C-007, CORPT00C-010).
     #[serde(default)]
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub yearly: String,
 
     /// `CUSTOM`, `PIC X(1)` (`CORPT00-018`): selects the report of the date range below when
     /// `monthly` and `yearly` are blank (CORPT00C-007).
     #[serde(default)]
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub custom: String,
 
     /// `SDTMM`, `PIC X(2)`, `NUM` (`CORPT00-022`): the start month of a custom report, digits
-    /// or blank (CORPT00C-011, CORPT00C-018).
+    /// with or without spaces around them, or blank (CORPT00C-011, CORPT00C-017, CORPT00C-018).
     #[serde(default)]
-    #[schema(max_length = 2, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 2), custom(function = "super::numeric"))]
+    #[schema(max_length = 2, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 2),
+        custom(function = "super::pic_x::<2>"),
+        custom(function = "super::numeric")
+    )]
     pub start_month: String,
 
-    /// `SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits or
-    /// blank (CORPT00C-012, CORPT00C-019).
+    /// `SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits with
+    /// or without spaces around them, or blank (CORPT00C-012, CORPT00C-017, CORPT00C-019).
     #[serde(default)]
-    #[schema(max_length = 2, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 2), custom(function = "super::numeric"))]
+    #[schema(max_length = 2, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 2),
+        custom(function = "super::pic_x::<2>"),
+        custom(function = "super::numeric")
+    )]
     pub start_day: String,
 
     /// `SDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-026`): the start year of a custom report, digits
-    /// or blank (CORPT00C-013).
+    /// with or without spaces around them, or blank (CORPT00C-013, CORPT00C-017).
     #[serde(default)]
-    #[schema(max_length = 4, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 4), custom(function = "super::numeric"))]
+    #[schema(max_length = 4, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 4),
+        custom(function = "super::pic_x::<4>"),
+        custom(function = "super::numeric")
+    )]
     pub start_year: String,
 
-    /// `EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits or
-    /// blank (CORPT00C-014, CORPT00C-021).
+    /// `EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits with
+    /// or without spaces around them, or blank (CORPT00C-014, CORPT00C-017, CORPT00C-021).
     #[serde(default)]
-    #[schema(max_length = 2, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 2), custom(function = "super::numeric"))]
+    #[schema(max_length = 2, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 2),
+        custom(function = "super::pic_x::<2>"),
+        custom(function = "super::numeric")
+    )]
     pub end_month: String,
 
-    /// `EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits or
-    /// blank (CORPT00C-015, CORPT00C-022).
+    /// `EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits with or
+    /// without spaces around them, or blank (CORPT00C-015, CORPT00C-017, CORPT00C-022).
     #[serde(default)]
-    #[schema(max_length = 2, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 2), custom(function = "super::numeric"))]
+    #[schema(max_length = 2, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 2),
+        custom(function = "super::pic_x::<2>"),
+        custom(function = "super::numeric")
+    )]
     pub end_day: String,
 
-    /// `EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits or
-    /// blank (CORPT00C-016).
+    /// `EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits with
+    /// or without spaces around them, or blank (CORPT00C-016, CORPT00C-017).
     #[serde(default)]
-    #[schema(max_length = 4, pattern = "^([0-9]*| *)$")]
-    #[validate(length(max = 4), custom(function = "super::numeric"))]
+    #[schema(max_length = 4, pattern = "^ *[0-9]* *$")]
+    #[validate(
+        length(max = 4),
+        custom(function = "super::pic_x::<4>"),
+        custom(function = "super::numeric")
+    )]
     pub end_year: String,
 
     /// `CONFIRM`, `PIC X(1)` (`CORPT00-038`): `Y` or `y` writes the job deck, `N` or `n` clears
@@ -120,7 +148,7 @@ pub struct ReportRequest {
     /// (CORPT00C-030 to CORPT00C-033).
     #[serde(default)]
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub confirm: String,
 }
 
@@ -276,8 +304,13 @@ mod tests {
             ("start_day", "1A", FIELD_NUMERIC_MESSAGE),
             ("start_year", "20X2", FIELD_NUMERIC_MESSAGE),
             ("end_month", "-3", FIELD_NUMERIC_MESSAGE),
-            ("end_day", " 5", FIELD_NUMERIC_MESSAGE),
+            ("end_day", "1.", FIELD_NUMERIC_MESSAGE),
             ("end_year", "22.0", FIELD_NUMERIC_MESSAGE),
+            // A space between digits is not one of the spaces NUMVAL-C reads around them.
+            ("start_year", "20 2", FIELD_NUMERIC_MESSAGE),
+            ("end_year", " 2 2", FIELD_NUMERIC_MESSAGE),
+            // `LOW-VALUES` fits the field but is not digits.
+            ("start_month", "\0\0", FIELD_NUMERIC_MESSAGE),
         ];
         for (member, value, message) in cases {
             let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
@@ -295,20 +328,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn text_the_pic_x_field_cannot_hold_is_a_400_naming_the_member() -> TestResult {
+        // Within `length` in characters, but not printable ASCII that fits the field byte for
+        // byte: a character outside ASCII, a control byte, or NUL that does not fill the field.
+        // The date parts answer the field-length message, not the digits-only one, because the
+        // field cannot hold the value at all.
+        let mut cases: Vec<(&str, &str)> = MEMBERS
+            .iter()
+            .flat_map(|&member| ["é", "\t", "\u{7f}", "\u{1F600}"].map(|value| (member, value)))
+            .collect();
+        cases.extend([
+            ("start_day", "\t5"),
+            ("start_year", "20é"),
+            ("end_month", "\0"),
+            ("end_day", "5\u{7f}"),
+            ("end_year", "ééé"),
+        ]);
+        for (member, value) in cases {
+            let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
+            let error = extract(&body)
+                .await?
+                .err()
+                .ok_or_else(|| format!("{member} = {value:?} accepted"))?;
+            assert_eq!(
+                parts(&error),
+                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(member)),
+                "{member} = {value:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn values_the_map_admits_reach_the_program_edits() -> TestResult {
         for (member, value) in [
             ("monthly", "N"),
+            ("monthly", "\0"),
             ("start_month", "13"),
             ("start_month", "00"),
             ("start_day", "  "),
             ("start_year", "0000"),
+            ("start_year", "    "),
             ("end_year", "9999"),
             ("end_day", ""),
             ("confirm", "x"),
+            ("confirm", " "),
         ] {
             let body = format!("{{\"{member}\":{}}}", serde_json::to_string(value)?);
             assert!(extract(&body).await?.is_ok(), "{member} = {value:?}");
         }
+
+        // Digits with spaces before or after them are admitted and reach the program as typed,
+        // untrimmed; NUMVAL-C, not this DTO, reads each as the value of its digits.
+        let padded = extract(
+            r#"{"custom":"X","start_month":" 5","start_day":"5 ","start_year":"  22",
+                "end_month":"7 ","end_day":" 6","end_year":"22  "}"#,
+        )
+        .await??;
+        assert_eq!(
+            [
+                padded.start_month.as_str(),
+                padded.start_day.as_str(),
+                padded.start_year.as_str(),
+                padded.end_month.as_str(),
+                padded.end_day.as_str(),
+                padded.end_year.as_str(),
+            ],
+            [" 5", "5 ", "  22", "7 ", " 6", "22  "]
+        );
+        // The space-padded month `5 ` is `05` and passes the month edit, which its text, above
+        // `12`, would fail; the day `99` is then the first part rejected.
+        // audit: CORPT00C-017
+        let month_passed = extract(
+            r#"{"custom":"X","start_month":"5 ","start_day":"99","start_year":"2022",
+                "end_month":"07","end_day":"06","end_year":"2022"}"#,
+        )
+        .await??;
+        let failure = rules::edit(&input(&month_passed), &clock()?)
+            .err()
+            .ok_or("day 99 passed the day edit")?;
+        assert_eq!(
+            parts(&ScreenError::from(failure)),
+            (
+                StatusCode::BAD_REQUEST,
+                "Start Date - Not a valid Day...",
+                Some("start_day")
+            )
+        );
 
         // audit: CORPT00C-018
         let request = extract(

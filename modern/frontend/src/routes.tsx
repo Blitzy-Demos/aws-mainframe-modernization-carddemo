@@ -1,5 +1,5 @@
-import type { ComponentType } from "react";
-import { Navigate, type RouteObject } from "react-router";
+import { createContext, type ComponentType, type ReactNode } from "react";
+import { Navigate, Outlet, useNavigation, type RouteObject } from "react-router";
 import { RequireSignon } from "@/auth/RequireSignon";
 
 /**
@@ -10,8 +10,9 @@ import { RequireSignon } from "@/auth/RequireSignon";
  * front of it. `PATHS`, `PROGRAM_ROUTES` and `routes` are derived from it, so every route is
  * written once.
  *
- * Screens import this module for their header values and for the paths they navigate to, so it
- * never imports a screen statically. Each screen is loaded through its route's `lazy`.
+ * Screens import this module for their header values and for the paths they navigate to, and
+ * `ScreenShell` for `TransferPendingContext`, so it never imports a screen statically. Each screen
+ * is loaded through its route's `lazy`.
  */
 
 /**
@@ -239,12 +240,40 @@ function NoHydrateFallback(): null {
 }
 
 /**
+ * Whether a transfer to another screen is under way: the router has been asked for a new
+ * location and has not committed it, which lasts while the target screen's module loads. The
+ * screen being left stays mounted meanwhile, and `ScreenShell` locks its keys, as the terminal
+ * keyboard stays locked until the next program sends its map.
+ *
+ * `false` outside {@link ScreenOutlet}, where no router reports navigations, such as a screen
+ * rendered alone inside a `MemoryRouter`.
+ */
+export const TransferPendingContext = createContext(false);
+
+/**
+ * The root route's element: the matched screen, told through {@link TransferPendingContext}
+ * whether the router is moving to another location. Every navigation of this table loads at most
+ * a lazy screen module, since no route has a loader or an action, so any state but `idle` is a
+ * transfer under way.
+ */
+export function ScreenOutlet(): ReactNode {
+  const transferPending = useNavigation().state !== "idle";
+  return (
+    <TransferPendingContext value={transferPending}>
+      <Outlet />
+    </TransferPendingContext>
+  );
+}
+
+/**
  * The route tree for `createBrowserRouter`. `/` and any unknown path go to sign-on, where every
  * CardDemo conversation starts (transaction CC00). The routes carry no query parameters: list
- * keys and selections travel in the route state the screens set.
+ * keys and selections travel in the route state the screens set. The root route renders
+ * {@link ScreenOutlet}, so every screen knows when a transfer away from it is under way.
  */
 export const routes: RouteObject[] = [
   {
+    Component: ScreenOutlet,
     HydrateFallback: NoHydrateFallback,
     children: [
       { path: "/", element: <Navigate to={PATHS.COSGN00} replace /> },

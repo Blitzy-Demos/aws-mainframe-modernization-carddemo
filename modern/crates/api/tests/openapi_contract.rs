@@ -139,7 +139,7 @@ const SCHEMA_REF: &str = "#/components/schemas/";
 
 /// The schemas the frontend names as `components["schemas"][…]` (AAP 0.6.2), with the shared
 /// and query types.
-const SCHEMAS: [&str; 44] = [
+const SCHEMAS: [&str; 48] = [
     "SignonRequest",
     "SignonResponse",
     "ScreenError",
@@ -147,7 +147,11 @@ const SCHEMAS: [&str; 44] = [
     "PageDirection",
     "MenuResponse",
     "AccountViewResponse",
+    "AccountViewAccountBlock",
+    "AccountViewCustomerBlock",
+    "AccountViewError",
     "AccountUpdateView",
+    "AccountUpdateViewError",
     "AccountUpdateRequest",
     "AccountUpdateResult",
     "CardListQuery",
@@ -191,13 +195,14 @@ const SCHEMAS: [&str; 44] = [
 /// `X(10)` date fields are `date`, `X(26)` timestamps `date-time`. The row date of
 /// `TranListResponse` is its `TranListRow` member `orig_ts`, from the `TRAN-ORIG-TS PIC X(26)`
 /// timestamp, so it is a `date-time`; its `display_date` is the `MM/DD/YY` text the screen
-/// shows and no date field. The raw date parts that `AccountUpdateRequest`, `ReportRequest` and
+/// shows and no date field. `AccountViewResponse` is `allOf` its two blocks, whose schemas hold
+/// its dates. The raw date parts that `AccountUpdateRequest`, `ReportRequest` and
 /// `TranAddRequest` carry to the programs' date edits stay strings and are not listed.
 const DATE_PROPERTIES: [(&str, &str, &str); 8] = [
-    ("AccountViewResponse", "open_date", "date"),
-    ("AccountViewResponse", "expiration_date", "date"),
-    ("AccountViewResponse", "reissue_date", "date"),
-    ("AccountViewResponse", "date_of_birth", "date"),
+    ("AccountViewAccountBlock", "open_date", "date"),
+    ("AccountViewAccountBlock", "expiration_date", "date"),
+    ("AccountViewAccountBlock", "reissue_date", "date"),
+    ("AccountViewCustomerBlock", "date_of_birth", "date"),
     ("CardViewResponse", "expiration_date", "date"),
     ("TranListRow", "orig_ts", "date-time"),
     ("TranViewResponse", "orig_ts", "date-time"),
@@ -595,6 +600,69 @@ fn ctli_statuses_declare_the_page_the_screen_error_or_any_of_both() -> TestResul
         assert!(
             !schemas.contains_key(name),
             "{name} is registered as a schema"
+        );
+    }
+    Ok(())
+}
+
+/// Endpoints 4 and 5 and the members their 404 and 500 bodies add to `ScreenError`: the blocks
+/// COACTVWC shows beside a message, and the state and details of COACTUPC-099. Their 400 and
+/// 401 stay `ScreenError`.
+const ACCOUNT_ERRORS: [(&str, &str, &[&str]); 2] = [
+    (
+        "/api/v1/accounts/{acct_id}/view",
+        "AccountViewError",
+        &["account", "customer"],
+    ),
+    (
+        "/api/v1/accounts/{acct_id}",
+        "AccountUpdateViewError",
+        &["details", "state"],
+    ),
+];
+
+#[test]
+fn account_errors_are_the_screen_error_with_optional_members_beside_it() -> TestResult {
+    let doc = document()?;
+    for (path, name, beside) in ACCOUNT_ERRORS {
+        let entry = operation(&doc, "GET", path)?;
+        for (status, body) in [
+            ("400", "ScreenError"),
+            ("401", "ScreenError"),
+            ("404", name),
+            ("500", name),
+        ] {
+            let schema = entry
+                .pointer(&format!(
+                    "/responses/{status}/content/application~1json/schema"
+                ))
+                .ok_or_else(|| format!("GET {path} {status} has no JSON body schema"))?;
+            assert_eq!(
+                schema,
+                &json!({"$ref": format!("{SCHEMA_REF}{body}")}),
+                "GET {path} {status}: body schema"
+            );
+        }
+        let parts = schema(&doc, name)?
+            .get("allOf")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{name} is not allOf"))?;
+        let [screen_error, members] = parts.as_slice() else {
+            return Err(format!("{name} is allOf {} parts", parts.len()).into());
+        };
+        assert!(
+            references(screen_error, "ScreenError"),
+            "{name} is ScreenError first"
+        );
+        assert_eq!(
+            property_names(members)?,
+            beside.iter().copied().collect::<BTreeSet<&str>>(),
+            "{name}: the members beside ScreenError"
+        );
+        assert_eq!(
+            members.get("required"),
+            None,
+            "{name}: no member beside ScreenError is required"
         );
     }
     Ok(())

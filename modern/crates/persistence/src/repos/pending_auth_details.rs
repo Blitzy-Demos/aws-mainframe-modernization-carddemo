@@ -19,7 +19,8 @@
 //! |---|---|
 //! | COPAUA0C `8500-INSERT-AUTH`, `ISRT` of `PAUTDTL1` under `ACCNTID` (`COPAUA0C.cbl:854-935`) | [`insert`](PendingAuthDetailRepository::insert) |
 //! | COPAUS0C `GET-AUTHORIZATIONS`, `GNP`, and `REPOSITION-AUTHORIZATIONS`, `GNP WHERE (PAUT9CTS = key)` (`COPAUS0C.cbl:458-520`) | [`page_after`](PendingAuthDetailRepository::page_after) |
-//! | COPAUS1C `READ-AUTH-RECORD`, `GNP WHERE (PAUT9CTS = key)` (`COPAUS1C.cbl:465-469`) | [`find_by_id`](PendingAuthDetailRepository::find_by_id) |
+//! | COPAUS1C `READ-AUTH-RECORD`, `GNP WHERE (PAUT9CTS = key)` (`COPAUS1C.cbl:465-469`), on ENTER and F8 | [`find_by_id`](PendingAuthDetailRepository::find_by_id) |
+//! | The same read under `MARK-AUTH-FRAUD` on F5, ahead of the `REPL`, held as the get-hold call a `REPL` requires (`COPAUS1C.cbl:230-265`; X-COPAUS1C-1) | [`lock_by_id`](PendingAuthDetailRepository::lock_by_id) |
 //! | COPAUS1C `READ-NEXT-AUTH-RECORD`, unqualified `GNP` (`COPAUS1C.cbl:493-498`) | [`page_after`](PendingAuthDetailRepository::page_after) with a limit of 2 from the current key |
 //! | COPAUS1C `UPDATE-AUTH-DETAILS`, `REPL` (`COPAUS1C.cbl:520-528`) | [`update`](PendingAuthDetailRepository::update) |
 //! | CBPAUP0C `3000-FIND-NEXT-AUTH-DTL`, `GNP` until `GE` (`CBPAUP0C.cbl:248-273`) | [`find_all_by_acct_id`](PendingAuthDetailRepository::find_all_by_acct_id) |
@@ -75,6 +76,30 @@ pub trait PendingAuthDetailRepository: Send {
     /// [`PersistenceError::Decode`] when the stored row does not fit `CIPAUDTY`;
     /// [`PersistenceError::Unavailable`] or [`PersistenceError::Database`] when the read fails.
     fn find_by_id(
+        &mut self,
+        acct: PicS<11>,
+        date_9c: PicS<5>,
+        time_9c: PicS<9>,
+    ) -> impl Future<Output = Result<Option<PendingAuthDetailRecord>, PersistenceError>> + Send;
+
+    /// The detail of account `acct` whose sequence key is (`date_9c`, `time_9c`), read with a
+    /// row lock (`SELECT … FOR UPDATE`): the read of COPAUS1C `MARK-AUTH-FRAUD` that its `REPL`
+    /// follows, held as the get-hold call IMS requires before a `REPL` would hold the segment
+    /// (`COPAUS1C.cbl:230-265`; COPAUS1C-028, X-COPAUS1C-1). `None` as for
+    /// [`find_by_id`](Self::find_by_id).
+    ///
+    /// On a [`PgTx`] the row stays locked until the transaction commits or rolls back, so two
+    /// fraud toggles of one detail run one after the other. A lock that another transaction
+    /// holds makes the call wait; once that transaction commits, the call returns the row as it
+    /// committed it, so the flag a toggle reads is the one the toggle before it stored. On a
+    /// [`PgStore`] the statement commits at once and the lock ends with the call.
+    ///
+    /// # Errors
+    ///
+    /// As [`find_by_id`](Self::find_by_id); a lock wait the server ends, such as a lock timeout
+    /// (`55P03`) or a deadlock (`40P01`), is [`PersistenceError::Database`] with that SQLSTATE,
+    /// the detail-read failure endpoint 23 answers with COPAUS1C-011's text.
+    fn lock_by_id(
         &mut self,
         acct: PicS<11>,
         date_9c: PicS<5>,
@@ -195,6 +220,20 @@ impl PendingAuthDetailRepository for PgStore {
         probed(verdict, select_by_key(self.pool(), acct, date_9c, time_9c))
     }
 
+    fn lock_by_id(
+        &mut self,
+        acct: PicS<11>,
+        date_9c: PicS<5>,
+        time_9c: PicS<9>,
+    ) -> impl Future<Output = Result<Option<PendingAuthDetailRecord>, PersistenceError>> + Send
+    {
+        let verdict = self.verdict(ProbePoint::AuthDetailLock, &[&acct, &date_9c, &time_9c]);
+        probed(
+            verdict,
+            select_for_update(self.pool(), acct, date_9c, time_9c),
+        )
+    }
+
     fn page_after(
         &mut self,
         acct: PicS<11>,
@@ -256,6 +295,20 @@ impl PendingAuthDetailRepository for PgTx<'_> {
     {
         let verdict = self.verdict(ProbePoint::AuthDetailRead, &[&acct, &date_9c, &time_9c]);
         probed(verdict, select_by_key(self.conn(), acct, date_9c, time_9c))
+    }
+
+    fn lock_by_id(
+        &mut self,
+        acct: PicS<11>,
+        date_9c: PicS<5>,
+        time_9c: PicS<9>,
+    ) -> impl Future<Output = Result<Option<PendingAuthDetailRecord>, PersistenceError>> + Send
+    {
+        let verdict = self.verdict(ProbePoint::AuthDetailLock, &[&acct, &date_9c, &time_9c]);
+        probed(
+            verdict,
+            select_for_update(self.conn(), acct, date_9c, time_9c),
+        )
     }
 
     fn page_after(
@@ -340,6 +393,35 @@ async fn select_by_key<'e, E: PgExecutor<'e>>(
              match_status, auth_fraud, fraud_rpt_date, filler \
          FROM pending_auth_details \
          WHERE acct_id = $1 AND auth_date_9c = $2 AND auth_time_9c = $3",
+        pic_s_to_i64(acct),
+        pic_s_to_i64(date_9c),
+        pic_s_to_i64(time_9c),
+    )
+    .fetch_optional(executor)
+    .await?;
+    row.map(into_detail).transpose()
+}
+
+/// [`PendingAuthDetailRepository::lock_by_id`]: one row by its full primary key, `FOR UPDATE`.
+/// The row lock lasts as long as the executor's transaction: until the caller's [`PgTx`]
+/// commits or rolls back, or, on the pool, only as long as the statement.
+async fn select_for_update<'e, E: PgExecutor<'e>>(
+    executor: E,
+    acct: PicS<11>,
+    date_9c: PicS<5>,
+    time_9c: PicS<9>,
+) -> Result<Option<PendingAuthDetailRecord>, PersistenceError> {
+    let row = sqlx::query_as!(
+        PendingAuthDetailRow,
+        "SELECT acct_id, auth_date_9c, auth_time_9c, auth_orig_date, auth_orig_time, card_num, \
+             auth_type, card_expiry_date, message_type, message_source, auth_id_code, \
+             auth_resp_code, auth_resp_reason, processing_code, transaction_amt, approved_amt, \
+             merchant_catagory_code, acqr_country_code, pos_entry_mode, merchant_id, \
+             merchant_name, merchant_city, merchant_state, merchant_zip, transaction_id, \
+             match_status, auth_fraud, fraud_rpt_date, filler \
+         FROM pending_auth_details \
+         WHERE acct_id = $1 AND auth_date_9c = $2 AND auth_time_9c = $3 \
+         FOR UPDATE",
         pic_s_to_i64(acct),
         pic_s_to_i64(date_9c),
         pic_s_to_i64(time_9c),
@@ -522,6 +604,8 @@ async fn delete_row<'e, E: PgExecutor<'e>>(
 #[cfg(test)]
 mod tests {
     use std::error::Error as StdError;
+    use std::pin::pin;
+    use std::time::Duration;
 
     use copybook::{PicS, PicU, PicX};
     use domain::money::Money;
@@ -529,11 +613,16 @@ mod tests {
     use domain::sensitive::CardNumber;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+    use tokio::time::timeout;
 
     use super::PendingAuthDetailRepository;
     use crate::{PersistenceError, PgStore};
 
     type TestResult = Result<(), Box<dyn StdError>>;
+
+    /// How long a locked read is given to show that it waits: far longer than a read of one row
+    /// by its key takes on an idle server.
+    const LOCK_WAIT: Duration = Duration::from_millis(300);
 
     /// Not a fixture card number: no error may repeat it, nor its last four digits.
     const CARD: &str = "9876543210987654";
@@ -805,6 +894,68 @@ mod tests {
                 .await?
         );
         assert_eq!(store.find_all_by_acct_id(acct).await?, vec![neighbour]);
+        Ok(())
+    }
+
+    /// `lock_by_id` on a transaction holds the detail until the transaction ends: a second
+    /// transaction's `lock_by_id` waits for it, a plain read does not, and the waiter, once the
+    /// holder commits, reads the flag the holder stored, as the next F5 on the detail must. On
+    /// the pool the lock ends with the call, and a key no detail holds is `None`.
+    // audit: COPAUS1C-028
+    #[tokio::test]
+    async fn lock_by_id_holds_the_detail_until_the_transaction_ends() -> TestResult {
+        let guard = test_support::postgres::start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let acct = PicS::<11>::new(ACCT)?;
+        seed_summary(guard.pool(), ACCT).await?;
+        let stored = detail(25_200, 101_010_101)?;
+        store.insert(acct, &stored).await?;
+        let (date, time) = (stored.auth_date_9c, stored.auth_time_9c);
+        let absent = PicS::<9>::new(time.get() + 1)?;
+
+        // Through the pool the lock ends with its statement, so a second one does not wait.
+        assert_eq!(
+            store.lock_by_id(acct, date, time).await?,
+            Some(stored.clone())
+        );
+        assert_eq!(
+            store.lock_by_id(acct, date, time).await?,
+            Some(stored.clone())
+        );
+        assert_eq!(store.lock_by_id(acct, date, absent).await?, None);
+
+        let mut holder = store.begin().await?;
+        assert_eq!(holder.lock_by_id(acct, date, absent).await?, None);
+        let mut reported = holder
+            .lock_by_id(acct, date, time)
+            .await?
+            .ok_or("the detail is stored")?;
+        assert_eq!(reported, stored);
+        // A plain read does not wait for the lock.
+        assert_eq!(
+            store.find_by_id(acct, date, time).await?,
+            Some(stored.clone())
+        );
+
+        // Another transaction's locked read waits while the holder's transaction is open.
+        let mut waiter = store.begin().await?;
+        let seen = {
+            let mut waiting = pin!(waiter.lock_by_id(acct, date, time));
+            assert!(
+                timeout(LOCK_WAIT, waiting.as_mut()).await.is_err(),
+                "a second lock of the detail was granted while the first was held"
+            );
+            // The holder flags the detail and commits, which releases the lock: the waiter then
+            // reads the detail as the holder committed it, not as it was when the wait began.
+            reported.auth_fraud = PicX::from_text("F")?;
+            reported.fraud_rpt_date = PicX::from_text("07/18/22")?;
+            assert!(holder.update(acct, &reported).await?);
+            holder.commit().await?;
+            waiting.await?
+        };
+        assert_eq!(seen, Some(reported.clone()));
+        waiter.rollback().await?;
+        assert_eq!(store.find_by_id(acct, date, time).await?, Some(reported));
         Ok(())
     }
 }

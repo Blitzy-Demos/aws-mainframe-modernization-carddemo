@@ -23,7 +23,9 @@
 //!   500, and 404 on endpoint 25) with the page, `dto::cotrtlic::TranTypeListResponse` or
 //!   `TranTypeListActionResult`; their request-layer rejections, an unissued `page_key` or
 //!   `state`, an unreachable database and a failed commit transaction keep the `ScreenError`.
-//!   An unmatched path (404) and a method its route does not serve (405) get axum's empty body.
+//!   The router answers with it too: 404 for an unmatched path, 405 for a method its route does
+//!   not serve (with the route's `Allow` header) and 503 for a request refused at the in-flight
+//!   limit, each with a fixed text of [`error`].
 //! - [`openapi`]: [`openapi::ApiDoc`], the base document every operation is added to.
 //! - `handlers` and `services`, crate-private: one module per program each, reached only through
 //!   [`app::router`].

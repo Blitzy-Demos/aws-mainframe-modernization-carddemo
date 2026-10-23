@@ -262,7 +262,7 @@ function disabledKeys(): Record<string, boolean> {
   return Object.fromEntries(
     within(keyRow())
       .getAllByRole("button")
-      .map((button) => [button.textContent ?? "", button.hasAttribute("disabled")]),
+      .map((button) => [button.textContent ?? "", button.getAttribute("aria-disabled") === "true"]),
   );
 }
 

@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentType } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -7,6 +8,7 @@ import {
   RouterProvider,
   Routes,
   useLocation,
+  type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
@@ -28,6 +30,15 @@ import { COTRTLI } from "./COTRTLI";
 
 const LIST_PATH = "/api/v1/transaction-types";
 const ACTIONS_PATH = "/api/v1/transaction-types/list-actions";
+
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
 
 const RECORD_ACTIONS = "Type U to update, D to delete any record";
 const DELETE_PROMPT = "Delete HIGHLIGHTED row ? Press F10 to confirm";
@@ -863,6 +874,18 @@ describe("COTRTLI", () => {
     expect(pageNo()).toHaveProperty("readOnly", true);
     expect(pageNo().getAttribute("size")).toBe("3");
     expect(pageNo()).toHaveProperty("value", "1");
+    // Every input takes the shared map-field box, `MAP_FIELD_BOX` with `size` = its LENGTH, so a
+    // full-length value, the 50-character row description included, shows on the narrowest frame.
+    for (const [box, length] of [
+      [pageNo(), "3"],
+      [typeFilter(), "2"],
+      [descFilter(), "50"],
+      [selectorAt(1), "1"],
+      [descriptionAt(1), "50"],
+    ] as const) {
+      expect(box.getAttribute("size")).toBe(length);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
+    }
 
     const table = screen.getByRole("table", { name: "Transaction types" });
     expect(within(table).getAllByRole("columnheader").map((head) => head.textContent)).toEqual([
@@ -1429,7 +1452,7 @@ describe("COTRTLI", () => {
     readonly filtersOpen: boolean;
     readonly description?: number;
   }[])(
-    "while $title is out, its keys are disabled and send nothing, F2 and F3 stay, and the inputs wait",
+    "while $title is out, its keys and F2 are disabled and send nothing, F3 stays, and the inputs wait",
     async (example) => {
       const { prior, start, answer, filtersOpen } = example;
       const description = "description" in example ? example.description : undefined;
@@ -1449,14 +1472,18 @@ describe("COTRTLI", () => {
       if (description !== undefined) {
         expect(descriptionAt(description)).toHaveProperty("readOnly", false);
       }
-      const refused = ["ENTER", "F7=Page Up", "F8=Page Dn", "F10=Save"];
-      const available = ["F2=Add", "F3=Exit"];
-      /** Every key that sends a request, by its button and on the keyboard; F1 counts as ENTER. */
+      // F2 sends no request, but its transfer takes the same lock, so it waits for the answer too.
+      const refused = ["ENTER", "F2=Add", "F7=Page Up", "F8=Page Dn", "F10=Save"];
+      const available = ["F3=Exit"];
+      /**
+       * Every key that sends a request, and F2, by its button and on the keyboard; F1 counts as
+       * ENTER.
+       */
       function pressRequestKeys(): void {
         for (const label of refused) {
           press(label);
         }
-        for (const key of ["Enter", "F7", "F8", "F10", "F1"]) {
+        for (const key of ["Enter", "F2", "F7", "F8", "F10", "F1"]) {
           fireEvent.keyDown(window, { key });
         }
       }
@@ -1483,10 +1510,10 @@ describe("COTRTLI", () => {
       expect(functionKeys().getAttribute("aria-busy")).toBe("true");
       expect(form().getAttribute("aria-busy")).toBe("true");
       for (const label of refused) {
-        expect(keyButton(label).disabled).toBe(true);
+        expect(keyButton(label).getAttribute("aria-disabled")).toBe("true");
       }
       for (const label of available) {
-        expect(keyButton(label).disabled).toBe(false);
+        expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
       }
       expect(typeFilter()).toHaveProperty("readOnly", true);
       expect(descFilter()).toHaveProperty("readOnly", true);
@@ -1503,7 +1530,7 @@ describe("COTRTLI", () => {
       await answered(seen, prior.length + 1);
       expect(functionKeys().getAttribute("aria-busy")).toBe("false");
       for (const label of [...refused, ...available]) {
-        expect(keyButton(label).disabled).toBe(false);
+        expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
       }
       expect(typeFilter()).toHaveProperty("readOnly", !filtersOpen);
       expect(descFilter()).toHaveProperty("readOnly", !filtersOpen);
@@ -1706,3 +1733,93 @@ describe("COTRTLI in the route table: a 401 ends the session", () => {
     },
   );
 });
+
+/**
+ * A route `lazy` that stays loading until `load` is called, as a screen's module does on a slow
+ * network, then renders `Component`.
+ */
+function slowRoute(Component: ComponentType): {
+  readonly lazy: () => Promise<{ Component: ComponentType }>;
+  readonly load: () => void;
+} {
+  let resolveModule: () => void = () => undefined;
+  const loaded = new Promise<{ Component: ComponentType }>((resolve) => {
+    resolveModule = () => {
+      resolve({ Component });
+    };
+  });
+  return {
+    lazy: () => loaded,
+    load: () => {
+      resolveModule();
+    },
+  };
+}
+
+// F2 leaves the list on screen until COTRTUP's module has loaded. F2 takes the keyboard lock, as
+// a request does, and holds it through that wait, as the terminal keyboard stays locked until the
+// next program sends its map. The screen sits in a data router without the application's root
+// element, so only the screen's own lock acts.
+describe("COTRTLI: F2 while the maintenance screen loads", () => {
+  it.each([{ via: "button" }, { via: "key" }])(
+    "F2 by its $via locks the keyboard until COTRTUP replaces the list, and no key sends a request meanwhile",
+    async ({ via }) => {
+      const seen = stubFetch([
+        [200, LOADED],
+        [200, REFRESHED],
+      ]);
+      const slow = slowRoute(() => <Target name="COTRTUP" />);
+      const screens: RouteObject[] = [
+        { path: PATHS.COTRTLI, element: <COTRTLI /> },
+        { path: PATHS.COTRTUP, lazy: slow.lazy },
+      ];
+      const router = createMemoryRouter(screens, { initialEntries: [PATHS.COTRTLI] });
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+      await answered(seen, 1);
+
+      if (via === "button") {
+        press("F2=Add");
+      } else {
+        fireEvent.keyDown(window, { key: "F2" });
+      }
+      await waitFor(() => {
+        expect(router.state.navigation.state).toBe("loading");
+        expect(form().getAttribute("aria-busy")).toBe("true");
+      });
+      expect(functionKeys().getAttribute("aria-busy")).toBe("true");
+      expect(typeFilter()).toHaveProperty("readOnly", true);
+      expect(descFilter()).toHaveProperty("readOnly", true);
+      for (const row of [1, 2, 3, 4, 5, 6, 7]) {
+        expect(selectorAt(row)).toHaveProperty("readOnly", true);
+        expect(descriptionAt(row)).toHaveProperty("readOnly", true);
+      }
+
+      // Every key that sends a request, and F2 again, by its button and on the keyboard; F1 is
+      // ENTER (COTRTLIC-014).
+      for (const label of ["ENTER", "F2=Add", "F7=Page Up", "F8=Page Dn", "F10=Save"]) {
+        press(label);
+      }
+      for (const key of ["Enter", "F1", "F2", "F7", "F8", "F10"]) {
+        fireEvent.keyDown(window, { key });
+      }
+      await settle();
+
+      expect(seen).toHaveLength(1);
+      expect(router.state.location.pathname).toBe(PATHS.COTRTLI);
+
+      slow.load();
+      expect(await arrivedAt("COTRTUP")).toEqual({ from: PATHS.COTRTLI });
+      expect(router.state.location.pathname).toBe(PATHS.COTRTUP);
+      expect(seen).toHaveLength(1);
+      router.dispose();
+    },
+  );
+});
+

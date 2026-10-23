@@ -12,7 +12,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCobil00cPay } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
@@ -65,20 +65,17 @@ const LABEL_CLASS = "h-full whitespace-pre text-foreground";
 const TEXT_CLASS = "flex h-full items-center whitespace-pre text-foreground";
 const RULE_CLASS = `${TEXT_CLASS} font-semibold`;
 /*
- * BLITZY [LAYOUT]: each input keeps its map cell (`POS`, `LENGTH`), but on narrow frames the 80
- * columns of `FieldGrid` leave a cell narrower than its `LENGTH` characters plus the Input's
- * padding, which would hide the end of the value. A minimum width on the spacing scale lets the
- * box extend past its cell into map columns that hold nothing:
- * - ACTIDIN, 11 characters (COBIL00-013): `min-w-36`, room for 11 monospace characters (0.6em
- *   each) at the Input's `text-base` below `md` as well as its `text-sm` above, with the default
- *   `px-3` and border; nothing follows it on line 6.
- * - CURBAL, 14 characters (COBIL00-017): `min-w-44`, likewise; nothing follows it on line 11.
- * - CONFIRM, 1 character (COBIL00-020): `min-w-6` with `px-1` (narrowing the Input's `px-3`), so
- *   the box reaches into the empty attribute and stopper columns (COBIL00-021), short of `(Y/N)`.
+ * Each input keeps its map cell (`POS`, `LENGTH`) and takes the shared map-field box
+ * (`FIELD_INPUT`, through `fieldInputClass` for the one-character CONFIRM) with `size` = its
+ * `LENGTH`, so a full-length value shows on the narrowest frame:
+ * - ACTIDIN, 11 characters (COBIL00-013); nothing follows it on line 6.
+ * - CURBAL, 14 characters (COBIL00-017), BLUE; nothing follows it on line 11.
+ * - CONFIRM, 1 character (COBIL00-020), centred; its short-field box reaches into the empty
+ *   attribute and stopper columns (COBIL00-021), short of `(Y/N)`.
  */
-const ACCT_CLASS = "min-w-36";
-const BALANCE_CLASS = "min-w-44 text-muted-foreground";
-const CONFIRM_CLASS = "min-w-6 px-1 text-center";
+const ACCT_CLASS = FIELD_INPUT;
+const BALANCE_CLASS = `${FIELD_INPUT} text-muted-foreground`;
+const CONFIRM_CLASS = `${fieldInputClass(COBIL00_LENGTHS.confirm)} text-center`;
 
 /** The cleared map: account and confirmation empty, as first entry and F4 leave them. */
 const EMPTY_VALUES: Cobil00Values = { acctId: "", confirm: "" };
@@ -348,6 +345,7 @@ export function COBIL00(): ReactNode {
                       <Input
                         {...field}
                         maxLength={COBIL00_LENGTHS.acctId}
+                        size={COBIL00_LENGTHS.acctId}
                         autoFocus
                         autoComplete="off"
                         spellCheck={false}
@@ -376,6 +374,7 @@ export function COBIL00(): ReactNode {
                 readOnly
                 tabIndex={-1}
                 value={balance}
+                size={BALANCE_LENGTH}
                 className={BALANCE_CLASS}
               />
             </GridCell>
@@ -392,6 +391,7 @@ export function COBIL00(): ReactNode {
                       <Input
                         {...field}
                         maxLength={COBIL00_LENGTHS.confirm}
+                        size={COBIL00_LENGTHS.confirm}
                         autoComplete="off"
                         spellCheck={false}
                         readOnly={pending}

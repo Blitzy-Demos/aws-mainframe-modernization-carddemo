@@ -8,10 +8,13 @@
 //!
 //! 1. `START OF EXECUTION OF PROGRAM CBTRN02C`, then the six opens in the program's order
 //!    (CBTRN02C-031, CBTRN02C-034):
-//!    - `DALYTRAN`: the `--dalytran` file is read in place, never written (CBTRN02C-033), and
-//!      decoded whole by codec A, line n as record n (CBTRN02C-001). A line codec A refuses, or
-//!      whose body is not one 350-byte record, ends the job before any other effect: no table
-//!      changes and no reject generation is created (CBTRN02C-032, CBTRN02C-045).
+//!    - `DALYTRAN`: the `--dalytran` file is opened for reading in place, never written
+//!      (CBTRN02C-033), and the open runs a validation pass over that one handle: every line is
+//!      read and decoded by codec A in turn and dropped once checked, so the whole file is
+//!      decoded when it is opened and no record is kept; the handle is then rewound to the
+//!      file's start for step 2. A line codec A refuses, or whose body is not one 350-byte
+//!      record, ends the job in this pass, before any other effect: no table changes and no
+//!      reject generation is created (CBTRN02C-032, CBTRN02C-045).
 //!    - `TRANFILE`: the run opens its session, the `PgSession` that holds its writer claims and
 //!      runs every statement of the run, and claims `transactions` for writing on it
 //!      (CBTRN02C-046); then `transactions` must hold no row, the only state in which the
@@ -24,7 +27,10 @@
 //!      (CBTRN02C-046); `XREFFILE` is opened for input, which claims nothing.
 //!    - `DALYREJS`: the next `DALYREJS` generation in `Config::dalyrejs_dir`, created before the
 //!      first record is read, so that it exists, empty, when nothing is rejected (CBTRN02C-028).
-//! 2. Each record goes to [`Posttran::process`] in input order (CBTRN02C-002). A posting's writes
+//! 2. The processing pass reads the rewound handle again, line n as record n (CBTRN02C-001), a
+//!    few records at a time, each line checked as the validation pass checked it, so the job
+//!    holds one line and at most [`READ_AHEAD`] decoded records whatever the size of the input.
+//!    Each record goes to [`Posttran::process`] in input order (CBTRN02C-002). A posting's writes
 //!    are issued in `2000-POST-TRANSACTION`'s order: the category balance (`2700`), the account
 //!    (`2800`), then the transaction (`2900`) (CBTRN02C-015 to CBTRN02C-024). A rejected record is
 //!    written to the generation as its 430 bytes and LF: the 350 input bytes, the four-digit
@@ -75,7 +81,7 @@
 //! | Operation | Line shown first | Status shown | Rules |
 //! |---|---|---|---|
 //! | `--dalytran` cannot be opened for reading | `ERROR OPENING DALYTRAN` | stand-in `0030` | CBTRN02C-031 |
-//! | `--dalytran` opens but cannot be read, as a directory | `ERROR READING DALYTRAN FILE` | stand-in `0030` | CBTRN02C-038 |
+//! | `--dalytran` opens but a read of it, or its rewind, fails, as for a directory | `ERROR READING DALYTRAN FILE` | stand-in `0030` | CBTRN02C-038 |
 //! | a line codec A refuses, or a body that is not 350 bytes | none; an event names the file, the line and the failing rule | none | CBTRN02C-032, CBTRN02C-045 |
 //! | another run holds the claim on `transactions` | `ERROR OPENING TRANSACTION FILE` | `9243`, not claimed as parity | CBTRN02C-046 |
 //! | the run's session cannot be opened, the claim on `transactions` fails, or `transactions` cannot be read | `ERROR OPENING TRANSACTION FILE` | stand-in `0030` | CBTRN02C-031 |
@@ -102,6 +108,11 @@
 //!   (X-POSTTRAN-H1), `9243`, the line of status `93`, for a cluster another run holds open
 //!   (CBTRN02C-046), and `0030`, the permanent-error status, for any other failure, none of them
 //!   a parity result (CBTRN02C-042, X-POSTTRAN-H3).
+//! - The failed read of `--dalytran`, a refused line and a body that is not 350 bytes are met in
+//!   the validation pass at the open, before any other effect. The processing pass meets them
+//!   only when a read fails after the open, or the file changes after it; it then takes the same
+//!   path once every record before the failing line has been processed, so their writes stand
+//!   and nothing after that line follows (CBTRN02C-015, CBTRN02C-038).
 //! - Every path ends with `ABENDING PROGRAM` and [`JobError::Abend`] with exit status 12, the
 //!   value X-POSTTRAN-2 proposes for the user abend `U0999` that `CEE3ABD` raises: neither 0 nor
 //!   4 (CBTRN02C-043). The unfinished generation is then dropped, and its guard removes it, so no
@@ -144,20 +155,25 @@
 //!   static text (CBTRN02C-037). No record is ever formatted here.
 //! - Typed Dates and Timestamps: `TRAN-PROC-TS` comes typed from the domain, the injected clock's
 //!   instant in layout `D` (CBTRN02C-013, E33); no timestamp text is built here.
-//! - Total Parsers Over Untrusted Input: the input is decoded only by codec A's total decoder,
-//!   and nothing here indexes input bytes.
+//! - Total Parsers Over Untrusted Input: each input line, as `BufRead::read_until` ends it at
+//!   its LF, is framed by `copybook::framing::lines` and decoded by `Framed::decode`, codec A's
+//!   total functions, which frame it exactly as a split of the whole file would; nothing here
+//!   indexes input bytes.
 //! - Local-Only Runtime: the job writes only the generation under `Config::dalyrejs_dir` and the
 //!   `PostgreSQL` tables.
 //! - R4: every statement is a call of `persistence` on the run's session: a repository call, a
 //!   writer claim of `PgSession::claim_writer`, or the session's close.
 
+use std::collections::VecDeque;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Seek};
+use std::mem;
 use std::path::{Path, PathBuf};
 
 use copybook::FixedRecord;
+use copybook::framing::{Framed, lines};
 use domain::batch::cbtrn02c::{Posting, Posttran, RecordOutcome, START_LINE, TcatbalWrite};
-use domain::batch::loads::{LoadError, decode_fixture};
+use domain::batch::loads::LoadErrorKind;
 use domain::records::{AccountRecord, DailyTransactionRecord, RejectRecord, TransactionRecord};
 use persistence::{
     AccountRepository, CardXrefRepository, Dataset, PersistenceError, PgSession, PgStore,
@@ -176,6 +192,13 @@ const REJECTS_BASE: &str = "DALYREJS";
 /// The name the events of a refused input line give the file: its DD name, never the path
 /// (CBTRN02C-032).
 const DALYTRAN: &str = "DALYTRAN";
+
+/// The most records one blocking step of the processing pass decodes ahead of the job, so that
+/// the records held never grow with the input (CBTRN02C-001).
+const READ_AHEAD: usize = 64;
+
+/// The byte that ends an input line.
+const LF: u8 = b'\n';
 
 /// The exit status of every `9999-ABEND-PROGRAM` path. `CEE3ABD` with abend code 999 ends the
 /// step with user abend `U0999`, which carries no return code; 12 is the value X-POSTTRAN-2
@@ -249,7 +272,8 @@ const ACCOUNT_REWRITE_FAILED: &str = "an account could not be rewritten";
 
 /// `0000-DALYTRAN-OPEN`.
 const OPEN_DALYTRAN_OP: &str = "OPEN DALYTRAN";
-/// The reads of `1000-DALYTRAN-GET-NEXT`, done at once.
+/// The reads of `1000-DALYTRAN-GET-NEXT`: every line, read once by the validation pass at the
+/// open, and again, a few records at a time, by the processing pass; the rewind between them.
 const READ_DALYTRAN_OP: &str = "READ DALYTRAN";
 /// `0100-TRANFILE-OPEN`.
 const OPEN_TRANFILE_OP: &str = "OPEN TRANFILE";
@@ -438,7 +462,7 @@ const TCATBALF: WriterOpen = WriterOpen {
 /// - [`JobError::Posttran`] when a run counter outgrows 64 bits (CBTRN02C-036).
 pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutcome, JobError> {
     tracing::info!("{START_LINE}");
-    let records = open_dalytran(dalytran).await?;
+    let mut records = open_dalytran(dalytran).await?;
     // Every statement of the run goes to its one session, the one holding its writer claims, so
     // that a session the server ends takes the claims and the run's next statement with it, and
     // no write follows the loss (CBTRN02C-046). Each statement on the session commits on its
@@ -457,8 +481,8 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
         .await
         .map_err(|error| shown_failure(READ_TCATBALF_OP, READ_TCATBAL, &error))?;
     let mut posttran = Posttran::new(accounts, xrefs, tcatbals);
-    for daily in &records {
-        match posttran.process(daily, ctx.clock)? {
+    while let Some(daily) = records.next().await? {
+        match posttran.process(&daily, ctx.clock)? {
             RecordOutcome::Posted(posting) => apply_posting(&mut session, &posting).await?,
             RecordOutcome::Rejected(reject) => write_reject(&mut rejects, &reject).await?,
         }
@@ -481,77 +505,279 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     })
 }
 
-/// `0000-DALYTRAN-OPEN` and every `1000-DALYTRAN-GET-NEXT` at once: the whole input, read in
-/// place and decoded by codec A in file order, line n as record n (CBTRN02C-001, CBTRN02C-033).
-/// An input of no bytes holds no record (CBTRN02C-029).
+/// `0000-DALYTRAN-OPEN`, then the validation pass: the file opened for reading in place
+/// (CBTRN02C-033) and every line read and decoded by codec A in file order, each record dropped
+/// once its line is checked, so the whole file is decoded at its open and none of it is kept
+/// (CBTRN02C-032, CBTRN02C-045). Returns the reader of the processing pass over the same
+/// handle, rewound to the file's start, which yields line n as record n (CBTRN02C-001). An
+/// input of no bytes holds no record (CBTRN02C-029).
 ///
 /// # Errors
 ///
 /// [`JobError::Abend`] when the file cannot be opened for reading (`ERROR OPENING DALYTRAN`,
-/// CBTRN02C-031), when it opens but cannot be read (`ERROR READING DALYTRAN FILE`,
-/// CBTRN02C-038), when codec A refuses a line (CBTRN02C-032), or when a line's body is not the
-/// 350-byte record, which is never padded into one (CBTRN02C-045). Nothing else has happened
-/// then.
+/// CBTRN02C-031), when a read of it or its rewind fails, as for a directory
+/// (`ERROR READING DALYTRAN FILE`, CBTRN02C-038), when codec A refuses a line (CBTRN02C-032),
+/// or when a line's body is not the 350-byte record, which is never padded into one
+/// (CBTRN02C-045). Nothing else has happened then.
 ///
-/// The read and the decoding block, so they run as one step on the blocking pool, awaited at
-/// once; the step only returns what failed, and the events of the failure are emitted here,
-/// in the job's span, as when the step ran inline (W011-F05).
-async fn open_dalytran(path: &Path) -> Result<Vec<DailyTransactionRecord>, JobError> {
+/// The open, the reads and the decoding block, so the pass runs as one step on the blocking
+/// pool, awaited at once; the step only returns the handle or what failed, and the events of
+/// the failure are emitted here, in the job's span, as when the step ran inline (W011-F05). A
+/// step the runtime cancels before it runs is the failed open.
+async fn open_dalytran(path: &Path) -> Result<Dalytran, JobError> {
     let path = path.to_path_buf();
-    let decoded = blocking(READING_INPUT, move || {
-        let bytes = read_dalytran(&path)?;
-        decode_fixture::<DailyTransactionRecord>(&bytes).map_err(DalytranFailure::Refused)
-    })
-    .await;
-    let lines = match decoded {
-        Ok(Ok(lines)) => lines,
-        Ok(Err(DalytranFailure::Unopenable(error))) | Err(error) => {
-            return Err(file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error));
-        }
-        Ok(Err(DalytranFailure::Unreadable(error))) => {
-            return Err(file_failure(READ_DALYTRAN_OP, READ_DALYTRAN, &error));
-        }
-        Ok(Err(DalytranFailure::Refused(error))) => return Err(refused(&error)),
-    };
-    let mut records = Vec::with_capacity(lines.len());
-    for (index, line) in lines.into_iter().enumerate() {
-        if line.framing.body_len != DailyTransactionRecord::WIDTH {
-            return Err(not_a_record(index.saturating_add(1), line.framing.body_len));
-        }
-        records.push(line.record);
+    match blocking(READING_INPUT, move || read_dalytran(&path)).await {
+        Ok(Ok(file)) => Ok(Dalytran::new(file)),
+        Ok(Err(failure)) => Err(failure.report()),
+        Err(error) => Err(file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error)),
     }
-    Ok(records)
 }
 
-/// `0000-DALYTRAN-OPEN`, the file opened for reading, then every `READ` of
-/// `1000-DALYTRAN-GET-NEXT` at once, the file read in place to its end (CBTRN02C-033). Runs
-/// inside the blocking step of [`open_dalytran`].
+/// The blocking step of [`open_dalytran`]: `0000-DALYTRAN-OPEN`, the file opened for reading,
+/// then the validation pass over it, every line read in place to the file's end, decoded and
+/// checked (CBTRN02C-033), and the handle rewound.
 ///
 /// # Errors
 ///
 /// [`DalytranFailure::Unopenable`] when the file cannot be opened for reading (CBTRN02C-031),
-/// and [`DalytranFailure::Unreadable`] when it opens but cannot be read, as a directory
-/// (CBTRN02C-038), each a [`JobError::Io`] with context `reading input` and the error's kind.
-fn read_dalytran(path: &Path) -> Result<Vec<u8>, DalytranFailure> {
-    let mut file = File::open(path)
-        .map_err(io(READING_INPUT))
-        .map_err(DalytranFailure::Unopenable)?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(io(READING_INPUT))
-        .map_err(DalytranFailure::Unreadable)?;
-    Ok(bytes)
+/// [`DalytranFailure::Unreadable`] when a read or the rewind fails, as for a directory
+/// (CBTRN02C-038), each a [`JobError::Io`] with context `reading input` and the error's kind,
+/// and the refusal of the first line that fails its check (CBTRN02C-032, CBTRN02C-045).
+fn read_dalytran(path: &Path) -> Result<DalytranFile, DalytranFailure> {
+    let mut file = DalytranFile::open(path)?;
+    file.validate()?;
+    Ok(file)
 }
 
-/// Why the blocking step of [`open_dalytran`] produced no lines, returned unreported so that
-/// its events are emitted on the job's task.
+/// The one open handle of the `--dalytran` file, buffered, and the line both passes read
+/// through it one at a time. It holds the reader's buffer and one line, whatever the size of
+/// the file.
+struct DalytranFile {
+    /// The file, opened for reading only (CBTRN02C-033).
+    reader: BufReader<File>,
+    /// The bytes of the line last read, its terminator included; cleared and reused for every
+    /// line.
+    line: Vec<u8>,
+    /// How many lines have been read since the file's start, the number of the line last read.
+    lines_read: usize,
+}
+
+impl DalytranFile {
+    /// `0000-DALYTRAN-OPEN`: the file at `path` opened for reading (CBTRN02C-031).
+    ///
+    /// # Errors
+    ///
+    /// [`DalytranFailure::Unopenable`] when the file cannot be opened for reading.
+    fn open(path: &Path) -> Result<Self, DalytranFailure> {
+        let file = File::open(path)
+            .map_err(io(READING_INPUT))
+            .map_err(DalytranFailure::Unopenable)?;
+        Ok(Self {
+            reader: BufReader::new(file),
+            line: Vec::new(),
+            lines_read: 0,
+        })
+    }
+
+    /// The validation pass: every line from the current position to the file's end read and
+    /// checked by [`Self::next_line`], each record dropped once checked, then the handle
+    /// rewound to the file's start for the processing pass, which numbers its lines from 1
+    /// again (CBTRN02C-032, CBTRN02C-045).
+    ///
+    /// # Errors
+    ///
+    /// The failure of the first line that fails, and [`DalytranFailure::Unreadable`] when the
+    /// rewind fails, a failed read like any other (CBTRN02C-038).
+    fn validate(&mut self) -> Result<(), DalytranFailure> {
+        while self.next_line()?.is_some() {}
+        self.reader
+            .rewind()
+            .map_err(io(READING_INPUT))
+            .map_err(DalytranFailure::Unreadable)?;
+        self.lines_read = 0;
+        Ok(())
+    }
+
+    /// One `READ` of `1000-DALYTRAN-GET-NEXT`: the next line, read up to and including its LF,
+    /// or to the file's end, framed by `copybook::framing::lines` exactly as a split of the
+    /// whole file frames it, LF, CRLF, or no terminator for a last line without LF, decoded by
+    /// codec A and checked to hold the 350-byte record (CBTRN02C-001). `None` at the end of the
+    /// file, where no byte is left to read. Both passes read every line through this one
+    /// check.
+    ///
+    /// # Errors
+    ///
+    /// [`DalytranFailure::Unreadable`] when the read fails (CBTRN02C-038),
+    /// [`DalytranFailure::Refused`] when codec A refuses the line (CBTRN02C-032), and
+    /// [`DalytranFailure::NotARecord`] when its body is not the 350-byte record (CBTRN02C-045);
+    /// each names the line by its number only.
+    fn next_line(&mut self) -> Result<Option<Framed<DailyTransactionRecord>>, DalytranFailure> {
+        self.line.clear();
+        self.reader
+            .read_until(LF, &mut self.line)
+            .map_err(io(READING_INPUT))
+            .map_err(DalytranFailure::Unreadable)?;
+        let Some(line) = lines(&self.line).next() else {
+            return Ok(None);
+        };
+        let number = self.lines_read.saturating_add(1);
+        self.lines_read = number;
+        let framed = Framed::<DailyTransactionRecord>::decode(line).map_err(|error| {
+            DalytranFailure::Refused {
+                line: number,
+                kind: LoadErrorKind::Record(error),
+            }
+        })?;
+        let body_len = framed.framing.body_len;
+        if body_len == DailyTransactionRecord::WIDTH {
+            Ok(Some(framed))
+        } else {
+            Err(DalytranFailure::NotARecord {
+                line: number,
+                body_len,
+            })
+        }
+    }
+
+    /// One step of the processing pass: records read by [`Self::next_line`] and appended to
+    /// `ahead`, in file order, until it holds [`READ_AHEAD`] of them, the file ends or a line
+    /// fails.
+    fn read_ahead(&mut self, ahead: &mut VecDeque<DailyTransactionRecord>) -> StepEnd {
+        while ahead.len() < READ_AHEAD {
+            match self.next_line() {
+                Ok(Some(framed)) => ahead.push_back(framed.record),
+                Ok(None) => return StepEnd::End,
+                Err(failure) => return StepEnd::Failed(failure),
+            }
+        }
+        StepEnd::Full
+    }
+}
+
+/// Where one step of the processing pass stopped.
+enum StepEnd {
+    /// It read [`READ_AHEAD`] records; the file may hold more.
+    Full,
+    /// It reached the end of the file.
+    End,
+    /// It met a failed read or a line that fails its check, after the records it read before.
+    Failed(DalytranFailure),
+}
+
+/// The processing pass over the rewound `--dalytran` file: every `READ` of
+/// `1000-DALYTRAN-GET-NEXT`, yielding line n as record n, in file order (CBTRN02C-001).
+///
+/// The reads and the decoding block, so each runs on the blocking pool as one step that
+/// decodes at most [`READ_AHEAD`] records, awaited at once: the job holds the reader's buffer,
+/// one line and those records, whatever the size of the input. A failure a step meets is kept
+/// until every record read before it has been yielded, then reported on the job's task through
+/// the path of [`open_dalytran`], so the records before the failing line are processed, their
+/// writes stand and nothing after it follows (CBTRN02C-015, CBTRN02C-038).
+struct Dalytran {
+    /// The file, rewound by the validation pass; `None` while a step holds it, and for good
+    /// once its end or a failure has been met.
+    file: Option<DalytranFile>,
+    /// The records read and not yet yielded, in file order; at most [`READ_AHEAD`].
+    ahead: VecDeque<DailyTransactionRecord>,
+    /// The failure met right after the records of `ahead`, reported once they are yielded.
+    failure: Option<DalytranFailure>,
+}
+
+impl Dalytran {
+    /// The processing pass over `file`, which the validation pass has rewound.
+    fn new(file: DalytranFile) -> Self {
+        Self {
+            file: Some(file),
+            ahead: VecDeque::with_capacity(READ_AHEAD),
+            failure: None,
+        }
+    }
+
+    /// The next record in file order, `None` once the file's end has been reached
+    /// (CBTRN02C-001).
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Abend`], after its events, when a line fails after the validation pass, the
+    /// file having changed since, once every record before that line has been yielded: a read
+    /// that fails, or a step the runtime cancelled, is `ERROR READING DALYTRAN FILE`
+    /// (CBTRN02C-038), a line codec A refuses is CBTRN02C-032, and a body that is not the
+    /// 350-byte record is CBTRN02C-045.
+    async fn next(&mut self) -> Result<Option<DailyTransactionRecord>, JobError> {
+        if self.ahead.is_empty() {
+            self.read_ahead().await;
+        }
+        if let Some(record) = self.ahead.pop_front() {
+            return Ok(Some(record));
+        }
+        match self.failure.take() {
+            Some(failure) => Err(failure.report()),
+            None => Ok(None),
+        }
+    }
+
+    /// Runs one step of the processing pass, which takes the file and the empty read-ahead
+    /// queue onto the blocking pool and gives them back, filled, with where it stopped. Nothing
+    /// is read once the file's end or a failure has been met.
+    async fn read_ahead(&mut self) {
+        let Some(mut file) = self.file.take() else {
+            return;
+        };
+        let mut ahead = mem::take(&mut self.ahead);
+        let step = blocking(READING_INPUT, move || {
+            let end = file.read_ahead(&mut ahead);
+            (file, ahead, end)
+        })
+        .await;
+        match step {
+            Ok((file, ahead, end)) => {
+                self.ahead = ahead;
+                match end {
+                    StepEnd::Full => self.file = Some(file),
+                    StepEnd::End => {}
+                    StepEnd::Failed(failure) => self.failure = Some(failure),
+                }
+            }
+            // A step the runtime cancelled before it ran read nothing, and the file went with
+            // it: the failed read (CBTRN02C-038).
+            Err(error) => self.failure = Some(DalytranFailure::Unreadable(error)),
+        }
+    }
+}
+
+/// Why a read of the `--dalytran` file produced no record, returned unreported from the
+/// blocking steps so that its events are emitted on the job's task.
 enum DalytranFailure {
     /// The file could not be opened for reading: the failed open (CBTRN02C-031).
     Unopenable(JobError),
-    /// The file opened but could not be read: the failed read (CBTRN02C-038).
+    /// A read of the file, or its rewind, failed: the failed read (CBTRN02C-038).
     Unreadable(JobError),
-    /// Codec A refused a line (CBTRN02C-032).
-    Refused(LoadError),
+    /// Codec A refused the line numbered `line` (CBTRN02C-032).
+    Refused {
+        /// The 1-based number of the line.
+        line: usize,
+        /// The rule the line breaks: a field, an offset and a width, never a byte of it.
+        kind: LoadErrorKind,
+    },
+    /// The body of the line numbered `line` is not the 350-byte record (CBTRN02C-045).
+    NotARecord {
+        /// The 1-based number of the line.
+        line: usize,
+        /// The length of the line's body.
+        body_len: usize,
+    },
+}
+
+impl DalytranFailure {
+    /// The failure's events, emitted on the job's task, then the abend it ends the job with.
+    fn report(self) -> JobError {
+        match self {
+            Self::Unopenable(error) => file_failure(OPEN_DALYTRAN_OP, OPEN_DALYTRAN, &error),
+            Self::Unreadable(error) => file_failure(READ_DALYTRAN_OP, READ_DALYTRAN, &error),
+            Self::Refused { line, kind } => refused(line, kind),
+            Self::NotARecord { line, body_len } => not_a_record(line, body_len),
+        }
+    }
 }
 
 /// `0100-TRANFILE-OPEN`: the `OPEN OUTPUT` of the transaction cluster, which admits one writer
@@ -747,13 +973,14 @@ async fn close_dalyrejs(rejects: OutputFile) -> Result<PathBuf, JobError> {
     })
 }
 
-/// A `DALYTRAN` line codec A refuses: one event naming the file, the line and the rule it breaks,
-/// a field, an offset and a width, never a byte of the line, then the abend (CBTRN02C-032).
-fn refused(error: &LoadError) -> JobError {
+/// The `DALYTRAN` line numbered `line`, which codec A refuses: one event naming the file, the
+/// line and `kind`, the rule it breaks, a field, an offset and a width, never a byte of the
+/// line, then the abend (CBTRN02C-032).
+fn refused(line: usize, kind: LoadErrorKind) -> JobError {
     tracing::error!(
         file = DALYTRAN,
-        line = error.line(),
-        rule = %error.kind(),
+        line,
+        rule = %kind,
         "DALYTRAN line refused by codec A"
     );
     abend(Failure::unshown(LINE_REFUSED))
@@ -841,7 +1068,9 @@ mod tests {
 
     use chrono::NaiveDate;
     use copybook::FixedRecord;
+    use copybook::framing::{Framed, Terminator};
     use domain::batch::cbtrn02c::{RejectReason, START_LINE, reject_record};
+    use domain::batch::loads::decode_fixture;
     use domain::clock::FixedClock;
     use domain::records::{AccountRecord, DailyTransactionRecord, TranCatBalanceRecord};
     use persistence::{
@@ -853,10 +1082,10 @@ mod tests {
     use test_support::trace_capture::{self, TraceCapture};
 
     use super::{
-        ABEND_LINE, ACCTFILE, CLUSTER_NOT_EMPTY, Failure, JobContext, JobError, LINE_REFUSED,
-        OPEN_DALYREJS, OPEN_DALYTRAN, OutputFile, REJECTS_BASE, Status, TCATBALF, TRANFILE,
-        WRITE_TRANFILE, XREF_READ_FAILED, abend, close_dalyrejs, open_dalyrejs, open_dalytran, run,
-        write_reject,
+        ABEND_LINE, ACCTFILE, CLUSTER_NOT_EMPTY, Dalytran, DalytranFailure, DalytranFile, Failure,
+        JobContext, JobError, LINE_REFUSED, OPEN_DALYREJS, OPEN_DALYTRAN, OutputFile, READ_AHEAD,
+        REJECTS_BASE, Status, TCATBALF, TRANFILE, WRITE_TRANFILE, XREF_READ_FAILED, abend,
+        close_dalyrejs, open_dalyrejs, open_dalytran, run, write_reject,
     };
 
     type TestResult = Result<(), Box<dyn Error>>;
@@ -1011,6 +1240,41 @@ mod tests {
         }
     }
 
+    /// Every record the processing pass yields, in order, through `records`.
+    async fn drain(mut records: Dalytran) -> Result<Vec<DailyTransactionRecord>, JobError> {
+        let mut drained = Vec::new();
+        while let Some(record) = records.next().await? {
+            drained.push(record);
+        }
+        Ok(drained)
+    }
+
+    /// Every line of the file at `path` as the per-line read of both passes frames and decodes
+    /// it, in order.
+    fn framed_lines(path: &Path) -> Result<Vec<Framed<DailyTransactionRecord>>, JobError> {
+        let mut file = DalytranFile::open(path).map_err(DalytranFailure::report)?;
+        let mut framed = Vec::new();
+        while let Some(line) = file.next_line().map_err(DalytranFailure::report)? {
+            framed.push(line);
+        }
+        Ok(framed)
+    }
+
+    /// The first `count` lines of the daily fixture, without their LF.
+    fn fixture_lines(count: usize) -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+        let bytes = fs::read(dailytran())?;
+        let lines: Vec<Vec<u8>> = bytes
+            .split(|byte| *byte == b'\n')
+            .take(count)
+            .map(<[u8]>::to_vec)
+            .collect();
+        if lines.len() == count {
+            Ok(lines)
+        } else {
+            Err("the fixture has fewer lines".into())
+        }
+    }
+
     // audit: CBTRN02C-025
     // audit: CBTRN02C-040
     // audit: CBTRN02C-041
@@ -1083,7 +1347,7 @@ mod tests {
     #[tokio::test]
     async fn the_daily_fixture_decodes_whole_in_input_order() -> TestResult {
         let before = fs::read(dailytran())?;
-        let records = open_dalytran(&dailytran()).await?;
+        let records = drain(open_dalytran(&dailytran()).await?).await?;
         assert_eq!(records.len(), 300);
         for (n, record) in [(1, records.first()), (300, records.last())] {
             let record = record.ok_or("a record is missing")?;
@@ -1098,7 +1362,134 @@ mod tests {
     async fn an_empty_input_holds_no_record() -> TestResult {
         let scratch = Scratch::new()?;
         let empty = scratch.file("empty.txt", b"")?;
-        assert!(open_dalytran(&empty).await?.is_empty());
+        assert!(open_dalytran(&empty).await?.next().await?.is_none());
+        Ok(())
+    }
+
+    /// Both passes read the input line by line, each line framed and decoded exactly as
+    /// `decode_fixture` frames and decodes the whole file: LF, CRLF and a last line without LF,
+    /// over inputs longer than one step of the processing pass and one exactly a step long. The
+    /// input is unchanged afterwards (CBTRN02C-001, CBTRN02C-033).
+    // audit: CBTRN02C-001
+    // audit: CBTRN02C-033
+    #[tokio::test]
+    async fn streamed_records_and_framing_equal_the_whole_file_decode() -> TestResult {
+        let scratch = Scratch::new()?;
+        // The file's name, its number of lines, the terminator of every line but the last, and
+        // the last line's.
+        let cases = [
+            ("lf.txt", 300, Terminator::Lf, Terminator::Lf),
+            ("crlf.txt", 300, Terminator::CrLf, Terminator::CrLf),
+            ("no-final-lf.txt", 300, Terminator::Lf, Terminator::None),
+            ("read-ahead.txt", READ_AHEAD, Terminator::Lf, Terminator::Lf),
+        ];
+        for (name, count, terminator, last_terminator) in cases {
+            let lines = fixture_lines(count)?;
+            let mut input = Vec::new();
+            for (index, line) in lines.iter().enumerate() {
+                input.extend_from_slice(line);
+                let end = if index + 1 == count {
+                    last_terminator
+                } else {
+                    terminator
+                };
+                input.extend_from_slice(end.as_bytes());
+            }
+            let path = scratch.file(name, &input)?;
+            let expected = decode_fixture::<DailyTransactionRecord>(&input)?;
+            assert_eq!(expected.len(), count, "{name}");
+            assert_eq!(
+                expected.last().map(|framed| framed.framing.terminator),
+                Some(last_terminator),
+                "{name}"
+            );
+            assert!(
+                framed_lines(&path)? == expected,
+                "{name}: the framing differs"
+            );
+            let records: Vec<DailyTransactionRecord> =
+                expected.into_iter().map(|framed| framed.record).collect();
+            assert!(
+                drain(open_dalytran(&path).await?).await? == records,
+                "{name}: the records differ"
+            );
+            assert!(fs::read(&path)? == input, "{name}: the input was changed");
+        }
+        Ok(())
+    }
+
+    /// A file rewritten in place after the validation pass, one of its later lines refused by
+    /// codec A, yields every record before that line, in file order, and then ends the job at
+    /// it as a line refused at the open does: one event naming the file and the line only, then
+    /// the abend; nothing after the line is read (CBTRN02C-001, CBTRN02C-037). The lines tried
+    /// are the second, the last of the first step, the first of the second step and the last.
+    // audit: CBTRN02C-001
+    // audit: CBTRN02C-037
+    #[tokio::test]
+    async fn a_line_refused_after_the_open_ends_the_job_after_the_records_before_it() -> TestResult
+    {
+        let scratch = Scratch::new()?;
+        let all = fixture_lines(300)?;
+        let card = card_number(all.first().ok_or("the fixture is empty")?)?;
+        let mut valid = Vec::new();
+        for line in &all {
+            valid.extend_from_slice(line);
+            valid.push(b'\n');
+        }
+        for bad in [2, READ_AHEAD, READ_AHEAD + 1, all.len()] {
+            let name = format!("rewritten-{bad}.txt");
+            let path = scratch.file(&name, &valid)?;
+            let mut records = open_dalytran(&path).await?;
+            let mut rewritten = Vec::new();
+            for (index, line) in all.iter().enumerate() {
+                if index + 1 == bad {
+                    rewritten.extend_from_slice(b"QQQ-not-a-record");
+                } else {
+                    rewritten.extend_from_slice(line);
+                }
+                rewritten.push(b'\n');
+            }
+            fs::write(&path, &rewritten)?;
+            let capture = trace_capture::capture();
+            let mut yielded = Vec::new();
+            let error = loop {
+                match records.next().await {
+                    Ok(Some(record)) => yielded.push(record),
+                    Ok(None) => return Err(format!("line {bad}: the refused line was read").into()),
+                    Err(error) => break error,
+                }
+            };
+            assert_eq!(yielded.len(), bad - 1, "line {bad}");
+            for (record, line) in yielded.iter().zip(&all) {
+                assert!(record.encode() == *line, "line {bad}: a record differs");
+            }
+            assert_eq!(
+                abend_of(&error),
+                Some((Some(12), LINE_REFUSED)),
+                "line {bad}"
+            );
+            assert_eq!(
+                messages(&capture),
+                ["DALYTRAN line refused by codec A", ABEND_LINE],
+                "line {bad}"
+            );
+            assert!(capture.contains(&format!(r#""line":{bad}"#)), "line {bad}");
+            assert!(capture.contains(r#""file":"DALYTRAN""#), "line {bad}");
+            assert!(
+                !capture.contains("QQQ"),
+                "line {bad}: the line's bytes are shown"
+            );
+            assert!(
+                !capture.contains(&card),
+                "line {bad}: a card number is shown"
+            );
+            assert!(!capture.contains(&name), "line {bad}: the path is shown");
+            drop(capture);
+            assert!(
+                records.next().await?.is_none(),
+                "line {bad}: a read followed"
+            );
+        }
         Ok(())
     }
 

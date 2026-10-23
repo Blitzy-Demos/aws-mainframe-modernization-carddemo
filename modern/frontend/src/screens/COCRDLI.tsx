@@ -207,10 +207,10 @@ function errorLine(text: string | null | undefined): ShellMessage | undefined {
  *   Shift+F1 to F12 (PF13 to PF24) act as F1 to F12 (COCRDLIC-003).
  * - While a request is in flight the keys that read are ignored, as the 3270 keyboard locks
  *   until the program answers; F3 still exits. The lock is taken when ENTER, F7 or F8 is
- *   accepted, before the filter edits, and opens when the edits fail, when a selection opens
- *   another screen, or when the answer arrives. While the request is out, ENTER, `F7=Backward`
- *   and `F8=Forward` are disabled, the key row and the form are busy and every input is
- *   read-only.
+ *   accepted, before the filter edits, and opens when the edits fail or when the answer arrives;
+ *   a selection that opens another screen keeps it until that screen replaces this one. While the
+ *   lock is held, ENTER, `F7=Backward` and `F8=Forward` are disabled, the key row and the form
+ *   are busy and every input is read-only.
  *
  * Card numbers are shown exactly as the server redacts them, and only `card_ref` travels to the
  * next screen (Cardholder Data Redaction, E32). The page size is never sent, so the server's
@@ -264,7 +264,10 @@ export function COCRDLI(): ReactNode {
     return true;
   }
 
-  /** Opens the lock: the answer has arrived, or the key that took it sends nothing. */
+  /**
+   * Opens the lock: the answer has arrived, or the key that took it sends nothing. A selection's
+   * transfer keeps it until the next screen replaces this one.
+   */
   function unlockKeys(): void {
     inFlight.current = false;
     setPending(false);
@@ -367,7 +370,8 @@ export function COCRDLI(): ReactNode {
       const card = cardAt(page, edit.selected);
       if (card !== undefined) {
         const target = values.selections.at(edit.selected) === "S" ? PATHS.COCRDSL : PATHS.COCRDUP;
-        unlockKeys();
+        // The lock `press` took stays held until the target replaces this screen, so no key
+        // reads a page or changes the selection while its module loads.
         void navigate(target, {
           state: { from: PATHS.COCRDLI, acct_id: card.acct_id, card_ref: card.card_ref },
         });
@@ -394,8 +398,9 @@ export function COCRDLI(): ReactNode {
 
   /**
    * ENTER, F7 or F8: the edits, then a transfer or a read. The lock is taken here, before the
-   * asynchronous edits, so a key that arrives during them or while the request is out is
-   * refused. Edits that fail, or fail unexpectedly, open it again, as nothing was sent.
+   * asynchronous edits, so a key that arrives during them, while the request is out or while the
+   * transfer is under way is refused. Edits that fail, or fail unexpectedly, open it again, as
+   * nothing was sent.
    */
   function press(key: ListKey): void {
     if (!lockKeys()) {

@@ -62,7 +62,10 @@
 //!   fails.
 //! - Repository methods take `&mut self`, because a `sqlx` transaction executes only through a
 //!   mutable reference. A caller holds a [`PgStore`] by value and clones it, which copies only
-//!   the pool handle, into a local `mut` binding.
+//!   the pool, probe and fail-fast gate handles, into a local `mut` binding.
+//! - A [`PgStore`] with a fail-fast gate ([`PgStore::failing_fast_while`]), as `carddemo-api`'s
+//!   is, fails every statement, transaction and session it starts while the gate is shut, at
+//!   once and without I/O, as the database unavailable.
 //!
 //! # Single-writer claims
 //!
@@ -129,6 +132,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
 pub use domain;
@@ -184,6 +188,9 @@ pub enum ProbePoint {
     /// [`PendingAuthDetailRepository::find_by_id`]: `[PicS<11>, PicS<5>, PicS<9>]`, the account
     /// ID and the inverted date and time.
     AuthDetailRead,
+    /// [`PendingAuthDetailRepository::lock_by_id`]: `[PicS<11>, PicS<5>, PicS<9>]`, the account
+    /// ID and the inverted date and time.
+    AuthDetailLock,
     /// [`PendingAuthDetailRepository::page_after`]: `[PicS<11>, PicS<5>, PicS<9>, i64]`, the
     /// account ID, the inverted start date and time and the limit.
     AuthDetailPage,
@@ -307,19 +314,65 @@ pub(crate) async fn probed<T: ProbeAnswer>(
 /// pooled connection and commits on its own.
 ///
 /// Cloning copies the pool handle, not the pool, so every clone shares the same connections,
-/// and the probe handle, if any (see "Probes" above).
+/// the probe handle, if any (see "Probes" above), and the fail-fast gate, if any (see
+/// [`failing_fast_while`](Self::failing_fast_while)).
 #[derive(Clone)]
 pub struct PgStore {
     pool: PgPool,
     /// The probe asked at each [`ProbePoint`]; `None` outside the endpoint tests.
     probe: Option<Arc<dyn RepositoryProbe>>,
+    /// The gate that fails every connection request at once while it is shut; `None` unless
+    /// [`failing_fast_while`](Self::failing_fast_while) installed one.
+    fail_fast: Option<Arc<FailFast>>,
+}
+
+/// The fail-fast gate of a [`PgStore`].
+struct FailFast {
+    /// A pool closed before any use: every connection request to it fails at once, with no I/O,
+    /// as [`sqlx::Error::PoolClosed`], which is [`PersistenceError::Unavailable`].
+    closed: PgPool,
+    /// Whether the gate is shut now.
+    shut: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
 impl PgStore {
-    /// A store over `pool`, as the `runtime` crate opens it from `DATABASE_URL`, with no probe.
+    /// A store over `pool`, as the `runtime` crate opens it from `DATABASE_URL`, with no probe
+    /// and no fail-fast gate.
     #[must_use]
     pub fn new(pool: PgPool) -> Self {
-        Self { pool, probe: None }
+        Self {
+            pool,
+            probe: None,
+            fail_fast: None,
+        }
+    }
+
+    /// This store, failing at once while `refusing` returns `true`: every statement, transaction
+    /// and session it or a clone of it starts then answers [`PersistenceError::Unavailable`]
+    /// without waiting for a connection or sending anything. `refusing` is asked once per
+    /// connection request, as it starts; otherwise the store uses its pool as before. The probe,
+    /// if any, is kept.
+    ///
+    /// `carddemo-api` installs this with the refusal report of its request pool, so that while
+    /// the server refuses connections a request answers its 500 at once rather than after the
+    /// pool's acquire timeout. The returned future builds the gate's closed pool, over the
+    /// store's connect options and never connected, and closes it; it needs a Tokio runtime, as
+    /// every pool does.
+    pub async fn failing_fast_while(
+        self,
+        refusing: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let options = PgConnectOptions::clone(&self.pool.connect_options());
+        let closed = PgPoolOptions::new().connect_lazy_with(options);
+        closed.close().await;
+        let gate = FailFast {
+            closed,
+            shut: Box::new(refusing),
+        };
+        Self {
+            fail_fast: Some(Arc::new(gate)),
+            ..self
+        }
     }
 
     /// This store with `probe` asked at each [`ProbePoint`] of its calls and of the
@@ -352,9 +405,15 @@ impl PgStore {
     /// The pool, for the repository implementations of this crate and for callers that manage
     /// the pool itself, such as the `test-support` harness. No other crate issues SQL through
     /// it (R4).
+    ///
+    /// While a fail-fast gate is shut (see [`failing_fast_while`](Self::failing_fast_while)),
+    /// this is the gate's closed pool instead, which fails every connection request at once.
     #[must_use]
     pub fn pool(&self) -> &PgPool {
-        &self.pool
+        match &self.fail_fast {
+            Some(gate) if (gate.shut)() => &gate.closed,
+            _ => &self.pool,
+        }
     }
 
     /// Opens a transaction on a connection taken from the pool, for a unit of work whose
@@ -362,17 +421,17 @@ impl PgStore {
     /// this store's probe, if any.
     ///
     /// The returned future owns clones of the pool and probe handles and borrows nothing from
-    /// `self`.
+    /// `self`. The pool is the one [`pool`](Self::pool) names when this is called.
     ///
     /// # Errors
     ///
     /// [`PersistenceError::Unavailable`] when no connection can be had: the pool timed out or is
-    /// closed, or connecting failed. [`PersistenceError::Database`] when the server refuses to
-    /// start the transaction.
+    /// closed, connecting failed, or the fail-fast gate is shut. [`PersistenceError::Database`]
+    /// when the server refuses to start the transaction.
     pub fn begin(
         &self,
     ) -> impl Future<Output = Result<PgTx<'static>, PersistenceError>> + Send + use<> {
-        let pool = self.pool.clone();
+        let pool = self.pool().clone();
         let probe = self.probe.clone();
         async move {
             let tx = pool.begin().await?;
@@ -384,16 +443,17 @@ impl PgStore {
     /// that claims data sets for writing and runs every statement on the session that holds
     /// its claims (see "Single-writer claims" above).
     ///
-    /// The returned future owns a clone of the pool handle and borrows nothing from `self`.
+    /// The returned future owns a clone of the pool handle and borrows nothing from `self`. The
+    /// pool is the one [`pool`](Self::pool) names when this is called.
     ///
     /// # Errors
     ///
     /// [`PersistenceError::Unavailable`] when no connection can be had: the pool timed out or is
-    /// closed, or connecting failed.
+    /// closed, connecting failed, or the fail-fast gate is shut.
     pub fn session(
         &self,
     ) -> impl Future<Output = Result<PgSession, PersistenceError>> + Send + use<> {
-        let pool = self.pool.clone();
+        let pool = self.pool().clone();
         async move {
             // Detached before any claim is tried, so that no outcome, a failed statement or a
             // future dropped mid-call included, hands a session that may hold a lock back to
@@ -686,6 +746,7 @@ const _: fn() = || {
 mod tests {
     use std::error::Error as StdError;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -725,7 +786,7 @@ mod tests {
     }
 
     /// Every probe point.
-    const POINTS: [ProbePoint; 13] = [
+    const POINTS: [ProbePoint; 14] = [
         ProbePoint::AccountRead,
         ProbePoint::AccountLock,
         ProbePoint::AccountUpdate,
@@ -735,6 +796,7 @@ mod tests {
         ProbePoint::UserDelete,
         ProbePoint::AuthSummaryRead,
         ProbePoint::AuthDetailRead,
+        ProbePoint::AuthDetailLock,
         ProbePoint::AuthDetailPage,
         ProbePoint::AuthDetailUpdate,
         ProbePoint::AuthFraudInsert,
@@ -920,6 +982,51 @@ mod tests {
             store.session().await.map(drop),
             Err(PersistenceError::Unavailable)
         );
+    }
+
+    /// A store with a fail-fast gate, as `carddemo-api` builds its own: while the gate is shut,
+    /// a statement, a transaction and a session each answer the database unavailable at once,
+    /// through a clone and a probed copy alike; while it is open, each runs on the store's pool,
+    /// which the gate never closes. The gate is asked at each call, so it opens and shuts as
+    /// often as its condition does, and the store's `Debug` stays the type name.
+    #[test]
+    fn a_shut_fail_fast_gate_fails_at_once_and_an_open_one_uses_the_pool() -> TestResult {
+        block_on(async {
+            let guard = start_postgres().await?;
+            let shut = Arc::new(AtomicBool::new(false));
+            let condition = Arc::clone(&shut);
+            let store = PgStore::new(guard.pool().clone())
+                .failing_fast_while(move || condition.load(Ordering::Acquire))
+                .await;
+            assert_eq!(format!("{store:?}"), "PgStore");
+            let probe: Arc<dyn RepositoryProbe> = Scripted::new()?;
+            let copies = [store.clone(), store.clone().with_probe(probe)];
+            let key = PicU::new(1)?;
+            for gate_shut in [true, false, true, false] {
+                shut.store(gate_shut, Ordering::Release);
+                for mut copy in copies.clone() {
+                    let started = Instant::now();
+                    let read = AccountRepository::find_by_id(&mut copy, key).await;
+                    let tx = copy.begin().await.map(drop);
+                    let session = copy.session().await.map(drop);
+                    let took = started.elapsed();
+                    assert_eq!(copy.pool().is_closed(), gate_shut);
+                    if gate_shut {
+                        assert_eq!(read, Err(PersistenceError::Unavailable));
+                        assert_eq!(tx, Err(PersistenceError::Unavailable));
+                        assert_eq!(session, Err(PersistenceError::Unavailable));
+                        assert!(took < Duration::from_millis(200), "took {took:?}");
+                    } else {
+                        // The migrated schema holds no account.
+                        assert_eq!(read, Ok(None));
+                        assert_eq!(tx, Ok(()));
+                        assert_eq!(session, Ok(()));
+                    }
+                }
+            }
+            assert!(!guard.pool().is_closed());
+            Ok(())
+        })
     }
 
     /// One session at a time holds each data set's claim: another session's claim is refused at
@@ -1225,7 +1332,7 @@ mod tests {
                 ProbePoint::UserUpdate => call.arg(0) == Some(&self.user),
                 ProbePoint::UserDelete => call.arg(0) == Some(&self.user.id),
                 ProbePoint::AuthSummaryRead => call.arg(0) == Some(&self.auth_acct),
-                ProbePoint::AuthDetailRead => auth_key(),
+                ProbePoint::AuthDetailRead | ProbePoint::AuthDetailLock => auth_key(),
                 ProbePoint::AuthDetailPage => auth_key() && call.arg(3) == Some(&self.limit),
                 ProbePoint::AuthDetailUpdate => {
                     call.arg(0) == Some(&self.auth_acct) && call.arg(1) == Some(detail)
@@ -1354,6 +1461,12 @@ mod tests {
                 .into(),
             ProbePoint::AuthDetailRead => {
                 PendingAuthDetailRepository::find_by_id(executor, acct, date, time)
+                    .await?
+                    .is_some()
+                    .into()
+            }
+            ProbePoint::AuthDetailLock => {
+                PendingAuthDetailRepository::lock_by_id(executor, acct, date, time)
                     .await?
                     .is_some()
                     .into()

@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentType } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -7,6 +8,7 @@ import {
   RouterProvider,
   Routes,
   useLocation,
+  type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { REQUEST_DEADLINE_MS } from "@/api/client";
@@ -373,7 +375,7 @@ function disabledKeys(): Record<string, boolean> {
   return Object.fromEntries(
     within(keyRow())
       .getAllByRole("button")
-      .map((button) => [button.textContent ?? "", button.hasAttribute("disabled")]),
+      .map((button) => [button.textContent ?? "", button.getAttribute("aria-disabled") === "true"]),
   );
 }
 
@@ -1572,3 +1574,107 @@ describe("COCRDLI request deadline", () => {
     expect(cleared).toHaveBeenCalledWith(deadlines[0]);
   });
 });
+
+/**
+ * A route `lazy` that stays loading until `load` is called, as a screen's module does on a slow
+ * network, then renders `Component`.
+ */
+function slowRoute(Component: ComponentType): {
+  readonly lazy: () => Promise<{ Component: ComponentType }>;
+  readonly load: () => void;
+} {
+  let resolveModule: () => void = () => undefined;
+  const loaded = new Promise<{ Component: ComponentType }>((resolve) => {
+    resolveModule = () => {
+      resolve({ Component });
+    };
+  });
+  return {
+    lazy: () => loaded,
+    load: () => {
+      resolveModule();
+    },
+  };
+}
+
+/** The screens a COCRDLI selection opens, each a stub showing the route state it received. */
+const TRANSFER_TARGETS = [
+  { path: PATHS.COCRDSL, name: "COCRDSL" },
+  { path: PATHS.COCRDUP, name: "COCRDUP" },
+] as const;
+
+// A selection leaves the list on screen until the card screen's module has loaded. The lock
+// ENTER took holds through that wait, as the terminal keyboard stays locked until the next
+// program sends its map, so no key pages the list or selects again meanwhile. The screen sits in
+// a data router without the application's root element, so only the screen's own lock acts.
+describe("COCRDLI while the card screen it opens loads", () => {
+  it.each([
+    { code: "S", target: "COCRDSL", path: PATHS.COCRDSL },
+    { code: "U", target: "COCRDUP", path: PATHS.COCRDUP },
+  ])(
+    "after $code on row 3 and ENTER the keyboard stays locked until $target replaces the list",
+    async ({ code, target, path }) => {
+      const requests = stubReplies([200, FIRST_PAGE], [200, SECOND_PAGE]);
+      const slow = slowRoute(() => <Target name={target} />);
+      const screens: RouteObject[] = [
+        { path: PATHS.COCRDLI, element: <COCRDLI /> },
+        ...TRANSFER_TARGETS.map(
+          (other): RouteObject =>
+            other.path === path
+              ? { path: other.path, lazy: slow.lazy }
+              : { path: other.path, element: <Target name={other.name} /> },
+        ),
+      ];
+      const router = createMemoryRouter(screens, { initialEntries: [PATHS.COCRDLI] });
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+      await firstPageShown();
+
+      type(selector(3), code);
+      press("ENTER");
+      await waitFor(() => {
+        expect(router.state.navigation.state).toBe("loading");
+        expect(listForm().getAttribute("aria-busy")).toBe("true");
+      });
+      expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      expect(readOnlyInputs().every(Boolean)).toBe(true);
+
+      // F8 and F7 would page, F2 is ENTER here (COCRDLIC-003), and a second selection with ENTER
+      // would open another card.
+      press("F8=Forward");
+      press("F7=Backward");
+      for (const key of ["F8", "F7", "F2", "Enter"]) {
+        fireEvent.keyDown(window, { key });
+      }
+      type(selector(5), code === "S" ? "U" : "S");
+      press("ENTER");
+      fireEvent.submit(listForm());
+      // Gives a request a refused key would send time to leave before the count.
+      await waitFor(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 20);
+        });
+      });
+
+      expect(listQueries(requests)).toEqual([{}]);
+      expect(router.state.location.pathname).toBe(PATHS.COCRDLI);
+
+      slow.load();
+      expect(await arrivedAt(target)).toEqual({
+        from: PATHS.COCRDLI,
+        acct_id: "00000000002",
+        card_ref: 3,
+      });
+      expect(router.state.location.pathname).toBe(path);
+      expect(listQueries(requests)).toEqual([{}]);
+      router.dispose();
+    },
+  );
+});
+

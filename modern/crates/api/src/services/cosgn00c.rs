@@ -38,10 +38,11 @@
 //! worker that unrelated requests need. The whole decision, an unknown user's included, runs
 //! within the `AppState::password_work` budget, so a burst of sign-ons, which anyone can send,
 //! runs a bounded number of verifications at once and queues a bounded number more
-//! (`crate::app::PasswordWork`). A decision the budget refuses at once because every place is
-//! taken, or whose task does not complete, is `ServiceError::Internal`; no verification is
-//! skipped and no ordinary answer changes. The token is issued only after a decision that signs
-//! on.
+//! (`crate::app::PasswordWork`); a sign-on that finds every place taken waits for one, for a
+//! bounded time. A decision the budget refuses because no place came free within that wait is
+//! `ServiceError::Saturated`, a 503 with `Retry-After`, and one whose task does not complete is
+//! `ServiceError::Internal`; no verification is skipped and no ordinary answer changes. The
+//! token is issued only after a decision that signs on.
 //!
 //! # Identity
 //!
@@ -61,8 +62,9 @@ use domain::online::cosgn00c::{
 };
 use domain::records::UserEntry;
 use persistence::{PersistenceError, UserRepository};
+use tracing::{Level, Metadata};
 
-use crate::app::{AppState, PasswordWork, PasswordWorkError};
+use crate::app::{AppState, EventSite, PasswordWork, PasswordWorkError, emit, event_metadata};
 use crate::auth::jwt::JwtKeys;
 use crate::dto::cosgn00c::SignonRequest;
 use crate::error::ServiceError;
@@ -79,8 +81,12 @@ use crate::error::ServiceError;
 /// - `ServiceError::Rule` with the program's `SignonFailure`: a rejected or blank input (400),
 ///   a wrong password or an unknown user (401), and a failed read or an unverifiable stored hash
 ///   (500, `Unable to verify the User ...`).
-/// - `ServiceError::Internal` when the password-work budget refuses the decision, the
-///   verification task does not complete or the token cannot be issued; it carries no detail.
+/// - `ServiceError::Saturated` when the password-work budget finds no place for the decision
+///   within its wait (503 with `Retry-After`).
+/// - `ServiceError::Internal` when the verification task does not complete or the token cannot
+///   be issued.
+///
+/// Neither carries any detail.
 pub(crate) async fn signon(
     state: &AppState,
     input: SignonRequest,
@@ -110,9 +116,10 @@ pub(crate) async fn signon(
 ///
 /// # Errors
 ///
-/// `ServiceError::Internal` when the budget refuses the decision, which `work` has already
-/// logged, or the verification task does not complete. The task is reported only as whether it
-/// panicked, never by its payload.
+/// - `ServiceError::Saturated` when the budget refuses the decision, which `work` has already
+///   logged.
+/// - `ServiceError::Internal` when the verification task does not complete. The task is
+///   reported only as whether it panicked, never by its payload.
 async fn decided(
     work: &PasswordWork,
     key: SignonKey,
@@ -120,12 +127,33 @@ async fn decided(
 ) -> Result<SignonOutcome, ServiceError<SignonFailure>> {
     work.run(move || cosgn00c::decide(&key, lookup(&read)))
         .await
-        .map_err(|error| {
-            if let PasswordWorkError::Interrupted { panicked } = error {
-                tracing::error!(panicked, "sign-on verification task did not complete");
+        .map_err(|error| match error {
+            PasswordWorkError::Saturated => ServiceError::Saturated,
+            PasswordWorkError::Interrupted { panicked } => {
+                verification_incomplete(panicked);
+                ServiceError::Internal
             }
-            ServiceError::Internal
         })
+}
+
+/// The `ERROR` event of a verification task that did not complete: whether it `panicked`, never
+/// its payload, and nothing of the user or the password.
+fn verification_incomplete(panicked: bool) {
+    static SITE: EventSite<2> = EventSite::new(&METADATA);
+    static METADATA: Metadata<'static> = event_metadata(
+        "verification_incomplete",
+        module_path!(),
+        Level::ERROR,
+        &["message", "panicked"],
+        &SITE,
+    );
+    emit(
+        &SITE,
+        [
+            Some(&"sign-on verification task did not complete"),
+            Some(&panicked),
+        ],
+    );
 }
 
 /// The `EVALUATE WS-RESP-CD` of `READ-USER-SEC-FILE` as a `UserLookup`: RESP 0, RESP 13 or
@@ -173,7 +201,7 @@ mod tests {
     use test_support::postgres::start_postgres;
     use test_support::trace_capture;
 
-    use super::signon;
+    use super::{signon, verification_incomplete};
     use crate::app::worker_hold::WorkerHold;
     use crate::app::{AppState, PasswordWork};
     use crate::auth::jwt::JwtKeys;
@@ -344,12 +372,13 @@ mod tests {
     }
 
     #[test]
-    fn a_full_password_budget_answers_internal_until_a_place_frees() -> TestResult {
+    fn a_full_password_budget_answers_saturated_until_a_place_frees() -> TestResult {
         block_on(async {
             let guard = start_postgres().await?;
             let mut store = PgStore::new(guard.pool().clone());
             seed(&mut store).await?;
-            let state = app_state(store, 3600).with_password_work(PasswordWork::new(1, 0));
+            let budget = PasswordWork::new(1, 0).with_wait(Duration::from_millis(50));
+            let state = app_state(store, 3600).with_password_work(budget);
             let hold = WorkerHold::start(&state.password_work).await?;
             let traces = trace_capture::capture();
 
@@ -361,7 +390,7 @@ mod tests {
                 ("NOBODY01", TYPED_PASSWORD),
             ] {
                 let outcome = signon(&state, request(user_id, typed)).await;
-                assert_eq!(outcome, Err(ServiceError::Internal), "{user_id} {typed}");
+                assert_eq!(outcome, Err(ServiceError::Saturated), "{user_id} {typed}");
             }
             assert!(traces.contains("password work budget saturated"));
             for value in [
@@ -386,6 +415,39 @@ mod tests {
             );
             Ok(())
         })
+    }
+
+    /// A verification task that did not complete is logged as the `ERROR` a `tracing` macro of
+    /// this module would write: its target, its message and whether the task panicked, and no
+    /// other field.
+    #[test]
+    fn an_incomplete_verification_is_logged_as_an_error_of_this_module() -> TestResult {
+        let traces = trace_capture::capture();
+        for panicked in [true, false] {
+            traces.clear();
+            verification_incomplete(panicked);
+            let lines = traces.lines();
+            let [line] = lines.as_slice() else {
+                return Err(format!("panicked {panicked}: {} lines", lines.len()).into());
+            };
+            let event: serde_json::Value = serde_json::from_str(line)?;
+            assert_eq!(
+                event.get("level").and_then(serde_json::Value::as_str),
+                Some("ERROR")
+            );
+            assert_eq!(
+                event.get("target").and_then(serde_json::Value::as_str),
+                Some("api::services::cosgn00c")
+            );
+            assert_eq!(
+                event.get("fields"),
+                Some(&serde_json::json!({
+                    "message": "sign-on verification task did not complete",
+                    "panicked": panicked,
+                }))
+            );
+        }
+        Ok(())
     }
 
     /// Verification leaves the runtime serving: on this test's single runtime thread, a

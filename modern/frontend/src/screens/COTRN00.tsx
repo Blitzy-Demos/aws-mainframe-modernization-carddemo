@@ -4,7 +4,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn00cList } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -183,9 +183,12 @@ function afterFailure(paging: typeof BLANK_PAGING, key: ListKey): typeof BLANK_P
   };
 }
 
+/** `PAGENUM`, `POS=(4,71) LENGTH=8` (`COTRN00.bms:85-89`): the page number's eight digits. */
+const PAGE_DIGITS = 8;
+
 /** `PAGENUM`: the `PIC 9(08)` page number moved to `X(8)`, eight digits (COTRN00C-036). */
 function pageNumberText(pageNo: number): string {
-  return String(pageNo).padStart(8, "0");
+  return String(pageNo).padStart(PAGE_DIGITS, "0");
 }
 
 /** The failure's message: the `ScreenError` text, or the network or status error's own. */
@@ -235,7 +238,9 @@ function firstFormError(errors: FieldErrors<Cotrn00Values>): string | undefined 
  *   (COTRN00C-038), and the cursor returns to the search field after every answer.
  * - While a request is outstanding the keyboard is locked, as the terminal's stays until the
  *   program answers: ENTER, F7 and F8 are refused before any selection is read, an unserved F-key
- *   shows nothing, and the search field and selectors are read-only. F3 still leaves.
+ *   shows nothing, and the search field and selectors are read-only. F3 still leaves. An `S`
+ *   selection's transfer keeps the keyboard locked the same way until COTRN01 replaces this
+ *   screen.
  *
  * The page size is never sent, so the server's ten rows, the map's, decide each page.
  */
@@ -273,7 +278,10 @@ export function COTRN00(): ReactNode {
     return true;
   }
 
-  /** Releases the keyboard: the answer arrived, or ENTER ended without a request. */
+  /**
+   * Releases the keyboard: the answer arrived, or ENTER ended without a request. A selection's
+   * transfer keeps it until COTRN01 replaces this screen.
+   */
   function unlock(): void {
     inFlight.current = false;
     setBusy(false);
@@ -354,7 +362,8 @@ export function COTRN00(): ReactNode {
       const tranId = rows[selected]?.tran_id ?? "";
       if (!isBlank(tranId)) {
         if (code === "S" || code === "s") {
-          unlock();
+          // The lock ENTER took stays held until COTRN01 replaces this screen, so no key pages
+          // the list or changes the selection while its module loads.
           navigate(PATHS.COTRN01, {
             state: { from: PATHS.COTRN00, tran_id: tranId, list: paging },
           });
@@ -441,18 +450,19 @@ export function COTRN00(): ReactNode {
                 Page:
               </Label>
             </GridCell>
-            <GridCell row={4} col={71} span={8}>
+            <GridCell row={4} col={71} span={PAGE_DIGITS}>
               {/*
-               * ASKIP output: the cursor skips it, as on the terminal.
-               * BLITZY [LAYOUT]: `px-2` instead of the input's `px-3`, so the eight digits fit the
-               * eight-column cell on screens down to about 1000px wide.
+               * ASKIP output: the cursor skips it, as on the terminal. Like every map input it
+               * takes the shared map-field box, `FIELD_INPUT` with `size` = its `LENGTH`, so all
+               * eight digits show on the narrowest frame and a page change stays visible.
                */}
               <Input
                 id={pageId}
                 readOnly
                 tabIndex={-1}
                 value={pageLabel}
-                className="px-2 text-muted-foreground"
+                size={PAGE_DIGITS}
+                className={`${FIELD_INPUT} text-muted-foreground`}
               />
             </GridCell>
             <FormField
@@ -472,8 +482,10 @@ export function COTRN00(): ReactNode {
                         {...field}
                         readOnly={busy}
                         maxLength={COTRN00_LENGTHS.startTranId}
+                        size={COTRN00_LENGTHS.startTranId}
                         autoComplete="off"
                         autoFocus
+                        className={FIELD_INPUT}
                       />
                     </FormControl>
                   </GridCell>
@@ -530,8 +542,9 @@ export function COTRN00(): ReactNode {
                                     {...field}
                                     readOnly={busy}
                                     maxLength={COTRN00_LENGTHS.selection}
+                                    size={COTRN00_LENGTHS.selection}
                                     autoComplete="off"
-                                    className="w-9 text-center"
+                                    className={`${FIELD_INPUT} w-9 text-center`}
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />

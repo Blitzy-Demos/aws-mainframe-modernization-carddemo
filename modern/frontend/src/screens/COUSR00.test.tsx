@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentType } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -7,11 +8,12 @@ import {
   RouterProvider,
   Routes,
   useLocation,
+  type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { clearSession, getSession, setSession } from "@/auth/session";
-import { PATHS, routes } from "@/routes";
+import { PATHS, routes, ScreenOutlet } from "@/routes";
 import { COUSR00 } from "./COUSR00";
 
 /**
@@ -27,6 +29,15 @@ import { COUSR00 } from "./COUSR00";
 
 const TOKEN = "test-token";
 const LIST_PATH = "/api/v1/users";
+
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
 
 /** The messages of COUSR00C and of the API, as the audit and the endpoint word them. */
 const INVALID_SELECTION = "Invalid selection. Valid values are U and D";
@@ -436,9 +447,9 @@ function mapForm(): HTMLFormElement {
   return form;
 }
 
-/** Whether the row-24 key labelled `label` is disabled. */
+/** Whether the row-24 key labelled `label` is disabled (`aria-disabled="true"`). */
 function isDisabled(label: string): boolean {
-  return screen.getByRole("button", { name: label }).hasAttribute("disabled");
+  return screen.getByRole("button", { name: label }).getAttribute("aria-disabled") === "true";
 }
 
 /** Whether each editable input is read-only: Search User ID, then the ten selectors. */
@@ -551,6 +562,16 @@ describe("COUSR00 List Users", () => {
     );
     expect(searchField().getAttribute("maxlength")).toBe("8");
     expect(searchField().parentElement?.className).toBe("row-start-6 col-start-21 col-span-8");
+    // The page, the search key and the selectors take the shared map-field box, `MAP_FIELD_BOX`
+    // with `size` = their LENGTH, so all eight characters show on the narrowest frame.
+    for (const [field, length] of [
+      [pageField(), "8"],
+      [searchField(), "8"],
+      [selector(1), "1"],
+    ] as const) {
+      expect(field.getAttribute("size")).toBe(length);
+      expect(MAP_FIELD_BOX.filter((name) => !field.classList.contains(name))).toEqual([]);
+    }
     // The zero-length stopper at POS=(6,30) renders no element.
     expect(document.querySelector(".row-start-6.col-start-30")).toBeNull();
 
@@ -1712,3 +1733,177 @@ describe("COUSR00 in the route table: a 401 ends the session", () => {
     },
   );
 });
+
+/**
+ * A route `lazy` that stays loading until `load` is called, as a screen's module does on a slow
+ * network, then renders `Component`.
+ */
+function slowRoute(Component: ComponentType): {
+  readonly lazy: () => Promise<{ Component: ComponentType }>;
+  readonly load: () => void;
+} {
+  let resolveModule: () => void = () => undefined;
+  const loaded = new Promise<{ Component: ComponentType }>((resolve) => {
+    resolveModule = () => {
+      resolve({ Component });
+    };
+  });
+  return {
+    lazy: () => loaded,
+    load: () => {
+      resolveModule();
+    },
+  };
+}
+
+/** The screens COUSR00 transfers to, each a stub showing the route state it received. */
+const TRANSFER_TARGETS = [
+  { path: PATHS.COUSR02, name: "Update User" },
+  { path: PATHS.COUSR03, name: "Delete User" },
+  { path: PATHS.COADM01, name: "Admin Menu" },
+] as const;
+
+/**
+ * Renders `/users` in a data router, as the application does. The target at `slowPath` loads
+ * through `slow`; the other targets render at once, so a key that transferred elsewhere would
+ * show. With `outlet`, the screens sit under the application's root element, `ScreenOutlet`,
+ * which tells the frame that a transfer is under way; without it only the screen's own lock acts.
+ */
+function renderSlowTransfer(
+  slowPath: string,
+  slow: ReturnType<typeof slowRoute>,
+  outlet: boolean,
+): ReturnType<typeof createMemoryRouter> {
+  const screens: RouteObject[] = [
+    { path: PATHS.COUSR00, element: <COUSR00 /> },
+    ...TRANSFER_TARGETS.map(
+      ({ path, name }): RouteObject =>
+        path === slowPath
+          ? { path, lazy: slow.lazy }
+          : { path, element: <TransferStub name={name} /> },
+    ),
+  ];
+  const router = createMemoryRouter(
+    outlet ? [{ Component: ScreenOutlet, children: screens }] : screens,
+    { initialEntries: [PATHS.COUSR00] },
+  );
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <RouterProvider router={router} />
+    </QueryClientProvider>,
+  );
+  return router;
+}
+
+/** Selects row 6 (`USER0001`) with `code` and presses ENTER. */
+function selectRow6(code: string): void {
+  typeInto(selector(6), code);
+  press("ENTER=Continue");
+}
+
+/** The route state a `U` or `D` on row 6 of {@link FIRST_PAGE} hands over (COUSR00C-008, -009). */
+const ROW_6_TRANSFER = {
+  from: PATHS.COUSR00,
+  user_id: "USER0001",
+  first_key: "ADMIN001",
+  last_key: "USER0005",
+};
+
+// A transfer leaves the list on screen until the next screen's module has loaded. The keyboard
+// stays locked through that wait, as the terminal's does until the next program sends its map:
+// the screen's own lock holds through a selection's transfer, and under the application's root
+// element the frame locks every key of any transfer, F3's included.
+describe("COUSR00 while the screen it transfers to loads", () => {
+  it.each([
+    {
+      how: "U on row 6 and ENTER",
+      outlet: false,
+      start: () => {
+        selectRow6("U");
+      },
+      ownLock: true,
+      path: PATHS.COUSR02,
+      name: "Update User",
+      state: ROW_6_TRANSFER,
+    },
+    {
+      how: "D on row 6 and ENTER",
+      outlet: false,
+      start: () => {
+        selectRow6("D");
+      },
+      ownLock: true,
+      path: PATHS.COUSR03,
+      name: "Delete User",
+      state: ROW_6_TRANSFER,
+    },
+    {
+      how: "U on row 6 and ENTER",
+      outlet: true,
+      start: () => {
+        selectRow6("U");
+      },
+      ownLock: true,
+      path: PATHS.COUSR02,
+      name: "Update User",
+      state: ROW_6_TRANSFER,
+    },
+    {
+      how: "F3",
+      outlet: true,
+      start: () => {
+        press("F3=Back");
+      },
+      ownLock: false,
+      path: PATHS.COADM01,
+      name: "Admin Menu",
+      state: null,
+    },
+  ])(
+    "after $how (root element: $outlet) no key pages or transfers again, and $name opens once loaded",
+    async ({ outlet, start, ownLock, path, name, state }) => {
+      const sent = stubFetch(json(200, FIRST_PAGE), json(200, SECOND_PAGE));
+      const slow = slowRoute(() => <TransferStub name={name} />);
+      const router = renderSlowTransfer(path, slow, outlet);
+      await listed(sent, 1, "ADMIN001");
+
+      start();
+      await waitFor(() => {
+        expect(router.state.navigation.state).toBe("loading");
+        expect(
+          screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),
+        ).toBe("true");
+      });
+      // A selection's transfer keeps the lock ENTER took: the form is busy, every input read-only.
+      expect(mapForm().getAttribute("aria-busy")).toBe(String(ownLock));
+      expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => ownLock));
+
+      // The keys of the slow-network report: F8 and F7 would page, F2 would show the invalid-key
+      // message, and a second selection with ENTER would replace the transfer.
+      press("F8=Forward");
+      press("F7=Backward");
+      pressKey("F8");
+      pressKey("F7");
+      pressKey("F2");
+      typeInto(selector(7), "D");
+      press("ENTER=Continue");
+      pressKey("Enter");
+      await settle();
+
+      expect(sent).toHaveLength(1);
+      expect(router.state.location.pathname).toBe(PATHS.COUSR00);
+      expect(errorRow().textContent).toBe("");
+
+      slow.load();
+      await screen.findByRole("region", { name });
+      expect(router.state.location.pathname).toBe(path);
+      expect(transferState(name)).toEqual(state);
+      expect(sent).toHaveLength(1);
+      router.dispose();
+    },
+  );
+});
+

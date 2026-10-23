@@ -228,7 +228,7 @@ pub const INVALID_PATH: &str = "Invalid path parameters...";
 pub const FIELD_LENGTH_MESSAGE: &str = "Input does not fit the screen field...";
 
 /// The message of a field with the map `NUM` attribute that holds a character other than a
-/// digit.
+/// digit, apart from spaces before and after the digits ([`numeric`]).
 ///
 /// The server half of the `NUM` `both` rows of `modern/audit/screens.md`: `CORPT00-022`,
 /// `CORPT00-024`, `CORPT00-026`, `CORPT00-030`, `CORPT00-032` and `CORPT00-034`, the six date
@@ -430,20 +430,25 @@ fn code(error: &ValidationError) -> &str {
     &error.code
 }
 
-/// The `NUM` attribute of a map field, as a `validator` custom rule:
-/// `#[validate(custom(function = "super::numeric"))]`.
+/// The `NUM` attribute of a map field, as a `validator` custom rule after the field's `length`
+/// and [`pic_x`]: `#[validate(length(max = 2), custom(function = "super::pic_x::<2>"),
+/// custom(function = "super::numeric"))]`, so that text the field cannot hold is answered with
+/// [`FIELD_LENGTH_MESSAGE`] before this rule is reported.
 ///
-/// Admits a value of ASCII digits only, the characters `modern/audit/screens.md` says the
-/// numeric field admits (`CORPT00-022` to `CORPT00-034`, X-CORPT00C-5), and a blank value,
-/// empty or all spaces, which the program's own blank-field edit answers with its message.
+/// Admits ASCII digits with any number of spaces before and after them, `^ *[0-9]* *$`: the
+/// characters `modern/audit/screens.md` says the numeric field admits (`CORPT00-022` to
+/// `CORPT00-034`, X-CORPT00C-5), which `NUMVAL-C` reads as the value of the digits
+/// (CORPT00C-017: `" 5"` and `"5 "` are both `05`). A blank value, empty or all spaces, is
+/// admitted too, and the program's own blank-field edit answers it with its message.
 ///
 /// # Errors
 ///
-/// A [`ValidationError`] with code [`NUMERIC_CODE`] for any other value, a sign, a decimal
-/// point or a space beside a digit included. The error carries no message.
+/// A [`ValidationError`] with code [`NUMERIC_CODE`] for any other value: a space between two
+/// digits, a sign, a decimal point, a comma, a letter, a non-ASCII digit or a control byte such
+/// as NUL, `LOW-VALUES` that [`pic_x`] admits included. The error carries no message.
 pub fn numeric(value: &str) -> Result<(), ValidationError> {
-    let bytes = value.as_bytes();
-    if bytes.iter().all(u8::is_ascii_digit) || bytes.iter().all(|&byte| byte == b' ') {
+    let digits = value.trim_matches(' ');
+    if digits.bytes().all(|byte| byte.is_ascii_digit()) {
         Ok(())
     } else {
         Err(ValidationError::new(NUMERIC_CODE))
@@ -803,12 +808,26 @@ mod tests {
     }
 
     #[test]
-    fn numeric_admits_digits_and_blank_values_only() {
-        for value in ["", "  ", "0", "07", "2022", "0123456789"] {
+    fn numeric_admits_digits_with_surrounding_spaces_and_blank_values_only() {
+        for value in [
+            "",
+            "  ",
+            "    ",
+            "0",
+            "07",
+            "2022",
+            "0123456789",
+            " 5",
+            "5 ",
+            " 22 ",
+            "  22",
+            "22  ",
+        ] {
             assert!(numeric(value).is_ok(), "{value:?}");
         }
         for value in [
-            "A", "1A", " 5", "5 ", "-3", "1.", "+1", "1,0", "\u{663}", "\t",
+            "A", "AB", "1A", "1 2", " 1 2 ", "-3", "1.", "+1", "1,0", "\u{663}", "\t", " 5\t",
+            "\0", "\0\0", "5\0",
         ] {
             let error = numeric(value).err();
             assert_eq!(

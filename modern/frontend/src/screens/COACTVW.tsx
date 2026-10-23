@@ -32,9 +32,12 @@ import { COACTVW_LENGTHS, coactvwSchema, type CoactvwValues } from "@/schemas/CO
  * modern/audit/online/COACTVWC.md.
  *
  * The server owns every program message: the error row shows the endpoint's message, or, when no
- * answer is current, the schema's MUSTFILL message for a partly filled field. Values are shown
- * exactly as the endpoint sends them: amounts already edited, the SSN already redacted, dates as
- * their YYYY-MM-DD text. Nothing here logs, stores or copies a response.
+ * answer is current, the schema's MUSTFILL message for a partly filled field. Beside some error
+ * messages the endpoint still sends a block, as COACTVWC shows it (COACTVWC-008): the account
+ * block when only the customer read did not succeed, both blocks when the account read did not
+ * and the customer read found the customer. Values are shown exactly as the endpoint sends them:
+ * amounts already edited, the SSN already redacted, dates as their YYYY-MM-DD text. Nothing here
+ * logs, stores or copies a response.
  */
 
 /** Map rows 1–4 (header rows, a blank row, the title), which `ScreenShell`'s header renders. */
@@ -89,18 +92,27 @@ type MapLabel = {
   readonly length: number;
 };
 
-/** One output field of the map, its caption, and the response value it shows. */
+/** One output field of the map, its caption, and the value of its block that it shows. */
 type OutputField = {
   /** BMS field name, kept as `data-field`. */
   readonly name: string;
   readonly row: number;
   readonly col: number;
   readonly length: number;
-  readonly value: (view: components["schemas"]["AccountViewResponse"]) => string;
 } & (
-  | { readonly label: MapLabel; readonly ariaLabel?: never }
-  | { readonly label?: never; readonly ariaLabel: string }
-);
+  | {
+      readonly block: "account";
+      readonly value: (account: components["schemas"]["AccountViewAccountBlock"]) => string;
+    }
+  | {
+      readonly block: "customer";
+      readonly value: (customer: components["schemas"]["AccountViewCustomerBlock"]) => string;
+    }
+) &
+  (
+    | { readonly label: MapLabel; readonly ariaLabel?: never }
+    | { readonly label?: never; readonly ariaLabel: string }
+  );
 
 /** A typed date (`format: date`) as its `YYYY-MM-DD` text; blank for `null` (COACTVWC-014, -019). */
 function dateText(value: string | null | undefined): string {
@@ -108,235 +120,265 @@ function dateText(value: string | null | undefined): string {
 }
 
 /**
- * The 28 output fields in macro order, each with the literal that captions it (COACTVW-015 to
- * COACTVW-094). The row-14 literals caption the three name fields below them. `ACSADL2` has no
- * literal: it is the second line of `Address:`, and its accessible name says so.
+ * The 28 output fields in macro order, each with the literal that captions it and the block it
+ * belongs to (COACTVW-015 to COACTVW-094): the ten of the account block (COACTVWC-010 to
+ * COACTVWC-015), then the eighteen of the customer block (COACTVWC-016 to COACTVWC-026). The row-14
+ * literals caption the three name fields below them. `ACSADL2` has no literal: it is the second
+ * line of `Address:`, and its accessible name says so.
  */
 const OUTPUT_FIELDS: readonly OutputField[] = [
   {
     name: "ACSTTUS",
+    block: "account",
     row: 5,
     col: 70,
     length: 1,
     label: { text: "Active Y/N: ", row: 5, col: 57, length: 12 },
-    value: (view) => view.active_status,
+    value: (account) => account.active_status,
   },
   {
     name: "ADTOPEN",
+    block: "account",
     row: 6,
     col: 17,
     length: 10,
     label: { text: "Opened:", row: 6, col: 8, length: 7 },
-    value: (view) => dateText(view.open_date),
+    value: (account) => dateText(account.open_date),
   },
   {
     name: "ACRDLIM",
+    block: "account",
     row: 6,
     col: 61,
     length: 15,
     label: { text: "Credit Limit        :", row: 6, col: 39, length: 21 },
-    value: (view) => view.credit_limit,
+    value: (account) => account.credit_limit,
   },
   {
     name: "AEXPDT",
+    block: "account",
     row: 7,
     col: 17,
     length: 10,
     label: { text: "Expiry:", row: 7, col: 8, length: 7 },
-    value: (view) => dateText(view.expiration_date),
+    value: (account) => dateText(account.expiration_date),
   },
   {
     name: "ACSHLIM",
+    block: "account",
     row: 7,
     col: 61,
     length: 15,
     label: { text: "Cash credit Limit   :", row: 7, col: 39, length: 21 },
-    value: (view) => view.cash_credit_limit,
+    value: (account) => account.cash_credit_limit,
   },
   {
     name: "AREISDT",
+    block: "account",
     row: 8,
     col: 17,
     length: 10,
     label: { text: "Reissue:", row: 8, col: 8, length: 8 },
-    value: (view) => dateText(view.reissue_date),
+    value: (account) => dateText(account.reissue_date),
   },
   {
     name: "ACURBAL",
+    block: "account",
     row: 8,
     col: 61,
     length: 15,
     label: { text: "Current Balance     :", row: 8, col: 39, length: 21 },
-    value: (view) => view.current_balance,
+    value: (account) => account.current_balance,
   },
   {
     name: "ACRCYCR",
+    block: "account",
     row: 9,
     col: 61,
     length: 15,
     label: { text: "Current Cycle Credit:", row: 9, col: 39, length: 21 },
-    value: (view) => view.current_cycle_credit,
+    value: (account) => account.current_cycle_credit,
   },
   {
     name: "AADDGRP",
+    block: "account",
     row: 10,
     col: 23,
     length: 10,
     label: { text: "Account Group:", row: 10, col: 8, length: 14 },
-    value: (view) => view.group_id,
+    value: (account) => account.group_id,
   },
   {
     name: "ACRCYDB",
+    block: "account",
     row: 10,
     col: 61,
     length: 15,
     label: { text: "Current Cycle Debit :", row: 10, col: 39, length: 21 },
-    value: (view) => view.current_cycle_debit,
+    value: (account) => account.current_cycle_debit,
   },
   {
     name: "ACSTNUM",
+    block: "customer",
     row: 12,
     col: 23,
     length: 9,
     label: { text: "Customer id  :", row: 12, col: 8, length: 14 },
-    value: (view) => view.customer_id,
+    value: (customer) => customer.customer_id,
   },
   {
     name: "ACSTSSN",
+    block: "customer",
     row: 12,
     col: 54,
     length: 12,
     label: { text: "SSN:", row: 12, col: 49, length: 4 },
     // Already `***-**-` and the last four digits (COACTVWC-017, E32); shown as received.
-    value: (view) => view.ssn,
+    value: (customer) => customer.ssn,
   },
   {
     name: "ACSTDOB",
+    block: "customer",
     row: 13,
     col: 23,
     length: 10,
     label: { text: "Date of birth:", row: 13, col: 8, length: 14 },
-    value: (view) => dateText(view.date_of_birth),
+    value: (customer) => dateText(customer.date_of_birth),
   },
   {
     name: "ACSTFCO",
+    block: "customer",
     row: 13,
     col: 61,
     length: 3,
     label: { text: "FICO Score:", row: 13, col: 49, length: 11 },
-    value: (view) => view.fico_score,
+    value: (customer) => customer.fico_score,
   },
   {
     name: "ACSFNAM",
+    block: "customer",
     row: 15,
     col: 1,
     length: 25,
     label: { text: "First Name", row: 14, col: 1, length: 10 },
-    value: (view) => view.first_name,
+    value: (customer) => customer.first_name,
   },
   {
     name: "ACSMNAM",
+    block: "customer",
     row: 15,
     col: 28,
     length: 25,
     label: { text: "Middle Name: ", row: 14, col: 28, length: 13 },
-    value: (view) => view.middle_name,
+    value: (customer) => customer.middle_name,
   },
   {
     name: "ACSLNAM",
+    block: "customer",
     row: 15,
     col: 55,
     length: 25,
     label: { text: "Last Name : ", row: 14, col: 55, length: 12 },
-    value: (view) => view.last_name,
+    value: (customer) => customer.last_name,
   },
   {
     name: "ACSADL1",
+    block: "customer",
     row: 16,
     col: 10,
     length: 50,
     label: { text: "Address:", row: 16, col: 1, length: 8 },
-    value: (view) => view.address_line_1,
+    value: (customer) => customer.address_line_1,
   },
   {
     name: "ACSSTTE",
+    block: "customer",
     row: 16,
     col: 73,
     length: 2,
     label: { text: "State ", row: 16, col: 63, length: 6 },
-    value: (view) => view.state,
+    value: (customer) => customer.state,
   },
   {
     name: "ACSADL2",
+    block: "customer",
     row: 17,
     col: 10,
     length: 50,
     ariaLabel: "Address line 2",
-    value: (view) => view.address_line_2,
+    value: (customer) => customer.address_line_2,
   },
   {
     name: "ACSZIPC",
+    block: "customer",
     row: 17,
     col: 73,
     length: 5,
     label: { text: "Zip", row: 17, col: 63, length: 3 },
-    value: (view) => view.zip,
+    value: (customer) => customer.zip,
   },
   {
     name: "ACSCITY",
+    block: "customer",
     row: 18,
     col: 10,
     length: 50,
     label: { text: "City ", row: 18, col: 1, length: 5 },
-    value: (view) => view.city,
+    value: (customer) => customer.city,
   },
   {
     name: "ACSCTRY",
+    block: "customer",
     row: 18,
     col: 73,
     length: 3,
     label: { text: "Country", row: 18, col: 63, length: 7 },
-    value: (view) => view.country,
+    value: (customer) => customer.country,
   },
   {
     name: "ACSPHN1",
+    block: "customer",
     row: 19,
     col: 10,
     length: 13,
     label: { text: "Phone 1:", row: 19, col: 1, length: 8 },
-    value: (view) => view.phone_1,
+    value: (customer) => customer.phone_1,
   },
   {
     name: "ACSGOVT",
+    block: "customer",
     row: 19,
     col: 58,
     length: 20,
     label: { text: "Government Issued Id Ref    : ", row: 19, col: 24, length: 30 },
-    value: (view) => view.government_id,
+    value: (customer) => customer.government_id,
   },
   {
     name: "ACSPHN2",
+    block: "customer",
     row: 20,
     col: 10,
     length: 13,
     label: { text: "Phone 2:", row: 20, col: 1, length: 8 },
-    value: (view) => view.phone_2,
+    value: (customer) => customer.phone_2,
   },
   {
     name: "ACSEFTC",
+    block: "customer",
     row: 20,
     col: 41,
     length: 10,
     label: { text: "EFT Account Id: ", row: 20, col: 24, length: 16 },
-    value: (view) => view.eft_account_id,
+    value: (customer) => customer.eft_account_id,
   },
   {
     name: "ACSPFLG",
+    block: "customer",
     row: 20,
     col: 78,
     length: 1,
     label: { text: "Primary Card Holder Y/N:", row: 20, col: 53, length: 24 },
-    value: (view) => view.primary_card_holder,
+    value: (customer) => customer.primary_card_holder,
   },
 ];
 
@@ -361,15 +403,47 @@ function MapCell({
 
 /** The answer the screen shows: the last response of endpoint 4, as COACTVWC sent it. */
 type Shown = {
-  /** The account and customer blocks; `null` before any view and after every error. */
-  readonly view: components["schemas"]["AccountViewResponse"] | null;
+  /** The account block: after a view, or beside an error message; `null` otherwise. */
+  readonly account: components["schemas"]["AccountViewAccountBlock"] | null;
+  /** The customer block: after a view, or beside an error message; `null` otherwise. */
+  readonly customer: components["schemas"]["AccountViewCustomerBlock"] | null;
   /** The program's message and the field it names; `null` after a view. */
   readonly error: { readonly message: string; readonly field: string | null } | null;
   /** How many responses have been shown, so focus returns to the field after each one. */
   readonly responses: number;
 };
 
-const NOTHING_SHOWN: Shown = { view: null, error: null, responses: 0 };
+const NOTHING_SHOWN: Shown = { account: null, customer: null, error: null, responses: 0 };
+
+/** Whether a value is an object or `null`, as a block member of an error body may be. */
+function isObjectOrNull(value: unknown): value is object | null {
+  return typeof value === "object";
+}
+
+/**
+ * Whether a thrown body is endpoint 4's error: a `ScreenError` whose `account` and `customer`
+ * members, when present, are blocks (COACTVWC-008). A failure without a body, such as the
+ * browser's network `TypeError`, has a string `message` and neither member, and passes as an
+ * error with no block.
+ */
+function isViewError(body: unknown): body is components["schemas"]["AccountViewError"] {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    "message" in body &&
+    typeof body.message === "string" &&
+    (!("account" in body) || isObjectOrNull(body.account)) &&
+    (!("customer" in body) || isObjectOrNull(body.customer))
+  );
+}
+
+/** The value `output` shows: its member of its block, blank while that block is not shown. */
+function shownValue(output: OutputField, shown: Shown): string {
+  if (output.block === "account") {
+    return shown.account === null ? "" : output.value(shown.account);
+  }
+  return shown.customer === null ? "" : output.value(shown.customer);
+}
 
 /** COACTVW: the account view of transaction CAVW (COACTVWC). */
 export function COACTVW(): ReactNode {
@@ -416,7 +490,8 @@ export function COACTVW(): ReactNode {
       {
         onSuccess: (data) => {
           setShown((previous) => ({
-            view: data,
+            account: data,
+            customer: data,
             error: null,
             responses: previous.responses + 1,
           }));
@@ -425,8 +500,12 @@ export function COACTVW(): ReactNode {
           if (error.message === NO_INPUT_RECEIVED) {
             setValue("acctId", BLANK_FILTER_MARK);
           }
+          // The blocks COACTVWC shows beside the message, as served; every other error clears
+          // both (COACTVWC-008).
+          const blocks = isViewError(error) ? error : { account: null, customer: null };
           setShown((previous) => ({
-            view: null,
+            account: blocks.account ?? null,
+            customer: blocks.customer ?? null,
             error: { message: error.message, field: error.field ?? null },
             responses: previous.responses + 1,
           }));
@@ -498,7 +577,6 @@ export function COACTVW(): ReactNode {
   // rejection shows the same way.
   const accountInError = shown.error?.field === ACCOUNT_FIELD;
   const messageText = shown.error?.message ?? form.formState.errors.acctId?.message;
-  const { view: account } = shown;
 
   return (
     <ScreenShell
@@ -566,7 +644,7 @@ export function COACTVW(): ReactNode {
                 key={output.name}
                 output={output}
                 id={`${fieldId}-${output.name}`}
-                value={account === null ? "" : output.value(account)}
+                value={shownValue(output, shown)}
               />
             ))}
           </FieldGrid>

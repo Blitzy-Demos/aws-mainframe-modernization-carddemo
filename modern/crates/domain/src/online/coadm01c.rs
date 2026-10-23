@@ -8,7 +8,7 @@
 //! |---|---|---|
 //! | COADM01C-005 | `BUILD-MENU-OPTIONS` | [`ADMIN_MENU_OPTIONS`] and [`ADMIN_OPTION_COUNT`]: six options; the `OCCURS 9` has no more |
 //! | COADM01C-006 to COADM01C-011 | `BUILD-MENU-OPTIONS` | one [`ADMIN_MENU_OPTIONS`] entry each, shown through [`MenuOption::display_text`] |
-//! | COADM01C-012 | `BUILD-MENU-OPTIONS`, `PROCESS-ENTER-KEY` | [`Access::AdminOnly`] on every option; no admin-only text |
+//! | COADM01C-012 | `BUILD-MENU-OPTIONS`, `PROCESS-ENTER-KEY` | [`Access::AdminOnly`] and no [`MenuOption::user_type`] on every option; no admin-only text |
 //! | COADM01C-013 | `PROCESS-ENTER-KEY`, `PGMIDERR-ERR-PARA` | [`Installation::Installed`] on every option, from the program-name test |
 //! | COADM01C-014 | `PROCESS-ENTER-KEY`, `PGMIDERR-ERR-PARA` | [`INVALID_OPTION`] and [`not_installed_message`], carried by [`admin_menu`] |
 //!
@@ -68,11 +68,12 @@ const IS_NOT_INSTALLED: &str = "is not installed ...";
 
 /// The six options of `CDEMO-ADMIN-OPTIONS-DATA` in table order, transcribed byte for byte from
 /// `COADM02Y.cpy:26-53`: number, 35-byte name with its trailing spaces, and program. The table
-/// has no user-type column, so every option is [`Access::AdminOnly`]: it is offered only on this
-/// menu, which only an `A` token reaches (COADM01C-012). No program begins with `DUMMY` and every
-/// option's screen exists, so every option is [`Installation::Installed`] (COADM01C-013). The
-/// `OCCURS 9` redefinition's occurrences 7 to 9 hold no values and are never read, so they are
-/// not options (COADM01C-005 to COADM01C-011).
+/// has no user-type column, so no option has a [`MenuOption::user_type`] and every option is
+/// [`Access::AdminOnly`]: it is offered only on this menu, which only an `A` token reaches
+/// (COADM01C-012). No program begins with `DUMMY` and every option's screen exists, so every
+/// option is [`Installation::Installed`] (COADM01C-013). The `OCCURS 9` redefinition's
+/// occurrences 7 to 9 hold no values and are never read, so they are not options (COADM01C-005
+/// to COADM01C-011).
 pub const ADMIN_MENU_OPTIONS: [MenuOption; 6] = [
     admin_option(1, b"User List (Security)               ", *b"COUSR00C"),
     admin_option(2, b"User Add (Security)                ", *b"COUSR01C"),
@@ -82,8 +83,10 @@ pub const ADMIN_MENU_OPTIONS: [MenuOption; 6] = [
     admin_option(6, b"Transaction Type Maintenance (Db2) ", *b"COTRTUPC"),
 ];
 
-/// One `COADM02Y` occurrence from its three `VALUE` clauses. Only constant items call it, so a
-/// number that did not fit `PIC 9(02)` would stop the build, never a running program.
+/// One `COADM02Y` occurrence from its three `VALUE` clauses. The table has no user-type column,
+/// so the option has no user-type byte and is [`Access::AdminOnly`] (COADM01C-012). Only constant
+/// items call it, so a number that did not fit `PIC 9(02)` would stop the build, never a running
+/// program.
 const fn admin_option(number: u64, name: &[u8; 35], program: [u8; 8]) -> MenuOption {
     let Ok(number) = PicU::new(number) else {
         panic!("a COADM02Y option number fits PIC 9(02)")
@@ -92,6 +95,7 @@ const fn admin_option(number: u64, name: &[u8; 35], program: [u8; 8]) -> MenuOpt
         number,
         PicX::from_array(*name),
         PicX::from_array(program),
+        None,
         Access::AdminOnly,
         installation_of(program),
     )
@@ -238,6 +242,7 @@ mod tests {
             .collect();
         assert_eq!(programs, PROGRAMS);
         for option in &ADMIN_MENU_OPTIONS {
+            assert_eq!(option.user_type(), None);
             assert_eq!(option.access(), Access::AdminOnly);
             assert!(option.access().is_admin_only());
             assert_eq!(option.installation(), Installation::Installed);

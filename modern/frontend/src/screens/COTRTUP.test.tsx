@@ -1393,7 +1393,9 @@ describe("COTRTUP while a request is out", () => {
 
       expect(functionKeys().getAttribute("aria-busy")).toBe("true");
       expect(screenForm().getAttribute("aria-busy")).toBe("true");
-      expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => true));
+      expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
+        ALL_KEYS.map(() => "true"),
+      );
       expect(shownKeys()).toEqual(shownBefore);
       expectEditable({ code: false, description: false });
       // The lock makes no input protected: an input the state leaves enterable stays a Tab stop.
@@ -1410,7 +1412,9 @@ describe("COTRTUP while a request is out", () => {
       });
       expect(infoText()).toBe(info);
       expect(functionKeys().getAttribute("aria-busy")).toBe("false");
-      expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => false));
+      expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
+        ALL_KEYS.map(() => null),
+      );
       expectEditable(after);
       expectTabStops(after);
 

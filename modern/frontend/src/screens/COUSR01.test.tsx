@@ -368,7 +368,7 @@ const KEY_LABELS = ["ENTER=Add User", "F3=Back", "F4=Clear", "F12=Exit"];
  */
 function lockShown(): { disabled: string[]; readOnly: string[]; busy: (string | null)[] } {
   return {
-    disabled: KEY_LABELS.filter((label) => key(label).hasAttribute("disabled")),
+    disabled: KEY_LABELS.filter((label) => key(label).getAttribute("aria-disabled") === "true"),
     readOnly: Object.values(LABELS).filter((label) => inputFor(label).readOnly),
     busy: [
       screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),

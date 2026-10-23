@@ -14,7 +14,12 @@ import { z } from "zod";
  * - `CORPT00-030`, `CORPT00-032`, `CORPT00-034` `EDTMM`, `EDTDD`, `EDTYYYY`, `LENGTH` 2, 2 and 4,
  *   each `NUM` (`CORPT00.bms:166-193`);
  * - `CORPT00-038` `CONFIRM`, `POS=(19,66) LENGTH=1` (`CORPT00.bms:206-210`).
- * screens.md records no message for these rows, so every issue carries zod's own message.
+ * screens.md records no message for these rows, and the server re-validates the same two
+ * attributes and owns every message, so each issue carries the text endpoint 14 answers the same
+ * condition with: {@link FIELD_LENGTH_MESSAGE} for a value longer than its field and
+ * {@link FIELD_NUMERIC_MESSAGE} for a date part that is not digits. The request DTO alone also
+ * refuses text its `PIC X(n)` field cannot hold, outside printable ASCII, with the field-length
+ * text; that is no map attribute, so such text in a date part is refused here as not digits.
  *
  * CORPT00C's edits are deliberately absent: `modern/audit/online/CORPT00C.md` places every one of
  * them on the `server` layer, so the request must reach endpoint 14 for the program's own text to
@@ -45,14 +50,34 @@ export const CORPT00_LENGTHS = {
 } as const;
 
 /**
- * The map's `NUM` attribute: digits only, which the request DTO revalidates (X-CORPT00C-5). An
- * empty part passes, so the server's blank-part edits still answer it.
+ * The text endpoint 14 answers a value longer than its map field with: `FIELD_LENGTH_MESSAGE` of
+ * `crates/api/src/dto/mod.rs`, repeated here because the server owns the message.
  */
-const DIGITS = /^[0-9]*$/;
+const FIELD_LENGTH_MESSAGE = "Input does not fit the screen field...";
 
-/** One `NUM` date part of the map: at most `length` characters, each a digit. */
+/**
+ * The text endpoint 14 answers a date part that is not digits with: `FIELD_NUMERIC_MESSAGE` of
+ * `crates/api/src/dto/mod.rs`, repeated here because the server owns the message.
+ */
+const FIELD_NUMERIC_MESSAGE = "Only digits can be entered in this field...";
+
+/**
+ * The map's `NUM` attribute as the request DTO revalidates it (`numeric` in
+ * `crates/api/src/dto/mod.rs`, X-CORPT00C-5): digits with any spaces before and after them, which
+ * NUMVAL-C reads as the value of the digits (`CORPT00C-017`). An empty or all-space part passes,
+ * so the server's blank-part edits still answer it; a space between two digits, a sign, a
+ * decimal point or a letter does not.
+ */
+const DIGITS = /^ *[0-9]* *$/;
+
+/** One `NUM` date part of the map: at most `length` characters, digits with spaces around them. */
 function datePart(length: number) {
-  return z.string().max(length).regex(DIGITS);
+  return z.string().max(length, FIELD_LENGTH_MESSAGE).regex(DIGITS, FIELD_NUMERIC_MESSAGE);
+}
+
+/** One field of the map without `NUM`: at most `length` characters. */
+function textField(length: number) {
+  return z.string().max(length, FIELD_LENGTH_MESSAGE);
 }
 
 /**
@@ -60,16 +85,16 @@ function datePart(length: number) {
  * confirmation, in map order, each at most its map `LENGTH`.
  */
 export const corpt00Schema = z.object({
-  monthly: z.string().max(CORPT00_LENGTHS.monthly),
-  yearly: z.string().max(CORPT00_LENGTHS.yearly),
-  custom: z.string().max(CORPT00_LENGTHS.custom),
+  monthly: textField(CORPT00_LENGTHS.monthly),
+  yearly: textField(CORPT00_LENGTHS.yearly),
+  custom: textField(CORPT00_LENGTHS.custom),
   startMonth: datePart(CORPT00_LENGTHS.startMonth),
   startDay: datePart(CORPT00_LENGTHS.startDay),
   startYear: datePart(CORPT00_LENGTHS.startYear),
   endMonth: datePart(CORPT00_LENGTHS.endMonth),
   endDay: datePart(CORPT00_LENGTHS.endDay),
   endYear: datePart(CORPT00_LENGTHS.endYear),
-  confirm: z.string().max(CORPT00_LENGTHS.confirm),
+  confirm: textField(CORPT00_LENGTHS.confirm),
 });
 
 /** Values of the report form, exactly as typed. */

@@ -6,8 +6,8 @@
 //! `comen01c::main_menu` and the admin menu through `coadm01c::admin_menu`, so this one
 //! conversion maps both and `dto::coadm01c` declares no schema of its own. What differs between
 //! the two responses is data the domain decides: 11 or 6 options, the admin-only flags, the
-//! unavailable texts, whether an admin-only text and a user type are stated (COMEN01C-020,
-//! COADM01C-005, COADM01C-012).
+//! unavailable texts, whether each option states its user type, and whether an admin-only text
+//! and the caller's user type are stated (COMEN01C-020, COADM01C-005, COADM01C-012).
 //!
 //! The ENTER option checks run on the screen from this response, without a further request, so
 //! the response carries every text those checks show: the invalid-option and admin-only texts and
@@ -24,14 +24,16 @@ use utoipa::ToSchema;
 use super::{digits, full_text, text};
 
 /// One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide
-/// ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021).
+/// ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021, COADM01C-006 to COADM01C-012).
 // The schema name `MenuOptionDto` is the frontend's `components["schemas"]["MenuOptionDto"]`
 // (Generated API Types Only); `MenuResponse` references it, which registers it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
     "number": "01",
+    "name": "Account View                       ",
     "text": "01. Account View                        ",
     "program": "COACTVWC",
+    "user_type": "U",
     "admin_only": false,
     "installed": true
 }))]
@@ -40,6 +42,11 @@ pub struct MenuOptionDto {
     /// `11` on the main menu and `01` to `06` on the admin menu, the value the screen's
     /// right-justified, zero-filled option input is matched against (COMEN01C-020).
     pub number: String,
+    /// `CDEMO-MENU-OPT-NAME PIC X(35)` on the main menu and `CDEMO-ADMIN-OPT-NAME PIC X(35)` on
+    /// the admin menu: the option's name as declared, all 35 bytes, trailing spaces included;
+    /// for example `Account View` followed by 23 spaces (COMEN01C-020, COADM01C-006 to
+    /// COADM01C-011).
+    pub name: String,
     /// The row text as `BUILD-MENU-OPTIONS` strings it into the 40-byte `OPTNnnn` field
     /// cleared to spaces: the two digits, `. `, the 35-byte name and one space, all 40 bytes,
     /// trailing spaces included; for example `01. Account View` followed by 24 spaces
@@ -49,6 +56,11 @@ pub struct MenuOptionDto {
     /// program the option transfers to, whose route the client's program table gives
     /// (COMEN01C-020).
     pub program: String,
+    /// `CDEMO-MENU-OPT-USRTYPE PIC X(01)`: the option's user-type byte as declared, verbatim,
+    /// `U` for all 11 main-menu options (COMEN01C-020). Absent on the admin menu, whose
+    /// `COADM02Y` table has no user-type column (COADM01C-012).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_type: Option<String>,
     /// Whether the option is refused to a `U` user: the main menu's `'A'` user-type column,
     /// which no shipped option has, and every admin-menu option, whose table has no user-type
     /// column and which only an `A` token reaches (COMEN01C-020, COADM01C-012).
@@ -74,8 +86,10 @@ pub struct MenuOptionDto {
 #[schema(example = json!({
     "options": [{
         "number": "01",
+        "name": "Account View                       ",
         "text": "01. Account View                        ",
         "program": "COACTVWC",
+        "user_type": "U",
         "admin_only": false,
         "installed": true
     }],
@@ -111,8 +125,14 @@ impl From<&rules::MenuEntry> for MenuOptionDto {
         let option = entry.option();
         Self {
             number: digits(option.number()),
+            name: full_text(option.name()),
             text: full_text(&option.display_text()),
             program: text(option.program()),
+            // The declared byte verbatim, as `full_text` renders a `PIC X` field, rather than
+            // a trimmed form, so a space would travel as a space.
+            user_type: option
+                .user_type()
+                .map(|code| String::from_utf8_lossy(&[code]).into_owned()),
             admin_only: option.access().is_admin_only(),
             installed: option.installation().is_installed(),
             unavailable_message: entry.unavailable_message().map(str::to_owned),
@@ -170,6 +190,22 @@ mod tests {
         "11. Pending Authorization View",
     ];
 
+    /// The main menu's option names in table order, before the padding of the 35-byte field
+    /// (COMEN01C-020).
+    const MAIN_NAMES: [&str; 11] = [
+        "Account View",
+        "Account Update",
+        "Credit Card List",
+        "Credit Card View",
+        "Credit Card Update",
+        "Transaction List",
+        "Transaction View",
+        "Transaction Add",
+        "Transaction Reports",
+        "Bill Payment",
+        "Pending Authorization View",
+    ];
+
     /// The main menu's programs in table order (COMEN01C-020).
     const MAIN_PROGRAMS: [&str; 11] = [
         "COACTVWC", "COACTUPC", "COCRDLIC", "COCRDSLC", "COCRDUPC", "COTRN00C", "COTRN01C",
@@ -187,6 +223,17 @@ mod tests {
         "06. Transaction Type Maintenance (Db2)",
     ];
 
+    /// The admin menu's option names in table order, before the padding of the 35-byte field
+    /// (COADM01C-006 to COADM01C-011).
+    const ADMIN_NAMES: [&str; 6] = [
+        "User List (Security)",
+        "User Add (Security)",
+        "User Update (Security)",
+        "User Delete (Security)",
+        "Transaction Type List/Update (Db2)",
+        "Transaction Type Maintenance (Db2)",
+    ];
+
     /// The admin menu's programs in table order (COADM01C-006 to COADM01C-011).
     const ADMIN_PROGRAMS: [&str; 6] = [
         "COUSR00C", "COUSR01C", "COUSR02C", "COUSR03C", "COTRTLIC", "COTRTUPC",
@@ -201,6 +248,12 @@ mod tests {
     /// COADM01C-006 to COADM01C-011).
     fn padded(text: &str) -> String {
         format!("{text:<40}")
+    }
+
+    /// `name` as the 35-byte name field holds it, space-padded on the right (COMEN01C-020,
+    /// COADM01C-006 to COADM01C-011).
+    fn name_field(name: &str) -> String {
+        format!("{name:<35}")
     }
 
     /// One text member of every option, in table order.
@@ -227,6 +280,11 @@ mod tests {
             numbers(11)
         );
         assert_eq!(
+            field(&response.options, |o| o.name.as_str()),
+            MAIN_NAMES.map(name_field)
+        );
+        assert!(response.options.iter().all(|o| o.name.len() == 35));
+        assert_eq!(
             field(&response.options, |o| o.text.as_str()),
             MAIN_TEXTS.map(padded)
         );
@@ -238,7 +296,7 @@ mod tests {
             response
                 .options
                 .iter()
-                .all(|o| !o.admin_only && o.installed)
+                .all(|o| o.user_type.as_deref() == Some("U") && !o.admin_only && o.installed)
         );
         assert!(response.options.iter().all(|o| o.text.len() == 40));
         assert_eq!(
@@ -276,6 +334,12 @@ mod tests {
     }
 
     // audit: COADM01C-005
+    // audit: COADM01C-006
+    // audit: COADM01C-007
+    // audit: COADM01C-008
+    // audit: COADM01C-009
+    // audit: COADM01C-010
+    // audit: COADM01C-011
     // audit: COADM01C-012
     // audit: COADM01C-013
     // audit: COADM01C-014
@@ -292,6 +356,11 @@ mod tests {
             numbers(6)
         );
         assert_eq!(
+            field(&response.options, |o| o.name.as_str()),
+            ADMIN_NAMES.map(name_field)
+        );
+        assert!(response.options.iter().all(|o| o.name.len() == 35));
+        assert_eq!(
             field(&response.options, |o| o.text.as_str()),
             ADMIN_TEXTS.map(padded)
         );
@@ -300,7 +369,12 @@ mod tests {
             field(&response.options, |o| o.program.as_str()),
             ADMIN_PROGRAMS
         );
-        assert!(response.options.iter().all(|o| o.admin_only && o.installed));
+        assert!(
+            response
+                .options
+                .iter()
+                .all(|o| o.user_type.is_none() && o.admin_only && o.installed)
+        );
         assert!(response.options.iter().all(|o| {
             o.unavailable_message.as_deref() == Some("This option is not installed ...")
         }));
@@ -324,6 +398,7 @@ mod tests {
                 PicU::new(3)?,
                 PicX::from_array(*b"Credit Card List                   "),
                 PicX::from_array(*b"DUMMY001"),
+                None,
                 access,
                 installation,
             );
@@ -337,8 +412,10 @@ mod tests {
             let response = MenuResponse::from(menu);
             let expected = MenuOptionDto {
                 number: "03".to_owned(),
+                name: name_field("Credit Card List"),
                 text: padded("03. Credit Card List"),
                 program: "DUMMY001".to_owned(),
+                user_type: None,
                 admin_only,
                 installed,
                 unavailable_message: Some("This option Creditis coming soon ...".to_owned()),
@@ -349,7 +426,10 @@ mod tests {
     }
 
     // audit: COMEN01C-011
+    // audit: COMEN01C-020
     // audit: COMEN01C-021
+    // audit: COADM01C-006
+    // audit: COADM01C-012
     #[test]
     fn wire_form_keeps_the_literals_and_omits_absent_texts() -> TestResult {
         let main = MenuResponse::from(main_menu(&UserType::USER));
@@ -358,8 +438,10 @@ mod tests {
             value.get("options").and_then(|options| options.get(0)),
             Some(&json!({
                 "number": "01",
+                "name": "Account View                       ",
                 "text": "01. Account View                        ",
                 "program": "COACTVWC",
+                "user_type": "U",
                 "admin_only": false,
                 "installed": true
             }))
@@ -374,6 +456,18 @@ mod tests {
 
         let admin = MenuResponse::from(admin_menu());
         let value = serde_json::to_value(&admin)?;
+        assert_eq!(
+            value.get("options").and_then(|options| options.get(0)),
+            Some(&json!({
+                "number": "01",
+                "name": "User List (Security)               ",
+                "text": "01. User List (Security)                ",
+                "program": "COUSR00C",
+                "admin_only": true,
+                "installed": true,
+                "unavailable_message": "This option is not installed ..."
+            }))
+        );
         assert_eq!(value.get("user_type"), None);
         assert_eq!(value.get("admin_only_message"), None);
         assert_eq!(serde_json::from_value::<MenuResponse>(value)?, admin);
@@ -388,6 +482,19 @@ mod tests {
         let required = schema.get("required").cloned().unwrap_or_default();
         assert_eq!(required, json!(["options", "invalid_option_message"]));
         assert!(schema.pointer("/properties/page_size").is_none());
+        let option = serde_json::to_value(<MenuOptionDto as utoipa::PartialSchema>::schema())?;
+        assert_eq!(
+            option.get("required"),
+            Some(&json!([
+                "number",
+                "name",
+                "text",
+                "program",
+                "admin_only",
+                "installed"
+            ]))
+        );
+        assert!(option.pointer("/properties/user_type").is_some());
         Ok(())
     }
 }

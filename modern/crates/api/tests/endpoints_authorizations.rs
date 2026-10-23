@@ -17,8 +17,9 @@
 //!
 //! - a second pool on the same database, closed before the request, fails the first read;
 //! - a second pool whose sessions carry `lock_timeout`, beside a transaction of the test that
-//!   holds a row lock, fails exactly the statement that needs that row, the insert into
-//!   `auth_fraud` or the replace of the detail, and leaves every earlier statement untouched;
+//!   holds a row lock, fails exactly the statement that needs that row, endpoint 23's locked
+//!   read of the detail or its insert into `auth_fraud`, and leaves every earlier statement
+//!   untouched;
 //! - a `ScriptedProbe` installed with `PgStore::with_probe` skips every call at one
 //!   `ProbePoint`, sending no SQL for it, and answers it with a store error or, for
 //!   `FRAUD-UPDATE`, with no row matched, while every other statement runs against the database
@@ -41,12 +42,14 @@
 //!
 //! # Probed failures and recordings
 //!
-//! Plain reads take no lock, so no held lock fails a read after the reads before it succeeded,
-//! and what endpoint 23 hands to its writes is committed only on COPAUS1C-032's halted branch.
-//! Nor does any real-store failure make COPAUS2C's `FRAUD-UPDATE` fail after its insert met the
-//! duplicate key. A `ScriptedProbe` reaches all three: it skips one `ProbePoint`, lets every
-//! other statement run, and records each call it is asked about, in order, its arguments cloned,
-//! so that a test asserts the calls reached before the failure and the values each write carried:
+//! Endpoints 21 and 22 take no lock, so no held lock fails one of their reads after the reads
+//! before it succeeded. Endpoint 23 holds the detail from its read to its commit or rollback,
+//! so no held lock fails its replace after COPAUS2C's statements ran, and what it hands to its
+//! writes is committed only on COPAUS1C-032's halted branch. Nor does any real-store failure
+//! make COPAUS2C's `FRAUD-UPDATE` fail after its insert met the duplicate key. A
+//! `ScriptedProbe` reaches all four: it skips one `ProbePoint`, lets every other statement run,
+//! and records each call it is asked about, in order, its arguments cloned, so that a test
+//! asserts the calls reached before the failure and the values each write carried:
 //!
 //! - endpoint 21: the account, customer, summary, first-page and repositioning reads failing
 //!   after the cross-reference was found (COPAUS0C-017, COPAUS0C-019, COPAUS0C-030,
@@ -54,18 +57,27 @@
 //! - endpoint 22: the detail read failing after the summary was found, on ENTER and F8, and the
 //!   next read failing after the current detail was found (COPAUS1C-011, COPAUS1C-026);
 //! - endpoint 23: the replace of the detail failing, so that F5 takes COPAUS1C-033's rollback
-//!   and never COPAUS1C-032's halted success branch. The recorded `auth_fraud` insert or update
-//!   and the replace show the flag decided from the stored detail, the account, customer and
-//!   detail handed to COPAUS2C, the key handed back and COPAUS2C's column moves (COPAUS1C-028,
-//!   COPAUS1C-030, COPAUS1C-034, COPAUS2C-006), and the database shows that nothing was
-//!   committed. The 500 is a `ScreenError`, which carries no key, so the screen keeps the key it
-//!   holds; `FraudToggleResult` carries the key only with a 200;
+//!   and never COPAUS1C-032's halted success branch. The recorded locked read, `auth_fraud`
+//!   insert or update and replace show the detail read again under its lock, the flag decided
+//!   from the stored detail, the account, customer and detail handed to COPAUS2C, the key
+//!   handed back and COPAUS2C's column moves (COPAUS1C-028, COPAUS1C-030, COPAUS1C-034,
+//!   COPAUS2C-006), and the database shows that nothing was committed. The 500 is a
+//!   `ScreenError`, which carries no key, so the screen keeps the key it holds;
+//!   `FraudToggleResult` carries the key only with a 200;
 //! - endpoint 23: `FRAUD-UPDATE`, run because the insert met the key of a seeded `auth_fraud`
 //!   row, answering no row matched and a store error, so that F5 takes COPAUS1C-031's rollback
 //!   with the update-failure text, issues no replace and changes nothing (COPAUS2C-011).
 //!
 //! The codes in each message stay halt H4 or, in COPAUS2C's text, halt H3 and X-COPAUS2C-H2,
 //! and are reported `BLOCKED` (COPAUS0C-056, COPAUS1C-038, COPAUS2C-011).
+//!
+//! # Concurrent F5s
+//!
+//! `copaus1c_concurrent_fraud_toggles` sends several F5s on one detail at once, as tasks of
+//! their own, while a transaction of the test holds the detail, and checks the replacement's
+//! serialisation of endpoint 23: no F5 answers while the detail is held, endpoint 22 does, and
+//! once released each F5 flips the flag the one before it committed. Its checks of the
+//! committed toggles carry no tag, as COPAUS1C-032's branch is halted.
 //!
 //! # Rules
 //!
@@ -77,14 +89,17 @@
 //!   cover and travel as the display strings the audits give (COPAUS0C-034, COPAUS1C-013).
 //! - Checked Integer Narrowing: every PIC value is built through its checked constructor.
 
+use std::convert::Infallible;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use api::app::{AppState, app};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, StatusCode, header};
+use axum::response::Response;
 use chrono::{NaiveDate, NaiveDateTime};
 use domain::copybook::{Count, PicS, PicU, PicX};
 use domain::money::{Decimal, Money};
@@ -102,10 +117,14 @@ use runtime::config::Config;
 use serde_json::{Value, json};
 use test_support::fixtures::{fixture_card_numbers, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
+use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
 /// The result of every test and helper.
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+/// A request served by a task of its own, its response not yet read.
+type InFlight = JoinHandle<Result<Response, Infallible>>;
 
 /// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
 /// without the lint attributes that macro's expansion carries.
@@ -448,17 +467,49 @@ impl Api {
 
     /// One request, in process, its body kept for [`Api::assert_redacted`].
     async fn send(&mut self, method: Method, uri: &str, body: Option<Value>) -> TestResult<Reply> {
+        let request = self.request(method, uri, body)?;
+        let response = self.router.clone().oneshot(request).await?;
+        self.reply(response).await
+    }
+
+    /// `count` requests `POST uri`, each served by a task of its own and all in flight at once,
+    /// so that only the database orders them; [`Api::replies`] reads what they answer.
+    fn spawn_posts(&self, uri: &str, count: usize) -> TestResult<Vec<InFlight>> {
+        let mut tasks = Vec::with_capacity(count);
+        for _ in 0..count {
+            let request = self.request(Method::POST, uri, None)?;
+            tasks.push(tokio::spawn(self.router.clone().oneshot(request)));
+        }
+        Ok(tasks)
+    }
+
+    /// The replies of `tasks`, in the order the tasks were spawned, each body kept for
+    /// [`Api::assert_redacted`].
+    async fn replies(&mut self, tasks: Vec<InFlight>) -> TestResult<Vec<Reply>> {
+        let mut replies = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            let response = task.await??;
+            replies.push(self.reply(response).await?);
+        }
+        Ok(replies)
+    }
+
+    /// The request `method uri`, with the bearer token when there is one and `body` as JSON.
+    fn request(&self, method: Method, uri: &str, body: Option<Value>) -> TestResult<Request<Body>> {
         let mut request = Request::builder().method(method).uri(uri);
         if !self.token.is_empty() {
             request = request.header(header::AUTHORIZATION, format!("Bearer {}", self.token));
         }
-        let request = match body {
+        Ok(match body {
             Some(json) => request
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(json.to_string()))?,
             None => request.body(Body::empty())?,
-        };
-        let response = self.router.clone().oneshot(request).await?;
+        })
+    }
+
+    /// The status and JSON body of `response`, the body kept for [`Api::assert_redacted`].
+    async fn reply(&mut self, response: Response) -> TestResult<Reply> {
         let status = response.status();
         let bytes = to_bytes(response.into_body(), usize::MAX).await?;
         let text = String::from_utf8(bytes.to_vec())?;
@@ -538,6 +589,22 @@ async fn store_with_options(guard: &PostgresGuard, options: &str) -> TestResult<
         ..Config::default()
     };
     Ok(PgStore::new(runtime::db::connect(&config).await?))
+}
+
+/// A store over the pool `carddemo-api` opens for its requests, on `guard`'s database, built as
+/// `carddemo-api` builds its own (`runtime::db::connect_for_requests`): its sessions keep the
+/// server's lock settings, so a row lock another transaction holds makes them wait until the
+/// holder ends, and the store fails at once while the pool's refusal watch finds the server
+/// refusing connections.
+async fn request_store(guard: &PostgresGuard) -> TestResult<PgStore> {
+    let config = Config {
+        database_url: guard.database_url().to_owned(),
+        ..Config::default()
+    };
+    let (pool, refusals) = runtime::db::connect_for_requests(&config).await?;
+    Ok(PgStore::new(pool)
+        .failing_fast_while(move || refusals.server_refusing())
+        .await)
 }
 
 /// A store over a second pool on `guard`'s database, closed before it is returned, so that the
@@ -1383,8 +1450,9 @@ fn seeded_report_date() -> TestResult<NaiveDate> {
     NaiveDate::from_ymd_opt(2022, 7, 1).ok_or_else(|| "2022-07-01 is a date".into())
 }
 
-/// Endpoint 23 failing after its first statements: against a held row lock, which the second
-/// pool's sessions give up waiting for after 500 milliseconds, and at `FRAUD-UPDATE`, which a
+/// Endpoint 23 failing after its first statements: against a row lock the test holds, which the
+/// second pool's sessions give up waiting for after 500 milliseconds, at the detail read and at
+/// the `auth_fraud` insert; and at the replace of the detail and at `FRAUD-UPDATE`, which a
 /// probe answers.
 #[tokio::test]
 async fn copaus2c_rollback_paths() -> TestResult {
@@ -1394,11 +1462,12 @@ async fn copaus2c_rollback_paths() -> TestResult {
     seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
     let waiting = store_with_options(&guard, "options[lock_timeout]=500").await?;
     let mut api = Api::signed_on(router_over(waiting)?).await?;
-    replace_fails_after_insert(&mut api, &mut store, &card).await?;
+    held_detail_stops_the_read(&mut api, &mut store, &card).await?;
+    replace_fails_after_insert(&mut api, &guard, &mut store, &card).await?;
     let seeded = fraud_row_of(&LOCKED_SPEC, &card, locked_auth_ts()?, "R")?;
     AuthFraudRepository::insert(&mut store, &seeded, seeded_report_date()?).await?;
     insert_fails_on_held_key(&mut api, &mut store, &card).await?;
-    replace_fails_after_update(&mut api, &mut store, &card).await?;
+    replace_fails_after_update(&mut api, &guard, &mut store, &card).await?;
     update_fails_through_probe(&mut api, &guard, &mut store, &card).await?;
     // audit: COPAUS2C-013
     api.assert_redacted()
@@ -1431,14 +1500,70 @@ fn assert_tagging_error(reply: &Reply) {
     report_blocked("H4: COPAUS1C-038, the IMS status position of the FRAUD Tagging text");
 }
 
-/// The insert succeeds and the replace of the detail cannot take its lock: both roll back.
-async fn replace_fails_after_insert(
+/// F5 while a transaction of the test holds the detail: F5 waits for the detail at its read,
+/// the held read its replace follows, and once the second pool's session gives up after 500
+/// milliseconds that read fails, with nothing written. The response is the replacement's for an
+/// F5 whose read fails, no parity result (COPAUS1C-029), so its checks carry no tag.
+async fn held_detail_stops_the_read(
     api: &mut Api,
     store: &mut PgStore,
     card: &CardNumber,
 ) -> TestResult {
     let reply = toggle_beside_detail_lock(api, store, card).await?;
+    assert_eq!(reply.status, StatusCode::INTERNAL_SERVER_ERROR);
+    // The detail read's text, not the insert's or the replace's: F5 stopped at its read.
+    let detail_error = " System error while reading Auth Details: Code:";
+    assert_fixed_pieces(reply.message(), 49, &[(0, detail_error)]);
+    assert!(is_bare_error(&reply), "more than a message");
+    let fraud = AuthFraudRepository::find_by_id(store, card, locked_auth_ts()?).await?;
+    assert_eq!(fraud, None);
+    assert_eq!(
+        stored_detail(store, &LOCKED_SPEC).await?,
+        Some(detail_of(&LOCKED_SPEC, card)?)
+    );
+    // audit: COPAUS1C-029
+    report_blocked("X-COPAUS1C-H1, X-COPAUS1C-H2: COPAUS1C-029, F5 whose detail read fails");
+    Ok(())
+}
+
+/// Runs F5 on [`LOCKED_KEY`] through a store whose probe fails the replace of the detail, its
+/// response joining `api`'s for the redaction scan, and returns the response and the calls the
+/// probe recorded. F5 holds the detail from its read on, so no lock another transaction holds
+/// fails the replace once the statements before it have run: only the probe reaches that
+/// failure.
+async fn toggle_with_failed_replace(
+    api: &mut Api,
+    guard: &PostgresGuard,
+) -> TestResult<(Reply, Vec<Seen>)> {
+    let probe = ScriptedProbe::failing_at(ProbePoint::AuthDetailUpdate);
+    let mut probed = probed_api(guard, &probe, &api.token)?;
+    let reply = probed.post(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY)).await?;
+    api.bodies.append(&mut probed.bodies);
+    Ok((reply, probe.seen()))
+}
+
+/// How many replaces of the detail `log` records after its first call that `is_first` accepts;
+/// none when no call is accepted.
+fn replaces_after(log: &[Seen], is_first: impl Fn(&Seen) -> bool) -> usize {
+    log.iter()
+        .skip_while(|call| !is_first(call))
+        .filter(|call| call.detail_update().is_some())
+        .count()
+}
+
+/// The insert succeeds and the replace of the detail after it fails: both roll back.
+async fn replace_fails_after_insert(
+    api: &mut Api,
+    guard: &PostgresGuard,
+    store: &mut PgStore,
+    card: &CardNumber,
+) -> TestResult {
+    let (reply, log) = toggle_with_failed_replace(api, guard).await?;
     // The replace runs only after COPAUS2C's insert returned status `S`.
+    let inserted = fraud_row_of(&LOCKED_SPEC, card, locked_auth_ts()?, "F")?;
+    let replaces = replaces_after(&log, |call| call.fraud_insert() == Some(&inserted));
+    // audit: COPAUS2C-007
+    assert_eq!(replaces, 1, "replaces after the insert");
     // audit: COPAUS2C-007
     assert_tagging_error(&reply);
     let fraud = AuthFraudRepository::find_by_id(store, card, locked_auth_ts()?).await?;
@@ -1497,14 +1622,22 @@ async fn insert_fails_on_held_key(
 }
 
 /// The insert meets the committed row's key, the update that follows succeeds, and the replace
-/// of the detail cannot take its lock: the update rolls back with it.
+/// of the detail after it fails: the update rolls back with it.
 async fn replace_fails_after_update(
     api: &mut Api,
+    guard: &PostgresGuard,
     store: &mut PgStore,
     card: &CardNumber,
 ) -> TestResult {
-    let reply = toggle_beside_detail_lock(api, store, card).await?;
+    let (reply, log) = toggle_with_failed_replace(api, guard).await?;
     // The replace runs only after the duplicate key led to `FRAUD-UPDATE` and its status `S`.
+    let (auth_ts, flag) = (locked_auth_ts()?, PicX::<1>::from_text("F")?);
+    let replaces = replaces_after(&log, |call| {
+        call.fraud_update() == Some((card, auth_ts, &flag))
+    });
+    // audit: COPAUS2C-008
+    // audit: COPAUS2C-009
+    assert_eq!(replaces, 1, "replaces after FRAUD-UPDATE");
     // audit: COPAUS2C-008
     // audit: COPAUS2C-009
     assert_tagging_error(&reply);
@@ -1604,6 +1737,97 @@ async fn update_fails_through_probe(
     Ok(())
 }
 
+/// How long the concurrent F5s are given to show that they wait for the held detail: far longer
+/// than one F5 takes on an idle server.
+const LOCK_WAIT: Duration = Duration::from_millis(300);
+
+/// The F5s [`copaus1c_concurrent_fraud_toggles`] sends at once: an even number, so that as many
+/// serial toggles leave the flag where they found it.
+const CONCURRENT_TOGGLES: usize = 4;
+
+/// [`CONCURRENT_TOGGLES`] F5s sent at once on one detail while a transaction of the test holds
+/// it, then released by that transaction's commit of a confirmed fraud.
+///
+/// It asserts the replacement's serialisation of endpoint 23, not COBOL parity: the COBOL's reads
+/// hold nothing, and the committed toggle is COPAUS1C-032's halted branch (X-COPAUS1C-H2), so
+/// its checks carry no tag. No F5 answers while the detail is held, and endpoint 22, which reads
+/// without a lock, still does. Once released, every F5 commits and each reads the flag the one
+/// before it committed, the holder's first: the answers are half removals and half reports, each
+/// showing the flag it stored, and the detail and its `auth_fraud` row end as that many serial
+/// toggles leave them. Two F5s that read the same flag would both report.
+#[tokio::test]
+async fn copaus1c_concurrent_fraud_toggles() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let card = card_of(&mut store, ACCT_50).await?;
+    seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
+    let mut api = Api::signed_on(router_over(request_store(&guard).await?)?).await?;
+    let acct = auth_acct(ACCT_50)?;
+    let (date, time) = (
+        PicS::new(LOCKED_SPEC.date_9c)?,
+        PicS::new(LOCKED_SPEC.time_9c)?,
+    );
+
+    let mut holder = store.begin().await?;
+    let mut confirmed = PendingAuthDetailRepository::lock_by_id(&mut holder, acct, date, time)
+        .await?
+        .ok_or("the detail is seeded")?;
+    let toggles = api.spawn_posts(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY), CONCURRENT_TOGGLES)?;
+    tokio::time::sleep(LOCK_WAIT).await;
+    let answered = toggles.iter().filter(|task| task.is_finished()).count();
+    assert_eq!(answered, 0, "F5s answered while the detail was held");
+
+    // Endpoint 22 answers while the detail is held, with the flag last committed.
+    let shown = api.get(&detail_uri(ACCT_50_TEXT, LOCKED_KEY, "")).await?;
+    // audit: COPAUS1C-008
+    shown.expect_ok()?;
+    // audit: COPAUS1C-008
+    assert_eq!(shown.text("/fraud_status")?, "-         ");
+
+    confirmed.auth_fraud = PicX::from_text("F")?;
+    let replaced = PendingAuthDetailRepository::update(&mut holder, acct, &confirmed).await?;
+    assert!(replaced, "the holder flags the detail");
+    holder.commit().await?;
+
+    let replies = api.replies(toggles).await?;
+    let mut removals = 0_usize;
+    for reply in &replies {
+        reply.expect_ok()?;
+        let flag = match reply.message() {
+            "AUTH FRAUD REMOVED..." => {
+                removals += 1;
+                "R"
+            }
+            "AUTH MARKED FRAUD..." => "F",
+            other => return Err(format!("F5 answered {other:?}").into()),
+        };
+        assert_eq!(
+            reply.text("/detail/fraud_status")?,
+            format!("{flag}-07/18/22")
+        );
+    }
+    assert_eq!(
+        (removals, replies.len()),
+        (CONCURRENT_TOGGLES / 2, CONCURRENT_TOGGLES),
+        "removals among the F5s"
+    );
+
+    // An even number of toggles from the holder's `F` leaves `F`, with the clock's report date,
+    // and the `auth_fraud` row carries the last toggle's report.
+    let stored = stored_detail(&mut store, &LOCKED_SPEC)
+        .await?
+        .ok_or("the detail is stored")?;
+    let flagged = (stored.auth_fraud.to_text(), stored.fraud_rpt_date.to_text());
+    assert_eq!(flagged, ("F".to_owned(), "07/18/22".to_owned()));
+    let auth_ts = locked_auth_ts()?;
+    let fraud = AuthFraudRepository::find_by_id(&mut store, &card, auth_ts).await?;
+    let expected = fraud_row_of(&LOCKED_SPEC, &card, auth_ts, "F")?;
+    assert_eq!(fraud, Some((expected, Some(clock_now()?.date()))));
+    // audit: COPAUS1C-032
+    report_blocked("X-COPAUS1C-H2: COPAUS1C-032, the detail and fraud row committed by each F5");
+    api.assert_redacted()
+}
+
 /// One call a [`ScriptedProbe`] was asked about: the arguments a test asserts on, cloned inside
 /// [`RepositoryProbe::answer`], or the point alone for any other call, and for a call whose
 /// arguments are not the types its point lists.
@@ -1617,6 +1841,8 @@ enum Seen {
     SummaryRead(PicS<11>),
     /// `AuthDetailRead`: the account ID and the inverted date and time.
     DetailRead(PicS<11>, PicS<5>, PicS<9>),
+    /// `AuthDetailLock`: the account ID and the inverted date and time.
+    DetailLock(PicS<11>, PicS<5>, PicS<9>),
     /// `AuthDetailPage`: the account ID and the inverted start date and time.
     DetailPage(PicS<11>, PicS<5>, PicS<9>),
     /// `AuthDetailUpdate`: the account ID and the record the replace carries.
@@ -1644,6 +1870,9 @@ impl Seen {
             ProbePoint::AuthDetailRead => {
                 Self::key_args(call).map(|(acct, date, time)| Self::DetailRead(acct, date, time))
             }
+            ProbePoint::AuthDetailLock => {
+                Self::key_args(call).map(|(acct, date, time)| Self::DetailLock(acct, date, time))
+            }
             ProbePoint::AuthDetailPage => {
                 Self::key_args(call).map(|(acct, date, time)| Self::DetailPage(acct, date, time))
             }
@@ -1666,7 +1895,8 @@ impl Seen {
         seen.unwrap_or(Self::Other(point))
     }
 
-    /// The account and the inverted date and time a detail read or page query starts from.
+    /// The account and the inverted date and time a detail read, locked read or page query
+    /// starts from.
     fn key_args(call: &ProbeCall<'_>) -> Option<(PicS<11>, PicS<5>, PicS<9>)> {
         let acct = call.arg::<PicS<11>>(0)?;
         let date = call.arg::<PicS<5>>(1)?;
@@ -2133,6 +2363,19 @@ async fn observed_toggle(
     // audit: COPAUS1C-034
     assert!(is_bare_error(&reply), "{key}: more than a message");
     let log = probe.seen();
+    // F5 reads the stored detail again inside its transaction, held until the rollback, and
+    // never through the plain read endpoint 22 makes.
+    let detail_reads: Vec<_> = log
+        .iter()
+        .filter(|call| matches!(call, Seen::DetailRead(..) | Seen::DetailLock(..)))
+        .collect();
+    let held_read = Seen::DetailLock(
+        auth_acct(case.acct)?,
+        seeded.auth_date_9c,
+        seeded.auth_time_9c,
+    );
+    // audit: COPAUS1C-028
+    assert_eq!(detail_reads, [&held_read], "{key}: the detail reads");
     let rows: Vec<_> = log.iter().filter_map(Seen::fraud_insert).collect();
     let rewrites: Vec<_> = log.iter().filter_map(Seen::detail_update).collect();
     let ([row], [(replace_acct, replaced)]) = (rows.as_slice(), rewrites.as_slice()) else {

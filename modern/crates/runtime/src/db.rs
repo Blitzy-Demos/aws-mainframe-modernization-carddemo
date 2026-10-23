@@ -2,7 +2,7 @@
 //! `carddemo-migrate` binaries.
 //!
 //! [`connect`] opens a [`PgPool`] on [`Config::database_url`], and [`connect_for_requests`] opens
-//! one whose sessions also start with the request deadlines described below. The default URL
+//! the same pool for `carddemo-api`, with the lock waits described below. The default URL
 //! names the local `PostgreSQL` 16 service of `modern/compose.yaml`, and an integration test
 //! hands a binary its testcontainers instance through `DATABASE_URL`. The `sqlx` feature set has
 //! no TLS backend, so every connection is unencrypted, and a URL that requires TLS (`sslmode`
@@ -49,6 +49,27 @@
 //! request of `carddemo-api` then answers its 500 after 5 seconds and logs the failure, instead
 //! of holding it for half a minute with nothing in the log.
 //!
+//! A server that refuses connections, as a stopped one does, would make every such request wait
+//! those 5 seconds, because the pool retries a refused connection until its acquire timeout,
+//! and so does a caller handed an idle connection the server left broken: the connection fails
+//! the ping the pool sends before handing it out, and the pool opens a new one in its place. So
+//! the request pool of [`connect_for_requests`] counts the server's answers, each connection it
+//! establishes and each idle one that answers that ping, and comes with a refusal watch, whose
+//! [`Refusals`] handle reports whether the server's port refuses connections. Every 100
+//! milliseconds the watch looks at the pool. It opens a bare connection to the port, and closes
+//! it before sending a byte, when some connection of the pool is in use or being opened, and so
+//! a caller may be waiting for one, and the pool has counted no answer since it last looked;
+//! while the port refuses, it opens one every time. While the pool's callers get their
+//! connections, and while the pool is idle, it sends nothing. A refused connection makes it
+//! report the server refusing, and an accepted one makes it report the server back; any other
+//! outcome leaves the report as it was. `carddemo-api` fails a request's store access at once
+//! while the report stands, however many broken connections the pool still holds idle, so only
+//! the requests already waiting when the watch finds the port refusing, the first to meet the
+//! outage, take the 5 seconds. A server that accepts connections but answers slowly, and a pool
+//! whose connections are all in use, as when requests wait for a row lock, never trip the
+//! watch, whose connection the server accepts: their callers wait up to [`ACQUIRE_TIMEOUT`] as
+//! before.
+//!
 //! Before it builds the pool, [`connect`] makes one connection of its own within the same 5
 //! seconds, resolving the host first. The pool alone would retry a refused connection until its
 //! acquire timeout and then report only that it timed out, and would report an unresolvable
@@ -58,19 +79,21 @@
 //! opens by that timeout too: a server that the first connection reaches in time is one the
 //! pool's own connections can reach.
 //!
-//! # Request deadlines
+//! # Lock waits
 //!
-//! Each session of the pool [`connect_for_requests`] opens starts with `lock_timeout`
-//! [`LOCK_TIMEOUT`] and `statement_timeout` [`STATEMENT_TIMEOUT`], so the server itself ends a
-//! row lock wait, such as a `SELECT … FOR UPDATE` of an account or a user that another
-//! transaction holds, and any statement that runs too long. They are sent as server options of
-//! the startup packet, ahead of those `DATABASE_URL` names, and no statement is issued for them.
-//! The server applies the last of repeated settings, so a `lock_timeout` or `statement_timeout`
-//! that `DATABASE_URL` sets, as an `options[<name>]` parameter or inside its `options`
-//! parameter, prevails. Like every setting a client sends, both take precedence over a value set
-//! with `ALTER ROLE` or `ALTER DATABASE`. Only `carddemo-api` serves requests; the other
-//! binaries use [`connect`], whose sessions keep the server's settings (see
-//! [`connect_for_requests`]).
+//! No pool opened here adds a server setting: each session runs with the server options
+//! `DATABASE_URL` names and the server's own settings otherwise, so its `lock_timeout` and
+//! `statement_timeout` are the server's, which `PostgreSQL` sets to zero, no limit, unless its
+//! configuration says otherwise. A request of `carddemo-api` whose `SELECT … FOR UPDATE` meets
+//! a row lock another transaction holds therefore waits until that transaction ends and then
+//! reads the row it left, as a CICS `READ UPDATE` waits for a record another task holds
+//! (COACTUPC-101, COACTUPC-102, COBIL00C-013; every `CardDemo` transaction is defined
+//! `DTIMOUT(NO)`). `PostgreSQL` counts a lock wait in `statement_timeout` and has no statement
+//! deadline that leaves lock waits out, so neither setting is added: every statement the API
+//! issues is served by an index and bounded by a page, and lock waits are the only long waits
+//! either setting would end. An operator who wants a bound sets it in `DATABASE_URL`, as
+//! `options[lock_timeout]=…`, `options[statement_timeout]=…` or inside its `options` parameter;
+//! the server then ends the wait, and the request answers its audited failed read.
 //!
 //! # Credential-safe diagnostics
 //!
@@ -83,16 +106,21 @@
 //! class and, for a database error, the SQLSTATE, and never the driver's or the server's text:
 //! that text can quote a rejected option value or a key value.
 
-use std::borrow::Cow;
 use std::error::Error as StdError;
 use std::fmt;
+use std::future;
 use std::io;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use crate::config::Config;
 use sqlx::Connection;
 use sqlx::error::DatabaseError;
 use sqlx::postgres::{PgConnectOptions, PgConnection, PgPool, PgPoolOptions, PgSslMode};
+use tokio::net::{TcpStream, UnixStream};
+use tokio::time::MissedTickBehavior;
 
 /// The query parameter names that the `sqlx` 0.8.6 `PostgreSQL` URL parser recognizes, besides
 /// the `options[<name>]` form. That parser logs any other parameter at `WARN` together with its
@@ -146,24 +174,13 @@ pub const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`ACQUIRE_TIMEOUT`] that then bounds each connection the pool opens.
 const CONNECT_TIMEOUT: Duration = ACQUIRE_TIMEOUT;
 
-/// How long a session of [`connect_for_requests`] waits for a lock before the server ends the
-/// statement with SQLSTATE `55P03` (`lock_not_available`): its `lock_timeout`.
-pub const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the refusal watch of [`connect_for_requests`] looks at its pool, and so how soon
+/// after a refused or an accepted connection the [`Refusals`] report follows it.
+const REFUSAL_WATCH_TICK: Duration = Duration::from_millis(100);
 
-/// How long a statement of a session of [`connect_for_requests`] runs before the server cancels
-/// it with SQLSTATE `57014` (`query_canceled`): its `statement_timeout`. It is longer than
-/// [`LOCK_TIMEOUT`], so a lock wait ends as `55P03`.
-pub const STATEMENT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// A server setting that the sessions of a pool start with: its name and its value, which is
-/// sent in milliseconds.
-type ServerSetting = (&'static str, Duration);
-
-/// The server settings each session of [`connect_for_requests`] starts with.
-const REQUEST_SETTINGS: [ServerSetting; 2] = [
-    ("lock_timeout", LOCK_TIMEOUT),
-    ("statement_timeout", STATEMENT_TIMEOUT),
-];
+/// How long one connection of the refusal watch may take to be refused or accepted. One that
+/// takes longer leaves the report as it was.
+const REFUSAL_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Opens a [`PgPool`] on [`Config::database_url`] with the default `sqlx` pool settings but an
 /// acquire timeout of [`ACQUIRE_TIMEOUT`], and establishes one connection before returning, so a
@@ -197,65 +214,214 @@ const REQUEST_SETTINGS: [ServerSetting; 2] = [
 ///   the server stops accepting connections or comes to take longer than [`ACQUIRE_TIMEOUT`] to
 ///   accept one.
 pub async fn connect(config: &Config) -> Result<PgPool, sqlx::Error> {
-    connect_within(config, &[], CONNECT_TIMEOUT).await
+    connect_within(config, CONNECT_TIMEOUT, pool_options()).await
 }
 
 /// Opens the request pool of `carddemo-api`: [`connect`], with every check, setting and error
-/// of it, and each session the pool opens starts with `lock_timeout` [`LOCK_TIMEOUT`] (5
-/// seconds) and `statement_timeout` [`STATEMENT_TIMEOUT`] (10 seconds).
+/// of it, and the pool's refusal watch, whose [`Refusals`] handle it returns beside the pool
+/// (see "Unreachable servers" above). The pool also counts the server's answers for the watch
+/// ([`request_pool_options`]). Its sessions add no server setting either, so they run with the
+/// server options `DATABASE_URL` names and the server's own settings otherwise (see "Lock
+/// waits" above).
 ///
-/// A request that waits for a row lock another transaction holds, such as the
-/// `SELECT … FOR UPDATE` of an account or a user, therefore waits at most 5 seconds, and any of
-/// its statements runs at most 10 seconds, before the server ends the statement with SQLSTATE
-/// `55P03` (`lock_not_available`) or `57014` (`query_canceled`). The server ends the wait
-/// itself, so the request's connection and the locks it holds are released even when nobody
-/// awaits the request any more. A service answers either failure as it answers any failed read
-/// or write, with the program's audited message once its transaction is rolled back.
+/// A request whose `SELECT … FOR UPDATE` meets a row lock another transaction holds, such as
+/// that of an account, a customer or a user, therefore waits until that transaction ends and
+/// then reads the row it left, as the CICS `READ UPDATE` it replaces waits for the record
+/// another task holds: a save of COACTUPC proceeds once the account and the customer are free
+/// (COACTUPC-101, COACTUPC-102), and a second bill payment for one account reads the balance the
+/// first left (COBIL00C-013). A `lock_timeout` or `statement_timeout` that `DATABASE_URL` sets,
+/// as `options[lock_timeout]=…`, `options[statement_timeout]=…` or inside its `options`
+/// parameter, reaches the server unchanged and ends such a wait there; the service then answers
+/// the failed read with the program's audited message once its transaction is rolled back. Like
+/// every setting a client sends, either takes precedence over a value set with `ALTER ROLE` or
+/// `ALTER DATABASE`.
 ///
-/// The settings are server options of the startup packet, sent ahead of those `DATABASE_URL`
-/// names; no statement is issued. The server applies the last of repeated settings, so a
-/// `lock_timeout` or `statement_timeout` that `DATABASE_URL` sets, as
-/// `options[lock_timeout]=…` or `options[statement_timeout]=…` or inside its `options`
-/// parameter, prevails. Like every setting a client sends, both take precedence over a value
-/// set with `ALTER ROLE` or `ALTER DATABASE`.
+/// The watch is a task of the Tokio runtime this function runs on. It ends once the pool is
+/// closed or every clone of the handle is dropped, so it keeps no pool alive that nobody uses.
+/// It never takes a connection from the pool, so it holds up no close.
 ///
-/// `carddemo-mq`, `carddemo-batch` and `carddemo-migrate` use [`connect`], whose sessions keep
-/// the server's settings: the CP00 workers of two processes serialise the decisions for one
-/// account by waiting on its summary row lock for as long as the other process holds it (i10),
-/// a batch job's statements and lock waits last as long as its input requires, and a migration
-/// waits for the locks its DDL needs.
+/// `carddemo-mq`, `carddemo-batch` and `carddemo-migrate` use [`connect`]: the CP00 workers of
+/// two processes serialise the decisions for one account by waiting on its summary row lock for
+/// as long as the other process holds it (i10), a batch job's statements and lock waits last as
+/// long as its input requires, and a migration waits for the locks its DDL needs.
 ///
 /// # Errors
 ///
-/// Those of [`connect`]. A value that `DATABASE_URL` gives either setting and the server rejects
-/// is [`sqlx::Error::Database`].
-pub async fn connect_for_requests(config: &Config) -> Result<PgPool, sqlx::Error> {
-    connect_within(config, &REQUEST_SETTINGS, CONNECT_TIMEOUT).await
+/// Those of [`connect`]. A value that `DATABASE_URL` gives a server setting and the server
+/// rejects is [`sqlx::Error::Database`]. No watch is started then.
+pub async fn connect_for_requests(config: &Config) -> Result<(PgPool, Refusals), sqlx::Error> {
+    let answers = Arc::new(AtomicU64::new(0));
+    let pool = connect_within(config, CONNECT_TIMEOUT, request_pool_options(&answers)).await?;
+    let refusals = watch_refusals(&pool, answers);
+    Ok((pool, refusals))
 }
 
-/// [`connect`], with `leading` sent ahead of the server options `DATABASE_URL` names (see
-/// [`connect_options`]) and the first connection bounded by `timeout`.
+/// Whether the server of a request pool refuses connections, as the pool's refusal watch last
+/// found it (see "Unreachable servers" above). [`connect_for_requests`] returns it.
+///
+/// A clone shares the report. The watch runs as long as the pool is open and one clone
+/// remains.
+#[derive(Debug, Clone)]
+pub struct Refusals {
+    /// The report; the watch holds it weakly, so it ends once every clone is dropped.
+    refusing: Arc<AtomicBool>,
+}
+
+impl Refusals {
+    /// Whether the last connection the watch opened to the server's port was refused, and none
+    /// has been accepted since: `false` until the watch first finds a connection of the pool in
+    /// use or being opened, with no answer from the server counted since it last looked, and
+    /// the port refusing.
+    #[must_use]
+    pub fn server_refusing(&self) -> bool {
+        self.refusing.load(Ordering::Acquire)
+    }
+}
+
+/// The settings of the request pool: [`pool_options`], with hooks that add one to `answers`
+/// for each answer of the server: each connection the pool establishes (`after_connect`) and
+/// each idle connection it hands out once the connection has answered the pool's ping
+/// (`before_acquire`, which `sqlx` calls only after that ping succeeded and which accepts every
+/// connection). That ping, the `sqlx` default, is set explicitly because the count relies on
+/// it: without it, a broken idle connection would count as an answer.
+fn request_pool_options(answers: &Arc<AtomicU64>) -> PgPoolOptions {
+    let connected = Arc::clone(answers);
+    let pinged = Arc::clone(answers);
+    pool_options()
+        .test_before_acquire(true)
+        .after_connect(move |_connection, _metadata| {
+            connected.fetch_add(1, Ordering::AcqRel);
+            Box::pin(future::ready(Ok(())))
+        })
+        .before_acquire(move |_connection, _metadata| {
+            pinged.fetch_add(1, Ordering::AcqRel);
+            Box::pin(future::ready(Ok(true)))
+        })
+}
+
+/// Starts the refusal watch of `pool`, whose server's answers `answers` counts, on the current
+/// Tokio runtime and returns its report, which starts as not refusing.
+fn watch_refusals(pool: &PgPool, answers: Arc<AtomicU64>) -> Refusals {
+    let refusing = Arc::new(AtomicBool::new(false));
+    // Detached: the task ends by itself, with the pool or with the report's last clone.
+    tokio::spawn(refusal_watch(
+        pool.clone(),
+        answers,
+        Arc::downgrade(&refusing),
+    ));
+    Refusals { refusing }
+}
+
+/// The refusal watch of `pool`, whose server's answers `answers` counts: every
+/// [`REFUSAL_WATCH_TICK`], the first one tick after it starts, it looks at the pool and the
+/// count and, when [`probes`] says so, opens a connection to the server ([`server_refuses`])
+/// and records the outcome in `report`. Each look therefore weighs the answers of at least one
+/// whole tick. It returns once the pool is closed or `report` has no strong holder left.
+async fn refusal_watch(pool: PgPool, answers: Arc<AtomicU64>, report: Weak<AtomicBool>) {
+    let first = tokio::time::Instant::now() + REFUSAL_WATCH_TICK;
+    let mut ticks = tokio::time::interval_at(first, REFUSAL_WATCH_TICK);
+    ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut counted = answers.load(Ordering::Acquire);
+    loop {
+        ticks.tick().await;
+        let Some(refusing) = report.upgrade() else {
+            return;
+        };
+        if pool.is_closed() {
+            return;
+        }
+        let count = answers.load(Ordering::Acquire);
+        let answered = count != counted;
+        counted = count;
+        let probe = probes(
+            refusing.load(Ordering::Acquire),
+            pool.size(),
+            pool.num_idle(),
+            answered,
+        );
+        if probe {
+            if let Some(refused) = server_refuses(&pool.connect_options()).await {
+                refusing.store(refused, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Whether the refusal watch opens a connection to the server at a tick: always while it
+/// reports the server `refusing`, and otherwise only while a caller may be waiting for a
+/// connection that the server has not shown it can give, that is when some of the pool's
+/// `size` connections, those being opened included, are not among its `idle` ones and the
+/// server has not `answered` since the previous tick.
+///
+/// The pool has no more idle connections than connections, so an `idle` count beyond `u32`
+/// leaves none in use.
+fn probes(refusing: bool, size: u32, idle: usize, answered: bool) -> bool {
+    let in_use = u32::try_from(idle).is_ok_and(|idle| size > idle);
+    refusing || (in_use && !answered)
+}
+
+/// Opens one connection to the server `options` name, within [`REFUSAL_PROBE_TIMEOUT`], and
+/// closes it at once, before any byte is sent, which `PostgreSQL` does not log: `Some(true)`
+/// when it is refused, `Some(false)` when it is accepted, and `None` on any other outcome, such
+/// as a timeout, a host that does not resolve or a missing socket file. Only a refused
+/// connection makes the pool retry until its acquire timeout; a host that does not resolve or a
+/// missing socket file fails the pool's caller at once.
+///
+/// The target is the one `sqlx` connects to: the Unix-domain socket of [`socket_path`], or else
+/// the host, without the brackets of an IPv6 address, and the port.
+async fn server_refuses(options: &PgConnectOptions) -> Option<bool> {
+    let connection = async {
+        if let Some(path) = socket_path(options) {
+            return UnixStream::connect(path).await.map(drop);
+        }
+        let host = options.get_host().trim_matches(['[', ']']);
+        TcpStream::connect((host, options.get_port()))
+            .await
+            .map(drop)
+    };
+    match tokio::time::timeout(REFUSAL_PROBE_TIMEOUT, connection).await {
+        Ok(Ok(())) => Some(false),
+        Ok(Err(error)) if error.kind() == io::ErrorKind::ConnectionRefused => Some(true),
+        Ok(Err(_)) | Err(_) => None,
+    }
+}
+
+/// The Unix-domain socket `sqlx` connects to for `options`, as it names it: `.s.PGSQL.<port>`
+/// in the socket directory the options set, or in the host when the host is a path. `None`
+/// when `sqlx` connects over TCP.
+fn socket_path(options: &PgConnectOptions) -> Option<PathBuf> {
+    let directory = match options.get_socket() {
+        Some(directory) => directory.clone(),
+        None if options.get_host().starts_with('/') => PathBuf::from(options.get_host()),
+        None => return None,
+    };
+    Some(directory.join(format!(".s.PGSQL.{}", options.get_port())))
+}
+
+/// [`connect`], with the first connection bounded by `timeout` and the pool built with
+/// `settings`: [`pool_options`] for [`connect`], [`request_pool_options`] for
+/// [`connect_for_requests`].
 ///
 /// The pool alone would retry a refused connection until its acquire timeout and then report
 /// only [`sqlx::Error::PoolTimedOut`], and would report a host that resolves to no address as
 /// an uncategorized I/O error. So one connection is made first, outside the pool, and its
 /// failure is returned as it happened: an elapsed `timeout` as [`io::ErrorKind::TimedOut`] and
-/// an unresolved host with [`HostNotResolved`] as its cause. The pool, with [`pool_options`], is
-/// built only once that connection has succeeded.
+/// an unresolved host with [`HostNotResolved`] as its cause. The pool is built only once that
+/// connection has succeeded.
 async fn connect_within(
     config: &Config,
-    leading: &[ServerSetting],
     timeout: Duration,
+    settings: PgPoolOptions,
 ) -> Result<PgPool, sqlx::Error> {
-    let options = connect_options(&config.database_url, leading)?;
+    let options = connect_options(&config.database_url)?;
     tokio::time::timeout(timeout, connect_once(&options))
         .await
         .map_err(|_| sqlx::Error::Io(io::ErrorKind::TimedOut.into()))??;
-    pool_options().connect_with(options).await
+    settings.connect_with(options).await
 }
 
 /// The settings of every pool opened here: those of `sqlx`, but an acquire timeout of
-/// [`ACQUIRE_TIMEOUT`].
+/// [`ACQUIRE_TIMEOUT`]. The request pool adds the hooks of [`request_pool_options`].
 fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new().acquire_timeout(ACQUIRE_TIMEOUT)
 }
@@ -287,18 +453,17 @@ impl fmt::Display for HostNotResolved {
 
 impl StdError for HostNotResolved {}
 
-/// Parses `url` into connect options in which no setting comes from the environment, with the
-/// server settings `leading` ahead of those the URL names.
+/// Parses `url` into connect options in which no setting comes from the environment and the
+/// server options are exactly those the URL names.
 ///
 /// [`check_query_parameters`] runs first, then [`UrlParts::of`]. The URL must name a host, a
 /// user and a password, and `PGOPTIONS` must name no server option ([`names_server_options`]),
 /// because `sqlx` takes each of these from the libpq environment, or the password from the
-/// pgpass file, when the URL omits it. `sqlx` then parses the URL with `leading` added at the
-/// head of its query ([`with_leading_settings`]), and any parse error becomes
+/// pgpass file, when the URL omits it. `sqlx` then parses the URL, and any parse error becomes
 /// [`UrlError::Invalid`]: the `sqlx` text can quote a rejected value, such as an unknown
 /// `sslmode`. The port, the TLS mode, the database and the application name are then set
 /// explicitly wherever the URL leaves them to the environment.
-fn connect_options(url: &str, leading: &[ServerSetting]) -> Result<PgConnectOptions, UrlError> {
+fn connect_options(url: &str) -> Result<PgConnectOptions, UrlError> {
     check_query_parameters(url)?;
     let parts = UrlParts::of(url)?;
     if !parts.names_host() {
@@ -320,7 +485,7 @@ fn connect_options(url: &str, leading: &[ServerSetting]) -> Result<PgConnectOpti
     {
         return Err(UrlError::EnvironmentOptions);
     }
-    let mut options = with_leading_settings(url, leading)
+    let mut options = url
         .parse::<PgConnectOptions>()
         .map_err(|_| UrlError::Invalid)?;
     if !parts.names_port() {
@@ -341,45 +506,6 @@ fn connect_options(url: &str, leading: &[ServerSetting]) -> Result<PgConnectOpti
         options = options.application_name("");
     }
     Ok(options)
-}
-
-/// `url` with each of `leading` as an `options[<name>]=<milliseconds>ms` query parameter at the
-/// head of its query, or `url` itself when `leading` is empty.
-///
-/// `sqlx` appends each `options` parameter to the server options in query order, after any that
-/// `PGOPTIONS` holds, so the settings of `leading` precede every one the URL names. The query is
-/// located as [`query_parameter_names`] locates it, the text after the first `?` that precedes
-/// the first `#`; a URL without one gains a query ahead of its fragment. Nothing outside the
-/// query changes, so `sqlx` reads every other part as [`UrlParts::of`] located it, and the
-/// checks made on `url` hold for the result.
-#[deny(clippy::indexing_slicing, clippy::unwrap_used, clippy::expect_used)]
-fn with_leading_settings<'a>(url: &'a str, leading: &[ServerSetting]) -> Cow<'a, str> {
-    if leading.is_empty() {
-        return Cow::Borrowed(url);
-    }
-    let settings = leading
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "{OPTIONS_PREFIX}{name}{OPTIONS_SUFFIX}={}ms",
-                value.as_millis()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("&");
-    let (before_fragment, fragment) = match url.split_once('#') {
-        Some((head, fragment)) => (head, Some(fragment)),
-        None => (url, None),
-    };
-    let mut with_settings = match before_fragment.split_once('?') {
-        Some((head, query)) => format!("{head}?{settings}&{query}"),
-        None => format!("{before_fragment}?{settings}"),
-    };
-    if let Some(fragment) = fragment {
-        with_settings.push('#');
-        with_settings.push_str(fragment);
-    }
-    Cow::Owned(with_settings)
 }
 
 /// The parts of a connection URL that decide which settings it states, located as the URL
@@ -740,11 +866,13 @@ mod tests {
     use std::fmt;
     use std::fs;
     use std::io;
-    use std::net::TcpListener;
+    use std::io::{Read as _, Write as _};
+    use std::net::{Shutdown, TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex, PoisonError, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -756,8 +884,9 @@ mod tests {
 
     use super::{
         ACQUIRE_TIMEOUT, CONNECT_TIMEOUT, ErrorSummary, HostNotResolved, RECOGNIZED_PARAMETERS,
-        REQUEST_SETTINGS, ServerSetting, UrlError, check_query_parameters, connect,
-        connect_for_requests, connect_options, connect_within, names_server_options, pool_options,
+        REFUSAL_WATCH_TICK, UrlError, check_query_parameters, connect, connect_for_requests,
+        connect_options, connect_within, names_server_options, pool_options, probes, refusal_watch,
+        request_pool_options, server_refuses, socket_path, watch_refusals,
     };
     use crate::config::Config;
     use crate::telemetry::json_layer;
@@ -799,12 +928,6 @@ mod tests {
     /// A `PGOPTIONS` of the ASCII whitespace that the server skips between options, which
     /// therefore names none.
     const BLANK_PGOPTIONS: &str = " \t\x0B ";
-    /// The server options that [`REQUEST_SETTINGS`] become: a 5-second `lock_timeout` and a
-    /// 10-second `statement_timeout`.
-    const REQUEST_DEADLINES: &str = "-c lock_timeout=5000ms -c statement_timeout=10000ms";
-    /// The server settings ahead of the URL's own, for [`connect`] and for
-    /// [`connect_for_requests`].
-    const LEADING: [&[ServerSetting]; 2] = [&[], &REQUEST_SETTINGS];
 
     /// The public entry points, which make the same checks and connect the same way.
     #[derive(Debug, Clone, Copy)]
@@ -857,7 +980,10 @@ mod tests {
         };
         match entry {
             Entry::Connect => logged_while(connect(&config)).await,
-            Entry::ForRequests => logged_while(connect_for_requests(&config)).await,
+            Entry::ForRequests => {
+                let (result, output) = logged_while(connect_for_requests(&config)).await;
+                (result.map(|(pool, _refusals)| pool), output)
+            }
         }
     }
 
@@ -957,7 +1083,7 @@ mod tests {
 
     /// Asserts, for URLs that state some settings in the authority, some as query parameters and
     /// omit others, that every setting comes from the URL or from the explicit default, whatever
-    /// the libpq environment holds, with or without the request settings ahead of the URL's.
+    /// the libpq environment holds.
     fn assert_settings_come_from_the_url() {
         let settings = |host, port, user, database, ssl_mode, application_name| Settings {
             host,
@@ -1009,15 +1135,12 @@ mod tests {
             ),
         ];
         for (url, expected) in cases {
-            for leading in LEADING {
-                let options = connect_options(url, leading)
-                    .unwrap_or_else(|reason| panic!("{url}: {reason}"));
-                assert_eq!(Settings::of(&options), expected, "{url} {leading:?}");
-                // `Debug` shows every option, the password and the certificate paths included.
-                let every_option = format!("{options:?}");
-                for (variable, value) in LIBPQ_ENVIRONMENT.into_iter().chain([PGPASSWORD]) {
-                    assert!(!every_option.contains(value), "{url}: {variable} was read");
-                }
+            let options = connect_options(url).unwrap_or_else(|reason| panic!("{url}: {reason}"));
+            assert_eq!(Settings::of(&options), expected, "{url}");
+            // `Debug` shows every option, the password and the certificate paths included.
+            let every_option = format!("{options:?}");
+            for (variable, value) in LIBPQ_ENVIRONMENT.into_iter().chain([PGPASSWORD]) {
+                assert!(!every_option.contains(value), "{url}: {variable} was read");
             }
         }
     }
@@ -1426,11 +1549,13 @@ mod tests {
         assert_settings_come_from_the_url();
     }
 
-    /// The request settings precede every server option the URL names, in either form, so the
-    /// URL's own `lock_timeout` or `statement_timeout` is the one the server applies last; the
-    /// URL's other settings are those it gives without the request settings.
+    /// The sessions of [`connect`] and of [`connect_for_requests`], which both build their
+    /// options here, carry exactly the server options the URL names, in either form and in its
+    /// order, and none when it names none: no `lock_timeout` or `statement_timeout` is added, so
+    /// a row lock wait lasts until its holder ends (COACTUPC-101, COBIL00C-013), and the URL's
+    /// own setting reaches the server unchanged.
     #[test]
-    fn request_sessions_carry_the_deadlines_ahead_of_the_urls_own() {
+    fn server_options_are_exactly_the_urls_own() {
         let cases = [
             ("", None),
             ("?", None),
@@ -1453,16 +1578,8 @@ mod tests {
         ];
         for (suffix, own) in cases {
             let url = format!("postgres://carddemo:{SECRET}@db.local:6543/carddemo{suffix}");
-            let plain = connect_options(&url, &[]).unwrap_or_else(|reason| panic!("{reason}"));
-            let request = connect_options(&url, &REQUEST_SETTINGS)
-                .unwrap_or_else(|reason| panic!("{reason}"));
-            assert_eq!(plain.get_options(), own, "{suffix}");
-            let expected = own.map_or_else(
-                || REQUEST_DEADLINES.to_owned(),
-                |own| format!("{REQUEST_DEADLINES} {own}"),
-            );
-            assert_eq!(request.get_options(), Some(expected.as_str()), "{suffix}");
-            assert_eq!(Settings::of(&request), Settings::of(&plain), "{suffix}");
+            let options = connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"));
+            assert_eq!(options.get_options(), own, "{suffix}");
         }
     }
 
@@ -1590,15 +1707,9 @@ mod tests {
             }
             "pgoptions-blank" => {
                 let url = format!("postgres://carddemo:{SECRET}@127.0.0.1/carddemo");
-                let options =
-                    connect_options(&url, &[]).unwrap_or_else(|reason| panic!("{reason}"));
+                let options = connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"));
                 // Only the whitespace, which the server skips, reaches it as server options.
                 assert_eq!(options.get_options(), Some(BLANK_PGOPTIONS));
-                // The request settings follow that whitespace.
-                let request = connect_options(&url, &REQUEST_SETTINGS)
-                    .unwrap_or_else(|reason| panic!("{reason}"));
-                let expected = format!("{BLANK_PGOPTIONS} {REQUEST_DEADLINES}");
-                assert_eq!(request.get_options(), Some(expected.as_str()));
             }
             other => panic!("unknown child mode {other}"),
         }
@@ -1612,17 +1723,14 @@ mod tests {
             .and_then(|listener| listener.local_addr())
             .expect("a free local port")
             .port();
-        // This peer accepts and never answers, reading until the client goes away, once for the
-        // sessions of each entry point.
+        // This peer accepts once and never answers, reading until the client goes away.
         let silent = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
         let silent_port = silent.local_addr().expect("listener address").port();
         let peer = thread::spawn(move || {
-            LEADING.iter().try_for_each(|_| {
-                silent
-                    .accept()
-                    .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
-                    .map(drop)
-            })
+            silent
+                .accept()
+                .and_then(|(mut stream, _)| io::copy(&mut stream, &mut io::sink()))
+                .map(drop)
         });
         let cases = [
             (
@@ -1641,24 +1749,22 @@ mod tests {
                 "io (timed out)",
             ),
         ];
-        for ((url, timeout, expected), leading) in cases
-            .iter()
-            .flat_map(|case| LEADING.map(|leading| (case, leading)))
-        {
+        for (url, timeout, expected) in &cases {
             let config = Config {
                 database_url: url.clone(),
                 ..Config::default()
             };
             let started = Instant::now();
-            let (result, output) = logged_while(connect_within(&config, leading, *timeout)).await;
+            let (result, output) =
+                logged_while(connect_within(&config, *timeout, pool_options())).await;
             let elapsed = started.elapsed();
             let error = match result {
                 Err(error @ sqlx::Error::Io(_)) => error,
-                Err(other) => panic!("expected {expected} with {leading:?}, got {other}"),
+                Err(other) => panic!("expected {expected}, got {other}"),
                 Ok(_) => panic!("an unreachable server must not yield a pool ({expected})"),
             };
             let summary = ErrorSummary::from(&error).to_string();
-            assert_eq!(summary, *expected, "{leading:?}");
+            assert_eq!(summary, *expected);
             // Reported by the first connection, not after the pool's acquire timeout.
             assert!(elapsed < CONNECT_TIMEOUT / 2, "{expected} took {elapsed:?}");
             for text in [error.to_string(), format!("{error:?}"), summary, output] {
@@ -1679,34 +1785,373 @@ mod tests {
             .expect("a current-thread runtime builds")
     }
 
-    /// A pool that finds no idle connection and a server that refuses every new one, as during
-    /// an outage, gives up after [`ACQUIRE_TIMEOUT`] rather than the 30 seconds of `sqlx`.
+    /// A local port nothing listens on: that of a listener bound and dropped at once.
+    fn refused_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a free local port")
+            .port()
+    }
+
+    /// The connect options of a URL naming `port` on the IPv4 loopback address.
+    fn loopback_options(port: u16) -> PgConnectOptions {
+        let url = format!("postgres://carddemo:{SECRET}@127.0.0.1:{port}/carddemo");
+        connect_options(&url).unwrap_or_else(|reason| panic!("{reason}"))
+    }
+
+    /// A pool opened as [`connect_for_requests`] opens its own, connecting lazily to `port` on
+    /// the IPv4 loopback address, and the count of the server's answers its hooks keep.
+    fn lazy_request_pool(port: u16) -> (PgPool, Arc<AtomicU64>) {
+        let answers = Arc::new(AtomicU64::new(0));
+        let pool = request_pool_options(&answers).connect_lazy_with(loopback_options(port));
+        (pool, answers)
+    }
+
+    /// `AuthenticationOk`: the server accepts a startup without authentication.
+    const AUTHENTICATION_OK: [u8; 9] = [b'R', 0, 0, 0, 8, 0, 0, 0, 0];
+    /// `ReadyForQuery`, with the session idle: the server's answer to a `Sync`, which is how a
+    /// pool pings a connection, and the end of a startup.
+    const READY_FOR_QUERY: [u8; 6] = [b'Z', 0, 0, 0, 5, b'I'];
+
+    /// Reads the rest of a protocol message whose length, itself included, is `length`.
+    fn skip_message_body(stream: &mut TcpStream, length: [u8; 4]) -> io::Result<()> {
+        let body = u64::from(u32::from_be_bytes(length).saturating_sub(4));
+        io::copy(&mut stream.take(body), &mut io::sink()).map(drop)
+    }
+
+    /// A stand-in for a `PostgreSQL` server, on a port of the IPv4 loopback address, which
+    /// accepts one connection and then nothing listens on the port, so every later connection
+    /// is refused. It accepts that connection's startup without authentication and answers each
+    /// `Sync` with [`READY_FOR_QUERY`] until the client sends `Terminate` or the connection
+    /// ends. Returned: the port, a receiver of the server's end of the connection once it is
+    /// accepted, which a test shuts down to break the connection, and the server's thread.
+    fn one_connection_server() -> (
+        u16,
+        mpsc::Receiver<TcpStream>,
+        thread::JoinHandle<io::Result<()>>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let (sender, accepted) = mpsc::channel();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept()?;
+            drop(listener);
+            sender.send(stream.try_clone()?).map_err(io::Error::other)?;
+            let mut length = [0; 4];
+            stream.read_exact(&mut length)?;
+            skip_message_body(&mut stream, length)?;
+            stream.write_all(&AUTHENTICATION_OK)?;
+            stream.write_all(&READY_FOR_QUERY)?;
+            loop {
+                let mut header = [0; 5];
+                match stream.read_exact(&mut header) {
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    read => read?,
+                }
+                let [kind, length @ ..] = header;
+                skip_message_body(&mut stream, length)?;
+                match kind {
+                    b'S' => stream.write_all(&READY_FOR_QUERY)?,
+                    b'X' => return Ok(()),
+                    other => return Err(io::Error::other(format!("unexpected message {other}"))),
+                }
+            }
+        });
+        (port, accepted, server)
+    }
+
+    /// Whether `condition` holds within `within`, tested every 10 milliseconds.
+    async fn eventually(within: Duration, condition: impl Fn() -> bool) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            if condition() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A pool that finds no idle connection gives up after [`ACQUIRE_TIMEOUT`] rather than the
+    /// 30 seconds of `sqlx`, whether the server refuses every new connection, as during an
+    /// outage, or accepts them and never answers, as a busy server does. The refusal watch
+    /// shortens neither wait: it reports the refusing server, which `carddemo-api`'s store then
+    /// fails at once for the callers that follow, and never the server that accepts.
     #[test]
     fn a_pool_waits_for_a_connection_no_longer_than_the_acquire_timeout() {
         current_thread().block_on(async {
             assert_eq!(ACQUIRE_TIMEOUT, Duration::from_secs(5));
             assert_eq!(CONNECT_TIMEOUT, ACQUIRE_TIMEOUT);
-            let refused_port = TcpListener::bind("127.0.0.1:0")
-                .and_then(|listener| listener.local_addr())
-                .expect("a free local port")
-                .port();
-            let url = format!("postgres://carddemo:{SECRET}@127.0.0.1:{refused_port}/carddemo");
-            let options = connect_options(&url, &REQUEST_SETTINGS)
-                .unwrap_or_else(|reason| panic!("{reason}"));
-            let pool = pool_options().connect_lazy_with(options);
-            assert_eq!(pool.options().get_acquire_timeout(), ACQUIRE_TIMEOUT);
-            let started = Instant::now();
-            let acquired = pool.acquire().await;
-            let waited = started.elapsed();
+            // Accepted by the kernel into the listener's backlog, and never answered.
+            let silent = TcpListener::bind("127.0.0.1:0").expect("bind a local listener");
+            let silent_port = silent.local_addr().expect("listener address").port();
+            let mut waits = Vec::new();
+            for (port, refusing) in [(refused_port(), true), (silent_port, false)] {
+                let (pool, answers) = lazy_request_pool(port);
+                assert_eq!(pool.options().get_acquire_timeout(), ACQUIRE_TIMEOUT);
+                let refusals = watch_refusals(&pool, answers);
+                let acquire = tokio::spawn(async move {
+                    let started = Instant::now();
+                    let acquired = pool.acquire().await.map(drop);
+                    (acquired, started.elapsed())
+                });
+                waits.push((acquire, refusals, refusing));
+            }
+            for (acquire, refusals, refusing) in waits {
+                let (acquired, waited) = acquire.await.expect("the acquire task ends");
+                assert!(
+                    matches!(acquired, Err(sqlx::Error::PoolTimedOut)),
+                    "expected the pool to time out, got {acquired:?}"
+                );
+                assert!(
+                    ACQUIRE_TIMEOUT <= waited && waited < ACQUIRE_TIMEOUT * 2,
+                    "the pool waited {waited:?}"
+                );
+                assert_eq!(refusals.server_refusing(), refusing);
+            }
+            drop(silent);
+        });
+    }
+
+    /// The refusal watch of a request pool opens nothing while the pool is idle, reports the
+    /// server refusing once a caller waits for a connection the port refuses, keeps opening
+    /// connections while that report stands, though no caller waits any more, and reports the
+    /// server back once the port accepts one.
+    #[test]
+    fn the_refusal_watch_follows_the_servers_port() {
+        current_thread().block_on(async {
+            let port = refused_port();
+            let (pool, answers) = lazy_request_pool(port);
+            let refusals = watch_refusals(&pool, answers);
+            let report = refusals.clone();
+            // Any connection the watch opened would have been refused.
+            tokio::time::sleep(REFUSAL_WATCH_TICK * 3).await;
+            assert!(!report.server_refusing(), "an idle pool was watched");
+
+            let waiting = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire().await.map(drop) }
+            });
             assert!(
-                matches!(acquired, Err(sqlx::Error::PoolTimedOut)),
-                "expected the pool to time out, got {:?}",
-                acquired.map(drop)
+                eventually(REFUSAL_WATCH_TICK * 10, || report.server_refusing()).await,
+                "a refused connection was not reported"
             );
+            waiting.abort();
+            let aborted = waiting.await;
+            assert!(aborted.is_err_and(|error| error.is_cancelled()));
+            assert!(eventually(REFUSAL_WATCH_TICK * 10, || pool.size() == 0).await);
             assert!(
-                ACQUIRE_TIMEOUT <= waited && waited < ACQUIRE_TIMEOUT * 2,
-                "the pool waited {waited:?}"
+                refusals.server_refusing(),
+                "the report fell without an accepted connection"
             );
+
+            let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind the refused port");
+            assert!(
+                eventually(REFUSAL_WATCH_TICK * 10, || !report.server_refusing()).await,
+                "an accepted connection was not reported"
+            );
+            drop(listener);
+            pool.close().await;
+        });
+    }
+
+    /// The refusal watch returns once its pool is closed or no handle of its report remains, so
+    /// a spawned watch lets its report go.
+    #[test]
+    fn the_refusal_watch_ends_with_its_pool_or_its_last_handle() {
+        current_thread().block_on(async {
+            let bound = REFUSAL_WATCH_TICK * 5;
+            let report = Arc::new(AtomicBool::new(false));
+            let (pool, answers) = lazy_request_pool(refused_port());
+            let watch = refusal_watch(pool, answers, Arc::downgrade(&report));
+            drop(report);
+            assert!(
+                tokio::time::timeout(bound, watch).await.is_ok(),
+                "no handle"
+            );
+
+            let (closed, answers) = lazy_request_pool(refused_port());
+            closed.close().await;
+            let report = Arc::new(AtomicBool::new(false));
+            let watch = refusal_watch(closed, answers, Arc::downgrade(&report));
+            assert!(tokio::time::timeout(bound, watch).await.is_ok(), "closed");
+
+            let (pool, answers) = lazy_request_pool(refused_port());
+            let refusals = watch_refusals(&pool, answers);
+            assert_eq!(Arc::weak_count(&refusals.refusing), 1);
+            pool.close().await;
+            assert!(eventually(bound, || Arc::weak_count(&refusals.refusing) == 0).await);
+            assert!(!refusals.server_refusing());
+        });
+    }
+
+    /// The decision of each tick of the refusal watch: a probe on every tick while the server
+    /// is reported refusing, and otherwise only while some connection is in use or being
+    /// opened with no answer from the server since the previous tick. An idle pool, an empty
+    /// one and one whose callers keep getting answered connections are not probed; an idle
+    /// count above the size, as a read racing the pool can give, leaves none in use.
+    #[test]
+    fn the_refusal_watch_probes_when_a_caller_may_wait_unanswered() {
+        let cases = [
+            // (refusing, size, idle, answered, probes)
+            (false, 0, 0, false, false),
+            (false, 2, 2, false, false),
+            (false, 10, 10, true, false),
+            (false, 1, 0, true, false),
+            (false, 3, 1, true, false),
+            (false, 1, 2, false, false),
+            (false, u32::MAX, usize::MAX, false, false),
+            (false, 1, 0, false, true),
+            (false, 4, 3, false, true),
+            (false, 10, 0, false, true),
+            (false, u32::MAX, 0, false, true),
+            (true, 0, 0, false, true),
+            (true, 0, 0, true, true),
+            (true, 2, 2, false, true),
+            (true, 3, 1, true, true),
+        ];
+        for (refusing, size, idle, answered, expected) in cases {
+            assert_eq!(
+                probes(refusing, size, idle, answered),
+                expected,
+                "refusing {refusing}, size {size}, idle {idle}, answered {answered}"
+            );
+        }
+    }
+
+    /// The refusal watch sends nothing while the server answers the pool, though a caller waits
+    /// for a connection the port refuses, and finds the port refusing once the answers stop.
+    #[test]
+    fn the_refusal_watch_probes_only_once_the_answers_stop() {
+        current_thread().block_on(async {
+            let (pool, answers) = lazy_request_pool(refused_port());
+            let refusals = watch_refusals(&pool, Arc::clone(&answers));
+            let waiting = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire().await.map(drop) }
+            });
+            // Five answers a tick, for ten ticks: well within the waiting caller's timeout.
+            for _ in 0..50 {
+                answers.fetch_add(1, Ordering::AcqRel);
+                tokio::time::sleep(REFUSAL_WATCH_TICK / 5).await;
+                assert!(
+                    !refusals.server_refusing(),
+                    "a pool the server answers was probed"
+                );
+            }
+            assert!(pool.size() > 0 && pool.num_idle() == 0, "no caller waited");
+            assert!(
+                eventually(REFUSAL_WATCH_TICK * 10, || refusals.server_refusing()).await,
+                "the refused port was not reported once the answers stopped"
+            );
+            waiting.abort();
+            assert!(waiting.await.is_err_and(|error| error.is_cancelled()));
+            pool.close().await;
+        });
+    }
+
+    /// The request pool counts one answer of the server for each connection it establishes and
+    /// one for each idle connection it hands out once that connection has answered its ping,
+    /// and none for an idle connection the server has broken, whose ping fails, or for the
+    /// connection the pool then opens in its place and the port refuses.
+    #[test]
+    fn the_request_pool_counts_the_servers_answers() {
+        current_thread().block_on(async {
+            let (port, accepted, server) = one_connection_server();
+            let answers = Arc::new(AtomicU64::new(0));
+            let pool = request_pool_options(&answers)
+                .acquire_timeout(REFUSAL_WATCH_TICK * 5)
+                .connect_lazy_with(loopback_options(port));
+            assert!(pool.options().get_test_before_acquire());
+            let bound = REFUSAL_WATCH_TICK * 10;
+
+            let established = pool
+                .acquire()
+                .await
+                .expect("the server accepts a connection");
+            assert_eq!(
+                answers.load(Ordering::Acquire),
+                1,
+                "an established connection"
+            );
+            drop(established);
+            assert!(eventually(bound, || pool.num_idle() == 1).await);
+            let reused = pool.acquire().await.expect("the idle connection answers");
+            assert_eq!(answers.load(Ordering::Acquire), 2, "an answered ping");
+            drop(reused);
+            assert!(eventually(bound, || pool.num_idle() == 1).await);
+
+            accepted
+                .try_recv()
+                .expect("the server accepted the connection")
+                .shutdown(Shutdown::Both)
+                .expect("the server breaks the connection");
+            let broken = pool.acquire().await.map(drop);
+            assert!(
+                matches!(broken, Err(sqlx::Error::PoolTimedOut)),
+                "expected the pool to time out, got {broken:?}"
+            );
+            assert_eq!(
+                answers.load(Ordering::Acquire),
+                2,
+                "a failed ping or a refusal"
+            );
+            pool.close().await;
+            server
+                .join()
+                .expect("the server thread ends")
+                .expect("the server spoke the protocol");
+        });
+    }
+
+    /// The watch connects where `sqlx` would: to `.s.PGSQL.<port>` in a socket directory named
+    /// by the URL's host or `host` parameter, or held as the host of the options, and otherwise
+    /// over TCP.
+    #[test]
+    fn the_refusal_watch_connects_where_sqlx_connects() {
+        let from_url = |url: &str| connect_options(url).unwrap_or_else(|reason| panic!("{reason}"));
+        let cases = [
+            (from_url("postgres://u:pw@127.0.0.1:6543/db"), None),
+            (from_url("postgres://u:pw@[::1]:6543/db"), None),
+            (
+                from_url("postgres://u:pw@%2Fvar%2Frun%2Fpostgresql/db"),
+                Some("/var/run/postgresql/.s.PGSQL.5432"),
+            ),
+            (
+                from_url("postgres://u:pw@localhost:6543/db?host=/run/pg"),
+                Some("/run/pg/.s.PGSQL.6543"),
+            ),
+            (
+                PgConnectOptions::new_without_pgpass()
+                    .host("/tmp/pg")
+                    .port(5433),
+                Some("/tmp/pg/.s.PGSQL.5433"),
+            ),
+        ];
+        for (options, expected) in cases {
+            assert_eq!(
+                socket_path(&options),
+                expected.map(PathBuf::from),
+                "{expected:?}"
+            );
+        }
+    }
+
+    /// A connection that is neither refused nor accepted, to a missing socket file or a host
+    /// that does not resolve, leaves the report as it was.
+    #[test]
+    fn a_probe_neither_refused_nor_accepted_reports_nothing() {
+        current_thread().block_on(async {
+            let urls = [
+                "postgres://u:pw@localhost/db?host=/nonexistent-carddemo-socket-directory",
+                "postgres://u:pw@no-such-host.invalid/db",
+            ];
+            for url in urls {
+                let options = connect_options(url).unwrap_or_else(|reason| panic!("{reason}"));
+                assert_eq!(server_refuses(&options).await, None, "{url}");
+            }
         });
     }
 }

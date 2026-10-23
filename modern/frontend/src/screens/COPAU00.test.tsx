@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, configure, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import type { ComponentType } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -7,6 +8,7 @@ import {
   RouterProvider,
   Routes,
   useLocation,
+  type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
@@ -398,7 +400,7 @@ function expectLocked(busy: boolean): void {
   expect(
     labels.map((label) => [
       label,
-      screen.getByRole("button", { name: label }).hasAttribute("disabled"),
+      screen.getByRole("button", { name: label }).getAttribute("aria-disabled") === "true",
     ]),
   ).toEqual(labels.map((label) => [label, busy]));
   const group = screen.getByRole("group", { name: "Function keys" });
@@ -1901,3 +1903,97 @@ describe("COPAU00 in the route table: a 401 ends the session", () => {
     },
   );
 });
+
+/**
+ * A route `lazy` that stays loading until `load` is called, as a screen's module does on a slow
+ * network, then renders `Component`.
+ */
+function slowRoute(Component: ComponentType): {
+  readonly lazy: () => Promise<{ Component: ComponentType }>;
+  readonly load: () => void;
+} {
+  let resolveModule: () => void = () => undefined;
+  const loaded = new Promise<{ Component: ComponentType }>((resolve) => {
+    resolveModule = () => {
+      resolve({ Component });
+    };
+  });
+  return {
+    lazy: () => loaded,
+    load: () => {
+      resolveModule();
+    },
+  };
+}
+
+// An `S` selection leaves the list on screen until COPAU01's module has loaded. The lock ENTER
+// took holds through that wait, as the terminal keyboard stays locked until the next program
+// sends its map, so no key pages the account or selects again meanwhile. The screen sits in a
+// data router without the application's root element, so only the screen's own lock acts.
+describe("COPAU00 while the authorization detail loads", () => {
+  it("after S on row 2 and ENTER the keyboard stays locked: F8, F7, F3 and a second selection do nothing, and COPAU01 opens with row 2 once loaded", async () => {
+    const sent = stubFetch(json(200, PAGE_1), json(200, PAGE_2));
+    const slow = slowRoute(() => <TransferStub name="Authorization Details" />);
+    const screens: RouteObject[] = [
+      { path: PATHS.COPAU00, element: <COPAU00 /> },
+      { path: PATHS.COPAU01, lazy: slow.lazy },
+      { path: PATHS.COMEN01, element: <TransferStub name="Main Menu" /> },
+    ];
+    const router = createMemoryRouter(screens, { initialEntries: [PATHS.COPAU00] });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    enter(ACCOUNT);
+    await answered(sent, 1);
+
+    typeInto(selector(2), "S");
+    press("ENTER=Continue");
+    await waitFor(() => {
+      expect(router.state.navigation.state).toBe("loading");
+      expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("true");
+    });
+    expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+      "true",
+    );
+    for (const field of [accountField(), ...[1, 2, 3, 4, 5].map(selector)]) {
+      expect(field).toHaveProperty("readOnly", true);
+    }
+
+    // The keys of the slow-network report: F8 and F7 would page, F3 would leave, F2 would show
+    // the invalid-key message, and a second selection with ENTER would submit again.
+    press("F8=Forward");
+    press("F7=Backward");
+    press("F3=Back");
+    for (const key of ["F8", "F7", "F3", "F2", "Enter"]) {
+      fireEvent.keyDown(window, { key });
+    }
+    typeInto(selector(3), "S");
+    press("ENTER=Continue");
+    // Inside `waitFor`, so the form-state updates the refused keys cause render where React
+    // expects them.
+    await waitFor(async () => {
+      await idle();
+    });
+
+    expect(sent).toHaveLength(1);
+    expect(router.state.location.pathname).toBe(PATHS.COPAU00);
+    expect(errorText()).toBe("");
+
+    slow.load();
+    await screen.findByRole("region", { name: "Authorization Details" });
+    expect(router.state.location.pathname).toBe(PATHS.COPAU01);
+    expect(transferState("Authorization Details")).toEqual({
+      from: PATHS.COPAU00,
+      acct_id: ACCOUNT,
+      auth_key: authKey(2),
+    });
+    expect(sent).toHaveLength(1);
+    router.dispose();
+  });
+});
+

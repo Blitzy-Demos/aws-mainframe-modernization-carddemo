@@ -21,10 +21,13 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` with the program's message: 400 when the account number fails its edit, 401
-         *     without a valid bearer token, 404 when the cross-reference, the account or the customer is not
-         *     found, and 500 when a read fails. A segment that is not UTF-8 once percent-decoded is a 400
-         *     with the API's `Invalid path parameters...` and no field, before the program's edit.
+         *     The program's message: a `ScreenError` with 400 when the account number fails its edit and
+         *     401 without a valid bearer token; an `AccountUpdateViewError` with 404 when the
+         *     cross-reference, the account or the customer is not found, and 500 when a read fails. When
+         *     the account read did not succeed and the customer was found, that body also carries state
+         *     `S` and the details to show with their snapshot, the account values a placeholder. A segment
+         *     that is not UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...`
+         *     and no field, before the program's edit.
          */
         get: operations["coactupc_fetch"];
         /**
@@ -103,11 +106,14 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` with the program's message and the field `acct_id`: 400 when the account
-         *     number is missing, not numeric or all zeros; 404 when the cross-reference, the account or
-         *     the customer record is not found; 500 when one of those reads fails. 401 when the request
-         *     carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a 400
-         *     with the API's `Invalid path parameters...` and no field, before the program's edit.
+         *     The program's message and, when the account number is in error, the field `acct_id`: a
+         *     `ScreenError` with 400 when the account number is missing, not numeric or all zeros; an
+         *     `AccountViewError` with 404 when the cross-reference, the account or the customer record is
+         *     not found, and 500 when one of those reads fails. Beside the message it carries the account
+         *     block when the account was found and the customer was not, and both blocks when the customer
+         *     was found and the account was not, the account values then a placeholder. 401 when the
+         *     request carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a
+         *     400 with the API's `Invalid path parameters...` and no field, before the program's edit.
          */
         get: operations["coactvwc_view"];
         put?: never;
@@ -462,6 +468,8 @@ export interface paths {
          *       character no screen field carries, or the user ID or the password is blank.
          *     - 401: no user has the user ID, or the password does not match the stored one.
          *     - 500: the user could not be read or verified, or the token could not be issued.
+         *     - 503, with `Retry-After` in seconds: the server's password verification was saturated, so
+         *       the credentials were not checked; the same request may be sent again after that delay.
          */
         post: operations["cosgn00c_signon"];
         delete?: never;
@@ -759,7 +767,9 @@ export interface paths {
          *     - 400 for a body that does not deserialise or a value its map field cannot hold, then for
          *       the first empty field, and for a user ID already stored, `User ID already exist...`
          *       (COUSR01C-010 to COUSR01C-014, COUSR01C-023);
-         *     - 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024).
+         *     - 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024);
+         *     - 503, with `Retry-After` in seconds, when the server's password hashing is saturated, so
+         *       nothing was stored; the same request may be sent again after that delay.
          */
         post: operations["cousr01c_add"];
         delete?: never;
@@ -810,6 +820,8 @@ export interface paths {
          *     - 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.
          *     - 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when
          *       the read, the password check or the rewrite fails.
+         *     - 503, with `Retry-After` in seconds, when the server's password checking is saturated, so
+         *       nothing was rewritten; the same request may be sent again after that delay.
          */
         put: operations["cousr02c_update"];
         post?: never;
@@ -870,8 +882,9 @@ export interface components {
             current_cycle_debit: string;
         };
         /**
-         * @description The raw text of every enterable map field of an endpoint 6 request, at most its map
-         *     `LENGTH`.
+         * @description The raw text of every enterable map field of an endpoint 6 request, each fitting its map
+         *     field's `PIC X(n)` byte for byte: at most its map `LENGTH` in bytes, each printable ASCII
+         *     (`0x20`–`0x7E`), or the field's `LOW-VALUES` (X-COUSR01C-3).
          *
          *     An absent member is the empty text, which the program reads as blank. The account number is
          *     the path's `acct_id`. The SSN parts are present only when the operator re-entered them:
@@ -1344,42 +1357,40 @@ export interface components {
             zip: string;
         };
         /**
-         * @description The account view of endpoint 4 (CAVW, COACTVWC): the account and customer blocks of map
-         *     `CACTVWA` after all three reads found their record (COACTVWC-008).
+         * @description The body of an endpoint 5 error: the `ScreenError` of the message and, when the account read
+         *     did not succeed and the customer read found the customer, the state `S` and the details the
+         *     screen then shows with its fields enterable (COACTUPC-099).
          *
-         *     Text fields hold every byte of their map field, trailing spaces included: the stored value
-         *     unchanged, or its first characters where the map field is narrower (ZIP code and phone
-         *     numbers). Numeric identifiers hold their digits with the leading zeros, and amounts the
-         *     15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number.
-         *     Dates are typed, `null` for a blank field. The SSN is only ever its redacted form.
+         *     Serialised as `{"message": …, "field": …, "state": …, "details": …}`, each of the last three
+         *     omitted when absent. Every other failure of the fetch leaves the state not fetched and shows
+         *     no value (COACTUPC-068, COACTUPC-095, COACTUPC-097), so its body is exactly its
+         *     `ScreenError`. The status is the `ScreenError`'s and travels as the response status only.
          */
-        AccountViewResponse: {
+        AccountUpdateViewError: components["schemas"]["ScreenError"] & {
+            details?: null | components["schemas"]["AccountUpdateView"];
             /**
-             * @description The account number every read used: eleven digits, leading zeros included
-             *     (COACTVWC-032).
+             * @description `ACUP-CHANGE-ACTION` after the response: `S`, present only beside `details`
+             *     (COACTUPC-099).
+             * @example S
              */
-            acct_id: string;
+            state?: string | null;
+        };
+        /**
+         * @description The account block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from
+         *     `ACCOUNT-RECORD` (COACTVWC-010 to COACTVWC-015): part of every [`AccountViewResponse`], and of
+         *     an [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008).
+         */
+        AccountViewAccountBlock: {
             /**
              * @description `ACCT-ACTIVE-STATUS`, the one-character active flag of `ACSTTUS` (COACTVWC-010,
              *     COACTVW-016).
              */
             active_status: string;
-            /** @description `CUST-ADDR-LINE-1`, the 50-character `ACSADL1` field (COACTVWC-021, COACTVW-067). */
-            address_line_1: string;
-            /** @description `CUST-ADDR-LINE-2`, the 50-character `ACSADL2` field (COACTVWC-021, COACTVW-072). */
-            address_line_2: string;
             /**
              * @description `ACCT-CASH-CREDIT-LIMIT` as the 15-character `ACSHLIM` field edits it (COACTVWC-012,
              *     COACTVW-028).
              */
             cash_credit_limit: string;
-            /**
-             * @description `CUST-ADDR-LINE-3`, the 50-character field the map labels `City` (COACTVWC-021,
-             *     COACTVW-078).
-             */
-            city: string;
-            /** @description `CUST-ADDR-COUNTRY-CD`, the 3-character `ACSCTRY` field (COACTVWC-022, COACTVW-081). */
-            country: string;
             /**
              * @description `ACCT-CREDIT-LIMIT` as the 15-character `ACRDLIM` field edits it (COACTVWC-012,
              *     COACTVW-022).
@@ -1400,6 +1411,42 @@ export interface components {
              *     COACTVW-043).
              */
             current_cycle_debit: string;
+            /**
+             * Format: date
+             * @description `ACCT-EXPIRAION-DATE`, shown in `AEXPDT`; `null` when blank (COACTVWC-014, COACTVW-025).
+             */
+            expiration_date?: string | null;
+            /** @description `ACCT-GROUP-ID`, the 10-character `AADDGRP` field (COACTVWC-015, COACTVW-040). */
+            group_id: string;
+            /**
+             * Format: date
+             * @description `ACCT-OPEN-DATE`, shown in `ADTOPEN`; `null` when blank (COACTVWC-014, COACTVW-019).
+             */
+            open_date?: string | null;
+            /**
+             * Format: date
+             * @description `ACCT-REISSUE-DATE`, shown in `AREISDT`; `null` when blank (COACTVWC-014, COACTVW-031).
+             */
+            reissue_date?: string | null;
+        };
+        /**
+         * @description The customer block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from
+         *     `CUSTOMER-RECORD` (COACTVWC-016 to COACTVWC-026): part of every [`AccountViewResponse`], and
+         *     of an [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008). The SSN
+         *     is only ever its redacted form.
+         */
+        AccountViewCustomerBlock: {
+            /** @description `CUST-ADDR-LINE-1`, the 50-character `ACSADL1` field (COACTVWC-021, COACTVW-067). */
+            address_line_1: string;
+            /** @description `CUST-ADDR-LINE-2`, the 50-character `ACSADL2` field (COACTVWC-021, COACTVW-072). */
+            address_line_2: string;
+            /**
+             * @description `CUST-ADDR-LINE-3`, the 50-character field the map labels `City` (COACTVWC-021,
+             *     COACTVW-078).
+             */
+            city: string;
+            /** @description `CUST-ADDR-COUNTRY-CD`, the 3-character `ACSCTRY` field (COACTVWC-022, COACTVW-081). */
+            country: string;
             /** @description `CUST-ID`: nine digits, leading zeros included (COACTVWC-016, COACTVW-047). */
             customer_id: string;
             /**
@@ -1410,11 +1457,6 @@ export interface components {
             /** @description `CUST-EFT-ACCOUNT-ID`, the 10-character `ACSEFTC` field (COACTVWC-025, COACTVW-091). */
             eft_account_id: string;
             /**
-             * Format: date
-             * @description `ACCT-EXPIRAION-DATE`, shown in `AEXPDT`; `null` when blank (COACTVWC-014, COACTVW-025).
-             */
-            expiration_date?: string | null;
-            /**
              * @description `CUST-FICO-CREDIT-SCORE`: three digits, leading zeros included (COACTVWC-018,
              *     COACTVW-056).
              */
@@ -1423,17 +1465,10 @@ export interface components {
             first_name: string;
             /** @description `CUST-GOVT-ISSUED-ID`, the 20-character `ACSGOVT` field (COACTVWC-025, COACTVW-086). */
             government_id: string;
-            /** @description `ACCT-GROUP-ID`, the 10-character `AADDGRP` field (COACTVWC-015, COACTVW-040). */
-            group_id: string;
             /** @description `CUST-LAST-NAME`, the 25-character `ACSLNAM` field (COACTVWC-020, COACTVW-065). */
             last_name: string;
             /** @description `CUST-MIDDLE-NAME`, the 25-character `ACSMNAM` field (COACTVWC-020, COACTVW-063). */
             middle_name: string;
-            /**
-             * Format: date
-             * @description `ACCT-OPEN-DATE`, shown in `ADTOPEN`; `null` when blank (COACTVWC-014, COACTVW-019).
-             */
-            open_date?: string | null;
             /**
              * @description `CUST-PHONE-NUM-1`: the first 13 characters only, as `ACSPHN1` holds them
              *     (COACTVWC-024, COACTVW-084).
@@ -1450,11 +1485,6 @@ export interface components {
              */
             primary_card_holder: string;
             /**
-             * Format: date
-             * @description `ACCT-REISSUE-DATE`, shown in `AREISDT`; `null` when blank (COACTVWC-014, COACTVW-031).
-             */
-            reissue_date?: string | null;
-            /**
              * @description `CUST-SSN`, redacted: `***-**-` followed by its last four digits, never the full
              *     number (COACTVWC-017, COACTVW-050).
              * @example ***-**-1234
@@ -1467,6 +1497,42 @@ export interface components {
              *     holds them (COACTVWC-023, COACTVW-075).
              */
             zip: string;
+        };
+        /**
+         * @description The body of an endpoint 4 error: the `ScreenError` of the message, and the blocks COACTVWC
+         *     still shows beside it (COACTVWC-008, X-COACTVWC-6).
+         *
+         *     Serialised as `{"message": …, "field": …, "account": …, "customer": …}`, each of the last
+         *     three omitted when absent, so an error without a block is exactly its `ScreenError`. The
+         *     status is the `ScreenError`'s and travels as the response status only.
+         *
+         *     - `account`: after the account read found the account and the customer read did not
+         *       (COACTVWC-044, COACTVWC-046), and after the account read did not succeed and the customer
+         *       read found the customer, when its values are halt candidate X-COACTVWC-H1's placeholder
+         *       (COACTVWC-009).
+         *     - `customer`: only when the customer read found the customer and the account read did not
+         *       succeed (COACTVWC-040, COACTVWC-042).
+         */
+        AccountViewError: components["schemas"]["ScreenError"] & {
+            account?: null | components["schemas"]["AccountViewAccountBlock"];
+            customer?: null | components["schemas"]["AccountViewCustomerBlock"];
+        };
+        /**
+         * @description The account view of endpoint 4 (CAVW, COACTVWC): the account and customer blocks of map
+         *     `CACTVWA` after all three reads found their record (COACTVWC-008).
+         *
+         *     Text fields hold every byte of their map field, trailing spaces included: the stored value
+         *     unchanged, or its first characters where the map field is narrower (ZIP code and phone
+         *     numbers). Numeric identifiers hold their digits with the leading zeros, and amounts the
+         *     15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number.
+         *     Dates are typed, `null` for a blank field. The SSN is only ever its redacted form.
+         */
+        AccountViewResponse: components["schemas"]["AccountViewAccountBlock"] & components["schemas"]["AccountViewCustomerBlock"] & {
+            /**
+             * @description The account number every read used: eleven digits, leading zeros included
+             *     (COACTVWC-032).
+             */
+            acct_id: string;
         };
         /**
          * @description The query of endpoint 22: which key the screen sent (COPAUS1C-003).
@@ -1792,10 +1858,13 @@ export interface components {
         /**
          * @description The two inputs of `COBIL0A`, each the raw text of its map field.
          *
-         *     Only the map `LENGTH` is checked here, the server half of the `both` rows `COBIL00-013` and
-         *     `COBIL00-020` of `modern/audit/screens.md`. An absent member is the empty text, which the
-         *     program's own edit answers with `Acct ID can NOT be empty...` (COBIL00C-007). The values are
-         *     neither trimmed nor upper-cased: COBIL00C reads them as typed.
+         *     Only the map `LENGTH` and the `PIC X(n)` storage of each field are checked here, the server
+         *     half of the `both` rows `COBIL00-013` and `COBIL00-020` of `modern/audit/screens.md`: a
+         *     member that does not fit its field byte for byte as printable ASCII, being longer than the
+         *     field or holding a character outside ASCII or a control byte, is a 400 naming it, with the
+         *     field-length message `FIELD_LENGTH_MESSAGE` (`super::pic_x`, X-COUSR01C-3). An absent member
+         *     is the empty text, which the program's own edit answers with `Acct ID can NOT be empty...`
+         *     (COBIL00C-007). The values are neither trimmed nor upper-cased: COBIL00C reads them as typed.
          * @example {
          *       "acct_id": "00000000001",
          *       "confirm": ""
@@ -1803,13 +1872,15 @@ export interface components {
          */
         BillPaymentRequest: {
             /**
-             * @description `ACTIDIN`, the account ID, at most 11 characters (`COBIL00-013`). Eleven digits name an
-             *     account; a blank value is refused (COBIL00C-007, COBIL00C-008).
+             * @description `ACTIDIN`, `PIC X(11)`, the account ID, at most 11 bytes of printable ASCII
+             *     (`COBIL00-013`). Eleven digits name an account; a blank value is refused (COBIL00C-007,
+             *     COBIL00C-008).
              */
             acct_id?: string;
             /**
-             * @description `CONFIRM`, at most 1 character (`COBIL00-020`): blank shows the balance, `Y` or `y` pays,
-             *     `N` or `n` clears; any other value is refused (COBIL00C-009 to COBIL00C-012).
+             * @description `CONFIRM`, `PIC X(1)`, at most 1 byte of printable ASCII (`COBIL00-020`): blank shows the
+             *     balance, `Y` or `y` pays, `N` or `n` clears; any other value is refused (COBIL00C-009 to
+             *     COBIL00C-012).
              */
             confirm?: string;
         };
@@ -2372,13 +2443,15 @@ export interface components {
         };
         /**
          * @description One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide
-         *     ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021).
+         *     ENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021, COADM01C-006 to COADM01C-012).
          * @example {
          *       "admin_only": false,
          *       "installed": true,
+         *       "name": "Account View                       ",
          *       "number": "01",
          *       "program": "COACTVWC",
-         *       "text": "01. Account View                        "
+         *       "text": "01. Account View                        ",
+         *       "user_type": "U"
          *     }
          */
         MenuOptionDto: {
@@ -2393,6 +2466,13 @@ export interface components {
              *     check: `true` for every shipped option (COMEN01C-013, COADM01C-013).
              */
             installed: boolean;
+            /**
+             * @description `CDEMO-MENU-OPT-NAME PIC X(35)` on the main menu and `CDEMO-ADMIN-OPT-NAME PIC X(35)` on
+             *     the admin menu: the option's name as declared, all 35 bytes, trailing spaces included;
+             *     for example `Account View` followed by 23 spaces (COMEN01C-020, COADM01C-006 to
+             *     COADM01C-011).
+             */
+            name: string;
             /**
              * @description `CDEMO-MENU-OPT-NUM PIC 9(02)`: the option's two digits with the leading zero, `01` to
              *     `11` on the main menu and `01` to `06` on the admin menu, the value the screen's
@@ -2420,6 +2500,12 @@ export interface components {
              *     finds no screen (COMEN01C-015, COMEN01C-017, COADM01C-014).
              */
             unavailable_message?: string | null;
+            /**
+             * @description `CDEMO-MENU-OPT-USRTYPE PIC X(01)`: the option's user-type byte as declared, verbatim,
+             *     `U` for all 11 main-menu options (COMEN01C-020). Absent on the admin menu, whose
+             *     `COADM02Y` table has no user-type column (COADM01C-012).
+             */
+            user_type?: string | null;
         };
         /**
          * @description The body of endpoints 2 and 3: the option table in table order and the program's rejection
@@ -2431,9 +2517,11 @@ export interface components {
          *         {
          *           "admin_only": false,
          *           "installed": true,
+         *           "name": "Account View                       ",
          *           "number": "01",
          *           "program": "COACTVWC",
-         *           "text": "01. Account View                        "
+         *           "text": "01. Account View                        ",
+         *           "user_type": "U"
          *         }
          *       ],
          *       "user_type": "U"
@@ -2479,10 +2567,13 @@ export interface components {
          *     The confirmation is read only once the report and its dates are set (CORPT00C-030 to
          *     CORPT00C-033).
          *
-         *     A member longer than its map field is a 400 naming it, with the field-length message
-         *     `FIELD_LENGTH_MESSAGE`. A date part holding a character other than a digit, unless every
-         *     character is a space, is a 400 naming it, with the digits-only message
-         *     `FIELD_NUMERIC_MESSAGE` (X-CORPT00C-5).
+         *     A member that does not fit its `PIC X(n)` map field byte for byte as printable ASCII, being
+         *     longer than the field or holding a character outside ASCII or a control byte, is a 400 naming
+         *     it, with the field-length message `FIELD_LENGTH_MESSAGE` (X-COUSR01C-3). A date part that
+         *     fits, but holds a character other than a digit apart from spaces before and after the
+         *     digits, is a 400 naming it, with the digits-only message `FIELD_NUMERIC_MESSAGE`
+         *     (X-CORPT00C-5); a part of digits with surrounding spaces, such as `" 5"`, reaches the
+         *     program, which reads it as the value of its digits (CORPT00C-017).
          * @example {
          *       "confirm": "Y",
          *       "custom": "X",
@@ -2509,18 +2600,18 @@ export interface components {
              */
             custom?: string;
             /**
-             * @description `EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits or
-             *     blank (CORPT00C-015, CORPT00C-022).
+             * @description `EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits with or
+             *     without spaces around them, or blank (CORPT00C-015, CORPT00C-017, CORPT00C-022).
              */
             end_day?: string;
             /**
-             * @description `EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits or
-             *     blank (CORPT00C-014, CORPT00C-021).
+             * @description `EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits with
+             *     or without spaces around them, or blank (CORPT00C-014, CORPT00C-017, CORPT00C-021).
              */
             end_month?: string;
             /**
-             * @description `EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits or
-             *     blank (CORPT00C-016).
+             * @description `EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits with
+             *     or without spaces around them, or blank (CORPT00C-016, CORPT00C-017).
              */
             end_year?: string;
             /**
@@ -2529,18 +2620,18 @@ export interface components {
              */
             monthly?: string;
             /**
-             * @description `SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits or
-             *     blank (CORPT00C-012, CORPT00C-019).
+             * @description `SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits with
+             *     or without spaces around them, or blank (CORPT00C-012, CORPT00C-017, CORPT00C-019).
              */
             start_day?: string;
             /**
              * @description `SDTMM`, `PIC X(2)`, `NUM` (`CORPT00-022`): the start month of a custom report, digits
-             *     or blank (CORPT00C-011, CORPT00C-018).
+             *     with or without spaces around them, or blank (CORPT00C-011, CORPT00C-017, CORPT00C-018).
              */
             start_month?: string;
             /**
              * @description `SDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-026`): the start year of a custom report, digits
-             *     or blank (CORPT00C-013).
+             *     with or without spaces around them, or blank (CORPT00C-013, CORPT00C-017).
              */
             start_year?: string;
             /**
@@ -3790,22 +3881,22 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
-            /** @description No cross-reference, account or customer was found */
+            /** @description No cross-reference, account or customer was found: the message and field, with state S and the details when only the account is missing */
             404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScreenError"];
+                    "application/json": components["schemas"]["AccountUpdateViewError"];
                 };
             };
-            /** @description A read failed */
+            /** @description A read failed: the message and field, with state S and the details when the account read failed and the customer was found */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScreenError"];
+                    "application/json": components["schemas"]["AccountUpdateViewError"];
                 };
             };
         };
@@ -4006,22 +4097,22 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
-            /** @description The cross-reference, account or customer record was not found */
+            /** @description The cross-reference, account or customer record was not found: the message and field, with the account block when only the customer is missing, and both blocks when the account is missing and the customer was found */
             404: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScreenError"];
+                    "application/json": components["schemas"]["AccountViewError"];
                 };
             };
-            /** @description The cross-reference, account or customer read failed */
+            /** @description The cross-reference, account or customer read failed: the message and field, with the account block when only the customer read failed, and both blocks when the account read failed and the customer was found */
             500: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ScreenError"];
+                    "application/json": components["schemas"]["AccountViewError"];
                 };
             };
         };
@@ -4704,6 +4795,17 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
+            /** @description Password verification is saturated; the credentials were not checked */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before sending the request again */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenError"];
+                };
+            };
         };
     };
     cotrtlic_list: {
@@ -5364,6 +5466,17 @@ export interface operations {
                     "application/json": components["schemas"]["ScreenError"];
                 };
             };
+            /** @description Password hashing is saturated; nothing was stored. */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before sending the request again */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenError"];
+                };
+            };
         };
     };
     cousr02c_fetch: {
@@ -5504,6 +5617,17 @@ export interface operations {
             /** @description The read, the password check or the rewrite failed */
             500: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScreenError"];
+                };
+            };
+            /** @description Password checking is saturated; nothing was rewritten */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before sending the request again */
+                    "Retry-After"?: number;
                     [name: string]: unknown;
                 };
                 content: {

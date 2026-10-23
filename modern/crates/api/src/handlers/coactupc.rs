@@ -4,7 +4,8 @@
 //!
 //! Each handler extracts the verified identity, the raw path account number ([`RawPath`]) and,
 //! for endpoint 6, the validated body, calls one function of `crate::services::coactupc` and maps
-//! what it returns through the `From` conversions of `crate::dto::coactupc` and `crate::error`.
+//! what it returns through the `From` conversions of `crate::dto::coactupc` and `crate::error`:
+//! endpoint 5's failures into `AccountUpdateViewError`, endpoint 6's into `ScreenError`.
 //! Which key does what is the service's and the domain's decision, never the handler's: the
 //! handler reads no member of the request (Thin Request Handlers).
 //!
@@ -19,7 +20,9 @@ use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
-use crate::dto::coactupc::{AccountUpdateRequest, AccountUpdateResult, AccountUpdateView};
+use crate::dto::coactupc::{
+    AccountUpdateRequest, AccountUpdateResult, AccountUpdateView, AccountUpdateViewError,
+};
 use crate::dto::{RawPath, ValidJson};
 use crate::error::ScreenError;
 use crate::services;
@@ -37,10 +40,13 @@ pub(crate) struct FetchOperation;
 ///
 /// # Errors
 ///
-/// A `ScreenError` with the program's message: 400 when the account number fails its edit, 401
-/// without a valid bearer token, 404 when the cross-reference, the account or the customer is not
-/// found, and 500 when a read fails. A segment that is not UTF-8 once percent-decoded is a 400
-/// with the API's `Invalid path parameters...` and no field, before the program's edit.
+/// The program's message: a `ScreenError` with 400 when the account number fails its edit and
+/// 401 without a valid bearer token; an `AccountUpdateViewError` with 404 when the
+/// cross-reference, the account or the customer is not found, and 500 when a read fails. When
+/// the account read did not succeed and the customer was found, that body also carries state
+/// `S` and the details to show with their snapshot, the account values a placeholder. A segment
+/// that is not UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...`
+/// and no field, before the program's edit.
 #[utoipa::path(
     impl_for = FetchOperation,
     get,
@@ -69,10 +75,16 @@ pub(crate) struct FetchOperation;
         (status = 401, description = "No valid bearer token", body = ScreenError),
         (
             status = 404,
-            description = "No cross-reference, account or customer was found",
-            body = ScreenError
+            description = "No cross-reference, account or customer was found: the message and \
+                           field, with state S and the details when only the account is missing",
+            body = AccountUpdateViewError
         ),
-        (status = 500, description = "A read failed", body = ScreenError),
+        (
+            status = 500,
+            description = "A read failed: the message and field, with state S and the details \
+                           when the account read failed and the customer was found",
+            body = AccountUpdateViewError
+        ),
     ),
     security(("bearer_auth" = [])),
 )]
@@ -80,12 +92,12 @@ pub(crate) async fn fetch(
     State(state): State<AppState>,
     user: SignedOnUser,
     RawPath(acct_id): RawPath<String>,
-) -> Result<Json<AccountUpdateView>, ScreenError> {
+) -> Result<Json<AccountUpdateView>, AccountUpdateViewError> {
     services::coactupc::fetch(&state, &user, &acct_id)
         .await
         .map(AccountUpdateView::from)
         .map(Json)
-        .map_err(ScreenError::from)
+        .map_err(AccountUpdateViewError::from)
 }
 
 /// The `utoipa::Path` of [`save`], from its `#[utoipa::path]`, for `crate::app::router`.

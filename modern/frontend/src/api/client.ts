@@ -2,6 +2,9 @@ import createClient, { type Middleware } from "openapi-fetch";
 import { clearSession, getToken } from "@/auth/session";
 import type { paths } from "./schema";
 
+/** Endpoint 1, sign-on: the one operation that takes no bearer token. */
+const SIGNON_PATH: keyof paths = "/api/v1/signon";
+
 /**
  * Bearer-token handling for every API call.
  *
@@ -10,27 +13,28 @@ import type { paths } from "./schema";
  * (app/cbl/COSGN00C.cbl:224-228, app/cpy/COCOM01Y.cpy:25-28). No other header claims who the
  * caller is: the API takes identity only from the verified token.
  *
- * A 401 means either a failed sign-on (endpoint 1) or a missing, expired or invalid token. Either
- * way the stored session is cleared, which is harmless after a failed sign-on. `RequireSignon`
- * is subscribed to the session, so a 401 on a guarded screen takes the user to `/signon` at once,
- * without waiting for a navigation; nothing navigates from here.
+ * Every operation but sign-on carries `Authorization: Bearer <token>` while a session is stored.
+ * Sign-on obtains the token, so it goes out with no `Authorization` header at all, whatever
+ * session is stored, rather than relying on the sign-on screen having ended it first.
  *
- * Neither callback reads, copies or logs a request or response body: the client is a conduit,
- * so no card number, SSN or password can reach any other sink through it.
+ * The session a 401 ends is cleared by `answered`, below, as soon as the 401's status arrives,
+ * not by response middleware: the client's `fetch` resolves, and openapi-fetch runs response
+ * middleware, only once the whole body has arrived.
+ *
+ * The callback reads, copies and logs no request body: the client is a conduit, so no card
+ * number, SSN or password can reach any other sink through it.
  */
 const sessionMiddleware: Middleware = {
-  onRequest({ request }) {
+  onRequest({ request, schemaPath }) {
+    if (schemaPath === SIGNON_PATH) {
+      request.headers.delete("Authorization");
+      return request;
+    }
     const token = getToken();
     if (token !== null) {
       request.headers.set("Authorization", `Bearer ${token}`);
     }
     return request;
-  },
-  onResponse({ response }) {
-    if (response.status === 401) {
-      clearSession();
-    }
-    return response;
   },
 };
 
@@ -45,9 +49,22 @@ export const REQUEST_DEADLINE_MS = 30_000;
 /** The `message` of the deadline's `TimeoutError`, which the screen's error row shows. */
 const DEADLINE_MESSAGE = `No answer from the server within ${REQUEST_DEADLINE_MS / 1000} seconds`;
 
-/** The global `fetch`'s answer to `request`, once its body has arrived in full. */
+/**
+ * The global `fetch`'s answer to `request`, once its body has arrived in full.
+ *
+ * A 401 means either a failed sign-on (endpoint 1) or a missing, expired or invalid token. Either
+ * way the stored session is cleared, which is harmless after a failed sign-on, and it is cleared
+ * here, once per response, as soon as the status arrives and before the body is awaited. A 401
+ * whose body then stalls past the deadline or fails part-way still ends the session, although
+ * openapi-fetch never sees that response. `RequireSignon` is subscribed to the session, so a 401
+ * on a guarded screen takes the user to `/signon` at once, without waiting for a navigation;
+ * nothing navigates from here.
+ */
 async function answered(request: Request): Promise<Response> {
   const response = await globalThis.fetch(request);
+  if (response.status === 401) {
+    clearSession();
+  }
   await response.clone().arrayBuffer();
   return response;
 }

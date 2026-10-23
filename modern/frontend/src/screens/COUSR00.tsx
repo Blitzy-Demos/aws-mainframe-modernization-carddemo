@@ -4,7 +4,7 @@ import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCousr00cList } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -72,13 +72,6 @@ const COLUMNS = [
   { caption: "     Last Name      ", rule: "--------------------", align: "text-left" },
   { caption: "Type", rule: "----", align: "text-center" },
 ] as const;
-
-/*
- * BLITZY [LAYOUT]: the two eight-character fields (USRIDIN, PAGENUM) use `px-2` instead of the
- * Input default `px-3`, so all eight characters stay visible while the eight grid columns they
- * span are narrow (about 1000 px of viewport).
- */
-const EIGHT_CHARACTER_FIELD = "px-2";
 
 /** The row-24 labels of the map (COUSR00-089, COUSR00-096 to COUSR00-099). */
 const KEY_ITEMS = keyRowItems(KEY_ROWS.COUSR00);
@@ -212,8 +205,8 @@ export function COUSR00(): ReactNode {
 
   // The terminal keyboard stays locked until the program's answer arrives. `inFlight` is taken
   // when a key is accepted, before the form's asynchronous validation, and freed when the key
-  // ends without a request or its page request settles; `pending` shows the same lock on the
-  // keys and inputs.
+  // ends without a request or its page request settles; a `U` or `D` transfer keeps it until the
+  // next screen replaces this one. `pending` shows the same lock on the keys and inputs.
   const inFlight = useRef(false);
   const [pending, setPending] = useState(false);
 
@@ -298,7 +291,7 @@ export function COUSR00(): ReactNode {
 
   /**
    * Takes ENTER and locks the keyboard before the form validates, so no selection is acted on
-   * and no list is requested while a page request is outstanding.
+   * and no list is requested while a page request or a transfer is outstanding.
    */
   function onSubmit(event: FormEvent<HTMLFormElement>): void {
     if (!lock()) {
@@ -312,9 +305,10 @@ export function COUSR00(): ReactNode {
   function onEnter(values: Cousr00Values): void {
     const outcome = selectionOutcome(values.selections, rows);
     if (outcome.action !== "list") {
-      unlock();
       // XCTL COUSR02C or COUSR03C with the selected user ID (COUSR00C-008, COUSR00C-009). The
-      // keys ride along as the COMMAREA does, for a partner screen that returns its state.
+      // keys ride along as the COMMAREA does, for a partner screen that returns its state. The
+      // lock ENTER took stays held until that screen replaces this one, so no key pages the list
+      // or changes the selection while its module loads.
       navigate(outcome.action === "update" ? PATHS.COUSR02 : PATHS.COUSR03, {
         state: {
           from: PATHS.COUSR00,
@@ -376,7 +370,8 @@ export function COUSR00(): ReactNode {
     F8: pageForward,
   };
   // ENTER has no action of its own: its button and the Enter key submit the form. F3 stays
-  // available while a page request is outstanding; ENTER, F7 and F8 wait for its answer.
+  // available while a page request is outstanding; ENTER, F7 and F8 wait for its answer, and
+  // stay refused through a selection's transfer.
   const keys: PfKeyBarEntry[] = KEY_ITEMS.map((item) => ({
     ...item,
     onPress: actions[item.key],
@@ -412,13 +407,19 @@ export function COUSR00(): ReactNode {
               </Label>
             </GridCell>
             <GridCell row={4} col={71} span={PAGE_DIGITS}>
-              {/* ASKIP: the cursor skips the field, so it is not in the tab order. */}
+              {/*
+               * ASKIP: the cursor skips the field, so it is not in the tab order. Both
+               * eight-character fields (PAGENUM, USRIDIN) take the shared map-field box,
+               * `FIELD_INPUT` with `size` = their `LENGTH`, so all eight characters show on the
+               * narrowest frame.
+               */}
               <Input
                 id={pageId}
                 readOnly
                 tabIndex={-1}
                 value={pagenum}
-                className={`${EIGHT_CHARACTER_FIELD} text-muted-foreground`}
+                size={PAGE_DIGITS}
+                className={`${FIELD_INPUT} text-muted-foreground`}
               />
             </GridCell>
 
@@ -438,10 +439,11 @@ export function COUSR00(): ReactNode {
                       <Input
                         {...field}
                         maxLength={COUSR00_LENGTHS.startUserId}
+                        size={COUSR00_LENGTHS.startUserId}
                         autoComplete="off"
                         autoFocus
                         readOnly={pending}
-                        className={EIGHT_CHARACTER_FIELD}
+                        className={FIELD_INPUT}
                       />
                     </FormControl>
                   </GridCell>
@@ -495,9 +497,10 @@ export function COUSR00(): ReactNode {
                                 <Input
                                   {...field}
                                   maxLength={COUSR00_LENGTHS.selection}
+                                  size={COUSR00_LENGTHS.selection}
                                   autoComplete="off"
                                   readOnly={pending}
-                                  className="w-10 text-center"
+                                  className={`${FIELD_INPUT} w-10 text-center`}
                                 />
                               </FormControl>
                               <FormMessage className="sr-only" />

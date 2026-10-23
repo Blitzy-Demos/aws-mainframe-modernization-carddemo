@@ -453,7 +453,9 @@ function pressKey(name: string, shiftKey = false): void {
  */
 function expectLocked(busy: boolean): void {
   const labels = ["ENTER=Fetch", "F3=Back", "F4=Clear", "F5=Delete", "F12"];
-  expect(labels.map((label) => [label, key(label).hasAttribute("disabled")])).toEqual([
+  expect(
+    labels.map((label) => [label, key(label).getAttribute("aria-disabled") === "true"]),
+  ).toEqual([
     ["ENTER=Fetch", busy],
     ["F3=Back", false],
     ["F4=Clear", busy],
@@ -1120,6 +1122,47 @@ describe("COUSR03 user delete screen", () => {
       `${method} ${ENDPOINT}${SELECTED_ID}`,
     ]);
   });
+
+  // A clicked key keeps focus while its request is outstanding: the lock marks it `aria-disabled`,
+  // not HTML-`disabled`, which would drop focus to the page. A click on the locked key, which is
+  // also what an Enter typed in a field sends to ENTER, neither submits nor sends anything.
+  it.each([
+    { label: "ENTER=Fetch", method: "GET" },
+    { label: "F5=Delete", method: "DELETE" },
+  ])(
+    "$label keeps focus while its click's request is outstanding, and a click on it then runs nothing",
+    async ({ label, method }) => {
+      const { requests, release } = stubApi(true);
+      renderScreen({ from: PATHS.COADM01 });
+      typeUserId(SELECTED_ID);
+      const button = key(label);
+      // A mouse click focuses the button, then clicks it.
+      await moveFocus(button);
+      fireEvent.click(button);
+      await waitFor(() => {
+        expect(button.getAttribute("aria-disabled")).toBe("true");
+      });
+      expect(button).toHaveProperty("disabled", false);
+      expect(document.activeElement).toBe(button);
+
+      const submits = vi.fn();
+      const form = userIdInput().form;
+      expect(form).toBeInstanceOf(HTMLFormElement);
+      form?.addEventListener("submit", submits);
+      fireEvent.click(button);
+      await settle();
+      expect(submits).not.toHaveBeenCalled();
+      expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
+      expect(document.activeElement).toBe(button);
+
+      release();
+      await waitFor(() => {
+        expect(button.getAttribute("aria-disabled")).toBeNull();
+      });
+      await settle();
+      expect(requests).toHaveLength(1);
+    },
+  );
 
   // audit: COUSR03-035
   // audit: COUSR03C-007

@@ -45,9 +45,11 @@ use chrono::NaiveDate;
 use domain::clock::{Clock, FixedClock};
 use domain::copybook::{Count, PicS, PicU, PicX};
 use domain::money::{Decimal, Money};
-use domain::records::{PendingAuthDetailRecord, PendingAuthSummaryRecord};
+use domain::records::{CardXrefRecord, PendingAuthDetailRecord, PendingAuthSummaryRecord};
 use domain::{CardNumber, Ssn};
-use persistence::{PendingAuthDetailRepository, PendingAuthSummaryRepository, PgStore};
+use persistence::{
+    CardXrefRepository, PendingAuthDetailRepository, PendingAuthSummaryRepository, PgStore,
+};
 use runtime::config::Config;
 use runtime::telemetry::UNMATCHED_ROUTE;
 use serde::Serialize;
@@ -98,6 +100,13 @@ const AUTH_TIME: u64 = 103_000_000;
 
 /// The pending-authorization details seeded under account 50, one millisecond apart.
 const SEEDED_DETAILS: u64 = 3;
+
+/// An account no `acctdata.txt` record holds, whose seeded cross-reference names customer 50:
+/// endpoints 4 and 5 answer its 404 with customer 50's block beside the message, the SSN
+/// included (COACTVWC-008, COACTUPC-099).
+const UNREAD_ACCOUNT: u64 = 88;
+/// The card of that cross-reference: no fixture holds it and no response may show it.
+const UNREAD_ACCOUNT_CARD: &str = "4000008888880088";
 
 /// Customer fields endpoint 6 sends in place of the fixture's, which COACTUPC's edits refuse:
 /// a FICO score from 300 to 850, a state and ZIP its combination table holds, and
@@ -303,6 +312,14 @@ const STEPS: &[Step] = &[
         "/api/v1/accounts/99999999999/view",
         [404, 404],
     ),
+    // An account missing behind its cross-reference: the 404 shows customer 50 beside the
+    // message.
+    step(
+        4,
+        Verb::Get,
+        "/api/v1/accounts/00000000088/view",
+        [404, 404],
+    ),
     step(
         4,
         Verb::Get,
@@ -315,6 +332,7 @@ const STEPS: &[Step] = &[
     // the save that commits is account 1's.
     step(5, Verb::Get, "/api/v1/accounts/00000000050", [200, 200]).keeping(Keep::AccountView),
     step(5, Verb::Get, "/api/v1/accounts/99999999999", [404, 404]),
+    step(5, Verb::Get, "/api/v1/accounts/00000000088", [404, 404]),
     step(6, Verb::Put, "/api/v1/accounts/00000000050", [400, 400])
         .sending(Payload::AccountSave("ENTER")),
     step(5, Verb::Get, "/api/v1/accounts/00000000001", [200, 200]).keeping(Keep::AccountView),
@@ -704,18 +722,22 @@ struct Needle {
 struct Needles(Vec<Needle>);
 
 impl Needles {
-    /// The fixture card numbers and [`UNKNOWN_CARD`], the fixture SSNs in both forms, the
-    /// fixture user passwords and [`SUBMITTED_PASSWORDS`].
+    /// The fixture card numbers, [`UNKNOWN_CARD`] and [`UNREAD_ACCOUNT_CARD`], the fixture SSNs
+    /// in both forms, the fixture user passwords and [`SUBMITTED_PASSWORDS`].
     fn load() -> Fallible<Self> {
         let mut needles = Self(Vec::new());
         let cards = fixture_card_numbers()?;
-        if cards.iter().any(|card| card == UNKNOWN_CARD) {
-            return Err("the unknown card number of endpoint 8 is a fixture card number".into());
+        if cards
+            .iter()
+            .any(|card| card == UNKNOWN_CARD || card == UNREAD_ACCOUNT_CARD)
+        {
+            return Err("a card number this file adds is a fixture card number".into());
         }
         for card in cards {
             needles.push(Kind::Card, card)?;
         }
         needles.push(Kind::Card, UNKNOWN_CARD.to_owned())?;
+        needles.push(Kind::Card, UNREAD_ACCOUNT_CARD.to_owned())?;
         for ssn in fixture_ssn_forms()? {
             needles.push(Kind::Ssn, ssn)?;
         }
@@ -809,6 +831,7 @@ impl Harness {
         let database = start_loaded_postgres().await?;
         let mut store = PgStore::new(database.pool().clone());
         seed_authorizations(&mut store).await?;
+        seed_unread_account(&mut store).await?;
         let config = Config {
             jwt_secret: SECRET.to_owned(),
             intrdr_dir: PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("redaction-jobs"),
@@ -904,6 +927,20 @@ async fn seed_authorizations(store: &mut PgStore) -> TestResult {
         let detail = approved_detail(index, Money::new(amount)?)?;
         PendingAuthDetailRepository::insert(store, account, &detail).await?;
     }
+    Ok(())
+}
+
+/// Inserts the cross-reference of [`UNREAD_ACCOUNT_CARD`] from account [`UNREAD_ACCOUNT`], which
+/// no account row holds, to customer [`AUTH_CUSTOMER`], so that the error bodies of endpoints 4
+/// and 5 for that account carry the customer's block.
+async fn seed_unread_account(store: &mut PgStore) -> TestResult {
+    let xref = CardXrefRecord {
+        card_num: CardNumber::parse(UNREAD_ACCOUNT_CARD)?,
+        cust_id: PicU::new(AUTH_CUSTOMER)?,
+        acct_id: PicU::new(UNREAD_ACCOUNT)?,
+        filler: PicX::spaces(),
+    };
+    CardXrefRepository::insert(store, &xref).await?;
     Ok(())
 }
 
@@ -1067,6 +1104,9 @@ struct Forms {
     card_rows: usize,
     /// Endpoint 4 responses whose `ssn` is the redacted form.
     ssns: usize,
+    /// Error responses of endpoints 4 and 5 whose `ssn` is the redacted form: the customer
+    /// shown beside a message.
+    error_ssns: usize,
     failures: Vec<String>,
 }
 
@@ -1101,11 +1141,16 @@ fn check_forms(exchanges: &[Exchange]) -> Forms {
                     }
                 }
                 ("ssn", Some(text)) => {
-                    if !is_redacted_ssn(text) {
+                    if is_redacted_ssn(text) {
+                        if exchange.endpoint == 4 {
+                            forms.ssns += 1;
+                        }
+                        if matches!(exchange.endpoint, 4 | 5) && !exchange.status.is_success() {
+                            forms.error_ssns += 1;
+                        }
+                    } else {
                         let label = exchange.label();
                         forms.failures.push(format!("{label}: an ssn not redacted"));
-                    } else if exchange.endpoint == 4 {
-                        forms.ssns += 1;
                     }
                 }
                 _ => {}
@@ -1176,6 +1221,10 @@ async fn no_sensitive_value_leaves_the_api() -> TestResult {
         "no endpoint 7 row showed a card number"
     );
     assert!(forms.ssns > 0, "no endpoint 4 response showed an SSN");
+    assert!(
+        forms.error_ssns > 0,
+        "no endpoint 4 or 5 error showed a customer's SSN"
+    );
     Ok(())
 }
 

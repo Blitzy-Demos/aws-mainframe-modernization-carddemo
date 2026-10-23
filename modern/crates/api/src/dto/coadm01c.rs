@@ -6,9 +6,10 @@
 //!   tests no user type itself, so the body depends on no identity and on no request field.
 //! - **Response.** 200 with the `MenuResponse` of `dto::comen01c`, the schema endpoint 2 also
 //!   returns: the six options of `COADM02Y` in table order, `01` (`COUSR00C`) to `06`
-//!   (`COTRTUPC`), each admin-only, installed and carrying `This option is not installed ...`,
-//!   and the invalid-option text, with no `user_type` and no `admin_only_message`
-//!   (COADM01C-005 to COADM01C-014). The menu is a fixed table, not a collection, so the
+//!   (`COTRTUPC`), each with its 35-byte name, admin-only, installed, carrying
+//!   `This option is not installed ...` and stating no user type of its own, and the
+//!   invalid-option text, with no `user_type` and no `admin_only_message` (COADM01C-005 to
+//!   COADM01C-014). The menu is a fixed table, not a collection, so the
 //!   endpoint takes no `page_size` (Bounded Pagination).
 //! - **Client-side keys.** ENTER's option edit, the not-installed and invalid-key messages, the
 //!   transfers to the six option screens and F3 back to sign-on all run on the `COADM01` screen
@@ -35,13 +36,15 @@ mod tests {
     /// The not-installed text every admin option carries (COADM01C-014).
     const NOT_INSTALLED: &str = "This option is not installed ...";
 
-    /// One option row of endpoint 3's body as the client receives it: the two digits, the row
-    /// text as the 40 bytes of its `OPTNnnn` field, trailing spaces included, the program, and
-    /// the flags every admin option has (COADM01C-006 to COADM01C-013).
+    /// One option row of endpoint 3's body as the client receives it: the two digits, the name
+    /// as the 35 bytes of `CDEMO-ADMIN-OPT-NAME`, the row text as the 40 bytes of its `OPTNnnn`
+    /// field, both with their trailing spaces, the program, the flags every admin option has and
+    /// no user type, the table having no user-type column (COADM01C-006 to COADM01C-013).
     fn option(number: &str, name: &str, program: &str) -> Value {
         let text = [number, ". ", name].concat();
         json!({
             "number": number,
+            "name": format!("{name:<35}"),
             "text": format!("{text:<40}"),
             "program": program,
             "admin_only": true,

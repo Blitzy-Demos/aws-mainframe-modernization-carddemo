@@ -50,7 +50,9 @@ import {
  *
  * The server owns every message and every edit. The screen keeps what the pseudo-conversational
  * COBOL kept in its COMMAREA: the state `ACUP-CHANGE-ACTION` and the snapshot of the fetch, which
- * every endpoint 6 request echoes with the state of the last response (COACTUPC-100).
+ * every endpoint 6 request echoes with the state of the last response (COACTUPC-100). A fetch
+ * whose account read did not succeed while its customer read found the customer still shows the
+ * details in state `S` beside the error message, as its error body carries them (COACTUPC-099).
  */
 
 /** A field of the update form, named as in `@/schemas/COACTUP`. */
@@ -646,6 +648,23 @@ function stateOfCode(code: string): CoactupKeyState {
   }
 }
 
+/**
+ * Whether a thrown body is endpoint 5's error: a `ScreenError` whose `state` and `details`, when
+ * present, are a state code and the details shown in it (COACTUPC-099). A failure without a body,
+ * such as the browser's network `TypeError`, has a string `message` and neither member, and passes
+ * as an error that shows nothing.
+ */
+function isFetchError(body: unknown): body is components["schemas"]["AccountUpdateViewError"] {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    "message" in body &&
+    typeof body.message === "string" &&
+    (!("state" in body) || body.state === null || typeof body.state === "string") &&
+    (!("details" in body) || typeof body.details === "object")
+  );
+}
+
 /** The form field a `ScreenError.field` names, if any. */
 function fieldOf(wireName: string | null | undefined): FieldName | undefined {
   return typeof wireName === "string" && Object.hasOwn(FIELD_OF_WIRE_NAME, wireName)
@@ -940,6 +959,26 @@ export function COACTUP(): ReactNode {
     form.setFocus("acctId");
   }
 
+  /**
+   * The details endpoint 5 sent, in state `S` with their snapshot, the fields enterable
+   * (COACTUPC-068, COACTUPC-080), and `message` in the error row when they came beside one
+   * (COACTUPC-099). Returns the form values shown.
+   */
+  function showDetails(
+    view: components["schemas"]["AccountUpdateView"],
+    message?: string,
+  ): CoactupValues {
+    const values = valuesFromView(view);
+    form.reset(values, RESET_OPTIONS);
+    setScreen({
+      state: "S",
+      details: { values, snapshot: view.snapshot },
+      info: view.info_message,
+      message,
+    });
+    return values;
+  }
+
   /** ENTER while no details are shown: endpoint 5 (COACTUPC-010, COACTUPC-011). */
   function fetchDetails(): void {
     const acctId = form.getValues("acctId");
@@ -957,17 +996,18 @@ export function COACTUP(): ReactNode {
       { path: accountPath(parsed.data.acctId) },
       {
         onSuccess: (view) => {
-          const values = valuesFromView(view);
-          form.reset(values, RESET_OPTIONS);
           // Endpoint 5 answers in state `S` only (COACTUPC-068).
-          setScreen({
-            state: "S",
-            details: { values, snapshot: view.snapshot },
-            info: view.info_message,
-          });
+          showDetails(view);
           form.setFocus("activeStatus");
         },
         onError: (failure) => {
+          // The account read did not succeed and the customer was found: the details in state
+          // `S` beside the account read's message, the account field marked (COACTUPC-081,
+          // COACTUPC-099).
+          if (isFetchError(failure) && failure.details && failure.state === STATE_CODES.S) {
+            markField(failure, showDetails(failure.details, failure.message), "activeStatus");
+            return;
+          }
           // The account number keeps the text sent, every other field its initial value
           // (COACTUPC-073).
           setScreen({ ...INITIAL_SCREEN, message: failure.message });

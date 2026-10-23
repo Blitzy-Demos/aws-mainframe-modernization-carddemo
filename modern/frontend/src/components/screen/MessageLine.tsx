@@ -43,22 +43,26 @@ export type MessageLineProps = {
  * it. `aria-live="polite"` overrides the assertive default of the `Alert`'s `role="alert"`, so a
  * message that follows another is announced without interrupting. `data-message-kind` names the
  * row's colour, which tells the error row from the information row on maps that carry both.
+ * `data-message-empty` marks a row that shows no message, so `src/index.css` can keep its border
+ * invisible in forced-colors mode, which overrides `transparent`.
  *
  * The text is shown verbatim, spacing included, and is never composed, formatted or logged here:
  * the server owns every message, and any card number in one already arrives redacted.
  */
 export function MessageLine({ text, kind, bright }: MessageLineProps): ReactNode {
   const isError = kind === "error";
+  const isEmpty = !text?.trim();
   return (
     <Alert
       variant={isError ? "destructive" : "default"}
       aria-live="polite"
       data-message-kind={kind}
+      data-message-empty={isEmpty || undefined}
       className={cn(
         // RED is the `--destructive` token itself (AAP 0.4.3); the destructive variant gives the
         // description that token at 90 percent, which this replaces in the merge.
         isError && "*:data-[slot=alert-description]:text-destructive",
-        !text?.trim() && "border-transparent",
+        isEmpty && "border-transparent",
       )}
     >
       {/*

@@ -36,6 +36,15 @@ const TYPED_PASSWORD = "NEWPASS1";
 
 const ENDPOINT = "/api/v1/users/";
 
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+
 /** The route state of a COUSR00 `U` selection of {@link SELECTED_ID}, as COUSR00 sends it. */
 const FROM_LIST = {
   from: PATHS.COUSR00,
@@ -521,7 +530,7 @@ const INPUT_NAMES = ["userId", "firstName", "lastName", "password", "userType"] 
  */
 function lockShown(): { disabled: string[]; readOnly: string[]; busy: (string | null)[] } {
   return {
-    disabled: KEY_LABELS.filter((label) => key(label).hasAttribute("disabled")),
+    disabled: KEY_LABELS.filter((label) => key(label).getAttribute("aria-disabled") === "true"),
     readOnly: INPUT_NAMES.filter((name) => input(name).readOnly),
     busy: [
       screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy"),
@@ -629,6 +638,13 @@ describe("COUSR02 user update screen", () => {
       expect(box.readOnly).toBe(false);
       expect(box.value).toBe("");
       expect(cellOf(box)).toBe(row.inputCell);
+    }
+    // Every input of two or more characters takes the shared map-field box, `MAP_FIELD_BOX` with
+    // `size` = its LENGTH, so a full-length value shows on the narrowest frame.
+    for (const row of layout.filter((field) => field.length > 1)) {
+      const box = input(row.name);
+      expect(box.size).toBe(row.length);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
     }
     expect(input("userId").type).toBe("text");
     expect(input("firstName").type).toBe("text");

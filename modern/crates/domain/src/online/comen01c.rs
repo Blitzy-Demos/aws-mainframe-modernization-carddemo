@@ -10,7 +10,7 @@
 //! | COMEN01C-011 | `PROCESS-ENTER-KEY` | [`INVALID_OPTION`] and [`ADMIN_ONLY`], carried by every [`Menu`] it builds |
 //! | COMEN01C-013 | `PROCESS-ENTER-KEY` | [`Installation`]: the outcome of the `INQUIRE PROGRAM` check, installed for all 11 |
 //! | COMEN01C-015, COMEN01C-017 | `PROCESS-ENTER-KEY` | [`unavailable_message`], over [`not_installed_message`] and [`coming_soon_message`] |
-//! | COMEN01C-020 | `BUILD-MENU-OPTIONS` | [`MAIN_MENU_OPTIONS`], [`OPTION_COUNT`] and [`Access`] |
+//! | COMEN01C-020 | `BUILD-MENU-OPTIONS` | [`MAIN_MENU_OPTIONS`], [`OPTION_COUNT`], [`MenuOption::name`], [`MenuOption::user_type`] and [`Access`] |
 //! | COMEN01C-021 | `BUILD-MENU-OPTIONS` | [`MenuOption::display_text`] |
 //!
 //! COMEN01C-002, the 401 for a missing, malformed, wrongly signed or expired token, is the API's
@@ -147,25 +147,29 @@ impl Installation {
     }
 }
 
-/// One menu option, an occurrence of `CDEMO-MENU-OPT` (`COMEN02Y.cpy:94-98`): its number, name
-/// and program as declared, with the access its user-type byte gives and the installation its
-/// program has (COMEN01C-013, COMEN01C-020).
+/// One menu option, an occurrence of `CDEMO-MENU-OPT` (`COMEN02Y.cpy:94-98`): its number, name,
+/// program and user-type byte as declared, with the access that byte gives and the installation
+/// its program has (COMEN01C-013, COMEN01C-020). An admin-menu option has no user-type byte,
+/// its table having no such column (COADM01C-012).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MenuOption {
     number: PicU<2>,
     name: PicX<35>,
     program: PicX<8>,
+    user_type: Option<u8>,
     access: Access,
     installation: Installation,
 }
 
 impl MenuOption {
-    /// The option with these values, for a menu's option table.
+    /// The option with these values, for a menu's option table. `user_type` is the option's
+    /// `CDEMO-MENU-OPT-USRTYPE` byte, `None` for a table without that column (COADM01C-012).
     #[must_use]
     pub const fn new(
         number: PicU<2>,
         name: PicX<35>,
         program: PicX<8>,
+        user_type: Option<u8>,
         access: Access,
         installation: Installation,
     ) -> Self {
@@ -173,6 +177,7 @@ impl MenuOption {
             number,
             name,
             program,
+            user_type,
             access,
             installation,
         }
@@ -195,6 +200,14 @@ impl MenuOption {
     #[must_use]
     pub const fn program(&self) -> &PicX<8> {
         &self.program
+    }
+
+    /// `CDEMO-MENU-OPT-USRTYPE PIC X(01)`: the option's user-type byte as declared, `'U'` for
+    /// all 11 main-menu options (COMEN01C-020); `None` on the admin menu, whose `COADM02Y` table
+    /// has no user-type column (COADM01C-012).
+    #[must_use]
+    pub const fn user_type(&self) -> Option<u8> {
+        self.user_type
     }
 
     /// Who may take the option (COMEN01C-020).
@@ -401,6 +414,7 @@ const fn table_option(number: u64, name: &[u8; 35], program: [u8; 8], user_type:
         number,
         PicX::from_array(*name),
         PicX::from_array(program),
+        Some(user_type),
         Access::from_code(user_type),
         installation_of(program),
     )
@@ -573,6 +587,11 @@ mod tests {
             assert_eq!(option.name().as_bytes().as_slice(), name.as_bytes());
             assert_eq!(option.program().as_bytes().as_slice(), program.as_bytes());
             assert_eq!(user_type, "U");
+            assert_eq!(
+                option.user_type().map(|code| vec![code]),
+                Some(user_type.as_bytes().to_vec()),
+                "user type of option {number}"
+            );
             assert_eq!(option.access(), Access::AnyUser);
         }
         Ok(())
@@ -599,7 +618,7 @@ mod tests {
         assert!(
             MAIN_MENU_OPTIONS
                 .iter()
-                .all(|option| !option.access().is_admin_only())
+                .all(|option| !option.access().is_admin_only() && option.user_type() == Some(b'U'))
         );
     }
 
@@ -614,6 +633,14 @@ mod tests {
         ] {
             assert_eq!(Access::from_code(code), access, "user type {code}");
             assert_eq!(access.is_admin_only(), code == b'A');
+            let option = table_option(
+                5,
+                b"Credit Card Update                 ",
+                *b"COCRDUPC",
+                code,
+            );
+            assert_eq!(option.user_type(), Some(code), "user type {code}");
+            assert_eq!(option.access(), access, "user type {code}");
         }
     }
 

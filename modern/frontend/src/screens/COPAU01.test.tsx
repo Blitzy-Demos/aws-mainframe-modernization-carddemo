@@ -629,7 +629,7 @@ function expectLocked(busy: boolean): void {
   expect(
     labels.map((label) => [
       label,
-      screen.getByRole("button", { name: label }).hasAttribute("disabled"),
+      screen.getByRole("button", { name: label }).getAttribute("aria-disabled") === "true",
     ]),
   ).toEqual([
     ["ENTER", busy],

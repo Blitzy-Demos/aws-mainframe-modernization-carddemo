@@ -14,7 +14,7 @@
 //!
 //! # Harness
 //!
-//! - Each `#[tokio::test]` owns one `postgres:16` container from
+//! - Each test owns one `postgres:16` container from
 //!   `test_support::fixtures::start_loaded_postgres`, held for the whole test and removed when it
 //!   ends. The schema comes from test-support alone (Single Schema Executor, Local-Only Runtime).
 //! - The API is `api::app::app` over that database, signing tokens with a local secret and
@@ -26,7 +26,9 @@
 //!   customer is missing, and a second cross-reference for fixture account 2. A store that
 //!   fails is a second pool on the same database, closed before the call; a lock that cannot be
 //!   had is a row lock another transaction holds while the API's pool runs with a short
-//!   `lock_timeout`. The loaded pool itself is never closed.
+//!   `lock_timeout` its URL sets. Over the pool `carddemo-api` serves requests from,
+//!   `runtime::db::connect_for_requests`, such a lock makes the save wait until its holder
+//!   commits instead. The loaded pool itself is never closed.
 //! - Every response body is searched for the 50 fixture SSN values in both forms, the fixture
 //!   and test card numbers, the test SSN values and a masked card number: none may appear
 //!   (Cardholder Data Redaction; COACTVWC-017, COACTVWC-034, COACTUPC-076, COACTUPC-090). No
@@ -44,6 +46,7 @@ use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::app::{AppState, app};
 use api::dto::FIELD_LENGTH_MESSAGE;
@@ -541,6 +544,21 @@ impl Harness {
     async fn impatient_state(&self) -> Fallible<AppState> {
         state_over(self.second_store(Some(LOCK_TIMEOUT_QUERY)).await?)
     }
+
+    /// An API over the pool `carddemo-api` serves requests from, with the store built as
+    /// `carddemo-api` builds its own: `runtime::db::connect_for_requests` on this test's
+    /// database, failing at once while the pool's refusal watch finds the server refusing.
+    async fn request_state(&self) -> Fallible<AppState> {
+        let config = Config {
+            database_url: self.guard.database_url().to_owned(),
+            ..Config::default()
+        };
+        let (pool, refusals) = runtime::db::connect_for_requests(&config).await?;
+        let store = PgStore::new(pool)
+            .failing_fast_while(move || refusals.server_refusing())
+            .await;
+        state_over(store)
+    }
 }
 
 /// An error response: its status, message and field, and nothing else in the body, because a
@@ -559,6 +577,143 @@ fn assert_screen_error(reply: &Reply, status: StatusCode, message: &str, field: 
         members,
         1 + usize::from(field.is_some()),
         "members of {message:?}"
+    );
+}
+
+/// The members of endpoint 4's account block (COACTVWC-010 to COACTVWC-015).
+const VIEW_ACCOUNT_MEMBERS: [&str; 10] = [
+    "active_status",
+    "open_date",
+    "expiration_date",
+    "reissue_date",
+    "credit_limit",
+    "cash_credit_limit",
+    "current_balance",
+    "current_cycle_credit",
+    "current_cycle_debit",
+    "group_id",
+];
+
+/// The members of endpoint 4's customer block (COACTVWC-016 to COACTVWC-026).
+const VIEW_CUSTOMER_MEMBERS: [&str; 18] = [
+    "customer_id",
+    "ssn",
+    "date_of_birth",
+    "fico_score",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "address_line_1",
+    "address_line_2",
+    "city",
+    "state",
+    "zip",
+    "country",
+    "phone_1",
+    "phone_2",
+    "government_id",
+    "eft_account_id",
+    "primary_card_holder",
+];
+
+/// The customer members of endpoint 5's view (COACTUPC-075 to COACTUPC-077).
+const UPDATE_CUSTOMER_MEMBERS: [&str; 22] = [
+    "customer_id",
+    "ssn",
+    "dob",
+    "fico_score",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "address_line_1",
+    "address_line_2",
+    "city",
+    "state",
+    "zip",
+    "country",
+    "phone_1_area",
+    "phone_1_prefix",
+    "phone_1_line",
+    "phone_2_area",
+    "phone_2_prefix",
+    "phone_2_line",
+    "government_id",
+    "eft_account_id",
+    "primary_card_holder",
+];
+
+/// The customer members of endpoint 5's snapshot (COACTUPC-100).
+const SNAPSHOT_CUSTOMER_MEMBERS: [&str; 17] = [
+    "customer_id",
+    "first_name",
+    "middle_name",
+    "last_name",
+    "address_line_1",
+    "address_line_2",
+    "city",
+    "state_code",
+    "country",
+    "zip",
+    "phone_1",
+    "phone_2",
+    "ssn_last4",
+    "government_id",
+    "dob",
+    "eft_account_id",
+    "primary_card_holder",
+];
+
+/// The member names of the object `value`, sorted; none when it is not an object.
+fn sorted_keys(value: &Value) -> Vec<&str> {
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    keys.sort_unstable();
+    keys
+}
+
+/// The members `names` of the object `value`, as an object, a missing member as `null`.
+fn members_of(value: &Value, names: &[&str]) -> Value {
+    Value::Object(
+        names
+            .iter()
+            .map(|&name| {
+                (
+                    name.to_owned(),
+                    value.get(name).cloned().unwrap_or(Value::Null),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// An error response whose body is its `ScreenError`, status, message and field, with exactly
+/// the members `beside` next to them (COACTVWC-008, COACTUPC-099).
+#[track_caller]
+fn assert_error_beside(reply: &Reply, status: StatusCode, field: Option<&str>, beside: &[&str]) {
+    assert_eq!(reply.status, status, "status of {:?}", reply.message());
+    assert!(
+        !reply.message().is_empty(),
+        "an error body without a message"
+    );
+    assert_eq!(
+        reply.body.get("field").and_then(Value::as_str),
+        field,
+        "field of {:?}",
+        reply.message()
+    );
+    let mut expected: Vec<&str> = ["message"]
+        .into_iter()
+        .chain(field.map(|_| "field"))
+        .chain(beside.iter().copied())
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(
+        sorted_keys(&reply.body),
+        expected,
+        "members of {:?}",
+        reply.message()
     );
 }
 
@@ -974,8 +1129,8 @@ async fn view_test_accounts(h: &Harness) -> TestResult {
 }
 
 /// The read chain's outcomes on endpoint 4: each not-found text, the `DUPKEY` of two cards, the
-/// message precedence and a failing store (COACTVWC-008, COACTVWC-009, COACTVWC-033 to
-/// COACTVWC-040, COACTVWC-044).
+/// message precedence, the blocks beside a message after a partial read and a failing store
+/// (COACTVWC-008, COACTVWC-009, COACTVWC-033 to COACTVWC-040, COACTVWC-044).
 async fn view_read_chain_failures(h: &Harness) -> TestResult {
     let unknown = h.view(ACCOUNT_UNKNOWN).await?;
     // audit: COACTVWC-033
@@ -996,19 +1151,33 @@ async fn view_read_chain_failures(h: &Harness) -> TestResult {
     assert_file_error(&two_cards, "CXACAIX  ");
 
     // The account is missing and the customer is found: the account's message, status and
-    // field; the error body carries no block (AAP 0.3.4.1, `ScreenError`).
+    // field, the customer block beside them, and an account block whose values are halt
+    // candidate X-COACTVWC-H1's and are not asserted (`blocked_uninitialised_storage`).
     let no_account = h.view(&acct(NO_ACCOUNT_FIXTURE_CUSTOMER)).await?;
+    let fixture_customer = h.view(ACCOUNT_1).await?;
     // audit: COACTVWC-008
     // audit: COACTVWC-009
     // audit: COACTVWC-040
-    assert_screen_error(
+    assert_error_beside(
         &no_account,
         StatusCode::NOT_FOUND,
-        no_account.message(),
         Some("acct_id"),
+        &["account", "customer"],
     );
     let key = acct(NO_ACCOUNT_FIXTURE_CUSTOMER);
     assert_account_not_found(&no_account, &key, " Acct Master file.Resp:");
+    assert_eq!(
+        no_account.body["customer"],
+        members_of(&fixture_customer.body, &VIEW_CUSTOMER_MEMBERS),
+        "the customer block is fixture customer 1's"
+    );
+    let mut account_members = VIEW_ACCOUNT_MEMBERS.to_vec();
+    account_members.sort_unstable();
+    assert_eq!(
+        sorted_keys(&no_account.body["account"]),
+        account_members,
+        "the account block is present with the account members"
+    );
 
     // Account and customer both missing: the first message set, the account's, stands.
     let nothing = h.view(&acct(NOTHING_BEHIND)).await?;
@@ -1023,17 +1192,19 @@ async fn view_read_chain_failures(h: &Harness) -> TestResult {
     );
     assert_account_not_found(&nothing, &acct(NOTHING_BEHIND), " Acct Master file.Resp:");
 
-    // The account is found and its customer is missing: the customer's text, no field.
+    // The account is found and its customer is missing: the customer's text, no field, and the
+    // account block beside them. Account 72 is stored as account 60 is, apart from its key.
     let no_customer = h.view(&acct(NO_CUSTOMER)).await?;
+    let same_account = h.view(&acct(CLEAN)).await?;
     // audit: COACTVWC-008
     // audit: COACTVWC-044
-    assert_screen_error(
-        &no_customer,
-        StatusCode::NOT_FOUND,
-        no_customer.message(),
-        None,
-    );
+    assert_error_beside(&no_customer, StatusCode::NOT_FOUND, None, &["account"]);
     assert_customer_not_found(&no_customer, &format!("{MISSING_CUSTOMER_72:09}"));
+    assert_eq!(
+        no_customer.body["account"],
+        members_of(&same_account.body, &VIEW_ACCOUNT_MEMBERS),
+        "the account block is account 72's"
+    );
 
     // A store that fails every statement fails the first read, the cross-reference's.
     let failing = h.failing_state().await?;
@@ -1239,7 +1410,8 @@ fn fetch_fixture_snapshot(reply: &Reply) -> TestResult {
 }
 
 /// The read chain's outcomes on endpoints 5 and 6: each not-found text, the `DUPKEY` of two
-/// cards, the message precedence and a failing store (COACTUPC-084 to COACTUPC-099).
+/// cards, the message precedence, the state and details beside a message after a partial read
+/// and a failing store (COACTUPC-084 to COACTUPC-099).
 async fn fetch_read_chain_failures(h: &Harness) -> TestResult {
     let unknown = h.fetch(ACCOUNT_UNKNOWN).await?;
     // audit: COACTUPC-084
@@ -1260,17 +1432,38 @@ async fn fetch_read_chain_failures(h: &Harness) -> TestResult {
     assert_file_error(&two_cards, "CXACAIX  ");
 
     // The account is missing and the customer is found: the account's message, status and
-    // field; the error body carries neither block nor state (AAP 0.3.4.1, `ScreenError`).
+    // field, state `S` and the details beside them, whose customer values are customer 60's.
+    // Their account values and the account part of their snapshot are halt candidate
+    // X-COACTUPC-H1's and are not asserted (`blocked_uninitialised_storage`).
     let no_account = h.fetch(&acct(NO_ACCOUNT)).await?;
+    let (same_customer, _, _) = h.fetched(CLEAN).await?;
     // audit: COACTUPC-091
     // audit: COACTUPC-099
-    assert_screen_error(
+    assert_error_beside(
         &no_account,
         StatusCode::NOT_FOUND,
-        no_account.message(),
         Some("acct_id"),
+        &["details", "state"],
     );
     assert_account_not_found(&no_account, &acct(NO_ACCOUNT), " Acct Master file.Resp:");
+    let details = &no_account.body["details"];
+    assert_eq!(no_account.body["state"], "S");
+    assert_eq!(details["info_message"], PRESENTED);
+    assert_eq!(details["snapshot"]["state"], "S");
+    assert_eq!(
+        members_of(details, &UPDATE_CUSTOMER_MEMBERS),
+        members_of(&same_customer, &UPDATE_CUSTOMER_MEMBERS),
+        "the details show customer 60"
+    );
+    assert_eq!(
+        members_of(&details["snapshot"], &SNAPSHOT_CUSTOMER_MEMBERS),
+        members_of(&same_customer["snapshot"], &SNAPSHOT_CUSTOMER_MEMBERS),
+        "the snapshot keeps customer 60"
+    );
+    // The details are what a screen echoes: they read back as the fields and snapshot of an
+    // endpoint 6 request.
+    echoed(details)?;
+    snapshot_of(details)?;
 
     // Both missing: the account's message, the first set, stands.
     let nothing = h.fetch(&acct(NOTHING_BEHIND)).await?;
@@ -2182,6 +2375,7 @@ async fn coactupc_field_edits() -> TestResult {
     edits_passing(&harness).await?;
     edits_keys_and_states(&harness).await?;
     edits_map_lengths(&harness).await?;
+    edits_unstorable_text(&harness).await?;
     // Every request above was ENTER, a key processed as ENTER, or a restart: nothing written.
     // audit: COACTUPC-013
     // audit: COACTUPC-014
@@ -2481,6 +2675,71 @@ async fn edits_map_lengths(h: &Harness) -> TestResult {
             FIELD_LENGTH_MESSAGE,
             Some(&path),
         );
+    }
+    Ok(())
+}
+
+/// Texts within their member's map `LENGTH` in characters that its `PIC X(n)` field cannot
+/// hold byte for byte as printable ASCII: an accented letter, a TAB, an emoji (X-COUSR01C-3,
+/// PIC-002).
+const UNSTORABLE_TEXTS: &[(&str, &str)] = &[
+    ("government_id", "PASSPORTé"),
+    ("address_line_2", "Café 9"),
+    ("city", "SPRING\tFIELD"),
+    ("group_id", "GRPé"),
+    ("address_line_1", "Emoji😀"),
+];
+
+/// A text of [`UNSTORABLE_TEXTS`] in its member, on ENTER and on F5 in state `N`: 400 with the
+/// request validation's message, naming the field as the member's over-long rejection names it,
+/// before any edit runs, and nothing written.
+async fn edits_unstorable_text(h: &Harness) -> TestResult {
+    let (_, clean, snapshot) = h.fetched(CLEAN).await?;
+    let account = h.account(CLEAN).await?;
+    let customer = h.customer(CLEAN).await?;
+    let body_with = |member: &str, text: &str, aid: &str, state: &str| -> Fallible<Value> {
+        let mut payload = update_body(aid, &clean, &in_state(&snapshot, state))?;
+        payload
+            .get_mut("fields")
+            .and_then(Value::as_object_mut)
+            .ok_or("the body has no fields")?
+            .insert(member.to_owned(), Value::from(text));
+        Ok(payload)
+    };
+    for &(member, text) in UNSTORABLE_TEXTS {
+        let width = MAP_LENGTHS
+            .iter()
+            .find(|&&(name, _)| name == member)
+            .map(|&(_, width)| width)
+            .ok_or("the member has no map LENGTH")?;
+        let over_long = "X".repeat(width + 1);
+        let length = h
+            .save(&acct(CLEAN), &body_with(member, &over_long, "ENTER", "S")?)
+            .await?;
+        let field = length.text("field").to_owned();
+        assert!(field.ends_with(member), "field of {member}: {field:?}");
+        assert_screen_error(
+            &length,
+            StatusCode::BAD_REQUEST,
+            FIELD_LENGTH_MESSAGE,
+            Some(&field),
+        );
+        for (aid, state) in [("ENTER", "S"), ("PF5", "N")] {
+            let reply = h
+                .save(&acct(CLEAN), &body_with(member, text, aid, state)?)
+                .await?;
+            assert_screen_error(
+                &reply,
+                StatusCode::BAD_REQUEST,
+                FIELD_LENGTH_MESSAGE,
+                Some(&field),
+            );
+            assert!(
+                !reply.body.to_string().contains(text),
+                "the {aid} reply for {member} holds the rejected text"
+            );
+            assert_stored(h, CLEAN, &account, &customer).await?;
+        }
     }
     Ok(())
 }
@@ -2976,6 +3235,78 @@ async fn save_narrowed_zip(h: &Harness) -> TestResult {
         &test_customer(ZIP_PLUS_4, "62701")?,
     )
     .await
+}
+
+/// How long another transaction holds a row lock while a save over the request pool waits for
+/// it: longer than the 5 seconds after which a save once gave up, so a wait that ended before
+/// the holder did fails the test.
+const LOCK_HOLD: Duration = Duration::from_secs(6);
+
+/// A current-thread runtime with every driver, the one `#[tokio::test]` builds, made here so
+/// that no test macro expands into a lint suppression or an unchecked pin.
+fn current_thread() -> Fallible<tokio::runtime::Runtime> {
+    Ok(tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?)
+}
+
+/// F5 in state `N` over the pool `carddemo-api` serves requests from, while another transaction
+/// holds the row lock of account [`CLEAN`], then of its customer: the read for update waits for
+/// as long as the holder keeps the lock, [`LOCK_HOLD`], as a CICS `READ UPDATE` waits for a
+/// record another task holds, and once the holder commits, the save goes on: both records are
+/// rewritten and the reply is the committed one (COACTUPC-101, COACTUPC-102, COACTUPC-108).
+#[test]
+fn coactupc_lock_wait_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let h = Harness::start().await?;
+        let requests = h.request_state().await?;
+        let cases: [(Touch, bool, u64); 2] = [
+            (|f| set(&mut f.fico_score, "701"), false, 701),
+            (|f| set(&mut f.fico_score, "702"), true, 702),
+        ];
+        for (touch, customer_held, fico) in cases {
+            let (fields, snapshot) = validated(&h, CLEAN, touch).await?;
+            let payload = update_body("PF5", &fields, &in_state(&snapshot, "N"))?;
+            let mut holder = h.store.begin().await?;
+            let held = if customer_held {
+                CustomerRepository::lock_by_id(&mut holder, PicU::<9>::new(CLEAN)?)
+                    .await?
+                    .is_some()
+            } else {
+                AccountRepository::lock_by_id(&mut holder, PicU::<11>::new(CLEAN)?)
+                    .await?
+                    .is_some()
+            };
+            assert!(held, "the holder locked record {CLEAN}");
+            let key = acct(CLEAN);
+            let mut save = Box::pin(h.save_as(&requests, &h.user, &key, &payload));
+            let waited = tokio::time::timeout(LOCK_HOLD, save.as_mut()).await;
+            // audit: COACTUPC-101
+            // audit: COACTUPC-102
+            assert!(
+                waited.is_err(),
+                "the save answered while the holder kept the lock (customer: {customer_held})"
+            );
+            holder.commit().await?;
+            let reply = tokio::time::timeout(LOCK_HOLD, save)
+                .await
+                .map_err(|_| "no answer once the holder committed")??;
+            // audit: COACTUPC-101
+            // audit: COACTUPC-102
+            assert_committed(&reply);
+            // The group ID received lands in the ZIP field (COACTUPC-103).
+            let account = AccountRecord {
+                addr_zip: PicX::from_text("GOLD")?,
+                ..test_account(CLEAN, "GOLD")?
+            };
+            let customer = CustomerRecord {
+                fico_credit_score: PicU::new(fico)?,
+                ..test_customer(CLEAN, "62701")?
+            };
+            assert_stored(&h, CLEAN, &account, &customer).await?;
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------------------------

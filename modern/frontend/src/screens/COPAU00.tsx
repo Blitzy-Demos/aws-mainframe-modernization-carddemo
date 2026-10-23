@@ -278,8 +278,9 @@ function LabelCell({ row, col, span, text, htmlFor }: LabelCellProps): ReactNode
  *
  * While a request is outstanding the keyboard is locked, as the terminal's is, so every response
  * is applied to the state it was sent from: every key is disabled, F3 included, and the account
- * and the selectors are read-only. The cursor returns to the account field after every
- * response (COPAUS0C-053). Nothing here logs or stores a response; the screen shows no card
+ * and the selectors are read-only. A selection's transfer to COPAU01 keeps the keyboard locked
+ * the same way until COPAU01 replaces this screen. The cursor returns to the account field after
+ * every response (COPAUS0C-053). Nothing here logs or stores a response; the screen shows no card
  * number, and endpoint 21 returns none (COPAUS0C-055).
  */
 export function COPAU00(): ReactNode {
@@ -328,7 +329,10 @@ export function COPAU00(): ReactNode {
     setPending(true);
   }
 
-  /** Unlocks the keyboard: the edits refused ENTER, a selection transferred, or a read answered. */
+  /**
+   * Unlocks the keyboard: the edits refused ENTER or a read answered. A selection's transfer keeps
+   * the lock, which goes with this screen once the next one replaces it.
+   */
   function unlock(): void {
     pendingRef.current = false;
     setPending(false);
@@ -442,8 +446,9 @@ export function COPAU00(): ReactNode {
     if (key !== null) {
       const code = values.selections[row];
       if (code === "S" || code === "s") {
-        // COPAUS0C-010: XCTL COPAUS1C with the account typed on this ENTER and the row's key.
-        unlock();
+        // COPAUS0C-010: XCTL COPAUS1C with the account typed on this ENTER and the row's key. The
+        // lock ENTER took stays held until COPAU01 replaces this screen, so no key acts here
+        // while its module loads.
         navigate(PATHS.COPAU01, {
           state: { from: PATHS.COPAU00, acct_id: values.acctId, auth_key: key },
         });
@@ -471,9 +476,9 @@ export function COPAU00(): ReactNode {
   }
 
   /**
-   * ENTER, refused while a read is outstanding. The lock is taken before the edits, which
-   * `handleSubmit` runs asynchronously, and released at their refusal or failure, at a transfer,
-   * or at the read's answer.
+   * ENTER, refused while a read or a transfer is outstanding. The lock is taken before the edits,
+   * which `handleSubmit` runs asynchronously, and released at their refusal or failure, or at the
+   * read's answer; a transfer holds it until this screen is replaced.
    */
   function onSubmit(event: FormEvent<HTMLFormElement>): void {
     if (pendingRef.current) {

@@ -25,25 +25,30 @@ use super::{digits, text};
 
 /// The two inputs of `COBIL0A`, each the raw text of its map field.
 ///
-/// Only the map `LENGTH` is checked here, the server half of the `both` rows `COBIL00-013` and
-/// `COBIL00-020` of `modern/audit/screens.md`. An absent member is the empty text, which the
-/// program's own edit answers with `Acct ID can NOT be empty...` (COBIL00C-007). The values are
-/// neither trimmed nor upper-cased: COBIL00C reads them as typed.
+/// Only the map `LENGTH` and the `PIC X(n)` storage of each field are checked here, the server
+/// half of the `both` rows `COBIL00-013` and `COBIL00-020` of `modern/audit/screens.md`: a
+/// member that does not fit its field byte for byte as printable ASCII, being longer than the
+/// field or holding a character outside ASCII or a control byte, is a 400 naming it, with the
+/// field-length message `FIELD_LENGTH_MESSAGE` (`super::pic_x`, X-COUSR01C-3). An absent member
+/// is the empty text, which the program's own edit answers with `Acct ID can NOT be empty...`
+/// (COBIL00C-007). The values are neither trimmed nor upper-cased: COBIL00C reads them as typed.
 // The schema name `BillPaymentRequest` is the frontend's
 // `components["schemas"]["BillPaymentRequest"]` (Generated API Types Only).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
 #[schema(example = json!({"acct_id": "00000000001", "confirm": ""}))]
 pub struct BillPaymentRequest {
-    /// `ACTIDIN`, the account ID, at most 11 characters (`COBIL00-013`). Eleven digits name an
-    /// account; a blank value is refused (COBIL00C-007, COBIL00C-008).
+    /// `ACTIDIN`, `PIC X(11)`, the account ID, at most 11 bytes of printable ASCII
+    /// (`COBIL00-013`). Eleven digits name an account; a blank value is refused (COBIL00C-007,
+    /// COBIL00C-008).
     #[serde(default)]
-    #[validate(length(max = 11))]
+    #[validate(length(max = 11), custom(function = "super::pic_x::<11>"))]
     #[schema(max_length = 11)]
     pub acct_id: String,
-    /// `CONFIRM`, at most 1 character (`COBIL00-020`): blank shows the balance, `Y` or `y` pays,
-    /// `N` or `n` clears; any other value is refused (COBIL00C-009 to COBIL00C-012).
+    /// `CONFIRM`, `PIC X(1)`, at most 1 byte of printable ASCII (`COBIL00-020`): blank shows the
+    /// balance, `Y` or `y` pays, `N` or `n` clears; any other value is refused (COBIL00C-009 to
+    /// COBIL00C-012).
     #[serde(default)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     #[schema(max_length = 1)]
     pub confirm: String,
 }
@@ -166,22 +171,42 @@ mod tests {
     }
 
     #[test]
-    fn inputs_longer_than_the_map_field_are_a_400_naming_the_field() -> TestResult {
+    fn inputs_the_map_field_cannot_hold_are_a_400_naming_the_field() -> TestResult {
+        let wide_acct_id = "é".repeat(11);
         let cases = [
             // audit: COBIL00-013
             (request("000000000011", ""), "acct_id"),
+            // Eleven characters within `length`, 22 bytes beyond the `PIC X(11)` field.
+            // audit: COBIL00-013
+            (request(&wide_acct_id, ""), "acct_id"),
+            // audit: COBIL00-013
+            (request("0000000001\t", "Y"), "acct_id"),
             // audit: COBIL00-020
             (request("00000000001", "YY"), "confirm"),
+            // One character within `length`, but not printable ASCII.
+            // audit: COBIL00-020
+            (request("00000000001", "é"), "confirm"),
+            // audit: COBIL00-020
+            (request("00000000001", "\t"), "confirm"),
         ];
         for (input, field) in cases {
-            let errors = input.validate().err().ok_or("over-length input passed")?;
+            let errors = input
+                .validate()
+                .err()
+                .ok_or("input the field cannot hold passed")?;
             let rejection = validation_error(&errors);
             assert_eq!(
                 (rejection.status(), rejection.message(), rejection.field()),
-                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field))
+                (StatusCode::BAD_REQUEST, FIELD_LENGTH_MESSAGE, Some(field)),
+                "{input:?}"
             );
         }
-        for input in [request("00000000001", "Y"), request("ABCDEFGHIJK", "x")] {
+        for input in [
+            request("00000000001", "Y"),
+            request("ABCDEFGHIJK", "x"),
+            request("           ", " "),
+            request("\0\0\0\0\0\0\0\0\0\0\0", "\0"),
+        ] {
             assert!(input.validate().is_ok(), "{input:?}");
         }
         Ok(())

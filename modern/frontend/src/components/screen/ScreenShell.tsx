@@ -1,8 +1,9 @@
-import { useId, type ReactNode } from "react";
+import { useContext, useId, useMemo, type ReactNode } from "react";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { TITLE01, TITLE02, formatHeaderDate, formatHeaderTime } from "@/lib/header";
+import { TransferPendingContext } from "@/routes";
 import { GridCell } from "./FieldGrid";
 import { MessageLine, type MessageKind } from "./MessageLine";
 import { PfKeyBar, type PfKeyBarProps } from "./PfKeyBar";
@@ -61,7 +62,10 @@ export type ScreenShellProps = {
   keys: PfKeyBarProps["keys"];
   /** Settings of the keyboard binding, forwarded to `PfKeyBar` as `options`. */
   keyOptions?: PfKeyBarProps["options"];
-  /** Whether the screen waits for a response; forwarded to `PfKeyBar` as `busy`. */
+  /**
+   * Whether the screen waits for a response; forwarded to `PfKeyBar` as `busy`, which is also
+   * true while a transfer to another screen is under way.
+   */
   busy?: boolean;
   /**
    * The instant `CURDATE` and `CURTIME` show; the current time at each render when omitted, as
@@ -179,8 +183,12 @@ const HEADER_CELLS: Readonly<Record<HeaderLayout, readonly HeaderCell[]>> = {
  * the body. No CICS region assigns `APPLID` and `SYSID`, so they stay empty (X-SCREENS-1).
  *
  * `PfKeyBar` is the screen's only keyboard binding, so screens never call `usePfKeys`; a screen
- * locks its keys through the keys' `disabled` and `busy`, which `PfKeyBar` receives. Every text
- * passed in is shown verbatim and never logged: card numbers and SSNs arrive already redacted.
+ * locks its keys through the keys' `disabled` and `busy`, which `PfKeyBar` receives. While a
+ * transfer to another screen is under way (`TransferPendingContext`: the router is loading the
+ * target screen and this one stays mounted), the frame locks them all itself: every key it
+ * forwards is `disabled` and the row is `busy`, whatever the screen passes, so no key acts on the
+ * screen being left and an unserved F-key shows no invalid-key message. Every text passed in is
+ * shown verbatim and never logged: card numbers and SSNs arrive already redacted.
  *
  * The frame is the page's `main` landmark. The skip link, shown only on keyboard focus, moves past
  * the header rows and the title to the screen body.
@@ -204,6 +212,12 @@ export function ScreenShell({
 }: ScreenShellProps): ReactNode {
   const bodyId = useId();
   const headerId = useId();
+  const transferPending = useContext(TransferPendingContext);
+  // Memoized, so the keys of a screen that memoizes them reach `PfKeyBar` as stable as they left.
+  const shownKeys = useMemo(
+    () => (transferPending ? keys.map((entry) => ({ ...entry, disabled: true })) : keys),
+    [keys, transferPending],
+  );
   const at = now ?? new Date();
   const values: Readonly<Record<HeaderField, string>> = {
     TRNNAME: transaction,
@@ -282,7 +296,12 @@ export function ScreenShell({
            * attribute byte, so the row is bright whatever colour its message takes.
            */}
           <MessageLine kind={message?.kind ?? "error"} bright text={message?.text} />
-          <PfKeyBar keys={keys} formId={formId} options={keyOptions} busy={busy} />
+          <PfKeyBar
+            keys={shownKeys}
+            formId={formId}
+            options={keyOptions}
+            busy={transferPending || busy === true}
+          />
         </CardFooter>
       </Card>
     </main>

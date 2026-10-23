@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -30,6 +30,15 @@ import { COBIL00 } from "./COBIL00";
  */
 
 const ENDPOINT = "/api/v1/bill-payments";
+
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
 
 /** The account of the last `acctdata.txt` record, whose balance is shown and paid. */
 const ACCT = "00000000050";
@@ -488,6 +497,17 @@ describe("COBIL00 bill payment screen", () => {
     expect(confirm.maxLength).toBe(1);
     expect(confirm.readOnly).toBe(false);
     expect(cell(confirm)).toBe("row-start-15 col-start-60 col-span-1");
+
+    // All three take the shared map-field box, `MAP_FIELD_BOX` with `size` = the LENGTH, so a
+    // full-length value shows on the narrowest frame.
+    for (const [box, length] of [
+      [acct, 11],
+      [balance, 14],
+      [confirm, 1],
+    ] as const) {
+      expect(box.size).toBe(length);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
+    }
 
     expect(screen.getByText("-".repeat(70)).textContent).toHaveLength(70);
     expect(screen.getByText("(Y/N)").textContent).toBe("(Y/N)");
@@ -1293,9 +1313,9 @@ describe("COBIL00 bill payment screen", () => {
     });
     expect(keyBar.getAttribute("aria-busy")).toBe("true");
     expect(form.getAttribute("aria-busy")).toBe("true");
-    expect(enter.hasAttribute("disabled")).toBe(true);
-    expect(clear.hasAttribute("disabled")).toBe(true);
-    expect(back.hasAttribute("disabled")).toBe(false);
+    expect(enter.getAttribute("aria-disabled")).toBe("true");
+    expect(clear.getAttribute("aria-disabled")).toBe("true");
+    expect(back.getAttribute("aria-disabled")).toBeNull();
     expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([true, true]);
 
     // The buttons, the keys and an unserved key all do nothing until the reply arrives.
@@ -1318,9 +1338,9 @@ describe("COBIL00 bill payment screen", () => {
     expect(errorText()).toBe("Confirm to make a bill payment...");
     expect(keyBar.getAttribute("aria-busy")).toBe("false");
     expect(form.getAttribute("aria-busy")).toBe("false");
-    expect([enter.hasAttribute("disabled"), clear.hasAttribute("disabled")]).toEqual([
-      false,
-      false,
+    expect([enter.getAttribute("aria-disabled"), clear.getAttribute("aria-disabled")]).toEqual([
+      null,
+      null,
     ]);
     expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([false, false]);
 
@@ -1348,7 +1368,7 @@ describe("COBIL00 bill payment screen", () => {
     expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
       "false",
     );
-    expect(pfKeyButton("F4=Clear").hasAttribute("disabled")).toBe(false);
+    expect(pfKeyButton("F4=Clear").getAttribute("aria-disabled")).toBeNull();
     expect(confirmInput().readOnly).toBe(false);
 
     fireEvent.change(confirmInput(), { target: { value: "" } });
@@ -1366,9 +1386,9 @@ describe("COBIL00 bill payment screen", () => {
     typeInputs(ACCT, "");
     pressEnter();
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "ENTER=Continue" }).hasAttribute("disabled")).toBe(
-        true,
-      );
+      expect(
+        screen.getByRole("button", { name: "ENTER=Continue" }).getAttribute("aria-disabled"),
+      ).toBe("true");
     });
 
     fireEvent.click(pfKeyButton("F3=Back"));
@@ -1525,4 +1545,120 @@ describe("COBIL00 in the route table: a 401 ends the session", () => {
       router.dispose();
     },
   );
+});
+
+/** The browser's network `TypeError` message, as Chrome's `fetch` words it with no connection. */
+const NO_NETWORK = "Failed to fetch";
+
+/** Endpoint 2, which the main menu loads on entry. */
+const MENU_ENDPOINT = "/api/v1/menus/main";
+
+/** The account the offline ENTER is typed with. */
+const OFFLINE_ACCT = "00000000002";
+
+/**
+ * Replaces `fetch` with a network that `network.up` switches. While it is down, every request is
+ * refused with the `TypeError` that `fetch` rejects with when it cannot connect; while it is up,
+ * endpoint 15 is answered by {@link billPayment} and any other request gets a 500. Returns every
+ * request `fetch` was handed, in order, whether it was answered or refused.
+ */
+function stubNetwork(network: { readonly up: boolean }): Request[] {
+  const requests: Request[] = [];
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = input instanceof Request ? input : new Request(input, init);
+      requests.push(req);
+      if (!network.up) {
+        throw new TypeError(NO_NETWORK);
+      }
+      const { pathname } = new URL(req.url);
+      if (req.method !== "POST" || pathname !== ENDPOINT) {
+        return unexpected(`${req.method} ${pathname}`);
+      }
+      const body: unknown = await req.clone().json();
+      return billPayment(body);
+    }),
+  );
+  return requests;
+}
+
+/** The browser's `offline` or `online` event, which TanStack Query's `onlineManager` follows. */
+function fireNetworkEvent(type: "offline" | "online"): void {
+  act(() => {
+    window.dispatchEvent(new Event(type));
+  });
+}
+
+// The application's own query client (`App.tsx`), not a test client, decides whether a request
+// made with no network is sent at once or held until the network returns. It is sent: `fetch`
+// rejects with the browser's network `TypeError`, which the message row shows as any failure, and
+// the keyboard is free again. Nothing is held, so the network's return after F3 sends nothing:
+// only the operator's next key sends a request again (`api/client.ts`).
+describe("COBIL00 in the application: ENTER with no network", () => {
+  afterEach(() => {
+    // The online state lives in TanStack Query's process-wide `onlineManager`: the next test
+    // starts online.
+    onlineManager.setOnline(true);
+  });
+
+  it("fails at once with the browser's message, frees the keys, and sends nothing when the network returns", async () => {
+    const network = { up: true };
+    const requests = stubNetwork(network);
+    const startUrl = window.location.href;
+    window.history.replaceState(null, "", PATHS.COBIL00);
+    try {
+      // `App` creates its router from `window.location` when its module is first evaluated. No
+      // other test in this file imports it, so this import evaluates it here, at `/bill-payment`.
+      const { App } = await import("@/App");
+      const { container } = render(<App />);
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Bill Payment" }, { timeout: 5_000 }),
+      ).toBeDefined();
+
+      network.up = false;
+      fireNetworkEvent("offline");
+      expect(onlineManager.isOnline()).toBe(false);
+      typeInputs(OFFLINE_ACCT, "");
+      pressEnter();
+
+      // The request is attempted at once and fails at once: the message row shows why, and ENTER,
+      // F4 and the inputs are free, the typed account kept.
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(NO_NETWORK);
+      });
+      expect(paths(requests)).toEqual([ENDPOINT]);
+      expect(await bodies(requests)).toStrictEqual([{ acct_id: OFFLINE_ACCT, confirm: "" }]);
+      expect(container.querySelector("form")?.getAttribute("aria-busy")).toBe("false");
+      expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
+        "false",
+      );
+      expect(screen.getByRole("button", { name: "ENTER=Continue" }).hasAttribute("disabled")).toBe(
+        false,
+      );
+      expect(pfKeyButton("F4=Clear").hasAttribute("disabled")).toBe(false);
+      expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([false, false]);
+      expect(shown()).toEqual({ acct: OFFLINE_ACCT, balance: "", confirm: "" });
+
+      // F3 to the main menu, whose load on entry is attempted and fails at once in the same way.
+      fireEvent.click(pfKeyButton("F3=Back"));
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      await waitFor(() => {
+        expect(errorText()).toBe(NO_NETWORK);
+      });
+      expect(paths(requests)).toEqual([ENDPOINT, MENU_ENDPOINT]);
+
+      // The network returns: the abandoned ENTER is not sent from the menu.
+      network.up = true;
+      fireNetworkEvent("online");
+      expect(onlineManager.isOnline()).toBe(true);
+      await settle();
+      expect(paths(requests).filter((path) => path === ENDPOINT)).toHaveLength(1);
+      expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
+    } finally {
+      window.history.replaceState(null, "", startUrl);
+    }
+  });
 });

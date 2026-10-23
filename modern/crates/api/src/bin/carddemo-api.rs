@@ -18,8 +18,10 @@
 //!    directory is no refusal, as the first submission creates it;
 //! 5. builds the multi-threaded async runtime;
 //! 6. opens the `PostgreSQL` request pool on `DATABASE_URL` (`runtime::db::connect_for_requests`),
-//!    whose sessions bound every lock wait and statement;
-//! 7. builds the application state, with the system clock;
+//!    whose sessions keep the server's lock and statement settings, so a row lock another
+//!    transaction holds makes a request wait for it, as a CICS `READ UPDATE` waits;
+//! 7. builds the application state, with the system clock, over a store that fails a request's
+//!    statements at once while the pool's refusal watch finds the server refusing connections;
 //! 8. listens on `CARDDEMO_API_BIND` and serves until SIGTERM or SIGINT.
 //!
 //! The server never changes the schema: only the schema executor binary of the `runtime` crate
@@ -139,11 +141,11 @@ fn run(config: &Config) -> ExitCode {
 
 /// Connects, listens and serves until a stop signal, then closes the pool.
 async fn serve(config: &Config) -> ExitCode {
-    // The request pool: the server ends a lock wait after 5 s and a statement after 10 s, so a
-    // request blocked on a row another transaction holds answers its audited failure instead of
-    // pinning its connection.
-    let pool = match runtime::db::connect_for_requests(config).await {
-        Ok(pool) => pool,
+    // The request pool: a request blocked on a row another transaction holds waits until that
+    // transaction ends, then reads the row it left (COACTUPC-101, COBIL00C-013). A stop stays
+    // bounded all the same, by `DRAIN_DEADLINE` and `POOL_CLOSE_DEADLINE`.
+    let (pool, refusals) = match runtime::db::connect_for_requests(config).await {
+        Ok(opened) => opened,
         Err(error) => {
             // Logged only as the value-free summary: the driver's own text can quote the
             // connection URL, password included.
@@ -151,8 +153,13 @@ async fn serve(config: &Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // The store takes a copy of the pool's handle; this one closes the pool after serving.
-    let store = PgStore::new(pool.clone());
+    // The store takes a copy of the pool's handle; this one closes the pool after serving,
+    // which also ends the pool's refusal watch. While the watch finds the server refusing
+    // connections, the store fails every request's statements at once, as the database
+    // unavailable, instead of after the pool's acquire timeout.
+    let store = PgStore::new(pool.clone())
+        .failing_fast_while(move || refusals.server_refusing())
+        .await;
     let state = match api::app::AppState::from_config(store, config, Arc::new(SystemClock)) {
         Ok(state) => state,
         Err(error) => {

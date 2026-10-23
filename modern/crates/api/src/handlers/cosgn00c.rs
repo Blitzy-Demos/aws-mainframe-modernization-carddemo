@@ -48,6 +48,8 @@ pub(crate) struct SignonOperation;
 ///   character no screen field carries, or the user ID or the password is blank.
 /// - 401: no user has the user ID, or the password does not match the stored one.
 /// - 500: the user could not be read or verified, or the token could not be issued.
+/// - 503, with `Retry-After` in seconds: the server's password verification was saturated, so
+///   the credentials were not checked; the same request may be sent again after that delay.
 #[utoipa::path(
     impl_for = SignonOperation,
     post,
@@ -75,6 +77,17 @@ pub(crate) struct SignonOperation;
             status = 500,
             description = "The user could not be read or verified, or no token could be issued",
             body = ScreenError
+        ),
+        (
+            status = 503,
+            description = "Password verification is saturated; the credentials were not checked",
+            body = ScreenError,
+            headers(
+                (
+                    "Retry-After" = u64,
+                    description = "Seconds to wait before sending the request again"
+                )
+            )
         ),
     ),
 )]
@@ -159,12 +172,13 @@ mod tests {
 
         let responses = object(&doc, &format!("{operation}/responses"))?;
         let statuses: Vec<&String> = responses.keys().collect();
-        assert_eq!(statuses, ["200", "400", "401", "500"]);
+        assert_eq!(statuses, ["200", "400", "401", "500", "503"]);
         for (status, schema) in [
             ("200", "SignonResponse"),
             ("400", "ScreenError"),
             ("401", "ScreenError"),
             ("500", "ScreenError"),
+            ("503", "ScreenError"),
         ] {
             assert_eq!(
                 doc.pointer(&format!(
@@ -174,6 +188,17 @@ mod tests {
                 "{status}"
             );
         }
+        // The saturation answer names one header: the delay before the request is sent again.
+        let headers: Vec<&String> = object(&doc, &format!("{operation}/responses/503/headers"))?
+            .keys()
+            .collect();
+        assert_eq!(headers, ["Retry-After"]);
+        assert_eq!(
+            doc.pointer(&format!(
+                "{operation}/responses/503/headers/Retry-After/schema/type"
+            )),
+            Some(&json!("integer"))
+        );
 
         let schemas = object(&doc, "/components/schemas")?;
         for name in ["SignonRequest", "SignonResponse"] {

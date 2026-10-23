@@ -4,7 +4,7 @@ import { useForm, type FieldPath } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCocrdupcFetch, useCocrdupcSave } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -142,15 +142,6 @@ const BLANK_VALUES: CocrdupValues = {
  * spacing.
  */
 const LABEL = "whitespace-pre text-foreground";
-
-/*
- * BLITZY [LAYOUT]: `Input` pads `px-3` and fills its cell. A grid column is about 0.44rem at the
- * frame's widest, so `CRDSTCD`, `EXPMON` and `EXPYEAR` (1, 2 and 4 columns) would leave no room
- * for their characters. Those fields size to their `LENGTH` in characters (`size`) with the `px-1`
- * spacing step instead; the extra width falls into the empty attribute column to their right.
- */
-const NARROW_FIELD = 4;
-const NARROW_INPUT = "w-auto px-1";
 
 /** `KEY_ROWS.COCRDUP.foldShifted`: COCRDUPC folds PF13–PF24 onto PF1–PF12 (`CSSTRPFY`). */
 const KEY_OPTIONS = { foldShifted: KEY_ROWS.COCRDUP.foldShifted };
@@ -367,11 +358,13 @@ function stateAfterSaveError(
  * the state protects (`enterable` false) is read-only and out of the Tab order, as the 3270 Tab
  * key skips protected fields; it still takes the cursor the program places on it. While `busy`, a
  * request holds the keyboard: every field is read-only, and an enterable one keeps its Tab stop.
+ * Every field takes the shared map-field box (`fieldInputClass` with `size` = the `LENGTH`), so
+ * each one, the read-only redacted card number included, shows a full-length value on the
+ * narrowest frame.
  */
 function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, busy: boolean) {
   const spec: MapFieldSpec = FIELDS[name];
   const length = COCRDUP_LENGTHS[name];
-  const narrow = length <= NARROW_FIELD;
   return {
     maxLength: length,
     readOnly: !enterable || busy,
@@ -379,8 +372,8 @@ function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, bus
     autoComplete: "off",
     spellCheck: false,
     "aria-label": spec.accessibleName,
-    size: narrow ? length : undefined,
-    className: narrow ? NARROW_INPUT : undefined,
+    size: length,
+    className: fieldInputClass(length),
   };
 }
 

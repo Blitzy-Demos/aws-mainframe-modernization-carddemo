@@ -16,7 +16,7 @@
           "COACTUPC"
         ],
         "summary": "Fetch an account for update (CAUP / COACTUPC).",
-        "description": "Endpoint 5, ENTER while no details are shown. The account number is the raw path text, which\nthe program's account edit checks before any read; the cross-reference, the account and the\ncustomer are then read, and the response carries the values the map shows with the snapshot\nthe client echoes in every endpoint 6 request. Dates are typed; the SSN is only `***-**-` and\nits last four digits.\n\n# Errors\n\nA `ScreenError` with the program's message: 400 when the account number fails its edit, 401\nwithout a valid bearer token, 404 when the cross-reference, the account or the customer is not\nfound, and 500 when a read fails. A segment that is not UTF-8 once percent-decoded is a 400\nwith the API's `Invalid path parameters...` and no field, before the program's edit.",
+        "description": "Endpoint 5, ENTER while no details are shown. The account number is the raw path text, which\nthe program's account edit checks before any read; the cross-reference, the account and the\ncustomer are then read, and the response carries the values the map shows with the snapshot\nthe client echoes in every endpoint 6 request. Dates are typed; the SSN is only `***-**-` and\nits last four digits.\n\n# Errors\n\nThe program's message: a `ScreenError` with 400 when the account number fails its edit and\n401 without a valid bearer token; an `AccountUpdateViewError` with 404 when the\ncross-reference, the account or the customer is not found, and 500 when a read fails. When\nthe account read did not succeed and the customer was found, that body also carries state\n`S` and the details to show with their snapshot, the account values a placeholder. A segment\nthat is not UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...`\nand no field, before the program's edit.",
         "operationId": "coactupc_fetch",
         "parameters": [
           {
@@ -61,21 +61,21 @@
             }
           },
           "404": {
-            "description": "No cross-reference, account or customer was found",
+            "description": "No cross-reference, account or customer was found: the message and field, with state S and the details when only the account is missing",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScreenError"
+                  "$ref": "#/components/schemas/AccountUpdateViewError"
                 }
               }
             }
           },
           "500": {
-            "description": "A read failed",
+            "description": "A read failed: the message and field, with state S and the details when the account read failed and the customer was found",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScreenError"
+                  "$ref": "#/components/schemas/AccountUpdateViewError"
                 }
               }
             }
@@ -311,7 +311,7 @@
           "COACTVWC"
         ],
         "summary": "View an account (CAVW / COACTVWC).",
-        "description": "ENTER on the account view: the account number as typed is edited, then the card\ncross-reference is read by account, the account by the same key and the customer by the\ncross-reference's customer ID. The response holds the account and customer blocks of the\nmap, the SSN in redacted form only. PF3 is client-side and calls no endpoint.\n\n# Errors\n\nA `ScreenError` with the program's message and the field `acct_id`: 400 when the account\nnumber is missing, not numeric or all zeros; 404 when the cross-reference, the account or\nthe customer record is not found; 500 when one of those reads fails. 401 when the request\ncarries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a 400\nwith the API's `Invalid path parameters...` and no field, before the program's edit.",
+        "description": "ENTER on the account view: the account number as typed is edited, then the card\ncross-reference is read by account, the account by the same key and the customer by the\ncross-reference's customer ID. The response holds the account and customer blocks of the\nmap, the SSN in redacted form only. PF3 is client-side and calls no endpoint.\n\n# Errors\n\nThe program's message and, when the account number is in error, the field `acct_id`: a\n`ScreenError` with 400 when the account number is missing, not numeric or all zeros; an\n`AccountViewError` with 404 when the cross-reference, the account or the customer record is\nnot found, and 500 when one of those reads fails. Beside the message it carries the account\nblock when the account was found and the customer was not, and both blocks when the customer\nwas found and the account was not, the account values then a placeholder. 401 when the\nrequest carries no valid bearer token. A segment that is not UTF-8 once percent-decoded is a\n400 with the API's `Invalid path parameters...` and no field, before the program's edit.",
         "operationId": "coactvwc_view",
         "parameters": [
           {
@@ -356,21 +356,21 @@
             }
           },
           "404": {
-            "description": "The cross-reference, account or customer record was not found",
+            "description": "The cross-reference, account or customer record was not found: the message and field, with the account block when only the customer is missing, and both blocks when the account is missing and the customer was found",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScreenError"
+                  "$ref": "#/components/schemas/AccountViewError"
                 }
               }
             }
           },
           "500": {
-            "description": "The cross-reference, account or customer read failed",
+            "description": "The cross-reference, account or customer read failed: the message and field, with the account block when only the customer read failed, and both blocks when the account read failed and the customer was found",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ScreenError"
+                  "$ref": "#/components/schemas/AccountViewError"
                 }
               }
             }
@@ -1267,7 +1267,7 @@
           "COSGN00C"
         ],
         "summary": "Sign on (CC00 / COSGN00C)",
-        "description": "ENTER on the sign-on screen: validates the user ID and the password, upper-cases both as the\nprogram does, reads the user by the upper-cased ID, verifies the password against the stored\nhash and returns a bearer token for every other operation, with the user ID, the user type\nand the route of the menu the program transfers to. F3 and every other key are handled by the\nscreen and send no request.\n\n# Errors\n\n- 400: the body is not a sign-on request, a field holds more than its 8 screen positions or a\n  character no screen field carries, or the user ID or the password is blank.\n- 401: no user has the user ID, or the password does not match the stored one.\n- 500: the user could not be read or verified, or the token could not be issued.",
+        "description": "ENTER on the sign-on screen: validates the user ID and the password, upper-cases both as the\nprogram does, reads the user by the upper-cased ID, verifies the password against the stored\nhash and returns a bearer token for every other operation, with the user ID, the user type\nand the route of the menu the program transfers to. F3 and every other key are handled by the\nscreen and send no request.\n\n# Errors\n\n- 400: the body is not a sign-on request, a field holds more than its 8 screen positions or a\n  character no screen field carries, or the user ID or the password is blank.\n- 401: no user has the user ID, or the password does not match the stored one.\n- 500: the user could not be read or verified, or the token could not be issued.\n- 503, with `Retry-After` in seconds: the server's password verification was saturated, so\n  the credentials were not checked; the same request may be sent again after that delay.",
         "operationId": "cosgn00c_signon",
         "requestBody": {
           "content": {
@@ -1312,6 +1312,26 @@
           },
           "500": {
             "description": "The user could not be read or verified, or no token could be issued",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Password verification is saturated; the credentials were not checked",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before sending the request again"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2219,7 +2239,7 @@
           "COUSR01C"
         ],
         "summary": "Add a user (CU01 / COUSR01C).",
-        "description": "ENTER on `COUSR1A`: the five fields are edited in the program's order and, when none is\nempty, the user is added and the message names its user ID, such as `User NEWUSR01 has been\nadded ...` (COUSR01C-010 to COUSR01C-014, COUSR01C-021). F4 and PF3 send no request. An\nadministrator token is required.\n\n# Errors\n\nA `ScreenError`, checked in this order:\n\n- 401 without a valid bearer token (COUSR01C-002);\n- 403 when the token's user type is not `A` (COUSR01C-001);\n- 400 for a body that does not deserialise or a value its map field cannot hold, then for\n  the first empty field, and for a user ID already stored, `User ID already exist...`\n  (COUSR01C-010 to COUSR01C-014, COUSR01C-023);\n- 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024).",
+        "description": "ENTER on `COUSR1A`: the five fields are edited in the program's order and, when none is\nempty, the user is added and the message names its user ID, such as `User NEWUSR01 has been\nadded ...` (COUSR01C-010 to COUSR01C-014, COUSR01C-021). F4 and PF3 send no request. An\nadministrator token is required.\n\n# Errors\n\nA `ScreenError`, checked in this order:\n\n- 401 without a valid bearer token (COUSR01C-002);\n- 403 when the token's user type is not `A` (COUSR01C-001);\n- 400 for a body that does not deserialise or a value its map field cannot hold, then for\n  the first empty field, and for a user ID already stored, `User ID already exist...`\n  (COUSR01C-010 to COUSR01C-014, COUSR01C-023);\n- 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024);\n- 503, with `Retry-After` in seconds, when the server's password hashing is saturated, so\n  nothing was stored; the same request may be sent again after that delay.",
         "operationId": "cousr01c_add",
         "requestBody": {
           "content": {
@@ -2274,6 +2294,26 @@
           },
           "500": {
             "description": "The user could not be stored (COUSR01C-024).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Password hashing is saturated; nothing was stored.",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before sending the request again"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2383,7 +2423,7 @@
           "COUSR02C"
         ],
         "summary": "Update a user (CU02 / COUSR02C)",
-        "description": "PF5 (`F5=Save`), and the save F3 (`F3=Save&Exit`) performs before the screen leaves: the\nnames and type of the user under the path `user_id` are rewritten when any of them, or the\npassword, differs from the stored row. An omitted or null `password` keeps the stored one; a\nsupplied one is checked against the stored hash and replaces it only when it differs. ENTER\nis the fetch, `GET /api/v1/users/{user_id}`; F4 (clear) and F12 (cancel) send no request.\nNo password is returned. An administrator token (`usr_type` `A`) is required.\n\n# Errors\n\n- 400 for a path user ID or a body that does not fit the screen fields, for the first\n  empty-field edit that fails, in the program's order (user ID, first name, last name, a\n  supplied password, user type), and `Please modify to update ...` when nothing differs from\n  the stored row.\n- 401 without a valid bearer token; 403 for a token whose user type is not `A`.\n- 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.\n- 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when\n  the read, the password check or the rewrite fails.",
+        "description": "PF5 (`F5=Save`), and the save F3 (`F3=Save&Exit`) performs before the screen leaves: the\nnames and type of the user under the path `user_id` are rewritten when any of them, or the\npassword, differs from the stored row. An omitted or null `password` keeps the stored one; a\nsupplied one is checked against the stored hash and replaces it only when it differs. ENTER\nis the fetch, `GET /api/v1/users/{user_id}`; F4 (clear) and F12 (cancel) send no request.\nNo password is returned. An administrator token (`usr_type` `A`) is required.\n\n# Errors\n\n- 400 for a path user ID or a body that does not fit the screen fields, for the first\n  empty-field edit that fails, in the program's order (user ID, first name, last name, a\n  supplied password, user type), and `Please modify to update ...` when nothing differs from\n  the stored row.\n- 401 without a valid bearer token; 403 for a token whose user type is not `A`.\n- 404 `User ID NOT found...` (`field` `user_id`) when no user has the ID.\n- 500 `Unable to lookup User...` or `Unable to Update User...` (`field` `first_name`) when\n  the read, the password check or the rewrite fails.\n- 503, with `Retry-After` in seconds, when the server's password checking is saturated, so\n  nothing was rewritten; the same request may be sent again after that delay.",
         "operationId": "cousr02c_update",
         "parameters": [
           {
@@ -2460,6 +2500,26 @@
           },
           "500": {
             "description": "The read, the password check or the rewrite failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScreenError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Password checking is saturated; nothing was rewritten",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds to wait before sending the request again"
+              }
+            },
             "content": {
               "application/json": {
                 "schema": {
@@ -2616,7 +2676,7 @@
       },
       "AccountUpdateFields": {
         "type": "object",
-        "description": "The raw text of every enterable map field of an endpoint 6 request, at most its map\n`LENGTH`.\n\nAn absent member is the empty text, which the program reads as blank. The account number is\nthe path's `acct_id`. The SSN parts are present only when the operator re-entered them:\nomitting all three means unchanged, a part omitted beside a present one is blank\n(COACTUPC-064). They are never serialised, so a body carrying them is written as JSON, and\n`Debug` prints them as `***`.",
+        "description": "The raw text of every enterable map field of an endpoint 6 request, each fitting its map\nfield's `PIC X(n)` byte for byte: at most its map `LENGTH` in bytes, each printable ASCII\n(`0x20`–`0x7E`), or the field's `LOW-VALUES` (X-COUSR01C-3).\n\nAn absent member is the empty text, which the program reads as blank. The account number is\nthe path's `acct_id`. The SSN parts are present only when the operator re-entered them:\nomitting all three means unchanged, a part omitted beside a present one is blank\n(COACTUPC-064). They are never serialised, so a body carrying them is written as JSON, and\n`Debug` prints them as `***`.",
         "properties": {
           "active_status": {
             "type": "string",
@@ -3335,18 +3395,110 @@
           }
         }
       },
-      "AccountViewResponse": {
+      "AccountUpdateViewError": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ScreenError",
+            "description": "The message and its field, as the `ScreenError` whose status the response carries."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "details": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AccountUpdateView",
+                    "description": "The values the screen shows in state `S` and the snapshot the client echoes in its next\nendpoint 6 request: the customer block as stored (COACTUPC-075, COACTUPC-076) and an\naccount block, and its part of the snapshot, that no read filled, a placeholder of halt\ncandidate X-COACTUPC-H1 that is no parity result."
+                  }
+                ]
+              },
+              "state": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "`ACUP-CHANGE-ACTION` after the response: `S`, present only beside `details`\n(COACTUPC-099).",
+                "example": "S"
+              }
+            }
+          }
+        ],
+        "description": "The body of an endpoint 5 error: the `ScreenError` of the message and, when the account read\ndid not succeed and the customer read found the customer, the state `S` and the details the\nscreen then shows with its fields enterable (COACTUPC-099).\n\nSerialised as `{\"message\": …, \"field\": …, \"state\": …, \"details\": …}`, each of the last three\nomitted when absent. Every other failure of the fetch leaves the state not fetched and shows\nno value (COACTUPC-068, COACTUPC-095, COACTUPC-097), so its body is exactly its\n`ScreenError`. The status is the `ScreenError`'s and travels as the response status only."
+      },
+      "AccountViewAccountBlock": {
         "type": "object",
-        "description": "The account view of endpoint 4 (CAVW, COACTVWC): the account and customer blocks of map\n`CACTVWA` after all three reads found their record (COACTVWC-008).\n\nText fields hold every byte of their map field, trailing spaces included: the stored value\nunchanged, or its first characters where the map field is narrower (ZIP code and phone\nnumbers). Numeric identifiers hold their digits with the leading zeros, and amounts the\n15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number.\nDates are typed, `null` for a blank field. The SSN is only ever its redacted form.",
+        "description": "The account block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from\n`ACCOUNT-RECORD` (COACTVWC-010 to COACTVWC-015): part of every [`AccountViewResponse`], and of\nan [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008).",
         "required": [
-          "acct_id",
           "active_status",
           "credit_limit",
           "cash_credit_limit",
           "current_balance",
           "current_cycle_credit",
           "current_cycle_debit",
-          "group_id",
+          "group_id"
+        ],
+        "properties": {
+          "active_status": {
+            "type": "string",
+            "description": "`ACCT-ACTIVE-STATUS`, the one-character active flag of `ACSTTUS` (COACTVWC-010,\nCOACTVW-016)."
+          },
+          "cash_credit_limit": {
+            "type": "string",
+            "description": "`ACCT-CASH-CREDIT-LIMIT` as the 15-character `ACSHLIM` field edits it (COACTVWC-012,\nCOACTVW-028)."
+          },
+          "credit_limit": {
+            "type": "string",
+            "description": "`ACCT-CREDIT-LIMIT` as the 15-character `ACRDLIM` field edits it (COACTVWC-012,\nCOACTVW-022)."
+          },
+          "current_balance": {
+            "type": "string",
+            "description": "`ACCT-CURR-BAL` as the 15-character `ACURBAL` field edits it (COACTVWC-011,\nCOACTVW-034)."
+          },
+          "current_cycle_credit": {
+            "type": "string",
+            "description": "`ACCT-CURR-CYC-CREDIT` as the 15-character `ACRCYCR` field edits it (COACTVWC-013,\nCOACTVW-037)."
+          },
+          "current_cycle_debit": {
+            "type": "string",
+            "description": "`ACCT-CURR-CYC-DEBIT` as the 15-character `ACRCYDB` field edits it (COACTVWC-013,\nCOACTVW-043)."
+          },
+          "expiration_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "description": "`ACCT-EXPIRAION-DATE`, shown in `AEXPDT`; `null` when blank (COACTVWC-014, COACTVW-025)."
+          },
+          "group_id": {
+            "type": "string",
+            "description": "`ACCT-GROUP-ID`, the 10-character `AADDGRP` field (COACTVWC-015, COACTVW-040)."
+          },
+          "open_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "description": "`ACCT-OPEN-DATE`, shown in `ADTOPEN`; `null` when blank (COACTVWC-014, COACTVW-019)."
+          },
+          "reissue_date": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date",
+            "description": "`ACCT-REISSUE-DATE`, shown in `AREISDT`; `null` when blank (COACTVWC-014, COACTVW-031)."
+          }
+        }
+      },
+      "AccountViewCustomerBlock": {
+        "type": "object",
+        "description": "The customer block of map `CACTVWA`, as `1200-SETUP-SCREEN-VARS` moves it from\n`CUSTOMER-RECORD` (COACTVWC-016 to COACTVWC-026): part of every [`AccountViewResponse`], and\nof an [`AccountViewError`] when COACTVWC shows it beside the message (COACTVWC-008). The SSN\nis only ever its redacted form.",
+        "required": [
           "customer_id",
           "ssn",
           "fico_score",
@@ -3366,14 +3518,6 @@
           "primary_card_holder"
         ],
         "properties": {
-          "acct_id": {
-            "type": "string",
-            "description": "The account number every read used: eleven digits, leading zeros included\n(COACTVWC-032)."
-          },
-          "active_status": {
-            "type": "string",
-            "description": "`ACCT-ACTIVE-STATUS`, the one-character active flag of `ACSTTUS` (COACTVWC-010,\nCOACTVW-016)."
-          },
           "address_line_1": {
             "type": "string",
             "description": "`CUST-ADDR-LINE-1`, the 50-character `ACSADL1` field (COACTVWC-021, COACTVW-067)."
@@ -3382,10 +3526,6 @@
             "type": "string",
             "description": "`CUST-ADDR-LINE-2`, the 50-character `ACSADL2` field (COACTVWC-021, COACTVW-072)."
           },
-          "cash_credit_limit": {
-            "type": "string",
-            "description": "`ACCT-CASH-CREDIT-LIMIT` as the 15-character `ACSHLIM` field edits it (COACTVWC-012,\nCOACTVW-028)."
-          },
           "city": {
             "type": "string",
             "description": "`CUST-ADDR-LINE-3`, the 50-character field the map labels `City` (COACTVWC-021,\nCOACTVW-078)."
@@ -3393,22 +3533,6 @@
           "country": {
             "type": "string",
             "description": "`CUST-ADDR-COUNTRY-CD`, the 3-character `ACSCTRY` field (COACTVWC-022, COACTVW-081)."
-          },
-          "credit_limit": {
-            "type": "string",
-            "description": "`ACCT-CREDIT-LIMIT` as the 15-character `ACRDLIM` field edits it (COACTVWC-012,\nCOACTVW-022)."
-          },
-          "current_balance": {
-            "type": "string",
-            "description": "`ACCT-CURR-BAL` as the 15-character `ACURBAL` field edits it (COACTVWC-011,\nCOACTVW-034)."
-          },
-          "current_cycle_credit": {
-            "type": "string",
-            "description": "`ACCT-CURR-CYC-CREDIT` as the 15-character `ACRCYCR` field edits it (COACTVWC-013,\nCOACTVW-037)."
-          },
-          "current_cycle_debit": {
-            "type": "string",
-            "description": "`ACCT-CURR-CYC-DEBIT` as the 15-character `ACRCYDB` field edits it (COACTVWC-013,\nCOACTVW-043)."
           },
           "customer_id": {
             "type": "string",
@@ -3426,14 +3550,6 @@
             "type": "string",
             "description": "`CUST-EFT-ACCOUNT-ID`, the 10-character `ACSEFTC` field (COACTVWC-025, COACTVW-091)."
           },
-          "expiration_date": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date",
-            "description": "`ACCT-EXPIRAION-DATE`, shown in `AEXPDT`; `null` when blank (COACTVWC-014, COACTVW-025)."
-          },
           "fico_score": {
             "type": "string",
             "description": "`CUST-FICO-CREDIT-SCORE`: three digits, leading zeros included (COACTVWC-018,\nCOACTVW-056)."
@@ -3446,10 +3562,6 @@
             "type": "string",
             "description": "`CUST-GOVT-ISSUED-ID`, the 20-character `ACSGOVT` field (COACTVWC-025, COACTVW-086)."
           },
-          "group_id": {
-            "type": "string",
-            "description": "`ACCT-GROUP-ID`, the 10-character `AADDGRP` field (COACTVWC-015, COACTVW-040)."
-          },
           "last_name": {
             "type": "string",
             "description": "`CUST-LAST-NAME`, the 25-character `ACSLNAM` field (COACTVWC-020, COACTVW-065)."
@@ -3457,14 +3569,6 @@
           "middle_name": {
             "type": "string",
             "description": "`CUST-MIDDLE-NAME`, the 25-character `ACSMNAM` field (COACTVWC-020, COACTVW-063)."
-          },
-          "open_date": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date",
-            "description": "`ACCT-OPEN-DATE`, shown in `ADTOPEN`; `null` when blank (COACTVWC-014, COACTVW-019)."
           },
           "phone_1": {
             "type": "string",
@@ -3477,14 +3581,6 @@
           "primary_card_holder": {
             "type": "string",
             "description": "`CUST-PRI-CARD-HOLDER-IND`, the one-character `ACSPFLG` flag (COACTVWC-026,\nCOACTVW-094)."
-          },
-          "reissue_date": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date",
-            "description": "`ACCT-REISSUE-DATE`, shown in `AREISDT`; `null` when blank (COACTVWC-014, COACTVW-031)."
           },
           "ssn": {
             "type": "string",
@@ -3500,6 +3596,67 @@
             "description": "`CUST-ADDR-ZIP`: the first five characters only, as the 5-character `ACSZIPC` field\nholds them (COACTVWC-023, COACTVW-075)."
           }
         }
+      },
+      "AccountViewError": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ScreenError",
+            "description": "The message and its field, as the `ScreenError` whose status the response carries."
+          },
+          {
+            "type": "object",
+            "properties": {
+              "account": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AccountViewAccountBlock",
+                    "description": "The account block shown beside the message, if any (COACTVWC-008, COACTVWC-009)."
+                  }
+                ]
+              },
+              "customer": {
+                "oneOf": [
+                  {
+                    "type": "null"
+                  },
+                  {
+                    "$ref": "#/components/schemas/AccountViewCustomerBlock",
+                    "description": "The customer block shown beside the message, if any (COACTVWC-008)."
+                  }
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The body of an endpoint 4 error: the `ScreenError` of the message, and the blocks COACTVWC\nstill shows beside it (COACTVWC-008, X-COACTVWC-6).\n\nSerialised as `{\"message\": …, \"field\": …, \"account\": …, \"customer\": …}`, each of the last\nthree omitted when absent, so an error without a block is exactly its `ScreenError`. The\nstatus is the `ScreenError`'s and travels as the response status only.\n\n- `account`: after the account read found the account and the customer read did not\n  (COACTVWC-044, COACTVWC-046), and after the account read did not succeed and the customer\n  read found the customer, when its values are halt candidate X-COACTVWC-H1's placeholder\n  (COACTVWC-009).\n- `customer`: only when the customer read found the customer and the account read did not\n  succeed (COACTVWC-040, COACTVWC-042)."
+      },
+      "AccountViewResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/AccountViewAccountBlock",
+            "description": "The account block (COACTVWC-010 to COACTVWC-015)."
+          },
+          {
+            "$ref": "#/components/schemas/AccountViewCustomerBlock",
+            "description": "The customer block (COACTVWC-016 to COACTVWC-026)."
+          },
+          {
+            "type": "object",
+            "required": [
+              "acct_id"
+            ],
+            "properties": {
+              "acct_id": {
+                "type": "string",
+                "description": "The account number every read used: eleven digits, leading zeros included\n(COACTVWC-032)."
+              }
+            }
+          }
+        ],
+        "description": "The account view of endpoint 4 (CAVW, COACTVWC): the account and customer blocks of map\n`CACTVWA` after all three reads found their record (COACTVWC-008).\n\nText fields hold every byte of their map field, trailing spaces included: the stored value\nunchanged, or its first characters where the map field is narrower (ZIP code and phone\nnumbers). Numeric identifiers hold their digits with the leading zeros, and amounts the\n15-character text of the map's `+ZZZ,ZZZ,ZZZ.99` field, so the client formats no number.\nDates are typed, `null` for a blank field. The SSN is only ever its redacted form."
       },
       "AuthDetailQuery": {
         "type": "object",
@@ -3888,16 +4045,16 @@
       },
       "BillPaymentRequest": {
         "type": "object",
-        "description": "The two inputs of `COBIL0A`, each the raw text of its map field.\n\nOnly the map `LENGTH` is checked here, the server half of the `both` rows `COBIL00-013` and\n`COBIL00-020` of `modern/audit/screens.md`. An absent member is the empty text, which the\nprogram's own edit answers with `Acct ID can NOT be empty...` (COBIL00C-007). The values are\nneither trimmed nor upper-cased: COBIL00C reads them as typed.",
+        "description": "The two inputs of `COBIL0A`, each the raw text of its map field.\n\nOnly the map `LENGTH` and the `PIC X(n)` storage of each field are checked here, the server\nhalf of the `both` rows `COBIL00-013` and `COBIL00-020` of `modern/audit/screens.md`: a\nmember that does not fit its field byte for byte as printable ASCII, being longer than the\nfield or holding a character outside ASCII or a control byte, is a 400 naming it, with the\nfield-length message `FIELD_LENGTH_MESSAGE` (`super::pic_x`, X-COUSR01C-3). An absent member\nis the empty text, which the program's own edit answers with `Acct ID can NOT be empty...`\n(COBIL00C-007). The values are neither trimmed nor upper-cased: COBIL00C reads them as typed.",
         "properties": {
           "acct_id": {
             "type": "string",
-            "description": "`ACTIDIN`, the account ID, at most 11 characters (`COBIL00-013`). Eleven digits name an\naccount; a blank value is refused (COBIL00C-007, COBIL00C-008).",
+            "description": "`ACTIDIN`, `PIC X(11)`, the account ID, at most 11 bytes of printable ASCII\n(`COBIL00-013`). Eleven digits name an account; a blank value is refused (COBIL00C-007,\nCOBIL00C-008).",
             "maxLength": 11
           },
           "confirm": {
             "type": "string",
-            "description": "`CONFIRM`, at most 1 character (`COBIL00-020`): blank shows the balance, `Y` or `y` pays,\n`N` or `n` clears; any other value is refused (COBIL00C-009 to COBIL00C-012).",
+            "description": "`CONFIRM`, `PIC X(1)`, at most 1 byte of printable ASCII (`COBIL00-020`): blank shows the\nbalance, `Y` or `y` pays, `N` or `n` clears; any other value is refused (COBIL00C-009 to\nCOBIL00C-012).",
             "maxLength": 1
           }
         },
@@ -4560,9 +4717,10 @@
       },
       "MenuOptionDto": {
         "type": "object",
-        "description": "One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide\nENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021).",
+        "description": "One menu option: one row `BUILD-MENU-OPTIONS` fills, with what the screen needs to decide\nENTER on it (COMEN01C-013, COMEN01C-020, COMEN01C-021, COADM01C-006 to COADM01C-012).",
         "required": [
           "number",
+          "name",
           "text",
           "program",
           "admin_only",
@@ -4576,6 +4734,10 @@
           "installed": {
             "type": "boolean",
             "description": "Whether the option's program can be taken, the outcome of the program's installation\ncheck: `true` for every shipped option (COMEN01C-013, COADM01C-013)."
+          },
+          "name": {
+            "type": "string",
+            "description": "`CDEMO-MENU-OPT-NAME PIC X(35)` on the main menu and `CDEMO-ADMIN-OPT-NAME PIC X(35)` on\nthe admin menu: the option's name as declared, all 35 bytes, trailing spaces included;\nfor example `Account View` followed by 23 spaces (COMEN01C-020, COADM01C-006 to\nCOADM01C-011)."
           },
           "number": {
             "type": "string",
@@ -4595,14 +4757,23 @@
               "null"
             ],
             "description": "The text the screen shows when the option cannot be taken, as the program composes it,\nor absent when the program composes none for the option. On the main menu only option\n11 has one, its not-installed text; every admin-menu option carries\n`This option is not installed ...`, which the admin screen also shows when a transfer\nfinds no screen (COMEN01C-015, COMEN01C-017, COADM01C-014)."
+          },
+          "user_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`CDEMO-MENU-OPT-USRTYPE PIC X(01)`: the option's user-type byte as declared, verbatim,\n`U` for all 11 main-menu options (COMEN01C-020). Absent on the admin menu, whose\n`COADM02Y` table has no user-type column (COADM01C-012)."
           }
         },
         "example": {
           "admin_only": false,
           "installed": true,
+          "name": "Account View                       ",
           "number": "01",
           "program": "COACTVWC",
-          "text": "01. Account View                        "
+          "text": "01. Account View                        ",
+          "user_type": "U"
         }
       },
       "MenuResponse": {
@@ -4646,9 +4817,11 @@
             {
               "admin_only": false,
               "installed": true,
+              "name": "Account View                       ",
               "number": "01",
               "program": "COACTVWC",
-              "text": "01. Account View                        "
+              "text": "01. Account View                        ",
+              "user_type": "U"
             }
           ],
           "user_type": "U"
@@ -4664,7 +4837,7 @@
       },
       "ReportRequest": {
         "type": "object",
-        "description": "The ten inputs of `CORPT0A` exactly as the screen sends them (CORPT00C-042). An absent\nmember is the empty text, which the program treats as blank.\n\nMonthly and Yearly take their dates from the server's clock and ignore the date parts\n(CORPT00C-007 to CORPT00C-010); Custom edits the six parts (CORPT00C-011 to CORPT00C-028).\nThe confirmation is read only once the report and its dates are set (CORPT00C-030 to\nCORPT00C-033).\n\nA member longer than its map field is a 400 naming it, with the field-length message\n`FIELD_LENGTH_MESSAGE`. A date part holding a character other than a digit, unless every\ncharacter is a space, is a 400 naming it, with the digits-only message\n`FIELD_NUMERIC_MESSAGE` (X-CORPT00C-5).",
+        "description": "The ten inputs of `CORPT0A` exactly as the screen sends them (CORPT00C-042). An absent\nmember is the empty text, which the program treats as blank.\n\nMonthly and Yearly take their dates from the server's clock and ignore the date parts\n(CORPT00C-007 to CORPT00C-010); Custom edits the six parts (CORPT00C-011 to CORPT00C-028).\nThe confirmation is read only once the report and its dates are set (CORPT00C-030 to\nCORPT00C-033).\n\nA member that does not fit its `PIC X(n)` map field byte for byte as printable ASCII, being\nlonger than the field or holding a character outside ASCII or a control byte, is a 400 naming\nit, with the field-length message `FIELD_LENGTH_MESSAGE` (X-COUSR01C-3). A date part that\nfits, but holds a character other than a digit apart from spaces before and after the\ndigits, is a 400 naming it, with the digits-only message `FIELD_NUMERIC_MESSAGE`\n(X-CORPT00C-5); a part of digits with surrounding spaces, such as `\" 5\"`, reaches the\nprogram, which reads it as the value of its digits (CORPT00C-017).",
         "properties": {
           "confirm": {
             "type": "string",
@@ -4678,21 +4851,21 @@
           },
           "end_day": {
             "type": "string",
-            "description": "`EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits or\nblank (CORPT00C-015, CORPT00C-022).",
+            "description": "`EDTDD`, `PIC X(2)`, `NUM` (`CORPT00-032`): the end day of a custom report, digits with or\nwithout spaces around them, or blank (CORPT00C-015, CORPT00C-017, CORPT00C-022).",
             "maxLength": 2,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "end_month": {
             "type": "string",
-            "description": "`EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits or\nblank (CORPT00C-014, CORPT00C-021).",
+            "description": "`EDTMM`, `PIC X(2)`, `NUM` (`CORPT00-030`): the end month of a custom report, digits with\nor without spaces around them, or blank (CORPT00C-014, CORPT00C-017, CORPT00C-021).",
             "maxLength": 2,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "end_year": {
             "type": "string",
-            "description": "`EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits or\nblank (CORPT00C-016).",
+            "description": "`EDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-034`): the end year of a custom report, digits with\nor without spaces around them, or blank (CORPT00C-016, CORPT00C-017).",
             "maxLength": 4,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "monthly": {
             "type": "string",
@@ -4701,21 +4874,21 @@
           },
           "start_day": {
             "type": "string",
-            "description": "`SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits or\nblank (CORPT00C-012, CORPT00C-019).",
+            "description": "`SDTDD`, `PIC X(2)`, `NUM` (`CORPT00-024`): the start day of a custom report, digits with\nor without spaces around them, or blank (CORPT00C-012, CORPT00C-017, CORPT00C-019).",
             "maxLength": 2,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "start_month": {
             "type": "string",
-            "description": "`SDTMM`, `PIC X(2)`, `NUM` (`CORPT00-022`): the start month of a custom report, digits\nor blank (CORPT00C-011, CORPT00C-018).",
+            "description": "`SDTMM`, `PIC X(2)`, `NUM` (`CORPT00-022`): the start month of a custom report, digits\nwith or without spaces around them, or blank (CORPT00C-011, CORPT00C-017, CORPT00C-018).",
             "maxLength": 2,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "start_year": {
             "type": "string",
-            "description": "`SDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-026`): the start year of a custom report, digits\nor blank (CORPT00C-013).",
+            "description": "`SDTYYYY`, `PIC X(4)`, `NUM` (`CORPT00-026`): the start year of a custom report, digits\nwith or without spaces around them, or blank (CORPT00C-013, CORPT00C-017).",
             "maxLength": 4,
-            "pattern": "^([0-9]*| *)$"
+            "pattern": "^ *[0-9]* *$"
           },
           "yearly": {
             "type": "string",

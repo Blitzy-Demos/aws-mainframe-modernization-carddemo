@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -48,9 +48,8 @@ const VIEW_PATH = /^\/api\/v1\/accounts\/[^/]*\/view$/;
  */
 const FULL_SSN = /(?<!\w)\d{3}-?\d{2}-?\d{4}(?!\w)/;
 
-/** Endpoint 4's answer for ACCOUNT: every value distinct, so a field showing another's is seen. */
-const view: components["schemas"]["AccountViewResponse"] = {
-  acct_id: ACCOUNT,
+/** The account block of ACCOUNT: every value distinct, so a field showing another's is seen. */
+const accountBlock: components["schemas"]["AccountViewAccountBlock"] = {
   active_status: "Y",
   open_date: "2014-11-20",
   expiration_date: "2025-05-20",
@@ -61,6 +60,10 @@ const view: components["schemas"]["AccountViewResponse"] = {
   current_cycle_credit: "+           .00",
   current_cycle_debit: "-         50.00",
   group_id: "A000000000",
+};
+
+/** The customer block of ACCOUNT's customer, every value distinct as well. */
+const customerBlock: components["schemas"]["AccountViewCustomerBlock"] = {
   customer_id: "000000050",
   ssn: "***-**-1234",
   date_of_birth: "1961-06-08",
@@ -79,6 +82,60 @@ const view: components["schemas"]["AccountViewResponse"] = {
   government_id: "DL NC 7731 0050",
   eft_account_id: "0053581756",
   primary_card_holder: "N",
+};
+
+/** Endpoint 4's answer for ACCOUNT: the key and both blocks. */
+const view: components["schemas"]["AccountViewResponse"] = {
+  acct_id: ACCOUNT,
+  ...accountBlock,
+  ...customerBlock,
+};
+
+/** The BMS names of the account block's ten output fields (COACTVWC-010 to COACTVWC-015). */
+const ACCOUNT_OUTPUTS: ReadonlySet<string> = new Set([
+  "ACSTTUS",
+  "ADTOPEN",
+  "ACRDLIM",
+  "AEXPDT",
+  "ACSHLIM",
+  "AREISDT",
+  "ACURBAL",
+  "ACRCYCR",
+  "AADDGRP",
+  "ACRCYDB",
+]);
+
+/** The 15-character `+ZZZ,ZZZ,ZZZ.99` text of zero. */
+const ZERO_AMOUNT = "+           .00";
+
+/**
+ * An account block whose values stand for the placeholder endpoint 4 sends beside a customer it
+ * found when the account read did not succeed (halt candidate X-COACTVWC-H1), and what each of
+ * its fields shows: the values as served.
+ */
+const unreadAccountBlock: components["schemas"]["AccountViewAccountBlock"] = {
+  active_status: " ",
+  open_date: null,
+  expiration_date: null,
+  reissue_date: null,
+  credit_limit: ZERO_AMOUNT,
+  cash_credit_limit: ZERO_AMOUNT,
+  current_balance: ZERO_AMOUNT,
+  current_cycle_credit: ZERO_AMOUNT,
+  current_cycle_debit: ZERO_AMOUNT,
+  group_id: " ".repeat(10),
+};
+const UNREAD_ACCOUNT_SHOWS: Readonly<Record<string, string>> = {
+  ACSTTUS: " ",
+  ADTOPEN: "",
+  ACRDLIM: ZERO_AMOUNT,
+  AEXPDT: "",
+  ACSHLIM: ZERO_AMOUNT,
+  AREISDT: "",
+  ACURBAL: ZERO_AMOUNT,
+  ACRCYCR: ZERO_AMOUNT,
+  AADDGRP: " ".repeat(10),
+  ACRCYDB: ZERO_AMOUNT,
 };
 
 /**
@@ -480,15 +537,17 @@ function accountForm(): HTMLFormElement {
  */
 function expectLocked(locked: boolean): void {
   const keyRow = screen.getByRole("group", { name: "Function keys" });
+  const ariaDisabled = (name: string): string | null =>
+    within(keyRow).getByRole("button", { name }).getAttribute("aria-disabled");
   expect({
-    enterDisabled: within(keyRow).getByRole("button", { name: "ENTER" }).hasAttribute("disabled"),
-    exitDisabled: within(keyRow).getByRole("button", { name: "F3=Exit" }).hasAttribute("disabled"),
+    enterDisabled: ariaDisabled("ENTER"),
+    exitDisabled: ariaDisabled("F3=Exit"),
     keyRowBusy: keyRow.getAttribute("aria-busy"),
     formBusy: accountForm().getAttribute("aria-busy"),
     accountReadOnly: field("ACCTSID").readOnly,
   }).toEqual({
-    enterDisabled: locked,
-    exitDisabled: false,
+    enterDisabled: locked ? "true" : null,
+    exitDisabled: null,
     keyRowBusy: String(locked),
     formBusy: String(locked),
     accountReadOnly: locked,
@@ -1002,6 +1061,90 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     },
   );
 
+  // audit: COACTVW-099
+  // audit: COACTVWC-007
+  // audit: COACTVWC-028
+  it.each<{
+    label: string;
+    status: number;
+    body: components["schemas"]["AccountViewError"];
+    accountShows: Readonly<Record<string, string>> | null;
+    customerShown: boolean;
+    red: boolean;
+  }>([
+    {
+      // COACTVWC-044; positions 53-62 and 69-75 hold the interim codes of halt H4.
+      label: "account block beside the customer not-found message",
+      status: 404,
+      body: {
+        message: "CustId:000000099 not found in customer master.Resp: 000000000  REAS:0000000",
+        account: accountBlock,
+      },
+      accountShows: null,
+      customerShown: false,
+      red: false,
+    },
+    {
+      // COACTVWC-046; positions 49-58 and 66-75 hold the interim codes of halt H4.
+      label: "account block beside the customer file error",
+      status: 500,
+      body: {
+        message: "File Error: READ     on CUSTDAT   returned RESP 000000000 ,RESP2 000000000",
+        account: accountBlock,
+      },
+      accountShows: null,
+      customerShown: false,
+      red: false,
+    },
+    {
+      // COACTVWC-040 and COACTVWC-009: the customer found, the account block a placeholder.
+      label: "both blocks beside the account not-found message, naming acct_id",
+      status: 404,
+      body: {
+        message: `Account:${OTHER_ACCOUNT} not found in Acct Master file.Resp:000000000  Reas:0000`,
+        field: "acct_id",
+        account: unreadAccountBlock,
+        customer: customerBlock,
+      },
+      accountShows: UNREAD_ACCOUNT_SHOWS,
+      customerShown: true,
+      red: true,
+    },
+  ])(
+    "shows the $label as served, the block not sent blank, beside the message",
+    async ({ status, body, accountShows, customerShown, red }) => {
+      stubFetch((acctId) => (acctId === ACCOUNT ? json(200, view) : json(status, body)));
+      renderScreen();
+
+      typeAccount(ACCOUNT);
+      pressEnterButton();
+      await waitFor(() => {
+        expect(field("ACSTSSN").value).toBe("***-**-1234");
+      });
+
+      typeAccount(OTHER_ACCOUNT);
+      pressEnterButton();
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe(body.message);
+      });
+
+      expect(outputValues()).toEqual(
+        Object.fromEntries(
+          OUTPUTS.map((output) => {
+            if (ACCOUNT_OUTPUTS.has(output.name)) {
+              return [output.name, accountShows?.[output.name] ?? output.shows];
+            }
+            return [output.name, customerShown ? output.shows : ""];
+          }),
+        ),
+      );
+      expect(field("ACCTSID").value).toBe(OTHER_ACCOUNT);
+      expectAccountColour(red);
+      await expectCursorInAccount();
+      expect(messageRow("info").textContent).toBe(PROMPT);
+    },
+  );
+
   // audit: COACTVWC-007
   // audit: COACTVWC-028
   it("sends an empty field as eleven spaces, and after 'No input received' shows * in the red field", async () => {
@@ -1334,6 +1477,73 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
     ]);
     router.dispose();
   });
+
+  /**
+   * The body of a 401 whose status and headers have arrived: its first bytes come, and then the
+   * rest never does, or the connection fails. `release` fails a body still open, so the request
+   * settles, and its deadline timer is cleared, once the test is done.
+   */
+  function partialBody(fails: boolean): { body: ReadableStream<Uint8Array>; release: () => void } {
+    let open: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        open = controller;
+        controller.enqueue(new TextEncoder().encode(JSON.stringify(signonRequired).slice(0, 20)));
+      },
+      // Asked for more once the first bytes are read: the connection fails, or nothing comes.
+      pull(controller) {
+        if (fails) {
+          controller.error(new TypeError("network error"));
+        }
+      },
+    });
+    return {
+      body,
+      release: () => {
+        open?.error(new TypeError("the test is done"));
+      },
+    };
+  }
+
+  // The session ends on the 401's status, before its body is awaited, so it ends long before the
+  // request's 30 s deadline: within `waitFor`'s 1 s default.
+  it.each([
+    { title: "whose body never finishes", fails: false },
+    { title: "whose body fails part-way", fails: true },
+  ])(
+    "ENTER answered 401 $title clears the session at once and replaces the screen with sign-on, with no retry",
+    async ({ fails }) => {
+      const { body, release } = partialBody(fails);
+      onTestFinished(release);
+      const requests = stubFetch(
+        () => new Response(body, { status: 401, headers: { "Content-Type": "application/json" } }),
+      );
+      const router = renderRouteTable();
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
+      ).toBeDefined();
+
+      typeAccount(ACCOUNT);
+      pressEnterButton();
+
+      await waitFor(() => {
+        expect(getSession()).toBeNull();
+      });
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "View Account" })).toBeNull();
+      expect(requests).toEqual([
+        {
+          method: "GET",
+          path: `/api/v1/accounts/${ACCOUNT}/view`,
+          authorization: "Bearer test-token",
+        },
+      ]);
+      router.dispose();
+    },
+  );
 });
 
 // Endpoint 4 answers a failed edit 400, a missing record 404 and a failed read 500, each with a

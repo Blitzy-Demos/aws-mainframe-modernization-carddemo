@@ -254,6 +254,47 @@ const CUSTOMER_NOT_FOUND: components["schemas"]["ScreenError"] = {
   message: "CustId:000000050 not found in customer master.Resp: 0000000013 REAS:0000080",
 };
 
+/** The 15-character `+ZZZ,ZZZ,ZZZ.99` text of zero. */
+const ZERO_AMOUNT = "+           .00";
+
+/**
+ * Endpoint 5's 404 when the account read finds no account and the customer read finds the
+ * customer (COACTUPC-091, COACTUPC-099): the account read's message and field, state `S`, and the
+ * details with the customer's values. Their account values stand for the placeholder of halt
+ * candidate X-COACTUPC-H1, which the screen shows as served; the CICS codes are placeholders (H4).
+ */
+const UNREAD_ACCOUNT: components["schemas"]["AccountUpdateViewError"] = {
+  message: `Account:${ACCOUNT} not found in Acct Master file.Resp:0000000013 Reas:0000`,
+  field: "acct_id",
+  state: "S",
+  details: {
+    ...VIEW,
+    active_status: " ",
+    open_date: null,
+    expiry_date: null,
+    reissue_date: null,
+    credit_limit: ZERO_AMOUNT,
+    cash_credit_limit: ZERO_AMOUNT,
+    current_balance: ZERO_AMOUNT,
+    current_cycle_credit: ZERO_AMOUNT,
+    current_cycle_debit: ZERO_AMOUNT,
+    group_id: " ".repeat(10),
+    snapshot: {
+      ...VIEW.snapshot,
+      active_status: " ",
+      open_date: null,
+      expiry_date: null,
+      reissue_date: null,
+      credit_limit: "0.00",
+      cash_credit_limit: "0.00",
+      current_balance: "0.00",
+      current_cycle_credit: "0.00",
+      current_cycle_debit: "0.00",
+      group_id: " ".repeat(10),
+    },
+  },
+};
+
 /** The info rows of the states, as COACTUPC-079 words them. */
 const INFO_NOT_FETCHED = "Enter or update id of account to update";
 const INFO_DETAILS = "Update account details presented above.";
@@ -470,7 +511,10 @@ function expectLocked(locked: boolean): void {
   const keyRow = screen.getByRole("group", { name: "Function keys" });
   const labels = within(keyRow)
     .getAllByRole("button", { hidden: true })
-    .map((button) => ({ label: button.textContent, disabled: button.hasAttribute("disabled") }));
+    .map((button) => ({
+      label: button.textContent,
+      disabled: button.getAttribute("aria-disabled") === "true",
+    }));
   expect(labels).toEqual(
     labels.map(({ label }) => ({ label, disabled: locked && label !== "F3=Exit" })),
   );
@@ -1128,6 +1172,96 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     expect(labelOf(acct).getAttribute("data-error")).toBe("true");
     expect(document.activeElement).toBe(acct);
   });
+
+  it("a fetch 404 with state S and details shows them beside the message, enterable, and ENTER echoes their snapshot", async () => {
+    // audit: COACTUPC-080
+    // audit: COACTUPC-081
+    // audit: COACTUPC-083
+    // audit: COACTUP-125
+    stubApi(get(404, UNREAD_ACCOUNT), put(200, VALIDATED));
+    renderScreen();
+    typeInto("Account Number :", ACCOUNT);
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(UNREAD_ACCOUNT.message);
+    });
+    await settled();
+
+    // The customer block as served, the SSN redacted; the account block as served too.
+    expect(input("First Name").value).toBe("Ada");
+    expect(input("Customer id :").value).toBe("000000050");
+    expect(ssnInputs().map((element) => element.value)).toEqual(["***", "**", "1234"]);
+    expect(
+      [input("Phone 2:"), input("Phone 2 prefix"), input("Phone 2 line number")].map(
+        (element) => element.value,
+      ),
+    ).toEqual(["217", "555", "0199"]);
+    expect(input("Active Y/N:").value).toBe(" ");
+    expect(input("Credit Limit :").value).toBe(ZERO_AMOUNT);
+    expect(
+      [input("Opened :"), input("Opened month"), input("Opened day")].map((e) => e.value),
+    ).toEqual(["", "", ""]);
+    // State S: the info line of S, the fields enterable, no F5 or F12, the account field red
+    // with the cursor on it.
+    expect(messageRow("info").textContent).toBe(INFO_DETAILS);
+    expectDetailsEnterable();
+    expect(key("F5=Save").hasAttribute("hidden")).toBe(true);
+    expect(key("F12=Cancel").hasAttribute("hidden")).toBe(true);
+    const acct = input("Account Number :");
+    expect(acct.value).toBe(ACCOUNT);
+    expect(acct.getAttribute("aria-invalid")).toBe("true");
+    expect(labelOf(acct).getAttribute("data-error")).toBe("true");
+    expect(document.activeElement).toBe(acct);
+
+    // ENTER is endpoint 6 with the details' snapshot, as after a fetch that found everything.
+    typeInto("Active Y/N:", "Y");
+    await validate();
+    expect(sent).toHaveLength(2);
+    expect(sent[1]?.body).toMatchObject({
+      aid: "ENTER",
+      fields: { active_status: "Y", first_name: "Ada", credit_limit: ZERO_AMOUNT },
+      snapshot: UNREAD_ACCOUNT.details?.snapshot,
+    });
+    expect(messageRow("error").textContent).toBe("");
+  });
+
+  it.each([
+    {
+      title: "the customer not-found 404",
+      status: 404,
+      failure: {
+        message: "CustId:000000050 not found in customer master.Resp: 0000000013 REAS:0000080",
+      },
+    },
+    {
+      title: "the account file error 500, naming the account",
+      status: 500,
+      failure: {
+        message: "File Error: READ     on ACCTDAT   returned RESP 0000000013,RESP2 0000000080",
+        field: "acct_id",
+      },
+    },
+  ])(
+    "a fetch error without details, $title, shows no value and leaves the state not fetched",
+    async ({ status, failure }) => {
+      // audit: COACTUPC-073
+      // audit: COACTUPC-081
+      // audit: COACTUP-125
+      stubApi(get(status, failure));
+      renderScreen();
+      typeInto("Account Number :", ACCOUNT);
+      fireEvent.click(key("ENTER=Process"));
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe(failure.message);
+      });
+      await settled();
+
+      expectEmptyScreen(ACCOUNT);
+      const acct = input("Account Number :");
+      expect(acct.getAttribute("aria-invalid")).toBe(String("field" in failure));
+      expect(document.activeElement).toBe(acct);
+    },
+  );
 
   it("F12=Cancel discards the edits and shows the fetched values, with no request", async () => {
     // audit: COACTUPC-069

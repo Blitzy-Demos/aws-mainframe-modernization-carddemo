@@ -31,6 +31,15 @@ import { COTRN02 } from "./COTRN02";
 
 const ENDPOINT = "/api/v1/transactions";
 
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+
 /** The account the user keys the transaction by. */
 const ACCOUNT = "00000000050";
 /** The card COTRN02C fills in from the cross-reference, as endpoint 13 returns it (E32). */
@@ -497,19 +506,19 @@ function formBusy(container: HTMLElement): string | null {
 /** The row-24 labels, in map order. */
 const KEY_LABELS = ["ENTER=Continue", "F3=Back", "F4=Clear", "F5=Copy Last Tran."];
 
-/** Whether the function-key button labelled `label` is disabled. */
+/** Whether the function-key button labelled `label` is disabled (`aria-disabled="true"`). */
 function keyDisabled(label: string): boolean {
   const button = screen.getByRole("button", { name: label });
   if (!(button instanceof HTMLButtonElement)) {
     throw new Error(`"${label}" names <${button.tagName.toLowerCase()}>, not a button`);
   }
-  return button.disabled;
+  return button.getAttribute("aria-disabled") === "true";
 }
 
 /**
  * Whether the screen shows itself waiting for an answer: `aria-busy` of the "Function keys" group
- * and of the form, the `disabled` of each row-24 button by label, and whether each input is
- * read-only, by form member.
+ * and of the form, whether each row-24 button is `aria-disabled`, by label, and whether each
+ * input is read-only, by form member.
  */
 function lockState() {
   return {
@@ -669,6 +678,10 @@ describe("COTRN02 Add Transaction screen", () => {
       expect(label.parentElement?.className).toBe(cellClass(mapInput.label));
       expect(box.parentElement?.className).toBe(cellClass(mapInput.input));
       expect(box.maxLength).toBe(mapInput.input[2]);
+      // The shared map-field box, `MAP_FIELD_BOX` with `size` = the LENGTH, so a full-length value
+      // shows on the narrowest frame.
+      expect(box.size).toBe(mapInput.input[2]);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
       expect(box.readOnly).toBe(false);
       // No input is `NUM` on the map, so none is narrowed to digits.
       expect(box.getAttribute("inputmode")).toBeNull();

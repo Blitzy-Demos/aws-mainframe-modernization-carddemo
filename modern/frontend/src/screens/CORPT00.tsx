@@ -3,7 +3,7 @@ import { useId, useMemo, useRef, useState, type FormEvent, type ReactNode } from
 import { useForm, type FieldErrors } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCorpt00cSubmit } from "@/api/hooks";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
@@ -47,21 +47,6 @@ const TURQUOISE = "h-full whitespace-pre text-foreground";
 const BLUE = "h-full whitespace-pre text-muted-foreground";
 const HINT_BLUE = "flex h-full items-center whitespace-pre text-muted-foreground";
 const HINT_NEUTRAL = "flex h-full items-center whitespace-pre text-foreground";
-
-/*
- * BLITZY [LAYOUT]: the Input's default `w-full` and `px-3` are overridden with `px-0.5` and the
- * width below for each map `LENGTH`. A grid column is narrower than a character, so the default
- * box, at least 26px wide inside a 7px to 52px cell, left no room for a 1- or 2-character value.
- * Each width is a spacing step that holds `LENGTH` monospace `text-sm` characters (0.525rem each)
- * with the padding and border, and a little more for a wider fallback monospace font, so a
- * full-length value shows; the box still ends before the `/` or hint that follows it when the
- * frame is at its minimum width.
- */
-const WIDTH_BY_LENGTH = {
-  1: "w-4",
-  2: "w-6",
-  4: "w-11",
-} as const satisfies Record<(typeof CORPT00_LENGTHS)[Corpt00Field], string>;
 
 /** One unprotected field of the map with the literal that labels it. */
 type InputSpec = {
@@ -252,9 +237,10 @@ function focusTarget(field: string | null | undefined): Corpt00Field {
  *   `ScreenError` keeps every input as typed, shows its message in red and focuses the field it
  *   names, or `MONTHLY`; the field it names stays marked invalid until it is corrected or ENTER is
  *   pressed again.
- * - A value the map would not take (longer than its `LENGTH`, or a date part that is not digits)
- *   is stopped by the schema before any request, with zod's message in the message row; a
- *   message from the server replaces it on the next response.
+ * - A value the map would not take (longer than its `LENGTH`, or a date part that is not digits
+ *   with spaces around them) is stopped by the schema before any request, with the text the
+ *   server answers the same input with in the message row; a message from the server replaces
+ *   it on the next response.
  * - F3 goes back to the main menu, as CORPT00C transfers to COMEN01C (CORPT00C-004).
  * - Any other function key shows `Invalid key pressed. Please see below...` and focuses
  *   `MONTHLY`, keeping the inputs (CORPT00C-005).
@@ -404,10 +390,16 @@ export function CORPT00(): ReactNode {
                       <FormLabel className={input.label.className}>{input.label.text}</FormLabel>
                     </GridCell>
                     <GridCell row={input.row} col={input.col} span={CORPT00_LENGTHS[input.name]}>
+                      {/*
+                       * The shared map-field box (`fieldInputClass` with `size` = the `LENGTH`):
+                       * a full-length value shows on the narrowest frame, and the box still ends
+                       * before the `/` or hint that follows it.
+                       */}
                       <FormControl>
                         <Input
                           {...field}
-                          className={`px-0.5 ${WIDTH_BY_LENGTH[CORPT00_LENGTHS[input.name]]}`}
+                          className={fieldInputClass(CORPT00_LENGTHS[input.name])}
+                          size={CORPT00_LENGTHS[input.name]}
                           maxLength={CORPT00_LENGTHS[input.name]}
                           inputMode={input.numeric ? "numeric" : undefined}
                           autoFocus={input.name === "monthly"}

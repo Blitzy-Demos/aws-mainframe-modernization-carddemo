@@ -4,7 +4,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCousr02cFetch, useCousr02cUpdate } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
@@ -56,9 +56,11 @@ const EMPTY: Cousr02Values = {
  * foreground; the BLUE hints keep `FormDescription`'s muted foreground; the YELLOW rule has no
  * token and is emphasis on the foreground. Static texts never wrap (`whitespace-pre`) and are
  * centred on their line, which every input makes `h-9` tall, so they stand level with the inputs.
+ * The inputs of two or more characters take the shared map-field box (`FIELD_INPUT`, with `size`
+ * = their `LENGTH`), so a full-length value shows on the narrowest frame.
  */
 const LABEL = "h-full whitespace-pre text-foreground";
-const VALUE = "text-foreground";
+const VALUE = `${FIELD_INPUT} text-foreground`;
 const HINT = "flex h-full items-center whitespace-pre";
 const RULE = "flex h-full items-center whitespace-pre font-semibold text-foreground";
 
@@ -66,13 +68,15 @@ const RULE = "flex h-full items-center whitespace-pre font-semibold text-foregro
 const RULE_TEXT = "*".repeat(70);
 
 /*
- * BLITZY [LAYOUT]: `USRTYPE` spans one grid column (`LENGTH=1`), a few pixels wide, so the Input's
- * default `w-full` and `px-3` would leave no room for its character. The input takes the width of
- * one character with the narrowest padding step instead, reaching into the empty attribute column
- * after it (column 18) but, down to the frame's minimum width, not into the hint at column 19;
- * its border and focus ring stay the component's.
+ * BLITZY [LAYOUT]: `USRTYPE` spans one grid column (`LENGTH=1`), a few pixels wide, and its hint
+ * starts two columns on, at column 19. The shared short-field box (`fieldInputClass`), and a
+ * `FIELD_INPUT` box holding its character, would both reach that hint on the frame's minimum
+ * width, so this input keeps the narrowest padding step instead of the shared inset and takes the
+ * width of one character: it reaches into the empty attribute column after it (column 18) but not
+ * into the hint. Its type size is the inputs' `text-sm` (AAP 0.4.3); its border and focus ring
+ * stay the component's.
  */
-const ONE_CHAR_VALUE = "min-w-4 px-0.5 text-center text-foreground";
+const ONE_CHAR_VALUE = "min-w-4 px-0.5 text-center text-sm text-foreground";
 
 /** `ScreenError.field` wire name → the input it names; the input of `MOVE -1 TO <field>L`. */
 const FIELD_BY_WIRE: Readonly<Record<string, FieldName>> = {
@@ -471,6 +475,7 @@ export function COUSR02(): ReactNode {
                         {...field}
                         readOnly={busy}
                         maxLength={COUSR02_LENGTHS.userId}
+                        size={COUSR02_LENGTHS.userId}
                         autoComplete="off"
                         spellCheck={false}
                         autoFocus
@@ -507,6 +512,7 @@ export function COUSR02(): ReactNode {
                         {...field}
                         readOnly={busy}
                         maxLength={COUSR02_LENGTHS.firstName}
+                        size={COUSR02_LENGTHS.firstName}
                         autoComplete="off"
                         spellCheck={false}
                         className={VALUE}
@@ -532,6 +538,7 @@ export function COUSR02(): ReactNode {
                         {...field}
                         readOnly={busy}
                         maxLength={COUSR02_LENGTHS.lastName}
+                        size={COUSR02_LENGTHS.lastName}
                         autoComplete="off"
                         spellCheck={false}
                         className={VALUE}
@@ -558,6 +565,7 @@ export function COUSR02(): ReactNode {
                         readOnly={busy}
                         type="password"
                         maxLength={COUSR02_LENGTHS.password}
+                        size={COUSR02_LENGTHS.password}
                         autoComplete="off"
                         className={VALUE}
                       />
@@ -585,6 +593,7 @@ export function COUSR02(): ReactNode {
                         {...field}
                         readOnly={busy}
                         maxLength={COUSR02_LENGTHS.userType}
+                        size={COUSR02_LENGTHS.userType}
                         autoComplete="off"
                         spellCheck={false}
                         className={ONE_CHAR_VALUE}

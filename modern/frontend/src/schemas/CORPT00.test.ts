@@ -6,18 +6,21 @@ import { CORPT00_LENGTHS, type Corpt00Values, corpt00Schema } from "./CORPT00";
  * half of the ten `both` rows of `modern/audit/screens.md`: the map `LENGTH` of the three report
  * selectors and the confirmation (`CORPT00-012`, `CORPT00-015`, `CORPT00-018`, `CORPT00-038`), and
  * the `LENGTH` and `NUM` of the six date parts (`CORPT00-022` to `CORPT00-034`). The rows record
- * no message, so every rejection carries zod's default. `modern/audit/online/CORPT00C.md` and
+ * no message and the server owns every message, so each rejection carries the text endpoint 14
+ * answers the same input with, written out here apart from the schema's constants. A date part
+ * of digits with spaces around them, or all spaces, is what the request DTO admits and NUMVAL-C
+ * reads (`CORPT00C-017`), so it passes here as typed. `modern/audit/online/CORPT00C.md` and
  * `modern/audit/online/CSUTLDTC.md` have no `both` row: the report selection, the blank-part,
  * month and day edits and the confirmation are `server` rows endpoint 14 owns, and calendar
  * validity is halt H5, so inputs those edits reject pass here and no program message is asserted.
  * Every expected length is written by hand from `app/bms/CORPT00.bms`. All values are synthetic.
  */
 
-/** Zod's default `max` message, which every length rejection carries. */
-const tooLong = (length: number): string => `String must contain at most ${length} character(s)`;
+/** `FIELD_LENGTH_MESSAGE` of the request DTOs, which every length rejection carries. */
+const TOO_LONG = "Input does not fit the screen field...";
 
-/** Zod's default `regex` message, for a date part that is not digits only (`NUM`). */
-const NOT_DIGITS = "Invalid";
+/** `FIELD_NUMERIC_MESSAGE` of the request DTOs, for a date part that is not digits (`NUM`). */
+const NOT_DIGITS = "Only digits can be entered in this field...";
 
 /** The form as the screen first sends it: every input empty. */
 const BLANK: Corpt00Values = {
@@ -124,6 +127,30 @@ describe("corpt00Schema", () => {
       values: { ...BLANK, monthly: " " },
     },
     {
+      name: "a confirmed monthly report with a space in Start Month, whose parts Monthly ignores",
+      values: { ...BLANK, monthly: "X", startMonth: " ", confirm: "Y" },
+    },
+    {
+      name: "a custom report with an all-space start month, which the server's blank edit answers",
+      values: { ...CUSTOM_RANGE, startMonth: "  " },
+    },
+    {
+      name: "a custom report with an all-space end year, which the server's blank edit answers",
+      values: { ...CUSTOM_RANGE, endYear: "    " },
+    },
+    {
+      name: "a custom report with space-padded parts, which NUMVAL-C reads as their digits",
+      values: {
+        ...CUSTOM_RANGE,
+        startMonth: " 1",
+        startDay: "5 ",
+        startYear: "  23",
+        endMonth: "3 ",
+        endDay: " 9",
+        endYear: " 23 ",
+      },
+    },
+    {
       name: "every selector marked at once, the server taking the first",
       values: { ...CUSTOM_RANGE, monthly: "X", yearly: "X" },
     },
@@ -163,7 +190,7 @@ describe("corpt00Schema", () => {
     }
     expect(check({ ...CUSTOM_RANGE, [field]: "XY" })).toEqual({
       success: false,
-      issues: [{ path: [field], message: tooLong(1) }],
+      issues: [{ path: [field], message: TOO_LONG }],
     });
   });
 
@@ -175,19 +202,37 @@ describe("corpt00Schema", () => {
     { field: "endDay", length: 2 }, // audit: CORPT00-032
     { field: "endYear", length: 4 }, // audit: CORPT00-034
   ])(
-    "accepts digits in $field up to its map LENGTH $length and rejects more or a non-digit",
+    "accepts digits with spaces around them in $field up to its LENGTH $length, and nothing else",
     ({ field, length }) => {
       expect(CORPT00_LENGTHS[field]).toBe(length);
-      for (const value of ["", "1", "0".repeat(length), "9".repeat(length)]) {
+      // Digits, an all-space blank and digits with spaces before or after them, sent as typed.
+      for (const value of [
+        "",
+        "1",
+        "0".repeat(length),
+        "9".repeat(length),
+        " ",
+        " ".repeat(length),
+        " 5",
+        "5 ",
+        "1".padStart(length),
+        "1".padEnd(length),
+      ]) {
         const accepted = { ...CUSTOM_RANGE, [field]: value };
         expect(corpt00Schema.safeParse(accepted)).toEqual({ success: true, data: accepted });
       }
       expect(check({ ...CUSTOM_RANGE, [field]: "9".repeat(length + 1) })).toEqual({
         success: false,
-        issues: [{ path: [field], message: tooLong(length) }],
+        issues: [{ path: [field], message: TOO_LONG }],
       });
-      // NUMVAL-C would read a sign, a decimal point or spaces; the map's NUM sends digits only.
-      for (const value of ["1a", "A", " 1", "-1", "1."]) {
+      expect(check({ ...CUSTOM_RANGE, [field]: " ".repeat(length + 1) })).toEqual({
+        success: false,
+        issues: [{ path: [field], message: TOO_LONG }],
+      });
+      // NUMVAL-C would read a sign or a decimal point, which the request DTO refuses; a space
+      // between two digits or a letter is no NUMVAL-C format at all.
+      const innerSpaces = length >= 3 ? ["1 2", " 1 2", "20 2"] : [];
+      for (const value of ["1a", "A", "AB", "-1", "1.", "+1", ...innerSpaces]) {
         expect(check({ ...CUSTOM_RANGE, [field]: value })).toEqual({
           success: false,
           issues: [{ path: [field], message: NOT_DIGITS }],
@@ -197,12 +242,12 @@ describe("corpt00Schema", () => {
   );
 
   // LENGTH and NUM are two attributes the terminal enforced on one field, so a part breaking both
-  // reports both issues, in the schema's order: the length first.
+  // reports both issues, in the schema's order: the length first, as the request DTO reports it.
   it("reports the length and then the digits when a date part breaks both", () => {
     expect(check({ ...CUSTOM_RANGE, startYear: "20a23" })).toEqual({
       success: false,
       issues: [
-        { path: ["startYear"], message: tooLong(4) },
+        { path: ["startYear"], message: TOO_LONG },
         { path: ["startYear"], message: NOT_DIGITS },
       ],
     });
@@ -236,7 +281,7 @@ describe("corpt00Schema", () => {
     const result = corpt00Schema.safeParse(over);
     expect(result.success).toBe(false);
     expect(result.error?.issues.map(({ path, message }) => ({ path, message }))).toEqual(
-      lengths.map(([field, length]) => ({ path: [field], message: tooLong(length) })),
+      lengths.map(([field]) => ({ path: [field], message: TOO_LONG })),
     );
   });
 });

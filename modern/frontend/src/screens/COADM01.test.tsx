@@ -48,9 +48,10 @@ const INVALID_KEY_TEXT = "Invalid key pressed. Please see below...".padEnd(50, "
 const OPTION_PROGRAMS = ["COUSR00C", "COUSR01C", "COUSR02C", "COUSR03C", "COTRTLIC", "COTRTUPC"];
 
 /**
- * Endpoint 3's body for the six options of `app/cpy/COADM02Y.cpy:26-53`. Each row text is the 40
- * bytes `BUILD-MENU-OPTIONS` strings: the two digits, `. `, the 35-byte name and one space. Option
- * 6 is stubbed as not installed, the case of COADM01C-018 that no shipped option has.
+ * Endpoint 3's body for the six options of `app/cpy/COADM02Y.cpy:26-53`. Each name is the 35
+ * bytes as declared, with no user type, and each row text is the 40 bytes `BUILD-MENU-OPTIONS`
+ * strings: the two digits, `. `, the 35-byte name and one space. Option 6 is stubbed as not
+ * installed, the case of COADM01C-018 that no shipped option has.
  */
 const menu: components["schemas"]["MenuResponse"] = {
   invalid_option_message: INVALID_OPTION,
@@ -58,6 +59,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: true,
+      name: "User List (Security)".padEnd(35, " "),
       number: "01",
       program: "COUSR00C",
       text: "01. User List (Security)".padEnd(40, " "),
@@ -66,6 +68,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: true,
+      name: "User Add (Security)".padEnd(35, " "),
       number: "02",
       program: "COUSR01C",
       text: "02. User Add (Security)".padEnd(40, " "),
@@ -74,6 +77,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: true,
+      name: "User Update (Security)".padEnd(35, " "),
       number: "03",
       program: "COUSR02C",
       text: "03. User Update (Security)".padEnd(40, " "),
@@ -82,6 +86,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: true,
+      name: "User Delete (Security)".padEnd(35, " "),
       number: "04",
       program: "COUSR03C",
       text: "04. User Delete (Security)".padEnd(40, " "),
@@ -90,6 +95,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: true,
+      name: "Transaction Type List/Update (Db2)".padEnd(35, " "),
       number: "05",
       program: "COTRTLIC",
       text: "05. Transaction Type List/Update (Db2)".padEnd(40, " "),
@@ -98,6 +104,7 @@ const menu: components["schemas"]["MenuResponse"] = {
     {
       admin_only: true,
       installed: false,
+      name: "Transaction Type Maintenance (Db2)".padEnd(35, " "),
       number: "06",
       program: "COTRTUPC",
       text: "06. Transaction Type Maintenance (Db2)".padEnd(40, " "),
@@ -305,8 +312,8 @@ function menuForm(): HTMLFormElement {
  * free either way.
  */
 function expectBusy(busy: boolean): void {
-  expect(enterButton()).toHaveProperty("disabled", busy);
-  expect(screen.getByRole("button", { name: "F3=Exit" })).toHaveProperty("disabled", false);
+  expect(enterButton().getAttribute("aria-disabled")).toBe(busy ? "true" : null);
+  expect(screen.getByRole("button", { name: "F3=Exit" }).getAttribute("aria-disabled")).toBeNull();
   expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
     String(busy),
   );

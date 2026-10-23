@@ -13,6 +13,8 @@
 //! | `page_after` | COTRN00C `PROCESS-PAGE-FORWARD`: `STARTBR` (`GTEQ`), `READNEXT` (`COTRN00C.cbl:279-328,591-653`; COTRN00C-014) | `queries/transactions_page_forward.sql` | `transactions_pkey` |
 //! | `page_before` | COTRN00C `PROCESS-PAGE-BACKWARD`: `STARTBR`, `READPREV` (`COTRN00C.cbl:333-375,591-619,658-687`; COTRN00C-023) | `queries/transactions_page_backward.sql` | `transactions_pkey`, backward |
 //! | `find_all_in_card_order` | CREASTMT `STEP010` `SORT FIELDS=(263,16,CH,A,1,16,CH,A)` (`CREASTMT.JCL:53`; CBSTM03A-001) | `ORDER BY card_num, tran_id` | `transactions_card_num_idx` |
+//! | `stream_in_card_order` | the same order, read as 8100-TRNXFILE-OPEN and 8500-READTRNX-READ read TRXFL, one record at a time (`CBSTM03A.CBL:744-761,818-853`; CBSTM03A-006, CBSTM03A-008) | the statement of `find_all_in_card_order` | `transactions_card_num_idx` |
+//! | `find_by_card` | one card's entry of CBSTM03A's table, which 4000-TRNXFILE-GET prints (`CBSTM03A.CBL:416-456`; CBSTM03A-008, CBSTM03A-013) | `WHERE card_num = $1::bpchar ORDER BY tran_id` | `transactions_card_num_idx` |
 //! | `find_processed_between` | TRANREPT `INCLUDE COND` on `TRAN-PROC-DT`, then `SORT FIELDS=(TRAN-CARD-NUM,A)` (`TRANREPT.jcl:41-48`, `TRANREPT.prc:39-46`; CBTRN03C-004, CBTRN03C-005) | the `proc_ts` window, `ORDER BY card_num, tran_id` | `transactions_proc_ts_idx` |
 //! | `stream_processed_between` | the same selection, read as CBTRN03C's loop reads the sorted file, one record at a time (`CBTRN03C.cbl:170-206,248-272`; CBTRN03C-003, CBTRN03C-010) | the statement of `find_processed_between` | `transactions_proc_ts_idx` |
 //!
@@ -23,22 +25,25 @@
 //! [`PgSession`] (a batch job's session, autocommit) run it. Every column is `COLLATE "C"`, so key comparisons and orders are byte order, which
 //! is the numeric order of the 16-digit IDs every in-scope writer stores (COTRN02C-043).
 //!
-//! The processing-date window is the one statement two methods share:
+//! Two statements are each shared by two methods. The processing-date window:
 //! `stream_processed_between` yields its rows as [`TransactionRows`], each decoded as it is
 //! read, so the selection is never held whole, and `find_processed_between` collects those
-//! rows into a `Vec`.
+//! rows into a `Vec`. The card order: `stream_in_card_order` yields the rows the same way, and
+//! `find_all_in_card_order` collects them.
 //!
 //! # Redaction (Cardholder Data Redaction)
 //!
 //! The card number reaches its bind parameter only inside the [`TransactionRow`] that
-//! `from_record` built through `CardNumber::expose`. No record or row is formatted into an
-//! error, and a failed allocation names the column alone, never the stored value.
+//! `from_record` built through `CardNumber::expose`, or, for `find_by_card`, as the key text
+//! taken from `CardNumber::expose`. No record, row or key is formatted into an error, and a
+//! failed allocation or a key that cannot be bound names the column alone, never the value.
 
 use std::task::{Context, Poll};
 
 use chrono::NaiveDate;
 use copybook::{PicU, PicX};
 use domain::records::TransactionRecord;
+use domain::sensitive::CardNumber;
 use sqlx::PgExecutor;
 
 use crate::error::{DecodeKind, PersistenceError};
@@ -48,6 +53,10 @@ use crate::{PgSession, PgStore, PgTx, ProbePoint, probed};
 /// Column `tran_id`, `TRAN-ID PIC X(16)` (CVTRA05Y-001): the key every keyed statement binds
 /// and the column a failed allocation names.
 const TRAN_ID: &str = "tran_id";
+
+/// Column `card_num`, `TRAN-CARD-NUM PIC X(16)` (CVTRA05Y-011): the key `find_by_card` binds
+/// and the column a key it cannot bind names.
+const CARD_NUM: &str = "card_num";
 
 /// The digits of `WS-TRAN-ID-N PIC 9(16)` (`COTRN02C.cbl:57`) and `WS-TRAN-ID-NUM PIC 9(16)`
 /// (`COBIL00C.cbl:57`), which the allocation moves back into `TRAN-ID`.
@@ -61,7 +70,8 @@ type PolledRecord = Poll<Option<Result<TransactionRecord, PersistenceError>>>;
 type PollRecord<'a> = Box<dyn FnMut(&mut Context<'_>) -> PolledRecord + Send + 'a>;
 
 /// The rows of a selection, read one at a time and in the selection's order: what
-/// [`TransactionRepository::stream_processed_between`] returns.
+/// [`TransactionRepository::stream_processed_between`] and
+/// [`TransactionRepository::stream_in_card_order`] return.
 ///
 /// - On [`PgStore`], [`PgTx`] and [`PgSession`] the statement runs at the first
 ///   [`next`](Self::next), and each row is decoded through codec B
@@ -80,7 +90,8 @@ pub struct TransactionRows<'a> {
 impl<'a> TransactionRows<'a> {
     /// Rows that yield `records`, in their order: the rows of an implementation that holds
     /// them, such as the default
-    /// [`stream_processed_between`](TransactionRepository::stream_processed_between).
+    /// [`stream_processed_between`](TransactionRepository::stream_processed_between) and
+    /// [`stream_in_card_order`](TransactionRepository::stream_in_card_order).
     #[must_use]
     pub fn from_records(records: Vec<TransactionRecord>) -> Self {
         let mut records = records.into_iter();
@@ -112,7 +123,7 @@ impl<'a> TransactionRows<'a> {
     ///
     /// [`PersistenceError::Decode`] when the row does not fit its pictures;
     /// [`PersistenceError::Unavailable`] or [`PersistenceError::Database`] when the statement or
-    /// the fetch of the row fails (CBTRN03C-007, CBTRN03C-010).
+    /// the fetch of the row fails (CBTRN03C-007, CBTRN03C-010, CBSTM03A-012).
     pub async fn next(&mut self) -> Result<Option<TransactionRecord>, PersistenceError> {
         let Some(poll) = self.poll.as_mut() else {
             return Ok(None);
@@ -183,8 +194,10 @@ pub trait TransactionRepository: Send {
     /// - Allocation takes no lock, exactly as the CICS browse takes none: two concurrent adds
     ///   or payments can compute the same ID, and the second [`insert`](Self::insert) fails with
     ///   [`PersistenceError::Duplicate`], which the caller answers with `Tran ID already
-    ///   exist...` (COTRN02C-050, COBIL00C-029). On a [`PgTx`] the read sees the transaction's
-    ///   own uncommitted inserts.
+    ///   exist...` (COTRN02C-050, COBIL00C-029). Serialising the allocation, for example with a
+    ///   lock taken before the read, would remove that audited outcome, so the browse is
+    ///   reproduced without one. On a [`PgTx`] the read sees the transaction's own uncommitted
+    ///   inserts.
     ///
     /// # Errors
     ///
@@ -276,6 +289,64 @@ pub trait TransactionRepository: Send {
     fn find_all_in_card_order(
         &mut self,
     ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send;
+
+    /// The transactions [`find_all_in_card_order`](Self::find_all_in_card_order) returns, in the
+    /// same order, read one at a time as [`TransactionRows`]: the records 8100-TRNXFILE-OPEN and
+    /// 8500-READTRNX-READ read from TRXFL, one `READ` each (`CBSTM03A.CBL:744-761,818-853`;
+    /// CBSTM03A-006, CBSTM03A-008).
+    ///
+    /// - [`PgStore`], [`PgTx`] and [`PgSession`] run the one statement of
+    ///   `find_all_in_card_order` at the first [`TransactionRows::next`] and decode each row as it
+    ///   is read, so one decoded row at a time is held, whatever the table holds. The rows hold
+    ///   their connection, a pooled one for [`PgStore`], until they end, fail or are dropped.
+    /// - The default body, for implementations that hold their rows, such as test doubles,
+    ///   awaits `find_all_in_card_order` and yields its records.
+    ///
+    /// # Errors
+    ///
+    /// The returned future fails only in the default body, as `find_all_in_card_order` fails.
+    /// On [`PgStore`], [`PgTx`] and [`PgSession`] the failures of the statement and of each
+    /// row, those of `find_all_in_card_order`, come from [`TransactionRows::next`]
+    /// (CBSTM03A-012).
+    fn stream_in_card_order(
+        &mut self,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        async move {
+            let records = self.find_all_in_card_order().await?;
+            Ok(TransactionRows::from_records(records))
+        }
+    }
+
+    /// The transactions of card `card`, by transaction ID: the entry of `card` in CBSTM03A's
+    /// table, whose transactions 4000-TRNXFILE-GET prints (`CBSTM03A.CBL:416-456`;
+    /// CBSTM03A-008, CBSTM03A-013), read by key when its statement is built. A card no row
+    /// carries has none.
+    ///
+    /// - The order is byte order, as for
+    ///   [`find_all_in_card_order`](Self::find_all_in_card_order), and the program's EBCDIC
+    ///   order (X-CREASTMT-3) is the caller's to apply. The rows are those of `card` in
+    ///   `find_all_in_card_order`, in the same order.
+    /// - The default body, for implementations that hold their rows, such as test doubles,
+    ///   keeps the records of `find_all_in_card_order` whose card number is `card`.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistenceError::Decode`] with [`DecodeKind::InvalidByte`] when `card` holds a NUL or
+    /// non-ASCII byte, which no `CHAR(16)` value can match; [`PersistenceError::Decode`] when a
+    /// stored row does not fit its pictures; [`PersistenceError::Unavailable`] or
+    /// [`PersistenceError::Database`] when the read fails (CBSTM03A-012).
+    fn find_by_card(
+        &mut self,
+        card: &CardNumber,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        async move {
+            let records = self.find_all_in_card_order().await?;
+            Ok(records
+                .into_iter()
+                .filter(|record| record.card_num == *card)
+                .collect())
+        }
+    }
 
     /// The transactions processed on `start` through `end`, both days included, by card
     /// number, then by transaction ID: TRANREPT's `INCLUDE COND=(TRAN-PROC-DT,GE,…,AND,
@@ -385,6 +456,19 @@ impl TransactionRepository for PgStore {
         select_in_card_order(self.pool())
     }
 
+    fn stream_in_card_order(
+        &mut self,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(in_card_order_rows(self.pool())))
+    }
+
+    fn find_by_card(
+        &mut self,
+        card: &CardNumber,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_by_card(self.pool(), card)
+    }
+
     fn find_processed_between(
         &mut self,
         start: NaiveDate,
@@ -450,6 +534,19 @@ impl TransactionRepository for PgTx<'_> {
         select_in_card_order(self.conn())
     }
 
+    fn stream_in_card_order(
+        &mut self,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(in_card_order_rows(self.conn())))
+    }
+
+    fn find_by_card(
+        &mut self,
+        card: &CardNumber,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_by_card(self.conn(), card)
+    }
+
     fn find_processed_between(
         &mut self,
         start: NaiveDate,
@@ -513,6 +610,19 @@ impl TransactionRepository for PgSession {
         &mut self,
     ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
         select_in_card_order(self.conn())
+    }
+
+    fn stream_in_card_order(
+        &mut self,
+    ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+        std::future::ready(Ok(in_card_order_rows(self.conn())))
+    }
+
+    fn find_by_card(
+        &mut self,
+        card: &CardNumber,
+    ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+        select_by_card(self.conn(), card)
     }
 
     fn find_processed_between(
@@ -679,17 +789,59 @@ async fn select_page_backward<'e, E: PgExecutor<'e>>(
     into_records(rows)
 }
 
-/// `find_all_in_card_order`: every row, by card number, then transaction ID.
-async fn select_in_card_order<'e, E: PgExecutor<'e>>(
+/// `find_all_in_card_order`: every record [`in_card_order_rows`] reads, in its order.
+async fn select_in_card_order<'e, E: PgExecutor<'e> + 'e>(
     executor: E,
 ) -> Result<Vec<TransactionRecord>, PersistenceError> {
-    let rows = sqlx::query_as!(
+    let mut rows = in_card_order_rows(executor);
+    let mut records = Vec::new();
+    while let Some(record) = rows.next().await? {
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// `stream_in_card_order`: every row, by card number, then transaction ID, each decoded
+/// through codec B as it is read. The statement runs at the first [`TransactionRows::next`].
+fn in_card_order_rows<'e, E: PgExecutor<'e> + 'e>(executor: E) -> TransactionRows<'e> {
+    let mut rows = sqlx::query_as!(
         TransactionRow,
         r#"SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
                   tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
                   card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler
            FROM transactions
            ORDER BY card_num, tran_id"#
+    )
+    .fetch(executor);
+    // The boxed stream is polled through its trait object, as in `processed_between_rows`.
+    TransactionRows::polled(move |cx| {
+        rows.as_mut().poll_next(cx).map(|row| {
+            row.map(|row| {
+                row.map_err(PersistenceError::from)
+                    .and_then(TransactionRow::into_record)
+            })
+        })
+    })
+}
+
+/// `find_by_card`: the rows whose card number is `card`, by transaction ID.
+async fn select_by_card<'e, E: PgExecutor<'e>>(
+    executor: E,
+    card: &CardNumber,
+) -> Result<Vec<TransactionRecord>, PersistenceError> {
+    let card_num = pic_x_to_string(CARD_NUM, card.expose())?;
+    // The key text is cast to `bpchar`: `sqlx` binds a `String` as `text`, against which the
+    // `CHAR(n)` column compares as `text`, its trailing spaces dropped, so a key that ends in
+    // spaces would find no row and `transactions_card_num_idx` could not serve the statement.
+    let rows = sqlx::query_as!(
+        TransactionRow,
+        r#"SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,
+                  tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,
+                  card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler
+           FROM transactions
+           WHERE card_num = $1::bpchar
+           ORDER BY tran_id"#,
+        card_num
     )
     .fetch_all(executor)
     .await?;
@@ -749,6 +901,7 @@ mod tests {
     use chrono::NaiveDate;
     use copybook::{FixedRecord, PicX};
     use domain::records::TransactionRecord;
+    use domain::sensitive::CardNumber;
 
     use super::{TransactionRepository, TransactionRows};
     use crate::PgStore;
@@ -800,6 +953,11 @@ mod tests {
     /// The `PIC X(16)` key holding `text`.
     fn key(text: &[u8; 16]) -> PicX<16> {
         PicX::from_array(*text)
+    }
+
+    /// The card number `text`.
+    fn card(text: &[u8; 16]) -> CardNumber {
+        CardNumber::new(key(text))
     }
 
     /// The IDs of `records`, in their order.
@@ -954,6 +1112,74 @@ mod tests {
         Ok(())
     }
 
+    /// CREASTMT's reads of the card order on the pool, a transaction and a session: the
+    /// streamed rows are those of `find_all_in_card_order`, in its order; `find_by_card` gives
+    /// exactly one card's rows, by transaction ID whatever the insertion order, and none for a
+    /// card no row carries. Rows dropped before their end leave the connection usable.
+    // audit: CBSTM03A-001
+    // audit: CBSTM03A-006
+    // audit: CBSTM03A-008
+    // audit: CBSTM03A-013
+    #[tokio::test]
+    async fn card_order_is_streamed_whole_and_read_by_card() -> TestResult {
+        let guard = test_support::postgres::start_postgres().await?;
+        let mut store = PgStore::new(guard.pool().clone());
+        let (card_a, card_b) = (card(CARD_A), card(CARD_B));
+        let unknown = card(b"9900000000000003");
+
+        // An empty table: no row to stream, none for a card.
+        assert!(drain(store.stream_in_card_order().await?).await?.is_empty());
+        assert!(store.find_by_card(&card_a).await?.is_empty());
+
+        let rows: [(&[u8; 16], &[u8; 16]); 5] = [
+            (b"0000000000000009", CARD_B),
+            (b"0000000000000007", CARD_A),
+            (b"0000000000000003", CARD_A),
+            (b"0000000000000001", CARD_B),
+            (b"0000000000000005", CARD_A),
+        ];
+        for (id, card_num) in rows {
+            store.insert(&record(id, card_num, BLANK_TS)?).await?;
+        }
+        let of_a = [
+            *b"0000000000000003",
+            *b"0000000000000005",
+            *b"0000000000000007",
+        ];
+        let of_b = [*b"0000000000000001", *b"0000000000000009"];
+        let all = store.find_all_in_card_order().await?;
+        assert_eq!(ids(&all), [of_a.as_slice(), of_b.as_slice()].concat());
+        assert_eq!(drain(store.stream_in_card_order().await?).await?, all);
+        for (card_num, expected) in [(&card_a, of_a.as_slice()), (&card_b, of_b.as_slice())] {
+            let found = store.find_by_card(card_num).await?;
+            assert_eq!(ids(&found), expected);
+            assert!(found.iter().all(|record| record.card_num == *card_num));
+        }
+        assert!(store.find_by_card(&unknown).await?.is_empty());
+
+        // A transaction reads its own uncommitted row in both.
+        let mut tx = store.begin().await?;
+        tx.insert(&record(b"0000000000000002", CARD_A, BLANK_TS)?)
+            .await?;
+        let in_tx = tx.find_all_in_card_order().await?;
+        assert_eq!(in_tx.len(), all.len() + 1);
+        assert_eq!(drain(tx.stream_in_card_order().await?).await?, in_tx);
+        let of_a_in_tx = [&[*b"0000000000000002"], of_a.as_slice()].concat();
+        assert_eq!(ids(&tx.find_by_card(&card_a).await?), of_a_in_tx);
+        let mut partly = tx.stream_in_card_order().await?;
+        assert!(partly.next().await?.is_some());
+        drop(partly);
+        assert!(tx.find_by_card(&unknown).await?.is_empty());
+        tx.rollback().await?;
+
+        // A session sees the committed rows alone.
+        let mut session = store.session().await?;
+        assert_eq!(drain(session.stream_in_card_order().await?).await?, all);
+        assert_eq!(ids(&session.find_by_card(&card_b).await?), of_b);
+        session.close().await?;
+        Ok(())
+    }
+
     /// A double that holds the answer of its window read: the default
     /// `stream_processed_between` yields exactly the records `find_processed_between` returns,
     /// or fails as it fails. Its other reads are never called.
@@ -1043,6 +1269,96 @@ mod tests {
         Ok(())
     }
 
+    /// A double that holds the answer of its card-order read: the default
+    /// `stream_in_card_order` and `find_by_card` serve exactly the records
+    /// `find_all_in_card_order` returns, or fail as it fails. Its other reads are never called.
+    struct CardOrdered(Result<Vec<TransactionRecord>, PersistenceError>);
+
+    impl TransactionRepository for CardOrdered {
+        fn find_by_id(
+            &mut self,
+            _: &PicX<16>,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn find_last(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn next_id(&mut self) -> impl Future<Output = Result<PicX<16>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn insert(
+            &mut self,
+            _: &TransactionRecord,
+        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn page_after(
+            &mut self,
+            _: &PicX<16>,
+            _: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn page_before(
+            &mut self,
+            _: &PicX<16>,
+            _: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+
+        fn find_all_in_card_order(
+            &mut self,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(self.0.clone())
+        }
+
+        fn find_processed_between(
+            &mut self,
+            _: NaiveDate,
+            _: NaiveDate,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            std::future::ready(Err(PersistenceError::Unavailable))
+        }
+    }
+
+    /// The default card-order reads of a double: the stream yields the held records in their
+    /// order; `find_by_card` keeps one card's records in that order, none for a card no record
+    /// carries; both fail as the whole read fails.
+    #[tokio::test]
+    async fn held_card_order_is_streamed_and_read_by_card_by_default() -> TestResult {
+        let (card_a, card_b) = (card(CARD_A), card(CARD_B));
+        let a1 = record(b"0000000000000001", CARD_A, BLANK_TS)?;
+        let a3 = record(b"0000000000000003", CARD_A, BLANK_TS)?;
+        let b2 = record(b"0000000000000002", CARD_B, BLANK_TS)?;
+        let held = vec![a1.clone(), a3.clone(), b2.clone()];
+        let mut answering = CardOrdered(Ok(held.clone()));
+        assert_eq!(drain(answering.stream_in_card_order().await?).await?, held);
+        assert_eq!(answering.find_by_card(&card_a).await?, [a1, a3]);
+        assert_eq!(answering.find_by_card(&card_b).await?, [b2]);
+        let unknown = card(b"9900000000000003");
+        assert!(answering.find_by_card(&unknown).await?.is_empty());
+
+        let mut failing = CardOrdered(Err(PersistenceError::Unavailable));
+        let refused = failing.stream_in_card_order().await;
+        assert_eq!(refused.err(), Some(PersistenceError::Unavailable));
+        assert_eq!(
+            failing.find_by_card(&card_a).await,
+            Err(PersistenceError::Unavailable)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn keys_no_statement_can_bind_and_negative_limits_are_refused() -> TestResult {
         let guard = test_support::postgres::start_postgres().await?;
@@ -1058,6 +1374,12 @@ mod tests {
             Err(invalid.clone())
         );
         assert_eq!(store.find_by_id(&high_values).await, Err(invalid));
+        // A card number no `CHAR(16)` value can hold names the column alone.
+        let unbound = PersistenceError::decode("card_num", DecodeKind::InvalidByte);
+        assert_eq!(
+            store.find_by_card(&CardNumber::new(high_values)).await,
+            Err(unbound)
+        );
         let refused = store.page_after(&PicX::spaces(), -1).await;
         assert_eq!(
             refused.as_ref().err().and_then(PersistenceError::sqlstate),

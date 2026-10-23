@@ -104,3 +104,30 @@
     @apply bg-background text-foreground;
   }
 }
+
+/*
+ * Forced-colors mode (Windows High Contrast and the like) replaces author colours with the user's
+ * palette and drops box-shadow. That removes the generated controls' focus indicator
+ * (`outline-none` plus a box-shadow ring) and the default (ENTER) button's filled background,
+ * which has no border, and it paints the empty message row's `border-transparent` in the text
+ * colour. These rules apply only in that mode, in system colours, which the mode keeps:
+ * - every focused element shows a 2px Highlight outline;
+ * - every button has a 1px ButtonText border, so ENTER keeps a boundary; the outline variant's
+ *   1px border keeps its width;
+ * - an empty message row (`data-message-empty`, set by MessageLine) paints its border in Canvas, so
+ *   it shows no box, as outside this mode, and keeps its height.
+ * The block is outside every layer on purpose: Tailwind puts `outline-none` in the utilities layer,
+ * and an unlayered declaration outranks every layered one whatever its specificity.
+ */
+@media (forced-colors: active) {
+  :focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: 2px;
+  }
+  [data-slot="button"] {
+    border: 1px solid ButtonText;
+  }
+  [data-slot="alert"][data-message-empty] {
+    border-color: Canvas;
+  }
+}

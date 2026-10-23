@@ -1,11 +1,17 @@
 //! The API's error contract: [`ScreenError`], the standard `{ message, field? }` failure body of
 //! the request layer, the token gate and the programs, with the HTTP status the owning program's
-//! audit assigns (AAP 0.3.4.1, 0.5.6). Two exceptions answer without it. Endpoints 24 and 25
-//! answer COTRTLIC's own errors (400 and 500, and 404 on endpoint 25) with the page,
+//! audit assigns (AAP 0.3.4.1, 0.5.6). Endpoints 4 and 5 answer their 404 and 500 with the
+//! [`ScreenError`] and optional members beside it, `dto::coactvwc::AccountViewError` and
+//! `dto::coactupc::AccountUpdateViewError`: the blocks, and for endpoint 5 the state, that the
+//! COBOL shows with a message after a partial read. Two exceptions answer without it. Endpoints
+//! 24 and 25 answer COTRTLIC's own errors (400 and 500, and 404 on endpoint 25) with the page,
 //! `dto::cotrtlic::TranTypeListResponse` or `TranTypeListActionResult`; their request-layer
 //! rejections, an unissued `page_key` or `state`, an unreachable database and a failed commit
-//! transaction keep the [`ScreenError`]. An unmatched path (404) and a method its route does not
-//! serve (405) get axum's empty body.
+//! transaction keep the [`ScreenError`]. The router's own answers are [`ScreenError`]s too: an
+//! unmatched path is a 404 with [`NO_SUCH_ROUTE`], a method its route does not serve a 405 with
+//! [`METHOD_NOT_SERVED`] and the route's `Allow` header, and a request that found the API at its
+//! in-flight limit and waited the whole admission wait for a place a 503 with [`SERVER_BUSY`]
+//! and `Retry-After: 1` (see `api::app`).
 //!
 //! # Where a status comes from
 //!
@@ -24,10 +30,23 @@
 //!   [`ScreenError::input`] and an out-of-range `page_size` with [`ScreenError::page_size`];
 //!   `api::auth::extract` rejects a missing or invalid token with [`ScreenError::unauthorized`]
 //!   and a non-admin token on an admin endpoint with [`ScreenError::forbidden`].
+//! - **The router.** `api::app` answers a path no route matches with [`ScreenError::not_found`]
+//!   and [`NO_SUCH_ROUTE`], a method its route does not serve with
+//!   [`ScreenError::method_not_allowed`], and a request still beyond its in-flight limit when
+//!   its admission wait passes with [`ScreenError::service_unavailable`]. None of them reaches a
+//!   program.
+//! - **A saturated password-work budget.** A request of sign-on, user add or user update whose
+//!   argon2id computation found no place within the budget's wait (`crate::app::PasswordWork`)
+//!   arrives as [`ServiceError::Saturated`] and answers 503 with [`UNABLE_TO_PROCESS`], no field
+//!   and a `Retry-After` header of [`RETRY_AFTER_SECONDS`]. The COBOL has no such answer: it is
+//!   the server being too busy to take the request now, not an outcome of the program.
 //!
 //! Statuses are 400 input, 401 sign-on or token, 403 admin gate, 404 not found, 409 changed by
-//! another user and 500 store failure. 422 is reserved for `page_size` (Bounded Pagination), and
-//! only [`ScreenError::page_size`] produces it.
+//! another user and 500 store failure; the router adds 404 for an unmatched path, 405 for an
+//! unserved method and 503 for a request refused at the in-flight limit. 422 is reserved for
+//! `page_size` (Bounded Pagination), and only [`ScreenError::page_size`] produces it. The only
+//! other 503 is that of a saturated password-work budget, which only [`ServiceError::Saturated`]
+//! produces. Every 503 carries `Retry-After`.
 //!
 //! # Thin Request Handlers
 //!
@@ -44,7 +63,8 @@
 use core::fmt;
 
 use axum::Json;
-use axum::http::StatusCode;
+use axum::http::header::RETRY_AFTER;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use domain::online::{
     coactupc, coactvwc, cobil00c, cocrdlic, cocrdslc, cocrdupc, copaus0c, copaus1c, corpt00c,
@@ -54,12 +74,40 @@ use persistence::PersistenceError;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::app::PASSWORD_WAIT;
+
 /// The message of a 500 that no COBOL program words: a store error with no audited message,
-/// such as a failed `begin` or `commit`, and an internal failure, such as token signing.
+/// such as a failed `begin` or `commit`, and an internal failure, such as token signing; and of
+/// the 503 of a saturated password-work budget.
 ///
 /// A fixed text of this crate, not a COBOL literal. It names no value, no SQLSTATE and no
 /// constraint.
 pub const UNABLE_TO_PROCESS: &str = "Unable to process request...";
+
+/// The `Retry-After` that [`ScreenError`]'s response gives a 503, in seconds: the password-work
+/// wait, [`PASSWORD_WAIT`]. A request refused by the saturated budget waited that long without a
+/// place coming free, so a retry sooner would most likely meet the same backlog. The router's
+/// in-flight refusal replaces it with its own `Retry-After: 1` (see `api::app`).
+pub const RETRY_AFTER_SECONDS: u64 = PASSWORD_WAIT.as_secs();
+
+/// The message of the router's 404: no route matches the request's path, so no program answers.
+///
+/// A fixed text of this crate, not a COBOL literal. It never names the path or the query, which
+/// can carry an account ID or a card number.
+pub const NO_SUCH_ROUTE: &str = "No operation is served at this path...";
+
+/// The message of the router's 405: a route matches the path, but none of its operations takes
+/// the request's method. The response's `Allow` header lists the methods that route serves.
+///
+/// A fixed text of this crate, not a COBOL literal. It never names the method or the path.
+pub const METHOD_NOT_SERVED: &str = "This method is not served at this path...";
+
+/// The message of the router's 503: the API already serves as many requests as it admits at
+/// once, and no place freed while this one waited for its bounded admission wait, so it was
+/// refused before any handler ran. Sending it again later may succeed.
+///
+/// A fixed text of this crate, not a COBOL literal. It names no value of the request.
+pub const SERVER_BUSY: &str = "Server busy. Please try again later...";
 
 /// The request field every [`ScreenError::page_size`] names.
 const PAGE_SIZE_FIELD: &str = "page_size";
@@ -173,10 +221,27 @@ impl ScreenError {
         )
     }
 
+    /// 405: a route matches the path, but none of its operations takes the request's method. It
+    /// names no field and sets no `Allow` header, so the router adds the one listing the route's
+    /// methods.
+    #[must_use]
+    pub fn method_not_allowed(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::METHOD_NOT_ALLOWED, message, None)
+    }
+
     /// 500: the store failed.
     #[must_use]
     pub fn store(message: impl Into<String>, field: Option<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, message, field)
+    }
+
+    /// 503: the API stayed at its limit of requests in flight for the whole time the request
+    /// waited for a place, so it was refused before any handler ran. It names no field; the
+    /// router sets its own `Retry-After` in place of the [`RETRY_AFTER_SECONDS`] the response
+    /// carries.
+    #[must_use]
+    pub fn service_unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message, None)
     }
 
     /// The HTTP status of the response.
@@ -198,10 +263,15 @@ impl ScreenError {
     }
 }
 
-/// The response: the status, and the body as JSON without the status.
+/// The response: the status, and the body as JSON without the status. A 503 also carries
+/// `Retry-After` with [`RETRY_AFTER_SECONDS`], which the router's in-flight refusal replaces.
 impl IntoResponse for ScreenError {
     fn into_response(self) -> Response {
         let status = self.status;
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            let retry_after = [(RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS))];
+            return (status, retry_after, Json(self)).into_response();
+        }
         (status, Json(self)).into_response()
     }
 }
@@ -228,6 +298,8 @@ impl std::error::Error for ScreenError {}
 ///   [`UNABLE_TO_PROCESS`]. `?` on a repository call produces it.
 /// - [`ServiceError::Internal`]: an internal failure outside the store, answered 500 with
 ///   [`UNABLE_TO_PROCESS`].
+/// - [`ServiceError::Saturated`]: the password-work budget took no more work within its wait,
+///   answered 503 with [`UNABLE_TO_PROCESS`] and `Retry-After`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServiceError<F> {
     /// The domain failure, carrying its audited message literal.
@@ -239,6 +311,10 @@ pub enum ServiceError<F> {
     /// An internal failure outside the store, such as token signing. It carries no payload, so
     /// it can disclose nothing.
     Internal,
+    /// The API's password-work budget found no place for the request's argon2id computation
+    /// within its wait, so the computation never ran and nothing was decided or written. It
+    /// carries no payload, so it can disclose nothing.
+    Saturated,
 }
 
 impl<F> From<PersistenceError> for ServiceError<F> {
@@ -254,20 +330,20 @@ impl<F: fmt::Display> fmt::Display for ServiceError<F> {
         match self {
             Self::Rule(failure) => failure.fmt(f),
             Self::Store(error) => error.fmt(f),
-            Self::Internal => f.write_str(UNABLE_TO_PROCESS),
+            Self::Internal | Self::Saturated => f.write_str(UNABLE_TO_PROCESS),
         }
     }
 }
 
 /// The source is the wrapped domain failure or [`PersistenceError`], so a walk of the error
-/// chain reaches it and can downcast to it; [`ServiceError::Internal`] wraps nothing and has
-/// none.
+/// chain reaches it and can downcast to it; [`ServiceError::Internal`] and
+/// [`ServiceError::Saturated`] wrap nothing and have none.
 impl<F: std::error::Error + 'static> std::error::Error for ServiceError<F> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Rule(failure) => Some(failure),
             Self::Store(error) => Some(error),
-            Self::Internal => None,
+            Self::Internal | Self::Saturated => None,
         }
     }
 }
@@ -282,6 +358,10 @@ where
             // Named in full: the bound `ScreenError: From<F>` would otherwise claim the call.
             ServiceError::Store(error) => <Self as From<PersistenceError>>::from(error),
             ServiceError::Internal => Self::store(UNABLE_TO_PROCESS, None),
+            // No field: the refusal concerns no input, and `into_response` adds `Retry-After`.
+            ServiceError::Saturated => {
+                Self::new(StatusCode::SERVICE_UNAVAILABLE, UNABLE_TO_PROCESS, None)
+            }
         }
     }
 }
@@ -627,7 +707,7 @@ mod tests {
     use std::error::Error as StdError;
 
     use axum::http::StatusCode;
-    use axum::http::header::CONTENT_TYPE;
+    use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
     use axum::response::IntoResponse;
     use domain::online::{
         coactupc, coactvwc, cobil00c, cocrdlic, cocrdslc, cocrdupc, copaus0c, copaus1c, corpt00c,
@@ -638,9 +718,9 @@ mod tests {
     use utoipa::{PartialSchema, ToSchema};
 
     use super::{
-        ScreenError, ServiceError, UNABLE_TO_PROCESS, account_update_field, audited_status,
-        auth_summary_field, bill_pay_field, card_list_field, report_field, tran_add_field,
-        tran_list_field, type_maint_field,
+        RETRY_AFTER_SECONDS, ScreenError, ServiceError, UNABLE_TO_PROCESS, account_update_field,
+        audited_status, auth_summary_field, bill_pay_field, card_list_field, report_field,
+        tran_add_field, tran_list_field, type_maint_field,
     };
 
     type TestResult = Result<(), Box<dyn StdError>>;
@@ -688,7 +768,9 @@ mod tests {
             (ScreenError::not_found("in", field()), 404, Some("acct_id")),
             (ScreenError::conflict("in", None), 409, None),
             (ScreenError::page_size("in"), 422, Some("page_size")),
+            (ScreenError::method_not_allowed("in"), 405, None),
             (ScreenError::store("in", field()), 500, Some("acct_id")),
+            (ScreenError::service_unavailable("in"), 503, None),
         ];
         for (error, status, expected_field) in cases {
             assert_eq!(parts(&error), (status, "in", expected_field), "{error:?}");
@@ -873,6 +955,10 @@ mod tests {
                 ScreenError::page_size("size"),
                 json!({"message": "size", "field": "page_size"}),
             ),
+            (
+                ScreenError::from(ServiceError::<cousr02c::UserMaintFailure>::Saturated),
+                json!({"message": UNABLE_TO_PROCESS}),
+            ),
         ];
         for (error, body) in cases {
             let status = error.status();
@@ -888,6 +974,45 @@ mod tests {
             assert_eq!(sent, body);
         }
         Ok(())
+    }
+
+    /// A saturated password-work budget answers 503 with the crate's fixed text, no field and
+    /// `Retry-After` in seconds, for every program that runs password work; the error displays
+    /// no value and wraps nothing. No other answer carries `Retry-After`.
+    #[test]
+    fn a_saturated_budget_answers_503_with_retry_after_and_no_field() {
+        let saturated = ServiceError::<cousr02c::UserMaintFailure>::Saturated;
+        assert_eq!(saturated.to_string(), UNABLE_TO_PROCESS);
+        assert!(saturated.source().is_none());
+        assert_eq!(RETRY_AFTER_SECONDS, 3);
+        let retry_after = RETRY_AFTER_SECONDS.to_string();
+        let answers = [
+            ScreenError::from(ServiceError::<cosgn00c::SignonFailure>::Saturated),
+            ScreenError::from(ServiceError::<cousr01c::UserAddFailure>::Saturated),
+            ScreenError::from(saturated),
+        ];
+        for error in answers {
+            assert_eq!(parts(&error), (503, UNABLE_TO_PROCESS, None));
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok()),
+                Some(retry_after.as_str())
+            );
+        }
+        let others = [
+            ScreenError::input("in", None),
+            ScreenError::page_size("size"),
+            ScreenError::from(ServiceError::<cousr02c::UserMaintFailure>::Internal),
+        ];
+        for error in others {
+            let status = error.status();
+            let response = error.into_response();
+            assert!(response.headers().get(RETRY_AFTER).is_none(), "{status}");
+        }
     }
 
     #[test]

@@ -8,6 +8,45 @@ import { cn } from "cn";
 const SCREEN_ROWS = 24;
 const SCREEN_COLUMNS = 80;
 
+/**
+ * The classes every map input adds to the `Input`'s own, with `size` = the field's `LENGTH`. A
+ * grid field of one or two characters takes them through {@link fieldInputClass}, as does code
+ * that places fields of any length; a list input's width is its table column's.
+ *
+ * BLITZY [LAYOUT]: on narrow frames a grid column is narrower than a character, so a cell of
+ * `LENGTH` columns can be narrower than `LENGTH` characters plus the padding. At the 768px minimum
+ * frame a cell of N columns is 9.075N - 8px wide, against 8.4N px of `text-sm` monospace text.
+ * - The `Input` default `w-full` stays, so the box fills its cell: the map's field box and width
+ *   (AAP 0.4.2).
+ * - `min-w-max` (replacing the Input's `min-w-0`) with `field-sizing-content` keeps the box never
+ *   narrower than its value plus the inset and border, so no value is clipped. The box is sized to
+ *   the value rather than to `size`, because browsers widen a `size` box by a wide-glyph allowance.
+ *   A box grown past its cell is therefore 8.4N + 10px at most, and for a field of two or more
+ *   characters it still ends before the next field's cell, which starts at least N + 1 columns on.
+ *   Where `field-sizing` is unsupported, `size` sets the minimum instead.
+ * - `px-1` is the one inset every map input shares, in place of the Input's `px-3`.
+ * - `text-sm` is the input type size of AAP 0.4.3. It is set here because below the `md`
+ *   breakpoint the Input uses `text-base`, whose wider glyphs would widen the box further.
+ */
+export const FIELD_INPUT = "min-w-max px-1 text-sm field-sizing-content";
+
+/** The longest `LENGTH` whose grid field takes the short-field box of {@link fieldInputClass}. */
+const SHORT_FIELD_LENGTH = 2;
+
+/**
+ * The `Input` classes of a grid field `length` characters long: {@link FIELD_INPUT}, and for a
+ * field of one or two characters a `w-6` box in place of `w-full`.
+ *
+ * BLITZY [LAYOUT]: a cell of one or two columns is at most about 22px wide, even on the widest
+ * frame, and a box sized to an empty value is only its inset and border, about 11px. The short
+ * field's box is therefore `w-6` (1.5rem) wide, whether empty or not, and always covers its cell.
+ * `min-w-max` still widens it to a two-character value, 26.8px. On the 768px frame it ends before
+ * a field that starts three columns on (27.2px).
+ */
+export function fieldInputClass(length: number): string {
+  return length <= SHORT_FIELD_LENGTH ? `${FIELD_INPUT} w-6` : FIELD_INPUT;
+}
+
 /** Props of {@link FieldGrid}. */
 export type FieldGridProps = {
   /** The map's fields, each placed by a {@link GridCell}. */

@@ -52,7 +52,9 @@ pub(crate) struct AddOperation;
 /// - 400 for a body that does not deserialise or a value its map field cannot hold, then for
 ///   the first empty field, and for a user ID already stored, `User ID already exist...`
 ///   (COUSR01C-010 to COUSR01C-014, COUSR01C-023);
-/// - 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024).
+/// - 500 `Unable to Add User...` when the user cannot be stored (COUSR01C-024);
+/// - 503, with `Retry-After` in seconds, when the server's password hashing is saturated, so
+///   nothing was stored; the same request may be sent again after that delay.
 // The taken user ID is a 400, not a 409: 409 is reserved for a record changed by another user,
 // and the duplicate is input the operator must change (COUSR01C-023), so the document declares
 // no 409. Success stays 200, not 201: the program answers the add with its message row.
@@ -90,6 +92,17 @@ pub(crate) struct AddOperation;
             status = 500,
             description = "The user could not be stored (COUSR01C-024).",
             body = ScreenError
+        ),
+        (
+            status = 503,
+            description = "Password hashing is saturated; nothing was stored.",
+            body = ScreenError,
+            headers(
+                (
+                    "Retry-After" = u64,
+                    description = "Seconds to wait before sending the request again"
+                )
+            )
         ),
     ),
     security(("bearer_auth" = [])),

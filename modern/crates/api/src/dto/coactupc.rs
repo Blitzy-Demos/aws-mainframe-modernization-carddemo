@@ -11,7 +11,10 @@
 //!   the echoed snapshot. It answers [`AccountUpdateResult`]: the info line, the screen state,
 //!   which keys apply and the amounts as shown (COACTUPC-078, COACTUPC-079, COACTUPC-082).
 //! - Every failure is an `api::error::ScreenError`, whose `field` is the name of the
-//!   [`AccountUpdateFields`] member, or `acct_id` for the path parameter.
+//!   [`AccountUpdateFields`] member, or `acct_id` for the path parameter. A 404 or 500 of
+//!   endpoint 5 is that `ScreenError` as [`AccountUpdateViewError`], which adds the state `S`
+//!   and the details the screen shows when the account read did not succeed and the customer
+//!   read found the customer (COACTUPC-099), and nothing otherwise.
 //!
 //! # State
 //!
@@ -24,7 +27,8 @@
 //! # Raw input and typed output
 //!
 //! The request carries the date, phone and SSN parts and the amounts as the raw text of their
-//! map fields, at most the map `LENGTH` (`modern/audit/screens.md` COACTUP-016 to COACTUP-120):
+//! map fields, at most the map `LENGTH` (`modern/audit/screens.md` COACTUP-016 to COACTUP-120)
+//! and fitting the field's `PIC X(n)` byte for byte as printable ASCII (X-COUSR01C-3):
 //! COACTUPC's own edits word the messages for them, the raw-edit-input exception of Typed Dates
 //! and Timestamps. Every date the API sends, in the view and in the snapshot, is a typed date,
 //! `null` for a blank field.
@@ -38,6 +42,8 @@
 
 use core::fmt;
 
+use axum::Json;
+use axum::response::{IntoResponse, Response};
 use chrono::NaiveDate;
 use domain::online::coactupc as rules;
 use domain::sensitive::Ssn;
@@ -46,6 +52,7 @@ use utoipa::ToSchema;
 use validator::Validate;
 
 use super::{digits, full_text};
+use crate::error::{ScreenError, ServiceError};
 
 /// What `Debug` prints for an SSN part that is present.
 const SSN_PART_MASK: &str = "***";
@@ -87,187 +94,192 @@ const fn withheld<T>(_: &T) -> bool {
     true
 }
 
-/// The raw text of every enterable map field of an endpoint 6 request, at most its map
-/// `LENGTH`.
+/// The raw text of every enterable map field of an endpoint 6 request, each fitting its map
+/// field's `PIC X(n)` byte for byte: at most its map `LENGTH` in bytes, each printable ASCII
+/// (`0x20`–`0x7E`), or the field's `LOW-VALUES` (X-COUSR01C-3).
 ///
 /// An absent member is the empty text, which the program reads as blank. The account number is
 /// the path's `acct_id`. The SSN parts are present only when the operator re-entered them:
 /// omitting all three means unchanged, a part omitted beside a present one is blank
 /// (COACTUPC-064). They are never serialised, so a body carrying them is written as JSON, and
 /// `Debug` prints them as `***`.
+// The byte rule is the parent module's `pic_x` beside each `length`, whose rejection text is
+// `FIELD_LENGTH_MESSAGE`, before COACTUPC's edits run. `length` counts characters, and the
+// save writes each value into a `PicX` that holds printable ASCII only, so without `pic_x` a
+// text such as `PASSPORTé` or one holding a TAB would pass the edits and fail every F5.
 #[derive(Clone, Default, Serialize, Deserialize, ToSchema, Validate)]
 #[serde(default)]
 pub struct AccountUpdateFields {
     /// `ACSTTUS` (1): the active status.
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub active_status: String,
     /// `OPNYEAR` (4): the open date's year.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub open_year: String,
     /// `OPNMON` (2): the open date's month.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub open_month: String,
     /// `OPNDAY` (2): the open date's day.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub open_day: String,
     /// `ACRDLIM` (15): the credit limit.
     #[schema(max_length = 15)]
-    #[validate(length(max = 15))]
+    #[validate(length(max = 15), custom(function = "super::pic_x::<15>"))]
     pub credit_limit: String,
     /// `EXPYEAR` (4): the expiry date's year.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub expiry_year: String,
     /// `EXPMON` (2): the expiry date's month.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub expiry_month: String,
     /// `EXPDAY` (2): the expiry date's day.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub expiry_day: String,
     /// `ACSHLIM` (15): the cash credit limit.
     #[schema(max_length = 15)]
-    #[validate(length(max = 15))]
+    #[validate(length(max = 15), custom(function = "super::pic_x::<15>"))]
     pub cash_credit_limit: String,
     /// `RISYEAR` (4): the reissue date's year.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub reissue_year: String,
     /// `RISMON` (2): the reissue date's month.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub reissue_month: String,
     /// `RISDAY` (2): the reissue date's day.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub reissue_day: String,
     /// `ACURBAL` (15): the current balance.
     #[schema(max_length = 15)]
-    #[validate(length(max = 15))]
+    #[validate(length(max = 15), custom(function = "super::pic_x::<15>"))]
     pub current_balance: String,
     /// `ACRCYCR` (15): the current cycle credit.
     #[schema(max_length = 15)]
-    #[validate(length(max = 15))]
+    #[validate(length(max = 15), custom(function = "super::pic_x::<15>"))]
     pub current_cycle_credit: String,
     /// `AADDGRP` (10): the account group.
     #[schema(max_length = 10)]
-    #[validate(length(max = 10))]
+    #[validate(length(max = 10), custom(function = "super::pic_x::<10>"))]
     pub group_id: String,
     /// `ACRCYDB` (15): the current cycle debit.
     #[schema(max_length = 15)]
-    #[validate(length(max = 15))]
+    #[validate(length(max = 15), custom(function = "super::pic_x::<15>"))]
     pub current_cycle_debit: String,
     /// `ACSTNUM` (9): the customer ID, read-only once details are shown.
     #[schema(max_length = 9)]
-    #[validate(length(max = 9))]
+    #[validate(length(max = 9), custom(function = "super::pic_x::<9>"))]
     pub customer_id: String,
     /// `ACTSSN1` (3): the first three SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 3, example = "***")]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub ssn_part1: Option<String>,
     /// `ACTSSN2` (2): the fourth and fifth SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 2, example = "**")]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub ssn_part2: Option<String>,
     /// `ACTSSN3` (4): the last four SSN digits, only when re-entered.
     #[serde(skip_serializing_if = "withheld")]
     #[schema(write_only, max_length = 4, example = "****")]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub ssn_part3: Option<String>,
     /// `DOBYEAR` (4): the date of birth's year.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub dob_year: String,
     /// `DOBMON` (2): the date of birth's month.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub dob_month: String,
     /// `DOBDAY` (2): the date of birth's day.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub dob_day: String,
     /// `ACSTFCO` (3): the FICO score.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub fico_score: String,
     /// `ACSFNAM` (25): the first name.
     #[schema(max_length = 25)]
-    #[validate(length(max = 25))]
+    #[validate(length(max = 25), custom(function = "super::pic_x::<25>"))]
     pub first_name: String,
     /// `ACSMNAM` (25): the middle name.
     #[schema(max_length = 25)]
-    #[validate(length(max = 25))]
+    #[validate(length(max = 25), custom(function = "super::pic_x::<25>"))]
     pub middle_name: String,
     /// `ACSLNAM` (25): the last name.
     #[schema(max_length = 25)]
-    #[validate(length(max = 25))]
+    #[validate(length(max = 25), custom(function = "super::pic_x::<25>"))]
     pub last_name: String,
     /// `ACSADL1` (50): address line 1.
     #[schema(max_length = 50)]
-    #[validate(length(max = 50))]
+    #[validate(length(max = 50), custom(function = "super::pic_x::<50>"))]
     pub address_line_1: String,
     /// `ACSSTTE` (2): the state code.
     #[schema(max_length = 2)]
-    #[validate(length(max = 2))]
+    #[validate(length(max = 2), custom(function = "super::pic_x::<2>"))]
     pub state: String,
     /// `ACSADL2` (50): address line 2.
     #[schema(max_length = 50)]
-    #[validate(length(max = 50))]
+    #[validate(length(max = 50), custom(function = "super::pic_x::<50>"))]
     pub address_line_2: String,
     /// `ACSZIPC` (5): the ZIP code.
     #[schema(max_length = 5)]
-    #[validate(length(max = 5))]
+    #[validate(length(max = 5), custom(function = "super::pic_x::<5>"))]
     pub zip: String,
     /// `ACSCITY` (50): address line 3, the city.
     #[schema(max_length = 50)]
-    #[validate(length(max = 50))]
+    #[validate(length(max = 50), custom(function = "super::pic_x::<50>"))]
     pub city: String,
     /// `ACSCTRY` (3): the country code, read-only once details are shown.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub country: String,
     /// `ACSPH1A` (3): phone number 1's area code.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub phone_1_area: String,
     /// `ACSPH1B` (3): phone number 1's prefix.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub phone_1_prefix: String,
     /// `ACSPH1C` (4): phone number 1's line number.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub phone_1_line: String,
     /// `ACSGOVT` (20): the government-issued ID.
     #[schema(max_length = 20)]
-    #[validate(length(max = 20))]
+    #[validate(length(max = 20), custom(function = "super::pic_x::<20>"))]
     pub government_id: String,
     /// `ACSPH2A` (3): phone number 2's area code.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub phone_2_area: String,
     /// `ACSPH2B` (3): phone number 2's prefix.
     #[schema(max_length = 3)]
-    #[validate(length(max = 3))]
+    #[validate(length(max = 3), custom(function = "super::pic_x::<3>"))]
     pub phone_2_prefix: String,
     /// `ACSPH2C` (4): phone number 2's line number.
     #[schema(max_length = 4)]
-    #[validate(length(max = 4))]
+    #[validate(length(max = 4), custom(function = "super::pic_x::<4>"))]
     pub phone_2_line: String,
     /// `ACSEFTC` (10): the EFT account ID.
     #[schema(max_length = 10)]
-    #[validate(length(max = 10))]
+    #[validate(length(max = 10), custom(function = "super::pic_x::<10>"))]
     pub eft_account_id: String,
     /// `ACSPFLG` (1): the primary card holder indicator.
     #[schema(max_length = 1)]
-    #[validate(length(max = 1))]
+    #[validate(length(max = 1), custom(function = "super::pic_x::<1>"))]
     pub primary_card_holder: String,
 }
 
@@ -801,6 +813,82 @@ impl From<rules::AccountUpdateView> for AccountUpdateView {
     }
 }
 
+/// The body of an endpoint 5 error: the `ScreenError` of the message and, when the account read
+/// did not succeed and the customer read found the customer, the state `S` and the details the
+/// screen then shows with its fields enterable (COACTUPC-099).
+///
+/// Serialised as `{"message": …, "field": …, "state": …, "details": …}`, each of the last three
+/// omitted when absent. Every other failure of the fetch leaves the state not fetched and shows
+/// no value (COACTUPC-068, COACTUPC-095, COACTUPC-097), so its body is exactly its
+/// `ScreenError`. The status is the `ScreenError`'s and travels as the response status only.
+// Errors keep the `ScreenError { message, field? }` shape: those two members are the flattened
+// `ScreenError`, unchanged, and the state and details are optional members beside them, which
+// the `ScreenError` schema, requiring only `message`, leaves open. A bare `ScreenError` would
+// drop the customer block and the state `S` the COBOL shows with these messages, which the
+// parity row COACTUPC-099 requires. The schema is `allOf` `ScreenError` and the two optional
+// members. Endpoint 6 answers its re-read's failures as bare `ScreenError`s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct AccountUpdateViewError {
+    /// The message and its field, as the `ScreenError` whose status the response carries.
+    #[serde(flatten)]
+    pub error: ScreenError,
+    /// `ACUP-CHANGE-ACTION` after the response: `S`, present only beside `details`
+    /// (COACTUPC-099).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "S")]
+    pub state: Option<String>,
+    /// The values the screen shows in state `S` and the snapshot the client echoes in its next
+    /// endpoint 6 request: the customer block as stored (COACTUPC-075, COACTUPC-076) and an
+    /// account block, and its part of the snapshot, that no read filled, a placeholder of halt
+    /// candidate X-COACTUPC-H1 that is no parity result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<AccountUpdateView>,
+}
+
+/// The program's failure: its `ScreenError`, through `api::error`, and the details and state
+/// the domain set beside it.
+impl From<rules::UpdateFailure> for AccountUpdateViewError {
+    fn from(failure: rules::UpdateFailure) -> Self {
+        let details = failure.details().cloned().map(AccountUpdateView::from);
+        // The state travels only with the details it leaves shown: every other failure of the
+        // fetch leaves the screen not fetched (COACTUPC-068).
+        let state = details
+            .is_some()
+            .then(|| failure.state().code().to_string());
+        Self {
+            error: ScreenError::from(failure),
+            state,
+            details,
+        }
+    }
+}
+
+/// The service's error: the program's failure with its details, or the `ScreenError` of a store
+/// or internal failure with no audited message, which shows nothing. Endpoint 5 runs no
+/// password work, so `ServiceError::Saturated` never reaches it; it would show nothing either.
+impl From<ServiceError<rules::UpdateFailure>> for AccountUpdateViewError {
+    fn from(error: ServiceError<rules::UpdateFailure>) -> Self {
+        match error {
+            ServiceError::Rule(failure) => Self::from(failure),
+            other @ (ServiceError::Store(_) | ServiceError::Internal | ServiceError::Saturated) => {
+                Self {
+                    error: ScreenError::from(other),
+                    state: None,
+                    details: None,
+                }
+            }
+        }
+    }
+}
+
+/// The `ScreenError`'s status, then the body as JSON without it.
+impl IntoResponse for AccountUpdateViewError {
+    fn into_response(self) -> Response {
+        let status = self.error.status();
+        (status, Json(self)).into_response()
+    }
+}
+
 /// The body of endpoint 6: the key, the raw text of the map fields and the echoed snapshot,
 /// whose `state` the last response set (COACTUPC-100).
 ///
@@ -893,15 +981,15 @@ mod tests {
     use domain::records::account::AccountRecord;
     use domain::records::card_xref::CardXrefRecord;
     use domain::records::customer::CustomerRecord;
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
     use utoipa::{OpenApi, ToSchema};
-    use validator::Validate;
+    use validator::{Validate, ValidationErrors};
 
     use super::{
         AccountUpdateAmounts, AccountUpdateFields, AccountUpdateRequest, AccountUpdateResult,
         AccountUpdateSnapshot, AccountUpdateView, Aid,
     };
-    use crate::dto::{FIELD_LENGTH_MESSAGE, digits, validation_error};
+    use crate::dto::{FIELD_LENGTH_MESSAGE, PIC_X_CODE, digits, validation_error};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -1246,6 +1334,153 @@ mod tests {
         Ok(())
     }
 
+    /// Every member of [`AccountUpdateFields`] and its map `LENGTH`, the `maxLength` of its
+    /// schema property.
+    fn member_widths() -> Result<Vec<(String, usize)>, Box<dyn StdError>> {
+        let document = serde_json::to_value(Contract::openapi())?;
+        let properties = document["components"]["schemas"]["AccountUpdateFields"]["properties"]
+            .as_object()
+            .ok_or("the schema has no AccountUpdateFields properties")?;
+        properties
+            .iter()
+            .map(|(member, property)| {
+                let width = property["maxLength"]
+                    .as_u64()
+                    .ok_or("a member has no maxLength")?;
+                Ok((member.clone(), usize::try_from(width)?))
+            })
+            .collect()
+    }
+
+    /// The fields of a body that holds only `members`, each with its text.
+    fn fields_of<'a>(
+        members: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<AccountUpdateFields, Box<dyn StdError>> {
+        let body: Map<String, Value> = members
+            .into_iter()
+            .map(|(member, text)| (member.to_owned(), Value::from(text)))
+            .collect();
+        Ok(serde_json::from_value(Value::Object(body))?)
+    }
+
+    /// The codes of the rules `member` fails in `errors`, empty when it fails none.
+    fn codes<'a>(errors: &'a ValidationErrors, member: &str) -> Vec<&'a str> {
+        errors
+            .field_errors()
+            .get(member)
+            .copied()
+            .map(|list| list.iter().map(|error| error.code.as_ref()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn printable_ascii_at_full_width_low_values_and_omitted_ssn_parts_pass() -> TestResult {
+        let widths = member_widths()?;
+        assert_eq!(widths.len(), 42, "every enterable map field is a member");
+        let printable: Vec<(&str, String)> = widths
+            .iter()
+            .map(|(member, width)| {
+                let text: String = (b' '..=b'~').cycle().take(*width).map(char::from).collect();
+                (member.as_str(), text)
+            })
+            .collect();
+        let low_values: Vec<(&str, String)> = widths
+            .iter()
+            .map(|(member, width)| (member.as_str(), "\0".repeat(*width)))
+            .collect();
+        for members in [&printable, &low_values] {
+            let fields = fields_of(
+                members
+                    .iter()
+                    .map(|(member, text)| (*member, text.as_str())),
+            )?;
+            assert!(fields.ssn_part1.is_some() && fields.ssn_part3.is_some());
+            assert!(fields.validate().is_ok(), "{fields:?}");
+        }
+        // COACTUPC-064: SSN parts omitted, or `null`, mean unchanged and pass.
+        let without_ssn = fields_of(
+            printable
+                .iter()
+                .filter(|(member, _)| !member.starts_with("ssn_part"))
+                .map(|(member, text)| (*member, text.as_str())),
+        )?;
+        let nulls: AccountUpdateFields = serde_json::from_value(json!({
+            "ssn_part1": null,
+            "ssn_part2": null,
+            "ssn_part3": null
+        }))?;
+        for fields in [without_ssn, nulls, AccountUpdateFields::default()] {
+            assert!(fields.input("").ssn.is_none());
+            assert!(fields.validate().is_ok(), "{fields:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_character_outside_printable_ascii_fails_pic_x_on_its_member() -> TestResult {
+        let (view, _) = fetched()?;
+        let snapshot = AccountUpdateView::from(view).snapshot;
+        let request = |fields: AccountUpdateFields| AccountUpdateRequest {
+            aid: Aid::Enter,
+            fields,
+            snapshot: snapshot.clone(),
+        };
+        let accents = "é".repeat(25);
+        // Within `length` by characters, beyond the field by bytes or by character class.
+        let inputs = [
+            ("government_id", "PASSPORTé"),
+            ("address_line_2", "Café 9"),
+            ("group_id", "GRPé"),
+            ("address_line_1", "Emoji😀"),
+            ("city", "SPRING\tFIELD"),
+            ("ssn_part3", "12\t4"),
+            ("middle_name", "\0"),
+            ("first_name", accents.as_str()),
+        ];
+        let widths = member_widths()?;
+        let every_member = widths.iter().flat_map(|(member, _)| {
+            ["é", "😀", "\t", "\n", "\u{7f}"].map(|text| (member.as_str(), text))
+        });
+        for (member, text) in inputs.into_iter().chain(every_member) {
+            let errors = fields_of([(member, text)])?
+                .validate()
+                .err()
+                .ok_or("a text outside printable ASCII was accepted")?;
+            assert_eq!(codes(&errors, member), [PIC_X_CODE], "{member} {text:?}");
+            assert_eq!(errors.field_errors().len(), 1, "{member} {text:?}");
+
+            // The 400 names the member as its over-long rejection does, and never the text.
+            let width = widths
+                .iter()
+                .find(|(name, _)| name == member)
+                .map(|&(_, width)| width)
+                .ok_or("no such member")?;
+            let over_long = "X".repeat(width + 1);
+            let too_long = request(fields_of([(member, over_long.as_str())])?)
+                .validate()
+                .err()
+                .ok_or("an over-long member was accepted")?;
+            let unstorable = request(fields_of([(member, text)])?)
+                .validate()
+                .err()
+                .ok_or("a text outside printable ASCII was accepted")?;
+            let (length, error) = (validation_error(&too_long), validation_error(&unstorable));
+            assert!(length.field().is_some_and(|field| field.ends_with(member)));
+            assert_eq!(
+                (error.status(), error.message(), error.field()),
+                (
+                    StatusCode::BAD_REQUEST,
+                    FIELD_LENGTH_MESSAGE,
+                    length.field()
+                ),
+                "{member} {text:?}"
+            );
+            let wire = serde_json::to_string(&error)?;
+            assert!(!wire.contains(text) && !format!("{error:?}").contains(text));
+        }
+        Ok(())
+    }
+
     #[test]
     fn a_result_carries_the_state_its_keys_and_the_amounts_shown() {
         let shown = rules::ShownAmounts {
@@ -1408,6 +1643,243 @@ mod tests {
             schemas["AccountUpdateSnapshot"]["properties"]["dob"]["format"],
             json!("date")
         );
+        Ok(())
+    }
+
+    /// How a master read of the fetch chain ends, without its record.
+    #[derive(Debug, Clone, Copy)]
+    enum Read {
+        Found,
+        NotFound,
+        Failed,
+    }
+
+    impl Read {
+        /// The read's outcome over `record`.
+        const fn of<T>(self, record: &T) -> rules::Lookup<&T> {
+            match self {
+                Self::Found => rules::Lookup::Found(record),
+                Self::NotFound => rules::Lookup::NotFound,
+                Self::Failed => rules::Lookup::Failed,
+            }
+        }
+    }
+
+    /// Endpoint 5's error body for the first cross-reference when its account and customer
+    /// reads end as `account` and `customer`.
+    fn fetch_error(
+        account: Read,
+        customer: Read,
+    ) -> Result<super::AccountUpdateViewError, Box<dyn StdError>> {
+        let (xref, stored_account, stored_customer) = records()?;
+        let failure = rules::fetch(
+            &digits(stored_account.id),
+            rules::Lookup::Found(&xref),
+            account.of(&stored_account),
+            customer.of(&stored_customer),
+        )
+        .err()
+        .ok_or_else(|| format!("{account:?} account and {customer:?} customer gave a view"))?;
+        Ok(super::AccountUpdateViewError::from(failure))
+    }
+
+    /// The error body of every outcome of the account and customer reads after a found
+    /// cross-reference: the state `S` and the details only when the account read did not succeed
+    /// and the customer was found (COACTUPC-091, COACTUPC-093, COACTUPC-095, COACTUPC-097,
+    /// COACTUPC-099). The details' customer values are the fetched customer's; their account
+    /// values, halt candidate X-COACTUPC-H1's placeholder, are not asserted.
+    #[test]
+    fn a_fetch_error_carries_the_state_and_details_only_beside_a_found_customer() -> TestResult {
+        // (account read, customer read, status, field, state and details)
+        let cases = [
+            (Read::NotFound, Read::Found, 404, Some("acct_id"), true),
+            (Read::Failed, Read::Found, 500, Some("acct_id"), true),
+            (Read::Found, Read::NotFound, 404, None, false),
+            (Read::Found, Read::Failed, 500, None, false),
+            (Read::NotFound, Read::NotFound, 404, Some("acct_id"), false),
+            (Read::NotFound, Read::Failed, 500, Some("acct_id"), false),
+            (Read::Failed, Read::NotFound, 500, Some("acct_id"), false),
+        ];
+        let (fetched_view, _) = fetched()?;
+        let shown = AccountUpdateView::from(fetched_view);
+        for (account, customer, status, field, with_details) in cases {
+            let label = format!("{account:?} account, {customer:?} customer");
+            let body = fetch_error(account, customer)?;
+            assert_eq!(body.error.status().as_u16(), status, "{label}");
+            assert_eq!(body.error.field(), field, "{label}");
+            assert_eq!(body.state.is_some(), with_details, "{label}");
+            assert_eq!(body.details.is_some(), with_details, "{label}");
+            let Some(details) = body.details else {
+                continue;
+            };
+            assert_eq!(body.state.as_deref(), Some("S"), "{label}");
+            assert_eq!(
+                details.info_message,
+                "Update account details presented above."
+            );
+            assert_eq!(details.snapshot.state, "S", "{label}");
+            assert_eq!(details.account_id, shown.account_id, "{label}");
+            assert_eq!(
+                [
+                    &details.customer_id,
+                    &details.fico_score,
+                    &details.first_name,
+                    &details.middle_name,
+                    &details.last_name,
+                    &details.address_line_1,
+                    &details.address_line_2,
+                    &details.city,
+                    &details.state,
+                    &details.zip,
+                    &details.country,
+                    &details.phone_1_area,
+                    &details.phone_1_prefix,
+                    &details.phone_1_line,
+                    &details.phone_2_area,
+                    &details.phone_2_prefix,
+                    &details.phone_2_line,
+                    &details.government_id,
+                    &details.eft_account_id,
+                    &details.primary_card_holder,
+                ],
+                [
+                    &shown.customer_id,
+                    &shown.fico_score,
+                    &shown.first_name,
+                    &shown.middle_name,
+                    &shown.last_name,
+                    &shown.address_line_1,
+                    &shown.address_line_2,
+                    &shown.city,
+                    &shown.state,
+                    &shown.zip,
+                    &shown.country,
+                    &shown.phone_1_area,
+                    &shown.phone_1_prefix,
+                    &shown.phone_1_line,
+                    &shown.phone_2_area,
+                    &shown.phone_2_prefix,
+                    &shown.phone_2_line,
+                    &shown.government_id,
+                    &shown.eft_account_id,
+                    &shown.primary_card_holder,
+                ],
+                "{label}"
+            );
+            assert_eq!(details.ssn, shown.ssn, "{label}");
+            assert_eq!(details.dob, shown.dob, "{label}");
+            assert_eq!(
+                details.snapshot.ssn_last4, shown.snapshot.ssn_last4,
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The wire form of a fetch error with details: the `ScreenError` members at the top level,
+    /// the state and the details beside them, the SSN redacted in the details and only its last
+    /// four digits in their snapshot (COACTUPC-076, COACTUPC-100); a bare error is exactly its
+    /// `ScreenError`.
+    #[test]
+    fn a_fetch_error_body_is_its_screen_error_with_the_state_and_details_beside_it() -> TestResult {
+        use axum::response::IntoResponse as _;
+
+        let (_, _, customer) = records()?;
+        let full_ssn = digits(*customer.ssn.expose());
+        let shown = fetch_error(Read::NotFound, Read::Found)?;
+        let body = serde_json::to_value(&shown)?;
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .ok_or("the body is not an object")?
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["details", "field", "message", "state"]);
+        assert_eq!(body["state"], json!("S"));
+        assert_eq!(body["details"]["snapshot"]["state"], json!("S"));
+        let ssn = body["details"]["ssn"].as_str().ok_or("no SSN")?;
+        assert!(ssn.starts_with("***-**-") && ssn.len() == 11, "{ssn}");
+        assert!(body["details"]["snapshot"].get("ssn").is_none());
+        assert!(!body.to_string().contains(&full_ssn), "the full SSN left");
+
+        let bare = fetch_error(Read::Found, Read::NotFound)?;
+        assert_eq!(
+            serde_json::to_value(&bare)?,
+            serde_json::to_value(&bare.error)?
+        );
+        assert_eq!(shown.into_response().status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// An edit failure and a cross-reference failure leave the state not fetched with nothing
+    /// shown (COACTUPC-068, COACTUPC-085); a store or internal failure with no audited message
+    /// is the API's 500 with nothing beside it.
+    #[test]
+    fn a_fetch_error_before_the_master_reads_shows_nothing() -> TestResult {
+        use persistence::PersistenceError;
+
+        use crate::error::{ServiceError, UNABLE_TO_PROCESS};
+
+        let (_, account, customer) = records()?;
+        let edit = rules::fetch(
+            "",
+            rules::Lookup::NotReached,
+            rules::Lookup::NotReached,
+            rules::Lookup::NotReached,
+        )
+        .err()
+        .ok_or("a blank account number passed the edit")?;
+        let no_xref = rules::fetch(
+            &digits(account.id),
+            rules::Lookup::NotFound,
+            rules::Lookup::Found(&account),
+            rules::Lookup::Found(&customer),
+        )
+        .err()
+        .ok_or("a missing cross-reference gave a view")?;
+        let bodies = [
+            super::AccountUpdateViewError::from(ServiceError::Rule(edit)),
+            super::AccountUpdateViewError::from(ServiceError::Rule(no_xref)),
+            super::AccountUpdateViewError::from(ServiceError::Store(PersistenceError::Unavailable)),
+            super::AccountUpdateViewError::from(ServiceError::<rules::UpdateFailure>::Internal),
+        ];
+        let statuses: Vec<u16> = bodies
+            .iter()
+            .map(|body| body.error.status().as_u16())
+            .collect();
+        assert_eq!(statuses, [400, 404, 500, 500]);
+        for body in &bodies {
+            assert!(body.state.is_none() && body.details.is_none(), "{body:?}");
+        }
+        for body in &bodies[2..] {
+            assert_eq!(body.error.message(), UNABLE_TO_PROCESS);
+            assert_eq!(body.error.field(), None);
+        }
+        Ok(())
+    }
+
+    /// The fetch error schema: `allOf` `ScreenError` and the optional state and details.
+    #[test]
+    fn the_fetch_error_schema_is_the_screen_error_with_optional_state_and_details() -> TestResult {
+        use utoipa::PartialSchema as _;
+
+        assert_eq!(
+            super::AccountUpdateViewError::name(),
+            "AccountUpdateViewError"
+        );
+        let schema = serde_json::to_value(super::AccountUpdateViewError::schema())?;
+        let parts = schema["allOf"].as_array().ok_or("the error is not allOf")?;
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["$ref"], json!("#/components/schemas/ScreenError"));
+        let members = &parts[1];
+        assert!(members.get("required").is_none(), "a member is required");
+        assert!(
+            members["properties"]["details"]
+                .to_string()
+                .contains("#/components/schemas/AccountUpdateView")
+        );
+        assert!(members["properties"]["state"].is_object());
         Ok(())
     }
 }

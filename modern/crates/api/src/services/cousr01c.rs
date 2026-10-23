@@ -25,10 +25,14 @@
 //! |---|---|---|---|
 //! | row inserted | `NORMAL` | 200, [`cousr01c::added_message`]: `User <id> has been added ...` | COUSR01C-021 |
 //! | [`PersistenceError::is_duplicate`], the `users_pkey` violation | `DUPKEY`, `DUPREC` | [`cousr01c::duplicate_user_id`]: `User ID already exist...` on `user_id`, 400 by its class | COUSR01C-023 |
-//! | any other store error, a hash that could not be computed, or a hash the API's password-work budget refused or could not finish | `WHEN OTHER` | [`cousr01c::write_failure`]: `Unable to Add User...` on `first_name`, 500 | COUSR01C-024 |
+//! | any other store error, a hash that could not be computed, or a hash whose task the API's password-work budget could not finish | `WHEN OTHER` | [`cousr01c::write_failure`]: `Unable to Add User...` on `first_name`, 500 | COUSR01C-024 |
 //!
-//! Every outcome is the program's own answer, a [`ServiceError::Rule`]; none is the unaudited
-//! [`ServiceError::Store`] or [`ServiceError::Internal`].
+//! Every outcome of the add is the program's own answer, a [`ServiceError::Rule`]; none is the
+//! unaudited [`ServiceError::Store`] or [`ServiceError::Internal`]. The one answer before the
+//! add is [`ServiceError::Saturated`], a 503 with `Retry-After`: the password-work budget found
+//! no place for the hash within its wait, so the record was never hashed or written. The COBOL
+//! has no such case, since it never declines work for lack of capacity, and the answer is not
+//! one of its outcomes.
 //!
 //! # Filler
 //!
@@ -53,8 +57,8 @@
 //! A `WHEN OTHER` failure is logged once before it is answered: a store error by its `Display`,
 //! an SQLSTATE and a constraint or column at most; a hash failure by the fixed class text of
 //! [`PasswordError`]; a hashing task that did not complete by whether it panicked, never its
-//! payload; a hash the full budget refused by the budget's own event, which names its limits
-//! alone. No event names the user, the password or the hash.
+//! payload. A hash the saturated budget refused is logged by the budget's own event, which names
+//! its limits and its count of refusals alone. No event names the user, the password or the hash.
 
 use domain::online::cousr01c::{self, UserAddFailure, UserAddInput};
 use domain::password::{self, PasswordError};
@@ -90,9 +94,11 @@ const WRITE_PARAGRAPH: &str = "WRITE-USER-SEC-FILE";
 ///   [`cousr01c::edit`] (COUSR01C-010 to COUSR01C-014);
 /// - [`cousr01c::duplicate_user_id`] when a stored row has the same 8 user ID bytes
 ///   (COUSR01C-023);
-/// - [`cousr01c::write_failure`] when the hash cannot be computed, the password-work budget
-///   refuses it or its task does not complete, or the insert fails for any other reason
-///   (COUSR01C-024).
+/// - [`cousr01c::write_failure`] when the hash cannot be computed or its task does not
+///   complete, or the insert fails for any other reason (COUSR01C-024).
+///
+/// [`ServiceError::Saturated`] when the password-work budget finds no place for the hash within
+/// its wait; nothing is written.
 pub(crate) async fn add(
     state: &AppState,
     _admin: &AdminUser,
@@ -130,10 +136,10 @@ async fn insert_user<R: UserRepository>(
 
     // argon2id is deliberately CPU- and memory-hard, so it runs on the blocking pool within the
     // API's password-work budget rather than stalling a runtime worker or running without
-    // bound. A hash that fails, that the full budget refuses, or whose task cannot finish, is
-    // the `WHEN OTHER` answer `Unable to Add User...` that COUSR01C-024 assigns to it, not the
-    // unaudited `ServiceError::Internal`; `hashed` logs its class here, after the await, and the
-    // answer never echoes it.
+    // bound. A hash that fails, or whose task cannot finish, is the `WHEN OTHER` answer `Unable
+    // to Add User...` that COUSR01C-024 assigns to it, not the unaudited
+    // `ServiceError::Internal`; `hashed` logs its class here, after the await, and the answer
+    // never echoes it. A hash the saturated budget refuses is `ServiceError::Saturated`.
     let computed = work
         .run(move || {
             let hashed = password::hash(record.pwd.expose());
@@ -157,9 +163,9 @@ async fn insert_user<R: UserRepository>(
         .map_err(|error| ServiceError::Rule(write_answer(&error)))
 }
 
-/// The record and its password hash from the hashing task (COUSR01C-018), or `Unable to Add
-/// User...` when the budget refused the task, the task did not complete or argon2id could not
-/// hash (COUSR01C-024).
+/// The record and its password hash from the hashing task (COUSR01C-018); `Unable to Add
+/// User...` when the task did not complete or argon2id could not hash (COUSR01C-024); and
+/// [`ServiceError::Saturated`] when the budget refused the task.
 ///
 /// A failure is logged first, once: the task's as whether it panicked, never its payload; the
 /// hash's as the fixed class text of [`PasswordError`]; a refusal by the budget itself, so
@@ -178,7 +184,7 @@ fn hashed<T>(
             );
             Err(ServiceError::Rule(cousr01c::write_failure()))
         }
-        Err(PasswordWorkError::Saturated) => Err(ServiceError::Rule(cousr01c::write_failure())),
+        Err(PasswordWorkError::Saturated) => Err(ServiceError::Saturated),
         Err(PasswordWorkError::Interrupted { panicked }) => {
             tracing::error!(
                 program = PROGRAM,
@@ -216,6 +222,7 @@ fn write_answer(error: &PersistenceError) -> UserAddFailure {
 mod tests {
     use std::error::Error;
     use std::future::{Future, ready};
+    use std::time::Duration;
 
     use domain::batch::loads::HashedUser;
     use domain::copybook::PicX;
@@ -561,23 +568,16 @@ mod tests {
     }
 
     #[test]
-    fn a_full_password_budget_answers_unable_to_add_user_and_writes_nothing() -> TestResult {
+    fn a_full_password_budget_answers_saturated_and_writes_nothing() -> TestResult {
         block_on(async {
-            let work = PasswordWork::new(1, 0);
+            let work = PasswordWork::new(1, 0).with_wait(Duration::from_millis(50));
             let hold = WorkerHold::start(&work).await?;
             let traces = trace_capture::capture();
             let mut store = InsertOnly::answering(Ok(()));
 
-            let failure = rule(insert_user(&mut store, &work, request()).await)?;
-            assert_eq!(failure, cousr01c::write_failure());
-            assert_eq!(
-                (
-                    failure.message(),
-                    failure.field().name(),
-                    failure.class().http_status()
-                ),
-                ("Unable to Add User...", "first_name", 500)
-            );
+            // Not the program's `Unable to Add User...`: the record was never hashed or written.
+            let outcome = insert_user(&mut store, &work, request()).await;
+            assert_eq!(outcome, Err(ServiceError::Saturated));
             assert!(store.inserted.is_empty());
             // The budget's refusal is the one event, and it names no request value.
             let lines = traces.lines();

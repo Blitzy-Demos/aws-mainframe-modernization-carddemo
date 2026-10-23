@@ -11,8 +11,8 @@
 //! | JCL step | What it does | Replacement |
 //! |---|---|---|
 //! | `DELDEF01` | `IDCAMS` deletes and defines the work KSDS `TRXFL` | none: no work file (CBSTM03A-001) |
-//! | `STEP010` | `SORT FIELDS=(263,16,CH,A,1,16,CH,A)` of `TRANSACT`: card number, then transaction ID | `TransactionRepository::find_all_in_card_order`, then `TransactionTable::build`, which puts the rows in EBCDIC order itself (CBSTM03A-001, X-CREASTMT-3) |
-//! | `STEP020` | `REPRO` of the sorted records into `TRXFL` | none: the rows stay in memory (CBSTM03A-001, CBSTM03B-002) |
+//! | `STEP010` | `SORT FIELDS=(263,16,CH,A,1,16,CH,A)` of `TRANSACT`: card number, then transaction ID | `TransactionRepository::stream_in_card_order`, every row read once and counted by `TableCensus`, none kept; then, for each statement, `TransactionRepository::find_by_card`, whose rows `TransactionTable::of_card` puts in EBCDIC order itself (CBSTM03A-001, CBSTM03A-008, X-CREASTMT-3) |
+//! | `STEP020` | `REPRO` of the sorted records into `TRXFL` | none: no work file; each statement reads its card's rows by key, so at most one card's transactions are held (CBSTM03A-001, CBSTM03B-002) |
 //! | `STEP030` | `IEFBR14` deletes the previous `STATEMNT.PS` and `STATEMNT.HTML` | `OutputFile::replace` of the three fixed names, `STATEMNT.PDF` included, under the statement directory's `DirectoryLock`, before the first read (CBSTM03A-002) |
 //! | `STEP040` | `CBSTM03A` writes `STMTFILE` and `HTMLFILE` | [`run`]: `STATEMNT.PS` of 80-byte records and `STATEMNT.HTML` of 100-byte records, the program's FD rather than the `LRECL=80` of `STEP030` (CBSTM03A-031, CBSTM03A-047, E20) |
 //! | `TXT2PDF1` `TXT2PDF` | `%TXT2PDF` converts `STATEMNT.PS` into `STATEMNT.PS.PDF` | `crate::pdf::render` over the text records, written as `STATEMNT.PDF`, the name AAP 0.3.4.5 gives it (CBSTM03A-051, X-CREASTMT-7) |
@@ -27,22 +27,28 @@
 //! 2. The three files are replaced, so the previous run's are gone before any table is read, as
 //!    `STEP030` deletes them and `CBSTM03A` opens its outputs before its first read
 //!    (CBSTM03A-002, CBSTM03A-004). The names are fixed, not `(+1)` generations.
-//! 3. Every `transactions` row is read and loaded into the `TransactionTable`, before the first
-//!    cross-reference record, as 8100-TRNXFILE-OPEN and 8500-READTRNX-READ load `WS-TRNX-TABLE`
-//!    (CBSTM03A-006 to CBSTM03A-008).
+//! 3. Every `transactions` row is read once, in card order, and counted by `TableCensus`, not
+//!    kept, before the first cross-reference record, as 8100-TRNXFILE-OPEN and
+//!    8500-READTRNX-READ load `WS-TRNX-TABLE` (CBSTM03A-004, CBSTM03A-006 to CBSTM03A-008). The
+//!    count gives the empty-set abend and the bounds warning.
 //! 4. Every `card_xref` row is read and put in key order, `xref_sort_key`, the EBCDIC key order
 //!    of the KSDS `CBSTM03B` reads sequentially (CBSTM03A-009, CBSTM03B-003). Each one gets one
 //!    statement: its customer by `cust_id`, then its account by `acct_id` (CBSTM03A-010,
-//!    CBSTM03A-011, CBSTM03B-004, CBSTM03B-005), then `cbstm03a::statement`, whose text records
-//!    go to `STATEMNT.PS` and HTML records to `STATEMNT.HTML`, each followed by LF. The keyed
-//!    reads are served from `customers` and `accounts` each read whole, once, the first time a
-//!    statement needs one of their records, so a run makes two master reads rather than two per
-//!    cross-reference record (W011-F04).
+//!    CBSTM03A-011, CBSTM03B-004, CBSTM03B-005), then its card's transactions, the card's entry
+//!    of the table, read by `card_num` and put in EBCDIC transaction-ID order by
+//!    `TransactionTable::of_card` (CBSTM03A-013), then `cbstm03a::statement`, whose text
+//!    records go to `STATEMNT.PS` and HTML records to `STATEMNT.HTML`, each followed by LF. So at
+//!    most one card's transactions are held at a time. The keyed master reads are served from
+//!    `customers` and `accounts` each read whole, once, the first time a statement needs one of
+//!    their records, so a run makes two master reads rather than two per cross-reference record
+//!    (W011-F04).
 //! 5. After the last statement the PDF is rendered from the text records read back from
 //!    `STATEMNT.PS` through the run's own handle, one at a time, and written; then
 //!    `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PDF` are completed in that order and their
 //!    paths returned in that order, which `main` prints; return code 0 (CBSTM03A-050,
-//!    CBSTM03A-051). No text record is held beyond its statement (W011-F06).
+//!    CBSTM03A-051). No text record is held beyond its statement (W011-F06). The PDF document is
+//!    the one part of the run that still grows with it: `printpdf` builds the whole document in
+//!    memory before it is written (escalation candidate X-CREASTMT-9).
 //!
 //! Every read is read-only and outside any transaction: the job writes no table.
 //!
@@ -89,8 +95,10 @@ use std::io::{self, BufRead, ErrorKind};
 use std::path::PathBuf;
 
 use copybook::PicU;
-use domain::batch::cbstm03a::{self, STMT_RECORD_LEN, Statement, StatementError, TransactionTable};
-use domain::records::{AccountRecord, CardXrefRecord, CustomerRecord, TransactionRecord};
+use domain::batch::cbstm03a::{
+    self, STMT_RECORD_LEN, Statement, StatementError, TableCensus, TransactionTable,
+};
+use domain::records::{AccountRecord, CardXrefRecord, CustomerRecord};
 use persistence::{
     AccountRepository, CardXrefRepository, CustomerRepository, PersistenceError,
     TransactionRepository,
@@ -147,9 +155,9 @@ pub(crate) async fn run(ctx: &JobContext<'_>) -> Result<JobOutcome, JobError> {
     outcome
 }
 
-/// The run under the statement directory's `lock`: replaces the three files, reads the tables
-/// and writes the statements, then completes the files. Every file it created is completed or
-/// removed when it returns.
+/// The run under the statement directory's `lock`: replaces the three files, counts the
+/// transactions, reads the cross-references and writes the statements, then completes the
+/// files. Every file it created is completed or removed when it returns.
 ///
 /// # Errors
 ///
@@ -161,34 +169,41 @@ async fn replace_statements(
     let mut files = StatementFiles::replace(lock).await?;
     // The store is a handle on the shared pool, cloned for the `&mut self` repository calls.
     let mut store = ctx.store.clone();
-    let table = transaction_table(TransactionRepository::find_all_in_card_order(&mut store).await)?;
+    transaction_census(&mut store).await?;
     let xrefs = in_key_order(CardXrefRepository::find_all(&mut store).await)?;
-    write_statements(&mut store, &xrefs, &table, &mut files).await?;
+    write_statements(&mut store, &xrefs, &mut files).await?;
     files.finish().await
 }
 
 /// The main loop of `CBSTM03A` over `xrefs`, in their order (CBSTM03A-009): for each record its
-/// customer, then its account, then its statement written to `files` (CBSTM03A-010,
-/// CBSTM03A-011, CBSTM03A-013). With no record nothing is read.
+/// customer, then its account, then its card's transactions, then its statement written to
+/// `files` (CBSTM03A-010, CBSTM03A-011, CBSTM03A-013). The transactions are the card's entry of
+/// the table, read by `card_num` for this statement alone and put in EBCDIC order by
+/// `TransactionTable::of_card`, so at most one card's transactions are held. With no record
+/// nothing is read.
 ///
 /// # Errors
 ///
 /// [`JobError::Abend`] for the first customer or account that is missing or cannot be read
-/// (CBSTM03A-010 to CBSTM03A-012), and [`JobError::Io`] when a record cannot be written.
+/// (CBSTM03A-010 to CBSTM03A-012), or the first card whose transactions cannot be read
+/// (CBSTM03A-012); [`JobError::Io`] when a record cannot be written.
 async fn write_statements<S>(
     store: &mut S,
     xrefs: &[CardXrefRecord],
-    table: &TransactionTable,
     files: &mut StatementFiles,
 ) -> Result<(), JobError>
 where
-    S: CustomerRepository + AccountRepository,
+    S: CustomerRepository + AccountRepository + TransactionRepository,
 {
     let mut masters = Masters::default();
     for xref in xrefs {
         let (customer, account) = masters.records_of(store, xref).await?;
+        let rows = TransactionRepository::find_by_card(store, &xref.card_num)
+            .await
+            .map_err(|error| abend(ReadFailure::TransactionsUnreadable, Some(&error)))?;
+        let table = TransactionTable::of_card(&rows);
         files
-            .write(&cbstm03a::statement(xref, customer, account, table))
+            .write(&cbstm03a::statement(xref, customer, account, &table))
             .await?;
     }
     Ok(())
@@ -253,29 +268,38 @@ impl Masters {
     }
 }
 
-/// The table of every transaction, from the read that stands for `TRNXFILE` (CBSTM03A-001,
-/// CBSTM03A-006 to CBSTM03A-008). The table orders the rows in EBCDIC order itself, whatever
-/// order the read returns them in.
+/// The census of every transaction, from the read in card order that stands for `TRNXFILE`,
+/// before the first cross-reference record, as 8100-TRNXFILE-OPEN and 8500-READTRNX-READ load
+/// the table (CBSTM03A-001, CBSTM03A-004, CBSTM03A-006 to CBSTM03A-008). Each record is
+/// counted as it is read and none is kept: the statements read their card's records again by
+/// key. A table beyond the 51 cards of 10 transactions is reported by one warning event
+/// (halt candidate X-CREASTMT-H2).
 ///
 /// # Errors
 ///
-/// [`JobError::Abend`] for a read that failed (CBSTM03A-012) or returned no row, the first read
-/// at end of file (CBSTM03A-007).
-fn transaction_table(
-    read: Result<Vec<TransactionRecord>, PersistenceError>,
-) -> Result<TransactionTable, JobError> {
-    let rows = read.map_err(|error| abend(ReadFailure::TransactionsUnreadable, Some(&error)))?;
-    let table = TransactionTable::build(&rows).map_err(|error| match error {
+/// [`JobError::Abend`] for a read that failed to start or failed at a row (CBSTM03A-012), or
+/// that returned no row, the first read at end of file (CBSTM03A-007).
+async fn transaction_census<S: TransactionRepository>(
+    store: &mut S,
+) -> Result<TableCensus, JobError> {
+    let unreadable =
+        |error: PersistenceError| abend(ReadFailure::TransactionsUnreadable, Some(&error));
+    let mut rows = store.stream_in_card_order().await.map_err(unreadable)?;
+    let mut census = TableCensus::default();
+    while let Some(record) = rows.next().await.map_err(unreadable)? {
+        census.count(&record);
+    }
+    let census = census.finish().map_err(|error| match error {
         StatementError::NoTransactions => abend(ReadFailure::TransactionsEmpty, None),
     })?;
-    if !table.within_cobol_bounds() {
+    if !census.within_cobol_bounds() {
         tracing::warn!(
-            cards = table.card_count(),
+            cards = census.card_count(),
             "the transactions exceed the 51 cards of 10 transactions of the CBSTM03A table: \
              every statement is written in full, and its parity is BLOCKED (X-CREASTMT-H2)"
         );
     }
-    Ok(table)
+    Ok(census)
 }
 
 /// The cross-reference records, from the read that stands for `XREFFILE`, in the key order of
@@ -657,14 +681,16 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use chrono::NaiveDate;
     use copybook::{FixedRecord, PicTimestamp, PicU, PicX};
-    use domain::batch::cbstm03a::{HTML_RECORD_LEN, STMT_RECORD_LEN, Statement, TransactionTable};
+    use domain::batch::cbstm03a::{HTML_RECORD_LEN, STMT_RECORD_LEN, Statement};
     use domain::batch::loads::decode_fixture;
     use domain::money::{Decimal, Money};
     use domain::records::{AccountRecord, CardXrefRecord, CustomerRecord, TransactionRecord};
     use domain::sensitive::CardNumber;
     use persistence::{
         AccountCustomerChain, AccountRepository, ChainLink, CustomerRepository, PersistenceError,
+        TransactionRepository, TransactionRows,
     };
     use runtime::telemetry::JobCounter;
     use test_support::trace_capture;
@@ -672,7 +698,7 @@ mod tests {
 
     use super::{
         DirectoryLock, HTML_FILE, JobError, PDF_FILE, ReadFailure, StatementFiles, TEXT_FILE,
-        abend, found, in_key_order, keyed, render_text, transaction_table, write_statements,
+        abend, found, in_key_order, keyed, render_text, transaction_census, write_statements,
     };
     use crate::jobs::LOCK_NAME;
     use crate::pdf::RenderError;
@@ -834,29 +860,178 @@ mod tests {
         Ok(())
     }
 
-    /// An empty transaction set and a failed transaction read both abend at `TRNXFILE`, before
-    /// any statement.
+    /// The census reads every transaction once, through the streamed read alone, and counts
+    /// its cards, keeping none; an empty transaction set, a read that fails to start and one
+    /// that fails at a row each abend at `TRNXFILE`, before any statement.
+    // audit: CBSTM03A-004
+    // audit: CBSTM03A-006
     // audit: CBSTM03A-007
+    // audit: CBSTM03A-008
     // audit: CBSTM03A-012
-    #[test]
-    fn no_transaction_table_without_transactions() -> TestResult {
+    #[tokio::test]
+    async fn the_census_counts_every_transaction_or_abends_at_trnxfile() -> TestResult {
+        let held = vec![
+            transaction(CARD_1, 1)?,
+            transaction(CARD_1, 2)?,
+            transaction(CARD_2, 3)?,
+        ];
+        let mut store = CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
+        let census = transaction_census(&mut store).await?;
+        assert_eq!(census.card_count(), 2);
+        assert!(census.within_cobol_bounds());
+        assert_eq!(
+            (store.census_reads, store.card_reads, store.other_calls),
+            (1, 0, 0)
+        );
+
         let cases = [
-            (Ok(Vec::new()), ReadFailure::TransactionsEmpty),
             (
-                Err(PersistenceError::Unavailable),
+                Vec::new(),
+                CensusEnd::Normally,
+                ReadFailure::TransactionsEmpty,
+            ),
+            (
+                vec![transaction(CARD_1, 1)?],
+                CensusEnd::AtStart,
+                ReadFailure::TransactionsUnreadable,
+            ),
+            (
+                vec![transaction(CARD_1, 1)?],
+                CensusEnd::AtRow,
                 ReadFailure::TransactionsUnreadable,
             ),
         ];
-        for (read, path) in cases {
-            let error = transaction_table(read)
+        for (held, end, failure) in cases {
+            let mut store = CountingStore::holding(None)?.with_transactions(held, end);
+            let error = transaction_census(&mut store)
+                .await
                 .err()
-                .ok_or("a table was built from no transaction")?;
-            assert_eq!(error.exit_code(), Some(16));
+                .ok_or("a census of no readable transaction")?;
+            assert_eq!(error.exit_code(), Some(16), "{end:?}");
             assert_eq!(
                 error.to_string(),
-                format!("ABEND: {} (return code 16)", path.reason())
+                format!("ABEND: {} (return code 16)", failure.reason()),
+                "{end:?}"
             );
+            assert_eq!((store.census_reads, store.other_calls), (1, 0), "{end:?}");
         }
+        Ok(())
+    }
+
+    /// A transaction set beyond the 51 cards of the COBOL table, or beyond 10 transactions on a
+    /// card, is counted in full and reported by one warning that carries the card count and no
+    /// card number; a set within the bounds gives no warning.
+    // audit: CBSTM03A-008
+    #[tokio::test]
+    async fn a_census_beyond_the_cobol_table_warns_of_blocked_parity() -> TestResult {
+        let cases: [(u64, u64, bool); 4] = [
+            (51, 1, false),
+            (51, 10, false),
+            (52, 1, true),
+            (1, 11, true),
+        ];
+        for (cards, per_card, warned) in cases {
+            let mut held = Vec::new();
+            for card in 1..=cards {
+                for n in 1..=per_card {
+                    held.push(transaction(numbered_card(card)?, card * 100 + n)?);
+                }
+            }
+            let mut store =
+                CountingStore::holding(None)?.with_transactions(held, CensusEnd::Normally);
+            let capture = trace_capture::capture();
+            let census = transaction_census(&mut store).await?;
+            let warnings: Vec<String> = capture
+                .lines()
+                .into_iter()
+                .filter(|line| line.contains(r#""level":"WARN""#))
+                .collect();
+            let shown = capture.text();
+            drop(capture);
+            let label = format!("{cards} x {per_card}");
+            assert_eq!(census.card_count(), usize::try_from(cards)?, "{label}");
+            assert_eq!(census.within_cobol_bounds(), !warned, "{label}");
+            if warned {
+                let [warning] = warnings.as_slice() else {
+                    return Err(format!("{label}: {} warnings", warnings.len()).into());
+                };
+                assert!(warning.contains("(X-CREASTMT-H2)"), "{label}: {warning}");
+                assert!(
+                    warning.contains(&format!(r#""cards":{cards}"#)),
+                    "{label}: {warning}"
+                );
+            } else {
+                assert!(warnings.is_empty(), "{label}: {warnings:?}");
+            }
+            let first = String::from_utf8(numbered_card(1)?.to_vec())?;
+            assert!(!shown.contains(&first), "{label}: a card number was traced");
+        }
+        Ok(())
+    }
+
+    /// Each statement reads its card's transactions by key once its customer and account are
+    /// found, and prints them in transaction-ID order: two, one and none for the three cards. A
+    /// card whose transactions cannot be read abends at `TRNXFILE` after that card's masters.
+    // audit: CBSTM03A-012
+    // audit: CBSTM03A-013
+    // audit: CBSTM03A-049
+    #[tokio::test]
+    async fn each_statement_reads_its_card_by_key_after_its_masters() -> TestResult {
+        let held = vec![
+            transaction(CARD_1, 1)?,
+            transaction(CARD_1, 3)?,
+            transaction(CARD_2, 2)?,
+        ];
+        let xrefs = vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?];
+        let scratch = Scratch::new()?;
+        let dir = scratch.statements();
+        let lock = DirectoryLock::acquire(&dir).await?;
+        let mut files = StatementFiles::replace(&lock).await?;
+        let mut store =
+            CountingStore::holding(None)?.with_transactions(held.clone(), CensusEnd::Normally);
+        write_statements(&mut store, &xrefs, &mut files).await?;
+        assert_eq!(
+            (store.customer_reads, store.account_reads, store.card_reads),
+            (1, 1, 3)
+        );
+        assert_eq!((store.census_reads, store.other_calls), (0, 0));
+        // 19 text records a statement, and one more for each of its transactions.
+        assert_eq!((files.statements, files.text_records), (3, 19 * 3 + 3));
+        files.finish().await?;
+        let text = fs::read(dir.join(TEXT_FILE))?;
+        let ids: Vec<&[u8]> = [16, 17, 21 + 16]
+            .iter()
+            .filter_map(|&at| text.chunks(STMT_RECORD_LEN + 1).nth(at)?.get(..16))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                b"0000000000000001",
+                b"0000000000000003",
+                b"0000000000000002"
+            ]
+        );
+
+        let mut files = StatementFiles::replace(&lock).await?;
+        let mut store = CountingStore::holding(Some(Unreadable::Transactions))?
+            .with_transactions(held, CensusEnd::Normally);
+        let error = write_statements(&mut store, &xrefs, &mut files)
+            .await
+            .err()
+            .ok_or("a statement was written without its transactions")?;
+        let failure = ReadFailure::TransactionsUnreadable;
+        assert_eq!(failure.error_line(), "ERROR READING TRNXFILE");
+        assert_eq!(
+            error.to_string(),
+            format!("ABEND: {} (return code 16)", failure.reason())
+        );
+        assert_eq!(
+            (store.customer_reads, store.account_reads, store.card_reads),
+            (1, 1, 1)
+        );
+        assert_eq!(files.statements, 0);
+        drop(files);
+        lock.release().await;
         Ok(())
     }
 
@@ -1118,7 +1293,8 @@ mod tests {
     /// The masters are read whole, once each, and never by key: customers when the first
     /// statement needs its customer, accounts once that customer is found. No cross-reference
     /// reads neither; a missing first customer ends the run before `accounts` is read; each
-    /// missing or unreadable master ends it on its own abend; nothing is written to a table.
+    /// missing or unreadable master ends it on its own abend; a card's transactions are read
+    /// only once its masters are found; nothing is written to a table.
     // audit: CBSTM03A-009
     // audit: CBSTM03A-010
     // audit: CBSTM03A-011
@@ -1128,51 +1304,57 @@ mod tests {
     // audit: CBSTM03B-006
     #[tokio::test]
     async fn masters_are_read_whole_once_in_customer_then_account_order() -> TestResult {
-        let table = TransactionTable::build(&[transaction()?])?;
         let cases = [
             MasterCase {
                 xrefs: vec![xref(CARD_1, 1)?, xref(CARD_2, 2)?, xref(CARD_3, 1)?],
                 unreadable: None,
                 outcome: Ok(3),
                 reads: (1, 1),
+                card_reads: 3,
             },
             MasterCase {
                 xrefs: Vec::new(),
                 unreadable: None,
                 outcome: Ok(0),
                 reads: (0, 0),
+                card_reads: 0,
             },
             MasterCase {
                 xrefs: vec![xref(CARD_1, 999)?, xref(CARD_2, 1)?],
                 unreadable: None,
                 outcome: Err(ReadFailure::CustomerNotFound),
                 reads: (1, 0),
+                card_reads: 0,
             },
             MasterCase {
                 xrefs: vec![xref(CARD_1, 1)?, xref_to(CARD_2, 2, 999)?],
                 unreadable: None,
                 outcome: Err(ReadFailure::AccountNotFound),
                 reads: (1, 1),
+                card_reads: 1,
             },
             MasterCase {
                 xrefs: vec![xref(CARD_1, 1)?],
                 unreadable: Some(Unreadable::Customers),
                 outcome: Err(ReadFailure::CustomerUnreadable),
                 reads: (1, 0),
+                card_reads: 0,
             },
             MasterCase {
                 xrefs: vec![xref(CARD_1, 1)?],
                 unreadable: Some(Unreadable::Accounts),
                 outcome: Err(ReadFailure::AccountUnreadable),
                 reads: (1, 1),
+                card_reads: 0,
             },
         ];
         for case in cases {
             let scratch = Scratch::new()?;
             let lock = DirectoryLock::acquire(&scratch.statements()).await?;
             let mut files = StatementFiles::replace(&lock).await?;
-            let mut store = CountingStore::holding(case.unreadable)?;
-            let written = write_statements(&mut store, &case.xrefs, &table, &mut files).await;
+            let mut store = CountingStore::holding(case.unreadable)?
+                .with_transactions(vec![transaction(CARD_1, 1)?], CensusEnd::Normally);
+            let written = write_statements(&mut store, &case.xrefs, &mut files).await;
             let label = format!("{:?} of {} records", case.outcome, case.xrefs.len());
             match (written, case.outcome) {
                 (Ok(()), Ok(statements)) => assert_eq!(files.statements, statements, "{label}"),
@@ -1188,6 +1370,7 @@ mod tests {
                 case.reads,
                 "{label}"
             );
+            assert_eq!(store.card_reads, case.card_reads, "{label}");
             assert_eq!(store.other_calls, 0, "{label}: a keyed read or a write");
         }
         Ok(())
@@ -1198,46 +1381,88 @@ mod tests {
     const CARD_2: [u8; 16] = *b"4000000000000002";
     const CARD_3: [u8; 16] = *b"4000000000000003";
 
+    /// Synthetic card number `n`, in no fixture file: `4`, then `n` in 15 digits.
+    fn numbered_card(n: u64) -> Result<[u8; 16], Box<dyn Error>> {
+        Ok(<[u8; 16]>::try_from(format!("4{n:015}").as_bytes())?)
+    }
+
     /// One run of `write_statements` over the fixture masters: the cross-references, the master
-    /// that cannot be read, the statements written or the abend, and the whole-table reads of
-    /// customers and accounts.
+    /// that cannot be read, the statements written or the abend, the whole-table reads of
+    /// customers and accounts, and the reads of a card's transactions.
     struct MasterCase {
         xrefs: Vec<CardXrefRecord>,
         unreadable: Option<Unreadable>,
         outcome: Result<usize, ReadFailure>,
         reads: (usize, usize),
+        card_reads: usize,
     }
 
-    /// The master table a [`CountingStore`] cannot read whole.
+    /// The table a [`CountingStore`] cannot read: a master whole, or a card's transactions.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Unreadable {
         Customers,
         Accounts,
+        Transactions,
     }
 
-    /// `customers` and `accounts` in memory, counting what a run asks of them: whole-table
-    /// reads of each, and keyed reads or writes of either, of which `creastmt` makes none.
+    /// How the census read of a [`CountingStore`] ends.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CensusEnd {
+        /// After its rows, at the end of the table.
+        Normally,
+        /// Before any row: the read fails to start.
+        AtStart,
+        /// After its rows, at a row that cannot be read.
+        AtRow,
+    }
+
+    /// `customers`, `accounts` and `transactions` in memory, counting what a run asks of them:
+    /// whole-table reads of each master, the census read and the reads by card of the
+    /// transactions, and keyed reads or writes of any other kind, of which `creastmt` makes none.
     struct CountingStore {
         customers: Vec<CustomerRecord>,
         accounts: Vec<AccountRecord>,
+        /// The transactions, in card order, then transaction ID.
+        transactions: Vec<TransactionRecord>,
         unreadable: Option<Unreadable>,
+        census_end: CensusEnd,
         customer_reads: usize,
         account_reads: usize,
+        census_reads: usize,
+        card_reads: usize,
         other_calls: usize,
     }
 
     impl CountingStore {
-        /// The customers and accounts of `custdata.txt` and `acctdata.txt`, read in place, with
-        /// `unreadable` failing its whole-table read.
+        /// The customers and accounts of `custdata.txt` and `acctdata.txt`, read in place, and
+        /// no transaction, with `unreadable` failing its read.
         fn holding(unreadable: Option<Unreadable>) -> Result<Self, Box<dyn Error>> {
             Ok(Self {
                 customers: fixture::<CustomerRecord>("custdata.txt")?,
                 accounts: fixture::<AccountRecord>("acctdata.txt")?,
+                transactions: Vec::new(),
                 unreadable,
+                census_end: CensusEnd::Normally,
                 customer_reads: 0,
                 account_reads: 0,
+                census_reads: 0,
+                card_reads: 0,
                 other_calls: 0,
             })
+        }
+
+        /// This store holding `transactions`, in card order, with a census read that ends as
+        /// `census_end` says.
+        fn with_transactions(
+            self,
+            transactions: Vec<TransactionRecord>,
+            census_end: CensusEnd,
+        ) -> Self {
+            Self {
+                transactions,
+                census_end,
+                ..self
+            }
         }
 
         /// The outcome of a call `creastmt` never makes, counted.
@@ -1360,6 +1585,98 @@ mod tests {
         }
     }
 
+    impl TransactionRepository for CountingStore {
+        fn find_by_id(
+            &mut self,
+            _id: &PicX<16>,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            self.other()
+        }
+
+        fn find_last(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<TransactionRecord>, PersistenceError>> + Send
+        {
+            self.other()
+        }
+
+        fn next_id(&mut self) -> impl Future<Output = Result<PicX<16>, PersistenceError>> + Send {
+            self.other()
+        }
+
+        fn insert(
+            &mut self,
+            _record: &TransactionRecord,
+        ) -> impl Future<Output = Result<(), PersistenceError>> + Send {
+            self.other()
+        }
+
+        fn page_after(
+            &mut self,
+            _start: &PicX<16>,
+            _limit: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            self.other()
+        }
+
+        fn page_before(
+            &mut self,
+            _start: &PicX<16>,
+            _limit: i64,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            self.other()
+        }
+
+        fn find_all_in_card_order(
+            &mut self,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            self.other()
+        }
+
+        fn stream_in_card_order(
+            &mut self,
+        ) -> impl Future<Output = Result<TransactionRows<'_>, PersistenceError>> + Send {
+            self.census_reads += 1;
+            let mut rows: Vec<Result<TransactionRecord, PersistenceError>> =
+                self.transactions.iter().cloned().map(Ok).collect();
+            let read = match self.census_end {
+                CensusEnd::AtStart => Err(PersistenceError::Unavailable),
+                CensusEnd::AtRow => {
+                    rows.push(Err(PersistenceError::Unavailable));
+                    Ok(TransactionRows::from_results(rows))
+                }
+                CensusEnd::Normally => Ok(TransactionRows::from_results(rows)),
+            };
+            std::future::ready(read)
+        }
+
+        fn find_by_card(
+            &mut self,
+            card: &CardNumber,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            self.card_reads += 1;
+            std::future::ready(if self.unreadable == Some(Unreadable::Transactions) {
+                Err(PersistenceError::Unavailable)
+            } else {
+                Ok(self
+                    .transactions
+                    .iter()
+                    .filter(|record| record.card_num == *card)
+                    .cloned()
+                    .collect())
+            })
+        }
+
+        fn find_processed_between(
+            &mut self,
+            _start: NaiveDate,
+            _end: NaiveDate,
+        ) -> impl Future<Output = Result<Vec<TransactionRecord>, PersistenceError>> + Send {
+            self.other()
+        }
+    }
+
     /// The records of the fixture `file`, read in place from `app/data/ASCII/`.
     fn fixture<R: FixedRecord>(file: &str) -> Result<Vec<R>, Box<dyn Error>> {
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1371,11 +1688,10 @@ mod tests {
             .collect())
     }
 
-    /// A purchase on [`CARD_1`], the one transaction of the table the statements are built
-    /// with.
-    fn transaction() -> Result<TransactionRecord, Box<dyn Error>> {
+    /// A purchase on `card` with the transaction ID `n`, in 16 digits.
+    fn transaction(card: [u8; 16], n: u64) -> Result<TransactionRecord, Box<dyn Error>> {
         Ok(TransactionRecord {
-            id: PicX::from_text("0000000000000001")?,
+            id: PicX::from_text(&format!("{n:016}"))?,
             type_cd: PicX::from_array(*b"01"),
             cat_cd: PicU::new(1)?,
             source: PicX::from_text("POS TERM")?,
@@ -1385,7 +1701,7 @@ mod tests {
             merchant_name: PicX::from_text("Abshire-Lowe")?,
             merchant_city: PicX::from_text("North Enoshaven")?,
             merchant_zip: PicX::from_text("72112")?,
-            card_num: CardNumber::new(PicX::from_array(CARD_1)),
+            card_num: CardNumber::new(PicX::from_array(card)),
             orig_ts: PicTimestamp::decode(b"2022-06-10 19:27:53.000000")?,
             proc_ts: PicTimestamp::decode(b"2022-07-01-10.15.42.370000")?,
             filler: PicX::spaces(),

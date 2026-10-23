@@ -19,8 +19,9 @@ export type PfKeyBarEntry = PfKeyItem & {
   readonly hidden?: boolean;
   /**
    * Whether the key is refused for now, as the 3270 keyboard is locked while the program runs.
-   * Screens set it while a request is outstanding. Its button is disabled and its key does
-   * nothing: the keydown is consumed, so it neither runs the action, nor reaches the browser
+   * Screens set it while a request is outstanding. Its button is `aria-disabled` and stays
+   * focusable, so a key just clicked keeps focus, and neither a click on it nor its key does
+   * anything: the keydown is consumed, so it neither runs the action, nor reaches the browser
    * (F5 does not reload), nor counts as an invalid key, nor submits the form.
    */
   readonly disabled?: boolean;
@@ -97,7 +98,9 @@ function pressHandler({ onPress, disabled }: PfKeyBarEntry): (() => void) | unde
 /**
  * The click handler of the ENTER button. With an action, the click runs it instead of submitting,
  * exactly as the Enter key does; without one, the click submits the form natively. A disabled
- * ENTER neither runs its action nor submits.
+ * ENTER neither runs its action nor submits: it cancels every click it receives, a mouse click,
+ * Enter or Space on the focused button, and the click the browser sends to the form's default
+ * button for an Enter typed in one of its fields.
  */
 function enterHandler({
   onPress,
@@ -115,6 +118,18 @@ function enterHandler({
         onPress();
       };
 }
+
+/**
+ * The look of a refused key, per `Button` variant. `Button` styles only the `disabled` attribute
+ * (`disabled:opacity-50 disabled:pointer-events-none`), and a refused key is `aria-disabled`
+ * instead, so each class list dims it the same way and holds its variant's hover colours at their
+ * resting values (`bg-primary` for `default`; `bg-background` and the inherited text colour for
+ * `outline`). Pointer events stay on: a click passing through to the key row, which cannot take
+ * focus, would move focus to the page.
+ */
+const REFUSED_ENTER_CLASSES = "aria-disabled:opacity-50 aria-disabled:hover:bg-primary";
+const REFUSED_KEY_CLASSES =
+  "aria-disabled:opacity-50 aria-disabled:hover:bg-background aria-disabled:hover:text-inherit";
 
 /**
  * The settings `usePfKeys` receives: `options` as the screen passes them, except that while
@@ -137,10 +152,12 @@ function keyOptionsFor(options: PfKeyOptions | undefined, busy: boolean): PfKeyO
  * removes it from view and from the accessibility tree; a hidden ENTER button still serves as the
  * form's default button on maps that label no ENTER key.
  *
- * A disabled entry's button carries the HTML `disabled` attribute, shown by the `Button`'s own
- * disabled style, and its key is consumed with no action. A disabled ENTER button is a disabled
- * default button, so an Enter typed in a field of the form submits nothing either. `busy` marks
- * the key row `aria-busy` while the screen waits for a response.
+ * A disabled entry's button is `aria-disabled="true"` rather than HTML-`disabled`, so a key the
+ * operator has just clicked or pressed keeps focus while the screen waits, instead of the browser
+ * dropping focus to the page. It looks as a disabled `Button` does; a click on it runs nothing, and
+ * its key is consumed with no action. A disabled ENTER button stays the form's default button and
+ * cancels its clicks, so an Enter typed in a field of the form submits nothing either. `busy`
+ * marks the key row `aria-busy` while the screen waits for a response.
  *
  * This is the only caller of `usePfKeys` on a screen: a second caller would bind a second window
  * listener and run every key's action twice. Browsers keep some F-keys (F5 reloads, F12 opens the
@@ -162,7 +179,8 @@ export function PfKeyBar({ keys, formId, options, busy = false }: PfKeyBarProps)
             size="sm"
             form={formId}
             hidden={entry.hidden ?? entry.dark}
-            disabled={entry.disabled}
+            aria-disabled={entry.disabled === true || undefined}
+            className={REFUSED_ENTER_CLASSES}
             onClick={enterHandler(entry)}
           >
             {entry.label}
@@ -174,7 +192,8 @@ export function PfKeyBar({ keys, formId, options, busy = false }: PfKeyBarProps)
             variant="outline"
             size="sm"
             hidden={entry.hidden ?? entry.dark}
-            disabled={entry.disabled}
+            aria-disabled={entry.disabled === true || undefined}
+            className={REFUSED_KEY_CLASSES}
             onClick={pressHandler(entry)}
           >
             {entry.label}

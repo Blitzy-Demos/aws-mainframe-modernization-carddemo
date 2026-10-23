@@ -14,7 +14,8 @@
 //!   COPAUS1C-009).
 //! - [`read_current`] is `READ-AUTH-RECORD`: the `GU` of the summary by `ACCNTID`, then the `GNP`
 //!   of the detail by `PAUT9CTS`, on the pool (COPAUS1C-008 to COPAUS1C-011). Neither COBOL call
-//!   holds the segment, so neither read takes a lock.
+//!   holds the segment, so neither read takes a lock, and endpoint 22 answers while an F5 holds
+//!   the detail.
 //! - No `direction` is ENTER, the detail of the path's key (COPAUS1C-008). `forward` is F8,
 //!   `PROCESS-PF8-KEY`: after the current read, [`read_next`] is `READ-NEXT-AUTH-RECORD`, the next
 //!   detail of the account in twin order (COPAUS1C-024 to COPAUS1C-026). `backward` is no key of
@@ -27,9 +28,10 @@
 //! COPAUS1C's `TAKE-SYNCPOINT` commits and `ROLL-BACK` backs out, and which COPAUS2C's statements
 //! join (COPAUS1C-030, COPAUS2C-012):
 //!
-//! 1. [`read_current`] on the transaction, then `copaus1c::toggle` flips the fraud flag and
-//!    `FraudToggle::with_report_date` stamps COPAUS2C's `MM/DD/YY` report date into the record
-//!    the replace writes back (COPAUS1C-028, COPAUS2C-001).
+//! 1. [`read_current`] on the transaction, its detail read `SELECT … FOR UPDATE`, then
+//!    `copaus1c::toggle` flips the fraud flag and `FraudToggle::with_report_date` stamps
+//!    COPAUS2C's `MM/DD/YY` report date into the record the replace writes back (COPAUS1C-028,
+//!    COPAUS2C-001).
 //! 2. [`read_customer`] supplies `WS-FRD-CUST-ID`, the customer COPAUS0C left in the COMMAREA
 //!    (COPAUS1C-030, X-COPAUS1C-4).
 //! 3. `copaus2c::fraud_row` builds the `AUTHFRDS` row and [`record_fraud`] inserts it inside a
@@ -41,6 +43,24 @@
 //!
 //! A read that misses or fails stops both endpoints with that read's outcome, and nothing is
 //! written (X-COPAUS1C-6).
+//!
+//! ## Concurrent F5s
+//!
+//! The flag the stored detail holds decides each toggle (COPAUS1C-028), and the replace follows
+//! a read that IMS requires to be a get-hold call, which holds the segment until the syncpoint
+//! (X-COPAUS1C-1, X-COPAUS1C-H2). Endpoint 23 therefore holds the detail row from its read to
+//! its commit or rollback, so concurrent F5s on one authorization run one after the other. A
+//! waiting transaction's read returns the row as the transaction before it committed it, since
+//! under `READ COMMITTED` a `FOR UPDATE` that waited re-reads the row it locks; each committed
+//! toggle thus flips the committed flag exactly once and reports that flip. The summary read
+//! stays plain, as endpoint 23 never writes the summary. Only the database serialises: no
+//! process-local lock guards the detail, so a second API process waits on the same row. The
+//! request pool (`runtime::db::connect_for_requests`) adds no `lock_timeout` or
+//! `statement_timeout`: its sessions carry only the server options `DATABASE_URL` names, so by
+//! default an F5 that meets the held detail waits until the holding transaction ends, then reads
+//! the row it left and goes on. Only a `lock_timeout` or `statement_timeout` set in
+//! `DATABASE_URL`, as `options[lock_timeout]=…`, or in the server's configuration ends the wait
+//! sooner; the detail read then fails, with COPAUS1C-011's text and nothing written.
 //!
 //! # Errors and halts
 //!
@@ -109,7 +129,7 @@ pub(crate) async fn detail(
 ) -> Result<AuthDetailView, ServiceError<AuthDetailFailure>> {
     let key = rules::edit(acct_id, auth_key).map_err(ServiceError::Rule)?;
     let mut store = state.store.clone();
-    let current = read_current(&mut store, key).await;
+    let current = read_current(&mut store, key, DetailHold::None).await;
     let view = match query.direction {
         Some(PageDirection::Forward) => match current.lookup().record() {
             Ok(record) => {
@@ -170,9 +190,10 @@ pub(crate) async fn toggle_fraud(
     }
 }
 
-/// F5 inside the open transaction `tx`, up to COPAUS1C's decision: the reads, the toggle, COPAUS2C's
-/// insert or update and, after its success only, the replace (COPAUS1C-028 to COPAUS1C-033). The
-/// caller commits or rolls back on the outcome returned.
+/// F5 inside the open transaction `tx`, up to COPAUS1C's decision: the reads, the detail held
+/// until the caller commits or rolls back, the toggle, COPAUS2C's insert or update and, after its
+/// success only, the replace (COPAUS1C-028 to COPAUS1C-033). The caller commits or rolls back on
+/// the outcome returned.
 ///
 /// # Errors
 ///
@@ -183,7 +204,10 @@ async fn mark_fraud(
     clock: &dyn Clock,
     key: DetailKey,
 ) -> Result<ToggleOutcome, ServiceError<AuthDetailFailure>> {
-    let current = read_current(tx, key).await;
+    // The flag the detail holds decides the toggle (COPAUS1C-028), so the detail is held from
+    // this read to the commit or rollback: a concurrent F5 on it waits here and then reads the
+    // flag this one committed.
+    let current = read_current(tx, key, DetailHold::UntilCommit).await;
     let detail = current.lookup().record().map_err(ServiceError::Rule)?;
     // COPAUS2C moves its report date into the COMMAREA copy of the detail, the copy COPAUS1C
     // writes back, so the replaced segment carries it (COPAUS1C-032, COPAUS2C-001).
@@ -242,13 +266,30 @@ impl CurrentRead {
     }
 }
 
+/// How [`read_current`] reads the detail.
+#[derive(Clone, Copy)]
+enum DetailHold {
+    /// A plain read, which takes no lock: endpoint 22, whose `GU` and `GNP` hold nothing
+    /// (COPAUS1C-008).
+    None,
+    /// `SELECT … FOR UPDATE` inside endpoint 23's transaction, the row held until its commit or
+    /// rollback: the read the `REPL` of `UPDATE-AUTH-DETAILS` follows, held as the get-hold call
+    /// IMS requires before a `REPL` (COPAUS1C-028, X-COPAUS1C-1).
+    UntilCommit,
+}
+
 /// `READ-AUTH-RECORD` on `store`, the pool for endpoint 22 and the transaction for endpoint 23:
 /// `GU PAUTSUM0 WHERE (ACCNTID = ..)`, then, only when the summary is found, `GNP PAUTDTL1 WHERE
-/// (PAUT9CTS = ..)` (`COPAUS1C.cbl:431-491`; COPAUS1C-008 to COPAUS1C-011).
+/// (PAUT9CTS = ..)` (`COPAUS1C.cbl:431-491`; COPAUS1C-008 to COPAUS1C-011). The summary read
+/// never takes a lock, and `hold` says whether the detail read does.
 ///
 /// The COBOL issues the detail call after a failed summary call too; the replacement stops at
-/// the summary (X-COPAUS1C-6).
-async fn read_current<E>(store: &mut E, key: DetailKey) -> CurrentRead
+/// the summary (X-COPAUS1C-6). A held read whose row another transaction holds waits until that
+/// transaction ends and then reads the row it left, as the request pool adds no `lock_timeout`
+/// or `statement_timeout`. Only one set in `DATABASE_URL`, as `options[lock_timeout]=…`, or in
+/// the server's configuration ends the wait sooner, and the held read then fails like any other
+/// detail read.
+async fn read_current<E>(store: &mut E, key: DetailKey, hold: DetailHold) -> CurrentRead
 where
     E: PendingAuthSummaryRepository + PendingAuthDetailRepository,
 {
@@ -262,18 +303,22 @@ where
         }
     }
     let auth_key = key.auth_key();
-    match PendingAuthDetailRepository::find_by_id(
-        store,
-        acct,
-        auth_key.date_9c(),
-        auth_key.time_9c(),
-    )
-    .await
-    {
+    let (date_9c, time_9c) = (auth_key.date_9c(), auth_key.time_9c());
+    let (read, statement) = match hold {
+        DetailHold::None => (
+            PendingAuthDetailRepository::find_by_id(store, acct, date_9c, time_9c).await,
+            "pending_auth_details find_by_id",
+        ),
+        DetailHold::UntilCommit => (
+            PendingAuthDetailRepository::lock_by_id(store, acct, date_9c, time_9c).await,
+            "pending_auth_details lock_by_id",
+        ),
+    };
+    match read {
         Ok(Some(record)) => CurrentRead::Found(Box::new(record)),
         Ok(None) => CurrentRead::NotFound,
         Err(error) => {
-            note_store_error("pending_auth_details find_by_id", &error);
+            note_store_error(statement, &error);
             CurrentRead::DetailError
         }
     }

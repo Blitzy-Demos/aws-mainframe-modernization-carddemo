@@ -13,7 +13,7 @@ import { useNavigate } from "react-router";
 import { cn } from "cn";
 import { useCotrtlicList, useCotrtlicListActions } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -47,15 +47,6 @@ const INFO_WIDTH = 45;
 /** `PAGENO`, `LENGTH=3` at `POS=(4,76)` (COTRTLI-013). */
 const PAGE_NO_LENGTH = 3;
 
-/*
- * BLITZY [LAYOUT]: a grid column is narrower than a character plus the `Input` padding, so a
- * field of one to three characters stretched over its `LENGTH` columns (the `Input` default
- * `w-full`) would hide its own text. Every input carries `size` = its map `LENGTH`, and these
- * short grid fields take that intrinsic width instead (`w-auto`), running into the empty columns
- * after them. The list selectors need no such width: their table column is wider.
- */
-const NARROW_FIELD = "w-auto";
-
 /**
  * A label fills its grid line, so its text, centred by `Label`'s own flex alignment, stands level
  * with the input on the same map line instead of at the line's top.
@@ -66,10 +57,11 @@ const LINE_LABEL = "h-full";
 const DESCRIPTION_DASHES = "-".repeat(COTRTLI_LENGTHS.description);
 
 /**
- * The labelled keys that send a request, refused with ENTER while one is outstanding; F2 and F3
- * only navigate (COTRTLIC-015, COTRTLIC-016), so they stay available.
+ * The labelled keys refused with ENTER while the keyboard is locked: those that send a request,
+ * and F2, whose transfer takes the same lock (COTRTLIC-016). F3 only navigates (COTRTLIC-015),
+ * so it stays available.
  */
-const REQUEST_KEYS: ReadonlySet<PfKey> = new Set<PfKey>(["F7", "F8", "F10"]);
+const LOCKED_KEYS: ReadonlySet<PfKey> = new Set<PfKey>(["F2", "F7", "F8", "F10"]);
 
 /** The form before the first response: both filters and all seven rows blank. */
 function blankValues(): CotrtliValues {
@@ -237,9 +229,9 @@ function firstMessage(errors: FieldErrors<CotrtliValues>): string | undefined {
  *
  * While a request is out the keyboard is locked, as the 3270's is until the program answers. The
  * lock is taken when a key is accepted, before the form's asynchronous check, and opens when the
- * check refuses the input or the reply settles. Meanwhile ENTER, F7, F8 and F10 are disabled and
- * refused, the key row and the form are busy and every input is read-only; F2 and F3 still
- * navigate.
+ * check refuses the input or the reply settles. F2 takes the same lock for its transfer and holds
+ * it until COTRTUP replaces this screen. Meanwhile ENTER, F2, F7, F8 and F10 are disabled and
+ * refused, the key row and the form are busy and every input is read-only; F3 still navigates.
  *
  * The state is the server's: it carries no authority, and the server re-reads and re-validates
  * every commit. The error line shows the server's message; the zod schema enforces only the map
@@ -483,8 +475,12 @@ export function COTRTLI(): ReactNode {
 
   const handlers: PfKeyHandlers = {
     // COTRTLIC-016: to CTTU to add a type; the list state is discarded. `from` lets CTTU's F3
-    // return here (COTRTUPC-044).
+    // return here (COTRTUPC-044). F2 is refused while a request is out, and its lock stays held
+    // until COTRTUP replaces this screen, so no key sends a request while its module loads.
     F2: () => {
+      if (!lock()) {
+        return;
+      }
       void navigate(PATHS.COTRTUP, { state: { from: PATHS.COTRTLI } });
     },
     // COTRTLIC-015: always the admin menu. Every display records COTRTLIC itself as the calling
@@ -512,7 +508,7 @@ export function COTRTLI(): ReactNode {
     ...keyRowItems(KEY_ROWS.COTRTLI).map((item) => ({
       ...item,
       onPress: handlers[item.key],
-      disabled: busy && REQUEST_KEYS.has(item.key),
+      disabled: busy && LOCKED_KEYS.has(item.key),
     })),
   ];
 
@@ -552,12 +548,18 @@ export function COTRTLI(): ReactNode {
               </Label>
             </GridCell>
             <GridCell row={4} col={76} span={3}>
+              {/*
+               * Every input of the screen carries `size` = its map `LENGTH` and takes the shared
+               * map-field box (`FIELD_INPUT`, through `fieldInputClass` for the two-character type
+               * filter): a grid field covers its `LENGTH` columns, a list input fills its table
+               * column, and none is narrower than its value plus the inset.
+               */}
               <Input
                 id={pageNoId}
                 readOnly
                 tabIndex={-1}
                 size={PAGE_NO_LENGTH}
-                className={NARROW_FIELD}
+                className={FIELD_INPUT}
                 value={page === null ? "" : String(page.page_no)}
               />
             </GridCell>
@@ -581,7 +583,7 @@ export function COTRTLI(): ReactNode {
                         readOnly={filtersLocked || busy}
                         tabIndex={filtersLocked ? -1 : undefined}
                         className={cn(
-                          NARROW_FIELD,
+                          fieldInputClass(COTRTLI_LENGTHS.typeFilter),
                           "aria-invalid:text-destructive",
                           filtersLocked && "text-muted-foreground",
                         )}
@@ -611,6 +613,7 @@ export function COTRTLI(): ReactNode {
                         readOnly={filtersLocked || busy}
                         tabIndex={filtersLocked ? -1 : undefined}
                         className={cn(
+                          FIELD_INPUT,
                           "aria-invalid:text-destructive",
                           filtersLocked && "text-muted-foreground",
                         )}
@@ -667,7 +670,7 @@ export function COTRTLI(): ReactNode {
                                     autoComplete="off"
                                     readOnly={!selectorOpen || busy}
                                     tabIndex={selectorOpen ? undefined : -1}
-                                    className="aria-invalid:text-destructive"
+                                    className={cn(FIELD_INPUT, "aria-invalid:text-destructive")}
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />
@@ -691,7 +694,7 @@ export function COTRTLI(): ReactNode {
                                     autoComplete="off"
                                     readOnly={!descriptionOpen || busy}
                                     tabIndex={descriptionOpen ? undefined : -1}
-                                    className="aria-invalid:text-destructive"
+                                    className={cn(FIELD_INPUT, "aria-invalid:text-destructive")}
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />

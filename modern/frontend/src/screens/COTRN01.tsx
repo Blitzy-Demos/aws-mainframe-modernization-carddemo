@@ -12,7 +12,7 @@ import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn01cView } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
   Form,
@@ -496,7 +496,7 @@ export function COTRN01(): ReactNode {
                         autoFocus
                         autoComplete="off"
                         spellCheck={false}
-                        className="min-w-max"
+                        className={FIELD_INPUT}
                       />
                     </FormControl>
                   </GridCell>
@@ -536,10 +536,11 @@ type OutputCellsProps = {
 
 /**
  * One `ASKIP` output field and its label, each in its own grid cell. The label is TURQUOISE, the
- * value BLUE (AAP 0.4.3). The box spans its `LENGTH` columns and is never narrower than `LENGTH`
- * characters plus its padding (`size` with `min-w-max`): a grid column is narrower than a
- * character, so the two columns of `TTYPCD` alone could not show its two characters. Like `ASKIP`,
- * the cursor skips it: it takes no tab stop, yet stays readable and selectable.
+ * value BLUE (AAP 0.4.3). The box is the shared map-field box (`fieldInputClass` with `size` = its
+ * `LENGTH`): it spans its `LENGTH` columns and is never narrower than its value plus the inset,
+ * because a grid column is narrower than a character, so the two columns of `TTYPCD` alone could
+ * not show its two characters. Like `ASKIP`, the cursor skips it: it takes no tab stop, yet stays
+ * readable and selectable.
  */
 function OutputCells({ id, field, value }: OutputCellsProps): ReactNode {
   return (
@@ -557,7 +558,7 @@ function OutputCells({ id, field, value }: OutputCellsProps): ReactNode {
           tabIndex={-1}
           value={value}
           size={field.at.span}
-          className="min-w-max text-muted-foreground"
+          className={`${fieldInputClass(field.at.span)} text-muted-foreground`}
         />
       </GridCell>
     </>

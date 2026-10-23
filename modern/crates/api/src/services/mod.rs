@@ -9,10 +9,18 @@
 //!   on a domain value, holds no `match` on a domain outcome and names neither `persistence` nor
 //!   `sqlx`.
 //! - **Services** (`services::<program>`) load through the repository traits of `persistence`,
-//!   called fully qualified (`AccountRepository::lock_by_id(&mut tx, id)`), reading through the
-//!   state's `PgStore` and writing inside a `PgTx`. They apply the rules of
+//!   called fully qualified (`AccountRepository::lock_by_id(&mut tx, id)`), apply the rules of
 //!   `domain::online::<program>`, persist what those rules decide, and return the domain's
-//!   outcome or `ServiceError<F>`, where `F` is the program's domain failure type.
+//!   outcome or `ServiceError<F>`, where `F` is the program's domain failure type. Each
+//!   repository call runs on one of the two executors that implement every repository trait,
+//!   `PgStore` (the pool) and `PgTx` (an open transaction; AAP 0.5.4). A read that stands alone,
+//!   or a write that is one statement, runs on a clone of the state's `PgStore`, where each
+//!   statement takes a pooled connection and commits on its own: endpoint 17's insert of the new
+//!   user (`cousr01c::add`) is such an autocommitted write. A unit of work that locks a row,
+//!   reads and then writes, or spans several statements runs in a `PgTx` that the service opens
+//!   with `PgStore::begin` and ends itself with `commit` or `rollback`; a store error that
+//!   returns early drops it, which rolls it back. Inside it, a statement after whose failure the
+//!   program goes on runs in a savepoint (see "Savepoints" below).
 //! - A service never names `sqlx`, holds SQL text, calls `runtime::migrate` (Single Schema
 //!   Executor) or reaches `RabbitMQ`, which no online transaction uses (AAP 0.5.3). It narrows
 //!   an integer only through a checked `try_from`, never an `as` cast (Checked Integer

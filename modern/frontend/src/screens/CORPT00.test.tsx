@@ -20,7 +20,7 @@ import { CORPT00 } from "./CORPT00";
  * `POST /api/v1/reports/transactions`. Expected values are the audited results of
  * `modern/audit/screens.md` (`CORPT00-nnn`) and `modern/audit/online/CORPT00C.md`
  * (`CORPT00C-nnn`); every message below is a literal those rows quote, except the 401's, which
- * comes from the API's token extractor.
+ * comes from the API's token extractor, and the digits-only text, which is the request DTOs'.
  *
  * Not tagged here: the `both` rows of the ten inputs (`LENGTH`, `NUM`), whose client half is
  * proved in `src/schemas/CORPT00.test.ts`, and the header label rows `CORPT00-001`, `-004`,
@@ -36,6 +36,15 @@ import { CORPT00 } from "./CORPT00";
  */
 
 const ENDPOINT = "/api/v1/reports/transactions";
+
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
 
 /** Accessible names of the inputs the tests address directly. */
 const MONTHLY = "Monthly (Current Month)";
@@ -121,6 +130,12 @@ const STOPPERS = [
   { row: 14, col: 44 },
   { row: 19, col: 68 },
 ];
+
+/**
+ * `FIELD_NUMERIC_MESSAGE` of the request DTOs (`crates/api/src/dto/mod.rs`): the text endpoint 14
+ * answers a date part that is not digits with, and the schema refuses the same part with.
+ */
+const NOT_DIGITS = "Only digits can be entered in this field...";
 
 /** `CCDA-MSG-INVALID-KEY`, the 50-byte value with its padding (CORPT00C-005). */
 const INVALID_KEY_TEXT = "Invalid key pressed. Please see below...".padEnd(50, " ");
@@ -291,6 +306,12 @@ const badMonth: components["schemas"]["ScreenError"] = {
 const noEndDay: components["schemas"]["ScreenError"] = {
   message: "End Date - Day can NOT be empty...",
   field: "end_day",
+};
+
+/** CORPT00C-011: a blank start month, all spaces included. */
+const noStartMonth: components["schemas"]["ScreenError"] = {
+  message: "Start Date - Month can NOT be empty...",
+  field: "start_month",
 };
 
 /** CORPT00C-014: a blank end month. */
@@ -599,6 +620,12 @@ describe("CORPT00 transaction reports screen", () => {
       expect(box.getAttribute("data-slot")).toBe("form-control");
       expect(box.closest('[data-slot="form-item"]')).not.toBeNull();
       expect(box.maxLength).toBe(field.length);
+      // The shared map-field box, `MAP_FIELD_BOX` with `size` = the LENGTH, so a full-length value
+      // shows on the narrowest frame; the one- and two-character fields keep a `w-6` box, empty
+      // or not, the four-character years fill their cells.
+      expect(box.size).toBe(field.length);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
+      expect(box.classList.contains("w-6")).toBe(field.length <= 2);
       expect(box.getAttribute("inputmode")).toBe(field.numeric ? "numeric" : null);
       expect(box.value).toBe("");
       const labels = Array.from(box.labels ?? []);
@@ -957,29 +984,81 @@ describe("CORPT00 transaction reports screen", () => {
     },
   );
 
-  it("refuses a date part that is not digits before any request, focusing that part", async () => {
-    // The `NUM` refusal itself is the client half of a `both` row, proved in the schema test;
-    // this shows what the screen does with it: zod's message in the red row, the inputs kept,
-    // and the part marked invalid with that message for screen readers.
-    // screens.md records no message for the row, so the text is zod 3's default for a `regex`.
-    const requests = stubApi();
-    renderScreen();
-    const request: components["schemas"]["ReportRequest"] = { ...customRequest, start_day: "1a" };
-    fill(request);
-    await pressEnter();
+  it.each([
+    { part: "Start Date month", wire: "start_month", value: "AB" },
+    { part: "Start Date day", wire: "start_day", value: "1a" },
+    { part: "End Date year", wire: "end_year", value: "20 2" },
+  ] as const)(
+    "refuses $value in $part before any request with the server's digits-only text, focusing it",
+    async ({ part, wire, value }) => {
+      // The `NUM` refusal itself is the client half of a `both` row, proved in the schema test;
+      // this shows what the screen does with it: the text endpoint 14 answers the same part with
+      // (`FIELD_NUMERIC_MESSAGE`) in the red row, the inputs kept, and the part marked invalid
+      // with that message for screen readers.
+      const requests = stubApi();
+      renderScreen();
+      const request: components["schemas"]["ReportRequest"] = { ...customRequest, [wire]: value };
+      fill(request);
+      await pressEnter();
 
-    await waitFor(() => {
-      expect(messageRow().textContent).toBe("Invalid");
-    });
-    expect(messageRow().dataset.messageKind).toBe("error");
-    expectMarked("Start Date day", "Invalid");
-    expect(shown()).toEqual(typed(request));
-    await waitFor(() => {
-      expect(document.activeElement).toBe(inputOf("Start Date day"));
-    });
-    await settle();
-    expect(requests).toHaveLength(0);
-  });
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(NOT_DIGITS);
+      });
+      expect(messageRow().dataset.messageKind).toBe("error");
+      expectMarked(part, NOT_DIGITS);
+      expect(shown()).toEqual(typed(request));
+      await waitFor(() => {
+        expect(document.activeElement).toBe(inputOf(part));
+      });
+      await settle();
+      expect(requests).toHaveLength(0);
+    },
+  );
+
+  // audit: CORPT00C-042
+  it.each([
+    {
+      title: "Monthly with one space in Start Month, whose parts Monthly ignores",
+      request: { ...monthlyRequest, start_month: " " },
+      status: 200,
+      reply: monthlySubmitted,
+    },
+    {
+      title: "Custom with an all-space Start Month, which the server's blank edit answers",
+      request: { ...customRequest, start_month: "  " },
+      status: 400,
+      reply: noStartMonth,
+    },
+    {
+      title: "Custom with digits and spaces around them, which the server reads as their digits",
+      request: {
+        ...customRequest,
+        start_month: " 1",
+        start_day: "1 ",
+        start_year: "2022",
+        end_month: "7 ",
+        end_day: " 6",
+        end_year: "2022",
+      },
+      status: 200,
+      reply: customSubmitted,
+    },
+  ])(
+    "sends $title in exactly one request, every part as typed",
+    async ({ request, status, reply }) => {
+      const requests = stubApi({ status, body: reply });
+      renderScreen();
+      fill(request);
+      await pressEnter();
+
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(reply.message);
+      });
+      await settle();
+      expect(requests).toHaveLength(1);
+      expect(await bodies(requests)).toEqual([request]);
+    },
+  );
 
   it.each([
     {
@@ -1134,8 +1213,8 @@ describe("CORPT00 transaction reports screen", () => {
     });
     expect(keyBar.getAttribute("aria-busy")).toBe("true");
     expect(form.getAttribute("aria-busy")).toBe("true");
-    expect(enterButton().hasAttribute("disabled")).toBe(true);
-    expect(back.hasAttribute("disabled")).toBe(false);
+    expect(enterButton().getAttribute("aria-disabled")).toBe("true");
+    expect(back.getAttribute("aria-disabled")).toBeNull();
     for (const field of FIELDS) {
       expect(inputOf(field.name).readOnly).toBe(true);
     }
@@ -1154,7 +1233,7 @@ describe("CORPT00 transaction reports screen", () => {
     });
     expect(keyBar.getAttribute("aria-busy")).toBe("false");
     expect(form.getAttribute("aria-busy")).toBe("false");
-    expect(enterButton().hasAttribute("disabled")).toBe(false);
+    expect(enterButton().getAttribute("aria-disabled")).toBeNull();
     for (const field of FIELDS) {
       expect(inputOf(field.name).readOnly).toBe(false);
     }
@@ -1175,12 +1254,12 @@ describe("CORPT00 transaction reports screen", () => {
     fill({ ...customRequest, start_day: "1a" });
     await pressEnter();
     await waitFor(() => {
-      expect(messageRow().textContent).toBe("Invalid");
+      expect(messageRow().textContent).toBe(NOT_DIGITS);
     });
     expect(screen.getByRole("group", { name: "Function keys" }).getAttribute("aria-busy")).toBe(
       "false",
     );
-    expect(enterButton().hasAttribute("disabled")).toBe(false);
+    expect(enterButton().getAttribute("aria-disabled")).toBeNull();
     expect(inputOf(MONTHLY).readOnly).toBe(false);
 
     fill(customRequest);
@@ -1199,7 +1278,7 @@ describe("CORPT00 transaction reports screen", () => {
     fill(monthlyRequest);
     await pressEnter();
     await waitFor(() => {
-      expect(enterButton().hasAttribute("disabled")).toBe(true);
+      expect(enterButton().getAttribute("aria-disabled")).toBe("true");
     });
 
     fireEvent.click(screen.getByRole("button", { name: "F3=Back" }));

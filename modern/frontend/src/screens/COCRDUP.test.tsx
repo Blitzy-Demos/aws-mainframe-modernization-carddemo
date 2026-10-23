@@ -38,6 +38,15 @@ const EXPIRY = "2030-06-30";
 const CARDS_EDIT = "GET /api/v1/cards/edit";
 const CARD_PUT = `PUT /api/v1/cards/${CARD_REF}`;
 
+/**
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
+ * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
+ * contract imports no module beside the screen, the session, the routes and the generated types,
+ * so a box is checked against this list rather than against the constant that renders it.
+ */
+const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+
 /** COCRDUPC `3250-SETUP-INFOMSG`: the info line of each state (`COCRDUPC.md`). */
 const INFO_SEARCH = "Please enter Account and Card Number";
 const INFO_SHOWN = "Details of selected card shown above";
@@ -323,7 +332,7 @@ function disabledKeys(): Record<string, boolean> {
   return Object.fromEntries(
     Array.from(keyRow().querySelectorAll("button"), (button) => [
       button.textContent ?? "",
-      button.disabled,
+      button.getAttribute("aria-disabled") === "true",
     ]),
   );
 }
@@ -598,6 +607,15 @@ describe("COCRDUP rendering", () => {
         Object.entries(LABELS).map(([name, label]) => [name, field(label).maxLength]),
       ),
     ).toEqual({ account: 11, card: 16, name: 50, status: 1, month: 2, year: 4 });
+    // Every input takes the shared map-field box, `MAP_FIELD_BOX` with `size` = its LENGTH, so a
+    // full-length value shows on the narrowest frame.
+    expect(
+      Object.fromEntries(Object.entries(LABELS).map(([name, label]) => [name, field(label).size])),
+    ).toEqual({ account: 11, card: 16, name: 50, status: 1, month: 2, year: 4 });
+    for (const label of Object.values(LABELS)) {
+      const box = field(label);
+      expect(MAP_FIELD_BOX.filter((name) => !box.classList.contains(name))).toEqual([]);
+    }
     expect(shownValues()).toEqual({
       account: "",
       card: "",

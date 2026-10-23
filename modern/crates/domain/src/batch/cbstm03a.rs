@@ -10,16 +10,18 @@
 //!
 //! # Flow
 //!
-//! `batch::jobs::creastmt` reads every `transactions` row and builds the [`TransactionTable`],
-//! which fails with [`StatementError::NoTransactions`] when there is none (CBSTM03A-007). It
-//! then takes the `card_xref` records in [`xref_sort_key`] order, reads each one's customer and
-//! account by key (CBSTM03A-009 to CBSTM03A-011, CBSTM03B-003 to CBSTM03B-005), and calls
-//! [`statement`] once per cross-reference record, writing [`Statement::text_lines`] to
-//! `STATEMNT.PS` and [`Statement::html_records`] to `STATEMNT.HTML`. File names, directories,
-//! the PDF, the SYSOUT lines, the error paths and the exit status are the job's (CBSTM03A-002,
-//! CBSTM03A-005, CBSTM03A-012, CBSTM03A-048 to CBSTM03A-052): this module reads no clock, does
-//! no I/O and has no state between statements, as `INITIALIZE STATEMENT-LINES` leaves none
-//! (CBSTM03A-014).
+//! `batch::jobs::creastmt` reads every `transactions` row in card order and counts it in a
+//! [`TableCensus`], keeping none; the census fails with [`StatementError::NoTransactions`] when
+//! there is none (CBSTM03A-007) and tells whether the table fits the COBOL's bounds
+//! (CBSTM03A-008). The job then takes the `card_xref` records in [`xref_sort_key`] order, reads
+//! each one's customer and account by key (CBSTM03A-009 to CBSTM03A-011, CBSTM03B-003 to
+//! CBSTM03B-005), then its card's transactions, which [`TransactionTable::of_card`] puts in
+//! table order, and calls [`statement`] once per cross-reference record, writing
+//! [`Statement::text_lines`] to `STATEMNT.PS` and [`Statement::html_records`] to
+//! `STATEMNT.HTML`. File names, directories, the PDF, the SYSOUT lines, the error paths and the
+//! exit status are the job's (CBSTM03A-002, CBSTM03A-005, CBSTM03A-012, CBSTM03A-048 to
+//! CBSTM03A-052): this module reads no clock, does no I/O and has no state between statements,
+//! as `INITIALIZE STATEMENT-LINES` leaves none (CBSTM03A-014).
 //!
 //! The PSA, TCB and TIOT walk that opens the program displays control-block names and affects
 //! no record (CBSTM03A-003), and its `ALTER` and `GO TO` dispatch fixes only the order of work,
@@ -34,9 +36,10 @@
 //! below upper case, letters below digits. [`sort_key`] and [`xref_sort_key`] weigh each byte by
 //! its code page 037 code, the proposed resolution of escalation candidate X-CREASTMT-3; for
 //! keys made only of digits, every key the fixtures hold, that is byte order. The job's SQL
-//! `ORDER BY` fixes only a deterministic retrieval order: [`TransactionTable::build`] orders its
-//! input by [`sort_key`] itself, as the KSDS returns its records in key order (CBSTM03B-002),
-//! and the job sorts the cross-reference records by [`xref_sort_key`] (CBSTM03B-003).
+//! `ORDER BY` fixes only a deterministic retrieval order: [`TransactionTable::build`] and
+//! [`TransactionTable::of_card`] order their input by [`sort_key`] themselves, as the KSDS
+//! returns its records in key order (CBSTM03B-002), and the job sorts the cross-reference
+//! records by [`xref_sort_key`] (CBSTM03B-003).
 //!
 //! # Table bounds
 //!
@@ -44,9 +47,10 @@
 //! 11th transaction is stored past its `OCCURS` with no range check, and what each statement
 //! then prints depends on the storage layout: halt candidate X-CREASTMT-H2. As CBSTM03A-008
 //! records for the replacement, the table here keeps every card and every transaction, neither
-//! dropping nor overlaying any, and [`TransactionTable::within_cobol_bounds`] tells the job when
-//! a run leaves the COBOL's bounds, so that such a run is reported as blocked parity rather
-//! than claimed.
+//! dropping nor overlaying any, and [`TransactionTable::within_cobol_bounds`], or
+//! [`TableCensus::within_cobol_bounds`] for the same records counted one at a time, tells the
+//! job when a run leaves the COBOL's bounds, so that such a run is reported as blocked parity
+//! rather than claimed.
 //!
 //! # Money
 //!
@@ -62,7 +66,8 @@
 //! No statement record carries a card number, an SSN, a CVV or a password (escalation candidate
 //! X-CREASTMT-5): card numbers are read through [`CardNumber::expose`] only to order and match
 //! transactions. The records leave as bytes; [`Statement`] has no `Debug`, and the derived
-//! `Debug` of [`TransactionTable`] shows card numbers only in their redacted form.
+//! `Debug` of [`TransactionTable`] and [`TableCensus`] shows card numbers only in their
+//! redacted form.
 
 use core::fmt;
 
@@ -238,7 +243,8 @@ struct CardEntry {
 }
 
 /// `WS-TRNX-TABLE`, every transaction grouped by card in collating order, as 8100-TRNXFILE-OPEN
-/// and 8500-READTRNX-READ load it before the first statement (CBSTM03A-006, CBSTM03A-008).
+/// and 8500-READTRNX-READ load it before the first statement (CBSTM03A-006, CBSTM03A-008), or
+/// the one entry of a single card ([`of_card`](Self::of_card)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransactionTable {
     /// The card entries, in [`sort_key`] order of their card numbers.
@@ -263,10 +269,32 @@ impl TransactionTable {
     pub fn build<'a>(
         transactions: impl IntoIterator<Item = &'a TransactionRecord>,
     ) -> Result<Self, StatementError> {
-        let mut ordered: Vec<&TransactionRecord> = transactions.into_iter().collect();
-        if ordered.is_empty() {
+        let table = Self::grouped(transactions);
+        if table.cards.is_empty() {
             return Err(StatementError::NoTransactions);
         }
+        Ok(table)
+    }
+
+    /// The table of one card's transaction records, in any order, built as
+    /// [`build`](Self::build) builds it: the card's entry holds its transactions in
+    /// [`sort_key`] order, the order 4000-TRNXFILE-GET prints them in (CBSTM03A-008,
+    /// CBSTM03A-013). With no record the table has no entry, the table of a card without
+    /// transactions, and is no error.
+    ///
+    /// Given the records of the card a cross-reference record names, [`statement`] prints from
+    /// this table exactly what it prints from the table of every transaction, so a job can build
+    /// each statement from its card's records alone and hold no other card's.
+    #[must_use]
+    pub fn of_card<'a>(transactions: impl IntoIterator<Item = &'a TransactionRecord>) -> Self {
+        Self::grouped(transactions)
+    }
+
+    /// The table of `transactions`, empty when they yield no record: the records put in
+    /// [`sort_key`] order, then each run of one card number made one entry, as
+    /// [`build`](Self::build) describes (CBSTM03A-001, CBSTM03A-008, CBSTM03B-002).
+    fn grouped<'a>(transactions: impl IntoIterator<Item = &'a TransactionRecord>) -> Self {
+        let mut ordered: Vec<&TransactionRecord> = transactions.into_iter().collect();
         // Stable, so two records with equal keys keep their retrieval order.
         ordered.sort_by_key(|transaction| sort_key(transaction));
         let mut cards: Vec<CardEntry> = Vec::new();
@@ -286,7 +314,7 @@ impl TransactionTable {
                 }),
             }
         }
-        Ok(Self { cards })
+        Self { cards }
     }
 
     /// Card entries in the table: the distinct card numbers of the transaction set, with or
@@ -304,11 +332,13 @@ impl TransactionTable {
     /// replacement's and their parity is blocked, never claimed.
     #[must_use]
     pub fn within_cobol_bounds(&self) -> bool {
-        self.cards.len() <= COBOL_CARD_ENTRIES
-            && self
-                .cards
-                .iter()
-                .all(|entry| entry.transactions.len() <= COBOL_TRANSACTIONS_PER_CARD)
+        let widest = self
+            .cards
+            .iter()
+            .map(|entry| entry.transactions.len())
+            .max()
+            .unwrap_or(0);
+        fits_cobol_table(self.cards.len(), widest)
     }
 
     /// The transactions 4000-TRNXFILE-GET prints for `card`, in table order (CBSTM03A-013).
@@ -323,6 +353,83 @@ impl TransactionTable {
             .take_while(move |entry| card_key(&entry.card_num) <= key)
             .filter(move |entry| entry.card_num == *card)
             .flat_map(|entry| entry.transactions.iter())
+    }
+}
+
+/// Whether a table of `cards` card entries whose widest entry holds `widest` transactions fits
+/// `WS-TRNX-TABLE`: `WS-CARD-TBL OCCURS 51 TIMES`, `WS-TRAN-TBL OCCURS 10 TIMES`
+/// (CBSTM03A-008, halt candidate X-CREASTMT-H2).
+const fn fits_cobol_table(cards: usize, widest: usize) -> bool {
+    cards <= COBOL_CARD_ENTRIES && widest <= COBOL_TRANSACTIONS_PER_CARD
+}
+
+/// The shape of `WS-TRNX-TABLE`, counted one transaction record at a time as 8100-TRNXFILE-OPEN
+/// and 8500-READTRNX-READ read them, without holding any (CBSTM03A-006 to CBSTM03A-008).
+///
+/// Fed the records in card order, the order STEP010 sorts them into (CBSTM03A-001), it counts
+/// what [`TransactionTable::build`] would hold: each run of consecutive records with one card
+/// number is one card entry, and the transactions of the widest entry bound the table, so
+/// [`card_count`](Self::card_count) and [`within_cobol_bounds`](Self::within_cobol_bounds)
+/// answer as the table's do. It keeps the last record's card number, `WS-SAVE-CARD`, and three
+/// counters, whatever the number of records. Its derived `Debug` shows that card number only in
+/// its redacted form.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TableCensus {
+    /// `WS-SAVE-CARD`, the card number of the last record counted; `None` before the first.
+    save_card: Option<CardNumber>,
+    /// Card entries opened so far.
+    cards: usize,
+    /// Transactions of the current card entry.
+    current: usize,
+    /// Transactions of the widest card entry so far.
+    widest: usize,
+}
+
+impl TableCensus {
+    /// Counts `transaction`, the next record of the read (CBSTM03A-006, CBSTM03A-008): a record
+    /// whose card number equals the previous record's adds 1 to the current entry's count; any
+    /// other record, the first included, opens the next entry with a count of 1.
+    pub fn count(&mut self, transaction: &TransactionRecord) {
+        if self.save_card.as_ref() == Some(&transaction.card_num) {
+            self.current += 1;
+        } else {
+            self.cards += 1;
+            self.current = 1;
+            self.save_card = Some(transaction.card_num.clone());
+        }
+        self.widest = self.widest.max(self.current);
+    }
+
+    /// Card entries counted: the distinct card numbers of a read in card order, with or without
+    /// a cross-reference record (CBSTM03A-008).
+    #[must_use]
+    pub const fn card_count(&self) -> usize {
+        self.cards
+    }
+
+    /// Whether the counted table fits `WS-TRNX-TABLE`, as
+    /// [`TransactionTable::within_cobol_bounds`] answers for the table of the same records:
+    /// at most 51 cards, each with at most 10 transactions (CBSTM03A-008). Outside them the
+    /// statements are the replacement's, with their parity blocked (halt candidate
+    /// X-CREASTMT-H2).
+    #[must_use]
+    pub const fn within_cobol_bounds(&self) -> bool {
+        fits_cobol_table(self.cards, self.widest)
+    }
+
+    /// Ends the count at the end of the read, which 8500-READTRNX-READ reaches with status
+    /// `10`, and gives the census of every record counted.
+    ///
+    /// # Errors
+    ///
+    /// [`StatementError::NoTransactions`] when no record was counted, the abend of the first
+    /// read at end of file (CBSTM03A-007).
+    pub fn finish(self) -> Result<Self, StatementError> {
+        if self.cards == 0 {
+            Err(StatementError::NoTransactions)
+        } else {
+            Ok(self)
+        }
     }
 }
 
@@ -872,7 +979,7 @@ mod tests {
     use copybook::{PicDate, PicTimestamp, PicU, PicX};
 
     use super::{
-        HTML_RECORD_LEN, STMT_RECORD_LEN, Statement, StatementError, TransactionTable,
+        HTML_RECORD_LEN, STMT_RECORD_LEN, Statement, StatementError, TableCensus, TransactionTable,
         ebcdic_weight, sort_key, statement, xref_sort_key,
     };
     use crate::money::{Decimal, Money};
@@ -1499,10 +1606,126 @@ mod tests {
             };
         let cases: [(u32, u32, bool); 3] = [(51, 10, true), (52, 1, false), (1, 11, false)];
         for (cards, per_card, within) in cases {
-            let table = TransactionTable::build(&records(cards, per_card)?)?;
+            let records = records(cards, per_card)?;
+            let table = TransactionTable::build(&records)?;
             assert_eq!(table.card_count(), usize::try_from(cards)?);
             assert_eq!(table.within_cobol_bounds(), within, "{cards} x {per_card}");
+            // The census of the same records, counted one at a time in card order, agrees.
+            let mut census = TableCensus::default();
+            for record in &records {
+                census.count(record);
+            }
+            let census = census.finish()?;
+            assert_eq!(
+                census.card_count(),
+                table.card_count(),
+                "{cards} x {per_card}"
+            );
+            assert_eq!(census.within_cobol_bounds(), within, "{cards} x {per_card}");
         }
+        Ok(())
+    }
+
+    /// The census opens one entry per run of one card number and keeps the widest entry's
+    /// count; with no record counted it ends as the first read at end of file; its `Debug`
+    /// shows no card number.
+    // audit: CBSTM03A-006, CBSTM03A-007, CBSTM03A-008
+    #[test]
+    fn the_census_counts_card_entries_and_the_widest_one_record_at_a_time() -> TestResult {
+        assert_eq!(
+            TableCensus::default().finish(),
+            Err(StatementError::NoTransactions)
+        );
+        let records = [
+            transaction(CARD, "0000000000000001", "a1", 100)?,
+            transaction(CARD, "0000000000000002", "a2", 100)?,
+            transaction(CARD, "0000000000000003", "a3", 100)?,
+            transaction(OTHER_CARD, "0000000000000004", "b", 100)?,
+            transaction("4000000000000009", "0000000000000005", "c1", 100)?,
+            transaction("4000000000000009", "0000000000000006", "c2", 100)?,
+        ];
+        let mut census = TableCensus::default();
+        let mut counted = Vec::new();
+        for record in &records {
+            census.count(record);
+            counted.push((census.card_count(), census.widest));
+        }
+        assert_eq!(counted, [(1, 1), (1, 2), (1, 3), (2, 3), (3, 3), (3, 3)]);
+        let census = census.finish()?;
+        assert_eq!(
+            census.card_count(),
+            TransactionTable::build(&records)?.card_count()
+        );
+        assert!(census.within_cobol_bounds());
+        let shown = format!("{census:?}");
+        assert!(!shown.contains("4000000000000009"), "{shown}");
+        Ok(())
+    }
+
+    /// The statement of each card built from that card's records alone, given in byte order as
+    /// the keyed read returns them, equals its statement from the table of every transaction:
+    /// a letter-led ID still prints before a digit-led one, and a card without records gets the
+    /// empty summary.
+    // audit: CBSTM03A-001, CBSTM03A-008, CBSTM03A-013
+    #[test]
+    fn a_statement_from_its_card_alone_equals_one_from_every_transaction() -> TestResult {
+        let ninth = "4000000000000009";
+        let all = [
+            transaction(CARD, "0000000000000001", "digits", 1_000)?,
+            transaction(OTHER_CARD, "0000000000000002", "other", 2_000)?,
+            transaction(CARD, "A000000000000001", "letter", -300)?,
+            transaction(ninth, "0000000000000004", "ninth", 400)?,
+            transaction(CARD, "0000000000000003", "later", 500)?,
+        ];
+        let every = TransactionTable::build(&all)?;
+        let customer = customer(NAMES, ADDRESS, 623)?;
+        let account = account(50, 194_587)?;
+        for card in [CARD, OTHER_CARD, BARE_CARD, ninth] {
+            let xref = xref(card)?;
+            let mut rows: Vec<&TransactionRecord> = all
+                .iter()
+                .filter(|record| record.card_num == xref.card_num)
+                .collect();
+            rows.sort_by_key(|record| *record.id.as_bytes());
+            let alone = TransactionTable::of_card(rows.iter().copied());
+            assert_eq!(alone.card_count(), usize::from(!rows.is_empty()), "{card}");
+            let from_every = statement(&xref, &customer, &account, &every);
+            let from_alone = statement(&xref, &customer, &account, &alone);
+            assert_eq!(from_alone.text_lines, from_every.text_lines, "{card}");
+            assert_eq!(from_alone.html_records, from_every.html_records, "{card}");
+        }
+        // In any input order, the letter-led ID prints first.
+        let card = xref(CARD)?;
+        let reversed = all
+            .iter()
+            .rev()
+            .filter(|record| record.card_num == card.card_num);
+        let st = statement(
+            &card,
+            &customer,
+            &account,
+            &TransactionTable::of_card(reversed),
+        );
+        let ids: Vec<&[u8]> = [16, 17, 18]
+            .iter()
+            .filter_map(|&at| st.text_lines.get(at)?.get(..16))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                b"A000000000000001",
+                b"0000000000000001",
+                b"0000000000000003"
+            ]
+        );
+        let none: [TransactionRecord; 0] = [];
+        let bare = statement(
+            &xref(BARE_CARD)?,
+            &customer,
+            &account,
+            &TransactionTable::of_card(&none),
+        );
+        assert_eq!(bare.text_lines.len(), 19);
         Ok(())
     }
 }
