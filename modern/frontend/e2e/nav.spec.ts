@@ -227,12 +227,13 @@ const TRANSACTION: Record<MapName, string> = {
  * The account and card of the first cross-reference record (`app/data/ASCII/cardxref.txt:1`),
  * which `e2e/fixtures/pending-auth-seed.sql` gives one pending authorization, with that
  * authorization's transaction ID and merchant name. The full card number is used only to assert
- * that it is never shown. COPAU01 masks the digit run of the transaction ID as free text (E32),
- * so the detail is recognised by its merchant name instead.
+ * that it is never shown. The stored transaction ID is `NAV000000000001`; COPAU00 and COPAU01
+ * both mask its 12-digit run as free text, `*` for each digit but its last four (E32), so the
+ * one stored value shows as the same text on the list and on the detail.
  */
 const SEED_ACCOUNT = "00000000050";
 const SEED_CARD = "0500024453765740";
-const SEED_AUTH_TRAN_ID = "NAV000000000001";
+const SEED_AUTH_TRAN_ID = "NAV********0001";
 const SEED_MERCHANT = /^CARDDEMO NAV MERCHANT\s*$/;
 
 /** A redacted card number: twelve `*` and the last four digits (E32). */
@@ -662,6 +663,7 @@ test.describe("o7: 19 maps", () => {
     // audit: COPAU01-009
     await expectHeader(page, "COPAU01");
     await expect(page.getByLabel(labelPattern("Name"))).toHaveValue(SEED_MERCHANT);
+    await expect(page.getByLabel(labelPattern("Tran Id"))).toHaveValue(SEED_AUTH_TRAN_ID);
     expectRedacted(
       await page.getByLabel(labelPattern("Card #")).inputValue(),
       "COPAU01 shows USER0001 a redacted card number",

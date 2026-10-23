@@ -362,14 +362,20 @@ function stateAfterSaveError(
   return echoed;
 }
 
-/** The `Input` attributes of one map field: its `LENGTH`, protection and accessible name. */
-function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean) {
+/**
+ * The `Input` attributes of one map field: its `LENGTH`, protection and accessible name. A field
+ * the state protects (`enterable` false) is read-only and out of the Tab order, as the 3270 Tab
+ * key skips protected fields; it still takes the cursor the program places on it. While `busy`, a
+ * request holds the keyboard: every field is read-only, and an enterable one keeps its Tab stop.
+ */
+function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, busy: boolean) {
   const spec: MapFieldSpec = FIELDS[name];
   const length = COCRDUP_LENGTHS[name];
   const narrow = length <= NARROW_FIELD;
   return {
     maxLength: length,
-    readOnly: !enterable,
+    readOnly: !enterable || busy,
+    tabIndex: enterable ? undefined : -1,
     autoComplete: "off",
     spellCheck: false,
     "aria-label": spec.accessibleName,
@@ -884,6 +890,8 @@ export function COCRDUP(): ReactNode {
       formId={formId}
       message={{ kind: "error", text: model.message }}
       info={model.info}
+      // COCRDUPC-046: the info line is always shown, bright.
+      infoBright
       keys={keys}
       keyOptions={KEY_OPTIONS}
       busy={busy}
@@ -909,7 +917,7 @@ export function COCRDUP(): ReactNode {
                       {/* `IC` on ACCTSID: the cursor starts on the account (COCRDUP-013). */}
                       <Input
                         {...field}
-                        {...inputAttributes(name, !busy)}
+                        {...inputAttributes(name, true, busy)}
                         autoFocus={name === "acctId"}
                       />
                     </FieldCells>
@@ -927,7 +935,7 @@ export function COCRDUP(): ReactNode {
                   name={name}
                   render={({ field }) => (
                     <FieldCells spec={FIELDS[name]}>
-                      <Input {...field} {...inputAttributes(name, keysEnterable && !busy)} />
+                      <Input {...field} {...inputAttributes(name, keysEnterable, busy)} />
                     </FieldCells>
                   )}
                 />
@@ -939,7 +947,7 @@ export function COCRDUP(): ReactNode {
                 name={name}
                 render={({ field }) => (
                   <FieldCells spec={FIELDS[name]}>
-                    <Input {...field} {...inputAttributes(name, detailsEnterable && !busy)} />
+                    <Input {...field} {...inputAttributes(name, detailsEnterable, busy)} />
                   </FieldCells>
                 )}
               />

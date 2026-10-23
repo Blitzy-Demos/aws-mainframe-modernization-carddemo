@@ -737,19 +737,21 @@ async fn view_rows(h: &Harness, token: &str, id: &str) -> TestResult {
             StatusCode::NOT_FOUND,
             "Transaction ID NOT found...",
         ),
-        (
-            "11111111111111111",
-            StatusCode::NOT_FOUND,
-            "Transaction ID NOT found...",
-        ),
     ] {
-        // An overlong path is refused by the domain's total key edit, not a length DTO.
         // audit: COTRN01C-009
         // audit: COTRN01C-010
         // audit: COTRN01C-012
-        // audit: COTRN01-013
         error_response(&h.view(token, id).await?, status, message, "tran_id");
     }
+    // One character beyond the map `LENGTH` of `TRNIDIN` is refused by the request DTO, while
+    // the sixteen-character `9999999999999998` above reaches the read.
+    // audit: COTRN01-013
+    error_response(
+        &h.view(token, "11111111111111111").await?,
+        StatusCode::BAD_REQUEST,
+        FIELD_LENGTH_MESSAGE,
+        "tran_id",
+    );
     Ok(())
 }
 

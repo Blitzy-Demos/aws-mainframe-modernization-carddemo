@@ -50,8 +50,7 @@ const RULE_CLASS =
 
 /**
  * `CCDA-MSG-INVALID-KEY` (`app/cpy/CSMSG01Y.cpy:20-21`) without the trailing spaces of its 50-byte
- * field, as COUSR03C-009 shows it. Defined here rather than imported from `@/lib/header`, which
- * holds the padded value, because this screen imports only its declared dependencies.
+ * field, as COUSR03C-009 shows it, while `@/lib/header` holds the padded 50-byte value.
  */
 const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...";
 
@@ -149,9 +148,10 @@ type OutputFieldProps = {
 
 /**
  * One protected (`ASKIP`) output field with its TURQUOISE label: a read-only `Input` in the BLUE
- * value colour, bound to its `Label`. While a red `ScreenError` names it, the field is marked
- * invalid and described by that text, which only assistive technology reads: the message row is
- * the screen's one visible message.
+ * value colour, bound to its `Label`. It is out of the Tab order, as the 3270 Tab key skips
+ * protected fields, and still takes the cursor the screen places on it. While a red `ScreenError`
+ * names it, the field is marked invalid and described by that text, which only assistive
+ * technology reads: the message row is the screen's one visible message.
  */
 function OutputField({
   row,
@@ -180,6 +180,7 @@ function OutputField({
           id={id}
           ref={inputRef}
           readOnly
+          tabIndex={-1}
           value={value}
           maxLength={span}
           size={span}
@@ -225,10 +226,13 @@ export function COUSR03(): ReactNode {
   const formId = useId();
   // The cursor is placed through the screen's own element refs: `form.reset` drops the field refs
   // `form.setFocus` relies on, which would leave the cursor on the pressed key after F4 or F5.
+  // The schema runs when ENTER or F5 is answered, never while the operator types, so its refusal
+  // marks the user ID until the next key is answered.
   const form = useForm<Cousr03Values>({
     resolver: zodResolver(cousr03Schema),
     defaultValues: { userId: entry.userId ?? "" },
     shouldFocusError: false,
+    reValidateMode: "onSubmit",
   });
   const fetchUser = useCousr02cFetch();
   const deleteUser = useCousr03cDelete();
@@ -458,6 +462,15 @@ export function COUSR03(): ReactNode {
                         ref={(element) => {
                           field.ref(element);
                           userIdRef.current = element;
+                        }}
+                        onChange={(event) => {
+                          // An edit replaces the value the server rejected, so its mark goes
+                          // while the message row keeps the server's message. A schema refusal
+                          // stays marked until the next key is answered.
+                          if (form.getFieldState("userId").error?.type === "server") {
+                            form.clearErrors("userId");
+                          }
+                          field.onChange(event);
                         }}
                         readOnly={busy}
                         maxLength={COUSR03_LENGTHS.userId}

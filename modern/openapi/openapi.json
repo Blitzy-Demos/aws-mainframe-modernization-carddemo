@@ -1981,16 +1981,17 @@
           "COTRN01C"
         ],
         "summary": "View a transaction (CT01 / COTRN01C).",
-        "description": "ENTER reads the transaction whose ID the Tran ID input holds, sent as the `tran_id` path\nsegment exactly as typed, and returns the detail fields of the `COTRN1A` map. Every signed-on\nuser gets the same view, whatever the user type. The card number is returned redacted to its\nlast four characters, and the original and processing timestamps are typed, `null` when\nblank. F4, F5 and PF3 send no request. Nothing is locked or written.\n\n# Errors\n\nA `ScreenError` naming field `tran_id`: 400 `Tran ID can NOT be empty...` when the Tran ID\nis blank, 404 `Transaction ID NOT found...` when no transaction has the key, and 500\n`Unable to lookup Transaction...` when the read fails. A request without a valid bearer\ntoken is refused with 401 before anything is read. A segment that is not UTF-8 once\npercent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the\nprogram's edit.",
+        "description": "ENTER reads the transaction whose ID the Tran ID input holds, sent as the `tran_id` path\nsegment exactly as typed, and returns the detail fields of the `COTRN1A` map. Every signed-on\nuser gets the same view, whatever the user type. The card number is returned redacted to its\nlast four characters, and the original and processing timestamps are typed, `null` when\nblank. F4, F5 and PF3 send no request. Nothing is locked or written.\n\n# Errors\n\nA `ScreenError` naming field `tran_id`: 400 `Input does not fit the screen field...` when\nthe Tran ID is longer than its 16 characters, with nothing read (COTRN01-013), 400 `Tran ID\ncan NOT be empty...` when it is blank, 404 `Transaction ID NOT found...` when no transaction\nhas the key, and 500 `Unable to lookup Transaction...` when the read fails. A request without\na valid bearer token is refused with 401 before any input is examined. A segment that is not\nUTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...` and no field,\nbefore the program's edit.",
         "operationId": "cotrn01c_view",
         "parameters": [
           {
             "name": "tran_id",
             "in": "path",
-            "description": "Transaction ID as typed on the screen (16 characters)",
+            "description": "Transaction ID as typed on the screen: at most 16 characters, neither trimmed nor\nzero-filled (COTRN01C-010).",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 16
             }
           }
         ],
@@ -2006,7 +2007,7 @@
             }
           },
           "400": {
-            "description": "`Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009); or a path segment that is not UTF-8 once percent-decoded",
+            "description": "`Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009); `Input does not fit the screen field...` naming `tran_id`: the Tran ID is longer than 16 characters, and nothing is read (COTRN01-013); or a path segment that is not UTF-8 once percent-decoded",
             "content": {
               "application/json": {
                 "schema": {
@@ -3856,7 +3857,7 @@
           },
           "auth_type": {
             "type": "string",
-            "description": "Type, `PTYPEnn` (4): the stored authorization type (COPAUS0C-032)."
+            "description": "Type, `PTYPEnn` (4): the stored authorization type, masked as the transaction ID is; its\n4 bytes hold no written number of nine digits and show as stored (COPAUS0C-032, E32)."
           },
           "date": {
             "type": "string",
@@ -3864,7 +3865,7 @@
           },
           "match_status": {
             "type": "string",
-            "description": "STS, `PSTATnn` (1): the stored match status (COPAUS0C-032)."
+            "description": "STS, `PSTATnn` (1): the stored match status, masked as the transaction ID is; its one\nbyte shows as stored (COPAUS0C-032, E32)."
           },
           "time": {
             "type": "string",
@@ -3872,7 +3873,7 @@
           },
           "transaction_id": {
             "type": "string",
-            "description": "Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space (COPAUS0C-032)."
+            "description": "Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space, masked by\n[`redact_free_text`] as stored request text, as endpoint 22 masks it: `TX0000000000001`\nshows as `TX*********0001`, a 9-digit SSN as `***-**-` and its last four digits, and a\nrun of fewer than nine digits as stored. A Tran Id whose SSN fills its last nine bytes is\none character longer than the 16 of the map field: the redacted form adds two, the one\ntrailing space gives back one (COPAUS0C-032, COPAUS1C-021, E32)."
           }
         },
         "example": {
@@ -3882,7 +3883,7 @@
           "date": "01/31/24",
           "match_status": "P",
           "time": "13:05:09",
-          "transaction_id": "TX0000000000001 "
+          "transaction_id": "TX*********0001 "
         }
       },
       "BillPaymentRequest": {
@@ -4457,7 +4458,7 @@
           },
           "embossed_name": {
             "type": "string",
-            "description": "`CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`, without its trailing spaces\n(COCRDSLC-019)."
+            "description": "`CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`: its 50 stored bytes, trailing spaces\nincluded (COCRDSLC-019)."
           },
           "expiration_date": {
             "type": [
@@ -4483,7 +4484,7 @@
           },
           "status": {
             "type": "string",
-            "description": "`CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`, the stored byte; empty when it is a space\n(COCRDSLC-019).",
+            "description": "`CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`: its stored byte, a space when it is a\nspace (COCRDSLC-019).",
             "example": "Y"
           }
         }

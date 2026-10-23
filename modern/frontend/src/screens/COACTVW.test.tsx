@@ -572,6 +572,9 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     expect(info.textContent).toBe(PROMPT);
     expect(info.className).toContain("text-card-foreground");
     expect(info.getAttribute("aria-live")).toBe("polite");
+    // INFOMSG is not `BRT` on the map, and COACTVWC never brightens it: normal weight.
+    const description = info.querySelector('[data-slot="alert-description"]');
+    expect(description?.classList.contains("font-semibold")).toBe(false);
     expect(messageRow("error").textContent).toBe("");
 
     const keys = within(screen.getByRole("group", { name: "Function keys" })).getAllByRole(

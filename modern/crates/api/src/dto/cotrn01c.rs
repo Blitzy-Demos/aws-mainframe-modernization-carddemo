@@ -1,15 +1,20 @@
 //! COTRN01C, the transaction view: the response contract of endpoint 12,
 //! `GET /api/v1/transactions/{tran_id}` (transaction `CT01`, map `COTRN1A`; AAP 0.3.4.1).
 //!
-//! The request has neither body nor query. The handler takes the Tran ID input `TRNIDIN` as the
-//! raw `tran_id` path parameter, a `String`, so that `domain::online::cotrn01c::edit_tran_id`
-//! answers a blank one with the program's own `Tran ID can NOT be empty...` (COTRN01C-009) and
-//! no deserialiser decides it. F3, F4 and F5 send no request (COTRN01C-004 to COTRN01C-006).
+//! The request has neither body nor query. The Tran ID input `TRNIDIN` is the `tran_id` path
+//! parameter, a [`TranIdPath`], which the handler extracts with the parent module's `ValidPath`.
+//! It revalidates the map `LENGTH` of `TRNIDIN`, 16, and nothing else (COTRN01-013): a longer
+//! segment is a 400 `Input does not fit the screen field...` naming `tran_id`, and nothing is
+//! read. A text that fits reaches the service unparsed and untrimmed, so that
+//! `domain::online::cotrn01c::edit_tran_id` answers a blank one with the program's own `Tran ID
+//! can NOT be empty...` (COTRN01C-009) and no deserialiser decides it. F3, F4 and F5 send no
+//! request (COTRN01C-004 to COTRN01C-006).
 //!
 //! A successful read answers [`TranViewResponse`], one value per detail field of the map
-//! (COTRN01C-015 to COTRN01C-028). Every failure answers the `ScreenError` that `crate::error`
-//! builds from `rules::TranViewFailure`: 400, 404 `Transaction ID NOT found...` or 500, each on
-//! field `tran_id` and with no transaction field (COTRN01C-009, COTRN01C-012, COTRN01C-013).
+//! (COTRN01C-015 to COTRN01C-028). Every failure past the length check answers the
+//! `ScreenError` that `crate::error` builds from `rules::TranViewFailure`: 400, 404 `Transaction
+//! ID NOT found...` or 500, each on field `tran_id` and with no transaction field (COTRN01C-009,
+//! COTRN01C-012, COTRN01C-013).
 //!
 //! # Values
 //!
@@ -30,8 +35,31 @@ use chrono::NaiveDateTime;
 use domain::CardNumber;
 use domain::copybook::PicX;
 use domain::online::cotrn01c as rules;
-use serde::Serialize;
-use utoipa::ToSchema;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
+use validator::Validate;
+
+/// The path of endpoint 12, `/api/v1/transactions/{tran_id}`: the Tran ID input `TRNIDIN` as
+/// typed.
+///
+/// Only the map `LENGTH` is checked here, the server half of the `both` row COTRN01-013 of
+/// `modern/audit/screens.md`: a segment longer than 16 characters is a 400 with
+/// [`super::FIELD_LENGTH_MESSAGE`] naming `tran_id`, and nothing is read. Anything that fits,
+/// blank and sixteen `\0` included, reaches the domain's edit unparsed and untrimmed, so the
+/// program's own messages answer it: `Tran ID can NOT be empty...` for a field of spaces or of
+/// low-values (COTRN01C-009), otherwise the key exactly as entered (COTRN01C-010), and
+/// `Transaction ID NOT found...` when no row has it (COTRN01C-012). No `PIC X` rule
+/// ([`super::pic_x`]) applies: sixteen `\0` must reach the blank edit, and a key holding a byte
+/// no stored key holds is the domain's not-found outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, IntoParams, Validate)]
+#[into_params(parameter_in = Path)]
+pub struct TranIdPath {
+    /// Transaction ID as typed on the screen: at most 16 characters, neither trimmed nor
+    /// zero-filled (COTRN01C-010).
+    #[validate(length(max = 16))]
+    #[param(max_length = 16)]
+    pub tran_id: String,
+}
 
 /// The transaction as the `COTRN1A` map shows it after a successful read: the 200 body of
 /// endpoint 12 (COTRN01C-015 to COTRN01C-028).
@@ -121,14 +149,21 @@ fn map_field<const N: usize>(field: &PicX<N>) -> String {
 mod tests {
     use std::error::Error as StdError;
 
+    use axum::body::{self, Body};
+    use axum::extract::Request;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
     use chrono::{NaiveDate, NaiveDateTime};
     use domain::CardNumber;
     use domain::copybook::PicX;
     use domain::online::cotrn01c as rules;
     use serde_json::{Value, json};
-    use utoipa::{PartialSchema, ToSchema};
+    use tower::ServiceExt as _;
+    use utoipa::{IntoParams, PartialSchema, ToSchema};
 
-    use super::TranViewResponse;
+    use super::{TranIdPath, TranViewResponse};
+    use crate::dto::{FIELD_LENGTH_MESSAGE, INVALID_PATH, ValidPath};
 
     type TestResult = Result<(), Box<dyn StdError>>;
 
@@ -284,6 +319,82 @@ mod tests {
             .ok_or("the schema lists no required members")?;
         for member in ["tran_id", "card_num", "amount", "merchant_zip"] {
             assert!(required.contains(&json!(member)), "{member}: {required:?}");
+        }
+        Ok(())
+    }
+
+    /// The status and body the route of endpoint 12 gives `uri` once `ValidPath` has extracted
+    /// its [`TranIdPath`]: the Tran ID it would pass on, or the rejection.
+    async fn through_path(uri: &str) -> Result<(StatusCode, Value), Box<dyn StdError>> {
+        let router = Router::new().route(
+            "/api/v1/transactions/{tran_id}",
+            get(|ValidPath(path): ValidPath<TranIdPath>| async move {
+                Json(json!({ "tran_id": path.tran_id }))
+            }),
+        );
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        let status = response.status();
+        let bytes = body::to_bytes(response.into_body(), usize::MAX).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    // audit: COTRN01-013
+    #[tokio::test]
+    async fn the_path_tran_id_is_revalidated_against_its_map_length_alone() -> TestResult {
+        let passed = |tran_id: &str| (StatusCode::OK, json!({ "tran_id": tran_id }));
+        let rejected = |message: &str, field: Option<&str>| {
+            let body = match field {
+                Some(field) => json!({ "message": message, "field": field }),
+                None => json!({ "message": message }),
+            };
+            (StatusCode::BAD_REQUEST, body)
+        };
+        let low_values = "%00".repeat(16);
+        let spaces_17 = "%20".repeat(17);
+        let nuls = "\0".repeat(16);
+        for (segment, expected) in [
+            // Within the map `LENGTH` the text passes as typed to the program's own edits:
+            // sixteen characters, and the blank, low-value, short, leading-space and non-ASCII
+            // keys the domain answers itself (COTRN01C-009, COTRN01C-010, COTRN01C-012).
+            ("0000000000683580", passed("0000000000683580")),
+            ("%20", passed(" ")),
+            (low_values.as_str(), passed(&nuls)),
+            ("1", passed("1")),
+            ("%20000000000000001", passed(" 000000000000001")),
+            ("%C3%A9", passed("\u{e9}")),
+            // Beyond 16 characters, blank or not: rejected naming the segment, never read.
+            (
+                "00000000006835801",
+                rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
+            ),
+            (
+                spaces_17.as_str(),
+                rejected(FIELD_LENGTH_MESSAGE, Some("tran_id")),
+            ),
+            // A segment that is not UTF-8 does not deserialise.
+            ("%FF", rejected(INVALID_PATH, None)),
+        ] {
+            let uri = format!("/api/v1/transactions/{segment}");
+            assert_eq!(through_path(&uri).await?, expected, "{uri}");
+        }
+        Ok(())
+    }
+
+    // audit: COTRN01-013
+    #[test]
+    fn the_path_parameter_publishes_its_map_length() -> TestResult {
+        let parameters = serde_json::to_value(TranIdPath::into_params(|| None))?;
+        assert_eq!(parameters.as_array().map(Vec::len), Some(1), "{parameters}");
+        for (pointer, expected) in [
+            ("/0/name", json!("tran_id")),
+            ("/0/in", json!("path")),
+            ("/0/required", json!(true)),
+            ("/0/schema/type", json!("string")),
+            ("/0/schema/maxLength", json!(16)),
+        ] {
+            assert_eq!(parameters.pointer(pointer), Some(&expected), "{parameters}");
         }
         Ok(())
     }

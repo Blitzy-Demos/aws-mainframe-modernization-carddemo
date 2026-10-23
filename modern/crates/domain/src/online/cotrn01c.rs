@@ -183,8 +183,11 @@ impl std::error::Error for TranViewFailure {}
 /// its leading zeros is a different key and is not found.
 ///
 /// The map field holds 16 bytes of terminal text, so the program never sees a longer text or a
-/// byte outside printable ASCII. Such a text, which the request DTO also rejects, names no
-/// stored key: it yields the not-found outcome, never a truncated or cleaned key (R7).
+/// byte outside printable ASCII. The request DTO of endpoint 12 refuses a text longer than 16
+/// characters before this edit runs (COTRN01-013); a text within 16 characters can still hold a
+/// byte outside `0x20` to `0x7E`, and multi-byte characters can make it longer than 16 bytes.
+/// Any such text, or a longer one, that reaches the edit names no stored key: it yields the
+/// not-found outcome, never a truncated or cleaned key (R7).
 ///
 /// # Errors
 ///

@@ -1195,9 +1195,8 @@ async fn view_found(h: &Harness) -> Outcome<()> {
     assert_eq!(user.text("message"), None);
     // audit: COCRDSLC-023
     assert_eq!(user.text("card_num"), Some(card.redacted.as_str()));
-    let name = user.text("embossed_name").map(|name| format!("{name:<50}"));
     // audit: COCRDSLC-019
-    assert_eq!(name, Some(card.name.clone()));
+    assert_eq!(user.text("embossed_name"), Some(card.name.as_str()));
     // audit: COCRDSLC-019
     assert_eq!(user.text("expiration_date"), Some(card.expiry.as_str()));
     // audit: COCRDSLC-019

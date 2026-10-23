@@ -41,6 +41,8 @@ const UNKNOWN_ACCT = "99999999999";
 const SETTLED_ACCT = "00000000070";
 /** An account whose read fails on the server (COBIL00C-015). */
 const FAILING_ACCT = "00000000500";
+/** An account other than {@link ACCT} whose payment the server fails after reading it. */
+const OTHER_ACCT = "00000000049";
 /** The transaction ID the payment writes (COBIL00C-023). */
 const NEW_TRAN_ID = "0000000000000301";
 /** COBIL00C-028: two spaces after `successful.`, then the 16-digit ID and a full stop. */
@@ -102,6 +104,18 @@ const nothingToPay: components["schemas"]["ScreenError"] = {
   message: "You have nothing to pay...",
   field: "acct_id",
 };
+
+/** The payment block's failures, each after the account read: COBIL00C-024 to COBIL00C-033. */
+const paymentFailures: components["schemas"]["ScreenError"][] = [
+  // COBIL00C-024: the browse for the highest transaction ID fails.
+  { message: "Unable to lookup Transaction...", field: "acct_id" },
+  // COBIL00C-029: a transaction with the new ID already exists.
+  { message: "Tran ID already exist...", field: "acct_id" },
+  // COBIL00C-030: the transaction write fails.
+  { message: "Unable to Add Bill pay Transaction...", field: "acct_id" },
+  // COBIL00C-033: the balance update fails.
+  { message: "Unable to Update Account...", field: "acct_id" },
+];
 
 /** `CCDA-MSG-INVALID-KEY PIC X(50)`, padded with spaces to its 50 bytes (COBIL00C-006). */
 const INVALID_KEY_TEXT = "Invalid key pressed. Please see below...".padEnd(50, " ");
@@ -730,6 +744,31 @@ describe("COBIL00 bill payment screen", () => {
     expect(await bodies(requests)).toStrictEqual([{ acct_id: ACCT, confirm: "" }]);
   });
 
+  // audit: COBIL00-017
+  it.each([
+    { title: "on first display", reach: settle },
+    { title: "with a balance shown", reach: showBalance },
+  ])("keeps the ASKIP balance out of the Tab order and the two inputs in it $title", async ({
+    reach,
+  }) => {
+    stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    await reach();
+
+    // The 3270 Tab key skips a protected field: CURBAL is read-only and no Tab stop, while
+    // ACTIDIN and CONFIRM stay enterable Tab stops.
+    expect(
+      [acctInput(), balanceOutput(), confirmInput()].map((element) => [
+        element.readOnly,
+        element.tabIndex,
+      ]),
+    ).toEqual([
+      [false, 0],
+      [true, -1],
+      [false, 0],
+    ]);
+  });
+
   // audit: COBIL00-031
   it("the Enter key with the cursor outside the inputs submits as the button does", async () => {
     const requests = stubApi();
@@ -754,6 +793,7 @@ describe("COBIL00 bill payment screen", () => {
 
   // audit: COBIL00C-035
   // audit: COBIL00C-037
+  // audit: COBIL00-023
   it.each([
     { confirm: "Y", title: "pays and names the new transaction in green", text: PAID_MESSAGE },
     { confirm: "y", title: "pays as Y does", text: PAID_MESSAGE },
@@ -781,6 +821,9 @@ describe("COBIL00 bill payment screen", () => {
     expect(message.dataset.messageKind).toBe(green ? "info" : "error");
     expect(message.classList.contains("text-destructive")).toBe(!green);
     expect(message.classList.contains("text-card-foreground")).toBe(green);
+    // ERRMSG is `BRT` whatever its colour, so the green payment text is semibold as an error is.
+    const description = message.querySelector('[data-slot="alert-description"]');
+    expect(description?.classList.contains("font-semibold")).toBe(true);
     await waitFor(() => {
       expect(document.activeElement).toBe(acctInput());
     });
@@ -795,13 +838,53 @@ describe("COBIL00 bill payment screen", () => {
   // audit: COBIL00C-035
   // audit: COBIL00C-037
   // audit: COBIL00-023
+  // The errors sent before the account read resend the balance shown, as `CURBAL` is `FSET`,
+  // whichever account was typed; the zero balance, sent after it, comes with a balance the
+  // screen never showed, so the screen empties its own.
   it.each([
-    { title: "the 404 of an unknown account", acct: UNKNOWN_ACCT, confirm: "", error: notFound },
-    { title: "the 500 of a failed read", acct: FAILING_ACCT, confirm: "", error: lookupFailed },
-    { title: "the 400 of a zero balance", acct: SETTLED_ACCT, confirm: "Y", error: nothingToPay },
-    { title: "the 400 of confirmation X", acct: ACCT, confirm: "X", error: invalidConfirm },
-    { title: "the 400 of a blank account", acct: "", confirm: "Y", error: emptyAcct },
-  ])("shows $title in red, keeps every field, focuses the field it names", async (row) => {
+    {
+      title: "the 404 of an unknown account",
+      acct: UNKNOWN_ACCT,
+      confirm: "",
+      error: notFound,
+      balance: BALANCE,
+    },
+    {
+      title: "the 500 of a failed read",
+      acct: FAILING_ACCT,
+      confirm: "",
+      error: lookupFailed,
+      balance: BALANCE,
+    },
+    {
+      title: "the 400 of a zero balance",
+      acct: SETTLED_ACCT,
+      confirm: "Y",
+      error: nothingToPay,
+      balance: "",
+    },
+    {
+      title: "the 400 of confirmation X",
+      acct: ACCT,
+      confirm: "X",
+      error: invalidConfirm,
+      balance: BALANCE,
+    },
+    {
+      title: "the 400 of confirmation X over another account",
+      acct: UNKNOWN_ACCT,
+      confirm: "X",
+      error: invalidConfirm,
+      balance: BALANCE,
+    },
+    {
+      title: "the 400 of a blank account",
+      acct: "",
+      confirm: "Y",
+      error: emptyAcct,
+      balance: BALANCE,
+    },
+  ])("shows $title in red, keeps the inputs, focuses the field it names", async (row) => {
     const requests = stubApi();
     renderScreen({ from: PATHS.COMEN01 });
     await showBalance();
@@ -819,8 +902,8 @@ describe("COBIL00 bill payment screen", () => {
     const [errorRow] = messageRows("error");
     expect(errorRow?.getAttribute("aria-live")).toBe("polite");
     expect(errorRow?.classList.contains("text-destructive")).toBe(true);
-    // The balance shown before the error stays, as do the inputs as typed.
-    expect(shown()).toEqual({ acct: row.acct, balance: BALANCE, confirm: row.confirm });
+    // The inputs stay as typed; the balance shown before the error stays, or goes.
+    expect(shown()).toEqual({ acct: row.acct, balance: row.balance, confirm: row.confirm });
     await waitFor(() => {
       expect(document.activeElement).toBe(inputNamed(row.error.field));
     });
@@ -835,6 +918,68 @@ describe("COBIL00 bill payment screen", () => {
       { acct_id: ACCT, confirm: "" },
       { acct_id: row.acct, confirm: row.confirm },
     ]);
+  });
+
+  // The errors COBIL00C sends after the account read come with the balance it read, which a
+  // `ScreenError` does not carry: a zero balance is one the screen never showed, and a failed
+  // payment's balance is the one shown only over the account it was shown for.
+  // audit: COBIL00C-037
+  it.each([
+    {
+      title: "the 400 of a zero balance over the account shown with confirmation Y",
+      acct: ACCT,
+      confirm: "Y",
+      status: 400,
+      error: nothingToPay,
+      balance: "",
+    },
+    {
+      title: "the 400 of a zero balance over the account shown with a blank confirmation",
+      acct: ACCT,
+      confirm: "",
+      status: 400,
+      error: nothingToPay,
+      balance: "",
+    },
+    ...paymentFailures.flatMap((error) => [
+      {
+        title: `the 500 ${error.message} over the account shown`,
+        acct: ACCT,
+        confirm: "Y",
+        status: 500,
+        error,
+        balance: BALANCE,
+      },
+      {
+        title: `the 500 ${error.message} over another account`,
+        acct: OTHER_ACCT,
+        confirm: "Y",
+        status: 500,
+        error,
+        balance: "",
+      },
+    ]),
+  ])('after a balance, $title leaves the balance "$balance", keeps the inputs', async (row) => {
+    stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    await showBalance();
+    const requests = stubApi(undefined, () => json(row.status, row.error));
+
+    typeInputs(row.acct, row.confirm);
+    const enter = screen.getByRole("button", { name: "ENTER=Continue" });
+    await moveFocus(enter);
+    fireEvent.click(enter);
+
+    await waitFor(() => {
+      expect(errorText()).toBe(row.error.message);
+    });
+    expect(messageRows("error")[0]?.classList.contains("text-destructive")).toBe(true);
+    expect(shown()).toEqual({ acct: row.acct, balance: row.balance, confirm: row.confirm });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(acctInput());
+    });
+    expect(acctInput().getAttribute("aria-invalid")).toBe("true");
+    expect(await bodies(requests)).toStrictEqual([{ acct_id: row.acct, confirm: row.confirm }]);
   });
 
   // The replacement's form state, which no audit row states: the input a `ScreenError` names stays

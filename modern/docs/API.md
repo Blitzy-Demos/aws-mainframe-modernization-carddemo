@@ -179,6 +179,7 @@ No full card number, SSN, CVV or password leaves the API in a response body, an 
 | 10 | — | No card number: the card is the path's `card_ref`, and `CardUpdateSnapshot` holds none |
 | 12 | `TranViewResponse.card_num` | Redacted card number, for every user type |
 | 13 | `TranAddResult.card_num` | Redacted card number, the key COTRN02C fills in from the cross-reference |
+| 21 | `AuthSummaryRow.transaction_id` (also `auth_type`, `match_status`) | No card number. The free-text Transaction ID CP00 stored from the request is masked as on 22, so COPAU00 and COPAU01 show one stored ID the same way: `TXN000000000001` shows as `TXN********0001` on both |
 | 22, 23 | `AuthDetailResponse.card_num` (23 returns it inside `FraudToggleResult.detail`) | Redacted card number. The free-text fields CP00 stored from the request (source, merchant fields, transaction ID and others) are masked too: a written run of nine digits shows in the SSN form, one of sixteen in the card form |
 
 - **The single card-detail endpoint.** Endpoint 8 is the only operation that may return all 16 digits, through `DisclosedCardNumber`, the workspace's one full-value serialiser. `api::services::cocrdslc` decides the disclosure from the verified token's `usr_type` alone, so no request field can ask for it. The rule's owner clause never grants disclosure, because no CardDemo user is linked to a customer, account or card.

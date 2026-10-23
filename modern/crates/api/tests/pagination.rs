@@ -564,8 +564,9 @@ fn edit_failures(harness: &Harness) -> Result<Vec<Refused>, Box<dyn Error>> {
     ])
 }
 
-/// Endpoints 4, 12 and 18, which page nothing: a stored key with `page_size=101` is served, and
-/// a blank, malformed or unknown key is refused with the program's 400 or 404.
+/// Endpoints 4, 12 and 18, which page nothing: a stored key with `page_size=101` is served, a
+/// blank, malformed or unknown key is refused with the program's 400 or 404, and a key longer
+/// than its map field with the length 400.
 fn non_collection_requests(harness: &Harness) -> Vec<(u8, String, StatusCode)> {
     let tran = &harness.first_tran_id;
     vec![
@@ -607,7 +608,7 @@ fn non_collection_requests(harness: &Harness) -> Vec<(u8, String, StatusCode)> {
         (
             12,
             "/api/v1/transactions/00000000006835800".to_owned(),
-            StatusCode::NOT_FOUND,
+            StatusCode::BAD_REQUEST,
         ),
         (
             18,

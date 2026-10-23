@@ -1103,6 +1103,8 @@ export function COACTUP(): ReactNode {
       formId={formId}
       message={{ kind: "error", text: screen.message }}
       info={screen.info}
+      // COACTUPC-083: the info row is always shown, bright.
+      infoBright
       keys={keys}
       keyOptions={KEY_OPTIONS}
       busy={busy}

@@ -131,6 +131,47 @@ function resultMessage(result: components["schemas"]["BillPaymentResult"]): Shel
   };
 }
 
+/*
+ * COBIL00C messages sent after lines 193-194 of `COBIL00C.cbl` moved the balance the request read
+ * into `CURBALI`, so the COBOL screen shows that balance beside them. A `ScreenError` carries only
+ * the message and the field, so the screen tells them from the message itself.
+ */
+/** COBIL00C-018: the balance read is zero or negative. */
+const NOTHING_TO_PAY = "You have nothing to pay...";
+/** The payment block's failures: COBIL00C-024, COBIL00C-029, COBIL00C-030 and COBIL00C-033. */
+const PAYMENT_FAILURES: ReadonlySet<string> = new Set([
+  "Unable to lookup Transaction...",
+  "Tran ID already exist...",
+  "Unable to Add Bill pay Transaction...",
+  "Unable to Update Account...",
+]);
+
+/**
+ * Whether the balance shown stays beside the `ScreenError` `message` answering the account input
+ * `acctId`, when the balance shown is the one a 200 showed for `shownAcct` ("" while none shows)
+ * (COBIL00C-037, X-COBIL00C-3). `CURBAL` is `FSET` (`COBIL00.bms:103-106`): the terminal returns
+ * the balance it shows and every send resends it, until `COBIL00C.cbl:193-206` moves the balance
+ * the request read into it and sends. The screen keeps a balance only where it is the COBOL's:
+ * - `You have nothing to pay...` (COBIL00C-018) comes with the zero or negative balance read,
+ *   which the screen never shows, a 200 showing only a positive one (COBIL00C-019); the balance
+ *   goes, whichever account showed it.
+ * - A payment-block failure comes with the balance read: it stays when it is the one shown for the
+ *   account sent, which a successful read names by the same 11 digits, and goes otherwise.
+ * - Every other message is sent before the read, whatever account was typed (COBIL00C-007,
+ *   COBIL00C-012, COBIL00C-014, COBIL00C-015), or is no program screen's (a failed or empty
+ *   reply), so the balance stays. The rewrite's `Account ID NOT found...` (COBIL00C-032), which
+ *   the read's row lock leaves unreached, has the read's literal and is read as it.
+ */
+function keepsBalance(message: string, acctId: string, shownAcct: string): boolean {
+  if (message === NOTHING_TO_PAY) {
+    return false;
+  }
+  if (PAYMENT_FAILURES.has(message)) {
+    return acctId === shownAcct;
+  }
+  return true;
+}
+
 /**
  * The bill-payment screen. It opens empty with the cursor on the account and sends nothing until
  * ENTER (COBIL00C-002).
@@ -139,7 +180,9 @@ function resultMessage(result: components["schemas"]["BillPaymentResult"]): Shel
  *   `cleared` (after `N` and after a payment) the inputs are emptied and the cursor goes to the
  *   account, otherwise the cursor goes to the confirmation of the prompt (COBIL00C-019,
  *   COBIL00C-037). A `ScreenError` shows its message, marks the field it names invalid and moves
- *   the cursor to it; the account, balance and confirmation keep what they showed.
+ *   the cursor to it; the account and confirmation keep what they showed, and the balance keeps
+ *   it unless the error comes after the account read with a balance the screen does not show
+ *   (`keepsBalance`), when it is emptied.
  * - F3 goes back (COBIL00C-004); F4 empties the screen and the message row (COBIL00C-005); any
  *   other function key shows the invalid-key message (COBIL00C-006). None sends a request.
  * - From the moment ENTER is taken until its reply arrives the keyboard is locked: ENTER and F4
@@ -162,7 +205,15 @@ export function COBIL00(): ReactNode {
   });
   const { reset, setError, setFocus, setValue } = form;
   const [balance, setBalance] = useState("");
+  // The account whose 200 showed `balance`, as the response named it; "" while none shows.
+  const balanceAcct = useRef("");
   const [message, setMessage] = useState<ShellMessage | undefined>(undefined);
+
+  /** Shows the balance `text` as the one of account `acctId`; `("", "")` shows none. */
+  const displayBalance = useCallback((text: string, acctId: string) => {
+    balanceAcct.current = acctId;
+    setBalance(text);
+  }, []);
 
   // The terminal keyboard stays locked until the program's reply arrives, so ENTER and F4 are
   // refused while a request is in flight: a second ENTER cannot pay twice, and no reply lands on
@@ -177,10 +228,10 @@ export function COBIL00(): ReactNode {
       return;
     }
     reset(EMPTY_VALUES, CLEAR_OPTIONS);
-    setBalance("");
+    displayBalance("", "");
     setMessage(undefined);
     setFocus("acctId");
-  }, [reset, setFocus]);
+  }, [displayBalance, reset, setFocus]);
 
   const back = useCallback(() => {
     // COBIL00C names itself the from-program before its XCTL (`RETURN-TO-PREV-SCREEN`).
@@ -233,11 +284,18 @@ export function COBIL00(): ReactNode {
           } else {
             setValue("acctId", result.acct_id);
           }
-          setBalance(result.current_balance ?? "");
+          // The balance belongs to the account the response names; a 200 without one shows none.
+          displayBalance(
+            result.current_balance ?? "",
+            result.current_balance == null ? "" : result.acct_id,
+          );
           setMessage(resultMessage(result));
           setFocus(result.cleared ? "acctId" : "confirm");
         },
         onError: (error) => {
+          if (!keepsBalance(error.message, values.acctId, balanceAcct.current)) {
+            displayBalance("", "");
+          }
           setMessage({ text: error.message, kind: "error" });
           const field = fieldOf(error.field);
           if (field !== undefined) {
@@ -312,7 +370,14 @@ export function COBIL00(): ReactNode {
               </Label>
             </GridCell>
             <GridCell row={11} col={32} span={BALANCE_LENGTH}>
-              <Input id={balanceId} readOnly value={balance} className={BALANCE_CLASS} />
+              {/* ASKIP output: the cursor skips it, as on the terminal. */}
+              <Input
+                id={balanceId}
+                readOnly
+                tabIndex={-1}
+                value={balance}
+                className={BALANCE_CLASS}
+              />
             </GridCell>
             <FormField
               control={form.control}

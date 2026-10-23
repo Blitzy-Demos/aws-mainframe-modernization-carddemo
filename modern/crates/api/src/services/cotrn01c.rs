@@ -3,8 +3,10 @@
 //!
 //! [`view`] ports `PROCESS-ENTER-KEY` and its `READ-TRANSACT-FILE` (`COTRN01C.cbl:143-192`,
 //! `COTRN01C.cbl:267-295`), the program's only read. `api::handlers::cotrn01c` is its only
-//! caller; it extracts the signed-on user and the raw path parameter, calls [`view`] and maps
-//! the answer through `TranViewResponse::from` or `ScreenError::from` (Thin Request Handlers).
+//! caller; it extracts the signed-on user and the `tran_id` path parameter, checked only against
+//! the 16-character map `LENGTH` of `TRNIDIN` and otherwise unparsed and untrimmed
+//! (COTRN01-013), calls [`view`] and maps the answer through `TranViewResponse::from` or
+//! `ScreenError::from` (Thin Request Handlers).
 //!
 //! # Flow
 //!

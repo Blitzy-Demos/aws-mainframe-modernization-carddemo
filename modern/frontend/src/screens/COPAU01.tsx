@@ -39,8 +39,7 @@ const INITIALIZED_ACCT_ID = "00000000000";
 
 /**
  * `CCDA-MSG-INVALID-KEY PIC X(50)` (`app/cpy/CSMSG01Y.cpy:20-21`), padded to its 50 bytes as the
- * `MOVE` transfers it (COPAUS1C-005). The text is declared here, from its copybook, because this
- * screen's planned dependencies do not include the header module that holds the shared copy.
+ * `MOVE` transfers it (COPAUS1C-005). The text is declared here, from its copybook.
  */
 const INVALID_KEY_MESSAGE = "Invalid key pressed. Please see below...".padEnd(50, " ");
 
@@ -584,6 +583,9 @@ function AuthorizationDetail({ acctId, authKey: enteredKey }: DetailEntry): Reac
           <Input
             id={id}
             readOnly
+            // ASKIP output: the Tab key skips it, as on the terminal; the cursor the program
+            // places still reaches it.
+            tabIndex={-1}
             value={value}
             size={field.span}
             // COPAUS1C-036: the program puts the cursor on Card # with every send. `autoFocus`

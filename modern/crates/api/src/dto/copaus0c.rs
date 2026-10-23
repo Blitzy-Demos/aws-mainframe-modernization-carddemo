@@ -14,6 +14,10 @@
 //! - **Display values** are the strings the domain builds with the program's moves and
 //!   pictures, at the map field widths and with their padding: the screen formats nothing, and
 //!   no amount is computed or edited here (R1).
+//! - **Stored request text**, the Transaction ID, Type and STS that CP00 keeps as the request
+//!   sent them, passes through [`redact_free_text`] as endpoint 22 masks it, so one stored
+//!   value shows one way on COPAU00 and COPAU01: `TX0000000000001` shows as `TX*********0001`
+//!   and an SSN as `***-**-` and its last four digits (COPAUS0C-032, COPAUS1C-021, E32).
 //! - **No card number**, full or redacted, is part of any schema: COPAU00 shows none
 //!   (COPAUS0C-055, E32).
 //!
@@ -22,6 +26,7 @@
 
 use domain::copybook::PicU;
 use domain::online::copaus0c as rules;
+use domain::sensitive::redact_free_text;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use validator::{Validate, ValidationError};
@@ -196,7 +201,7 @@ impl From<rules::SummaryBlock> for AuthSummaryBlock {
 // tell from a card number (Cardholder Data Redaction).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
-    "transaction_id": "TX0000000000001 ",
+    "transaction_id": "TX*********0001 ",
     "date": "01/31/24",
     "time": "13:05:09",
     "auth_type": "PURC",
@@ -209,33 +214,48 @@ pub struct AuthSummaryRow {
     /// and 23 for an `S` on this row, and the `page_key` of the next F7 or F8 when it is the
     /// page's first or last row (COPAUS0C-010, COPAUS0C-034).
     pub auth_key: String,
-    /// Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space (COPAUS0C-032).
+    /// Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space, masked by
+    /// [`redact_free_text`] as stored request text, as endpoint 22 masks it: `TX0000000000001`
+    /// shows as `TX*********0001`, a 9-digit SSN as `***-**-` and its last four digits, and a
+    /// run of fewer than nine digits as stored. A Tran Id whose SSN fills its last nine bytes is
+    /// one character longer than the 16 of the map field: the redacted form adds two, the one
+    /// trailing space gives back one (COPAUS0C-032, COPAUS1C-021, E32).
     pub transaction_id: String,
     /// Date, `PDATEnn` (8): `MM/DD/YY` from the stored `YYMMDD` (COPAUS0C-034).
     pub date: String,
     /// Time, `PTIMEnn` (8): `HH:MM:SS` from the stored `HHMMSS` (COPAUS0C-034).
     pub time: String,
-    /// Type, `PTYPEnn` (4): the stored authorization type (COPAUS0C-032).
+    /// Type, `PTYPEnn` (4): the stored authorization type, masked as the transaction ID is; its
+    /// 4 bytes hold no written number of nine digits and show as stored (COPAUS0C-032, E32).
     pub auth_type: String,
     /// A/D, `PAPRVnn` (1): `A` for response code `00`, `D` otherwise (COPAUS0C-033).
     pub approval: String,
-    /// STS, `PSTATnn` (1): the stored match status (COPAUS0C-032).
+    /// STS, `PSTATnn` (1): the stored match status, masked as the transaction ID is; its one
+    /// byte shows as stored (COPAUS0C-032, E32).
     pub match_status: String,
     /// Amount, `PAMTnnn` (12): the approved amount through `-zzzzzzz9.99` (COPAUS0C-033).
     pub amount: String,
 }
 
-/// The row as the domain renders it, its key through [`rules::AuthKey::render`].
+/// The row as the domain renders it, its key through [`rules::AuthKey::render`] and its stored
+/// request text through [`redact_free_text`].
 impl From<rules::AuthRow> for AuthSummaryRow {
     fn from(row: rules::AuthRow) -> Self {
         Self {
             auth_key: row.key.render(),
-            transaction_id: row.transaction_id,
+            // The Transaction ID, Type and STS are stored text of the CP00 request, kept as the
+            // request sent it, so the 15 bytes of the ID can hold an SSN. They leave through
+            // `redact_free_text` with no exemption, exactly as endpoint 22 masks the same
+            // members, so one stored value shows one way on COPAU00 and COPAU01 and no stored
+            // text reaches the body or the derived `Debug` of this type unmasked; the 4 bytes of
+            // the type and the 1 of the status hold no written number of nine digits and pass
+            // unchanged (E32). The values the program builds stay as built.
+            transaction_id: redact_free_text(&row.transaction_id),
             date: row.date,
             time: row.time,
-            auth_type: row.auth_type,
+            auth_type: redact_free_text(&row.auth_type),
             approval: row.approval.as_str().to_owned(),
-            match_status: row.match_status,
+            match_status: redact_free_text(&row.match_status),
             amount: row.amount,
         }
     }
@@ -421,7 +441,7 @@ mod tests {
                 dto,
                 AuthSummaryRow {
                     auth_key: KEY.to_owned(),
-                    transaction_id: "TX0000000000001 ".to_owned(),
+                    transaction_id: "TX*********0001 ".to_owned(),
                     date: "13/99/24".to_owned(),
                     time: "13:05:09".to_owned(),
                     auth_type: "PURC".to_owned(),
@@ -436,6 +456,68 @@ mod tests {
         let text = AuthSummaryRow::from(row(negative, rules::Approval::Declined)).auth_key;
         assert_eq!(text, "1000011000000002");
         assert_eq!(rules::AuthKey::parse(&text), Ok(negative));
+        Ok(())
+    }
+
+    // audit: COPAUS0C-032
+    #[test]
+    fn stored_request_text_leaves_masked_as_endpoint_22_shows_it() -> TestResult {
+        // An invented SSN, assembled from its groups: no fixture value appears in this module.
+        let ssn = ["123", "45", "6789"].concat();
+        let dashed = ["123", "45", "6789"].join("-");
+        let redacted = "***-**-6789";
+        // The stored Transaction ID with its blank column, the text endpoint 21 shows for it and
+        // that text's width: the 13-digit run of an ordinary ID with `*` for each digit but its
+        // last four; runs of six and five digits as stored; a plain SSN in its redacted form,
+        // kept at 16 through its trailing spaces; an SSN filling the last nine bytes, whose
+        // redacted form is one character longer than the map field.
+        let cases = [
+            (
+                "an ordinary ID",
+                "TX0000000000001 ".to_owned(),
+                "TX*********0001 ".to_owned(),
+                16,
+            ),
+            (
+                "runs of fewer than nine digits",
+                "PTX220718A00002 ".to_owned(),
+                "PTX220718A00002 ".to_owned(),
+                16,
+            ),
+            (
+                "a plain SSN",
+                format!("{ssn:<16}"),
+                format!("{redacted:<16}"),
+                16,
+            ),
+            (
+                "an SSN filling the last nine bytes",
+                format!("ABCDEF{ssn} "),
+                format!("ABCDEF{redacted}"),
+                17,
+            ),
+        ];
+        for (case, stored, shown, width) in cases {
+            let dto = AuthSummaryRow::from(rules::AuthRow {
+                transaction_id: stored,
+                ..row(key(75_968, 869_490_879)?, rules::Approval::Approved)
+            });
+            assert_eq!(dto.transaction_id, shown, "{case}");
+            assert_eq!(dto.transaction_id.chars().count(), width, "{case}");
+            // The 4 bytes of the type and the 1 of the status hold no written number of nine
+            // digits, so they leave as stored.
+            assert_eq!(
+                (dto.auth_type.as_str(), dto.match_status.as_str()),
+                ("PURC", "P"),
+                "{case}"
+            );
+            for egress in [format!("{dto:?}"), serde_json::to_string(&dto)?] {
+                assert!(
+                    !egress.contains(&ssn) && !egress.contains(&dashed),
+                    "{case}: the stored SSN left unmasked"
+                );
+            }
+        }
         Ok(())
     }
 

@@ -368,6 +368,18 @@ function expectEditable(editable: { code: boolean; description: boolean }) {
   }).toEqual(editable);
 }
 
+/**
+ * Which of the two inputs are Tab stops (`tabIndex` 0); the others are skipped (`tabIndex` -1), as
+ * the 3270 Tab key skips protected fields.
+ */
+function expectTabStops(stops: { code: boolean; description: boolean }) {
+  const tabIndex = (stop: boolean) => (stop ? 0 : -1);
+  expect({
+    code: field(LABELS.code).tabIndex,
+    description: field(LABELS.description).tabIndex,
+  }).toEqual({ code: tabIndex(stops.code), description: tabIndex(stops.description) });
+}
+
 /** COTRTUPC-047: which of the two inputs show in red (the destructive token). */
 function redFields(): { code: boolean; description: boolean } {
   return {
@@ -996,11 +1008,16 @@ describe("COTRTUP states", () => {
       expect(calls.map((call) => call.route)).toEqual(requests);
       expect(shownValues()).toEqual(values);
       expectEditable(editable);
+      // A protected input is out of the Tab order; the program's cursor still reaches it.
+      expectTabStops(editable);
       expect(redFields()).toEqual(red);
       // A red input is also marked invalid, described by the error row's text.
       expect(marks()).toEqual(marksFor(red, error));
       await expectFocus(cursor);
       expect(infoText()).toBe(info);
+      // Every state has an info text, which the program shows bright (COTRTUPC-045).
+      const infoDescription = messageRow("info").querySelector('[data-slot="alert-description"]');
+      expect(infoDescription?.classList.contains("font-semibold")).toBe(true);
       expect(errorText()).toBe(error);
       expect(shownKeys()).toEqual(keys);
       expect(allKeys()).toEqual(ALL_KEYS);
@@ -1029,6 +1046,48 @@ describe("COTRTUP fetch, endpoint 26", () => {
     });
 
     expect(calls.map((call) => call.route)).toEqual([FETCH]);
+  });
+
+  // audit: COTRTUPC-013
+  // audit: COTRTUPC-039
+  it("a stored description padded to 50 is shown without its trailing spaces, so it takes typing in state S and again in state B", async () => {
+    const appended = `${STORED} X`;
+    const paddedFound: components["schemas"]["TranTypeView"] = {
+      ...found,
+      description: padded(STORED),
+    };
+    const appendedValidated: components["schemas"]["TranTypeActionResult"] = {
+      ...validated,
+      description: padded(appended),
+    };
+    const calls = stubApi({
+      [FETCH]: [reply(200, paddedFound)],
+      [ACTIONS]: [reply(200, appendedValidated)],
+    });
+    await showFound();
+    // A full `maxLength` input takes no keystroke: the shown text leaves the pad's room to type.
+    expect(field(LABELS.description).value).toBe(STORED);
+    expect(field(LABELS.description).maxLength).toBe(50);
+    expectEditable({ code: false, description: true });
+
+    fireEvent.change(field(LABELS.description), { target: { value: appended } });
+    press("ENTER=Process");
+    await waitFor(() => {
+      expect(infoText()).toBe(INFO.validated);
+    });
+    expect(calls[1]).toEqual({
+      route: ACTIONS,
+      body: { aid: "ENTER", description: appended },
+      authorization: BEARER,
+    });
+
+    // F12 backs the change out: state B shows the fetched description, still without the pad.
+    press("F12=Cancel");
+    await waitFor(() => {
+      expect(errorText()).toBe(MSG.updateCancelled);
+    });
+    expect(shownValues()).toEqual({ code: CODE, description: STORED });
+    expectEditable({ code: false, description: true });
   });
 
   // audit: COTRTUP-035
@@ -1337,6 +1396,8 @@ describe("COTRTUP while a request is out", () => {
       expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => true));
       expect(shownKeys()).toEqual(shownBefore);
       expectEditable({ code: false, description: false });
+      // The lock makes no input protected: an input the state leaves enterable stays a Tab stop.
+      expectTabStops(before);
 
       pressEveryKey();
       await settle();
@@ -1351,6 +1412,7 @@ describe("COTRTUP while a request is out", () => {
       expect(functionKeys().getAttribute("aria-busy")).toBe("false");
       expect(ALL_KEYS.map((label) => key(label).disabled)).toEqual(ALL_KEYS.map(() => false));
       expectEditable(after);
+      expectTabStops(after);
 
       // The keyboard is open again: the next request is sent.
       later();

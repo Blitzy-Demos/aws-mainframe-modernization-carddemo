@@ -1404,6 +1404,35 @@ describe("COPAU01 authorization detail screen", () => {
   });
 
   // audit: COPAUS1C-036
+  it("keeps the 20 ASKIP outputs out of the Tab order: Tab from Card # reaches ENTER, F3, F5, F8", async () => {
+    await renderSelected();
+
+    // The cursor the program places is on Card #, although the Tab key skips it.
+    const cardNum = field("Card #:");
+    expect(document.activeElement).toBe(cardNum);
+    expect(
+      FIELDS.map((spec) => [spec.field, field(spec.label).readOnly, field(spec.label).tabIndex]),
+    ).toEqual(FIELDS.map((spec) => [spec.field, true, -1]));
+
+    // Tab moves on through the Tab stops after Card # in document order: no output remains, only
+    // the four enabled key-row buttons, in the map's key order.
+    const stops = Array.from(document.body.querySelectorAll("*")).filter(
+      (element): element is HTMLElement =>
+        element instanceof HTMLElement &&
+        (cardNum.compareDocumentPosition(element) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0 &&
+        element.tabIndex >= 0 &&
+        element.closest("[hidden]") === null &&
+        !(element instanceof HTMLButtonElement && element.disabled),
+    );
+    expect(stops.map((element) => element.textContent)).toEqual([
+      "ENTER",
+      "F3=Back",
+      "F5=Mark/Remove Fraud",
+      "F8=Next Auth",
+    ]);
+  });
+
+  // audit: COPAUS1C-036
   it.each([
     {
       title: "a found F8",

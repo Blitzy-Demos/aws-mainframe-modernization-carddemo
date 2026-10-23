@@ -354,7 +354,10 @@ function infoText(): string | null {
   return messageRow("info").textContent;
 }
 
-/** COCRDUPC-045: whether the account and card, and the four details, are enterable. */
+/**
+ * COCRDUPC-045: whether the account and card, and the four details, are enterable. A protected
+ * field is read-only and out of the Tab order; an enterable one takes typing and is a Tab stop.
+ */
 function expectEnterable(keys: boolean, details: boolean) {
   expect([LABELS.account, LABELS.card].map((label) => field(label).readOnly)).toEqual([
     !keys,
@@ -363,6 +366,23 @@ function expectEnterable(keys: boolean, details: boolean) {
   expect(
     [LABELS.name, LABELS.status, LABELS.month, LABELS.year].map((label) => field(label).readOnly),
   ).toEqual([!details, !details, !details, !details]);
+  expectTabStops(keys, details);
+}
+
+/**
+ * Whether the account and card, and the four details, are Tab stops (`tabIndex` 0) or skipped
+ * (`tabIndex` -1), as the 3270 Tab key skips protected fields.
+ */
+function expectTabStops(keys: boolean, details: boolean) {
+  const tabIndex = (stop: boolean) => (stop ? 0 : -1);
+  expect(Object.values(LABELS).map((label) => field(label).tabIndex)).toEqual([
+    tabIndex(keys),
+    tabIndex(keys),
+    tabIndex(details),
+    tabIndex(details),
+    tabIndex(details),
+    tabIndex(details),
+  ]);
 }
 
 /** COCRDUP-034: `F5=Save F12=Cancel` shown (in view and in the accessibility tree) or hidden. */
@@ -920,6 +940,9 @@ describe("COCRDUP keys", () => {
     expect(calls[1].body).toEqual({ aid: "ENTER", fields, snapshot: view.snapshot });
     expect(infoText()).toBe(INFO_CONFIRM);
     expect(messageRow("info").className).toContain("text-card-foreground");
+    // The program brightens the info line whenever it holds a message (COCRDUPC-046).
+    const info = messageRow("info").querySelector('[data-slot="alert-description"]');
+    expect(info?.classList.contains("font-semibold")).toBe(true);
     expect(errorText()).toBe("");
     expectConfirmationKeys(true);
     expectEnterable(false, false);
@@ -1353,6 +1376,7 @@ describe("COCRDUP keys", () => {
         renderScreen(FROM_LIST);
       },
       pendingAt: 1,
+      stops: [true, false],
       enterable: [false, true],
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
@@ -1373,6 +1397,7 @@ describe("COCRDUP keys", () => {
         fireEvent.click(key("ENTER=Process"));
       },
       pendingAt: 1,
+      stops: [true, false],
       enterable: [false, true],
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
@@ -1396,6 +1421,7 @@ describe("COCRDUP keys", () => {
         fireEvent.click(key("ENTER=Process"));
       },
       pendingAt: 2,
+      stops: [false, true],
       enterable: [false, false],
       next: async () => {
         await save(INFO_DONE);
@@ -1415,6 +1441,7 @@ describe("COCRDUP keys", () => {
         fireEvent.click(key("F5=Save"));
       },
       pendingAt: 3,
+      stops: [false, false],
       enterable: [false, false],
       next: async () => {
         fireEvent.click(key("ENTER=Process"));
@@ -1439,6 +1466,7 @@ describe("COCRDUP keys", () => {
         pressKey("F5");
       },
       pendingAt: 4,
+      stops: [false, true],
       enterable: [false, true],
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
@@ -1454,6 +1482,7 @@ describe("COCRDUP keys", () => {
     puts,
     reach,
     pendingAt,
+    stops,
     enterable,
     next,
     routes,
@@ -1473,6 +1502,8 @@ describe("COCRDUP keys", () => {
     expect(Object.values(LABELS).map((label) => field(label).readOnly)).toEqual(
       Object.values(LABELS).map(() => true),
     );
+    // The lock makes no field protected: the fields the state leaves enterable stay Tab stops.
+    expectTabStops(stops[0], stops[1]);
     // Neither the buttons nor the keys send a second request while the first is out.
     for (const label of ["ENTER=Process", "F5=Save", "F12=Cancel", "F7"]) {
       fireEvent.click(key(label));

@@ -25,8 +25,9 @@ export type ShellMessage = {
   /** The message as received; absent, empty or all spaces leaves the row empty. */
   text?: string;
   /**
-   * `error` for an error (RED). `info` for a success text the program moves to `ERRMSG` after
-   * recolouring the field, so it shows as information rather than as an error.
+   * The colour: `error` for an error (RED). `info` for a success text the program moves to
+   * `ERRMSG` after recolouring the field, so it shows in the information colour rather than as an
+   * error. Either colour keeps the field's `BRT` emphasis.
    */
   kind: MessageKind;
 };
@@ -49,6 +50,13 @@ export type ScreenShellProps = {
    * `undefined` renders none.
    */
   info?: string;
+  /**
+   * Whether the `INFOMSG` row shows bright (`font-semibold`); `false` when omitted, as the map
+   * declares the field without `BRT`. Set by the three programs that brighten it whenever it holds
+   * a message, and every state of theirs has one: COCRDUPC (`DFHBMBRY`, audit row COCRDUPC-046),
+   * COACTUPC (`DFHBMASB`, COACTUPC-083) and COTRTUPC (`DFHBMASB`, COTRTUPC-045).
+   */
+  infoBright?: boolean;
   /** The map's row-24 keys, forwarded to `PfKeyBar` unchanged. */
   keys: PfKeyBarProps["keys"];
   /** Settings of the keyboard binding, forwarded to `PfKeyBar` as `options`. */
@@ -186,6 +194,7 @@ export function ScreenShell({
   formId,
   message,
   info,
+  infoBright = false,
   keys,
   keyOptions,
   busy,
@@ -267,8 +276,12 @@ export function ScreenShell({
           {children}
         </CardContent>
         <CardFooter className="flex-col items-stretch gap-2">
-          {info !== undefined && <MessageLine kind="info" text={info} />}
-          <MessageLine kind={message?.kind ?? "error"} text={message?.text} />
+          {info !== undefined && <MessageLine kind="info" bright={infoBright} text={info} />}
+          {/*
+           * Every map declares `ERRMSG` `ATTRB=(ASKIP,BRT,FSET)` and no program changes its
+           * attribute byte, so the row is bright whatever colour its message takes.
+           */}
+          <MessageLine kind={message?.kind ?? "error"} bright text={message?.text} />
           <PfKeyBar keys={keys} formId={formId} options={keyOptions} busy={busy} />
         </CardFooter>
       </Card>

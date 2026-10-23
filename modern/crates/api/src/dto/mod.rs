@@ -313,8 +313,8 @@ where
 }
 
 /// Path parameters deserialised into `T` and checked against `T`'s `validator` rules, for a
-/// path segment that carries the text of a map field, such as the user ID of endpoints 18 to 20
-/// (`USRIDIN`, 8).
+/// path segment that carries the text of a map field, such as the transaction ID of endpoint 12
+/// (`TRNIDIN`, 16) and the user ID of endpoints 18 to 20 (`USRIDIN`, 8).
 ///
 /// A handler that takes it declares `params(T)` in its `#[utoipa::path]`, `T` deriving
 /// `utoipa::IntoParams` with `parameter_in = Path`. The rejection is a [`ScreenError`]: 400 with
@@ -344,8 +344,8 @@ where
 
 /// Path parameters deserialised into `T` and passed on unchecked, for a path segment that
 /// carries a key the program's own edit checks: the account number of endpoints 4 to 6 and 21,
-/// the card handle of endpoint 10, the transaction ID of endpoint 12, and the account and
-/// authorization key of endpoints 22 and 23.
+/// the card handle of endpoint 10, and the account and authorization key of endpoints 22 and
+/// 23.
 ///
 /// No rule is checked and nothing is parsed, trimmed or normalised here, so the text reaches the
 /// service as the client sent it, once percent-decoded, and the program's total domain edit

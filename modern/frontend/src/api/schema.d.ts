@@ -702,12 +702,13 @@ export interface paths {
          *
          *     # Errors
          *
-         *     A `ScreenError` naming field `tran_id`: 400 `Tran ID can NOT be empty...` when the Tran ID
-         *     is blank, 404 `Transaction ID NOT found...` when no transaction has the key, and 500
-         *     `Unable to lookup Transaction...` when the read fails. A request without a valid bearer
-         *     token is refused with 401 before anything is read. A segment that is not UTF-8 once
-         *     percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
-         *     program's edit.
+         *     A `ScreenError` naming field `tran_id`: 400 `Input does not fit the screen field...` when
+         *     the Tran ID is longer than its 16 characters, with nothing read (COTRN01-013), 400 `Tran ID
+         *     can NOT be empty...` when it is blank, 404 `Transaction ID NOT found...` when no transaction
+         *     has the key, and 500 `Unable to lookup Transaction...` when the read fails. A request without
+         *     a valid bearer token is refused with 401 before any input is examined. A segment that is not
+         *     UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...` and no field,
+         *     before the program's edit.
          */
         get: operations["cotrn01c_view"];
         put?: never;
@@ -1750,7 +1751,7 @@ export interface components {
          *       "date": "01/31/24",
          *       "match_status": "P",
          *       "time": "13:05:09",
-         *       "transaction_id": "TX0000000000001 "
+         *       "transaction_id": "TX*********0001 "
          *     }
          */
         AuthSummaryRow: {
@@ -1764,15 +1765,28 @@ export interface components {
              *     page's first or last row (COPAUS0C-010, COPAUS0C-034).
              */
             auth_key: string;
-            /** @description Type, `PTYPEnn` (4): the stored authorization type (COPAUS0C-032). */
+            /**
+             * @description Type, `PTYPEnn` (4): the stored authorization type, masked as the transaction ID is; its
+             *     4 bytes hold no written number of nine digits and show as stored (COPAUS0C-032, E32).
+             */
             auth_type: string;
             /** @description Date, `PDATEnn` (8): `MM/DD/YY` from the stored `YYMMDD` (COPAUS0C-034). */
             date: string;
-            /** @description STS, `PSTATnn` (1): the stored match status (COPAUS0C-032). */
+            /**
+             * @description STS, `PSTATnn` (1): the stored match status, masked as the transaction ID is; its one
+             *     byte shows as stored (COPAUS0C-032, E32).
+             */
             match_status: string;
             /** @description Time, `PTIMEnn` (8): `HH:MM:SS` from the stored `HHMMSS` (COPAUS0C-034). */
             time: string;
-            /** @description Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space (COPAUS0C-032). */
+            /**
+             * @description Transaction ID, `TRNIDnn` (16): the 15 stored characters and one space, masked by
+             *     [`redact_free_text`] as stored request text, as endpoint 22 masks it: `TX0000000000001`
+             *     shows as `TX*********0001`, a 9-digit SSN as `***-**-` and its last four digits, and a
+             *     run of fewer than nine digits as stored. A Tran Id whose SSN fills its last nine bytes is
+             *     one character longer than the 16 of the map field: the redacted form adds two, the one
+             *     trailing space gives back one (COPAUS0C-032, COPAUS1C-021, E32).
+             */
             transaction_id: string;
         };
         /**
@@ -2264,8 +2278,8 @@ export interface components {
              */
             card_ref: number;
             /**
-             * @description `CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`, without its trailing spaces
-             *     (COCRDSLC-019).
+             * @description `CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`: its 50 stored bytes, trailing spaces
+             *     included (COCRDSLC-019).
              */
             embossed_name: string;
             /**
@@ -2286,8 +2300,8 @@ export interface components {
              */
             message?: string | null;
             /**
-             * @description `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`, the stored byte; empty when it is a space
-             *     (COCRDSLC-019).
+             * @description `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`: its stored byte, a space when it is a
+             *     space (COCRDSLC-019).
              * @example Y
              */
             status: string;
@@ -5134,7 +5148,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Transaction ID as typed on the screen (16 characters) */
+                /**
+                 * @description Transaction ID as typed on the screen: at most 16 characters, neither trimmed nor
+                 *     zero-filled (COTRN01C-010).
+                 */
                 tran_id: string;
             };
             cookie?: never;
@@ -5150,7 +5167,7 @@ export interface operations {
                     "application/json": components["schemas"]["TranViewResponse"];
                 };
             };
-            /** @description `Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009); or a path segment that is not UTF-8 once percent-decoded */
+            /** @description `Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is read (COTRN01C-009); `Input does not fit the screen field...` naming `tran_id`: the Tran ID is longer than 16 characters, and nothing is read (COTRN01-013); or a path segment that is not UTF-8 once percent-decoded */
             400: {
                 headers: {
                     [name: string]: unknown;

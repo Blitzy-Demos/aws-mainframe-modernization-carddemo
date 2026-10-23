@@ -301,13 +301,15 @@ const ROW_MEMBERS: [&str; 8] = [
     "amount",
 ];
 
-/// Endpoint 21's row for each detail of [`SPECS`]: key, Transaction ID (the 15 stored bytes and
-/// a space), Date `MM/DD/YY`, Time `HH:MM:SS`, Type, A/D, STS and the approved amount through
-/// `-zzzzzzz9.99` (COPAUS0C-032 to COPAUS0C-034).
+/// Endpoint 21's row for each detail of [`SPECS`]: key, Transaction ID (the 15 stored bytes
+/// masked as stored request text, a run of nine digits or more showing `*` for each digit but its
+/// last four, then a space; COPAUS0C-032, E32), Date `MM/DD/YY`, Time `HH:MM:SS`, Type, A/D, STS
+/// and the approved amount through `-zzzzzzz9.99` (COPAUS0C-032 to COPAUS0C-034). Endpoint 22
+/// shows the same Transaction ID without the blank column (COPAUS1C-021).
 const ROWS: [[&str; 8]; 6] = [
     [
         KEYS[0],
-        "TXN000000000001 ",
+        "TXN********0001 ",
         "07/18/22",
         "10:15:30",
         "SALE",
@@ -608,17 +610,6 @@ const REASONS: [&str; 6] = [
     "0000-APPROVED       ",
     "0000-APPROVED       ",
     "3100-INVALID CARD   ",
-];
-
-/// Endpoint 22's Tran Id for each detail of [`SPECS`]: a run of nine digits or more shows `*`
-/// for each digit but its last four, a shorter run as stored (COPAUS1C-021, E32).
-const DETAIL_TRAN_IDS: [&str; 6] = [
-    "TXN********0001",
-    "PTX220718A00002",
-    "PTX220717A00003",
-    "PTX241399A00004",
-    "PTX220716A00005",
-    "PTX220716A00006",
 ];
 
 /// `cents` hundredths as a money value of `INT` integer digits.
@@ -939,9 +930,11 @@ async fn summary_first_page(api: &mut Api) -> TestResult {
     // audit: COPAUS0C-036
     assert_eq!(next_page_flag(&page), Some(true));
     let shown = page.body.to_string();
+    // The card redacted form begins with twelve `*`; a masked Transaction ID holds at most
+    // eleven, for the fifteen digits its 15 bytes can hold, so only the card form is sought.
     // audit: COPAUS0C-055
     assert!(
-        !shown.contains("****") && !shown.contains("card"),
+        !shown.contains("************") && !shown.contains("card"),
         "a card number on CPVS"
     );
     Ok(())
@@ -1150,7 +1143,11 @@ fn assert_detail(reply: &Reply, prefix: &str, index: usize) -> TestResult {
     let auth_time = format!("{}  ", row[3]);
     let auth_type = format!("{}          ", row[4]);
     let reason = REASONS.get(index).ok_or("no reason")?;
-    let tran_id = DETAIL_TRAN_IDS.get(index).ok_or("no transaction ID")?;
+    // One stored Tran Id shows one way on both screens: endpoint 22's is endpoint 21's masked
+    // Transaction ID without its blank column (E32).
+    let tran_id = row[1]
+        .strip_suffix(' ')
+        .ok_or("endpoint 21's Transaction ID lacks its blank column")?;
     // audit: COPAUS1C-013
     assert_members(reply, prefix, &[("auth_date", auth_date.as_str())])?;
     // audit: COPAUS1C-014
@@ -1163,12 +1160,13 @@ fn assert_detail(reply: &Reply, prefix: &str, index: usize) -> TestResult {
     // audit: COPAUS1C-018
     assert_members(reply, prefix, &[("reason", *reason)])?;
     // audit: COPAUS1C-021
+    // audit: COPAUS0C-032
     assert_members(
         reply,
         prefix,
         &[
             ("auth_type", auth_type.as_str()),
-            ("transaction_id", *tran_id),
+            ("transaction_id", tran_id),
             ("match_status", row[6]),
         ],
     )

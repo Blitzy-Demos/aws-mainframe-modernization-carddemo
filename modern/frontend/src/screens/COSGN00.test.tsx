@@ -590,6 +590,14 @@ describe("COSGN00 sign-on screen", () => {
       await waitFor(() => {
         expect(errorRow().textContent).toBe(failure.message);
       });
+      // ERRMSG is RED, the `--destructive` token whole: the description takes `text-destructive`
+      // in place of the destructive variant's 90 percent `text-destructive/90`.
+      const row = errorRow();
+      expect(row.classList.contains("*:data-[slot=alert-description]:text-destructive")).toBe(true);
+      expect(row.className).not.toContain("text-destructive/90");
+      // ERRMSG is `BRT`: its text is semibold.
+      const description = row.querySelector('[data-slot="alert-description"]');
+      expect(description?.classList.contains("font-semibold")).toBe(true);
       expect(sent).toHaveLength(1);
       expect(getSession()).toBeNull();
       // The map is sent again from the fields as typed, with the cursor on the field the error

@@ -278,8 +278,9 @@ function formFieldOf(field: string | null | undefined): keyof Cotrn01Values | un
  *   The detail fields are blank while the read runs and after any failure, so a transaction shown
  *   before a failed fetch is no longer shown (COTRN01C-014). The cursor returns to the Tran ID
  *   input after every outcome, as every send of the program puts it there. A failure naming
- *   `tran_id`, like a schema refusal, marks the input invalid until it is edited or the next key
- *   is answered.
+ *   `tran_id` marks the input invalid until it is edited or the next key is answered; a schema
+ *   refusal marks it until the next key is answered. The message row changes only with an answer,
+ *   to the entry read or to a key, never while the operator types.
  * - F3 returns to the screen that transferred here, else to the main menu (COTRN01C-004); F4 clears
  *   the screen (COTRN01C-005); F5 goes to the transaction list (COTRN01C-006); any other F-key
  *   shows the invalid-key message, keeps the Tran ID and blanks the details (COTRN01C-007).
@@ -300,9 +301,12 @@ export function COTRN01(): ReactNode {
 
   const formId = useId();
   const fieldIdPrefix = useId();
+  // The schema runs when ENTER is answered, never while the operator types: its refusal, and the
+  // message row that shows it, change only when a key is answered.
   const form = useForm<Cotrn01Values>({
     resolver: zodResolver(cotrn01Schema),
     defaultValues: { tranId: selectedTranId ?? "" },
+    reValidateMode: "onSubmit",
   });
   const view = useCotrn01cView();
   const { mutateAsync, reset: resetView } = view;
@@ -477,10 +481,9 @@ export function COTRN01(): ReactNode {
                       <Input
                         {...field}
                         onChange={(event) => {
-                          // An edit replaces the value a server error rejected, so its mark
-                          // goes, also after the entry read, where the default `reValidateMode:
-                          // "onChange"` re-checks nothing until ENTER. Schema errors are left to
-                          // that re-check.
+                          // An edit replaces the value the server rejected, so its mark goes
+                          // while the message row keeps the server's message. A schema refusal
+                          // stays, with its message, until the next key is answered.
                           if (form.getFieldState("tranId").error?.type === "server") {
                             form.clearErrors("tranId");
                           }

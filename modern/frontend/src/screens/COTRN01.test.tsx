@@ -198,6 +198,9 @@ const SHOWN_TYPED = {
 /** `CCDA-MSG-INVALID-KEY`, the message of an F-key the screen does not serve (COTRN01C-007). */
 const INVALID_KEY_TEXT = "Invalid key pressed. Please see below...";
 
+/** The schema's blank-Tran-ID message (COTRN01C-009). */
+const TRAN_ID_EMPTY = "Tran ID can NOT be empty...";
+
 /** The twelve F-keys a browser sends. */
 const ALL_F_KEYS = ["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"];
 
@@ -993,6 +996,85 @@ describe("COTRN01 transaction view screen", () => {
       expect(tranIdErrorState()).toEqual(UNMARKED);
     });
     expect(errorText().trimEnd()).toBe(row.message);
+  });
+
+  // The message row and the input's mark change only when a key is answered, as the terminal
+  // sends nothing while the operator types. No audit row records that timing, so none is tagged.
+  it.each([
+    {
+      title: "the entry read of a COTRN00 selection",
+      typed: undefined,
+      shown: SHOWN_SELECTED,
+      read: [SELECTED_ID],
+    },
+    {
+      title: "an ENTER that found a transaction",
+      typed: TYPED_ID,
+      shown: SHOWN_TYPED,
+      read: [SELECTED_ID, TYPED_ID],
+    },
+  ])("after $title, clearing the Tran ID changes nothing until ENTER refuses it", async (row) => {
+    const requests = stubApi();
+    renderScreen(FROM_LIST);
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(SHOWN_SELECTED);
+    });
+    if (row.typed !== undefined) {
+      fetchTyped(row.typed);
+      await waitFor(() => {
+        expect(shownDetails()).toEqual(row.shown);
+      });
+    }
+    const read = row.read.map((tranId) => `${ENDPOINT}${tranId}`);
+
+    fireEvent.change(tranIdInput(), { target: { value: "" } });
+    await settle();
+
+    expect(errorText()).toBe("");
+    expect(tranIdErrorState()).toEqual(UNMARKED);
+    expect(shownDetails()).toEqual(row.shown);
+    expect(paths(requests)).toEqual(read);
+
+    fireEvent.click(screen.getByRole("button", { name: "ENTER=Fetch" }));
+
+    await waitFor(() => {
+      expect(errorText()).toBe(TRAN_ID_EMPTY);
+    });
+    expect(tranIdErrorState()).toEqual(markedWith(TRAN_ID_EMPTY));
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(BLANK_DETAILS);
+    });
+    await settle();
+    expect(paths(requests)).toEqual(read);
+  });
+
+  // No audit row records when the message row and the mark change, so none is tagged: a schema
+  // refusal stays, with its message, until the next key is answered, however the input is edited.
+  it("a refused blank Tran ID keeps its message and mark through an edit until ENTER", async () => {
+    const requests = stubApi();
+    renderScreen({ from: PATHS.COMEN01 });
+    fetchTyped("");
+    await waitFor(() => {
+      expect(errorText()).toBe(TRAN_ID_EMPTY);
+    });
+    expect(tranIdErrorState()).toEqual(markedWith(TRAN_ID_EMPTY));
+
+    fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
+    await settle();
+
+    expect(errorText()).toBe(TRAN_ID_EMPTY);
+    expect(tranIdErrorState()).toEqual(markedWith(TRAN_ID_EMPTY));
+    expect(shownDetails()).toEqual(BLANK_DETAILS);
+    expect(requests).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "ENTER=Fetch" }));
+
+    await waitFor(() => {
+      expect(shownDetails()).toEqual(SHOWN_TYPED);
+    });
+    expect(errorText()).toBe("");
+    expect(tranIdErrorState()).toEqual(UNMARKED);
+    expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
   });
 
   // audit: COTRN01C-005

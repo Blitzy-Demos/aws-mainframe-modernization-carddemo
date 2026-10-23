@@ -751,6 +751,40 @@ describe("COUSR03 user delete screen", () => {
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer test-token");
   });
 
+  // audit: COUSR03-017
+  // audit: COUSR03-020
+  // audit: COUSR03-023
+  it.each([
+    {
+      title: "on first display",
+      reach: async () => {
+        stubApi();
+        renderScreen({ from: PATHS.COADM01 });
+        await settle();
+      },
+    },
+    { title: "with a fetched user shown", reach: renderSelected },
+  ])("keeps the three ASKIP outputs out of the Tab order and the user ID in it $title", async ({
+    reach,
+  }) => {
+    await reach();
+
+    // The 3270 Tab key skips a protected field: FNAME, LNAME and USRTYPE are read-only and no Tab
+    // stop, while USRIDIN stays an enterable Tab stop.
+    const { firstName, lastName, userType } = outputs();
+    expect(
+      [userIdInput(), firstName, lastName, userType].map((element) => [
+        element.readOnly,
+        element.tabIndex,
+      ]),
+    ).toEqual([
+      [false, 0],
+      [true, -1],
+      [true, -1],
+      [true, -1],
+    ]);
+  });
+
   // audit: COUSR03-033
   // audit: COUSR03C-011
   it.each([
@@ -1286,6 +1320,97 @@ describe("COUSR03 user delete screen", () => {
       expect(marks()).toEqual(marked);
     },
   );
+
+  // The message row and the user ID's mark change only when a key is answered, as the terminal
+  // sends nothing while the operator types. No audit row records that timing, so none is tagged.
+  it.each([
+    {
+      title: "the entry fetch of a COUSR00 selection",
+      typed: undefined,
+      shows: SHOWN_SELECTED,
+      read: [`GET ${ENDPOINT}${SELECTED_ID}`],
+    },
+    {
+      title: "an ENTER that found a user",
+      typed: TYPED_ID,
+      shows: SHOWN_TYPED,
+      read: [`GET ${ENDPOINT}${SELECTED_ID}`, `GET ${ENDPOINT}${TYPED_ID}`],
+    },
+  ])("after $title, clearing the user ID changes nothing until ENTER refuses it", async (row) => {
+    const requests = await renderSelected();
+    if (row.typed !== undefined) {
+      typeUserId(row.typed);
+      fireEvent.click(key("ENTER=Fetch"));
+      await waitFor(() => {
+        expect(shown()).toEqual(row.shows);
+      });
+    }
+
+    typeUserId("");
+    await settle();
+
+    expect(marks()).toEqual(UNMARKED);
+    expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
+    expect(shown()).toEqual(row.shows);
+    expect(sent(requests)).toEqual(row.read);
+
+    fireEvent.click(key("ENTER=Fetch"));
+
+    await waitFor(() => {
+      expect(messageRow()).toEqual(errorRow(USER_ID_EMPTY));
+    });
+    expect(marks()).toEqual({ ...UNMARKED, userId: USER_ID_EMPTY });
+    expect(shown()).toEqual(row.shows);
+    await settle();
+    expect(sent(requests)).toEqual(row.read);
+  });
+
+  // No audit row records when the message row and the mark change, so none is tagged. A schema
+  // refusal stays marked until the next key is answered; a server error marks the value it
+  // rejected, so an edit removes that mark. Either way the red row keeps its text until a key.
+  it.each([
+    {
+      title: "the blank-user-ID edit",
+      refused: "",
+      message: USER_ID_EMPTY,
+      shows: SHOWN_SELECTED,
+      read: [`GET ${ENDPOINT}${SELECTED_ID}`],
+      edited: { ...UNMARKED, userId: USER_ID_EMPTY },
+    },
+    {
+      title: "the 404 of COUSR03C-013",
+      refused: UNKNOWN_ID,
+      message: readNotFound.message,
+      shows: BLANK,
+      read: [`GET ${ENDPOINT}${SELECTED_ID}`, `GET ${ENDPOINT}${UNKNOWN_ID}`],
+      edited: UNMARKED,
+    },
+  ])("after ENTER refused by $title, an edit keeps the red row until the next key", async (row) => {
+    const requests = await renderSelected();
+    typeUserId(row.refused);
+    fireEvent.click(key("ENTER=Fetch"));
+    await waitFor(() => {
+      expect(messageRow()).toEqual(errorRow(row.message));
+    });
+    expect(marks()).toEqual({ ...UNMARKED, userId: row.message });
+
+    typeUserId(TYPED_ID);
+    await settle();
+
+    expect(marks()).toEqual(row.edited);
+    expect(messageRow()).toEqual(errorRow(row.message));
+    expect(shown()).toEqual(row.shows);
+    expect(sent(requests)).toEqual(row.read);
+
+    fireEvent.click(key("ENTER=Fetch"));
+
+    await waitFor(() => {
+      expect(shown()).toEqual(SHOWN_TYPED);
+    });
+    expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
+    expect(marks()).toEqual(UNMARKED);
+    expect(sent(requests)).toEqual([...row.read, `GET ${ENDPOINT}${TYPED_ID}`]);
+  });
 
   // audit: COUSR03C-006
   it("keeps its origin across ENTER, F4, F5 and invalid keys: F3 returns to COUSR00", async () => {

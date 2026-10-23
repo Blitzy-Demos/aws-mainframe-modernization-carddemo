@@ -347,12 +347,18 @@ function screenState(
 
 /**
  * The screen after endpoint 26 answered: a row found is state S with its values as the fetched
- * ones (COTRTUPC-009); a code no row holds is state X with the normalised code entered and shown
- * red (COTRTUPC-010, COTRTUPC-014).
+ * ones (COTRTUPC-009), the description without its trailing spaces; a code no row holds is state
+ * X with the normalised code entered and shown red (COTRTUPC-010, COTRTUPC-014).
  */
 function afterFetch(from: ScreenView, result: components["schemas"]["TranTypeView"]): ScreenView {
   const state = screenState(result.state, from.old);
-  const values = { code: result.type_code, description: result.description ?? "" };
+  // A description saved through COTRTUPC comes back space-padded to its 50 characters
+  // (COTRTUPC-009, COTRTUPC-023). The 3270 operator types over those spaces of the X(50) field; a
+  // browser input bounded by `maxLength` is full and takes no keystroke, so the pad is dropped.
+  // Leading spaces are data the map shows and stay. The server sees no difference:
+  // `1150-STORE-MAP-IN-NEW` trims the description it receives (`COTRTUPC.cbl:678-684`) and the
+  // no-change test compares trimmed values (COTRTUPC-017).
+  const values = { code: result.type_code, description: (result.description ?? "").trimEnd() };
   return nextScreen(from, state, {
     old: state === "S" ? values : from.old,
     entered: state === "S" ? BLANK : values,
@@ -476,7 +482,16 @@ type MapInputProps = {
   length: number;
   input: BoundInput;
   invalid: boolean;
+  /**
+   * Whether the screen state leaves the input enterable (COTRTUPC-046). A protected input is
+   * read-only and out of the Tab order, as the 3270 Tab key skips protected fields; it still takes
+   * the cursor the program places on it.
+   */
   editable: boolean;
+  /**
+   * A request holds the keyboard: the input is read-only, and an enterable one keeps its Tab stop.
+   */
+  locked: boolean;
   mark: Mark;
   /** `ERRMSG`, the error row's text, which describes the input while the screen marks it. */
   message: string;
@@ -508,6 +523,7 @@ function MapInputCell({
   input,
   invalid,
   editable,
+  locked,
   mark,
   message,
   autoFocus = false,
@@ -525,7 +541,8 @@ function MapInputCell({
           size={length}
           autoFocus={autoFocus}
           autoComplete="off"
-          readOnly={!editable}
+          readOnly={!editable || locked}
+          tabIndex={editable ? undefined : -1}
           aria-invalid={red || invalid}
           aria-describedby={described ? formMessageId : undefined}
           className={cn(INPUT_CLASS, red && "text-destructive")}
@@ -863,6 +880,8 @@ export function COTRTUP(): ReactNode {
       formId={formId}
       message={{ text: view.message, kind: "error" }}
       info={centred(view.info)}
+      // COTRTUPC-045: the info row is shown bright.
+      infoBright
       keys={keys}
       keyOptions={{
         foldShifted: KEY_ROWS.COTRTUP.foldShifted,
@@ -886,7 +905,8 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.typeCode}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={CODE_EDITABLE.has(view.state) && !pending}
+                    editable={CODE_EDITABLE.has(view.state)}
+                    locked={pending}
                     mark={view.codeMark}
                     message={view.message}
                     autoFocus
@@ -903,6 +923,7 @@ export function COTRTUP(): ReactNode {
                 col={INPUT_COLUMN}
                 span={COTRTUP_LENGTHS.description}
               >
+                {/* Protected on the search form: the Tab key skips it, as on the terminal. */}
                 <Input
                   id={descriptionId}
                   value={shown.description}
@@ -911,6 +932,7 @@ export function COTRTUP(): ReactNode {
                   className={INPUT_CLASS}
                   autoComplete="off"
                   readOnly
+                  tabIndex={-1}
                 />
               </GridCell>
             </FieldGrid>
@@ -930,7 +952,8 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.typeCode}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={CODE_EDITABLE.has(view.state) && !pending}
+                    editable={CODE_EDITABLE.has(view.state)}
+                    locked={pending}
                     mark={view.codeMark}
                     message={view.message}
                     autoFocus
@@ -947,7 +970,8 @@ export function COTRTUP(): ReactNode {
                     length={COTRTUP_LENGTHS.description}
                     input={field}
                     invalid={fieldState.invalid}
-                    editable={DESCRIPTION_EDITABLE.has(view.state) && !pending}
+                    editable={DESCRIPTION_EDITABLE.has(view.state)}
+                    locked={pending}
                     mark={view.descriptionMark}
                     message={view.message}
                   />

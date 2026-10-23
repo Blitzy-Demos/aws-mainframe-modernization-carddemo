@@ -48,7 +48,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
 use validator::Validate;
 
-use super::{digits, text};
+use super::{digits, full_text};
 
 /// What the `Debug` of [`CardLookupQuery`] shows for a typed `card_num`, whatever it holds: the
 /// input need not be a card number at all, so no character of it is kept.
@@ -163,15 +163,15 @@ pub struct CardViewResponse {
     /// twelve `*` followed by the last four digits (COCRDSLC-022, COCRDSLC-023).
     #[schema(value_type = String, example = "************5740")]
     pub card_num: CardViewNumber,
-    /// `CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`, without its trailing spaces
-    /// (COCRDSLC-019).
+    /// `CRDNAMEO` from `CARD-EMBOSSED-NAME PIC X(50)`: its 50 stored bytes, trailing spaces
+    /// included (COCRDSLC-019).
     pub embossed_name: String,
     /// `CARD-EXPIRAION-DATE PIC X(10)` as a date, `null` when the stored date is blank
     /// (COCRDSLC-019, CVACT02Y-005). The screen shows its month in `EXPMON` and its year in
     /// `EXPYEAR` (COCRDSLC-024).
     pub expiration_date: Option<NaiveDate>,
-    /// `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`, the stored byte; empty when it is a space
-    /// (COCRDSLC-019).
+    /// `CRDSTCDO` from `CARD-ACTIVE-STATUS PIC X(01)`: its stored byte, a space when it is a
+    /// space (COCRDSLC-019).
     #[schema(example = "Y")]
     pub status: String,
     /// `ERRMSGO`: always `null`, because a found card leaves `WS-RETURN-MSG` spaces; every other
@@ -189,9 +189,9 @@ impl From<rules::CardView> for CardViewResponse {
             acct_id: digits(view.acct_id),
             card_ref: view.card_ref.get(),
             card_num: view.card_num.into(),
-            embossed_name: text(&view.embossed_name),
+            embossed_name: full_text(&view.embossed_name),
             expiration_date: view.expiration_date,
-            status: text(&view.status),
+            status: full_text(&view.status),
             message: None,
             info_message: Some(view.info_message.to_owned()),
         }
@@ -280,6 +280,7 @@ mod tests {
     // audit: COCRDSLC-023
     #[test]
     fn the_response_shows_the_number_the_domain_disclosed_and_nothing_else() -> TestResult {
+        let embossed_name = format!("{:<50}", "Test Holder");
         for (user_type, card_num) in [(UserType::USER, REDACTED), (UserType::ADMIN, CARD)] {
             let response = CardViewResponse::from(view(&user_type, Some(expiry()?))?);
             assert_eq!(
@@ -288,7 +289,7 @@ mod tests {
                     "acct_id": "00000000050",
                     "card_ref": 7,
                     "card_num": card_num,
-                    "embossed_name": "Test Holder",
+                    "embossed_name": embossed_name,
                     "expiration_date": "2025-04-30",
                     "status": "Y",
                     "message": null,
@@ -300,6 +301,28 @@ mod tests {
             let debug = format!("{response:?}");
             assert!(!debug.contains(CARD), "{debug}");
             assert!(debug.contains(REDACTED), "{debug}");
+        }
+        Ok(())
+    }
+
+    // audit: COCRDSLC-019
+    #[test]
+    fn the_name_and_the_status_are_their_stored_bytes() -> TestResult {
+        let full_name = "X".repeat(50);
+        for (name, status) in [("Test Holder", " "), ("", "N"), (full_name.as_str(), "Y")] {
+            let response = CardViewResponse::from(rules::CardView {
+                embossed_name: PicX::from_text(name)?,
+                status: PicX::from_text(status)?,
+                ..view(&UserType::USER, None)?
+            });
+            assert_eq!(response.embossed_name.chars().count(), 50, "{name:?}");
+            let body = serde_json::to_value(&response)?;
+            assert_eq!(
+                body["embossed_name"],
+                json!(format!("{name:<50}")),
+                "{name:?}"
+            );
+            assert_eq!(body["status"], json!(status), "{status:?}");
         }
         Ok(())
     }

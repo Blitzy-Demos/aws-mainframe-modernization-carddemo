@@ -964,6 +964,9 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
       },
     });
     expect(messageRow("info").textContent).toBe("Changes validated.Press F5 to save");
+    // The program brightens the info row whenever it holds a message (COACTUPC-083).
+    const info = messageRow("info").querySelector('[data-slot="alert-description"]');
+    expect(info?.classList.contains("font-semibold")).toBe(true);
     expect(messageRow("error").textContent).toBe("");
     expect(input("Credit Limit :").value).toBe("+      3,000.00");
     expect(screen.getByRole("button", { name: "F12=Cancel" })).toBe(key("F12=Cancel"));

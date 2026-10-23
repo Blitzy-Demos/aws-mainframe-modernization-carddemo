@@ -890,6 +890,7 @@ describe("COTRN02 Add Transaction screen", () => {
     },
   );
 
+  // audit: COTRN02-060
   // audit: COTRN02-068
   // audit: COTRN02C-058
   // audit: COTRN02C-060
@@ -963,6 +964,9 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(JSON.stringify(requests[2]?.body)).not.toContain("*");
     const success = messageRow();
     expect(success).toEqual({ kind: "info", text: added.message, red: false });
+    // ERRMSG is `BRT` whatever its colour, so the green success text is semibold.
+    const description = screen.getByRole("alert").querySelector('[data-slot="alert-description"]');
+    expect(description?.classList.contains("font-semibold")).toBe(true);
     // The longest COTRN02C message, 66 characters, fits the 78 columns of ERRMSG uncut.
     expect(success.text).toHaveLength(66);
     await waitFor(() => {

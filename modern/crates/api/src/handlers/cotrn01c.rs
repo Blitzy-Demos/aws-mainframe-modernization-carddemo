@@ -2,24 +2,26 @@
 //! `GET /api/v1/transactions/{tran_id}` (transaction `CT01`, map `COTRN1A`; AAP 0.3.4.1).
 //!
 //! [`view`] serves ENTER, the program's only key that reads: it extracts the signed-on user and
-//! the raw `tran_id` path segment ([`RawPath`]), calls `services::cotrn01c::view` and maps the
-//! answer through `TranViewResponse::from` or `ScreenError::from` (Thin Request Handlers). F4
-//! (clear), F5 (to the transaction list) and PF3 (back) are served by the screen alone and reach
-//! no endpoint (COTRN01C-004 to COTRN01C-006).
+//! the `tran_id` path segment as a [`TranIdPath`] ([`ValidPath`]), calls
+//! `services::cotrn01c::view` and maps the answer through `TranViewResponse::from` or
+//! `ScreenError::from` (Thin Request Handlers). F4 (clear), F5 (to the transaction list) and PF3
+//! (back) are served by the screen alone and reach no endpoint (COTRN01C-004 to COTRN01C-006).
 //!
-//! The path segment stays a `String`, never parsed here: the domain's total edit, not an
-//! extractor, answers a blank Tran ID with the program's own message (COTRN01C-009). The card
-//! number leaves only in its redacted form, because the response holds it as a `CardNumber`
-//! (COTRN01C-017, E32, Cardholder Data Redaction), and the two timestamps are typed in the
-//! response (COTRN01C-023, COTRN01C-024, Typed Dates and Timestamps).
+//! The extractor checks only the map `LENGTH` of `TRNIDIN`, 16: a longer segment is refused with
+//! 400 before anything is read (COTRN01-013). A segment that fits stays a `String`, never parsed
+//! or trimmed here: the domain's total edit, not an extractor, answers a blank Tran ID with the
+//! program's own message (COTRN01C-009). The card number leaves only in its redacted form,
+//! because the response holds it as a `CardNumber` (COTRN01C-017, E32, Cardholder Data
+//! Redaction), and the two timestamps are typed in the response (COTRN01C-023, COTRN01C-024,
+//! Typed Dates and Timestamps).
 
 use axum::Json;
 use axum::extract::State;
 
 use crate::app::AppState;
 use crate::auth::extract::SignedOnUser;
-use crate::dto::RawPath;
-use crate::dto::cotrn01c::TranViewResponse;
+use crate::dto::ValidPath;
+use crate::dto::cotrn01c::{TranIdPath, TranViewResponse};
 use crate::error::ScreenError;
 use crate::services;
 
@@ -36,25 +38,20 @@ pub(crate) struct ViewOperation;
 ///
 /// # Errors
 ///
-/// A `ScreenError` naming field `tran_id`: 400 `Tran ID can NOT be empty...` when the Tran ID
-/// is blank, 404 `Transaction ID NOT found...` when no transaction has the key, and 500
-/// `Unable to lookup Transaction...` when the read fails. A request without a valid bearer
-/// token is refused with 401 before anything is read. A segment that is not UTF-8 once
-/// percent-decoded is a 400 with the API's `Invalid path parameters...` and no field, before the
-/// program's edit.
+/// A `ScreenError` naming field `tran_id`: 400 `Input does not fit the screen field...` when
+/// the Tran ID is longer than its 16 characters, with nothing read (COTRN01-013), 400 `Tran ID
+/// can NOT be empty...` when it is blank, 404 `Transaction ID NOT found...` when no transaction
+/// has the key, and 500 `Unable to lookup Transaction...` when the read fails. A request without
+/// a valid bearer token is refused with 401 before any input is examined. A segment that is not
+/// UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...` and no field,
+/// before the program's edit.
 #[utoipa::path(
     impl_for = ViewOperation,
     get,
     path = "/api/v1/transactions/{tran_id}",
     operation_id = "cotrn01c_view",
     tag = "COTRN01C",
-    params(
-        (
-            "tran_id" = String,
-            Path,
-            description = "Transaction ID as typed on the screen (16 characters)"
-        )
-    ),
+    params(TranIdPath),
     responses(
         (
             status = 200,
@@ -65,7 +62,9 @@ pub(crate) struct ViewOperation;
         (
             status = 400,
             description = "`Tran ID can NOT be empty...`: the Tran ID is blank, and nothing is \
-                read (COTRN01C-009); or a path segment that is not UTF-8 once percent-decoded",
+                read (COTRN01C-009); `Input does not fit the screen field...` naming `tran_id`: \
+                the Tran ID is longer than 16 characters, and nothing is read (COTRN01-013); or \
+                a path segment that is not UTF-8 once percent-decoded",
             body = ScreenError
         ),
         (
@@ -87,12 +86,14 @@ pub(crate) struct ViewOperation;
     ),
     security(("bearer_auth" = []))
 )]
+// `SignedOnUser` precedes the path so a request without a valid token gets 401 before any input
+// is examined.
 pub(crate) async fn view(
     State(state): State<AppState>,
     user: SignedOnUser,
-    RawPath(tran_id): RawPath<String>,
+    ValidPath(path): ValidPath<TranIdPath>,
 ) -> Result<Json<TranViewResponse>, ScreenError> {
-    services::cotrn01c::view(&state, &user, &tran_id)
+    services::cotrn01c::view(&state, &user, &path.tran_id)
         .await
         .map(TranViewResponse::from)
         .map(Json)

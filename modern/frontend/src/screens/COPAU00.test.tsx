@@ -146,7 +146,7 @@ function authRows(first: number, count: number): components["schemas"]["AuthSumm
   return Array.from({ length: count }, (_, index) => {
     const n = first + index;
     return {
-      transaction_id: `TX${String(n).padStart(13, "0")} `,
+      transaction_id: `TX*********${String(n).padStart(4, "0")} `,
       auth_key: authKey(n),
       ...ROW_SHAPES[(n - 1) % ROW_SHAPES.length],
     };

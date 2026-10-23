@@ -910,6 +910,13 @@ impl Approval {
 /// `PA-AUTH-ORIG-TIME` are `PIC X(06)`, outside the `X(10)` dates and `X(26)` timestamps that
 /// Typed Dates and Timestamps covers, and the program copies their bytes with no calendar check,
 /// so `241399` shows `13/99/24`, which no date type holds (COPAUS0C-034).
+///
+/// The derived `Debug` shows the stored request text as stored: `transaction_id`, `auth_type`
+/// and `match_status` hold the text of the CP00 request and may hold a protected value, such as
+/// an SSN. `api::dto::copaus0c` masks every one of them with
+/// [`crate::sensitive::redact_free_text`] as the response leaves the service, exactly as
+/// `api::dto::copaus1c` masks them for endpoint 22, so the row itself is not formatted into a
+/// log line, a span or an error (Cardholder Data Redaction, E32).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct AuthRow {
     /// The row's `PA-AUTHORIZATION-KEY`, `CDEMO-CPVS-AUTH-KEYS(n)` (COPAUS0C-034).

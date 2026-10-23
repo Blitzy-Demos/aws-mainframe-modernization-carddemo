@@ -779,6 +779,7 @@ describe("CORPT00 transaction reports screen", () => {
     },
   );
 
+  // audit: CORPT00-041
   // audit: CORPT00-049
   // audit: CORPT00C-040
   // audit: CORPT00C-042
@@ -827,6 +828,9 @@ describe("CORPT00 transaction reports screen", () => {
       const [info] = messageRows("info");
       expect(info?.className).toContain("text-card-foreground");
       expect(info?.className).not.toContain("text-destructive");
+      // ERRMSG is `BRT` whatever its colour, so the information text is semibold.
+      const description = info?.querySelector('[data-slot="alert-description"]');
+      expect(description?.classList.contains("font-semibold")).toBe(true);
       expect(messageRows("error")).toHaveLength(0);
       expect(shown()).toEqual(BLANK);
       await waitFor(() => {
