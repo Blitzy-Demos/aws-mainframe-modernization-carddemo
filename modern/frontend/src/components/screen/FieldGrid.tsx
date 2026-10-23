@@ -3,7 +3,8 @@ import { cn } from "cn";
 
 /**
  * Lines and columns of every map, `DFHMDI SIZE=(24,80)` (for example `app/bms/COSGN00.bms:28`).
- * The `grid-rows-24` and `grid-cols-80` literals of {@link FieldGrid} state the same size.
+ * The `grid-rows-24` and `grid-cols-80` literals of {@link FieldGrid} state the same size, and
+ * {@link GridCell} holds a `POS` to it.
  */
 const SCREEN_ROWS = 24;
 const SCREEN_COLUMNS = 80;
@@ -71,8 +72,8 @@ export type GridCellProps = {
   span: number;
   /**
    * How many map lines the cell spans from `row`; one when omitted. A list `Table` spans the
-   * lines of its captions and rows, so its height is shared by those lines instead of making
-   * every line of the grid as tall as the whole table.
+   * lines of its captions and rows, so its height is shared by those lines instead of making its
+   * first line as tall as the whole table.
    */
   rowSpan?: number;
   /** The field's content, rendered exactly as given. */
@@ -108,13 +109,27 @@ export function fieldBox(length: number): string {
  * The 24 × 80 terminal grid a screen body places its map fields on.
  *
  * shadcn/ui has no layout primitive, so this is a plain container styled with Tailwind grid
- * utilities and default spacing steps. The 24 row tracks are flexible in a container of auto
- * height, so every line takes the height of the tallest one, and map lines that hold no field
- * keep their place as they do on the terminal.
+ * utilities and default spacing steps. One row rule holds for every screen:
+ *
+ * - Each field sits on its map line: {@link GridCell} places it at grid line `r` of its
+ *   `POS=(r,c)`, so fields of one map line share one track and lines keep their map order.
+ * - The grid declares the map's 24 lines as its row tracks (`grid-rows-24`), each sized to its
+ *   content by the `--grid-template-rows-24` token of `src/index.css`, so a line is as tall as its
+ *   tallest field.
+ * - A map line that holds no field takes no height; only the `gap-y-1` row gap remains. These are
+ *   the lines `ScreenShell` draws around the body (the header rows, the screen title, the
+ *   `INFOMSG` and `ERRMSG` rows and the row-24 keys) and the map's blank lines, so the frame lines
+ *   are not reserved a second time as empty bands.
+ * - `items-center` centres each field on its line, so a label stands level with the input
+ *   beside it.
+ *
+ * The token, not the utility, sets the track size: Tailwind's own `grid-rows-24` is 24 equal
+ * `minmax(0, 1fr)` tracks, which would make every line as tall as the tallest and turn the lines
+ * without a field into blank bands.
  */
 export function FieldGrid({ children, className }: FieldGridProps): ReactNode {
   return (
-    <div className={cn("grid grid-cols-80 grid-rows-24 gap-x-2 gap-y-1", className)}>
+    <div className={cn("grid grid-cols-80 grid-rows-24 items-center gap-x-2 gap-y-1", className)}>
       {children}
     </div>
   );
@@ -172,10 +187,10 @@ export type GridTableProps = {
  *
  * The block is a {@link GridCell} whose content reaches over the column gap after its last
  * column (`-mr-2`, the grid's `gap-x-2`) and over the line gap after its last line (`-mb-1`, the
- * grid's `gap-y-1`). It is therefore exactly `span` column pitches wide and `rowSpan` line pitches
- * tall. A `table-fixed` `Table` whose `col` widths are fractions of `span` starts each column on
- * its map column, and rows of {@link LIST_ROW} height stand on their map lines without making the
- * grid's lines taller.
+ * grid's `gap-y-1`), so it is exactly `span` column pitches wide. A `table-fixed` `Table` whose
+ * `col` widths are fractions of `span` starts each column on its map column. The block's lines
+ * hold no other field, so their content-sized tracks share the table's height: each of its rows of
+ * {@link LIST_ROW} height is one map line.
  */
 export function GridTable({ row, col, span, rowSpan = 1, children }: GridTableProps): ReactNode {
   return (
@@ -186,17 +201,22 @@ export function GridTable({ row, col, span, rowSpan = 1, children }: GridTablePr
 }
 
 /**
- * The height of one list row in a {@link GridTable}: one map line plus the line gap, the `Input`
- * height (`h-9`) and `gap-y-1`. Every caption, dash and list row has it, whatever it holds, so a
- * page with fewer rows keeps the same lines.
+ * The height of one list row in a {@link GridTable}: one map line, as tall as a map field's box
+ * ({@link fieldBox}, `h-7`). Every caption, dash and list row has it, whatever it holds, so a page
+ * with fewer rows keeps the same lines.
+ *
+ * BLITZY [LAYOUT]: `h-7` instead of the 40px caption row of the `TableHead` default `h-10`
+ * (which {@link LIST_CELL} lifts), and the row's input as compact as a field box, so the list lines
+ * stand one after another as the terminal's do and a list screen, up to the twelve list lines of
+ * COTRN00, fits a 1024 × 768 viewport with its message row and keys.
  */
-export const LIST_ROW = "h-10";
+export const LIST_ROW = "h-7";
 
 /**
- * The padding of every `TableHead` and `TableCell` in a {@link GridTable}. No inline padding, so
- * the content starts on its column's map column. Below the content, the line gap less the 1px
- * rule `TableRow` draws under each row (`pb-0.75` and `border-b` make `gap-y-1`), so a row that
- * holds an `Input` is exactly {@link LIST_ROW} tall and its content is centred on its map line,
- * as {@link FieldGrid} centres a field.
+ * The box of every `TableHead` and `TableCell` in a {@link GridTable}: no padding and no height of
+ * its own. No inline padding, so the content starts on its column's map column; no vertical
+ * padding, and `h-auto` in place of the `TableHead` fixed `h-10`, so a caption row and a row that
+ * holds a field's box are both exactly {@link LIST_ROW} tall, with their content centred on the
+ * map line, as {@link FieldGrid} centres a field.
  */
-export const LIST_CELL = "px-0 pt-0 pb-0.75";
+export const LIST_CELL = "h-auto px-0 py-0";

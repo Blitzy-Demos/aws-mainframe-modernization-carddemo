@@ -166,14 +166,6 @@ const TRAN_ID_INPUT: MapPosition = { row: 6, col: 21, span: 16 };
 /** The NEUTRAL rule of 70 dashes under the Tran ID input (`COTRN01-015`). */
 const SEPARATOR: MapPosition = { row: 8, col: 6, span: 70 };
 
-/*
- * BLITZY [LAYOUT]: row tracks of the body grid, overriding FieldGrid's 24 equal rows. Lines 1–5
- * (header rows, title, blank) and 21–24 (blank, ERRMSG, keys) are drawn by `ScreenShell`, so here
- * they take no height; lines 6–20 keep equal heights, so the map's blank lines between fields
- * keep their place. Fields stay at their map lines.
- */
-const BODY_ROWS = "grid-rows-[repeat(5,0)_repeat(15,minmax(0,1fr))_repeat(4,0)]";
-
 /** The labels of row 24, `ENTER=Fetch  F3=Back  F4=Clear  F5=Browse Tran.` (`COTRN01-056`). */
 const KEY_ITEMS = keyRowItems(KEY_ROWS.COTRN01);
 
@@ -462,7 +454,7 @@ export function COTRN01(): ReactNode {
     >
       <Form {...form}>
         <form id={formId} noValidate aria-busy={busy} onSubmit={onSubmit}>
-          <FieldGrid className={BODY_ROWS}>
+          <FieldGrid>
             <FormField
               control={form.control}
               name="tranId"

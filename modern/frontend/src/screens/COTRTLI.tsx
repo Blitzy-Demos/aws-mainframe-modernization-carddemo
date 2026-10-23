@@ -62,6 +62,15 @@ const COLUMN_WIDTHS = ["w-13/71", "w-8/71", "w-50/71"] as const;
  */
 const LINE_LABEL = "h-full";
 
+/**
+ * A list input, compact to fit its list line; its text turns red with its error mark.
+ *
+ * BLITZY [LAYOUT]: every list line is a compact `LIST_ROW`, and the selectors and descriptions
+ * take the `Input`'s `h-7` and `py-0` instead of its `h-9` and `py-1`, so each input fits its list
+ * line. The nine lines then fit their map lines and the whole screen fits a 1024 × 768 viewport.
+ */
+const LIST_INPUT = "h-7 py-0 aria-invalid:text-destructive";
+
 /** The 50 dashes under the description caption, `POS=(11,25)` (COTRTLI-025). */
 const DESCRIPTION_DASHES = "-".repeat(COTRTLI_LENGTHS.description);
 
@@ -720,8 +729,8 @@ export function COTRTLI(): ReactNode {
                                     tabIndex={selectorOpen ? undefined : -1}
                                     className={cn(
                                       FIELD_INPUT,
+                                      LIST_INPUT,
                                       "relative left-2/13 w-9 text-center",
-                                      "aria-invalid:text-destructive",
                                     )}
                                   />
                                 </FieldControl>
@@ -748,7 +757,7 @@ export function COTRTLI(): ReactNode {
                                     autoComplete="off"
                                     readOnly={!descriptionOpen || busy}
                                     tabIndex={descriptionOpen ? undefined : -1}
-                                    className={cn(FIELD_INPUT, "aria-invalid:text-destructive")}
+                                    className={cn(FIELD_INPUT, LIST_INPUT)}
                                   />
                                 </FieldControl>
                                 <FormMessage className="sr-only" />

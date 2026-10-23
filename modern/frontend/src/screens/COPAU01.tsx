@@ -69,8 +69,9 @@ const VALUE_TONE: Readonly<Record<MapColour, string>> = {
 };
 
 /**
- * Every label of the map is TURQUOISE, which maps to `--foreground`. `h-full` fills the grid line
- * so the label centres on the `Input` beside it; `whitespace-pre` keeps `Source   :` as declared.
+ * Every label of the map is TURQUOISE, which maps to `--foreground`. `FieldGrid` centres each cell
+ * on its line, so the label stands level with the `Input` beside it; `whitespace-pre` keeps
+ * `Source   :` as declared.
  */
 const LABEL_CLASS = "h-full whitespace-pre text-foreground";
 

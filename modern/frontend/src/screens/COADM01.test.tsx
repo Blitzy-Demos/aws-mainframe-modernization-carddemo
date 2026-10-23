@@ -551,6 +551,25 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     expect(exitKey.dataset.size).toBe("sm");
   });
 
+  // audit: COADM01-012
+  // audit: COADM01-023
+  it("places the option table on the map's lines 6 to 17, from column 20, 40 columns wide", async () => {
+    // `OPTN001` is at `POS=(6,20)` and `OPTN012` at `POS=(17,20)`, each `LENGTH=40`: the table's
+    // grid cell starts on line 6 and spans the 12 lines, directly on the screen's `FieldGrid`.
+    stubMenu(200, menu);
+    renderAdminMenu();
+    await loaded();
+
+    const cell = screen
+      .getByRole("table", { name: "Admin Menu options" })
+      .closest(".row-start-6");
+    expect(cell).not.toBeNull();
+    expect(cell?.className.split(" ").sort()).toEqual(
+      ["col-span-40", "col-start-20", "row-span-12", "row-start-6"].sort(),
+    );
+    expect(cell?.parentElement?.parentElement?.tagName).toBe("FORM");
+  });
+
   // audit: COADM01C-022
   // audit: COADM01-029
   // audit: COADM01-030

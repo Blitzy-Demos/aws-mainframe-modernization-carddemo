@@ -725,20 +725,22 @@ describe("COCRDLI", () => {
       expect(form.contains(element)).toBe(false);
     }
 
-    // Every placed element of the body grid as its line, column and width. No cell stands at the
-    // zero-length stoppers (6,56), (7,61) and (20,65): their columns stay empty.
+    // Every placed element of the body grid as its line, column and width, and the lines it
+    // spans. No cell stands at the zero-length stoppers (6,56), (7,61) and (20,65): their columns
+    // stay empty.
     const placed = Array.from(form.querySelectorAll('[class*="row-start-"]'), (cell) => [
       /\brow-start-(\d+)\b/.exec(cell.className)?.[1],
       /\bcol-start-(\d+)\b/.exec(cell.className)?.[1],
       /\bcol-span-(\d+)\b/.exec(cell.className)?.[1],
+      /\brow-span-(\d+)\b/.exec(cell.className)?.[1],
     ]);
     expect(placed).toEqual([
-      ["6", "22", "19"],
-      ["6", "44", "11"],
-      ["7", "22", "19"],
-      ["7", "44", "16"],
+      ["6", "22", "19", undefined],
+      ["6", "44", "11", undefined],
+      ["7", "22", "19", undefined],
+      ["7", "44", "16", undefined],
       // The list table, map lines 9 to 17, columns 10 to 72.
-      ["9", "10", "63"],
+      ["9", "10", "63", "9"],
     ]);
 
     // Each list row holds its selector and three output cells and nothing else: neither the
@@ -753,6 +755,32 @@ describe("COCRDLI", () => {
     // The form's inputs are the two filters and the seven selectors.
     expect(form.querySelectorAll("input")).toHaveLength(9);
     expect(form.querySelectorAll('input[type="hidden"]')).toHaveLength(0);
+  });
+
+  it("shows `Page ` and PAGENO on the title's line of the card header, beside the level-1 heading", async () => {
+    // audit: COCRDLI-011
+    // audit: COCRDLI-012
+    // audit: COCRDLI-013
+    stubReplies([200, FIRST_PAGE]);
+    renderScreen();
+    await firstPageShown();
+
+    // Map line 4 holds the title and both fields: they are cells of the one line of the frame's
+    // header, each at its map column, and the body gives the line no track.
+    const heading = screen.getByRole("heading", { level: 1, name: "List Credit Cards" });
+    const line = heading.parentElement;
+    const value = pageNo();
+    if (!(value instanceof HTMLInputElement)) {
+      throw new Error("PAGENO is not an input");
+    }
+    const label = value.labels?.item(0) ?? null;
+    expect(label?.textContent).toBe("Page ");
+    expect(line?.closest('[data-slot="card-header"]')).not.toBeNull();
+    expect(label?.parentElement?.parentElement).toBe(line);
+    expect(value.parentElement?.parentElement).toBe(line);
+    expect(label?.parentElement?.className).toBe("row-start-1 col-start-70 col-span-5");
+    expect(value.parentElement?.className).toBe("row-start-1 col-start-76 col-span-3");
+    expect(document.querySelector("form")?.contains(value)).toBe(false);
   });
 
   it.each([
@@ -818,14 +846,17 @@ describe("COCRDLI", () => {
       });
       expect(shown).toEqual([22, 43, 67]);
     }
-    // Nine rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    // Nine rows of one compact map line each, whatever they hold, and no cell padding on the line.
+    // No cell keeps a height of its own, so the caption row is as tall as the others.
     expect(table.querySelectorAll("tr")).toHaveLength(9);
     for (const row of table.querySelectorAll("tr")) {
-      expect(row.classList.contains("h-10")).toBe(true);
+      expect(row.classList.contains("h-7")).toBe(true);
     }
     for (const cell of table.querySelectorAll("th, td")) {
       expect(cell.classList.contains("px-0")).toBe(true);
-      expect(cell.classList.contains("pt-0")).toBe(true);
+      expect(cell.classList.contains("py-0")).toBe(true);
+      expect(cell.classList.contains("h-auto")).toBe(true);
+      expect(cell.classList.contains("h-10")).toBe(false);
     }
   });
 

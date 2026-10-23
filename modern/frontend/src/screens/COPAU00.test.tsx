@@ -1123,14 +1123,14 @@ describe("COPAU00 View Authorizations", () => {
     for (let row = 1; row <= 5; row += 1) {
       expect(shownColumn(selector(row), columns.at(0))).toBe(3);
     }
-    // Seven rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    // Seven rows of one compact map line each, whatever they hold, and no cell padding on the line.
     expect(table.querySelectorAll("tr")).toHaveLength(7);
     for (const row of table.querySelectorAll("tr")) {
-      expect(row.classList.contains("h-10")).toBe(true);
+      expect(row.classList.contains("h-7")).toBe(true);
     }
     for (const cell of table.querySelectorAll("th, td")) {
       expect(cell.classList.contains("px-0")).toBe(true);
-      expect(cell.classList.contains("pt-0")).toBe(true);
+      expect(cell.classList.contains("py-0")).toBe(true);
     }
   });
 

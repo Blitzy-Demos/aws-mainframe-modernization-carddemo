@@ -421,12 +421,11 @@ export function COCRDSL(): ReactNode {
       <Form {...form}>
         <form id={formId} noValidate aria-busy={pending} onSubmit={submit}>
           {/*
-           * Rows keep their map numbers. Lines that hold no field (the header and title lines
-           * 1-6, which ScreenShell draws above, and the blank lines 9, 10, 12 and 14) take no
-           * height of their own, only the row gap, so the body does not repeat the frame's rows
-           * as empty space; `gap-y-2` keeps the blank lines visible between the field groups.
+           * Rows keep their map numbers under FieldGrid's one row rule: lines that hold no field
+           * (the header and title lines 1-6, which ScreenShell draws above, and the blank lines 9,
+           * 10, 12 and 14) take no height of their own, only the row gap.
            */}
-          <FieldGrid className="grid-rows-none gap-y-2">
+          <FieldGrid>
             {/*
              * Both inputs are protected while the card list is the caller (`DFHBMPRF`,
              * COCRDSLC-002): read-only for the visit and, as the 3270 cursor skips a protected

@@ -1148,14 +1148,14 @@ describe("COTRTLI", () => {
       expect(descriptionAt(row).closest("td")?.classList.contains("pr-2")).toBe(true);
       expect(shownColumn(descriptionAt(row), columns.at(2))).toBe(25);
     }
-    // Nine rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    // Nine rows of one compact map line each, whatever they hold, and no cell padding on the line.
     expect(table.querySelectorAll("tr")).toHaveLength(9);
     for (const row of table.querySelectorAll("tr")) {
-      expect(row.classList.contains("h-10")).toBe(true);
+      expect(row.classList.contains("h-7")).toBe(true);
     }
     for (const cell of table.querySelectorAll("th, td")) {
       expect(cell.classList.contains("px-0")).toBe(true);
-      expect(cell.classList.contains("pt-0")).toBe(true);
+      expect(cell.classList.contains("py-0")).toBe(true);
     }
   });
 
@@ -1202,6 +1202,29 @@ describe("COTRTLI", () => {
       vi.useRealTimers();
     }
   });
+
+  it("shows `Page ` and PAGENO on the title's line of the card header, beside the level-1 heading", async () => {
+    // audit: COTRTLI-011
+    // audit: COTRTLI-012
+    // audit: COTRTLI-013
+    const seen = stubFetch([[200, LOADED]]);
+    renderScreen();
+    await answered(seen, 1);
+
+    // Map line 4 holds the title and both fields: they are cells of the one line of the frame's
+    // header, each at its map column, and the body gives the line no track.
+    const heading = screen.getByRole("heading", { level: 1, name: "Maintain Transaction Type" });
+    const line = heading.parentElement;
+    const label = screen.getByText("Page").parentElement;
+    const value = pageNo().parentElement;
+    expect(line?.closest('[data-slot="card-header"]')).not.toBeNull();
+    expect(label?.parentElement).toBe(line);
+    expect(value?.parentElement).toBe(line);
+    expect(label?.className).toBe("row-start-1 col-start-70 col-span-5");
+    expect(value?.className).toBe("row-start-1 col-start-76 col-span-3");
+    expect(form().contains(pageNo())).toBe(false);
+  });
+
 
   it("ENTER sends the filters, seven rows and loaded state, then shows the prompt", async () => {
     // audit: COTRTLI-013

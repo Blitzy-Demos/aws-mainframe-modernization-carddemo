@@ -66,8 +66,8 @@ const DESCRIPTION_ROW = 14;
 
 /**
  * TURQUOISE labels snap to the foreground token (AAP 0.4.3); `whitespace-pre` keeps the spaces of
- * the `INITIAL` text, which align the colons, and `h-full` centres the label on its line beside
- * the taller input.
+ * the `INITIAL` text, which align the colons. `FieldGrid` centres each cell on its line, so the
+ * label stands level with the taller input beside it.
  */
 const LABEL_CLASS = "h-full whitespace-pre text-foreground";
 

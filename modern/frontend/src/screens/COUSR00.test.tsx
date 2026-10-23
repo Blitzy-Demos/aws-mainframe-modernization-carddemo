@@ -593,11 +593,11 @@ describe("COUSR00 List Users", () => {
 
     // `Page:` POS=(4,65) labels PAGENUM, POS=(4,71) LENGTH=8: an ASKIP output the cursor skips.
     expect(screen.getByText("Page:").parentElement?.className).toBe(
-      "row-start-4 col-start-65 col-span-5",
+      "row-start-1 col-start-65 col-span-5",
     );
     expect(pageField().hasAttribute("readonly")).toBe(true);
     expect(pageField().getAttribute("tabindex")).toBe("-1");
-    expect(pageField().parentElement?.className).toBe("row-start-4 col-start-71 col-span-8");
+    expect(pageField().parentElement?.className).toBe("row-start-1 col-start-71 col-span-8");
     expect(valueOf(pageField())).toBe("00000001");
 
     // `Search User ID:` POS=(6,5) labels USRIDIN, POS=(6,21) LENGTH=8.
@@ -765,16 +765,41 @@ describe("COUSR00 List Users", () => {
       expect(labels.map((bound) => bound.textContent)).toEqual(label === null ? [] : [label]);
       expect(labels.every((bound) => bound.dataset.slot === "label")).toBe(true);
       expect(value.getAttribute("aria-label")).toBe(label === null ? `Title row ${row}` : null);
-      // The title rows hold no editable control: their six controls are the read-only values.
+      // The header holds no editable control: its controls are the six read-only values of the
+      // title rows and the read-only PAGENUM of the title line.
       const controls = Array.from(
         header.querySelectorAll("input, textarea, select, button, [contenteditable]"),
       );
-      expect(controls).toHaveLength(6);
+      expect(controls).toHaveLength(7);
+      expect(controls).toContain(pageField());
       expect(
         controls.every((control) => control instanceof HTMLInputElement && control.readOnly),
       ).toBe(true);
     },
   );
+
+  it("shows `Page:` and PAGENUM on the title's line of the card header, beside the level-1 heading", async () => {
+    // audit: COUSR00-011
+    // audit: COUSR00-012
+    // audit: COUSR00-013
+    const sent = stubFetch(json(200, FIRST_PAGE));
+    renderList();
+    await listed(sent, 1, "ADMIN001");
+
+    // Map line 4 holds the title and both fields: they are cells of the one line of the frame's
+    // header, each at its map column, and the body gives the line no track.
+    const heading = screen.getByRole("heading", { level: 1, name: "List Users" });
+    const line = heading.parentElement;
+    const label = screen.getByText("Page:").parentElement;
+    const value = pageField().parentElement;
+    expect(line?.closest('[data-slot="card-header"]')).not.toBeNull();
+    expect(label?.parentElement).toBe(line);
+    expect(value?.parentElement).toBe(line);
+    expect(label?.className).toBe("row-start-1 col-start-65 col-span-5");
+    expect(value?.className).toBe("row-start-1 col-start-71 col-span-8");
+    expect(document.querySelector("form")?.contains(pageField())).toBe(false);
+  });
+
 
   it.each([
     { title: "two users and the end-of-file message", page: PAGE, message: BOTTOM_REACHED },

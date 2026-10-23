@@ -41,17 +41,6 @@ import { COACTVW_LENGTHS, coactvwSchema, type CoactvwValues } from "@/schemas/CO
  * logs, stores or copies a response.
  */
 
-/** Map rows 1–4 (header rows, a blank row, the title), which `ScreenShell`'s header renders. */
-const HEADER_ROWS = 4;
-
-/*
- * BLITZY [LAYOUT]: the body grid holds map rows 5–20, the only rows with body fields, instead of
- * FieldGrid's default 24: its rows are equal flexible tracks, so the header and message rows the
- * shell already renders would otherwise stand as empty lines between the title and row 5 and below
- * row 20.
- */
-const BODY_GRID_ROWS = "grid-rows-16";
-
 /**
  * The information row: the 40-byte `WS-INFO-MSG` of 88 `WS-PROMPT-FOR-INPUT` in the 45-position
  * `INFOMSG`. COACTVWC moves nothing else there, so the screen shows it on every display and no
@@ -71,9 +60,10 @@ const ACCOUNT_FIELD = "acct_id";
 
 /*
  * Every map literal is TURQUOISE, which snaps to the foreground token (AAP 0.4.3); `whitespace-pre`
- * keeps the padding that aligns the colons, and `h-full` centres the text on its grid line.
+ * keeps the padding that aligns the colons, and `h-7` centres the text on the height of the
+ * fields beside it.
  */
-const LABEL_CLASS = "h-full whitespace-pre text-foreground";
+const LABEL_CLASS = "h-7 whitespace-pre text-foreground";
 
 /** ENTER, served by COACTVWC but unlabelled on the map, as a bare `ENTER` button (COACTVW-108). */
 const ENTER_KEY: PfKeyBarEntry = { key: "ENTER", label: "ENTER", dark: false };
@@ -391,25 +381,6 @@ const CUSTOMER_OUTPUTS: readonly OutputField[] = OUTPUT_FIELDS.filter(
   (output) => output.row > CUSTOMER_DETAILS_ROW,
 );
 
-/** A map field at its `POS` and `LENGTH`, on the body grid that starts at map row 5. */
-function MapCell({
-  row,
-  col,
-  span,
-  children,
-}: {
-  row: number;
-  col: number;
-  span: number;
-  children: ReactNode;
-}): ReactNode {
-  return (
-    <GridCell row={row - HEADER_ROWS} col={col} span={span}>
-      {children}
-    </GridCell>
-  );
-}
-
 /** The answer the screen shows: the last response of endpoint 4, as COACTVWC sent it. */
 type Shown = {
   /** The account block: after a view, or beside an error message; `null` otherwise. */
@@ -602,7 +573,7 @@ export function COACTVW(): ReactNode {
     >
       <Form {...form}>
         <form id={formId} onSubmit={submit} noValidate aria-busy={pending}>
-          <FieldGrid className={BODY_GRID_ROWS}>
+          <FieldGrid>
             <FormField
               control={form.control}
               name="acctId"
@@ -616,7 +587,7 @@ export function COACTVW(): ReactNode {
                 // inside the screen. The account number has no hint, so its control names no
                 // description.
                 <FormItem className="contents">
-                  <MapCell row={5} col={19} span={16}>
+                  <GridCell row={5} col={19} span={16}>
                     {/*
                      * COACTVWC recolours the field, never its literal (COACTVWC-028), so the
                      * label keeps its colour when the field is in error.
@@ -624,8 +595,8 @@ export function COACTVW(): ReactNode {
                     <FormLabel className={cn(LABEL_CLASS, "data-[error=true]:text-foreground")}>
                       Account Number :
                     </FormLabel>
-                  </MapCell>
-                  <MapCell row={5} col={38} span={COACTVW_LENGTHS.acctId}>
+                  </GridCell>
+                  <GridCell row={5} col={38} span={COACTVW_LENGTHS.acctId}>
                     <FieldControl messaged={accountMessage !== ""}>
                       <Input
                         {...field}
@@ -643,7 +614,7 @@ export function COACTVW(): ReactNode {
                         )}
                       />
                     </FieldControl>
-                  </MapCell>
+                  </GridCell>
                   <FormMessage className="sr-only">{accountMessage}</FormMessage>
                 </FormItem>
               )}
@@ -656,15 +627,15 @@ export function COACTVW(): ReactNode {
                 value={shownValue(output, shown)}
               />
             ))}
-            <MapCell row={CUSTOMER_DETAILS_ROW} col={32} span={16}>
+            <GridCell row={CUSTOMER_DETAILS_ROW} col={32} span={16}>
               <span
                 role="heading"
                 aria-level={2}
-                className="flex h-full items-center whitespace-pre text-foreground"
+                className="flex h-7 items-center whitespace-pre text-foreground"
               >
                 Customer Details
               </span>
-            </MapCell>
+            </GridCell>
             {CUSTOMER_OUTPUTS.map((output) => (
               <OutputCell
                 key={output.name}
@@ -701,13 +672,13 @@ function OutputCell({
   return (
     <>
       {output.label !== undefined && (
-        <MapCell row={output.label.row} col={output.label.col} span={output.label.length}>
+        <GridCell row={output.label.row} col={output.label.col} span={output.label.length}>
           <Label htmlFor={id} className={LABEL_CLASS}>
             {output.label.text}
           </Label>
-        </MapCell>
+        </GridCell>
       )}
-      <MapCell row={output.row} col={output.col} span={output.length}>
+      <GridCell row={output.row} col={output.col} span={output.length}>
         <Input
           id={id}
           data-field={output.name}
@@ -718,7 +689,7 @@ function OutputCell({
           aria-label={output.ariaLabel}
           className={fieldBox(output.length)}
         />
-      </MapCell>
+      </GridCell>
     </>
   );
 }

@@ -72,14 +72,15 @@ const COLUMNS = [
 ] as const;
 
 /*
- * BLITZY [LAYOUT]: every list line is a `LIST_ROW`, one map line pitch tall whatever it holds,
+ * BLITZY [LAYOUT]: every list line is a `LIST_ROW`, one compact map line tall whatever it holds,
  * and every cell a `LIST_CELL`, without the cell's `p-2` padding, so each value starts on its
- * map column and the twelve lines keep the terminal's 24-line rhythm. The selector, at column 3,
- * is moved one of its column's six map columns to the right (`left-1/6`).
+ * map column and the twelve lines fit their map lines: the whole screen fits a 1024 × 768
+ * viewport. The selector is the compact `h-7 py-0` box, and at column 3 it is moved one of its
+ * column's six map columns to the right (`left-1/6`).
  */
 /**
  * BLUE list values, shown byte for byte with their trailing spaces (COTRN00C-028 to
- * COTRN00C-032), one map line tall.
+ * COTRN00C-032), one compact list line tall.
  */
 const VALUE = `${LIST_CELL} whitespace-pre text-muted-foreground`;
 
@@ -435,6 +436,31 @@ export function COTRN00(): ReactNode {
       transaction={SCREENS.COTRN00.transaction}
       program={SCREENS.COTRN00.program}
       title="List Transactions"
+      titleRow={
+        // `Page:` and PAGENUM, on the title's line 4 of the map.
+        <>
+          <GridCell row={1} col={65} span={5}>
+            <Label htmlFor={pageId} className="h-9 whitespace-pre font-semibold text-foreground">
+              Page:
+            </Label>
+          </GridCell>
+          <GridCell row={1} col={71} span={PAGE_DIGITS}>
+            {/*
+             * ASKIP output: the cursor skips it, as on the terminal. Like every map input it
+             * takes the shared map-field box, `FIELD_INPUT` with `size` = its `LENGTH`, so all
+             * eight digits show on the narrowest frame and a page change stays visible.
+             */}
+            <Input
+              id={pageId}
+              readOnly
+              tabIndex={-1}
+              value={pageLabel}
+              size={PAGE_DIGITS}
+              className={`${FIELD_INPUT} text-muted-foreground`}
+            />
+          </GridCell>
+        </>
+      }
       formId={formId}
       message={{ kind: "error", text: message }}
       keys={keys}
@@ -452,31 +478,7 @@ export function COTRN00(): ReactNode {
     >
       <Form {...form}>
         <form id={formId} noValidate aria-busy={busy} onSubmit={onSubmit}>
-          {/*
-           * Auto-height lines: with the grid's equal lines, the ten-row table on line 8 would
-           * make every one of the 24 lines as tall as the table.
-           */}
-          <FieldGrid className="grid-rows-none">
-            <GridCell row={4} col={65} span={5}>
-              <Label htmlFor={pageId} className="h-9 whitespace-pre font-semibold text-foreground">
-                Page:
-              </Label>
-            </GridCell>
-            <GridCell row={4} col={71} span={PAGE_DIGITS}>
-              {/*
-               * ASKIP output: the cursor skips it, as on the terminal. Like every map input it
-               * takes the shared map-field box, `FIELD_INPUT` with `size` = its `LENGTH`, so all
-               * eight digits show on the narrowest frame and a page change stays visible.
-               */}
-              <Input
-                id={pageId}
-                readOnly
-                tabIndex={-1}
-                value={pageLabel}
-                size={PAGE_DIGITS}
-                className={`${FIELD_INPUT} text-muted-foreground`}
-              />
-            </GridCell>
+          <FieldGrid>
             <FormField
               control={form.control}
               name="startTranId"
@@ -511,12 +513,16 @@ export function COTRN00(): ReactNode {
                 </FormItem>
               )}
             />
-            <GridTable row={8} col={2} span={77}>
+            {/*
+             * Map lines 8 to 19: the captions, the rules and the ten rows, one block spanning its
+             * twelve lines.
+             */}
+            <GridTable row={8} col={2} span={77} rowSpan={12}>
               {/*
-               * BLITZY [A11Y]: the selectors keep the input's default `h-9` (36px) square, below
-               * the 44px touch-target guidance, and its focus ring (`ring-ring/50`) is about 1.5:1
-               * against the card, below 3:1. Both are the system's defaults; flagged for designer
-               * review.
+               * BLITZY [A11Y]: the selectors are 28px tall (`h-7`) so that the list fits the
+               * screen: above the 24px minimum target of WCAG 2.5.8, below the 44px touch-target
+               * guidance. Their focus ring (`ring-ring/50`), the system's default, is about 1.5:1
+               * against the card, below 3:1. Flagged for designer review.
                */}
               <Table aria-label="Transactions" className="table-fixed">
                 <colgroup>
@@ -562,7 +568,7 @@ export function COTRN00(): ReactNode {
                                     maxLength={COTRN00_LENGTHS.selection}
                                     size={COTRN00_LENGTHS.selection}
                                     autoComplete="off"
-                                    className={`${FIELD_INPUT} relative left-1/6 w-9 text-center`}
+                                    className={`${FIELD_INPUT} relative left-1/6 h-7 w-9 py-0 text-center`}
                                   />
                                 </FieldControl>
                                 <FormMessage className="sr-only" />

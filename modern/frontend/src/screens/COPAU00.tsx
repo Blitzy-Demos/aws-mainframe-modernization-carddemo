@@ -118,9 +118,15 @@ const COLUMNS = [
  * the 3-character counts would otherwise cut off its last characters; it reaches instead into the
  * empty attribute-byte columns that follow it on the map. Output inputs also use `px-1` instead of
  * the default `px-3`, which keeps that overhang inside those columns.
+ *
+ * BLITZY [LAYOUT]: every input is the compact `h-7 py-0` box of COACTUP instead of the `Input`
+ * default `h-9 py-1`. The map holds fields on 15 of its lines, the five list rows included, and at
+ * the default height those lines make the screen taller than a 768px viewport, so the message row
+ * and the keys would open below it. With the compact box and the compact list lines
+ * (`LIST_ROW`), the whole screen shows at 1024x768.
  */
 const LABEL = "h-full whitespace-pre text-foreground";
-const FIELD = "w-auto min-w-full";
+const FIELD = "h-7 w-auto min-w-full py-0";
 const OUTPUT = `${FIELD} px-1 text-muted-foreground`;
 const CELL = `${LIST_CELL} whitespace-pre text-muted-foreground`;
 const HEADING = `${LIST_CELL} whitespace-pre`;
@@ -767,10 +773,10 @@ export function COPAU00(): ReactNode {
 
             {/*
              * BLITZY [LAYOUT]: the list occupies map lines 14 to 20 (captions, dashes, five rows)
-             * from column 2 to column 78. A Table on one line of FieldGrid's equal-height rows
-             * would stretch every line to the Table's height, so its block spans the seven lines
-             * it holds on the map, one `LIST_ROW` per line, and its fixed columns start at the
-             * line-16 fields' `POS`.
+             * from column 2 to column 78. `GridCell` places a field on one line, so the Table's
+             * block spans the seven lines it holds on the map, one `LIST_ROW` per line: those
+             * lines share its height, and their row gaps fall inside it rather than below it. Its
+             * fixed columns start at the line-16 fields' `POS`.
              */}
             <GridTable row={14} col={2} span={77} rowSpan={7}>
               <Table aria-label="Authorizations" className="table-fixed">
@@ -809,8 +815,10 @@ export function COPAU00(): ReactNode {
                     const row = rows.at(index);
                     const isProtected = pageRead && row === undefined;
                     return (
-                      // BLITZY [LAYOUT]: cells drop the default padding (`LIST_CELL`) so a list
-                      // row keeps the height of one map line and each value starts on its column.
+                      // BLITZY [LAYOUT]: cells drop the default padding (`LIST_CELL`) and the
+                      // selector is the compact `h-7 py-0` input, so a list row keeps the height of
+                      // one map line, as tall as an input line of the block above it, and each
+                      // value starts on its column.
                       <TableRow key={index} className={LIST_ROW}>
                         <TableCell className={LIST_CELL}>
                           <FormField
@@ -826,7 +834,7 @@ export function COPAU00(): ReactNode {
                                     autoComplete="off"
                                     readOnly={isProtected || pending}
                                     tabIndex={isProtected ? -1 : undefined}
-                                    className="relative left-1/6 w-9"
+                                    className="relative left-1/6 h-7 w-9 py-0"
                                   />
                                 </FieldControl>
                                 <FormMessage className="sr-only" />

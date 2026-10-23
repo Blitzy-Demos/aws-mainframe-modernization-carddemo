@@ -1,4 +1,13 @@
-import { createContext, useContext, useId, useLayoutEffect, useMemo, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type ReactNode,
+} from "react";
 import { cn } from "cn";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -49,10 +58,10 @@ export type ScreenShellProps = {
   title: string;
   /**
    * The map's other fields on the screen title's line, such as the `Page ` literal and `PAGENO`
-   * that COCRDLI and COTRTLI place beside the title on line 4: each a `GridCell` with `row={1}`
-   * at its map column and `LENGTH`. They stand on the title's line, on the 80 columns of the
-   * header and the body, outside the heading, whose name stays `title`. Without it the title
-   * stands alone on its line.
+   * that COCRDLI and COTRTLI place beside the title on line 4, or the `Page:` literal and
+   * `PAGENUM` of COTRN00 and COUSR00: each a `GridCell` with `row={1}` at its map column and
+   * `LENGTH`. They stand on the title's line, on the 80 columns of the header and the body,
+   * outside the heading, whose name stays `title`. Without it the title stands alone on its line.
    */
   titleRow?: ReactNode;
   /** `id` of the screen's `<form>`, which ENTER submits; forwarded to `PfKeyBar`. */
@@ -241,6 +250,16 @@ export const TransferPendingContext = createContext(false);
  * - `CardContent`: the screen body;
  * - `CardFooter`: the `INFOMSG` row when the map has one, the `ERRMSG` row and the row-24 keys.
  *
+ * The title line is the title alone, or, on a map with `titleRow`, the title and those fields on
+ * one line of the 80-column grid: the title spans the line and is centred, and each field stands
+ * at its `POS` column over it. The frame draws the header rows, the title line and the footer
+ * rows, so the body's `FieldGrid` gives those map lines no height.
+ *
+ * Scrolling follows the terminal, where the whole screen is always in view. Whenever the `ERRMSG`
+ * row receives a non-blank text, on mount, by a change or by a new send of the same text, the page
+ * scrolls down just far enough to show the footer whole, so the message and the keys are in view;
+ * a footer already in view leaves the page where it is, and the `INFOMSG` row never moves it.
+ *
  * The header grid has the body grid's columns and gaps inside the same padding, so the header
  * fields stand over the body columns of the same number. Each header value is an output field of
  * the map, so it is a read-only `Input` keeping the field's box and width; each header literal is
@@ -296,6 +315,9 @@ export function ScreenShell({
     () => (transferPending ? keys.map((entry) => ({ ...entry, disabled: true })) : keys),
     [keys, transferPending],
   );
+  const footerRef = useRef<HTMLDivElement>(null);
+  const messageText = message?.text?.trim() ?? "";
+  const messageSend = message?.send;
   const at = now ?? new Date();
 
   // Arrival only, hence no dependencies. A layout effect runs after the commit's `autoFocus`
@@ -324,6 +346,21 @@ export function ScreenShell({
       document.title = replaced;
     };
   }, [title, transaction]);
+
+  // Keyed on the trimmed text and the send stamp, not on `message`, which screens build anew at
+  // every render, so the page moves only when a message is sent. A passive effect, so it runs
+  // after the arrival reset above and measures the laid-out footer.
+  useEffect(() => {
+    const footer = footerRef.current;
+    if (messageText === "" || footer === null) {
+      return;
+    }
+    const overflow = footer.getBoundingClientRect().bottom - window.innerHeight;
+    if (overflow > 0) {
+      const page = document.scrollingElement ?? document.documentElement;
+      page.scrollTop += overflow;
+    }
+  }, [messageText, messageSend]);
 
   const values: Readonly<Record<HeaderField, string>> = {
     TRNNAME: transaction,
@@ -418,7 +455,7 @@ export function ScreenShell({
           <CardContent id={bodyId} tabIndex={-1}>
             {children}
           </CardContent>
-          <CardFooter className="flex-col items-stretch gap-2">
+          <CardFooter ref={footerRef} className="flex-col items-stretch gap-2">
             {info !== undefined && <MessageLine kind="info" bright={infoBright} text={info} />}
             {/*
              * Every map declares `ERRMSG` `ATTRB=(ASKIP,BRT,FSET)` and no program changes its

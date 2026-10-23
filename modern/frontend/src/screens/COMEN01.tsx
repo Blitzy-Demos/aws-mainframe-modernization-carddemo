@@ -385,10 +385,16 @@ export function COMEN01(): ReactNode {
                           : "hover:bg-transparent"
                       }
                     >
-                      {/* BLUE output field; `whitespace-pre` shows the 40 bytes as sent. */}
+                      {/*
+                       * BLUE output field; `whitespace-pre` shows the 40 bytes as sent.
+                       * BLITZY [LAYOUT]: `py-0.5` instead of the cell's `p-2` vertical padding,
+                       * as on the other list screens, so each option line is as tall as its text
+                       * and the message row and the keys stay in view on a 768px-high window. A
+                       * blank line keeps its 40 spaces, so it is as tall as an option line.
+                       */}
                       <TableCell
                         data-field={optionField(index)}
-                        className="whitespace-pre text-muted-foreground"
+                        className="whitespace-pre py-0.5 text-muted-foreground"
                       >
                         {text}
                       </TableCell>

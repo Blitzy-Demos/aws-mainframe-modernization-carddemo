@@ -575,6 +575,23 @@ describe("COMEN01 first entry", () => {
     expect(load.headers.get("Authorization")).toBe(`Bearer ${TOKEN}`);
   });
 
+  it("places the option table on the map's lines 6 to 17, from column 20, 40 columns wide", async () => {
+    // audit: COMEN01-012
+    // audit: COMEN01-023
+    // `OPTN001` is at `POS=(6,20)` and `OPTN012` at `POS=(17,20)`, each `LENGTH=40`: the table's
+    // grid cell starts on line 6 and spans the 12 lines, directly on the screen's `FieldGrid`.
+    serve(MENU);
+    renderMenu();
+    await loaded();
+
+    const cell = screen.getByRole("table", { name: "Menu options" }).closest(".row-start-6");
+    expect(cell).not.toBeNull();
+    expect(cell?.className.split(" ").sort()).toEqual(
+      ["col-span-40", "col-start-20", "row-span-12", "row-start-6"].sort(),
+    );
+    expect(cell?.parentElement?.parentElement?.tagName).toBe("FORM");
+  });
+
   it.each([
     // audit: COMEN01-002
     {

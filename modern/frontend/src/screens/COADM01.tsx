@@ -301,8 +301,8 @@ export function COADM01(): ReactNode {
           <FieldGrid>
             {/*
              * The option table holds the twelve OPTNnnn fields of lines 6 to 17, so it spans those
-             * lines; a single-line GridCell would make every line of the 24-line grid as tall as
-             * the table. Departs from GridCell placement for this one element only.
+             * lines, which share its height. Departs from GridCell placement for this one element
+             * only.
              */}
             <div className="col-span-40 col-start-20 row-span-12 row-start-6">
               <Table aria-label="Admin Menu options">
@@ -323,9 +323,16 @@ export function COADM01(): ReactNode {
                           text === undefined ? "border-transparent hover:bg-transparent" : undefined
                         }
                       >
+                        {/*
+                         * BLITZY [LAYOUT]: `py-0.5` instead of the cell's `p-2` vertical padding,
+                         * as on the other list screens, so each option line is as tall as its
+                         * text and the message row and the keys stay in view on a 768px-high
+                         * window. A blank line keeps its INITIAL space, so it is as tall as an
+                         * option line.
+                         */}
                         <TableCell
                           data-field={field}
-                          className="whitespace-pre text-muted-foreground"
+                          className="whitespace-pre py-0.5 text-muted-foreground"
                         >
                           {text ?? OPTION_INITIAL}
                         </TableCell>

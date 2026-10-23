@@ -491,8 +491,7 @@ function cellsOf(grid: Element): string[] {
 
 /**
  * Every grid cell placed under the body grid `body`, in document order, which is the reading
- * order: its map row (the body grid's line plus the four header rows) and its content as
- * `cellsOf` describes it.
+ * order: its map row, which is the body grid's line, and its content as `cellsOf` describes it.
  */
 function bodyCellsInOrder(body: Element): { row: number; content: string }[] {
   return Array.from(body.querySelectorAll('[class^="row-start-"]'), (cell) => {
@@ -505,21 +504,16 @@ function bodyCellsInOrder(body: Element): { row: number; content: string }[] {
       named instanceof HTMLElement
         ? `field ${named.dataset.field ?? ""}`
         : `text ${cell.textContent ?? ""}`;
-    return { row: Number.parseInt(line, 10) + 4, content };
+    return { row: Number.parseInt(line, 10), content };
   });
 }
 
-/** A grid cell at a map `POS` and `LENGTH`, as `cellsOf` describes it. */
-function cell(gridRow: number, col: number, length: number, content: string): string {
-  return `row-start-${gridRow} col-start-${col} col-span-${length} ${content}`;
-}
-
 /**
- * A body cell at map row `row`: the body grid's line 1 is map row 5, because `ScreenShell`'s
- * header renders map rows 1 to 4.
+ * A grid cell at a map `POS` and `LENGTH`, as `cellsOf` describes it. Header and body cells alike
+ * stand on the grid line of their map row.
  */
-function bodyCell(row: number, col: number, length: number, content: string): string {
-  return cell(row - 4, col, length, content);
+function cell(row: number, col: number, length: number, content: string): string {
+  return `row-start-${row} col-start-${col} col-span-${length} ${content}`;
 }
 
 /** Types `value` into the account number, replacing its text. */
@@ -824,21 +818,21 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
     }
     expect(cellsOf(body)).toEqual(
       [
-        bodyCell(5, 19, 16, "text Account Number :"),
-        bodyCell(5, 38, 11, "field ACCTSID"),
-        bodyCell(11, 32, 16, "text Customer Details"),
+        cell(5, 19, 16, "text Account Number :"),
+        cell(5, 38, 11, "field ACCTSID"),
+        cell(11, 32, 16, "text Customer Details"),
         ...OUTPUTS.flatMap((output) => [
           ...(output.label === null
             ? []
             : [
-                bodyCell(
+                cell(
                   output.label.row,
                   output.label.col,
                   output.label.length,
                   `text ${output.label.text}`,
                 ),
               ]),
-          bodyCell(output.row, output.col, output.length, `field ${output.name}`),
+          cell(output.row, output.col, output.length, `field ${output.name}`),
         ]),
       ].sort(),
     );

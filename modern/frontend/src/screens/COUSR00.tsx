@@ -67,6 +67,20 @@ const COLUMNS = [
   { caption: "Type", rule: "----", align: "text-center" },
 ] as const;
 
+/*
+ * BLITZY [LAYOUT]: each list line is one compact line, as tall as a compact input: the caption
+ * and rule heads take `h-7` instead of the `TableHead` default `h-10`, the selectors the
+ * `Input`'s `h-7` and `py-0` instead of its `h-9` and `py-1`, and the cells drop the `p-2`
+ * vertical padding (`py-0`). The twelve lines then fit their map lines and the whole screen fits
+ * a 1024 × 768 viewport.
+ */
+const HEAD = "h-7 whitespace-pre";
+const LINE = "py-0";
+const SELECTOR = "h-7 w-10 py-0 text-center";
+
+/** A list value: a BLUE output shown with its spaces, one compact list line tall. */
+const VALUE = `${LINE} whitespace-pre text-muted-foreground`;
+
 /** The row-24 labels of the map (COUSR00-089, COUSR00-096 to COUSR00-099). */
 const KEY_ITEMS = keyRowItems(KEY_ROWS.COUSR00);
 
@@ -377,6 +391,33 @@ export function COUSR00(): ReactNode {
       transaction={SCREENS.COUSR00.transaction}
       program={SCREENS.COUSR00.program}
       title="List Users"
+      titleRow={
+        // COUSR00-012, COUSR00-013: `Page:` (TURQUOISE, BRT) and PAGENUM (BLUE output), on the
+        // title's line 4 of the map.
+        <>
+          <GridCell row={1} col={65} span={5}>
+            <Label htmlFor={pageId} className="h-full whitespace-pre font-semibold text-foreground">
+              Page:
+            </Label>
+          </GridCell>
+          <GridCell row={1} col={71} span={PAGE_DIGITS}>
+            {/*
+             * ASKIP: the cursor skips the field, so it is not in the tab order. Both
+             * eight-character fields (PAGENUM, USRIDIN) take the shared map-field box,
+             * `FIELD_INPUT` with `size` = their `LENGTH`, so all eight characters show on the
+             * narrowest frame.
+             */}
+            <Input
+              id={pageId}
+              readOnly
+              tabIndex={-1}
+              value={pagenum}
+              size={PAGE_DIGITS}
+              className={`${FIELD_INPUT} text-muted-foreground`}
+            />
+          </GridCell>
+        </>
+      }
       formId={formId}
       message={{ text: message.slice(0, ERRMSG_LENGTH), kind: "error" }}
       keys={keys}
@@ -385,38 +426,7 @@ export function COUSR00(): ReactNode {
     >
       <Form {...form}>
         <form id={formId} noValidate aria-busy={pending} onSubmit={onSubmit}>
-          {/*
-           * BLITZY [LAYOUT]: the map's line tracks are sized to content (`grid-rows-none`, which
-           * overrides FieldGrid's 24 equal tracks). The list block is one `Table` on line 8 that
-           * stands for lines 8 to 19; with equal tracks every line would take the table's height.
-           */}
-          <FieldGrid className="grid-rows-none">
-            {/* COUSR00-012, COUSR00-013: `Page:` (TURQUOISE, BRT) and PAGENUM (BLUE output). */}
-            <GridCell row={4} col={65} span={5}>
-              <Label
-                htmlFor={pageId}
-                className="h-full whitespace-pre font-semibold text-foreground"
-              >
-                Page:
-              </Label>
-            </GridCell>
-            <GridCell row={4} col={71} span={PAGE_DIGITS}>
-              {/*
-               * ASKIP: the cursor skips the field, so it is not in the tab order. Both
-               * eight-character fields (PAGENUM, USRIDIN) take the shared map-field box,
-               * `FIELD_INPUT` with `size` = their `LENGTH`, so all eight characters show on the
-               * narrowest frame.
-               */}
-              <Input
-                id={pageId}
-                readOnly
-                tabIndex={-1}
-                value={pagenum}
-                size={PAGE_DIGITS}
-                className={`${FIELD_INPUT} text-muted-foreground`}
-              />
-            </GridCell>
-
+          <FieldGrid>
             {/* COUSR00-014, COUSR00-015: `Search User ID:` (TURQUOISE) and USRIDIN. */}
             <FormField
               control={form.control}
@@ -451,8 +461,11 @@ export function COUSR00(): ReactNode {
               )}
             />
 
-            {/* COUSR00-017 to COUSR00-086: the captions, rules and ten rows, lines 8 to 19. */}
-            <GridCell row={8} col={5} span={71}>
+            {/*
+             * COUSR00-017 to COUSR00-086: the captions, rules and ten rows, one block spanning
+             * map lines 8 to 19.
+             */}
+            <GridCell row={8} col={5} span={71} rowSpan={12}>
               <Table aria-label="Users">
                 <TableHeader>
                   <TableRow>
@@ -460,7 +473,7 @@ export function COUSR00(): ReactNode {
                       <TableHead
                         key={column.caption}
                         scope="col"
-                        className={`whitespace-pre ${column.align}`}
+                        className={`${HEAD} ${column.align}`}
                       >
                         {column.caption}
                       </TableHead>
@@ -469,7 +482,7 @@ export function COUSR00(): ReactNode {
                   {/* The dashed rule of line 9 is decoration, so screen readers skip it. */}
                   <TableRow aria-hidden="true">
                     {COLUMNS.map((column) => (
-                      <TableHead key={column.caption} className={`whitespace-pre ${column.align}`}>
+                      <TableHead key={column.caption} className={`${HEAD} ${column.align}`}>
                         {column.rule}
                       </TableHead>
                     ))}
@@ -479,7 +492,7 @@ export function COUSR00(): ReactNode {
                   {rows.map((row, index) => (
                     // Rows are positions on the map, not records: line 10 + index.
                     <TableRow key={index}>
-                      <TableCell className="text-center">
+                      <TableCell className={`${LINE} text-center`}>
                         <FormField
                           control={form.control}
                           name={`selections.${index}`}
@@ -495,7 +508,7 @@ export function COUSR00(): ReactNode {
                                   size={COUSR00_LENGTHS.selection}
                                   autoComplete="off"
                                   readOnly={pending}
-                                  className={`${FIELD_INPUT} w-10 text-center`}
+                                  className={`${FIELD_INPUT} ${SELECTOR}`}
                                 />
                               </FieldControl>
                               <FormMessage className="sr-only" />
@@ -504,16 +517,10 @@ export function COUSR00(): ReactNode {
                         />
                       </TableCell>
                       {/* USRIDnn, FNAMEnn, LNAMEnn, UTYPEnn: BLUE outputs, never a password. */}
-                      <TableCell className="whitespace-pre text-muted-foreground">
-                        {row?.user_id ?? ""}
-                      </TableCell>
-                      <TableCell className="whitespace-pre text-muted-foreground">
-                        {row?.first_name ?? ""}
-                      </TableCell>
-                      <TableCell className="whitespace-pre text-muted-foreground">
-                        {row?.last_name ?? ""}
-                      </TableCell>
-                      <TableCell className="whitespace-pre text-center text-muted-foreground">
+                      <TableCell className={VALUE}>{row?.user_id ?? ""}</TableCell>
+                      <TableCell className={VALUE}>{row?.first_name ?? ""}</TableCell>
+                      <TableCell className={VALUE}>{row?.last_name ?? ""}</TableCell>
+                      <TableCell className={`${VALUE} text-center`}>
                         {row?.user_type ?? ""}
                       </TableCell>
                     </TableRow>

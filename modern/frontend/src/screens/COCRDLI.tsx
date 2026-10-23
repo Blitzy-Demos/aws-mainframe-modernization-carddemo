@@ -78,8 +78,11 @@ const FILTER_LABEL = `${LABEL} data-[error=true]:text-foreground`;
 /** A field in error shows its text red as well as its border (`DFHRED`, COCRDLIC-011, -035). */
 const MARKED = "aria-invalid:text-destructive";
 
-/** A one-character field: the cell is narrow, so the input keeps little padding. */
-const ONE_CHARACTER = `w-9 px-1 text-center ${MARKED}`;
+/**
+ * A one-character field: the cell is narrow, so the input keeps little padding; as tall as a map
+ * field's box (`h-7`, `py-0`), so it fits its `LIST_ROW` line.
+ */
+const ONE_CHARACTER = `h-7 w-9 px-1 py-0 text-center ${MARKED}`;
 
 /**
  * The list's columns as fractions of its 63 map columns. Each column starts at its data field's
@@ -519,8 +522,7 @@ export function COCRDLI(): ReactNode {
             press("ENTER");
           }}
         >
-          {/* Centred in their lines, so a label sits level with the input beside it. */}
-          <FieldGrid className="items-center">
+          <FieldGrid>
             {/*
              * COCRDLI-014, COCRDLI-015: the account filter, the initial cursor (`IC`). The error
              * line is the map's one visible message, so a filter's own message, the schema's or
