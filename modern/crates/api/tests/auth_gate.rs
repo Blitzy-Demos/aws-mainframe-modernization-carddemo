@@ -197,13 +197,15 @@ fn assert_no_password(response: &Value, submitted: &str, case: &str) {
 
 /// R8: the two DUSRSECJ users sign on to their menus, the audited failures answer with their
 /// messages, and an unreadable user store answers with the `WHEN OTHER` message.
-#[tokio::test]
-async fn signon_parity_r8() -> TestResult {
-    let pg = start_loaded_postgres().await?;
-    let api = api(&pg)?;
-    signed_on_users(&api).await?;
-    signon_failures(&api).await?;
-    unreadable_user_store(&api, &pg).await
+#[test]
+fn signon_parity_r8() -> TestResult {
+    block_on(async {
+        let pg = start_loaded_postgres().await?;
+        let api = api(&pg)?;
+        signed_on_users(&api).await?;
+        signon_failures(&api).await?;
+        unreadable_user_store(&api, &pg).await
+    })
 }
 
 /// `ADMIN001` and `USER0001` sign on, also when both fields are typed in lower case, and the
@@ -693,35 +695,39 @@ const fn served(status: u16) -> bool {
 
 /// n5, the admin gate: a `U` token is refused on every `[A]` operation with 403 and served on
 /// every other one; an `A` token is served on all 26.
-#[tokio::test]
-async fn admin_gate_n5() -> TestResult {
-    let pg = start_loaded_postgres().await?;
-    let api = api(&pg)?;
-    let admin = bearer(&signon_token(&api, "ADMIN001").await?);
-    let user = bearer(&signon_token(&api, "USER0001").await?);
-    let operations = bearer_operations(&api, &admin).await?;
-    for operation in &operations {
-        let (status, response) = operation.send(&api, Some(&user)).await?;
-        match operation.gate {
-            Gate::Admin => {
-                assert_eq!(status, 403, "{operation} with a U token");
-                assert_eq!(
-                    member(&response, "message"),
-                    Some(ADMIN_REQUIRED),
-                    "{operation}"
-                );
-                assert_eq!(
-                    response.get("field"),
-                    None,
-                    "{operation}: the gate names no field"
-                );
+#[test]
+fn admin_gate_n5() -> TestResult {
+    block_on(async {
+        let pg = start_loaded_postgres().await?;
+        let api = api(&pg)?;
+        let admin = bearer(&signon_token(&api, "ADMIN001").await?);
+        let user = bearer(&signon_token(&api, "USER0001").await?);
+        let operations = bearer_operations(&api, &admin).await?;
+        for operation in &operations {
+            let (status, response) = operation.send(&api, Some(&user)).await?;
+            match operation.gate {
+                Gate::Admin => {
+                    assert_eq!(status, 403, "{operation} with a U token");
+                    assert_eq!(
+                        member(&response, "message"),
+                        Some(ADMIN_REQUIRED),
+                        "{operation}"
+                    );
+                    assert_eq!(
+                        response.get("field"),
+                        None,
+                        "{operation}: the gate names no field"
+                    );
+                }
+                Gate::SignedOn => {
+                    assert!(served(status), "{operation} refused a U token: {status}");
+                }
             }
-            Gate::SignedOn => assert!(served(status), "{operation} refused a U token: {status}"),
+            let (status, _) = operation.send(&api, Some(&admin)).await?;
+            assert!(served(status), "{operation} refused an A token: {status}");
         }
-        let (status, _) = operation.send(&api, Some(&admin)).await?;
-        assert!(served(status), "{operation} refused an A token: {status}");
-    }
-    spoofed_identity_is_ignored(&api, &user).await
+        spoofed_identity_is_ignored(&api, &user).await
+    })
 }
 
 /// A `U` token with an `X-User-Type: A` header and `usr_type=A` in the query string is still
@@ -801,35 +807,37 @@ fn refused_authorizations(
 
 /// n5, the token gate: every bearer operation refuses every [`refused_authorizations`] value
 /// with 401 and the sign-on text, while endpoint 1 needs no token and reads none it is sent.
-#[tokio::test]
-async fn missing_or_bad_token_is_401() -> TestResult {
-    let pg = start_loaded_postgres().await?;
-    let api = api(&pg)?;
-    // Endpoint 1 signs on without an `Authorization` header.
-    // audit: COSGN00C-006
-    let admin = signon_token(&api, "ADMIN001").await?;
-    let user = signon_token(&api, "USER0001").await?;
-    signon_ignores_a_bearer_header(&api).await?;
+#[test]
+fn missing_or_bad_token_is_401() -> TestResult {
+    block_on(async {
+        let pg = start_loaded_postgres().await?;
+        let api = api(&pg)?;
+        // Endpoint 1 signs on without an `Authorization` header.
+        // audit: COSGN00C-006
+        let admin = signon_token(&api, "ADMIN001").await?;
+        let user = signon_token(&api, "USER0001").await?;
+        signon_ignores_a_bearer_header(&api).await?;
 
-    let operations = bearer_operations(&api, &bearer(&admin)).await?;
-    let refused = refused_authorizations(&admin, &user)?;
-    for operation in &operations {
-        for (label, authorization) in &refused {
-            let (status, response) = operation.send(&api, authorization.as_deref()).await?;
-            assert_eq!(status, 401, "{operation} with {label}");
-            assert_eq!(
-                member(&response, "message"),
-                Some(SIGNON_REQUIRED),
-                "{operation} with {label}"
-            );
-            assert_eq!(
-                response.get("field"),
-                None,
-                "{operation} with {label}: no field"
-            );
+        let operations = bearer_operations(&api, &bearer(&admin)).await?;
+        let refused = refused_authorizations(&admin, &user)?;
+        for operation in &operations {
+            for (label, authorization) in &refused {
+                let (status, response) = operation.send(&api, authorization.as_deref()).await?;
+                assert_eq!(status, 401, "{operation} with {label}");
+                assert_eq!(
+                    member(&response, "message"),
+                    Some(SIGNON_REQUIRED),
+                    "{operation} with {label}"
+                );
+                assert_eq!(
+                    response.get("field"),
+                    None,
+                    "{operation} with {label}: no field"
+                );
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Sign-on decides from its own fields alone: an invalid bearer header does not stop it.

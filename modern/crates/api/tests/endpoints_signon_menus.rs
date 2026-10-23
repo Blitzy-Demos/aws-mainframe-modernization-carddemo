@@ -594,46 +594,59 @@ async fn stored_as_typed(app: &Router, state: &AppState) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn cosgn00c_signon_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let (app, state) = app_over(&guard, &config(SECRET))?;
-    successful_signons(&app, &state).await?;
-    no_state_between_signons(&app).await?;
-    blank_and_length_edits(&app).await?;
-    non_object_bodies(&app).await?;
-    failed_signons(&app).await?;
-    stored_as_typed(&app, &state).await
+/// Runs `test` to completion on a current-thread runtime, the one `#[tokio::test]` builds,
+/// without the lint attributes that macro's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
+#[test]
+fn cosgn00c_signon_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let (app, state) = app_over(&guard, &config(SECRET))?;
+        successful_signons(&app, &state).await?;
+        no_state_between_signons(&app).await?;
+        blank_and_length_edits(&app).await?;
+        non_object_bodies(&app).await?;
+        failed_signons(&app).await?;
+        stored_as_typed(&app, &state).await
+    })
 }
 
 /// COSGN00C-020 over a dedicated database whose pool is closed, so that every read fails; the
 /// blank-field edits still answer first, because they read nothing (COSGN00C-010).
-#[tokio::test]
-async fn cosgn00c_store_failure_rows() -> TestResult {
-    let guard = start_postgres().await?;
-    let (app, _state) = app_over(&guard, &config(SECRET))?;
-    guard.pool().close().await;
-    // audit: COSGN00C-010
-    assert_eq!(
-        sign_on(&app, "", DUSRSECJ_PASSWORD).await?,
-        (400, screen_error(ENTER_USER_ID, Some("user_id")))
-    );
-    // audit: COSGN00C-010
-    assert_eq!(
-        sign_on(&app, "ADMIN001", "").await?,
-        (400, screen_error(ENTER_PASSWORD, Some("password")))
-    );
-    for user_id in ["ADMIN001", "NOSUCHUS"] {
-        let (status, body) = sign_on(&app, user_id, DUSRSECJ_PASSWORD).await?;
-        // audit: COSGN00C-020
+#[test]
+fn cosgn00c_store_failure_rows() -> TestResult {
+    block_on(async {
+        let guard = start_postgres().await?;
+        let (app, _state) = app_over(&guard, &config(SECRET))?;
+        guard.pool().close().await;
+        // audit: COSGN00C-010
         assert_eq!(
-            (status, &body),
-            (500, &screen_error(UNABLE_TO_VERIFY, Some("user_id"))),
-            "{user_id}"
+            sign_on(&app, "", DUSRSECJ_PASSWORD).await?,
+            (400, screen_error(ENTER_USER_ID, Some("user_id")))
         );
-        assert_redacted(&body, DUSRSECJ_PASSWORD, user_id);
-    }
-    Ok(())
+        // audit: COSGN00C-010
+        assert_eq!(
+            sign_on(&app, "ADMIN001", "").await?,
+            (400, screen_error(ENTER_PASSWORD, Some("password")))
+        );
+        for user_id in ["ADMIN001", "NOSUCHUS"] {
+            let (status, body) = sign_on(&app, user_id, DUSRSECJ_PASSWORD).await?;
+            // audit: COSGN00C-020
+            assert_eq!(
+                (status, &body),
+                (500, &screen_error(UNABLE_TO_VERIFY, Some("user_id"))),
+                "{user_id}"
+            );
+            assert_redacted(&body, DUSRSECJ_PASSWORD, user_id);
+        }
+        Ok(())
+    })
 }
 
 /// Endpoint 2's body for a caller whose `usr_type` claim is `user_type` (COMEN01C-004,
@@ -754,41 +767,43 @@ async fn main_menu_refuses_invalid_tokens(
     Ok(())
 }
 
-#[tokio::test]
-async fn comen01c_main_menu_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let (app, _state) = app_over(&guard, &config(SECRET))?;
-    let user_token = token(&app, "USER0001", DUSRSECJ_PASSWORD).await?;
-    let admin_token = token(&app, "ADMIN001", DUSRSECJ_PASSWORD).await?;
+#[test]
+fn comen01c_main_menu_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let (app, _state) = app_over(&guard, &config(SECRET))?;
+        let user_token = token(&app, "USER0001", DUSRSECJ_PASSWORD).await?;
+        let admin_token = token(&app, "ADMIN001", DUSRSECJ_PASSWORD).await?;
 
-    let (status, user_menu) = get(&app, MAIN_MENU, Some(&user_token)).await?;
-    // audit: COMEN01C-004
-    assert_eq!(status, 200);
-    assert_main_menu(&user_menu, "U")?;
-    let (status, admin_menu) = get(&app, MAIN_MENU, Some(&admin_token)).await?;
-    // audit: COMEN01C-004
-    assert_eq!(status, 200);
-    assert_main_menu(&admin_menu, "A")?;
-    // audit: COMEN01C-004
-    assert_eq!(
-        without_user_type(admin_menu),
-        without_user_type(user_menu.clone())
-    );
-    // A single resource, not a collection: no `page_size` is declared or read.
-    let paged = format!("{MAIN_MENU}?page_size=101");
-    // audit: COMEN01C-004
-    assert_eq!(
-        get(&app, &paged, Some(&user_token)).await?,
-        (200, user_menu)
-    );
-    let (status, document) = get(&app, DOCUMENT_ROUTE, None).await?;
-    assert_eq!(status, 200);
-    // audit: COMEN01C-004
-    assert!(!declares_page_size(
-        &document,
-        "/paths/~1api~1v1~1menus~1main/get"
-    )?);
-    main_menu_refuses_invalid_tokens(&app, &guard, &user_token, &admin_token).await
+        let (status, user_menu) = get(&app, MAIN_MENU, Some(&user_token)).await?;
+        // audit: COMEN01C-004
+        assert_eq!(status, 200);
+        assert_main_menu(&user_menu, "U")?;
+        let (status, admin_menu) = get(&app, MAIN_MENU, Some(&admin_token)).await?;
+        // audit: COMEN01C-004
+        assert_eq!(status, 200);
+        assert_main_menu(&admin_menu, "A")?;
+        // audit: COMEN01C-004
+        assert_eq!(
+            without_user_type(admin_menu),
+            without_user_type(user_menu.clone())
+        );
+        // A single resource, not a collection: no `page_size` is declared or read.
+        let paged = format!("{MAIN_MENU}?page_size=101");
+        // audit: COMEN01C-004
+        assert_eq!(
+            get(&app, &paged, Some(&user_token)).await?,
+            (200, user_menu)
+        );
+        let (status, document) = get(&app, DOCUMENT_ROUTE, None).await?;
+        assert_eq!(status, 200);
+        // audit: COMEN01C-004
+        assert!(!declares_page_size(
+            &document,
+            "/paths/~1api~1v1~1menus~1main/get"
+        )?);
+        main_menu_refuses_invalid_tokens(&app, &guard, &user_token, &admin_token).await
+    })
 }
 
 /// Admin option `index` of endpoint 3's body against row `index` of [`ADMIN_OPTIONS`].
@@ -899,34 +914,36 @@ async fn admin_menu_gate(app: &Router, admin_token: &str) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn coadm01c_admin_menu_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let (app, _state) = app_over(&guard, &config(SECRET))?;
-    let first_admin = token(&app, "ADMIN001", DUSRSECJ_PASSWORD).await?;
-    let second_admin = token(&app, "ADMIN002", DUSRSECJ_PASSWORD).await?;
+#[test]
+fn coadm01c_admin_menu_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let (app, _state) = app_over(&guard, &config(SECRET))?;
+        let first_admin = token(&app, "ADMIN001", DUSRSECJ_PASSWORD).await?;
+        let second_admin = token(&app, "ADMIN002", DUSRSECJ_PASSWORD).await?;
 
-    let (status, menu) = get(&app, ADMIN_MENU, Some(&first_admin)).await?;
-    // audit: COADM01C-001
-    assert_eq!(status, 200);
-    assert_admin_menu(&menu)?;
-    // audit: COADM01C-005
-    assert_eq!(
-        get(&app, ADMIN_MENU, Some(&second_admin)).await?,
-        (200, menu.clone())
-    );
-    // A single resource, not a collection: no `page_size` is declared or read.
-    let paged = format!("{ADMIN_MENU}?page_size=101");
-    // audit: COADM01C-005
-    assert_eq!(get(&app, &paged, Some(&first_admin)).await?, (200, menu));
-    let (status, document) = get(&app, DOCUMENT_ROUTE, None).await?;
-    assert_eq!(status, 200);
-    // audit: COADM01C-005
-    assert!(!declares_page_size(
-        &document,
-        "/paths/~1api~1v1~1menus~1admin/get"
-    )?);
-    admin_menu_gate(&app, &first_admin).await
+        let (status, menu) = get(&app, ADMIN_MENU, Some(&first_admin)).await?;
+        // audit: COADM01C-001
+        assert_eq!(status, 200);
+        assert_admin_menu(&menu)?;
+        // audit: COADM01C-005
+        assert_eq!(
+            get(&app, ADMIN_MENU, Some(&second_admin)).await?,
+            (200, menu.clone())
+        );
+        // A single resource, not a collection: no `page_size` is declared or read.
+        let paged = format!("{ADMIN_MENU}?page_size=101");
+        // audit: COADM01C-005
+        assert_eq!(get(&app, &paged, Some(&first_admin)).await?, (200, menu));
+        let (status, document) = get(&app, DOCUMENT_ROUTE, None).await?;
+        assert_eq!(status, 200);
+        // audit: COADM01C-005
+        assert!(!declares_page_size(
+            &document,
+            "/paths/~1api~1v1~1menus~1admin/get"
+        )?);
+        admin_menu_gate(&app, &first_admin).await
+    })
 }
 
 /// A `GET` of `uri` under `token` that also sends the header `name: value`, as a caller naming
@@ -1181,14 +1198,16 @@ async fn commarea_document_absence(app: &Router) -> TestResult {
 /// COCOM01Y-007, COCOM01Y-015, COCOM01Y-016): COSGN00C's moves before its `XCTL` become the
 /// claims `sub` and `usr_type` and the route `next_route`, every request takes its user from its
 /// verified token, and nothing else travels.
-#[tokio::test]
-async fn cocom01y_commarea_rows() -> TestResult {
-    let guard = start_loaded_postgres().await?;
-    let (app, state) = app_over(&guard, &config(SECRET))?;
-    let admin = ("admin001", "ADMIN001", "A", "/admin");
-    let admin_token = commarea_signon(&app, &state, admin).await?;
-    let user = ("USER0001", "USER0001", "U", "/menu");
-    let user_token = commarea_signon(&app, &state, user).await?;
-    commarea_from_token_only(&app, &state, &admin_token, &user_token).await?;
-    commarea_document_absence(&app).await
+#[test]
+fn cocom01y_commarea_rows() -> TestResult {
+    block_on(async {
+        let guard = start_loaded_postgres().await?;
+        let (app, state) = app_over(&guard, &config(SECRET))?;
+        let admin = ("admin001", "ADMIN001", "A", "/admin");
+        let admin_token = commarea_signon(&app, &state, admin).await?;
+        let user = ("USER0001", "USER0001", "U", "/menu");
+        let user_token = commarea_signon(&app, &state, user).await?;
+        commarea_from_token_only(&app, &state, &admin_token, &user_token).await?;
+        commarea_document_absence(&app).await
+    })
 }

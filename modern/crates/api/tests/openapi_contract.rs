@@ -1477,9 +1477,9 @@ where
     }
 }
 
-#[tokio::test]
-async fn every_operation_answers_with_a_declared_status() -> TestResult {
-    served(exercise).await
+#[test]
+fn every_operation_answers_with_a_declared_status() -> TestResult {
+    block_on(served(exercise))
 }
 
 #[test]
