@@ -29,7 +29,7 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 test-support = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 insta = { workspace = true }
 
 [lints]

@@ -14,8 +14,12 @@
 //! today has a day difference of +1000 and one dated 1000 above it −1000: both stay inside the
 //! four digits of `WS-DAY-DIFF` (so halt candidate `X-CBPAUP0J-H1` never applies) and far from
 //! every expiry of 0 to 99 days, whatever the day, a midnight or a New Year during the run
-//! included. Only a detail dated today, difference 0, tells expiry 0 from expiry 5; its outcome,
-//! and the SYSOUT that shows today, are asserted only when today did not change during the run.
+//! included. Only a detail dated today, difference 0, tells expiry 0 from expiry 5. A later day
+//! only raises that difference, so under expiry 0 the detail is deleted whatever day the binary
+//! read, and its deletion is asserted on every run. Under expiry 5 a New Year during the run
+//! would expire it, so its staying with its summary, the survivor check that includes that
+//! summary and every SYSOUT comparison that includes the `TODAYS DATE` line are asserted only
+//! when today did not change during the run.
 //!
 //! # Standard output
 //!
@@ -208,7 +212,8 @@ fn json_string(text: &str) -> Option<(String, &str)> {
 }
 
 /// Runs `carddemo-batch` with `args` from `modern/`, against `database_url`, with every output
-/// directory inside `scratch`, and waits for it on a blocking thread.
+/// directory inside `scratch`, and waits for it through `test_support::run_child`, which kills a
+/// run still going at `test_support::CHILD_DEADLINE`.
 async fn run_batch(database_url: &str, scratch: &Scratch, args: &[&str]) -> Outcome<Run> {
     let mut command = Command::new(env!("CARGO_BIN_EXE_carddemo-batch"));
     command
@@ -224,7 +229,7 @@ async fn run_batch(database_url: &str, scratch: &Scratch, args: &[&str]) -> Outc
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
         .env("RUST_LOG", LOG_FILTER)
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    let output = tokio::task::spawn_blocking(move || command.output()).await??;
+    let output = test_support::run_child(command, test_support::CHILD_DEADLINE).await?;
     Ok(Run {
         status: output.status.code(),
         stdout: String::from_utf8(output.stdout)?,

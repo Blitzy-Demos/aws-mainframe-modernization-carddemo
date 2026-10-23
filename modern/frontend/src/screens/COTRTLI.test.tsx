@@ -477,8 +477,11 @@ function Target({ name }: { readonly name: string }) {
   );
 }
 
-/** Renders `/transaction-types`, arriving with `arrival` as route state, with stub targets. */
-function renderScreen(arrival: { readonly from: string } | null = null): void {
+/**
+ * Renders `/transaction-types`, arriving with `arrival` as route state, with stub targets.
+ * Returns the query client, whose pending requests {@link clientIdle} reads.
+ */
+function renderScreen(arrival: { readonly from: string } | null = null): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -493,6 +496,7 @@ function renderScreen(arrival: { readonly from: string } | null = null): void {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 /** The route state the target `name` received, once the screen has opened it. */
@@ -520,15 +524,34 @@ async function answered(seen: ReturnType<typeof stubFetch>, count: number): Prom
 }
 
 /**
- * Lets every pending promise and timer run, so a request a key would send has been sent. Run
- * inside `waitFor`, so any state update it lets through lands where React expects it.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoints 24 and 25 are mutations of that client. Each stays
+ * pending from the moment the screen starts it until its reply has arrived and, while the screen
+ * is mounted, has been passed to the screen's `onSuccess` or `onError`. Every request the screen
+ * had started when this is called, the held ones aside, has therefore been answered once it
+ * returns. It cannot see a request the screen has not started yet: a test calls it once it has
+ * awaited what the screen shows at the end of a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
+  });
+}
+
+/**
+ * For keys that must send nothing and leave nothing on screen to wait for, such as the keys the
+ * lock refuses: lets 50 ms pass inside `act`, so whatever the screen does with them within that
+ * window (a render, a request) runs and renders first, then waits as {@link clientIdle} does. It
+ * shows only that nothing was sent within those 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
+  await clientIdle(client, held);
 }
 
 /** A reply held back until the test passes it to `release`. */
@@ -1682,7 +1705,7 @@ describe("COTRTLI", () => {
         held.reply,
         [200, REFRESHED],
       ]);
-      renderScreen();
+      const client = renderScreen();
       for (let shown = 1; shown <= prior.length; shown += 1) {
         if (shown > 1) {
           press("ENTER");
@@ -1743,7 +1766,8 @@ describe("COTRTLI", () => {
       }
 
       pressRequestKeys();
-      await settle();
+      // The held reply stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(seen).toHaveLength(prior.length + 1);
 
       held.release(json(answer[0], answer[1]));
@@ -2137,7 +2161,7 @@ describe("COTRTLI: F2 while the maintenance screen loads", () => {
       for (const key of ["Enter", "F1", "F2", "F7", "F8", "F10"]) {
         fireEvent.keyDown(window, { key });
       }
-      await settle();
+      await idleAfter50ms(client);
 
       expect(seen).toHaveLength(1);
       expect(router.state.location.pathname).toBe(PATHS.COTRTLI);

@@ -169,9 +169,14 @@ function json(status: number, body: unknown): Response {
 /**
  * Replaces `fetch` with {@link REPLIES}. With `hold`, every reply waits until `release` is
  * called, so a test can act while a request is outstanding. Returns every request in the order
- * the screen sent it, and `release`, which lets every waiting reply go.
+ * the screen sent it, `release`, which lets every waiting reply go, and `held`, the number of
+ * replies waiting for it.
  */
-function stubApi(hold = false): { requests: Request[]; release: () => void } {
+function stubApi(hold = false): {
+  requests: Request[];
+  release: () => void;
+  held: () => number;
+} {
   const requests: Request[] = [];
   const waiting: Array<() => void> = [];
   vi.stubGlobal(
@@ -205,6 +210,7 @@ function stubApi(hold = false): { requests: Request[]; release: () => void } {
         resolve();
       }
     },
+    held: () => waiting.length,
   };
 }
 
@@ -223,12 +229,15 @@ function RouteStub() {
   );
 }
 
-/** COUSR03 at `/users/delete` with `state`, and stubs at the routes it transfers to. */
+/**
+ * COUSR03 at `/users/delete` with `state`, and stubs at the routes it transfers to. Returns the
+ * render result and the QueryClient, whose outstanding requests a test waits on.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const view = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COUSR03, state }]}>
         <Routes>
@@ -239,6 +248,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...view, client };
 }
 
 /** The path of the route stub a transfer reached. */
@@ -574,29 +584,57 @@ function typeUserId(value: string): void {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests. The pause runs inside `waitFor`, which
- * lets React render the updates those responses cause.
+ * Waits until no request the screen started is still outstanding, other than the `held` replies
+ * the stub keeps: `client` fetches no query, and its pending mutations are exactly the `held`
+ * ones. It covers only requests already started, so a test calls it once the key's outcome has
+ * shown (a message, a fetched value, the cursor, a route) and then counts or inspects requests.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
+async function requestsAnswered(client: QueryClient, held: () => number = () => 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held());
+  });
+}
+
+/**
+ * A bounded observation, for a check that an action sent nothing where the screen shows no sign
+ * of having decided: 50 ms of real time inside `act`, which renders every update the action
+ * causes in that time, then {@link requestsAnswered}. A request started later than the 50 ms
+ * escapes it.
+ */
+async function boundedWindow(client: QueryClient, held?: () => number): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
+  });
+  await requestsAnswered(client, held);
+}
+
+/**
+ * Waits until the screen takes keys: the keyboard is unlocked and the cursor is in the user ID.
+ * The entry effect locks the keyboard within `render` before a route-state selection's fetch goes
+ * out, and the fetch's answer unlocks it, so after first display this is that answer shown, or,
+ * with no selection, the first display itself.
+ */
+async function readyForKey(): Promise<void> {
+  await waitFor(() => {
+    expectLocked(false);
+    expect(document.activeElement).toBe(userIdInput());
   });
 }
 
 /**
  * Renders the screen after a COUSR00 `D` selection, waits for the entry fetch to show, and
- * returns every request sent so far and after.
+ * returns every request sent so far and after, and the QueryClient.
  */
-async function renderSelected(): Promise<Request[]> {
+async function renderSelected(): Promise<{ requests: Request[]; client: QueryClient }> {
   const { requests } = stubApi();
-  renderScreen(FROM_LIST);
+  const { client } = renderScreen(FROM_LIST);
   await waitFor(() => {
     expect(shown()).toEqual(SHOWN_SELECTED);
   });
-  return requests;
+  return { requests, client };
 }
 
 beforeEach(() => {
@@ -753,7 +791,7 @@ describe("COUSR03 user delete screen", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
     const { requests } = stubApi();
-    const { container } = renderScreen({ from: PATHS.COADM01 });
+    const { container, client } = renderScreen({ from: PATHS.COADM01 });
 
     expectHeaderValues(container, [
       { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CU03", title: false },
@@ -777,7 +815,7 @@ describe("COUSR03 user delete screen", () => {
       },
       { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
     ]);
-    await settle();
+    await boundedWindow(client);
     expect(requests).toEqual([]);
   });
 
@@ -790,7 +828,7 @@ describe("COUSR03 user delete screen", () => {
     { title: "with a selected user ID that is not a string", state: { user_id: 1 } },
   ])("first display $title: everything empty, cursor in user ID, no request", async (row) => {
     const { requests } = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
 
     await waitFor(() => {
       expect(document.activeElement).toBe(userIdInput());
@@ -798,7 +836,7 @@ describe("COUSR03 user delete screen", () => {
     expect(userIdInput().value).toBe("");
     expect(shown()).toEqual(BLANK);
     expect(messageRow()).toEqual(EMPTY_ROW);
-    await settle();
+    await boundedWindow(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -810,7 +848,7 @@ describe("COUSR03 user delete screen", () => {
   // audit: COUSR03C-012
   it("after a COUSR00 selection fetches the user at once, shows it and the prompt", async () => {
     const { requests } = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
 
     expect(userIdInput().value).toBe(SELECTED_ID);
     await waitFor(() => {
@@ -836,7 +874,7 @@ describe("COUSR03 user delete screen", () => {
     });
 
     // One read, and no delete: the entry sends endpoint 18 exactly one request.
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer test-token");
   });
@@ -849,8 +887,9 @@ describe("COUSR03 user delete screen", () => {
       title: "on first display",
       reach: async () => {
         stubApi();
-        renderScreen({ from: PATHS.COADM01 });
-        await settle();
+        const { client } = renderScreen({ from: PATHS.COADM01 });
+        await readyForKey();
+        await requestsAnswered(client);
       },
     },
     { title: "with a fetched user shown", reach: renderSelected },
@@ -891,8 +930,8 @@ describe("COUSR03 user delete screen", () => {
     },
   ])("ENTER by $title fetches the typed user ID with no route state", async (row) => {
     const { requests } = stubApi();
-    renderScreen();
-    await settle();
+    const { client } = renderScreen();
+    await boundedWindow(client);
     expect(requests).toHaveLength(0);
 
     typeUserId(TYPED_ID);
@@ -915,7 +954,7 @@ describe("COUSR03 user delete screen", () => {
     { title: "the 404 of COUSR03C-013", userId: UNKNOWN_ID, error: readNotFound, cursor: "user" },
     { title: "the 500 of COUSR03C-014", userId: FAILING_ID, error: readFailed, cursor: "first" },
   ])("ENTER answered by $title blanks the outputs and shows it in red", async (row) => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     typeUserId(row.userId);
     await moveFocus(key("F4=Clear"));
@@ -946,7 +985,7 @@ describe("COUSR03 user delete screen", () => {
   // COUSR03C-010 is a `both` row: the schema's half is proved in src/schemas/COUSR03.test.ts and
   // the server's in the endpoint tests. This shows what the screen does with the schema's refusal.
   it("ENTER with a blank user ID sends nothing, keeps the outputs, shows it in red", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     typeUserId("        ");
     await moveFocus(key("F4=Clear"));
@@ -960,7 +999,7 @@ describe("COUSR03 user delete screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(userIdInput());
     });
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -971,7 +1010,7 @@ describe("COUSR03 user delete screen", () => {
     { title: "a click on F5=Delete", byKey: false },
     { title: "the F5 key", byKey: true },
   ])("$title deletes the fetched user, empties every field, shows the result", async (row) => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     await moveFocus(key("F3=Back"));
     if (row.byKey) {
@@ -1038,7 +1077,7 @@ describe("COUSR03 user delete screen", () => {
       cursor: "user",
     },
   ])("F5 answered by $title keeps every field", async (row) => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     // F5 deletes the user ID as it stands, whatever the outputs still show.
     typeUserId(row.userId);
@@ -1065,7 +1104,7 @@ describe("COUSR03 user delete screen", () => {
   // audit: COUSR03C-025
   // COUSR03C-016 is a `both` row: the schema's half is proved in src/schemas/COUSR03.test.ts.
   it("F5 with a blank user ID sends nothing, keeps every field, shows it in red", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     typeUserId("");
     await moveFocus(key("F3=Back"));
@@ -1079,7 +1118,7 @@ describe("COUSR03 user delete screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(userIdInput());
     });
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1087,8 +1126,8 @@ describe("COUSR03 user delete screen", () => {
   // do nothing and the user ID is read-only, as the 3270 keyboard stays locked until the program
   // answers; F3 and F12 stay enabled.
   it("locks ENTER, F4, F5 and the user ID while the fetch or the delete is outstanding", async () => {
-    const { requests, release } = stubApi(true);
-    renderScreen(FROM_LIST);
+    const { requests, release, held } = stubApi(true);
+    const { client } = renderScreen(FROM_LIST);
     const form = userIdInput().closest("form");
     await waitFor(() => {
       expect(form?.getAttribute("aria-busy")).toBe("true");
@@ -1099,7 +1138,7 @@ describe("COUSR03 user delete screen", () => {
     fireEvent.click(key("F4=Clear"));
     fireEvent.click(key("ENTER=Fetch"));
     pressKey("F7");
-    await settle();
+    await boundedWindow(client, held);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(userIdInput().value).toBe(SELECTED_ID);
     // An unserved key while the keyboard is locked shows no invalid-key message.
@@ -1122,7 +1161,7 @@ describe("COUSR03 user delete screen", () => {
     pressKey("F5");
     fireEvent.click(key("F4=Clear"));
     fireEvent.click(key("ENTER=Fetch"));
-    await settle();
+    await boundedWindow(client, held);
     expect(sent(requests)).toEqual([
       `GET ${ENDPOINT}${SELECTED_ID}`,
       `DELETE ${ENDPOINT}${SELECTED_ID}`,
@@ -1139,7 +1178,7 @@ describe("COUSR03 user delete screen", () => {
       expect(form?.getAttribute("aria-busy")).toBe("false");
     });
     expectLocked(false);
-    await settle();
+    await requestsAnswered(client, held);
     expect(requests).toHaveLength(2);
   });
 
@@ -1159,8 +1198,8 @@ describe("COUSR03 user delete screen", () => {
     },
     { title: "the F5, Enter and F4 keys", presses: ["F5", "Enter", "F4"] },
   ])("$title in one burst send one request until it is answered", async ({ presses }) => {
-    const { requests, release } = stubApi(true);
-    renderScreen({ from: PATHS.COADM01 });
+    const { requests, release, held } = stubApi(true);
+    const { client } = renderScreen({ from: PATHS.COADM01 });
     const [first] = presses;
     const method = first === "F5" || first === "F5=Delete" ? "DELETE" : "GET";
     // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
@@ -1182,7 +1221,7 @@ describe("COUSR03 user delete screen", () => {
       expect(requests).toHaveLength(1);
     });
     expectLocked(true);
-    await settle();
+    await boundedWindow(client, held);
     expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
     expect(userIdInput().value).toBe(SELECTED_ID);
 
@@ -1204,7 +1243,7 @@ describe("COUSR03 user delete screen", () => {
       expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
     });
     expectLocked(false);
-    await settle();
+    await requestsAnswered(client, held);
     expect(sent(requests)).toEqual([
       `${method} ${ENDPOINT}${SELECTED_ID}`,
       `${method} ${ENDPOINT}${SELECTED_ID}`,
@@ -1220,8 +1259,8 @@ describe("COUSR03 user delete screen", () => {
   ])(
     "$label keeps focus while its click's request is outstanding, and a click on it then runs nothing",
     async ({ label, method }) => {
-      const { requests, release } = stubApi(true);
-      renderScreen({ from: PATHS.COADM01 });
+      const { requests, release, held } = stubApi(true);
+      const { client } = renderScreen({ from: PATHS.COADM01 });
       typeUserId(SELECTED_ID);
       const button = key(label);
       // A mouse click focuses the button, then clicks it.
@@ -1238,7 +1277,7 @@ describe("COUSR03 user delete screen", () => {
       expect(form).toBeInstanceOf(HTMLFormElement);
       form?.addEventListener("submit", submits);
       fireEvent.click(button);
-      await settle();
+      await boundedWindow(client, held);
       expect(submits).not.toHaveBeenCalled();
       expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
       expect(document.activeElement).toBe(button);
@@ -1247,7 +1286,7 @@ describe("COUSR03 user delete screen", () => {
       await waitFor(() => {
         expect(button.getAttribute("aria-disabled")).toBeNull();
       });
-      await settle();
+      await requestsAnswered(client, held);
       expect(requests).toHaveLength(1);
     },
   );
@@ -1255,7 +1294,7 @@ describe("COUSR03 user delete screen", () => {
   // audit: COUSR03-035
   // audit: COUSR03C-007
   it("F4 empties the user ID, outputs and message row, refocuses, sends nothing", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
     expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
 
     // F4=Clear by its button, over a shown user, with the cursor away from the input.
@@ -1283,7 +1322,7 @@ describe("COUSR03 user delete screen", () => {
     expect(shown()).toEqual(BLANK);
     expect(document.activeElement).toBe(userIdInput());
 
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([
       `GET ${ENDPOINT}${SELECTED_ID}`,
       `GET ${ENDPOINT}${UNKNOWN_ID}`,
@@ -1326,9 +1365,10 @@ describe("COUSR03 user delete screen", () => {
     },
   ])("$title, deleting nothing and sending no request", async (row) => {
     const { requests } = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     // The entry's outcome first, so that only the key's effect remains to observe.
-    await settle();
+    await readyForKey();
+    await requestsAnswered(client);
     const before = requests.length;
 
     if (row.byKey) {
@@ -1338,7 +1378,7 @@ describe("COUSR03 user delete screen", () => {
     }
 
     expect(await reachedPath()).toBe(row.target);
-    await settle();
+    await requestsAnswered(client);
     expect(requests).toHaveLength(before);
     expect(sent(requests).some((request) => request.startsWith("DELETE"))).toBe(false);
   });
@@ -1351,8 +1391,9 @@ describe("COUSR03 user delete screen", () => {
     { title: "the F12 button with no recorded origin", state: undefined, byKey: false },
   ])("$title goes to /admin, deleting nothing and sending no request", async (row) => {
     const { requests } = stubApi();
-    renderScreen(row.state);
-    await settle();
+    const { client } = renderScreen(row.state);
+    await readyForKey();
+    await requestsAnswered(client);
     const before = requests.length;
 
     if (row.byKey) {
@@ -1362,7 +1403,7 @@ describe("COUSR03 user delete screen", () => {
     }
 
     expect(await reachedPath()).toBe("/admin");
-    await settle();
+    await requestsAnswered(client);
     expect(requests).toHaveLength(before);
     expect(sent(requests).some((request) => request.startsWith("DELETE"))).toBe(false);
   });
@@ -1373,7 +1414,7 @@ describe("COUSR03 user delete screen", () => {
     // PF13 to PF24: COUSR03C does not fold them onto PF1 to PF12, so Shift+F5 is no F5.
     ...ALL_F_KEYS.map((name) => ({ title: `Shift+${name}`, name, shiftKey: true })),
   ])("$title shows the invalid-key message in red and keeps every field", async (row) => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
     typeUserId(TYPED_ID);
 
     pressKey(row.name, row.shiftKey);
@@ -1384,7 +1425,7 @@ describe("COUSR03 user delete screen", () => {
     expect(userIdInput().value).toBe(TYPED_ID);
     expect(shown()).toEqual(SHOWN_SELECTED);
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1468,7 +1509,7 @@ describe("COUSR03 user delete screen", () => {
       read: [`GET ${ENDPOINT}${SELECTED_ID}`, `GET ${ENDPOINT}${TYPED_ID}`],
     },
   ])("after $title, clearing the user ID changes nothing until ENTER refuses it", async (row) => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
     if (row.typed !== undefined) {
       typeUserId(row.typed);
       fireEvent.click(key("ENTER=Fetch"));
@@ -1477,8 +1518,11 @@ describe("COUSR03 user delete screen", () => {
       });
     }
 
-    typeUserId("");
-    await settle();
+    // The edit's own update, then a bounded window: an edit shows no sign that it sent nothing.
+    await act(async () => {
+      typeUserId("");
+    });
+    await boundedWindow(client);
 
     expect(marks()).toEqual(UNMARKED);
     expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
@@ -1492,7 +1536,7 @@ describe("COUSR03 user delete screen", () => {
     });
     expect(marks()).toEqual({ ...UNMARKED, userId: USER_ID_EMPTY });
     expect(shown()).toEqual(row.shows);
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual(row.read);
   });
 
@@ -1517,7 +1561,7 @@ describe("COUSR03 user delete screen", () => {
       edited: UNMARKED,
     },
   ])("after ENTER refused by $title, an edit keeps the red row until the next key", async (row) => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
     typeUserId(row.refused);
     fireEvent.click(key("ENTER=Fetch"));
     await waitFor(() => {
@@ -1525,8 +1569,11 @@ describe("COUSR03 user delete screen", () => {
     });
     expect(marks()).toEqual({ ...UNMARKED, userId: row.message });
 
-    typeUserId(TYPED_ID);
-    await settle();
+    // The edit's own update, then a bounded window: an edit shows no sign that it sent nothing.
+    await act(async () => {
+      typeUserId(TYPED_ID);
+    });
+    await boundedWindow(client);
 
     expect(marks()).toEqual(row.edited);
     expect(messageRow()).toEqual(errorRow(row.message));
@@ -1545,7 +1592,7 @@ describe("COUSR03 user delete screen", () => {
 
   // audit: COUSR03C-006
   it("keeps its origin across ENTER, F4, F5 and invalid keys: F3 returns to COUSR00", async () => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     typeUserId(TYPED_ID);
     fireEvent.click(key("ENTER=Fetch"));
@@ -1649,13 +1696,13 @@ describe("COUSR03: endpoint 18 and 20 requests", () => {
   }
 
   it("the read and F5's delete each send the user's path with the bearer token, no query and no body, and the delete's message shows", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     fireEvent.click(key("F5=Delete"));
     await waitFor(() => {
       expect(messageRow()).toEqual(infoRow(deletedSelected.message));
     });
-    await settle();
+    await requestsAnswered(client);
 
     expect(await Promise.all(requests.map(shapeOf))).toEqual(
       ["GET", "DELETE"].map((method) => ({
@@ -1679,9 +1726,12 @@ const adminSignonRequired: components["schemas"]["ScreenError"] = {
  * Renders the application's route table at `/users/delete` with `state`, so the admin guard that
  * only the table mounts stands in front of the screen. Each screen is imported by its route's
  * loader, so a wait for one to render allows 5 s. Returns the router, whose location the test
- * reads.
+ * reads, and the QueryClient, whose outstanding requests the test waits on.
  */
-function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter> {
+function renderRouteTable(state?: unknown): {
+  router: ReturnType<typeof createMemoryRouter>;
+  client: QueryClient;
+} {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -1693,7 +1743,7 @@ function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return router;
+  return { router, client };
 }
 
 /**
@@ -1746,10 +1796,10 @@ describe("COUSR03 in the route table: the admin guard and a 401", () => {
   it("opened with no session, goes to sign-on before endpoint 18 gets a request", async () => {
     sessionStorage.clear();
     const { requests } = stubApi();
-    const router = renderRouteTable(FROM_LIST);
+    const { router, client } = renderRouteTable(FROM_LIST);
 
     await expectSignonShown(router);
-    await settle();
+    await requestsAnswered(client);
     expect(requests).toHaveLength(0);
     expect(getSession()).toBeNull();
     router.dispose();
@@ -1759,7 +1809,7 @@ describe("COUSR03 in the route table: the admin guard and a 401", () => {
   it("opened with a U session, goes to the main menu, and endpoints 18 and 20 get no request", async () => {
     setSession("test-token", "USER0001", "U");
     const { requests } = stubApi();
-    const router = renderRouteTable(FROM_LIST);
+    const { router, client } = renderRouteTable(FROM_LIST);
 
     await waitFor(
       () => {
@@ -1776,7 +1826,7 @@ describe("COUSR03 in the route table: the admin guard and a 401", () => {
     await waitFor(() => {
       expect(messageRow()).toEqual(errorRow("Unexpected request GET /api/v1/menus/main"));
     });
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests).filter((request) => request.includes(ENDPOINT))).toEqual([]);
     router.dispose();
   });
@@ -1809,7 +1859,7 @@ describe("COUSR03 in the route table: the admin guard and a 401", () => {
     "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
     async ({ state, refused, drive, expected }) => {
       const requests = stubRefusing(refused);
-      const router = renderRouteTable(state);
+      const { router } = renderRouteTable(state);
       expect(
         await screen.findByRole("heading", { level: 1, name: "Delete User" }, { timeout: 5_000 }),
       ).toBeDefined();
@@ -1871,7 +1921,7 @@ describe("COUSR03 /users/delete opened with no session, through the route table"
     }
     expect(screen.queryByRole("button", { name: "F5=Delete" })).toBeNull();
 
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([]);
     router.dispose();
   });
@@ -1910,8 +1960,14 @@ describe("COUSR03 /users/delete with a request answered 401, through the route t
     return requests;
   }
 
-  /** The route table at `/users/delete`, entered with a COUSR00 `D` selection. */
-  function renderRoutes(): ReturnType<typeof createMemoryRouter> {
+  /**
+   * The route table at `/users/delete`, entered with a COUSR00 `D` selection. Returns the router
+   * and the QueryClient, whose outstanding requests the test waits on.
+   */
+  function renderRoutes(): {
+    router: ReturnType<typeof createMemoryRouter>;
+    client: QueryClient;
+  } {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -1923,7 +1979,7 @@ describe("COUSR03 /users/delete with a request answered 401, through the route t
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    return router;
+    return { router, client };
   }
 
   /**
@@ -1949,12 +2005,12 @@ describe("COUSR03 /users/delete with a request answered 401, through the route t
   // audit: COUSR03C-003
   it("the entry fetch answered 401 takes the screen to /signon and ends the session", async () => {
     const requests = stubSignonRequired(false);
-    const router = renderRoutes();
+    const { router, client } = renderRoutes();
 
     await signonReached(router);
     // The guard let the screen mount with the session, so the screen's own entry fetch went out
     // with the token; its 401 alone ended the session, and nothing was sent after it.
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer test-token");
     router.dispose();
@@ -1963,7 +2019,7 @@ describe("COUSR03 /users/delete with a request answered 401, through the route t
   // audit: COUSR03C-003
   it("F5=Delete answered 401 takes the screen to /signon and ends the session", async () => {
     const requests = stubSignonRequired(true);
-    const router = renderRoutes();
+    const { router, client } = renderRoutes();
     await waitFor(() => {
       expect(shown()).toEqual(SHOWN_SELECTED);
     });
@@ -1972,7 +2028,7 @@ describe("COUSR03 /users/delete with a request answered 401, through the route t
     fireEvent.click(key("F5=Delete"));
 
     await signonReached(router);
-    await settle();
+    await requestsAnswered(client);
     expect(sent(requests)).toEqual([
       `GET ${ENDPOINT}${SELECTED_ID}`,
       `DELETE ${ENDPOINT}${SELECTED_ID}`,

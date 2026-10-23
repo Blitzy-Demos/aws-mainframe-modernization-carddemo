@@ -1256,7 +1256,11 @@ mod intcalc {
         let mut kept = Vec::with_capacity(5);
         for n in 1_u64..=1_000_002 {
             let effects = run.process(&tcatbal, &clock)?;
-            let [IntcalcEffect::SystemTransaction(record)] = effects.as_slice() else {
+            let [
+                IntcalcEffect::DefaultGroupFallback,
+                IntcalcEffect::SystemTransaction(record),
+            ] = effects.as_slice()
+            else {
                 return Err(format!("CBACT04C-016: record {n} is one SYSTRAN record").into());
             };
             let expected = format!("2022071800{:06}", n % 1_000_000);
@@ -1329,12 +1333,17 @@ mod intcalc {
                 "FIXINT-{n:03}: tcatbal.txt line n holds account n"
             );
             let effects = run.process(&tcatbal, &clock)?;
-            // Every account has a blank group, so its own lookup misses and DEFAULT 01/0001
-            // (15.00, not zero) applies: each balance writes one SYSTRAN record (E07).
+            // Every account has a blank group, so its own lookup misses, the fallback follows the
+            // break and DEFAULT 01/0001 (15.00, not zero) applies: each balance writes one
+            // SYSTRAN record (E07).
             let record = match effects.as_slice() {
-                [IntcalcEffect::SystemTransaction(record)] if n == 1 => record,
+                [
+                    IntcalcEffect::DefaultGroupFallback,
+                    IntcalcEffect::SystemTransaction(record),
+                ] if n == 1 => record,
                 [
                     IntcalcEffect::AccountUpdate(account),
+                    IntcalcEffect::DefaultGroupFallback,
                     IntcalcEffect::SystemTransaction(record),
                 ] => {
                     rewritten.push(account.clone());
@@ -1386,18 +1395,22 @@ mod intcalc {
             fixture::<DisclosureGroupRecord>("discgrp.txt")?,
         );
         let clock = interest_clock()?;
-        let (mut written, mut rewrites) = (0, 0);
+        let (mut written, mut rewrites, mut fallbacks) = (0, 0, 0);
         for ((acct_id, type_cd, _), tcatbal) in posted.tcatbals()? {
             let effects = run.process(&tcatbal, &clock)?;
             if type_cd == *b"03" {
-                // DEFAULT 03/0001 has rate 0.00: nothing is computed or written.
-                assert!(
-                    effects.is_empty(),
+                // The blank group falls back, and DEFAULT 03/0001 has rate 0.00: nothing is
+                // computed or written.
+                assert_eq!(
+                    effects,
+                    [IntcalcEffect::DefaultGroupFallback],
                     "FIXINT-{acct_id:03}: type 03 writes nothing"
                 );
+                fallbacks += 1;
                 continue;
             }
-            // 1400-COMPUTE-FEES adds no effect: at most the break's rewrite and one record.
+            // 1400-COMPUTE-FEES adds no effect: at most the break's rewrite, the fallback and one
+            // record.
             for effect in &effects {
                 match effect {
                     IntcalcEffect::AccountUpdate(account) => {
@@ -1413,12 +1426,14 @@ mod intcalc {
                         );
                         rewrites += 1;
                     }
+                    IntcalcEffect::DefaultGroupFallback => fallbacks += 1,
                     IntcalcEffect::SystemTransaction(_) => written += 1,
                 }
             }
-            assert!(effects.len() <= 2, "FIXINT-{acct_id:03}: no fee effect");
+            assert!(effects.len() <= 3, "FIXINT-{acct_id:03}: no fee effect");
         }
-        assert_eq!((written, rewrites), (50, 49));
+        // Every one of the 100 lookups falls back to DEFAULT (FIXINT-902).
+        assert_eq!((written, rewrites, fallbacks), (50, 49, 100));
         let summary = run.finish();
         assert_eq!(
             (summary.records_read(), summary.transactions_written()),
@@ -1449,15 +1464,16 @@ mod intcalc {
         let clock = interest_clock()?;
         // GOLD's own 0.00 applies, so DEFAULT's 15.00 is never read for account 1.
         assert!(run.process(&balance(1, 100_000)?, &clock)?.is_empty());
-        // No record keys the blank group: DEFAULT applies, and the run's first record takes
-        // suffix 000001 although it comes from the second balance.
+        // No record keys the blank group: DEFAULT applies after the fallback, and the run's first
+        // record takes suffix 000001 although it comes from the second balance.
         let effects = run.process(&balance(2, 100_000)?, &clock)?;
         let [
             IntcalcEffect::AccountUpdate(first),
+            IntcalcEffect::DefaultGroupFallback,
             IntcalcEffect::SystemTransaction(record),
         ] = effects.as_slice()
         else {
-            return Err("account 1 rewritten, then one record for account 2".into());
+            return Err("account 1 rewritten, the fallback, then one record for account 2".into());
         };
         assert_eq!(first.id.get(), 1);
         assert_eq!(record.id.as_bytes(), b"2022071800000001");

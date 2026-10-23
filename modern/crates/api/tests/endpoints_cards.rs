@@ -48,7 +48,7 @@ use api::app::{AppState, app};
 use api::dto::FIELD_LENGTH_MESSAGE;
 use axum::body::{self, Body};
 use axum::http::{Method, Request, StatusCode, header};
-use chrono::NaiveDate;
+use chrono::{Datelike as _, NaiveDate};
 use domain::clock::FixedClock;
 use domain::copybook::{PicDate, PicU, PicX};
 use domain::online::cocrdlic::CardRef;
@@ -648,18 +648,31 @@ impl Harness {
     }
 }
 
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute builds,
+/// without the lint attributes, the panicking runtime build and the unchecked pinning that
+/// attribute's expansion carries: a runtime that cannot be built fails the test as an error. The
+/// harness holds a `RefCell`, so the test runs on this thread and is never spawned.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
 /// Endpoint 7 over the 50 fixture cards: the fresh start, blank filters, paging both ways, the
 /// last page, the filters and the message precedence, the map lengths and a failed read.
-#[tokio::test]
-async fn cocrdlic_list_rows() -> TestResult {
-    let h = Harness::start().await?;
-    let first = list_first_page(&h).await?;
-    list_blank_filters(&h, &first).await?;
-    let third = list_paging(&h, &first).await?;
-    list_last_page(&h, &third).await?;
-    list_filters(&h, &third).await?;
-    list_lengths_and_store(&h).await?;
-    Ok(())
+#[test]
+fn cocrdlic_list_rows() -> TestResult {
+    block_on(async {
+        let h = Harness::start().await?;
+        let first = list_first_page(&h).await?;
+        list_blank_filters(&h, &first).await?;
+        let third = list_paging(&h, &first).await?;
+        list_last_page(&h, &third).await?;
+        list_filters(&h, &third).await?;
+        list_lengths_and_store(&h).await?;
+        Ok(())
+    })
 }
 
 /// The fresh start, with both tokens; returns page 1.
@@ -983,62 +996,64 @@ async fn list_lengths_and_store(h: &Harness) -> Outcome<()> {
 /// Endpoint 7 over cards the fixture cannot provide, inserted through the card repository:
 /// several cards per account, a filtered page whose look-ahead finds a card the filter
 /// excludes, a full last page and more than 63 cards for the page-number wrap.
-#[tokio::test]
-async fn cocrdlic_inserted_cards_rows() -> TestResult {
-    let mut h = Harness::start().await?;
-    let own = h.line(1)?.clone();
-    let following = h.line(2)?.clone();
-    // Six more cards of line 1's account, numbered right after line 1 and before line 2.
-    let base = own.number.parse::<u64>()?;
-    let numbers: Vec<String> = (1..=6).map(|n| format!("{:016}", base + n)).collect();
-    assert!(
-        numbers.iter().all(|number| *number < following.number),
-        "an inserted card does not sort between lines 1 and 2"
-    );
-    let group = insert_cards(&mut h, &numbers, &own.acct).await?;
-    let mut matching: Vec<&Card> = vec![&own];
-    matching.extend(group.iter());
-    let filtered = h.list(&query(&[("acct_id", &own.acct)])).await?;
-    // audit: COCRDLIC-010
-    assert_page(&filtered, &matching, 1, None, Some(RECORD_ACTIONS))?;
-    // audit: COCRDLIC-019
-    assert_eq!(filtered.int("last_key"), Some(following.handle));
-    // audit: COCRDLIC-019
-    assert_eq!(filtered.flag("has_next_page"), Some(true));
-    let empty = h
-        .list(&with(
-            echo(&filtered, Some("forward")),
-            "acct_id",
-            &own.acct,
-        ))
-        .await?;
-    // audit: COCRDLIC-021
-    assert_page(&empty, &[], 2, Some(NO_MORE_RECORDS), Some(RECORD_ACTIONS))?;
-    // audit: COCRDLIC-022
-    assert_eq!(empty.int("first_key"), Some(own.handle));
-    // audit: COCRDLIC-025
-    assert_eq!(empty.flag("last_page_shown"), Some(true));
-    let mut all = h.cards.clone();
-    all.extend(group);
-    all.sort_by(|left, right| left.number.cmp(&right.number));
-    let last = walk_forward(&h, &all, 8).await?;
-    // A full last page: the look-ahead finds no card.
-    // audit: COCRDLIC-019
-    assert_eq!(last.flag("has_next_page"), Some(false));
-    // audit: COCRDLIC-019
-    assert_eq!(
-        last.int("last_key"),
-        page_of(&all, 8).last().map(|card| card.handle)
-    );
-    // audit: COCRDLIC-019
-    assert_page(
-        &last,
-        &page_of(&all, 8),
-        8,
-        Some(NO_MORE_RECORDS),
-        Some(RECORD_ACTIONS),
-    )?;
-    inserted_wrap_rows(&mut h, all).await
+#[test]
+fn cocrdlic_inserted_cards_rows() -> TestResult {
+    block_on(async {
+        let mut h = Harness::start().await?;
+        let own = h.line(1)?.clone();
+        let following = h.line(2)?.clone();
+        // Six more cards of line 1's account, numbered right after line 1 and before line 2.
+        let base = own.number.parse::<u64>()?;
+        let numbers: Vec<String> = (1..=6).map(|n| format!("{:016}", base + n)).collect();
+        assert!(
+            numbers.iter().all(|number| *number < following.number),
+            "an inserted card does not sort between lines 1 and 2"
+        );
+        let group = insert_cards(&mut h, &numbers, &own.acct).await?;
+        let mut matching: Vec<&Card> = vec![&own];
+        matching.extend(group.iter());
+        let filtered = h.list(&query(&[("acct_id", &own.acct)])).await?;
+        // audit: COCRDLIC-010
+        assert_page(&filtered, &matching, 1, None, Some(RECORD_ACTIONS))?;
+        // audit: COCRDLIC-019
+        assert_eq!(filtered.int("last_key"), Some(following.handle));
+        // audit: COCRDLIC-019
+        assert_eq!(filtered.flag("has_next_page"), Some(true));
+        let empty = h
+            .list(&with(
+                echo(&filtered, Some("forward")),
+                "acct_id",
+                &own.acct,
+            ))
+            .await?;
+        // audit: COCRDLIC-021
+        assert_page(&empty, &[], 2, Some(NO_MORE_RECORDS), Some(RECORD_ACTIONS))?;
+        // audit: COCRDLIC-022
+        assert_eq!(empty.int("first_key"), Some(own.handle));
+        // audit: COCRDLIC-025
+        assert_eq!(empty.flag("last_page_shown"), Some(true));
+        let mut all = h.cards.clone();
+        all.extend(group);
+        all.sort_by(|left, right| left.number.cmp(&right.number));
+        let last = walk_forward(&h, &all, 8).await?;
+        // A full last page: the look-ahead finds no card.
+        // audit: COCRDLIC-019
+        assert_eq!(last.flag("has_next_page"), Some(false));
+        // audit: COCRDLIC-019
+        assert_eq!(
+            last.int("last_key"),
+            page_of(&all, 8).last().map(|card| card.handle)
+        );
+        // audit: COCRDLIC-019
+        assert_page(
+            &last,
+            &page_of(&all, 8),
+            8,
+            Some(NO_MORE_RECORDS),
+            Some(RECORD_ACTIONS),
+        )?;
+        inserted_wrap_rows(&mut h, all).await
+    })
 }
 
 /// Eight more cards of line 50's account, above every fixture number: paging under a filter
@@ -1157,27 +1172,29 @@ async fn insert_cards(h: &mut Harness, numbers: &[String], acct: &str) -> Outcom
 
 /// Endpoint 8: the found card for both tokens, by number and by handle, the edits, the
 /// not-found and store-failure answers, the map lengths and the texts no response carries.
-#[tokio::test]
-async fn cocrdslc_view_rows() -> TestResult {
-    let h = Harness::start().await?;
-    view_found(&h).await?;
-    view_by_handle_and_account(&h).await?;
-    view_edits(&h).await?;
-    view_not_found_and_store(&h).await?;
-    for text in NEVER_SENT_BY_VIEW {
-        let carried = h
-            .seen
-            .borrow()
-            .iter()
-            .filter(|body| body.contains(text))
-            .count();
-        // audit: COCRDSLC-028
-        // audit: COCRDSLC-029
-        // audit: COCRDSLC-030
-        // audit: COCRDSLC-031
-        assert_eq!(carried, 0, "a response carried {text:?}");
-    }
-    Ok(())
+#[test]
+fn cocrdslc_view_rows() -> TestResult {
+    block_on(async {
+        let h = Harness::start().await?;
+        view_found(&h).await?;
+        view_by_handle_and_account(&h).await?;
+        view_edits(&h).await?;
+        view_not_found_and_store(&h).await?;
+        for text in NEVER_SENT_BY_VIEW {
+            let carried = h
+                .seen
+                .borrow()
+                .iter()
+                .filter(|body| body.contains(text))
+                .count();
+            // audit: COCRDSLC-028
+            // audit: COCRDSLC-029
+            // audit: COCRDSLC-030
+            // audit: COCRDSLC-031
+            assert_eq!(carried, 0, "a response carried {text:?}");
+        }
+        Ok(())
+    })
 }
 
 /// A found card: its fields for a `U` token and the full number for an `A` token.
@@ -1399,20 +1416,22 @@ impl<'a> Fields<'a> {
 /// Endpoints 9 and 10, in the order the screen uses them: the search edits, the fetch, the
 /// change check and the detail edits, the confirmation and the save, the conflicts and failures
 /// of a save, the account a save writes, the map lengths and a failed read.
-#[tokio::test]
-async fn cocrdupc_update_rows() -> TestResult {
-    let h = Harness::start().await?;
-    update_search_edits(&h).await?;
-    let view = update_fetch(&h).await?;
-    update_no_change(&h, &view).await?;
-    update_detail_edits(&h, &view).await?;
-    let validated = update_confirm(&h, &view).await?;
-    update_save(&h, &validated).await?;
-    update_conflicts(&h, &validated).await?;
-    update_failures(&h).await?;
-    update_account_move(&h).await?;
-    update_lengths_and_store(&h).await?;
-    Ok(())
+#[test]
+fn cocrdupc_update_rows() -> TestResult {
+    block_on(async {
+        let h = Harness::start().await?;
+        update_search_edits(&h).await?;
+        let view = update_fetch(&h).await?;
+        update_no_change(&h, &view).await?;
+        update_detail_edits(&h, &view).await?;
+        let validated = update_confirm(&h, &view).await?;
+        update_save(&h, &validated).await?;
+        update_conflicts(&h).await?;
+        update_failures(&h).await?;
+        update_account_move(&h).await?;
+        update_lengths_and_store(&h).await?;
+        Ok(())
+    })
 }
 
 /// The search-key edits of endpoint 9: each a 400 with no read (COCRDUPC-015).
@@ -1760,23 +1779,106 @@ async fn update_save(h: &Harness, validated: &Reply) -> Outcome<()> {
     Ok(())
 }
 
-/// A save against a card changed since its fetch, and a change of letter case alone, which the
-/// comparison does not detect.
-async fn update_conflicts(h: &Harness, validated: &Reply) -> Outcome<()> {
-    let card = h.line(1)?;
-    let first_save = h.stored(card.handle).await?;
-    let stale = validated.snapshot_in("changes_ok_not_confirmed")?;
-    let again = CHANGE.with_name("Aniya Vonn");
-    let conflict = h
-        .put(&card.handle_text(), &again.body("PF5", &stale))
-        .await?;
-    // audit: COCRDUPC-037
-    assert_error(&conflict, StatusCode::CONFLICT, CHANGED_BY_OTHER, None);
-    // audit: COCRDUPC-037
-    assert!(
-        h.stored(card.handle).await? == first_save,
-        "a conflicting save wrote the card"
-    );
+/// One value `9300-CHECK-CHANGE-IN-REC` compares that another user changes in a stored card
+/// between its fetch and its save, every other value of the card kept (COCRDUPC-037).
+#[derive(Clone, Copy, Debug)]
+enum Term {
+    /// The name, to one whose upper-cased value differs.
+    Name,
+    /// The status, `Y` to `N` or `N` to `Y`.
+    Status,
+    /// The expiry year, one later.
+    Year,
+    /// The expiry month, one later, December to January.
+    Month,
+    /// The expiry day, one later within days 1 to 28.
+    Day,
+}
+
+impl Term {
+    /// `record` with this value changed and every other value kept; a card whose changed
+    /// expiry would be no calendar date is an error.
+    fn changed(self, mut record: CardRecord) -> Outcome<CardRecord> {
+        let date = record
+            .expiraion_date
+            .value()
+            .ok_or("a stored card has no expiry date")?;
+        let (year, month, day) = (date.year(), date.month(), date.day());
+        let expiry = |year, month, day| -> Outcome<PicDate> {
+            let moved = NaiveDate::from_ymd_opt(year, month, day)
+                .ok_or("a changed expiry date is no calendar date")?;
+            Ok(PicDate::new(Some(moved))?)
+        };
+        match self {
+            Self::Name => record.embossed_name = PicX::from_text("Another Holder")?,
+            Self::Status => {
+                let flipped = if record.active_status.as_bytes() == b"Y" {
+                    "N"
+                } else {
+                    "Y"
+                };
+                record.active_status = PicX::from_text(flipped)?;
+            }
+            Self::Year => record.expiraion_date = expiry(year + 1, month, day)?,
+            Self::Month => record.expiraion_date = expiry(year, month % 12 + 1, day)?,
+            Self::Day => record.expiraion_date = expiry(year, month, day % 28 + 1)?,
+        }
+        Ok(record)
+    }
+}
+
+/// Saves against cards another user changed after their fetch, in one compared value each, and
+/// a change of letter case alone, which the comparison does not detect.
+async fn update_conflicts(h: &Harness) -> Outcome<()> {
+    // Lines 4 to 8: names of letters and spaces, and expiry days that every month has.
+    let cases = [
+        (4, Term::Name),
+        (5, Term::Status),
+        (6, Term::Year),
+        (7, Term::Month),
+        (8, Term::Day),
+    ];
+    for (line, term) in cases {
+        let card = h.line(line)?;
+        let handle = card.handle_text();
+        let view = h.get(EDIT, &by_ref(&card.acct, &handle), &h.user).await?;
+        let upper = card.name.trim_end().to_ascii_uppercase();
+        // The user changes the year alone, to one no other user writes.
+        let fields = Fields {
+            name: &upper,
+            status: &card.status,
+            month: card
+                .expiry
+                .get(5..7)
+                .ok_or("a fixture expiry has no month")?,
+            year: "2030",
+        };
+        let shown = view.snapshot_in("show_details")?;
+        let checked = h.put(&handle, &fields.body("ENTER", &shown)).await?;
+        assert_validated(&checked);
+        let confirmed = checked.snapshot_in("changes_ok_not_confirmed")?;
+        let changed = term.changed(h.stored(card.handle).await?)?;
+        let mut store = h.store.clone();
+        let rewritten = CardRepository::update(&mut store, &changed).await?;
+        assert!(
+            rewritten,
+            "the other user's change of the {term:?} was not stored"
+        );
+        let conflict = h.put(&handle, &fields.body("PF5", &confirmed)).await?;
+        // audit: COCRDUPC-037
+        assert_eq!(
+            conflict.status,
+            StatusCode::CONFLICT,
+            "another user's change of the {term:?} was not detected"
+        );
+        // audit: COCRDUPC-037
+        assert_error(&conflict, StatusCode::CONFLICT, CHANGED_BY_OTHER, None);
+        // audit: COCRDUPC-037
+        assert!(
+            h.stored(card.handle).await? == changed,
+            "a save conflicting with a change of the {term:?} wrote the card"
+        );
+    }
     // Another user lowers the case of line 2's name after the fetch: not detected.
     let other = h.line(2)?;
     let other_ref = other.handle_text();
@@ -1954,89 +2056,148 @@ async fn update_lengths_and_store(h: &Harness) -> Outcome<()> {
 /// The selected card as route state (COCOM01Y-014): an endpoint 7 row filtered by the card's
 /// account carries its handle and its redacted number, and endpoints 8 and 9, sent that account
 /// and handle and no card number, read the same card and show it redacted the same way.
-#[tokio::test]
-async fn cocom01y_card_rows() -> TestResult {
-    let h = Harness::start().await?;
-    let card = h.line(1)?;
-    let listed = h.list(&query(&[("acct_id", &card.acct)])).await?;
-    assert_eq!(listed.status, StatusCode::OK);
-    let rows = listed.rows()?;
-    let (handle, number, _, _) = rows.first().ok_or("the card list lists no row")?;
-    // audit: COCOM01Y-014
-    assert!(
-        *handle == card.handle && *number == card.redacted,
-        "the listed row is not the card's handle and redacted number"
-    );
-    // audit: COCOM01Y-014
-    assert!(
-        number.len() == 16
-            && number.get(..12) == Some("************")
-            && number.get(12..) == card.number.get(12..)
-            && *number != card.number,
-        "the listed card number is not twelve * and the last four digits"
-    );
-    let sent = by_ref(&card.acct, &handle.to_string());
-    for path in [VIEW, EDIT] {
-        let reply = h.get(path, &sent, &h.user).await?;
-        assert_eq!(reply.status, StatusCode::OK, "{path}");
+#[test]
+fn cocom01y_card_rows() -> TestResult {
+    block_on(async {
+        let h = Harness::start().await?;
+        let card = h.line(1)?;
+        let listed = h.list(&query(&[("acct_id", &card.acct)])).await?;
+        assert_eq!(listed.status, StatusCode::OK);
+        let rows = listed.rows()?;
+        let (handle, number, _, _) = rows.first().ok_or("the card list lists no row")?;
         // audit: COCOM01Y-014
         assert!(
-            reply.int("card_ref") == Some(*handle)
-                && reply.text("acct_id") == Some(card.acct.as_str())
-                && reply.text("card_num") == Some(number.as_str()),
-            "{path} reads another card by the listed handle"
+            *handle == card.handle && *number == card.redacted,
+            "the listed row is not the card's handle and redacted number"
         );
-    }
-    Ok(())
+        // audit: COCOM01Y-014
+        assert!(
+            number.len() == 16
+                && number.get(..12) == Some("************")
+                && number.get(12..) == card.number.get(12..)
+                && *number != card.number,
+            "the listed card number is not twelve * and the last four digits"
+        );
+        let sent = by_ref(&card.acct, &handle.to_string());
+        for path in [VIEW, EDIT] {
+            let reply = h.get(path, &sent, &h.user).await?;
+            assert_eq!(reply.status, StatusCode::OK, "{path}");
+            // audit: COCOM01Y-014
+            assert!(
+                reply.int("card_ref") == Some(*handle)
+                    && reply.text("acct_id") == Some(card.acct.as_str())
+                    && reply.text("card_num") == Some(number.as_str()),
+                "{path} reads another card by the listed handle"
+            );
+        }
+        Ok(())
+    })
 }
 
-// The cases below have no single COBOL result. Each test asserts nothing and is reported
-// ignored with its halt; the tags keep the rows visible to the a8 coverage check, which counts
-// them as blocked, never as satisfied.
+// The cases below have no single COBOL result. Each test asserts nothing, is reported ignored
+// with its halt, and returns an error naming that halt, so a run that includes ignored tests
+// reports it failed, never passed. The tags keep the rows visible to the a8 coverage check,
+// which counts them as blocked, never as satisfied.
 
 // audit: COCRDLIC-037
 #[test]
 #[ignore = "BLOCKED(H4): COCRDLIC-037 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of the CARDDAT file-error text have no PostgreSQL counterpart"]
-fn blocked_cocrdlic_file_error_codes() {}
+fn blocked_cocrdlic_file_error_codes() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H4): COCRDLIC-037 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of \
+         the CARDDAT file-error text have no PostgreSQL counterpart"
+            .into(),
+    )
+}
 
 // audit: COCRDLIC-038
 #[test]
 #[ignore = "BLOCKED(X-COCRDLIC-H1): COCRDLIC-038 — a browse whose STARTBR finds no card ends the task by CICS's abnormal end, which no endpoint response reproduces"]
-fn blocked_cocrdlic_unpositioned_browse() {}
+fn blocked_cocrdlic_unpositioned_browse() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDLIC-H1): COCRDLIC-038 — a browse whose STARTBR finds no card ends the \
+         task by CICS's abnormal end, which no endpoint response reproduces"
+            .into(),
+    )
+}
 
 // audit: COCRDLIC-006
 // audit: COCRDLIC-008
 // audit: COCRDLIC-009
 #[test]
 #[ignore = "BLOCKED(X-COCRDLIC-H2): COCRDLIC-006, COCRDLIC-008, COCRDLIC-009 — the zero test of a non-numeric filter reads invalid zoned data, whose result the compiler options decide"]
-fn blocked_cocrdlic_filter_zero_test() {}
+fn blocked_cocrdlic_filter_zero_test() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDLIC-H2): COCRDLIC-006, COCRDLIC-008, COCRDLIC-009 — the zero test of \
+         a non-numeric filter reads invalid zoned data, whose result the compiler options decide"
+            .into(),
+    )
+}
 
 // audit: COCRDSLC-005
 #[test]
 #[ignore = "BLOCKED(X-COCRDSLC-H2): COCRDSLC-005 — the first-entry test reads uninitialised working storage before the COMMAREA is moved in"]
-fn blocked_cocrdslc_first_entry_storage() {}
+fn blocked_cocrdslc_first_entry_storage() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDSLC-H2): COCRDSLC-005 — the first-entry test reads uninitialised \
+         working storage before the COMMAREA is moved in"
+            .into(),
+    )
+}
 
 // audit: COCRDSLC-011
 // audit: COCRDSLC-012
 #[test]
 #[ignore = "BLOCKED(X-COCRDSLC-H1): COCRDSLC-011, COCRDSLC-012 — the zero test of a non-numeric input reads invalid zoned data, whose result the compiler options decide"]
-fn blocked_cocrdslc_input_zero_test() {}
+fn blocked_cocrdslc_input_zero_test() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDSLC-H1): COCRDSLC-011, COCRDSLC-012 — the zero test of a non-numeric \
+         input reads invalid zoned data, whose result the compiler options decide"
+            .into(),
+    )
+}
 
 // audit: COCRDSLC-017
 #[test]
 #[ignore = "BLOCKED(H4): COCRDSLC-017 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of the CARDDAT file-error text have no PostgreSQL counterpart"]
-fn blocked_cocrdslc_file_error_codes() {}
+fn blocked_cocrdslc_file_error_codes() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H4): COCRDSLC-017 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of \
+         the CARDDAT file-error text have no PostgreSQL counterpart"
+            .into(),
+    )
+}
 
 // audit: COCRDUPC-047
 #[test]
 #[ignore = "BLOCKED(H4): COCRDUPC-047 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of the CARDDAT file-error text have no PostgreSQL counterpart"]
-fn blocked_cocrdupc_file_error_codes() {}
+fn blocked_cocrdupc_file_error_codes() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H4): COCRDUPC-047 — the CICS RESP and RESP2 codes in bytes 49-58 and 66-75 of \
+         the CARDDAT file-error text have no PostgreSQL counterpart"
+            .into(),
+    )
+}
 
 // audit: COCRDUPC-002
 // audit: COCRDUPC-038
 #[test]
 #[ignore = "BLOCKED(X-COCRDUPC-H1): COCRDUPC-002 (the C, L and F first-entry case), COCRDUPC-038 (the FILLER bytes written) — both depend on storage past the 160-byte COMMAREA"]
-fn blocked_cocrdupc_commarea_overrun() {}
+fn blocked_cocrdupc_commarea_overrun() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDUPC-H1): COCRDUPC-002 (the C, L and F first-entry case), COCRDUPC-038 \
+         (the FILLER bytes written) — both depend on storage past the 160-byte COMMAREA"
+            .into(),
+    )
+}
 
 // audit: COCRDUPC-011
 // audit: COCRDUPC-013
@@ -2045,4 +2206,12 @@ fn blocked_cocrdupc_commarea_overrun() {}
 // audit: COCRDUPC-038
 #[test]
 #[ignore = "BLOCKED(X-COCRDUPC-H2): COCRDUPC-011, COCRDUPC-013 (zero-nibble keys), COCRDUPC-030, COCRDUPC-032 (non-digit month or year), COCRDUPC-038 (the CVV written) — numeric redefinitions read unchecked screen text"]
-fn blocked_cocrdupc_unchecked_numeric() {}
+fn blocked_cocrdupc_unchecked_numeric() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(X-COCRDUPC-H2): COCRDUPC-011, COCRDUPC-013 (zero-nibble keys), COCRDUPC-030, \
+         COCRDUPC-032 (non-digit month or year), COCRDUPC-038 (the CVV written) — numeric \
+         redefinitions read unchecked screen text"
+            .into(),
+    )
+}

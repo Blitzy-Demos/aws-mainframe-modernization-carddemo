@@ -62,13 +62,15 @@
 //! # Cardholder data
 //!
 //! Report records hold no card number (CBTRN03C-023), but every failure message names record
-//! numbers, block numbers, byte offsets or line positions only, never record bytes, and no
-//! job-log line is printed: the `TRAN-RECORD` line holds a card number in its redacted form
-//! only (CBTRN03C-012). Standard error, which `carddemo-batch` keeps free of protected values,
-//! is the only process output a message shows. Every `tranrept` run, normal or failing, has its
-//! standard output and standard error searched whole for the 50 fixture card numbers, which none
-//! may hold (CBTRN03C-039), the run whose transaction IDs are card numbers included.
+//! numbers, block numbers, byte offsets, line positions or field names only, never record
+//! bytes, and no job-log line is printed: the `TRAN-RECORD` line holds a card number in its
+//! redacted form only (CBTRN03C-012). Standard error, which `carddemo-batch` keeps free of
+//! protected values, is the only process output a message shows. Every `tranrept` run, normal or
+//! failing, has its standard output and standard error searched whole for the 50 fixture card
+//! numbers, which none may hold (CBTRN03C-039), the run whose transaction IDs are card numbers
+//! included.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsStr;
 use std::fs;
@@ -217,6 +219,30 @@ const CARD_MASK_LEN: usize = 12;
 /// `TRAN-ID`, bytes 1-16 of the `TRAN-RECORD` line and columns 1-16 of a detail record
 /// (CBTRN03C-012, CBTRN03C-023).
 const TRAN_ID_LEN: usize = 16;
+/// `TRAN-PROC-TS`, bytes 305-330 of the `TRAN-RECORD` line, as a 0-based range (CVTRA05Y-013).
+const PROC_TS_BYTES: (usize, usize) = (304, 330);
+/// The fields of the `TRAN-RECORD` line, as 0-based ranges covering its 350 bytes, by which a
+/// failure names what differs (CVTRA05Y-001 to CVTRA05Y-014).
+const TRAN_RECORD_FIELDS: [(&str, usize, usize); 14] = [
+    ("TRAN-ID", 0, 16),
+    ("TRAN-TYPE-CD", 16, 18),
+    ("TRAN-CAT-CD", 18, 22),
+    ("TRAN-SOURCE", 22, 32),
+    ("TRAN-DESC", 32, 132),
+    ("TRAN-AMT", 132, 143),
+    ("TRAN-MERCHANT-ID", 143, 152),
+    ("TRAN-MERCHANT-NAME", 152, 202),
+    ("TRAN-MERCHANT-CITY", 202, 252),
+    ("TRAN-MERCHANT-ZIP", 252, 262),
+    ("TRAN-CARD-NUM", 262, 278),
+    ("TRAN-ORIG-TS", 278, 304),
+    ("TRAN-PROC-TS", 304, 330),
+    ("FILLER", 330, 350),
+];
+/// The shape of the `TRAN-PROC-TS` that `posttran` stamps from the clock: layout `D` with the
+/// fraction cut to hundredths, `YYYY-MM-DD-HH.MM.SS.hh0000`, `9` standing for any ASCII digit
+/// (CBTRN02C-013).
+const CLOCK_PROC_TS_SHAPE: &[u8; 26] = b"9999-99-99-99.99.99.990000";
 /// The end-of-file lines: `TRAN-AMT ` (9 characters) and `WS-PAGE-TOTAL` (13), each followed by
 /// its item's 11 digits, the sign overpunched on the last (CBTRN03C-029).
 const TRAN_AMT_LABEL: &str = "TRAN-AMT ";
@@ -241,6 +267,21 @@ const ABEND_LINE: &str = "ABENDING PROGRAM";
 const _: () = assert!(REPORTING_FROM.len() == 15 && REPORTING_TO.len() == 4);
 const _: () = assert!(TRAN_AMT_LABEL.len() == 9 && PAGE_TOTAL_ITEM_LABEL.len() == 13);
 const _: () = assert!(STATUS_LABEL.len() == 20);
+// The fields follow one another from byte 1 to byte 350, `TRAN-PROC-TS` among them.
+const _: () = {
+    let mut index = 0;
+    let mut next = 0;
+    while index < TRAN_RECORD_FIELDS.len() {
+        let (_, start, end) = TRAN_RECORD_FIELDS[index];
+        assert!(start == next && end > start);
+        next = end;
+        index += 1;
+    }
+    assert!(next == TRAN_RECORD_LEN);
+    assert!(
+        TRAN_RECORD_FIELDS[12].1 == PROC_TS_BYTES.0 && TRAN_RECORD_FIELDS[12].2 == PROC_TS_BYTES.1
+    );
+};
 
 /// The target every job-log event carries in the JSON lines of `runtime::telemetry`: the job's
 /// module. The events of `main`, such as `job finished`, carry another.
@@ -258,14 +299,42 @@ const TRANSACTION_CATEGORIES_COLUMN: &str = "tran_cat_type_desc";
 /// The setting the event of a failed report open names in place of the directory's path.
 const REPORTS_DIR_SETTING: &str = "reports under CARDDEMO_VAR_DIR";
 
-/// The file-size limit, in the 512-byte blocks of `ulimit -f` in `/bin/sh` (dash), below the
-/// first buffer the job writes: the binary buffers 8,192 bytes before a write reaches the file,
-/// so the POSTED report fails at its first write, inside the loop (CBTRN03C-033).
-const FIRST_WRITE_LIMIT: u32 = 1;
-/// A limit above the 7 buffers of 61 records the loop writes over POSTED (57,218 bytes) and
-/// below the report's 60,434 bytes (451 records of 134), so only the last write, when the file is
-/// closed, fails (CBTRN03C-034).
-const CLOSE_LIMIT: u32 = 114;
+/// The bytes a file-size limit lies strictly between. `/bin/sh` sets the limit in `ulimit -f`
+/// blocks, whose size depends on the shell: 512 bytes under dash, POSIX and GNU Bash in POSIX
+/// mode, 1,024 under GNU Bash outside it and under Apple's Bash 3.2, which macOS can run as
+/// `/bin/sh`. [`run_size_limited`] therefore sets the fewest blocks of the size
+/// [`ulimit_block_len`] measures whose bytes lie inside the window.
+#[derive(Clone, Copy)]
+struct SizeWindow {
+    above: usize,
+    below: usize,
+}
+
+/// The bytes of each write the job makes to the report over POSTED: the binary buffers 8,192
+/// bytes before a write reaches the file, which hold 61 records of 134.
+const WRITE_LEN: usize = 8_174;
+/// The limit of a run whose report fails at its first write, inside the loop (CBTRN03C-033):
+/// below that write. One block, 512 or 1,024 bytes, lies inside it.
+const FIRST_WRITE_LIMIT: SizeWindow = SizeWindow {
+    above: 0,
+    below: WRITE_LEN,
+};
+/// The limit of a run whose report fails only at the last write, when the file is closed
+/// (CBTRN03C-034): above the 7 writes the loop makes over POSTED (57,218 bytes) and below the
+/// report's 60,434 bytes (451 records of 134). 112 blocks of 512 bytes or 56 of 1,024, 57,344
+/// bytes either way, are the fewest inside it.
+const CLOSE_LIMIT: SizeWindow = SizeWindow {
+    above: 57_218,
+    below: 60_434,
+};
+// 61 records of 134 fill the 8,192 bytes; the loop makes 7 such writes and leaves the close
+// fewer bytes than one.
+const _: () = assert!(
+    WRITE_LEN == 8_192 / (RECORD_LEN + 1) * (RECORD_LEN + 1)
+        && CLOSE_LIMIT.above == 7 * WRITE_LEN
+        && CLOSE_LIMIT.below == REPORT_RECORDS * (RECORD_LEN + 1)
+        && CLOSE_LIMIT.below - CLOSE_LIMIT.above < WRITE_LEN
+);
 
 /// The type of a POSTED detail, which fixes its columns 30-97.
 #[derive(Clone, Copy)]
@@ -1012,36 +1081,96 @@ async fn run_against(
     let mut command = Command::new(env!("CARGO_BIN_EXE_carddemo-batch"));
     command.args(args);
     configure(&mut command, database_url, scratch, log);
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
-/// Runs `carddemo-batch` with `args` against `guard`'s database, logging its job log, after
-/// `/bin/sh` has limited the size of every file it writes to `blocks` blocks of 512 bytes.
+/// `/bin/sh` set to run `program` once it has limited the size of every file `program` writes to
+/// `blocks` of its `ulimit -f` blocks.
 ///
-/// The shell ignores `SIGXFSZ` before it replaces itself with the binary, and an ignored signal
+/// The shell ignores `SIGXFSZ` before it replaces itself with `program`, and an ignored signal
 /// stays ignored across `exec`, so a write past the limit fails with `EFBIG` instead of killing
-/// the process: the job meets it as a failed write. Standard output is a pipe, which the limit
-/// does not reach.
-async fn run_size_limited(
-    guard: &PostgresGuard,
-    scratch: &Scratch,
-    args: &[&OsStr],
-    blocks: u32,
-) -> Result<Output, Box<dyn Error>> {
+/// the process: the job meets it as a failed write. Standard output and standard error are
+/// pipes, which the limit does not reach.
+fn size_limited(blocks: usize, program: &str) -> Command {
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
         .arg(format!(
             "trap '' XFSZ; ulimit -f {blocks} && exec \"$0\" \"$@\""
         ))
-        .arg(env!("CARGO_BIN_EXE_carddemo-batch"))
-        .args(args);
+        .arg(program);
+    command
+}
+
+/// The bytes [`ulimit_block_len`] offers its probe file, more than one block of any shell.
+const PROBE_LEN: usize = 4_096;
+
+/// The bytes of one `ulimit -f` block of `/bin/sh`, measured rather than assumed
+/// ([`SizeWindow`]). Under [`size_limited`] to one block, `dd` copies [`PROBE_LEN`] bytes into a
+/// file in `scratch`, outside `CARDDEMO_VAR_DIR`, one byte per write, so the file stops at the
+/// limit whether the system shortens the write that crosses it or refuses it whole, and its
+/// length is the block. `dd` fails at the refused write, so its status is not read; a file that
+/// holds none or all of the bytes has measured no block.
+async fn ulimit_block_len(scratch: &Scratch) -> Result<usize, Box<dyn Error>> {
+    let probe = scratch.path().join("ulimit-block");
+    let mut target = std::ffi::OsString::from("of=");
+    target.push(&probe);
+    let mut command = size_limited(1, "dd");
+    command
+        .arg("if=/dev/zero")
+        .arg(target)
+        .arg("bs=1")
+        .arg(format!("count={PROBE_LEN}"));
+    let output = test_support::run_child(command, test_support::CHILD_DEADLINE).await?;
+    let len = fs::metadata(&probe).map_or(Ok(0), |metadata| usize::try_from(metadata.len()))?;
+    if len == 0 || len >= PROBE_LEN {
+        return Err(format!(
+            "`ulimit -f 1` in /bin/sh let dd write {len} of {PROBE_LEN} bytes: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        )
+        .into());
+    }
+    Ok(len)
+}
+
+/// The fewest `ulimit -f` blocks of `block_len` bytes whose bytes lie strictly inside `window`.
+fn size_limit_blocks(window: SizeWindow, block_len: usize) -> Result<usize, Box<dyn Error>> {
+    let blocks = window
+        .above
+        .checked_div(block_len)
+        .and_then(|whole| whole.checked_add(1))
+        .ok_or("a `ulimit -f` block of no bytes")?;
+    let limit = blocks
+        .checked_mul(block_len)
+        .ok_or("a file-size limit past usize")?;
+    if limit <= window.above || limit >= window.below {
+        return Err(format!(
+            "no whole number of {block_len}-byte `ulimit -f` blocks lies between {} and {} bytes",
+            window.above, window.below
+        )
+        .into());
+    }
+    Ok(blocks)
+}
+
+/// Runs `carddemo-batch` with `args` against `guard`'s database, logging its job log, through
+/// [`size_limited`] to the fewest blocks of `/bin/sh` whose bytes lie inside `window`, so the
+/// limit lies inside it whichever block size the shell counts in.
+async fn run_size_limited(
+    guard: &PostgresGuard,
+    scratch: &Scratch,
+    args: &[&OsStr],
+    window: SizeWindow,
+) -> Result<Output, Box<dyn Error>> {
+    let blocks = size_limit_blocks(window, ulimit_block_len(scratch).await?)?;
+    let mut command = size_limited(blocks, env!("CARGO_BIN_EXE_carddemo-batch"));
+    command.args(args);
     configure(&mut command, guard.database_url(), scratch, Log::JobLog);
     // Under `cargo llvm-cov` the binary is instrumented and writes its profile when it exits.
     // Under the limit that profile would be cut short and break the merged report, so this run
     // writes it to `/dev/null`, a device the limit does not reach, and adds no coverage.
     command.env("LLVM_PROFILE_FILE", "/dev/null");
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
 /// The environment of every run: `modern/` as working directory, the database `database_url`
@@ -1644,18 +1773,54 @@ fn daily_transactions() -> Result<Vec<TransactionRecord>, Box<dyn Error>> {
 /// twelve `*` and its last four digits; by Cardholder Data Redaction (CBTRN03C-039), the
 /// transaction ID shows in that redacted form too.
 fn id_redacted_tran_record_line(row: &TransactionRecord) -> Result<String, Box<dyn Error>> {
+    let mut line = redacted_tran_record(row)?;
+    line.get_mut(..CARD_MASK_LEN)
+        .ok_or("a transaction record shorter than 350 bytes")?
+        .fill(b'*');
+    Ok(String::from_utf8(line)?)
+}
+
+/// The `TRAN-RECORD` line of `row`, transcribed from CBTRN03C-012: the row's 350 bytes with the
+/// six free-text fields as `*` and the card number as twelve `*` and its last four digits.
+fn redacted_tran_record(row: &TransactionRecord) -> Result<Vec<u8>, Box<dyn Error>> {
     let mut line = row.encode();
-    for &(start, end) in &MASKED_BYTES {
+    if line.len() != TRAN_RECORD_LEN {
+        return Err(format!("a transaction record of {} bytes", line.len()).into());
+    }
+    for (start, end) in MASKED_BYTES
+        .into_iter()
+        .chain([(CARD_BYTES.0, CARD_BYTES.0 + CARD_MASK_LEN)])
+    {
         line.get_mut(start..end)
             .ok_or("a transaction record shorter than 350 bytes")?
             .fill(b'*');
     }
-    for start in [0, CARD_BYTES.0] {
-        line.get_mut(start..start + CARD_MASK_LEN)
-            .ok_or("a transaction record shorter than 350 bytes")?
-            .fill(b'*');
+    Ok(line)
+}
+
+/// The `TRAN-RECORD` line of each POSTED detail of [`BLOCKS`], by its transaction ID: the
+/// detail's `dailytran.txt` record, read in place, in its redacted form. `posttran` moves every
+/// field of the record but `DALYTRAN-PROC-TS` unchanged into the row it writes (CBTRN02C-012),
+/// so every byte of the line but `TRAN-PROC-TS` is the record's (CBTRN03C-012).
+fn expected_tran_record_lines() -> Result<HashMap<Vec<u8>, Vec<u8>>, Box<dyn Error>> {
+    let daily = daily_transactions()?;
+    let mut lines = HashMap::new();
+    for detail in BLOCKS.iter().flat_map(|block| block.details) {
+        let row = detail
+            .tran_line
+            .checked_sub(1)
+            .and_then(|index| daily.get(index))
+            .ok_or_else(|| format!("dailytran.txt has no line {}", detail.tran_line))?;
+        let line = redacted_tran_record(row)?;
+        let id = line
+            .get(..TRAN_ID_LEN)
+            .ok_or("a transaction record shorter than its ID")?
+            .to_vec();
+        if lines.insert(id, line).is_some() {
+            return Err(format!("dailytran.txt:{} repeats a detail's ID", detail.tran_line).into());
+        }
     }
-    Ok(String::from_utf8(line)?)
+    Ok(lines)
 }
 
 /// `text` padded on the right with spaces to a report record (CBTRN03C-032).
@@ -1901,6 +2066,61 @@ fn is_tran_record_line(line: &str) -> bool {
     bytes.len() == TRAN_RECORD_LEN && masked && card
 }
 
+/// The `TRAN-PROC-TS` of the rows a report over POSTED reads, as its `TRAN-RECORD` lines show it.
+#[derive(Clone, Copy)]
+enum ProcTs {
+    /// The stamp the test stored in every row, compared byte for byte.
+    Stored(&'static [u8; 26]),
+    /// The stamp `posttran` took from the system clock, which a subprocess cannot be given: a
+    /// time field, compared by its format only, [`CLOCK_PROC_TS_SHAPE`].
+    Clock,
+}
+
+impl ProcTs {
+    /// Whether `shown`, bytes 305-330 of a `TRAN-RECORD` line, is this stamp.
+    fn admits(self, shown: &[u8]) -> bool {
+        match self {
+            ProcTs::Stored(stamp) => shown == stamp.as_slice(),
+            ProcTs::Clock => {
+                shown.len() == CLOCK_PROC_TS_SHAPE.len()
+                    && shown
+                        .iter()
+                        .zip(CLOCK_PROC_TS_SHAPE)
+                        .all(|(&byte, &shape)| {
+                            if shape == b'9' {
+                                byte.is_ascii_digit()
+                            } else {
+                                byte == shape
+                            }
+                        })
+            }
+        }
+    }
+}
+
+/// The fields in which `shown`, a `TRAN-RECORD` job-log line, departs from `expected`, its row's
+/// redacted line: every field byte for byte but `TRAN-PROC-TS`, which `proc_ts` decides, and
+/// `length` for a line of other than 350 bytes.
+fn differing_fields(shown: &[u8], expected: &[u8], proc_ts: ProcTs) -> Vec<&'static str> {
+    let mut fields: Vec<&'static str> = TRAN_RECORD_FIELDS
+        .iter()
+        .filter(|&&(_, start, end)| {
+            let field = shown.get(start..end);
+            let matches = if (start, end) == PROC_TS_BYTES {
+                field.is_some_and(|stamp| proc_ts.admits(stamp))
+            } else {
+                field.is_some() && field == expected.get(start..end)
+            };
+            !matches
+        })
+        .map(|&(name, ..)| name)
+        .collect();
+    if shown.len() != TRAN_RECORD_LEN {
+        fields.push("length");
+    }
+    fields
+}
+
 /// Whether `line` is the end-of-file line `label` followed by a signed DISPLAY item: ten digits,
 /// then a digit with the sign overpunched (CBTRN03C-029).
 fn is_amount_line(line: &str, label: &str) -> bool {
@@ -1917,9 +2137,15 @@ fn is_amount_line(line: &str, label: &str) -> bool {
 /// Checks the job log of a normal run over POSTED against the `report` it wrote, its window line
 /// being `reporting_line`: the start line, the window line, one `TRAN-RECORD` line per detail in
 /// report order, the two end-of-file lines and the end line, and nothing else (CBTRN03C-006,
-/// CBTRN03C-008 to CBTRN03C-010, CBTRN03C-012, CBTRN03C-029, CBTRN03C-034). Failures name line
-/// positions only.
-fn assert_posted_job_log(log: &[String], reporting_line: &str, report: &[u8]) -> TestResult {
+/// CBTRN03C-008 to CBTRN03C-010, CBTRN03C-012, CBTRN03C-029, CBTRN03C-034). Each `TRAN-RECORD`
+/// line is the redacted line of the detail whose transaction ID it shows, byte for byte, its
+/// `TRAN-PROC-TS` being `proc_ts`. Failures name line positions and fields only.
+fn assert_posted_job_log(
+    log: &[String],
+    reporting_line: &str,
+    report: &[u8],
+    proc_ts: ProcTs,
+) -> TestResult {
     let records = fixed_records(report, RECORD_LEN)?;
     let mut detail_numbers: Vec<usize> = BLOCKS
         .iter()
@@ -1953,16 +2179,27 @@ fn assert_posted_job_log(log: &[String], reporting_line: &str, report: &[u8]) ->
     let shown = log
         .get(2..2 + POSTED_ROWS)
         .ok_or("the job log ends before one TRAN-RECORD line per selected row")?;
-    let malformed: Vec<usize> = shown
-        .iter()
-        .zip(3_usize..)
-        .filter(|(line, _)| !is_tran_record_line(line))
-        .map(|(_, number)| number)
-        .collect();
+    // Each line is matched by its transaction ID, as X-TRANREPT-H1 leaves the order inside a card
+    // block to the sort; a line whose ID is no detail's, or one shown before, differs in its ID.
+    let mut expected = expected_tran_record_lines()?;
+    let mut differing: Vec<(usize, Vec<&str>)> = Vec::new();
+    for (line, number) in shown.iter().map(String::as_bytes).zip(3_usize..) {
+        let fields = line
+            .get(..TRAN_ID_LEN)
+            .and_then(|id| expected.remove(id))
+            .map_or_else(
+                || vec!["TRAN-ID"],
+                |want| differing_fields(line, &want, proc_ts),
+            );
+        if !fields.is_empty() {
+            differing.push((number, fields));
+        }
+    }
     // audit: CBTRN03C-012
     assert!(
-        malformed.is_empty(),
-        "job-log lines that are not a redacted TRAN-RECORD line: {malformed:?}"
+        differing.is_empty(),
+        "job-log lines that differ from their detail's redacted TRAN-RECORD line, by line and \
+         field: {differing:?}"
     );
     let shown_ids: Vec<&[u8]> = shown
         .iter()
@@ -2064,7 +2301,7 @@ async fn report_over_posted_transactions_matches_audit() -> TestResult {
     // audit: CBTRN03C-004
     assert_posted_report(&run.report, &start, &end)?;
     let reporting_line = format!("{REPORTING_FROM}{start}{REPORTING_TO}{end}");
-    assert_posted_job_log(&run.job_log, &reporting_line, &run.report)?;
+    assert_posted_job_log(&run.job_log, &reporting_line, &run.report, ProcTs::Clock)?;
     // audit: CBTRN03C-003
     assert!(
         TransactionRepository::find_all_in_card_order(&mut store).await? == posted,
@@ -2119,7 +2356,12 @@ async fn default_window() -> TestResult {
     // audit: CBTRN03C-004
     // audit: FIXRPT-901
     assert_posted_report(&run.report, DEFAULT_START, DEFAULT_END)?;
-    assert_posted_job_log(&run.job_log, DEFAULT_REPORTING_LINE, &run.report)
+    assert_posted_job_log(
+        &run.job_log,
+        DEFAULT_REPORTING_LINE,
+        &run.report,
+        ProcTs::Stored(POSTED_PROC_TS),
+    )
 }
 
 /// Transaction IDs that are card numbers: two `dailytran.txt` records of two cards that
@@ -2365,10 +2607,10 @@ async fn a_selection_lost_after_its_first_row_abends_the_read() -> TestResult {
     Ok(())
 }
 
-/// One run of [`report_writes_past_a_size_limit_abend_the_run`]: the file-size limit, the
-/// failure line the write it stops shows, and the rule that line proves.
+/// One run of [`report_writes_past_a_size_limit_abend_the_run`]: the bytes its file-size limit
+/// lies between, the failure line the write it stops shows, and the rule that line proves.
 struct LimitCase {
-    blocks: u32,
+    limit: SizeWindow,
     failure_line: &'static str,
     rule: &'static str,
 }
@@ -2386,12 +2628,12 @@ async fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
     let (start, end) = window_around_today()?;
     let cases = [
         LimitCase {
-            blocks: FIRST_WRITE_LIMIT,
+            limit: FIRST_WRITE_LIMIT,
             failure_line: WRITE_REPTFILE,
             rule: "CBTRN03C-033",
         },
         LimitCase {
-            blocks: CLOSE_LIMIT,
+            limit: CLOSE_LIMIT,
             failure_line: CLOSE_REPTFILE,
             rule: "CBTRN03C-034",
         },
@@ -2400,7 +2642,7 @@ async fn report_writes_past_a_size_limit_abend_the_run() -> TestResult {
         let rule = case.rule;
         let scratch = Scratch::new()?;
         let args = tranrept_args(&start, &end);
-        let output = run_size_limited(&guard, &scratch, &args, case.blocks).await?;
+        let output = run_size_limited(&guard, &scratch, &args, case.limit).await?;
         // audit: CBTRN03C-039
         assert_no_fixture_card_number(&output)?;
         // audit: CBTRN03C-035

@@ -34,8 +34,7 @@ import {
  * card-number check asserts a verdict only, never the value (Cardholder Data Redaction).
  */
 
-// A missing control fails its step after this bound instead of waiting for the test timeout, and
-// `transfer` relies on it to retry a menu choice that a finished navigation has overtaken.
+// A missing control fails its step after this bound instead of waiting for the test timeout.
 test.use({ actionTimeout: 15_000 });
 
 /** The member names of the 21 maps. */
@@ -316,11 +315,6 @@ const SIGNON_HEADER: readonly HeaderLabel[] = [
   { text: "Time :", row: 2, col: 64, span: 6, field: "CURTIME" },
 ];
 
-/** The path the page shows now. */
-function pathOf(page: Page): string {
-  return new URL(page.url()).pathname;
-}
-
 /** The two-digit option number of the 0-based menu line `index`. */
 function optionNumber(index: number): string {
   return String(index + 1).padStart(2, "0");
@@ -374,22 +368,46 @@ async function expectMenuOptions(page: Page, options: readonly string[]): Promis
   }
 }
 
+/** The ENTER key of both menus' row 24 (COMEN01-028, COADM01-028). */
+const MENU_ENTER = "ENTER=Continue";
+
+/** The bound on a menu choice's transfer, as on an action: the target's module loads on arrival. */
+const TRANSFER_TIMEOUT = 15_000;
+
 /**
- * Chooses option `nn` on the menu shown and waits for its transfer to `target`.
+ * Waits until the menu shown is ready for ENTER: its option table is shown and its keyboard is
+ * unlocked. COMEN01 and COADM01 read their option table (endpoint 2, endpoint 3) on every arrival
+ * and lock the keyboard while it loads or reloads: the form and the key row are `aria-busy`, the
+ * option input is read-only and `ENTER=Continue` is `aria-disabled`, and an ENTER pressed
+ * meanwhile decides nothing. The lock shows from the menu's first render, so a caller that has
+ * seen the menu's screen and then finds every signal released has a menu that serves ENTER.
+ */
+async function expectMenuReady(page: Page): Promise<void> {
+  const option = page.getByLabel(labelPattern("Please select an option"));
+  await expect(page.locator('[data-field="OPTN001"]')).not.toHaveText(/^\s*$/);
+  await expect(page.locator("form", { has: option })).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByRole("group", { name: "Function keys", exact: true })).toHaveAttribute(
+    "aria-busy",
+    "false",
+  );
+  await expect(option).toBeEditable();
+  await expect(page.getByRole("button", { name: MENU_ENTER, exact: true })).toBeEnabled();
+}
+
+/**
+ * Chooses option `nn` once on the menu shown and waits for its transfer to `target`.
  *
- * COMEN01 decides ENTER from endpoint 2's option table and ignores ENTER while that table loads,
- * which it does again on every arrival with nothing on screen to show it; COADM01 ignores ENTER
- * until its table first loads. An ignored ENTER sends nothing and changes nothing, so the choice is
- * repeated until the transfer happens. A choice that a finished transfer overtakes fails within
- * the action timeout, and the next attempt then finds the target shown.
+ * The choice waits for the menu's keyboard lock to release (`expectMenuReady`), then types the
+ * option and presses ENTER once, which the unlocked menu decides. Nothing is pressed again: a menu
+ * that drops that ENTER stays shown, and the step fails when the transfer bound expires.
  */
 async function transfer(page: Page, nn: string, target: ScreenExpectation): Promise<void> {
-  await expect(async () => {
-    if (pathOf(page) !== target.route) {
-      await chooseOption(page, nn);
-    }
-    await expect(page).toHaveURL((url) => url.pathname === target.route, { timeout: 2_000 });
-  }).toPass({ timeout: 60_000 });
+  await expectMenuReady(page);
+  await chooseOption(page, nn);
+  await expect(page, `option ${nn} transfers to ${target.route}`).toHaveURL(
+    (url) => url.pathname === target.route,
+    { timeout: TRANSFER_TIMEOUT },
+  );
   await expectScreen(page, target);
 }
 

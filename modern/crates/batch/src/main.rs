@@ -291,8 +291,8 @@ fn has_line_break(path: &Path) -> bool {
 }
 
 /// Opens the pool, runs `selected` and reports its result, inside the job span. A pool that
-/// cannot be opened is reported as a connection failure, after which `intcalc` also shows its
-/// first open's failure (CBACT04C-034).
+/// cannot be opened is reported as a connection failure, which `intcalc` precedes with its
+/// first line and follows with its first open's failure (CBACT04C-002, CBACT04C-034).
 async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -> ExitCode {
     let pool = match runtime::db::connect(config).await {
         Ok(pool) => pool,
@@ -300,10 +300,15 @@ async fn execute(job: &'static str, selected: CheckedJob<'_>, config: &Config) -
             // The summary keeps an error class and a SQLSTATE at most: the driver's own text can
             // quote the connection URL.
             let error = runtime::db::ErrorSummary::from(&error);
+            // CBACT04C-002, CBACT04C-034: the connection stands for INTCALC's input opens, which
+            // follow its first line, so its failure is the first open's: the first line, this
+            // event carrying the cause, then that open's abend lines. Every other job shows none.
+            let intcalc = matches!(selected, CheckedJob::Intcalc(_));
+            if intcalc {
+                jobs::intcalc::show_start();
+            }
             tracing::error!(job, error = %error, "database connection failed (DATABASE_URL)");
-            // CBACT04C-034: the connection stands for INTCALC's input opens, so its failure is
-            // the first open's, shown with that open's abend lines. Every other job shows none.
-            if matches!(selected, CheckedJob::Intcalc(_)) {
+            if intcalc {
                 jobs::intcalc::show_failed_connection();
             }
             return fail(

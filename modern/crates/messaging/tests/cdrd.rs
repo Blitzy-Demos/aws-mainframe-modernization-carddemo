@@ -14,6 +14,13 @@
 //! - Reply bytes that do not depend on the request body, and IDs copied from each reply's own
 //!   request (CODATE01-001, CODATE01-013).
 //! - The acknowledgement only after the reply is confirmed (CODATE01-012, the request override).
+//!   A reply on its queue is not a confirmed one, as the broker queues a message before its
+//!   confirmation reaches the publisher, so the worker connects through a
+//!   `test_support::rabbitmq::ConfirmGate` that withholds the broker's confirmation for
+//!   [`HOLD`]. While it is held, the reply is on `CARD.DEMO.REPLY.DATE` and the request is
+//!   neither acknowledged nor rejected; the acknowledgement comes once the gate has handed the
+//!   confirmation on. A confirmation the gate refuses, a negative one, is a failed put: the
+//!   request is acknowledged only after its `MQPUT ERR` message is confirmed (CODATE01-014).
 //! - The failure paths and how their request is settled (CODATE01-014, CODATE01-015,
 //!   CODATE01-018, CODATE01-019).
 //!
@@ -28,7 +35,7 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use chrono::NaiveDate;
@@ -40,11 +47,11 @@ use lapin::message::Delivery;
 use lapin::options::{ConfirmSelectOptions, QueueDeclareOptions, QueueDeleteOptions};
 use lapin::types::{FieldTable, ShortString};
 use lapin::{BasicProperties, Channel, Connection};
-use messaging::broker::{Acknowledger, AmqpError};
+use messaging::broker::{Acknowledger, AmqpError, PUBLISH_DEADLINE};
 use messaging::workers::cdrd::Worker;
 use messaging::workers::{Processed, Step};
 use runtime::config::Config;
-use test_support::rabbitmq::{self, RabbitMqGuard};
+use test_support::rabbitmq::{self, ConfirmGate, RabbitMqGuard};
 use test_support::trace_capture;
 use tokio::time::{Instant, sleep, timeout};
 
@@ -68,6 +75,15 @@ const SETTLE_WINDOW: Duration = Duration::from_secs(2);
 /// Interval between queue counts.
 const POLL: Duration = Duration::from_millis(100);
 
+/// How long the confirmation gate withholds a confirmation that has reached it before the test
+/// reads the queues and the acknowledger. A quarter of the worker's [`PUBLISH_DEADLINE`] at
+/// most, so that the publication and its released confirmation still finish within it.
+const HOLD: Duration = Duration::from_secs(1);
+const _: () = assert!(
+    HOLD.as_millis() * 4 <= PUBLISH_DEADLINE.as_millis(),
+    "HOLD must stay well within PUBLISH_DEADLINE"
+);
+
 /// AMQP 0-9-1 `reply-success`, sent when the test closes the worker's connection.
 const REPLY_SUCCESS: u16 = 200;
 
@@ -83,10 +99,11 @@ const REPLY_TEXT_MASK: &[u8; REPLY_TEXT_LEN] = b"SYSTEM DATE : NN-NN-NNNNSYSTEM 
 /// configuration and, dropped last, the container guard.
 struct Harness {
     channel: Channel,
-    connection: Connection,
+    /// The connection that carries `channel`, kept open with it.
+    _connection: Connection,
     worker_connection: Connection,
     config: Config,
-    _guard: RabbitMqGuard,
+    guard: RabbitMqGuard,
 }
 
 impl Harness {
@@ -106,10 +123,10 @@ impl Harness {
         };
         Ok(Self {
             channel,
-            connection,
+            _connection: connection,
             worker_connection,
             config,
-            _guard: guard,
+            guard,
         })
     }
 
@@ -122,6 +139,52 @@ impl Harness {
     async fn worker(&self) -> TestResult<Worker> {
         let open = Worker::open(&self.worker_connection, &self.config, fixed_clock()?);
         bounded("open the CDRD worker", open).await
+    }
+
+    /// A confirmation gate in front of the broker, a connection of the worker's own through it,
+    /// and a CDRD worker on that connection that reads the fixed clock and settles through a
+    /// [`RecordingAcknowledger`] filling `record`.
+    async fn gated_worker(
+        &self,
+        record: &Arc<Record>,
+    ) -> TestResult<(ConfirmGate, Connection, Worker<RecordingAcknowledger>)> {
+        let gate = self.guard.confirm_gate().await?;
+        let connection = gate.connect().await?;
+        let open = Worker::open(&connection, &self.config, fixed_clock()?);
+        let worker = bounded("open the CDRD worker through the gate", open).await?;
+        let double = RecordingAcknowledger {
+            gate: gate.clone(),
+            record: Arc::clone(record),
+        };
+        Ok((gate, connection, worker.with_acknowledger(double)))
+    }
+
+    /// Waits until `count` confirmations have reached `gate`, keeps the last of them withheld
+    /// for [`HOLD`], and reads at its end what `queue` holds and what `record` has seen. The
+    /// held confirmation is then settled with `settle` whatever the reads returned, so that the
+    /// worker is never left waiting for it.
+    async fn hold(
+        &self,
+        gate: &ConfirmGate,
+        record: &Record,
+        count: usize,
+        queue: &str,
+        settle: fn(&ConfirmGate),
+    ) -> TestResult<Held> {
+        let held = async {
+            gate.wait_for_arrivals(count, GET_TIMEOUT).await?;
+            sleep(HOLD).await;
+            let queued = rabbitmq::message_count(&self.channel, queue).await?;
+            Ok(Held {
+                queued,
+                passed: gate.passed(),
+                acks: record.acks.load(Ordering::SeqCst),
+                rejected: record.rejected.load(Ordering::SeqCst),
+            })
+        }
+        .await;
+        settle(gate);
+        held
     }
 
     /// Publishes a request with `body` and `properties` and waits for the broker's confirmation.
@@ -371,31 +434,58 @@ fn assert_copied_properties(
 /// What [`RecordingAcknowledger`] saw.
 #[derive(Default)]
 struct Record {
-    acked: AtomicBool,
-    reply_queued_at_ack: AtomicBool,
+    /// Acknowledgements made.
+    acks: AtomicUsize,
+    /// How many confirmations the gate had handed on to the worker at the latest one.
+    passed_at_ack: AtomicUsize,
     rejected: AtomicBool,
 }
 
-/// An [`Acknowledger`] that settles nothing on the broker. At the acknowledgement it reads, on
-/// the test's own connection, whether `CARD.DEMO.REPLY.DATE` already holds the one reply.
+/// An [`Acknowledger`] that settles nothing on the broker. Each acknowledgement is counted with
+/// the number of confirmations the gate had handed on to the worker when it was made.
 struct RecordingAcknowledger {
-    channel: Channel,
+    gate: ConfirmGate,
     record: Arc<Record>,
 }
 
 impl Acknowledger for RecordingAcknowledger {
     async fn ack(&self, _delivery_tag: u64) -> Result<(), AmqpError> {
-        let queued = rabbitmq::message_count(&self.channel, REPLY_QUEUE).await;
         self.record
-            .reply_queued_at_ack
-            .store(matches!(queued, Ok(1)), Ordering::SeqCst);
-        self.record.acked.store(true, Ordering::SeqCst);
+            .passed_at_ack
+            .store(self.gate.passed(), Ordering::SeqCst);
+        self.record.acks.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
     async fn reject_without_requeue(&self, _delivery_tag: u64) -> Result<(), AmqpError> {
         self.record.rejected.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+/// What [`Harness::hold`] read at the end of one hold of a confirmation.
+#[derive(Debug, PartialEq, Eq)]
+struct Held {
+    /// The ready messages of the queue the held confirmation's message went to.
+    queued: u32,
+    /// Confirmations the gate had handed on to the worker.
+    passed: usize,
+    /// Acknowledgements the worker had made.
+    acks: usize,
+    /// Whether the worker had rejected the request.
+    rejected: bool,
+}
+
+impl Held {
+    /// A hold at whose end `queue` held `queued` messages, the gate had handed on `passed`
+    /// confirmations and the request was not settled.
+    fn unsettled(queued: u32, passed: usize) -> Self {
+        Self {
+            queued,
+            passed,
+            acks: 0,
+            rejected: false,
+        }
     }
 }
 
@@ -482,25 +572,27 @@ async fn ack_follows_confirmed_reply() -> TestResult {
         .publish_request(b"DATE", request_ids("cdrd-msg-0004", "cdrd-corr-0004"))
         .await?;
     let record = Arc::new(Record::default());
-    let double = RecordingAcknowledger {
-        channel: bounded(
-            "open the recording channel",
-            harness.connection.create_channel(),
-        )
-        .await?,
-        record: Arc::clone(&record),
-    };
-    let mut worker = harness.worker().await?.with_acknowledger(double);
+    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
 
-    let processed = step(&mut worker, &harness.worker_connection).await?;
-    assert_eq!(processed, Processed::Replied);
-    assert!(
-        record.acked.load(Ordering::SeqCst),
-        "the request was not acknowledged"
+    // The worker answers while the test holds the reply's confirmation, then releases it.
+    let held = harness.hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::release);
+    let (processed, held) = tokio::join!(step(&mut worker, &gated), held);
+    // Queue presence is not confirmation: the reply was on its queue throughout the hold.
+    assert_eq!(
+        held?,
+        Held::unsettled(1, 0),
+        "while the reply's confirmation was held: the reply queued, the request unsettled"
     );
-    assert!(
-        record.reply_queued_at_ack.load(Ordering::SeqCst),
-        "the request was acknowledged before its reply was on CARD.DEMO.REPLY.DATE"
+    assert_eq!(processed?, Processed::Replied);
+    assert_eq!(
+        record.acks.load(Ordering::SeqCst),
+        1,
+        "the request was acknowledged once"
+    );
+    assert_eq!(
+        record.passed_at_ack.load(Ordering::SeqCst),
+        1,
+        "the request was acknowledged before the reply's confirmation reached the worker"
     );
     assert!(
         !record.rejected.load(Ordering::SeqCst),
@@ -509,7 +601,76 @@ async fn ack_follows_confirmed_reply() -> TestResult {
 
     // The double, not the consumer channel, settled the request: closing the worker's
     // connection returns it to its queue.
-    let close = harness.worker_connection.close(REPLY_SUCCESS, "test done");
+    let close = gated.close(REPLY_SUCCESS, "test done");
+    bounded("close the worker connection", close).await?;
+    harness.wait_for_count(harness.request_queue(), 1).await
+}
+
+// audit: CODATE01-012
+// audit: CODATE01-014
+// audit: CODATE01-015
+// audit: CODATE01-018
+#[tokio::test]
+async fn refused_reply_confirmation_acks_only_after_the_confirmed_mqput_err() -> TestResult {
+    let harness = Harness::start().await?;
+    harness
+        .publish_request(b"DATE", request_ids("cdrd-msg-0008", "cdrd-corr-0008"))
+        .await?;
+    let record = Arc::new(Record::default());
+    let (gate, gated, mut worker) = harness.gated_worker(&record).await?;
+
+    // The reply's confirmation is held, then refused; the MQPUT ERR message's is held, then
+    // released.
+    let holds = async {
+        let reply = harness
+            .hold(&gate, &record, 1, REPLY_QUEUE, ConfirmGate::refuse)
+            .await?;
+        let error = harness
+            .hold(&gate, &record, 2, ERROR_QUEUE, ConfirmGate::release)
+            .await?;
+        Ok::<_, Box<dyn Error + Send + Sync>>((reply, error))
+    };
+    let (processed, holds) = tokio::join!(step(&mut worker, &gated), holds);
+    let (reply_hold, error_hold) = holds?;
+    // The broker queued the reply and only the worker was told Nack, so the reply is on
+    // CARD.DEMO.REPLY.DATE: a refused confirmation, not an unroutable reply.
+    assert_eq!(
+        reply_hold,
+        Held::unsettled(1, 0),
+        "while the reply's confirmation was held"
+    );
+    assert_eq!(
+        error_hold,
+        Held::unsettled(1, 1),
+        "while the error message's confirmation was held"
+    );
+    // Only Ack(None) is a confirmed put: the refused reply took the MQPUT ERR path.
+    assert_eq!(processed?, Processed::ErrorRouted);
+    assert_eq!(
+        record.acks.load(Ordering::SeqCst),
+        1,
+        "the request was acknowledged once"
+    );
+    assert_eq!(
+        record.passed_at_ack.load(Ordering::SeqCst),
+        2,
+        "the request was acknowledged before the error message's confirmation reached the worker"
+    );
+    assert!(
+        !record.rejected.load(Ordering::SeqCst),
+        "the request was rejected"
+    );
+    let error = harness.take(ERROR_QUEUE).await?;
+    assert_error_body(&error.data, REPLY_QUEUE)?;
+    assert_copied_properties(
+        &error.properties,
+        Some("cdrd-msg-0008"),
+        Some("cdrd-corr-0008"),
+    );
+
+    // The double, not the consumer channel, settled the request: closing the worker's
+    // connection returns it to its queue.
+    let close = gated.close(REPLY_SUCCESS, "test done");
     bounded("close the worker connection", close).await?;
     harness.wait_for_count(harness.request_queue(), 1).await
 }

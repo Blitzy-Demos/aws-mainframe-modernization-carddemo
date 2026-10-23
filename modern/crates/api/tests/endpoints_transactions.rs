@@ -297,8 +297,21 @@ fn blocked(rule: &str, halt: &str) {
     eprintln!("BLOCKED({halt}): {rule}; no parity result asserted");
 }
 
-#[tokio::test]
-async fn cotrn02c_add_then_view_rows() -> TestResult {
+/// Runs `test` to completion on a current-thread runtime, the one Tokio's test attribute
+/// builds, without the lint attributes that attribute's expansion carries.
+fn block_on(test: impl Future<Output = TestResult>) -> TestResult {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(test)
+}
+
+#[test]
+fn cotrn02c_add_then_view_rows() -> TestResult {
+    block_on(add_then_view_rows())
+}
+
+async fn add_then_view_rows() -> TestResult {
     let harness = Harness::loaded().await?;
     let token = harness.sign_on("USER0001").await?;
     key_edits(&harness, &token).await?;
@@ -658,10 +671,17 @@ fn check_inserted(record: &TransactionRecord) -> TestResult {
     // audit: COTRN02C-047
     assert_eq!(record.amt.as_decimal(), Decimal::new(1234, 2));
     // audit: COTRN02C-046
-    for ts in [&record.orig_ts, &record.proc_ts] {
-        let ts = ts.value().ok_or("no stored timestamp")?;
-        assert_eq!(ts.form(), TsForm::ScreenDate);
-        assert_eq!(ts.value().time().to_string(), "00:00:00");
+    // Each field holds its own entered date of `entered()` at midnight, never a clock value.
+    for (field, stored, (year, month, day)) in [
+        ("orig_ts", &record.orig_ts, (2022, 6, 10)),
+        ("proc_ts", &record.proc_ts, (2022, 6, 11)),
+    ] {
+        let ts = stored.value().ok_or("no stored timestamp")?;
+        let midnight = NaiveDate::from_ymd_opt(year, month, day)
+            .and_then(|date| date.and_hms_opt(0, 0, 0))
+            .ok_or("an invalid entered date")?;
+        assert_eq!(ts.form(), TsForm::ScreenDate, "{field} layout");
+        assert_eq!(ts.value(), midnight, "{field} at 00:00:00.000000");
     }
     Ok(())
 }
@@ -789,8 +809,12 @@ fn check_view(response: &Value, record: &TransactionRecord) -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn cotrn00c_list_rows() -> TestResult {
+#[test]
+fn cotrn00c_list_rows() -> TestResult {
+    block_on(list_rows())
+}
+
+async fn list_rows() -> TestResult {
     let h = Harness::loaded().await?;
     let token = h.sign_on("USER0001").await?;
     h.list(&token, &[]).await?;
@@ -1003,8 +1027,12 @@ async fn search_and_boundaries(
     Ok(())
 }
 
-#[tokio::test]
-async fn view_and_copy_numeric_pictures() -> TestResult {
+#[test]
+fn view_and_copy_numeric_pictures() -> TestResult {
+    block_on(numeric_pictures())
+}
+
+async fn numeric_pictures() -> TestResult {
     let h = Harness::loaded().await?;
     let token = h.sign_on("USER0001").await?;
     let mut record = fixture_transactions()?
@@ -1049,8 +1077,12 @@ async fn view_and_copy_numeric_pictures() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn store_failures_answer_the_lookup_messages() -> TestResult {
+#[test]
+fn store_failures_answer_the_lookup_messages() -> TestResult {
+    block_on(store_failure_messages())
+}
+
+async fn store_failure_messages() -> TestResult {
     let guard = start_postgres().await?;
     guard.pool().close().await;
     let h = Harness::over(guard)?;
@@ -1119,8 +1151,12 @@ async fn store_failures_answer_the_lookup_messages() -> TestResult {
     Ok(())
 }
 
-#[tokio::test]
-async fn allocation_and_write_failures_roll_back() -> TestResult {
+#[test]
+fn allocation_and_write_failures_roll_back() -> TestResult {
+    block_on(write_failures_roll_back())
+}
+
+async fn write_failures_roll_back() -> TestResult {
     let mut h = Harness::loaded().await?;
     let token = h.sign_on("USER0001").await?;
     let mut request = entered();

@@ -6,31 +6,40 @@
 //! migrated by the `test-support` harness, and starts it in `modern/`, the working directory of
 //! every binary, so the relative defaults `../app/data/ASCII` and `../app/jcl/DUSRSECJ.jcl`
 //! resolve as they do for an operator. The fixtures are read in place. The inputs no fixture
-//! holds (a subset, a refused line, keys out of sequence, broken decks) are scratch files in the
-//! test's temporary directory, passed with `--input`, as LOADS.md ("How the rows are proved")
-//! prescribes. State is read back only through the `persistence` repository traits (R4).
+//! holds (a subset, disjoint slices for two concurrent runs, a refused line, keys out of
+//! sequence, broken decks) are scratch files in the test's temporary directory, passed with
+//! `--input`, as LOADS.md ("How the rows are proved") prescribes. State is read back only
+//! through the `persistence` repository traits (R4). The concurrent-load test also observes the
+//! server's lock waits in its log, which `PostgresGuard::server_log` reads through Docker with
+//! no SQL.
 //!
 //! Expected values are transcribed from the audit rows and the fixture bytes they cite, never
-//! from the code under test, and each assertion carries the rule IDs it proves. LOADS.md names
-//! no halt, so no assertion here is blocked. This crate issues no query (R4), so LOADS-020, the
-//! unchanged catalog, and the clauses of FIXLOAD-011 no repository reads whole (`auth_fraud`,
-//! `pending_auth_details`, the whole of schema `db2`) are proved in
-//! `crates/persistence/tests/schema.rs`, over the loads' statements. This file proves
+//! from the code under test, and each assertion carries the rule IDs it proves. Expected records
+//! are the fixture lines decoded by codec A at the `copybook` level, never through the
+//! `domain::batch::loads` path the binary decodes with, and a loaded row must also re-encode to
+//! its line's bytes. LOADS.md names no halt, so no assertion here is blocked. This crate issues
+//! no query (R4), so LOADS-020, the unchanged catalog, and the clauses of FIXLOAD-011 no
+//! repository reads whole (`auth_fraud`, `pending_auth_details`, the whole of schema `db2`) are
+//! proved in `crates/persistence/tests/schema.rs`, over the loads' statements. This file proves
 //! FIXLOAD-011's `var/` clause and its empty tables that a repository reads whole
 //! (`transactions`, `pending_auth_summaries`, `cssl_error_log`) against the real binary.
 //!
 //! Cardholder Data Redaction: the fixtures hold card numbers, CVVs, SSNs and passwords. Records
 //! and input bytes are compared in memory and never printed; a failed comparison names the table
-//! and the row index, or the file, and nothing else.
+//! and the row index, or the file, and nothing else. The server log, which can quote statement
+//! texts, is parsed in memory too, and a failure names only the wait it lacks.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use copybook::{PicU, PicX};
+use copybook::framing::decode_all;
+use copybook::{FixedRecord, Framed, PicU, PicX};
 use domain::online::cocrdlic::CardRef;
 use domain::password;
 use domain::records::{
@@ -50,6 +59,8 @@ use test_support::fixtures::{
 };
 use test_support::modern_dir;
 use test_support::postgres::{PostgresGuard, start_postgres};
+use tokio::sync::oneshot;
+use tokio::time::{self, Instant};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -108,6 +119,29 @@ const PAGE_LIMIT: i64 = 100;
 /// A broker URL nothing listens on (port 9, discard): a load that needed `RabbitMQ` would fail
 /// against it (LOADS-037).
 const UNREACHABLE_BROKER: &str = "amqp://127.0.0.1:9/%2f";
+
+/// The server settings of the two concurrent runs' sessions, as `options` parameters of their
+/// `DATABASE_URL`: each lock wait of the session that lasts 100 ms is logged with the backends
+/// holding the lock and the waiting statement, and its end is logged when the lock is acquired.
+/// Both are superuser settings, which the image's bootstrap user `carddemo` may set.
+const LOG_LOCK_WAITS: &str = "options[log_lock_waits]=on&options[deadlock_timeout]=100ms";
+
+/// The two statements of the `accounts` replacement a concurrent run waits in, as the server log
+/// quotes them: they tell which wait is which, and are no expectation of the audit.
+const LOCK_ACCOUNTS: &str = "LOCK TABLE accounts IN SHARE ROW EXCLUSIVE MODE";
+const DELETE_ACCOUNTS: &str = "DELETE FROM accounts";
+
+/// Interval between two reads of the server log while a lock wait is awaited.
+const LOG_POLL: Duration = Duration::from_millis(50);
+
+/// Bound on awaiting a lock wait in the server log, far above the 100 ms after which the server
+/// logs it, so only a run that never waits reaches it.
+const LOG_BOUND: Duration = Duration::from_secs(60);
+
+/// Bound on one read of `accounts` while both concurrent runs wait. A read never waits for their
+/// locks; one that did would wait for the test's own transaction, so the bound turns it into a
+/// failure.
+const READ_BOUND: Duration = Duration::from_secs(10);
 
 /// A private directory under the system temporary directory, removed with everything in it when
 /// the guard drops. `var/` inside it is the `CARDDEMO_VAR_DIR` of every run.
@@ -220,7 +254,7 @@ async fn run_batch_on(
     } else {
         command.env_remove("CARDDEMO_FIXTURE_DIR");
     }
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
 /// The lines of standard output that name a written path: every line that is not empty and does
@@ -640,6 +674,117 @@ fn assert_reference_contents(tables: &Tables) {
     );
 }
 
+/// Asserts that `stored`, the rows of `table` in key order, are the records of `input`, the bytes
+/// of the fixture the table was loaded from, as [`framed_records`] decodes them: one row per
+/// line, each equal to its line's record in every copybook-derived field, in file order, which
+/// is key order because every fixture's keys ascend (FIXFRM-020). Each row is then re-encoded
+/// inside its line's framing and must give that line's bytes, terminator included, so every
+/// stored field is tied to the fixture bytes themselves; the encoding also checks that a short
+/// body's missing tail is blank FILLER (PIC-013). A failure names the table and the row or line
+/// index only.
+fn assert_rows_are_input<'a, R>(
+    table: &str,
+    stored: impl IntoIterator<Item = &'a R>,
+    input: &[u8],
+) -> TestResult
+where
+    R: FixedRecord + PartialEq + Clone + 'a,
+{
+    let stored: Vec<&R> = stored.into_iter().collect();
+    let expected = framed_records::<R>(input)?;
+    let records: Vec<&R> = expected.iter().map(|line| &line.record).collect();
+    assert_eq!(
+        stored.len(),
+        records.len(),
+        "{table}: rows against input lines"
+    );
+    assert_eq!(
+        first_difference(&records, &stored),
+        None,
+        "{table}: first row that differs from its input line"
+    );
+
+    let mut encoded = Vec::with_capacity(stored.len());
+    for (index, (&row, line)) in stored.iter().zip(&expected).enumerate() {
+        let framed = Framed {
+            record: row.clone(),
+            framing: line.framing,
+        };
+        encoded.push(framed.try_encode().map_err(|err| {
+            format!("{table}: row {index} does not re-encode inside its line framing: {err}")
+        })?);
+    }
+    let encoded: Vec<&[u8]> = encoded.iter().map(Vec::as_slice).collect();
+    let lines: Vec<&[u8]> = input.split_inclusive(|&byte| byte == b'\n').collect();
+    assert_eq!(
+        first_difference(&lines, &encoded),
+        None,
+        "{table}: first input line its row does not re-encode to"
+    );
+    Ok(())
+}
+
+/// Asserts that the eight fixture loads left each table holding exactly its fixture's records,
+/// field by field and down to the bytes of each line, as [`assert_rows_are_input`] compares them,
+/// with every fixture read in place. `cards.card_ref` is no copybook field and is left out
+/// (LOADS-027); the users are compared by [`assert_users`], whose passwords are hashes.
+fn assert_fixture_contents(tables: &Tables) -> TestResult {
+    let fixture = |name: &str| fs::read(fixture_path(name));
+    // audit: LOADS-001
+    // audit: LOADS-032
+    // audit: FIXLOAD-001
+    assert_rows_are_input("accounts", &tables.accounts, &fixture("acctdata.txt")?)?;
+    // audit: LOADS-002
+    // audit: LOADS-032
+    // audit: FIXLOAD-002
+    assert_rows_are_input("cards", card_records(tables), &fixture("carddata.txt")?)?;
+    // audit: LOADS-003
+    // audit: LOADS-030
+    // audit: LOADS-032
+    // audit: FIXLOAD-003
+    assert_rows_are_input("card_xref", &tables.xrefs, &fixture("cardxref.txt")?)?;
+    // audit: LOADS-004
+    // audit: LOADS-032
+    // audit: FIXLOAD-004
+    assert_rows_are_input("customers", &tables.customers, &fixture("custdata.txt")?)?;
+    // audit: LOADS-005
+    // audit: LOADS-032
+    // audit: FIXLOAD-005
+    assert_rows_are_input(
+        "disclosure_groups",
+        &tables.groups,
+        &fixture("discgrp.txt")?,
+    )?;
+    // audit: LOADS-006
+    // audit: LOADS-031
+    // audit: LOADS-032
+    // audit: FIXLOAD-006
+    assert_rows_are_input(
+        "tran_cat_balances",
+        &tables.balances,
+        &fixture("tcatbal.txt")?,
+    )?;
+    // audit: LOADS-007
+    // audit: LOADS-031
+    // audit: LOADS-032
+    // audit: FIXLOAD-007
+    assert_rows_are_input(
+        "transaction_categories",
+        &tables.categories,
+        &fixture("trancatg.txt")?,
+    )?;
+    // audit: LOADS-008
+    // audit: LOADS-031
+    // audit: LOADS-032
+    // audit: FIXLOAD-008
+    assert_rows_are_input(
+        "transaction_types",
+        &tables.types,
+        &fixture("trantype.txt")?,
+    )?;
+    Ok(())
+}
+
 /// The ten users after a `dusrsecj` run, against the deck's records in key order and
 /// `passwords`, the 8 `SEC-USR-PWD` bytes of each record in deck order: every column but the
 /// password as decoded and padded, and in its place an argon2id PHC string that verifies the
@@ -851,6 +996,23 @@ fn concat<'a>(parts: impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
     parts.flatten().copied().collect()
 }
 
+/// The lines of the load input `bytes` decoded as `R`, each with its line framing, in input
+/// order: the expected records of a load, taken from the input itself. The decoder is codec A at
+/// the `copybook` level, `framing::decode_all`, whose field values the i8 round trip and its
+/// decoded-corpus snapshot fix against the copybooks, and not the `domain::batch::loads` path the
+/// binary decodes through.
+fn framed_records<R: FixedRecord>(bytes: &[u8]) -> TestResult<Vec<Framed<R>>> {
+    Ok(decode_all::<R>(bytes)?)
+}
+
+/// The records of [`framed_records`] without their line framing, in input order.
+fn input_records<R: FixedRecord>(bytes: &[u8]) -> TestResult<Vec<R>> {
+    Ok(framed_records::<R>(bytes)?
+        .into_iter()
+        .map(|line| line.record)
+        .collect())
+}
+
 /// An `acctfile` input the load must refuse: the scratch file name, its bytes, the start of the
 /// refused line, which the error must not show, and the line numbers the error must name.
 struct Refusal<'a> {
@@ -902,6 +1064,11 @@ async fn assert_refused_accounts(
 /// The nine loads in `scripts/dev-up.sh` order on a freshly migrated database, then again on the
 /// loaded one, then once more in reverse order: every run succeeds, the first leaves the fixture
 /// contents, and the later runs leave the same copybook-derived contents.
+///
+/// The first load's rows are compared field by field with the fixture lines, decoded from the
+/// files read in place, and re-encoded inside each line's framing to the lines' bytes
+/// ([`assert_fixture_contents`]); its users with the deck's records ([`assert_users`]). The later
+/// runs are compared with that proven first load.
 #[tokio::test(flavor = "multi_thread")]
 async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
     let guard = start_postgres().await?;
@@ -921,6 +1088,7 @@ async fn nine_loads_in_dev_up_order_then_rerun() -> TestResult {
     // audit: LOADS-015
     run_loads(&guard, &scratch, &DEV_UP_ORDER, &needles).await?;
     let first = snapshot(&mut store).await?;
+    assert_fixture_contents(&first)?;
     assert_master_contents(&first, &card_numbers);
     assert_reference_contents(&first);
     assert_users(&first.users, &passwords)?;
@@ -1190,42 +1358,361 @@ async fn a_refused_input_leaves_the_previous_contents() -> TestResult {
     Ok(())
 }
 
-/// Two runs of `acctfile` at once, over the whole fixture and over its first ten records: both
-/// exit 0, and the table then holds exactly the input set of one of them, never their union.
+/// One lock wait of a backend, as the server logs it under `log_lock_waits`.
+///
+/// It has no `Debug`: its statement is server log text, which a failure never shows.
+struct LockWait {
+    /// The waiting backend.
+    pid: u32,
+    /// `false` for the report that the backend still waits, `true` for the report that it
+    /// acquired the lock after waiting.
+    acquired: bool,
+    /// The lock as the server names it: the mode, then the object, as in
+    /// `ShareLock on transaction 745` or `ShareRowExclusiveLock on relation 16390 of database
+    /// 16384`.
+    lock: String,
+    /// The backends holding a lock on the object, from the report's `DETAIL`, whether or not
+    /// their mode conflicts with the one awaited; empty when the report has none.
+    holders: Vec<u32>,
+    /// The statement that waits, from the report's `STATEMENT`; `None` until that line is in the
+    /// log.
+    statement: Option<String>,
+}
+
+/// The lock waits of the server log `log`, in log order.
+///
+/// Under the image's `log_line_prefix`, `%m [%p] `, every line reads
+/// `<date> <time> UTC [<pid>] <severity>:  <text>`. A wait is reported as
+/// `LOG:  process <pid> still waiting for <lock> after <ms> ms`, and its end as
+/// `LOG:  process <pid> acquired <lock> after <ms> ms`. The lines of the same pid that follow,
+/// among which other backends' lines may fall, complete the report:
+/// `DETAIL:  Process holding the lock: <pid>. Wait queue: <pids>.` (`Processes holding the lock:
+/// <pid>, <pid>. …` for several holders), an optional `CONTEXT:  …`, then `STATEMENT:  <sql>`.
+/// Any other message of that pid ends the report, and a line in any other shape, such as the
+/// image's entrypoint output, is no report.
+fn lock_waits(log: &[u8]) -> Vec<LockWait> {
+    let text = String::from_utf8_lossy(log);
+    let mut waits: Vec<LockWait> = Vec::new();
+    // The report each backend's next `DETAIL` or `STATEMENT` line completes, by index in `waits`.
+    let mut open: BTreeMap<u32, usize> = BTreeMap::new();
+    for line in text.lines() {
+        let Some((pid, severity, message)) = log_line(line) else {
+            continue;
+        };
+        match severity {
+            "DETAIL" => {
+                let report = open.get(&pid).and_then(|&index| waits.get_mut(index));
+                if let (Some(wait), Some(holders)) = (report, lock_holders(message)) {
+                    wait.holders = holders;
+                }
+            }
+            "STATEMENT" => {
+                if let Some(wait) = open.remove(&pid).and_then(|index| waits.get_mut(index)) {
+                    wait.statement = Some(message.to_owned());
+                }
+            }
+            "CONTEXT" | "HINT" => {}
+            _ => {
+                open.remove(&pid);
+                if let Some((acquired, lock)) = lock_report(pid, message) {
+                    open.insert(pid, waits.len());
+                    waits.push(LockWait {
+                        pid,
+                        acquired,
+                        lock,
+                        holders: Vec::new(),
+                        statement: None,
+                    });
+                }
+            }
+        }
+    }
+    waits
+}
+
+/// The pid, severity and text of one server log line (see [`lock_waits`]), or `None` for a line
+/// in another shape.
+fn log_line(line: &str) -> Option<(u32, &str, &str)> {
+    let (_, rest) = line.split_once(" [")?;
+    let (pid, rest) = rest.split_once("] ")?;
+    let (severity, text) = rest.split_once(":  ")?;
+    Some((pid.parse().ok()?, severity, text))
+}
+
+/// Whether the `LOG` text `text` of backend `pid` reports a lock it still waits for (`false`) or
+/// acquired after waiting (`true`), with that lock; `None` for any other message.
+fn lock_report(pid: u32, text: &str) -> Option<(bool, String)> {
+    let report = text.strip_prefix(&format!("process {pid} "))?;
+    let (acquired, rest) = match report.strip_prefix("still waiting for ") {
+        Some(rest) => (false, rest),
+        None => (true, report.strip_prefix("acquired ")?),
+    };
+    let (lock, _) = rest.rsplit_once(" after ")?;
+    Some((acquired, lock.to_owned()))
+}
+
+/// The holder pids of a lock wait's `DETAIL` text, or `None` when it names none.
+fn lock_holders(text: &str) -> Option<Vec<u32>> {
+    let listed = text
+        .strip_prefix("Process holding the lock: ")
+        .or_else(|| text.strip_prefix("Processes holding the lock: "))?;
+    let (holders, _) = listed.split_once(". Wait queue: ")?;
+    holders.split(", ").map(|pid| pid.parse().ok()).collect()
+}
+
+/// Reads the server log of `guard` every [`LOG_POLL`] until a lock wait satisfies `wanted`, and
+/// returns that backend's pid.
+///
+/// When the run watched has ended, `ended` is set, and the call fails at once rather than at
+/// [`LOG_BOUND`]: a run that ends before its wait is seen never waited. `awaited` names the wait
+/// in the error, which never shows the log.
+async fn await_lock_wait(
+    guard: &PostgresGuard,
+    awaited: &str,
+    ended: Option<&AtomicBool>,
+    wanted: impl Fn(&LockWait) -> bool,
+) -> TestResult<u32> {
+    let deadline = Instant::now() + LOG_BOUND;
+    loop {
+        // The flag is read before the log, so a run it shows ended had ended before the log was
+        // read; a run that waits cannot end while the lock it waits for is held.
+        let run_ended = ended.is_some_and(|flag| flag.load(Ordering::SeqCst));
+        let log = guard.server_log().await?;
+        if let Some(wait) = lock_waits(&log).iter().find(|&wait| wanted(wait)) {
+            return Ok(wait.pid);
+        }
+        if run_ended {
+            return Err(
+                format!("{awaited}: the run ended before the server logged the wait").into(),
+            );
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "{awaited}: not in the server log within {} ms",
+                LOG_BOUND.as_millis()
+            )
+            .into());
+        }
+        time::sleep(LOG_POLL).await;
+    }
+}
+
+/// The scratch file `name` holding lines `range` of `acctdata.txt` (0-based, end excluded), and
+/// the records those bytes decode to.
+fn account_slice(
+    scratch: &Scratch,
+    fixture: &[u8],
+    name: &str,
+    range: Range<usize>,
+) -> TestResult<(PathBuf, Vec<AccountRecord>)> {
+    let lines: Vec<&[u8]> = fixture.split_inclusive(|&byte| byte == b'\n').collect();
+    let slice = lines
+        .get(range)
+        .ok_or("acctdata.txt holds fewer lines than a slice needs")?;
+    let bytes = concat(slice.iter().copied());
+    let path = scratch.path(name);
+    fs::write(&path, &bytes)?;
+    Ok((path, input_records(&bytes)?))
+}
+
+/// The keys of `accounts`.
+fn account_keys(accounts: &[AccountRecord]) -> BTreeSet<u64> {
+    accounts.iter().map(|account| account.id.get()).collect()
+}
+
+/// The two waits of [`concurrent_runs_of_one_load_leave_one_input_set`], observed while the test
+/// holds the lock of the first prior row: run A, already started, takes the table lock and waits
+/// in its delete for the test's transaction; run B, started through `start_b` once that wait is
+/// logged, waits for the table lock with A among its holders (the test's backend is listed too,
+/// but its ROW SHARE does not conflict with SHARE ROW EXCLUSIVE); and while both wait, a read of
+/// `accounts` returns at once and sees `prior`, the rows committed before either run. Returns the
+/// pids of A and B.
+///
+/// An error drops `start_b` unsent when B has not been started, so B never runs.
+async fn observe_overlap(
+    guard: &PostgresGuard,
+    reader: &mut PgStore,
+    prior: &[AccountRecord],
+    start_b: oneshot::Sender<()>,
+    ended: [&AtomicBool; 2],
+) -> TestResult<(u32, u32)> {
+    let [a_ended, b_ended] = ended;
+    let pid_a = await_lock_wait(
+        guard,
+        "run A waiting in its delete for the test's row lock",
+        Some(a_ended),
+        |wait| {
+            !wait.acquired
+                && wait.lock.starts_with("ShareLock on transaction ")
+                && wait.statement.as_deref() == Some(DELETE_ACCOUNTS)
+        },
+    )
+    .await?;
+    start_b
+        .send(())
+        .map_err(|()| "run B is gone before its start")?;
+    let pid_b = await_lock_wait(
+        guard,
+        "run B waiting for the table lock run A holds",
+        Some(b_ended),
+        |wait| {
+            !wait.acquired
+                && wait.pid != pid_a
+                && wait.lock.starts_with("ShareRowExclusiveLock on relation ")
+                && wait.holders.contains(&pid_a)
+                && wait.statement.as_deref() == Some(LOCK_ACCOUNTS)
+        },
+    )
+    .await?;
+
+    let read = time::timeout(READ_BOUND, AccountRepository::find_all(reader))
+        .await
+        .map_err(|_| {
+            format!(
+                "accounts: a read while both runs wait did not return within {} ms",
+                READ_BOUND.as_millis()
+            )
+        })??;
+    // audit: LOADS-014
+    // audit: LOADS-040
+    assert_eq!(
+        first_difference(prior, &read),
+        None,
+        "accounts while both runs wait: first row that differs from lines 1-10"
+    );
+    // audit: LOADS-040
+    assert!(
+        !a_ended.load(Ordering::SeqCst) && !b_ended.load(Ordering::SeqCst),
+        "a run ended while the test held its row lock"
+    );
+    Ok((pid_a, pid_b))
+}
+
+/// Two runs of `acctfile` whose transactions overlap, over disjoint inputs: lines 11-30 of
+/// `acctdata.txt` (run A) and lines 31-50 (run B), on a table holding lines 1-10.
+///
+/// The test holds the row lock of account 1, so run A takes the table lock and its delete waits
+/// for the test's transaction; run B starts only once the server logs that wait, and waits for
+/// the table lock A holds. Both waits are read from the server log, which `log_lock_waits` makes
+/// report each wait with its holders and statement; no sleep orders the runs. While both wait, a
+/// reader still sees lines 1-10. The test then rolls its transaction back: A commits first, B
+/// acquires the table lock A held and commits last. Both exit 0, and the table holds exactly the
+/// records of lines 31-50: no row of lines 1-10 or of run A, so never a union of inputs.
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_runs_of_one_load_leave_one_input_set() -> TestResult {
     let guard = start_postgres().await?;
     let scratch = Scratch::create("concurrent")?;
     let mut store = PgStore::new(guard.pool().clone());
-    let whole = fs::canonicalize(fixture_path("acctdata.txt"))?;
-    let subset = scratch.path("acctdata-first-10.txt");
-    fs::write(&subset, first_lines(&fs::read(&whole)?, 10))?;
-    let whole_args = ["acctfile", "--input", path_arg(&whole)?];
-    let subset_args = ["acctfile", "--input", path_arg(&subset)?];
-    let whole_keys = one_to_fifty();
-    let subset_keys: Vec<u64> = (1..=10).collect();
+    let mut reader = PgStore::new(guard.pool().clone());
+    let fixture = fs::read(fixture_path("acctdata.txt"))?;
+    let (prior_path, prior) = account_slice(&scratch, &fixture, "acctdata-1-10.txt", 0..10)?;
+    let (a_path, a_records) = account_slice(&scratch, &fixture, "acctdata-11-30.txt", 10..30)?;
+    let (b_path, b_records) = account_slice(&scratch, &fixture, "acctdata-31-50.txt", 30..50)?;
+    let (prior_keys, a_keys, b_keys) = (
+        account_keys(&prior),
+        account_keys(&a_records),
+        account_keys(&b_records),
+    );
+    assert!(
+        prior_keys.is_disjoint(&a_keys)
+            && prior_keys.is_disjoint(&b_keys)
+            && a_keys.is_disjoint(&b_keys),
+        "acctdata.txt: two of lines 1-10, 11-30 and 31-50 share a key"
+    );
 
-    for round in 1..=3 {
-        let (first, second) = tokio::join!(
-            run_batch(&guard, &scratch, &whole_args, None),
-            run_batch(&guard, &scratch, &subset_args, None),
-        );
+    let loaded = run_batch(
+        &guard,
+        &scratch,
+        &["acctfile", "--input", path_arg(&prior_path)?],
+        None,
+    )
+    .await?;
+    // audit: LOADS-014
+    assert_exit(&loaded, 0, "acctfile over lines 1-10");
+    // audit: LOADS-014
+    assert_eq!(
+        first_difference(&prior, &AccountRepository::find_all(&mut store).await?),
+        None,
+        "accounts after lines 1-10: first row that differs"
+    );
+
+    // `SELECT … FOR UPDATE` takes ROW SHARE on the table, which the load's SHARE ROW EXCLUSIVE
+    // does not conflict with, and the row lock, which the load's delete waits for.
+    let mut held = store.begin().await?;
+    let first_key = prior.first().ok_or("lines 1-10 hold no record")?.id;
+    AccountRepository::lock_by_id(&mut held, first_key)
+        .await?
+        .ok_or("accounts: the first row of lines 1-10 is not stored")?;
+
+    let logged = format!("{}?{LOG_LOCK_WAITS}", guard.database_url());
+    let a_args = ["acctfile", "--input", path_arg(&a_path)?];
+    let b_args = ["acctfile", "--input", path_arg(&b_path)?];
+    let (a_ended, b_ended) = (AtomicBool::new(false), AtomicBool::new(false));
+    let (start_b, b_started) = oneshot::channel::<()>();
+
+    let run_a = async {
+        let output = run_batch_on(&logged, &scratch, &a_args, None).await;
+        a_ended.store(true, Ordering::SeqCst);
+        output
+    };
+    let run_b = async {
+        // An observer that fails before B is due drops the sender, and B never runs.
+        if b_started.await.is_err() {
+            return Ok(None);
+        }
+        let output = run_batch_on(&logged, &scratch, &b_args, None).await;
+        b_ended.store(true, Ordering::SeqCst);
+        output.map(Some)
+    };
+    let observer = async {
+        let observed =
+            observe_overlap(&guard, &mut reader, &prior, start_b, [&a_ended, &b_ended]).await;
+        // Whatever was observed, ending the test's transaction lets A, then B, go on, so no run
+        // is left waiting.
+        held.rollback().await?;
+        observed
+    };
+    let (a_output, b_output, overlap) = tokio::join!(run_a, run_b, observer);
+
+    // audit: LOADS-040
+    assert_exit(&a_output?, 0, "acctfile over lines 11-30");
+    let b_output: Option<Output> = b_output?;
+    if let Some(output) = &b_output {
         // audit: LOADS-040
-        assert_exit(&first?, 0, "acctfile over the whole fixture");
-        // audit: LOADS-040
-        assert_exit(&second?, 0, "acctfile over the first 10 records");
-        let keys: Vec<u64> = AccountRepository::find_all(&mut store)
-            .await?
-            .iter()
-            .map(|account| account.id.get())
-            .collect();
-        // audit: LOADS-040
-        assert!(
-            keys == whole_keys || keys == subset_keys,
-            "round {round}: accounts hold neither input set ({} rows)",
-            keys.len()
-        );
+        assert_exit(output, 0, "acctfile over lines 31-50");
     }
+    let (_, pid_b) = overlap?;
+    if b_output.is_none() {
+        return Err("acctfile over lines 31-50 never started".into());
+    }
+    // audit: LOADS-040
+    await_lock_wait(
+        &guard,
+        "run B acquiring the table lock after run A ended",
+        None,
+        |wait| {
+            wait.acquired
+                && wait.pid == pid_b
+                && wait.lock.starts_with("ShareRowExclusiveLock on relation ")
+        },
+    )
+    .await?;
+
+    let after = AccountRepository::find_all(&mut store).await?;
+    // audit: LOADS-014
+    // audit: LOADS-040
+    assert_eq!(
+        after.len(),
+        b_records.len(),
+        "accounts after both runs: rows against lines 31-50"
+    );
+    // audit: LOADS-014
+    // audit: LOADS-040
+    assert_eq!(
+        first_difference(&b_records, &after),
+        None,
+        "accounts after both runs: first row that differs from lines 31-50"
+    );
     Ok(())
 }
 

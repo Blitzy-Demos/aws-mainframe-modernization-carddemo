@@ -63,6 +63,17 @@ const NOTE_LENGTH = 42;
 /** COSGN00-037: `ENTER=Sign-on` and `F3=Exit`, in map order. */
 const KEY_ITEMS = keyRowItems(KEY_ROWS.COSGN00);
 
+/** `WS-MESSAGE PIC X(80)` (`app/cbl/COSGN00C.cbl:38`), the field F3 sends as plain text. */
+const WS_MESSAGE_WIDTH = 80;
+
+/**
+ * COSGN00C-004: the session-end text as F3 sends it. `MOVE CCDA-MSG-THANK-YOU TO WS-MESSAGE`
+ * (`app/cbl/COSGN00C.cbl:89`) pads the 50-byte message with spaces to the 80-byte field, and
+ * `SEND TEXT FROM(WS-MESSAGE) LENGTH(LENGTH OF WS-MESSAGE)` sends all 80 bytes
+ * (`app/cbl/COSGN00C.cbl:162-172`).
+ */
+const SESSION_END_TEXT = THANK_YOU.padEnd(WS_MESSAGE_WIDTH, " ");
+
 /*
  * Colour tokens of AAP 0.4.3: BLUE is `muted-foreground`; TURQUOISE, GREEN and NEUTRAL are the
  * foreground. A grid column is wider than a character, so a literal fills only part of its cell:
@@ -231,7 +242,7 @@ export function COSGN00(): ReactNode {
     // keys, so it is not framed by ScreenShell.
     return (
       <main ref={endedRef} tabIndex={-1} className="p-4 font-mono text-sm text-foreground">
-        <p className="whitespace-pre">{THANK_YOU}</p>
+        <p className="whitespace-pre">{SESSION_END_TEXT}</p>
       </main>
     );
   }

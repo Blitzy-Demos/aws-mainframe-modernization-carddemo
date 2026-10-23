@@ -38,7 +38,8 @@
 //! included, those parts are asserted and the halted positions skipped. The committed fraud
 //! toggle, COPAUS1C-032's success branch, is still driven once to check the replacement's
 //! intended behaviour; its checks carry no tag, so it is a parity result for no row. The two
-//! ignored tests at the end name the halts H3 and H4 and carry no tag.
+//! ignored tests at the end name the halts H3 and H4, carry no tag and fail when run with
+//! `--ignored`, so a halted row is never reported passed.
 //!
 //! # Probed failures and recordings
 //!
@@ -75,9 +76,13 @@
 //!
 //! `copaus1c_concurrent_fraud_toggles` sends several F5s on one detail at once, as tasks of
 //! their own, while a transaction of the test holds the detail, and checks the replacement's
-//! serialisation of endpoint 23: no F5 answers while the detail is held, endpoint 22 does, and
-//! once released each F5 flips the flag the one before it committed. Its checks of the
-//! committed toggles carry no tag, as COPAUS1C-032's branch is halted.
+//! serialisation of endpoint 23. An `ArrivalProbe` installed with `PgStore::with_probe` on the
+//! API's store runs every statement and counts the F5s that reach the detail's locked read
+//! (`ProbePoint::AuthDetailLock`); the test waits, within a bound that only a failure reaches,
+//! until every F5 has arrived. Then endpoint 22 answers, no F5 has answered and none has
+//! reached COPAUS2C's writes or the replace, and once released each F5 flips the flag the one
+//! before it committed. Its checks of the committed toggles carry no tag, as COPAUS1C-032's
+//! branch is halted.
 //!
 //! # Rules
 //!
@@ -92,6 +97,7 @@
 use std::convert::Infallible;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -117,6 +123,7 @@ use runtime::config::Config;
 use serde_json::{Value, json};
 use test_support::fixtures::{fixture_card_numbers, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tower::ServiceExt;
 
@@ -1271,6 +1278,74 @@ async fn detail_enter(api: &mut Api) -> TestResult {
     Ok(())
 }
 
+/// COPAUS1C's decline table as endpoint 22 shows it, copied from audit row COPAUS1C-017: each of
+/// the ten codes and its Resp Reason, the code, `-`, then the first 15 bytes of the description,
+/// padded with spaces to 20, spellings as written.
+const DECLINE_REASONS: [(&str, &str); 10] = [
+    ("0000", "0000-APPROVED       "),
+    ("3100", "3100-INVALID CARD   "),
+    ("4100", "4100-INSUFFICNT FUND"),
+    ("4200", "4200-CARD NOT ACTIVE"),
+    ("4300", "4300-ACCOUNT CLOSED "),
+    ("4400", "4400-EXCED DAILY LMT"),
+    ("5100", "5100-CARD FRAUD     "),
+    ("5200", "5200-MERCHANT FRAUD "),
+    ("5300", "5300-LOST CARD      "),
+    ("9000", "9000-UNKNOWN        "),
+];
+
+/// The key of account 50's detail for each entry of [`DECLINE_REASONS`], in order: the inverted
+/// processing time `999999999 − HHMMSSmmm` of 11:00:00.000 on 2022-07-18 and of each second
+/// after it, and the key rendered as in [`KEYS`]. No two keys meet.
+const DECLINE_KEYS: [(i64, &str); 10] = [
+    (889_999_999, "0778000889999999"),
+    (889_998_999, "0778000889998999"),
+    (889_997_999, "0778000889997999"),
+    (889_996_999, "0778000889996999"),
+    (889_995_999, "0778000889995999"),
+    (889_994_999, "0778000889994999"),
+    (889_993_999, "0778000889993999"),
+    (889_992_999, "0778000889992999"),
+    (889_991_999, "0778000889991999"),
+    (889_990_999, "0778000889990999"),
+];
+
+/// Account 50's detail for each entry of [`DECLINE_REASONS`], under its key of [`DECLINE_KEYS`]:
+/// the stored reason is the entry's code, the response code `00` for `0000` and `05` for every
+/// other code, and each remaining field is that of `SPECS[1]`.
+fn decline_specs() -> Vec<Spec> {
+    DECLINE_REASONS
+        .iter()
+        .zip(DECLINE_KEYS)
+        .map(|(&(reason, _), (time_9c, _))| Spec {
+            time_9c,
+            resp: if reason == "0000" { "00" } else { "05" },
+            reason,
+            ..SPECS[1]
+        })
+        .collect()
+}
+
+/// Endpoint 22 ENTER for USER0001 on one detail of account 50 per code of COPAUS1C's decline
+/// table, over a database of its own: Resp Reason is the code's table entry. The reason the
+/// table lacks is `copaus1c_detail_and_fraud_rows`'s case (COPAUS1C-018).
+#[tokio::test]
+async fn copaus1c_reason_descriptions() -> TestResult {
+    let guard = start_loaded_postgres().await?;
+    let mut store = PgStore::new(guard.pool().clone());
+    let card = card_of(&mut store, ACCT_50).await?;
+    seed_account_50(&mut store, &card, &decline_specs()).await?;
+    let mut api = Api::signed_on(router_over(PgStore::new(guard.pool().clone()))?).await?;
+    for (&(_, expected), (_, key)) in DECLINE_REASONS.iter().zip(DECLINE_KEYS) {
+        let reply = api.get(&detail_uri(ACCT_50_TEXT, key, "")).await?;
+        reply.expect_ok()?;
+        assert_eq!(reply.text("/auth_key")?, key);
+        // audit: COPAUS1C-017
+        assert_eq!(reply.text("/reason")?, expected, "{key}");
+    }
+    api.assert_redacted()
+}
+
 /// F8 from a detail to the next, and on the last detail.
 async fn detail_next(api: &mut Api) -> TestResult {
     for (from, to) in [(0, 1), (2, 3), (4, 5)] {
@@ -1737,45 +1812,116 @@ async fn update_fails_through_probe(
     Ok(())
 }
 
-/// How long the concurrent F5s are given to show that they wait for the held detail: far longer
-/// than one F5 takes on an idle server.
-const LOCK_WAIT: Duration = Duration::from_millis(300);
-
 /// The F5s [`copaus1c_concurrent_fraud_toggles`] sends at once: an even number, so that as many
 /// serial toggles leave the flag where they found it.
 const CONCURRENT_TOGGLES: usize = 4;
+
+/// How long [`copaus1c_concurrent_fraud_toggles`] waits for its F5s to reach the locked read of
+/// the held detail. It bounds only a failure: the test goes on the moment the last F5 arrives,
+/// and waits this long only when one never does.
+const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The probe of [`copaus1c_concurrent_fraud_toggles`]: it runs every statement, counts the
+/// locked reads of one detail, and notes whether any call got past such a read to COPAUS2C's
+/// `auth_fraud` insert or update or to the replace of the detail.
+struct ArrivalProbe {
+    /// The account and the inverted date and time of the detail whose locked reads are counted.
+    key: (PicS<11>, PicS<5>, PicS<9>),
+    /// The locked reads of `key` asked about so far, published to the test's receiver.
+    arrivals: watch::Sender<usize>,
+    /// Whether an `auth_fraud` insert or update or a replace of a detail was asked about.
+    passed_lock: AtomicBool,
+}
+
+impl ArrivalProbe {
+    /// A probe counting the locked reads of `key`, and the receiver that sees the count.
+    fn counting(key: (PicS<11>, PicS<5>, PicS<9>)) -> (Arc<Self>, watch::Receiver<usize>) {
+        let (arrivals, counted) = watch::channel(0);
+        let probe = Self {
+            key,
+            arrivals,
+            passed_lock: AtomicBool::new(false),
+        };
+        (Arc::new(probe), counted)
+    }
+
+    /// Whether a call that follows the locked read was asked about so far.
+    fn passed_lock(&self) -> bool {
+        self.passed_lock.load(Ordering::SeqCst)
+    }
+}
+
+impl RepositoryProbe for ArrivalProbe {
+    fn answer(&self, call: &ProbeCall<'_>) -> ProbeVerdict {
+        match call.point() {
+            ProbePoint::AuthDetailLock if Seen::key_args(call) == Some(self.key) => {
+                self.arrivals.send_modify(|count| *count += 1);
+            }
+            ProbePoint::AuthFraudInsert
+            | ProbePoint::AuthFraudUpdate
+            | ProbePoint::AuthDetailUpdate => self.passed_lock.store(true, Ordering::SeqCst),
+            _ => {}
+        }
+        ProbeVerdict::Proceed
+    }
+}
+
+/// Waits, for at most [`ARRIVAL_TIMEOUT`], until `arrivals` counts [`CONCURRENT_TOGGLES`] locked
+/// reads; when the wait runs out, the error names how many arrived.
+async fn all_arrived(arrivals: &mut watch::Receiver<usize>) -> TestResult {
+    let waited = tokio::time::timeout(
+        ARRIVAL_TIMEOUT,
+        arrivals.wait_for(|count| *count >= CONCURRENT_TOGGLES),
+    )
+    .await
+    .map(|reached| reached.map(|count| *count));
+    let Ok(reached) = waited else {
+        let arrived = *arrivals.borrow();
+        return Err(format!(
+            "{arrived} of the {CONCURRENT_TOGGLES} F5s reached the held detail's locked read \
+             within {ARRIVAL_TIMEOUT:?}"
+        )
+        .into());
+    };
+    reached?;
+    Ok(())
+}
 
 /// [`CONCURRENT_TOGGLES`] F5s sent at once on one detail while a transaction of the test holds
 /// it, then released by that transaction's commit of a confirmed fraud.
 ///
 /// It asserts the replacement's serialisation of endpoint 23, not COBOL parity: the COBOL's reads
 /// hold nothing, and the committed toggle is COPAUS1C-032's halted branch (X-COPAUS1C-H2), so
-/// its checks carry no tag. No F5 answers while the detail is held, and endpoint 22, which reads
-/// without a lock, still does. Once released, every F5 commits and each reads the flag the one
-/// before it committed, the holder's first: the answers are half removals and half reports, each
-/// showing the flag it stored, and the detail and its `auth_fraud` row end as that many serial
-/// toggles leave them. Two F5s that read the same flag would both report.
+/// its checks carry no tag. An [`ArrivalProbe`] on the API's store counts the F5s that reach the
+/// locked read of the held detail, and the test waits until all of them have, so every check
+/// that follows meets them at the contested lock and never before it. Endpoint 22, which reads
+/// without a lock, still answers; then no F5 has answered and none has reached a statement after
+/// its locked read. Once released, every F5 commits and each reads the flag the one before it
+/// committed, the holder's first: the answers are half removals and half reports, each showing
+/// the flag it stored, and the detail and its `auth_fraud` row end as that many serial toggles
+/// leave them. Two F5s that read the same flag would both report.
 #[tokio::test]
 async fn copaus1c_concurrent_fraud_toggles() -> TestResult {
     let guard = start_loaded_postgres().await?;
     let mut store = PgStore::new(guard.pool().clone());
     let card = card_of(&mut store, ACCT_50).await?;
     seed_account_50(&mut store, &card, std::slice::from_ref(&LOCKED_SPEC)).await?;
-    let mut api = Api::signed_on(router_over(request_store(&guard).await?)?).await?;
     let acct = auth_acct(ACCT_50)?;
     let (date, time) = (
         PicS::new(LOCKED_SPEC.date_9c)?,
         PicS::new(LOCKED_SPEC.time_9c)?,
     );
+    let (probe, mut arrivals) = ArrivalProbe::counting((acct, date, time));
+    let shared: Arc<dyn RepositoryProbe> = probe.clone();
+    let probed = request_store(&guard).await?.with_probe(shared);
+    let mut api = Api::signed_on(router_over(probed)?).await?;
 
     let mut holder = store.begin().await?;
     let mut confirmed = PendingAuthDetailRepository::lock_by_id(&mut holder, acct, date, time)
         .await?
         .ok_or("the detail is seeded")?;
     let toggles = api.spawn_posts(&fraud_uri(ACCT_50_TEXT, LOCKED_KEY), CONCURRENT_TOGGLES)?;
-    tokio::time::sleep(LOCK_WAIT).await;
-    let answered = toggles.iter().filter(|task| task.is_finished()).count();
-    assert_eq!(answered, 0, "F5s answered while the detail was held");
+    all_arrived(&mut arrivals).await?;
 
     // Endpoint 22 answers while the detail is held, with the flag last committed.
     let shown = api.get(&detail_uri(ACCT_50_TEXT, LOCKED_KEY, "")).await?;
@@ -1783,6 +1929,12 @@ async fn copaus1c_concurrent_fraud_toggles() -> TestResult {
     shown.expect_ok()?;
     // audit: COPAUS1C-008
     assert_eq!(shown.text("/fraud_status")?, "-         ");
+    let answered = toggles.iter().filter(|task| task.is_finished()).count();
+    assert_eq!(answered, 0, "F5s answered while the detail was held");
+    assert!(
+        !probe.passed_lock(),
+        "an F5 got past its locked read while the detail was held"
+    );
 
     confirmed.auth_fraud = PicX::from_text("F")?;
     let replaced = PendingAuthDetailRepository::update(&mut holder, acct, &confirmed).await?;
@@ -1810,6 +1962,11 @@ async fn copaus1c_concurrent_fraud_toggles() -> TestResult {
         (removals, replies.len()),
         (CONCURRENT_TOGGLES / 2, CONCURRENT_TOGGLES),
         "removals among the F5s"
+    );
+    assert_eq!(
+        *arrivals.borrow(),
+        CONCURRENT_TOGGLES,
+        "locked reads of the detail, one per F5"
     );
 
     // An even number of toggles from the holder's `F` leaves `F`, with the clock's report date,
@@ -2618,8 +2775,28 @@ fn assert_fraud_moves(
 
 #[test]
 #[ignore = "BLOCKED(H3): COPAUS2C-005, COPAUS2C-010, COPAUS2C-011 — SQLCODE/SQLERRM text defined by Db2"]
-fn blocked_h3_db2_texts() {}
+fn blocked_h3_db2_texts() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H3): COPAUS2C-005, COPAUS2C-010 and COPAUS2C-011: the SQLCODE and SQLSTATE \
+         values COPAUS2C strings into its ' SYSTEM ERROR DB2: CODE:' and \
+         ' UPDT ERROR DB2: CODE:' texts are defined by Db2, with no PostgreSQL counterpart, so \
+         the running tests assert the fixed pieces of those texts, the status and the store \
+         effects, and never a code position"
+            .into(),
+    )
+}
 
 #[test]
 #[ignore = "BLOCKED(H4): COPAUS0C-014 to COPAUS0C-019, COPAUS0C-030, COPAUS0C-037, COPAUS0C-038, COPAUS0C-051, COPAUS1C-007, COPAUS1C-010, COPAUS1C-011, COPAUS1C-026, COPAUS1C-033 — CICS RESP and IMS status codes inside texts"]
-fn blocked_h4_codes() {}
+fn blocked_h4_codes() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H4): COPAUS0C-014 to COPAUS0C-019, COPAUS0C-030, COPAUS0C-037, COPAUS0C-038, \
+         COPAUS0C-051, COPAUS1C-007, COPAUS1C-010, COPAUS1C-011, COPAUS1C-026 and COPAUS1C-033: \
+         the CICS RESP and RESP2 codes and the IMS status strung into their texts are defined \
+         by CICS and IMS, with no PostgreSQL counterpart, so the running tests assert only the \
+         fixed parts of these rows and never a code position"
+            .into(),
+    )
+}

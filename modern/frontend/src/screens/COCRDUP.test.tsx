@@ -866,7 +866,11 @@ describe("COCRDUP rendering", () => {
     focus: LABELS.account,
     info: INFO_SEARCH,
   };
-  /** COCRDUPC-002: the selected card, fetched once by its handle. */
+  /**
+   * The selected card, fetched once by its handle. The stubbed 200 stands for endpoint 9's answer
+   * that server row COCRDUPC-002 describes, proved in `crates/api/tests/endpoints_cards.rs`; this
+   * table proves the screen's handling of it.
+   */
   const listEntry = {
     requests: [{ route: CARDS_EDIT, query: { acct_id: ACCT_ID, card_ref: String(CARD_REF) } }],
     shown: {
@@ -917,7 +921,12 @@ describe("COCRDUP rendering", () => {
       state: { ...FROM_LIST, card_ref: "1" },
       expected: searchEntry,
     },
-    // audit: COCRDUPC-002
+    // audit: COCRDUPC-045
+    // audit: COCRDUPC-046
+    // audit: COCRDUP-031
+    // audit: COCRDUP-032
+    // State `S` protects the keys and opens the details, the cursor goes to the name, the info row
+    // shows the response's info message and the error row stays empty.
     { title: "from COCRDLI", state: { ...listKeys, from: PATHS.COCRDLI }, expected: listEntry },
   ])(
     "an account and card_ref $title: only a COCRDLI selection fetches on entry",
@@ -1032,7 +1041,11 @@ describe("COCRDUP rendering", () => {
     expectNoFullCardDigits();
   });
 
-  // audit: COCRDUPC-003
+  // The stubbed 404 stands for endpoint 9's answer that server row COCRDUPC-003 describes, proved
+  // in `crates/api/tests/endpoints_cards.rs`; this test proves the screen's handling of it.
+  // audit: COCRDUPC-045
+  // audit: COCRDUPC-046
+  // audit: COCRDUP-032
   it("a list entry whose card is not found shows the details empty and enterable", async () => {
     const calls = stubApi({
       [CARDS_EDIT]: [{ status: 404, body: notFound }],
@@ -1985,8 +1998,10 @@ describe("COCRDUP messages", () => {
   });
 
   /**
-   * The 500 of a failed card read (COCRDUPC-019): `WS-FILE-ERROR-MESSAGE` in its 75 bytes, the
-   * RESP and RESP2 fields left blank, as their values are halted (COCRDUPC-047).
+   * The stubbed 500 of a failed card read, standing for endpoint 9's answer that server row
+   * COCRDUPC-019 describes, proved in `crates/api/tests/endpoints_cards.rs`:
+   * `WS-FILE-ERROR-MESSAGE` in its 75 bytes, the RESP and RESP2 fields left blank, as their values
+   * are halted (COCRDUPC-047).
    */
   const fileError: components["schemas"]["ScreenError"] = {
     message: [
@@ -2002,10 +2017,14 @@ describe("COCRDUP messages", () => {
     field: "acct_id",
   };
 
-  // `NOTFND` sets both filter flags, a file error only the account's; NOT-OK moves no `*`, so the
-  // card keeps what it showed. No cursor is asserted for the list entry (state `S`).
-  // audit: COCRDUPC-018
-  // audit: COCRDUPC-019
+  // The stubbed 404 and 500 stand for endpoint 9's answers that server rows COCRDUPC-018 and
+  // COCRDUPC-019 describe, proved in `crates/api/tests/endpoints_cards.rs`; these tests prove the
+  // screen's handling of them. `NOTFND` sets both filter flags, a file error only the account's;
+  // NOT-OK moves no `*`, so the card keeps what it showed. No cursor is asserted for the list
+  // entry (state `S`).
+  // audit: COCRDUPC-045
+  // audit: COCRDUPC-046
+  // audit: COCRDUP-032
   it.each([
     {
       title: "a search whose card is not found marks the account and the card",

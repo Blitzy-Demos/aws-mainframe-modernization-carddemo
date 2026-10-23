@@ -11,7 +11,6 @@ import {
 } from "react-router";
 import type { components } from "@/api/schema";
 import { clearSession, getSession, SESSION_KEY, setSession } from "@/auth/session";
-import { INVALID_KEY } from "@/lib/header";
 import { PATHS, routes } from "@/routes";
 import { COUSR01 } from "./COUSR01";
 
@@ -28,6 +27,12 @@ const USERS_PATH = "/api/v1/users";
 
 /** A synthetic typed password in lower case, sent as typed and never upper-cased (E26). */
 const TYPED_PASSWORD = "secret1";
+
+/**
+ * COUSR01C-009: `CCDA-MSG-INVALID-KEY PIC X(50)` (`app/cpy/CSMSG01Y.cpy:20-21`), its 40-character
+ * `VALUE` padded with spaces to the 50 bytes of the field.
+ */
+const INVALID_KEY = `Invalid key pressed. Please see below...${" ".repeat(10)}`;
 
 /**
  * The five fields as typed. The first name is lower case with a trailing space and the last name
@@ -600,6 +605,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
 
     fireEvent.click(key("F12=Exit"));
     expect(messageRow("error").textContent).toBe(INVALID_KEY);
+    expect(messageRow("error").textContent).toHaveLength(50);
     expectHeader();
 
     fireEvent.click(key("F4=Clear"));
@@ -827,24 +833,33 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
 
   // audit: COUSR01C-005
   it.each([
-    { how: "F12=Exit, with the invalid-key message", label: "F12=Exit", message: INVALID_KEY },
-    { how: "F4=Clear, with the message row emptied", label: "F4=Clear", message: "" },
-  ])("the next key, $how, unmarks the field a server error named", async ({ label, message }) => {
-    stubFetch({ status: 400, body: duplicate });
-    renderScreen();
-    typeEntry(typed);
-    fireEvent.click(key("ENTER=Add User"));
-    await waitFor(() => {
-      expect(markOf(inputFor(LABELS.userId))).toBe(duplicate.message);
-    });
+    {
+      how: "F12=Exit, with the invalid-key message",
+      label: "F12=Exit",
+      message: INVALID_KEY,
+      length: 50,
+    },
+    { how: "F4=Clear, with the message row emptied", label: "F4=Clear", message: "", length: 0 },
+  ])(
+    "the next key, $how, unmarks the field a server error named",
+    async ({ label, message, length }) => {
+      stubFetch({ status: 400, body: duplicate });
+      renderScreen();
+      typeEntry(typed);
+      fireEvent.click(key("ENTER=Add User"));
+      await waitFor(() => {
+        expect(markOf(inputFor(LABELS.userId))).toBe(duplicate.message);
+      });
 
-    fireEvent.click(key(label));
+      fireEvent.click(key(label));
 
-    expect(messageRow("error").textContent).toBe(message);
-    await waitFor(() => {
-      expect(marks()).toEqual([null, null, null, null, null]);
-    });
-  });
+      expect(messageRow("error").textContent).toBe(message);
+      expect(messageRow("error").textContent).toHaveLength(length);
+      await waitFor(() => {
+        expect(marks()).toEqual([null, null, null, null, null]);
+      });
+    },
+  );
 
   // audit: COUSR01C-005
   it("each key clears the previous message first: ENTER empties the row before its answer arrives", async () => {
@@ -857,6 +872,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
 
     fireEvent.click(key("F12=Exit"));
     expect(messageRow("error").textContent).toBe(INVALID_KEY);
+    expect(messageRow("error").textContent).toHaveLength(50);
 
     typeEntry(typed);
     fireEvent.click(key("ENTER=Add User"));
@@ -966,6 +982,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       typeEntry(typed);
       fireEvent.click(key("F12=Exit"));
       expect(messageRow("error").textContent).toBe(INVALID_KEY);
+      expect(messageRow("error").textContent).toHaveLength(50);
       moveFocus(inputFor(LABELS.password));
 
       press();
@@ -1026,9 +1043,7 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
 
       // COUSR01C has no PF12 branch, so `F12=Exit` takes WHEN OTHER: the 50-byte CSMSG01Y text.
       expect(messageRow("error").textContent).toBe(INVALID_KEY);
-      expect(messageRow("error").textContent?.trimEnd()).toBe(
-        "Invalid key pressed. Please see below...",
-      );
+      expect(messageRow("error").textContent).toHaveLength(50);
       expect(messageRow("error").classList.contains("text-destructive")).toBe(true);
       expect(values()).toEqual(inMapOrder(typed));
       await waitFor(() => {

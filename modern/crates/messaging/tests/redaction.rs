@@ -12,6 +12,13 @@
 //! - the 50 fixture SSNs, each with and without dashes;
 //! - the fixture user passwords and the eight-digit numeric password the probes send.
 //!
+//! No CVV is a needle: three digits occur in any output. A CVV could show only as a field named
+//! for it, so the test also finds no captured trace line with a JSON member, at any depth, whose
+//! name holds `cvv` in any ASCII case, and no published body or encoded `cssl_error_log` record,
+//! fixed-format text rather than JSON, holding a `cvv` label. It holds every CDRD and CDRA body to
+//! its audited layout with spaces after the written bytes, and every CP00 reply to the six commas
+//! of its written fields, so that no output carries a field its audit does not list.
+//!
 //! The workers key their spans and alert with the `CARDDEMO_AMQP_URL` they were opened with, and
 //! CDRD and CP00 requests carry a fixture card number, a dashed fixture SSN and the fixture
 //! password as their `message_id` and `correlation_id`: the trace must show each only as its
@@ -95,6 +102,10 @@ const WITHHELD_ID: &[u8; 15] = &[b'*'; 15];
 /// Reply bytes 48-61 when the approved amount's edit holds eight or more consecutive digits
 /// (COPAUA0C-064).
 const WITHHELD_AMOUNT: &[u8; 14] = &[b'*'; 14];
+
+/// The offsets of the six `,` the CP00 reply `STRING` writes, one after each of `CCPAURLY`'s six
+/// fields, the last closing its [`copaua0c::REPLY_WRITTEN_LEN`] written bytes (COPAUA0C-060).
+const REPLY_COMMAS: [usize; 6] = [16, 32, 39, 42, 47, copaua0c::REPLY_WRITTEN_LEN - 1];
 
 /// CDRA reply bytes 37-47 of every not-found, bad-parameter and undecoded reply: the key
 /// positions, masked (COACCT01-021, COACCT01-022, COACCT01-003).
@@ -233,6 +244,189 @@ fn assert_no_sensitive(label: &str, haystack: &[u8], needles: &Needles) {
         found.is_empty(),
         "{label} holds protected values: {}",
         found.join(", ")
+    );
+}
+
+/// Why a captured trace line is not one JSON object with a member. It names the defect, never a
+/// byte of the line.
+type Malformed = &'static str;
+
+/// Whether `bytes` holds `cvv` in any ASCII case, the test `api/tests/redaction.rs` applies to a
+/// member name.
+fn holds_cvv(bytes: &[u8]) -> bool {
+    bytes
+        .windows(3)
+        .any(|window| window.eq_ignore_ascii_case(b"cvv"))
+}
+
+/// Decodes the escape whose backslash `chars` has just passed: `\"`, `\\`, `\/`, `\b`, `\f`,
+/// `\n`, `\r`, `\t`, or `\u` and four hexadecimal digits. A `\u` value that is not a Unicode
+/// scalar value, such as half of a surrogate pair, decodes to U+FFFD, which hides no ASCII
+/// letter.
+///
+/// # Errors
+///
+/// An escape of any other form, or the line ending inside it.
+fn json_escape(chars: &mut impl Iterator<Item = char>) -> Result<char, Malformed> {
+    let decoded = match chars.next() {
+        Some('"') => '"',
+        Some('\\') => '\\',
+        Some('/') => '/',
+        Some('b') => '\u{8}',
+        Some('f') => '\u{c}',
+        Some('n') => '\n',
+        Some('r') => '\r',
+        Some('t') => '\t',
+        Some('u') => {
+            let mut code = 0_u32;
+            for _ in 0..4 {
+                let digit = chars
+                    .next()
+                    .and_then(|digit| digit.to_digit(16))
+                    .ok_or("a \\u escape lacks four hexadecimal digits")?;
+                code = (code << 4) | digit;
+            }
+            char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER)
+        }
+        Some(_) => return Err("a string holds an invalid escape"),
+        None => return Err("a string is not terminated"),
+    };
+    Ok(decoded)
+}
+
+/// Reads the rest of a JSON string whose opening quote `chars` has just passed, through its
+/// closing quote, with every escape decoded.
+///
+/// # Errors
+///
+/// The line ending inside the string, an invalid escape, or an unescaped control character.
+fn json_string(chars: &mut impl Iterator<Item = char>) -> Result<String, Malformed> {
+    let mut text = String::new();
+    loop {
+        match chars.next() {
+            None => return Err("a string is not terminated"),
+            Some('"') => return Ok(text),
+            Some('\\') => text.push(json_escape(chars)?),
+            Some(control) if control < ' ' => {
+                return Err("a string holds an unescaped control character");
+            }
+            Some(character) => text.push(character),
+        }
+    }
+}
+
+/// The member names of `line`, one captured trace line, at every depth: each JSON string, its
+/// escapes decoded, that JSON whitespace and then `:` follow. The JSON formatter writes every line
+/// as one object and escapes the quotes inside a value, so no text inside a value is ever read as
+/// a name. The lexer is total.
+///
+/// # Errors
+///
+/// What makes `line` other than one JSON object with a member: a first character other than `{`
+/// or a last other than `}`, a malformed string, brackets that do not pair, text after the
+/// object, or no member at all.
+fn member_names(line: &str) -> Result<Vec<String>, Malformed> {
+    if !(line.starts_with('{') && line.ends_with('}')) {
+        return Err("it is not one JSON object");
+    }
+    let mut names = Vec::new();
+    let mut closers = Vec::new();
+    let mut chars = line.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {
+                let text = json_string(&mut chars)?;
+                let rest = chars.as_str().trim_start_matches([' ', '\t', '\n', '\r']);
+                if rest.starts_with(':') {
+                    names.push(text);
+                }
+            }
+            '{' => closers.push('}'),
+            '[' => closers.push(']'),
+            '}' | ']' => {
+                if closers.pop() != Some(character) {
+                    return Err("its brackets do not pair");
+                }
+            }
+            _ => {}
+        }
+        if closers.is_empty() && !chars.as_str().is_empty() {
+            return Err("text follows its object");
+        }
+    }
+    if !closers.is_empty() {
+        return Err("its object is not closed");
+    }
+    if names.is_empty() {
+        return Err("it has no member");
+    }
+    Ok(names)
+}
+
+/// The findings of the CVV member check over `lines`, the captured trace `label` names: one per
+/// member, at any depth (the event's `fields`, its `span`, every entry of its `spans`), whose name
+/// holds `cvv` in any ASCII case, and one per line [`member_names`] cannot read, since such a
+/// line could hide one. A capture with no line is a finding too, so the check never passes over
+/// nothing. Each finding names `label`, the line's index and the member name or the defect, never
+/// a value.
+fn cvv_member_findings(label: &str, lines: &[String]) -> Vec<String> {
+    if lines.is_empty() {
+        return vec![format!("{label}: no trace line was captured")];
+    }
+    let mut findings = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        match member_names(line) {
+            Ok(names) => findings.extend(
+                names
+                    .iter()
+                    .filter(|name| holds_cvv(name.as_bytes()))
+                    .map(|name| format!("{label} line {index}: member {name:?} names a CVV")),
+            ),
+            Err(defect) => findings.push(format!("{label} line {index}: {defect}")),
+        }
+    }
+    findings
+}
+
+/// Fails when [`cvv_member_findings`] reports anything for `lines`, naming every finding.
+fn assert_no_cvv_member(label: &str, lines: &[String]) {
+    let findings = cvv_member_findings(label, lines);
+    assert!(findings.is_empty(), "{}", findings.join("; "));
+}
+
+/// The finding of the CVV label check over `body`, the fixed-format output `label` names. A
+/// published body or an encoded `cssl_error_log` record is fixed-width fields and literals, not
+/// JSON, so a CVV could show only under a label naming it: `cvv` in any ASCII case. The finding
+/// names `label`, never a byte.
+fn cvv_label_finding(label: &str, body: &[u8]) -> Option<String> {
+    holds_cvv(body).then(|| format!("{label} holds a CVV label"))
+}
+
+/// Fails when [`cvv_label_finding`] reports `body`.
+fn assert_no_cvv_label(label: &str, body: &[u8]) {
+    let finding = cvv_label_finding(label, body);
+    assert!(finding.is_none(), "{}", finding.unwrap_or_default());
+}
+
+/// Fails unless `body`, a CDRD or CDRA output, fills the [`codate01::BUFFER_LEN`]-byte message
+/// area and every byte from `written`, its audited written width, on is a space: the body carries
+/// its audited layout and nothing after it, so no field outside that layout, a CVV among them,
+/// rides in its padding. A failure names `label` and an offset, never a byte.
+fn assert_fixed_shape(label: &str, body: &[u8], written: usize) {
+    assert_eq!(
+        body.len(),
+        codate01::BUFFER_LEN,
+        "{label}: bytes in the body"
+    );
+    let stray = body
+        .iter()
+        .enumerate()
+        .skip(written)
+        .find(|&(_, &byte)| byte != b' ')
+        .map(|(offset, _)| offset);
+    assert_eq!(
+        stray, None,
+        "{label}: the offset of a byte other than a space after the {written} written bytes"
     );
 }
 
@@ -460,15 +654,13 @@ impl Published {
         Ok(taken)
     }
 
-    /// Fails when any body taken holds a protected value.
+    /// Fails when any body taken holds a protected value or a CVV label.
     fn assert_redacted(&self, needles: &Needles) {
         assert!(!self.bodies.is_empty(), "no published body was taken");
         for (position, (queue, body)) in self.bodies.iter().enumerate() {
-            assert_no_sensitive(
-                &format!("published body {position} from {queue}"),
-                body,
-                needles,
-            );
+            let label = format!("published body {position} from {queue}");
+            assert_no_sensitive(&label, body, needles);
+            assert_no_cvv_label(&label, body);
         }
     }
 }
@@ -653,7 +845,9 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
         settle(&mut worker, connection, &dispatch).await?,
         Processed::Replied
     );
-    published.take(&client, codate01::REPLY_QUEUE, 1).await?;
+    for reply in published.take(&client, codate01::REPLY_QUEUE, 1).await? {
+        assert_fixed_shape("the CDRD reply", &reply, codate01::REPLY_TEXT_LEN);
+    }
 
     client.delete_queue(codate01::REPLY_QUEUE).await?;
     client
@@ -663,7 +857,9 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
         settle(&mut worker, connection, &dispatch).await?,
         Processed::ErrorRouted
     );
-    published.take(&client, codate01::ERROR_QUEUE, 1).await?;
+    for error in published.take(&client, codate01::ERROR_QUEUE, 1).await? {
+        assert_fixed_shape("the CDRD error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
+    }
     close(&session, &dispatch).await?;
 
     published.assert_redacted(&needles);
@@ -675,6 +871,7 @@ async fn cdrd_outputs_and_traces_are_redacted() -> TestResult {
         &[&probes.card, &probes.ssn_dashed, &probes.password],
     );
     assert_no_sensitive("the CDRD trace", capture.text().as_bytes(), &needles);
+    assert_no_cvv_member("the CDRD trace", &capture.lines());
     client.close().await
 }
 
@@ -745,6 +942,14 @@ async fn cdra_outputs_and_traces_are_redacted() -> TestResult {
             !masked || reply.get(37..48) == Some(MASKED_KEY.as_slice()),
             "CDRA reply {position}: offsets 37-47 are not eleven `*`"
         );
+        // A masked reply is not-found text (48 bytes) or bad-parameter text (63 bytes), so
+        // every byte from 63 on is padding either way.
+        let written = if *masked {
+            coacct01::BAD_PARAMETER_TEXT_LEN
+        } else {
+            coacct01::ACCT_RESPONSE_LEN
+        };
+        assert_fixed_shape(&format!("CDRA reply {position}"), reply, written);
     }
 
     client
@@ -754,12 +959,15 @@ async fn cdra_outputs_and_traces_are_redacted() -> TestResult {
         settle(&mut failing, connection, &dispatch).await?,
         Processed::ErrorRouted
     );
-    published.take(&client, coacct01::ERROR_QUEUE, 1).await?;
+    for error in published.take(&client, coacct01::ERROR_QUEUE, 1).await? {
+        assert_fixed_shape("the CDRA error body", &error, codate01::MQ_ERR_DISPLAY_LEN);
+    }
     close(&session, &dispatch).await?;
 
     published.assert_redacted(&needles);
     assert_settled(&capture, "CDRA", requests.len() + 1);
     assert_no_sensitive("the CDRA trace", capture.text().as_bytes(), &needles);
+    assert_no_cvv_member("the CDRA trace", &capture.lines());
     client.close().await
 }
 
@@ -955,12 +1163,21 @@ fn cp00_requests(xrefs: &[CardXrefRecord], probes: &Probes) -> Result<Vec<Cp00Re
     Ok(requests)
 }
 
-/// Checks the fields of one CP00 reply inside its 63 written bytes: the card field (COPAUA0C-061),
-/// field 18 (COPAUA0C-062) and, for [`Screen::WithheldAmount`], the amount (COPAUA0C-064). The
-/// body taken whole is HALTED(H6), so neither its length nor all of it is compared
-/// (COPAUA0C-065).
+/// Checks the fields of one CP00 reply inside its 63 written bytes: the [`REPLY_COMMAS`], so that
+/// those bytes are `CCPAURLY`'s six fields and no other, a CVV among them; the card field
+/// (COPAUA0C-061), field 18 (COPAUA0C-062) and, for [`Screen::WithheldAmount`], the amount
+/// (COPAUA0C-064). The body taken whole is HALTED(H6), so neither its length nor all of it is
+/// compared (COPAUA0C-065).
 fn assert_screened(request: &Cp00Request, reply: &[u8], screen: Screen) {
     let label = request.label;
+    let misplaced: Vec<usize> = REPLY_COMMAS
+        .into_iter()
+        .filter(|&offset| reply.get(offset) != Some(&b','))
+        .collect();
+    assert!(
+        misplaced.is_empty(),
+        "{label}: no `,` at reply offsets {misplaced:?}"
+    );
     assert!(
         reply.get(..16) == Some(redacted(&request.card).as_slice()),
         "{label}: bytes 0-15 are not twelve `*` and the last four digits of the request's card"
@@ -982,7 +1199,9 @@ fn assert_screened(request: &Cp00Request, reply: &[u8], screen: Screen) {
 }
 
 /// Takes the reply to `request` from `reply_to` when one is due and checks its screened fields;
-/// for the unparseable card, checks that none arrives.
+/// for the unparseable card, checks that none arrives. The caller calls it as soon as `request`
+/// is settled: a CP00 reply expires five seconds after it is published (E16), so a reply taken
+/// later could be gone however correct the worker.
 ///
 /// # Errors
 ///
@@ -1009,7 +1228,7 @@ async fn take_reply(
 /// Checks the `cssl_error_log` rows of the scenario: `A001`, `M004` and `I004`, in that order
 /// (COPAUA0C-114, COPAUA0C-117, COPAUA0C-120), the `A001` and `I004` event keys starting with the
 /// redacted form of their request's card, and no row, encoded as its 122-byte record, holding a
-/// protected value (COPAUA0C-110).
+/// protected value or a CVV label (COPAUA0C-110).
 ///
 /// # Errors
 ///
@@ -1033,7 +1252,9 @@ async fn assert_log_rows(
             ErrorLogRecord::WIDTH,
             "cssl_error_log row {id}"
         );
-        assert_no_sensitive(&format!("cssl_error_log row {id}"), &encoded, needles);
+        let label = format!("cssl_error_log row {id}");
+        assert_no_sensitive(&label, &encoded, needles);
+        assert_no_cvv_label(&label, &encoded);
     }
     for (location, card) in [(b"A001", a001_card), (b"I004", i004_card)] {
         let keyed = rows
@@ -1051,10 +1272,12 @@ async fn assert_log_rows(
 
 /// CP00 over the fixture-loaded database: every request of [`cp00_requests`] is published with a
 /// reply queue of its own, or the missing queue of the `M004` case, and settled one at a time
-/// under one clock instant. Every reply's card field is the redacted form of its request's card,
-/// `ORDER-A` comes back unchanged, every probe comes back withheld, the `A001` and `I004` event
-/// keys hold the redacted card, the unparseable card raises one alert and no reply, and no reply,
-/// log row or trace holds a protected value.
+/// under one clock instant. Each reply is taken as soon as its request is settled, before the
+/// next request is published, because a CP00 reply expires five seconds after it is published
+/// (E16). Every reply's card field is the redacted form of its request's card, `ORDER-A` comes
+/// back unchanged, every probe comes back withheld, the `A001` and `I004` event keys hold the
+/// redacted card, the unparseable card raises one alert and no reply, and no reply, log row or
+/// trace holds a protected value.
 // audit: COPAUA0C-006
 // audit: COPAUA0C-061
 // audit: COPAUA0C-110
@@ -1091,6 +1314,7 @@ async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
     let connection = session.connection();
     let opening = cp00::Worker::open(connection, &config, store.clone(), fixed_clock()?);
     let mut worker = bounded(opening.with_subscriber(dispatch.clone())).await?;
+    let mut published = Published::default();
     for (request, reply_to) in requests.iter().zip(&reply_queues) {
         let properties = match &request.ids {
             Some((message_id, correlation_id)) => id_properties(message_id, correlation_id),
@@ -1102,13 +1326,12 @@ async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
             .await?;
         let processed = settle(&mut worker, connection, &dispatch).await?;
         assert_eq!(processed, request.outcome.processed(), "{}", request.label);
+        // A CP00 reply expires five seconds after it is published (E16), so it is taken now,
+        // before the next request is published, and never after later steps.
+        take_reply(&client, &mut published, request, reply_to).await?;
     }
     close(&session, &dispatch).await?;
 
-    let mut published = Published::default();
-    for (request, reply_to) in requests.iter().zip(&reply_queues) {
-        take_reply(&client, &mut published, request, reply_to).await?;
-    }
     published.assert_redacted(&needles);
     let i004_card = card_of(&xrefs, DUPLICATE_KEY_ACCOUNT)?;
     assert_log_rows(&mut store, &needles, UNKNOWN_CARD, &i004_card).await?;
@@ -1144,5 +1367,159 @@ async fn cp00_outputs_log_rows_and_traces_are_redacted() -> TestResult {
         &[&probes.card, &probes.ssn_dashed, &probes.password],
     );
     assert_no_sensitive("the CP00 trace", capture.text().as_bytes(), &needles);
+    assert_no_cvv_member("the CP00 trace", &capture.lines());
     client.close().await
+}
+
+/// A synthetic CVV value, the CVV of no fixture card (`carddata.txt`), which no finding may print.
+const SYNTHETIC_CVV: &str = "987";
+
+/// A trace line in the JSON formatter's shape with no CVV member.
+const CLEAN_LINE: &str = concat!(
+    r#"{"timestamp":"2022-07-18T19:30:05.250Z","level":"INFO","#,
+    r#""fields":{"message":"the request is settled","elapsed_ms":5,"redelivered":false,"#,
+    r#""reply_to":null},"target":"carddemo::messaging","#,
+    r#""span":{"queue":"CARD.DEMO.REQUEST.PAUTH","name":"message"},"#,
+    r#""spans":[{"queue":"CARD.DEMO.REQUEST.PAUTH","name":"message"}]}"#,
+);
+
+/// What a case of [`cvv_checks_report_a_cvv_field_without_printing_its_value`] gives a check.
+#[derive(Clone, Copy)]
+enum Synthetic {
+    /// Captured trace lines, for [`cvv_member_findings`].
+    Lines(&'static [&'static str]),
+    /// One fixed-format body, for [`cvv_label_finding`].
+    Body(&'static [u8]),
+}
+
+/// The cases of [`cvv_checks_report_a_cvv_field_without_printing_its_value`]: a name, the input
+/// and the number of findings the check must report. An input that gives a CVV member or label a
+/// value gives it [`SYNTHETIC_CVV`].
+const CVV_CASES: [(&str, Synthetic, usize); 24] = [
+    (
+        "a CVV member in the event fields",
+        Synthetic::Lines(&[
+            r#"{"level":"INFO","fields":{"message":"settled","cvv":"987"},"target":"carddemo"}"#,
+        ]),
+        1,
+    ),
+    (
+        "a CVV member in the span",
+        Synthetic::Lines(&[r#"{"fields":{"message":"new"},"span":{"card_cvv_cd":"987"}}"#]),
+        1,
+    ),
+    (
+        "a CVV member in an entry of spans",
+        Synthetic::Lines(&[r#"{"fields":{"message":"m"},"spans":[{"name":"a"},{"cvvCode":987}]}"#]),
+        1,
+    ),
+    (
+        "a CVV member in upper case",
+        Synthetic::Lines(&[r#"{"fields":{"CVV":"987"}}"#]),
+        1,
+    ),
+    (
+        "CVV members in mixed case, in the fields and the span",
+        Synthetic::Lines(&[r#"{"fields":{"Card_Cvv":"987"},"span":{"cvV":"987"}}"#]),
+        2,
+    ),
+    (
+        "a CVV member whose name is escaped",
+        Synthetic::Lines(&[r#"{"fields":{"\u0063v\u0056":"987"}}"#]),
+        1,
+    ),
+    (
+        "a CVV member followed by whitespace",
+        Synthetic::Lines(&["{\"fields\":{\"cvv\" \t: \"987\"}}"]),
+        1,
+    ),
+    (
+        "a CVV member on the second line",
+        Synthetic::Lines(&[CLEAN_LINE, r#"{"fields":{"cvv":"987"}}"#]),
+        1,
+    ),
+    (
+        "`cvv` only inside an escaped value",
+        Synthetic::Lines(&[r#"{"fields":{"message":"a \"cvv\": 987 quoted"}}"#]),
+        0,
+    ),
+    (
+        "`cvv` only as values",
+        Synthetic::Lines(&[r#"{"fields":{"message":"cvv","items":["CVV",":"]}}"#]),
+        0,
+    ),
+    ("a clean line", Synthetic::Lines(&[CLEAN_LINE]), 0),
+    (
+        "an unterminated string",
+        Synthetic::Lines(&[r#"{"fields":{"cvv":"987}}"#]),
+        1,
+    ),
+    (
+        "an invalid escape",
+        Synthetic::Lines(&[r#"{"fields":{"message":"\x987"}}"#]),
+        1,
+    ),
+    (
+        "a short \\u escape",
+        Synthetic::Lines(&[r#"{"fields":{"message":"\u98"}}"#]),
+        1,
+    ),
+    (
+        "an unescaped control character",
+        Synthetic::Lines(&["{\"fields\":{\"message\":\"\u{1}987\"}}"]),
+        1,
+    ),
+    (
+        "an object that is not closed",
+        Synthetic::Lines(&[r#"{"fields":{"message":"987"}"#]),
+        1,
+    ),
+    (
+        "brackets that do not pair",
+        Synthetic::Lines(&[r#"{"spans":[{"cvv":"987"}}}"#]),
+        1,
+    ),
+    (
+        "text after the object",
+        Synthetic::Lines(&[r#"{"fields":{"message":"m"}} {"cvv":"987"}"#]),
+        1,
+    ),
+    (
+        "a line that is not an object",
+        Synthetic::Lines(&[r#"["cvv","987"]"#]),
+        1,
+    ),
+    ("an object with no member", Synthetic::Lines(&["{}"]), 1),
+    ("a capture with no line", Synthetic::Lines(&[]), 1),
+    ("a body with a CVV label", Synthetic::Body(b"CVV : 987"), 1),
+    ("a body with a mixed-case label", Synthetic::Body(b"Cvv"), 1),
+    (
+        "a clean body",
+        Synthetic::Body(b"SYSTEM DATE : 07-18-2022SYSTEM TIME : 19:30:05"),
+        0,
+    ),
+];
+
+/// The CVV checks report a CVV member at any depth and in any ASCII case, every trace line they
+/// cannot read, a capture with no line and a fixed-format body with a CVV label, and they pass a
+/// clean line, a line whose only `cvv` is text inside a value and a clean body. No finding prints
+/// [`SYNTHETIC_CVV`], and each names its case. The checks need no broker.
+#[test]
+fn cvv_checks_report_a_cvv_field_without_printing_its_value() {
+    for (case, input, expected) in CVV_CASES {
+        let findings = match input {
+            Synthetic::Lines(lines) => {
+                let lines: Vec<String> = lines.iter().map(|line| (*line).to_owned()).collect();
+                cvv_member_findings(case, &lines)
+            }
+            Synthetic::Body(body) => cvv_label_finding(case, body).into_iter().collect(),
+        };
+        assert_eq!(findings.len(), expected, "{case}: findings");
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.starts_with(case) && !finding.contains(SYNTHETIC_CVV)),
+            "{case}: a finding does not name its case, or prints the CVV value"
+        );
+    }
 }

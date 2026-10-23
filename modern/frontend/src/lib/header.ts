@@ -28,8 +28,9 @@ export const TITLE02 = "              CardDemo                  ";
 const MESSAGE_WIDTH = 50;
 
 /**
- * `CCDA-MSG-THANK-YOU PIC X(50)` (`app/cpy/CSMSG01Y.cpy:18-19`): the session-end text COSGN00C
- * sends as plain text on F3 before it ends the conversation (`app/cbl/COSGN00C.cbl:88-90,162-172`).
+ * `CCDA-MSG-THANK-YOU PIC X(50)` (`app/cpy/CSMSG01Y.cpy:18-19`): the session-end message COSGN00C
+ * moves into its 80-byte `WS-MESSAGE` and sends as plain text on F3 before it ends the
+ * conversation (`app/cbl/COSGN00C.cbl:38,88-90,162-172`).
  * Audit: `COSGN00C-004`, which records the padded field value. The `VALUE` literal is shorter than
  * the field, so the value is padded with spaces to all 50 bytes, as the `MOVE` transfers it.
  * `CCDA-THANK-YOU` of `COTTL01Y.cpy:23-24` is referenced by no program and is not this text.

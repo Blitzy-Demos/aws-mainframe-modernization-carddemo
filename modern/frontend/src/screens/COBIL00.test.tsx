@@ -200,9 +200,49 @@ function billPayment(body: unknown): Response {
 }
 
 /**
+ * A hold for {@link stubApi}: every reply it holds stays outstanding until `release` is called,
+ * which a test that ends with a reply still held calls in a `finally`.
+ */
+function held(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+/**
+ * Waits for `hold`, as a held reply of {@link stubApi} does, or rejects with the reason of
+ * `signal` once it aborts, as the native `fetch` rejects a request whose signal aborts before its
+ * answer. With no `hold` it resolves at once.
+ */
+async function heldUnlessAborted(
+  hold: Promise<void> | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  if (hold === undefined) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const abort = (): void => {
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    hold.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+/**
  * Replaces `fetch` with endpoint 15 as `answer` (by default {@link billPayment}) answers it; any
- * other request gets a 500. Each reply waits for `hold` when one is given. Returns every request
- * in the order the screen sent it.
+ * other request gets a 500. Each reply waits for `hold` when one is given, and fails with the
+ * request signal's reason if that aborts first. Returns every request in the order the screen
+ * sent it.
  */
 function stubApi(
   hold?: Promise<void>,
@@ -219,7 +259,7 @@ function stubApi(
         return unexpected(`${req.method} ${pathname}`);
       }
       const body: unknown = await req.clone().json();
-      await hold;
+      await heldUnlessAborted(hold, req.signal);
       return answer(body);
     }),
   );
@@ -254,10 +294,13 @@ function testQueryClient(): QueryClient {
   });
 }
 
-/** COBIL00 at `/bill-payment` with `state`, and stubs at the routes F3 can return to. */
+/**
+ * COBIL00 at `/bill-payment` with `state`, and stubs at the routes F3 can return to. Returns the
+ * render result and the query client, whose `isMutating` tells when the screen's request settled.
+ */
 function renderScreen(state?: unknown) {
   const client = testQueryClient();
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COBIL00, state }]}>
         <Routes>
@@ -268,6 +311,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route stub a transfer reached: its path and the route state it was given. */
@@ -1481,21 +1525,31 @@ describe("COBIL00 bill payment screen", () => {
   });
 
   it("F3 goes back while ENTER's request is in flight", async () => {
-    const requests = stubApi(new Promise<void>(() => undefined));
-    renderScreen({ from: PATHS.COMEN01 });
-    typeInputs(ACCT, "");
-    pressEnter();
-    await waitFor(() => {
-      expect(
-        screen.getByRole("button", { name: "ENTER=Continue" }).getAttribute("aria-disabled"),
-      ).toBe("true");
-    });
+    const reply = held();
+    const requests = stubApi(reply.promise);
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
+    try {
+      typeInputs(ACCT, "");
+      pressEnter();
+      await waitFor(() => {
+        expect(
+          screen.getByRole("button", { name: "ENTER=Continue" }).getAttribute("aria-disabled"),
+        ).toBe("true");
+      });
 
-    fireEvent.click(pfKeyButton("F3=Back"));
+      fireEvent.click(pfKeyButton("F3=Back"));
 
-    const stub = await reachedStub();
-    expect(stub.path).toBe("/menu");
-    expect(requests).toHaveLength(1);
+      const stub = await reachedStub();
+      expect(stub.path).toBe("/menu");
+      expect(requests).toHaveLength(1);
+    } finally {
+      // The reply is answered only after F3 left, pass or fail, and the test ends once the request
+      // has settled, so neither it nor the client's deadline outlives the test.
+      reply.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   // COBIL00-013 and COBIL00-020 are `both` rows: the schema's half is proved in

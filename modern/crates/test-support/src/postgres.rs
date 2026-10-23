@@ -6,7 +6,8 @@
 //! `carddemo-migrate` binary and this module. Every test database is therefore built from
 //! `crates/persistence/migrations` exactly as the local stack is, the `db2` schema and its
 //! `CREADB21` seed rows of migration `0006` included. This module issues no SQL of its own: the
-//! readiness probe uses the connection ping alone.
+//! readiness probe uses the connection ping alone, and [`PostgresGuard::server_log`] reads the
+//! container's log through Docker.
 //!
 //! Errors carry only the `Display` text of the testcontainers, Docker, `sqlx` or migration error
 //! behind them, the bound that passed, or the label token of the start, none of which holds
@@ -104,6 +105,24 @@ impl PostgresGuard {
     #[must_use]
     pub fn database_url(&self) -> &str {
         &self.database_url
+    }
+
+    /// The server log so far, as text bytes: everything the container has written to standard
+    /// error from its start to this call, where the `postgres:16` image's server writes its log
+    /// lines. A test reads it to observe what the server alone reports, such as the lock waits
+    /// that `log_lock_waits` logs. Reading it issues no SQL.
+    ///
+    /// The log may quote statement texts, and with them the values a statement carries, so a
+    /// caller parses it in memory and never prints it (Cardholder Data Redaction).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`HarnessError`] when Docker cannot return the container's log.
+    pub async fn server_log(&self) -> Result<Vec<u8>, HarnessError> {
+        self.container
+            .stderr_to_vec()
+            .await
+            .map_err(|err| HarnessError::new("read postgres log", &err))
     }
 }
 
@@ -241,10 +260,12 @@ fn address(database_url: &str) -> &str {
 mod tests {
     use std::time::Duration;
 
-    use tokio::time::Instant;
+    use sqlx::{Connection, PgConnection};
+    use tokio::time::{self, Instant};
 
     use super::{
-        IMAGE, address, connect, image, migrate, request, start_container, start_postgres,
+        IMAGE, PASSWORD, READY_MESSAGE, USER, address, connect, image, migrate, request,
+        start_container, start_postgres,
     };
     use crate::HarnessError;
     use crate::tests::{
@@ -258,11 +279,54 @@ mod tests {
     /// Time allowed past [`FROZEN_BOUND`] for force-removing the paused container.
     const REMOVAL_ALLOWANCE: Duration = Duration::from_secs(15);
 
+    /// Bound on a server log line reaching the container's log after the server writes it.
+    const LOG_BOUND: Duration = Duration::from_secs(30);
+    /// Interval between two reads of the server log while waiting for a line.
+    const LOG_POLL: Duration = Duration::from_millis(50);
+
     #[tokio::test]
     async fn a_started_database_is_owned_and_leaves_with_its_guard() -> Result<(), HarnessError> {
         let guard = start_postgres().await?;
         let id = guard.container.id().to_owned();
         guarded_container_case(guard, &id, IMAGE).await
+    }
+
+    /// The server log holds what the server wrote from its start, the ready message included,
+    /// and what it writes later: a sign-on refused for a wrong password, which issues no SQL,
+    /// appears in a read made after it, within [`LOG_BOUND`].
+    #[tokio::test]
+    async fn the_server_log_holds_the_start_and_what_followed() -> Result<(), HarnessError> {
+        // What the server logs for a sign-on refused for its password, naming the user only.
+        let refused_sign_on = format!("password authentication failed for user \"{USER}\"");
+        let guard = start_postgres().await?;
+        let started = guard.server_log().await?;
+        assert!(
+            String::from_utf8_lossy(&started).contains(READY_MESSAGE),
+            "the server log lacks the ready message"
+        );
+        assert!(
+            !String::from_utf8_lossy(&started).contains(&refused_sign_on),
+            "the server log reports a refused sign-on before any was attempted"
+        );
+
+        let wrong = format!(
+            "postgres://{USER}:not-{PASSWORD}@{}",
+            address(guard.database_url())
+        );
+        assert!(
+            PgConnection::connect(&wrong).await.is_err(),
+            "a sign-on with a wrong password succeeded"
+        );
+        let deadline = Instant::now() + LOG_BOUND;
+        while !String::from_utf8_lossy(&guard.server_log().await?).contains(&refused_sign_on) {
+            assert!(
+                Instant::now() < deadline,
+                "the refused sign-on did not reach the server log within {} ms",
+                LOG_BOUND.as_millis()
+            );
+            time::sleep(LOG_POLL).await;
+        }
+        Ok(())
     }
 
     /// The server is paused between readiness and migration, so it accepts nothing more. The

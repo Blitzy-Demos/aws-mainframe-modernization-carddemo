@@ -219,10 +219,12 @@ const ACCOUNTS_COLUMN: &str = "acct_active_status";
 const TRAN_CAT_BALANCES_COLUMN: &str = "tran_cat_bal";
 
 /// The launcher of [`Launch::FileSizeLimited`], run by `/bin/sh -c` with the binary as `$0` and
-/// its arguments after it. `ulimit -f` counts 512-byte blocks, so no regular file the job writes
-/// can grow past 512 bytes. `trap ''` ignores `SIGXFSZ`, a disposition `exec` keeps, so a write
-/// past the limit fails with `EFBIG` instead of the signal ending the process. Standard output
-/// and standard error are pipes, which the limit does not reach.
+/// its arguments after it. `ulimit -f 1` keeps every regular file the job writes to one block of
+/// the shell's `ulimit`: 512 bytes under dash, POSIX and GNU Bash in POSIX mode, 1,024 under GNU
+/// Bash outside it and under Apple's Bash 3.2. Each write the tests make fail carries more than
+/// 1,024 bytes, so either size fails it. `trap ''` ignores `SIGXFSZ`, a disposition `exec` keeps,
+/// so a write past the limit fails with `EFBIG` instead of the signal ending the process.
+/// Standard output and standard error are pipes, which the limit does not reach.
 const FILE_SIZE_LIMITED: &str = "trap '' XFSZ; ulimit -f 1 && exec \"$0\" \"$@\"";
 
 /// How long the account-removal test waits for the job's first reject bytes.
@@ -1010,7 +1012,7 @@ async fn run_posttran(
 enum Launch {
     /// The binary itself.
     Direct,
-    /// The binary under a file-size limit of 512 bytes ([`FILE_SIZE_LIMITED`]), so the reject
+    /// The binary under a file-size limit of one shell block ([`FILE_SIZE_LIMITED`]), so the reject
     /// generation cannot grow past it.
     FileSizeLimited,
 }
@@ -1063,7 +1065,7 @@ async fn run_posttran_with(
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
         .env("RUST_LOG", "info")
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
 /// The lines of standard output that are not JSON events: the paths the job wrote.
@@ -2380,8 +2382,8 @@ async fn a_duplicate_transaction_id_abends_after_its_balances_are_written() -> T
 /// effects before it standing and none after it. In a read-only session the update of a category
 /// balance the loads hold, and the insert of one they do not, fail with SQLSTATE 25006, each the
 /// first write of its run, so neither run changes a table; nor does a run whose input opens and
-/// then cannot be read. Under a 512-byte file-size limit the fixture run's first reject bytes
-/// cannot reach the file, after the postings of the records before.
+/// then cannot be read. Under a file-size limit of one shell block the fixture run's first reject
+/// bytes cannot reach the file, after the postings of the records before.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_category_balance_or_reject_write_abends_at_that_write() -> TestResult {
     let needles = Needles::load()?;
@@ -2713,7 +2715,8 @@ async fn a_failed_table_read_abends_before_the_first_record() -> TestResult {
 /// `ERROR CLOSING DAILY REJECTS FILE` and the status the program shows there, always `0000`,
 /// before the count lines, and no generation is kept. The three rejects, 1,293 bytes, fit the
 /// 8 KiB the job buffers, so no byte of them reaches the file before the close, and they exceed
-/// the 512-byte file-size limit the job runs under, so the close's write fails.
+/// the file-size limit of one shell block, 1,024 bytes at most, the job runs under, so the
+/// close's write fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_reject_close_shows_the_cross_reference_status() -> TestResult {
     let needles = Needles::load()?;

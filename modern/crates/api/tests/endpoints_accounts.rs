@@ -24,9 +24,13 @@
 //! - Outcomes the fixtures do not hold are built through the real repositories: test accounts,
 //!   customers and cross-references numbered from 60, a cross-reference whose account or
 //!   customer is missing, and a second cross-reference for fixture account 2. A store that
-//!   fails is a second pool on the same database, closed before the call; a lock that cannot be
-//!   had is a row lock another transaction holds while the API's pool runs with a short
-//!   `lock_timeout` its URL sets. Over the pool `carddemo-api` serves requests from,
+//!   fails every statement is a second pool on the same database, closed before the call. An
+//!   account or customer read that fails after the cross-reference read found its row is the
+//!   loaded pool behind `FailingReads`, a `persistence::RepositoryProbe` installed with
+//!   `PgStore::with_probe`, which skips the statement at its probe points, fails it with a
+//!   store error and records each call it is asked about. A lock that cannot be had is a row
+//!   lock another transaction holds while the API's pool runs with a short `lock_timeout` its
+//!   URL sets. Over the pool `carddemo-api` serves requests from,
 //!   `runtime::db::connect_for_requests`, such a lock makes the save wait until its holder
 //!   commits instead. The loaded pool itself is never closed.
 //! - Every response body is searched for the 50 fixture SSN values in both forms, the fixture
@@ -37,15 +41,14 @@
 //! # Reported, never passed
 //!
 //! The `#[ignore]` tests at the end carry the tags of what no endpoint test can assert: the CICS
-//! codes of halt H4, the `CEEDAYS` verdict of halt H5, the cases the audits' halt candidates
-//! name, and the read failures after a found cross-reference, which no input reaches over a
-//! real store. Each returns an error when it is run, so a run with `--ignored` fails on them.
+//! codes of halt H4, the `CEEDAYS` verdict of halt H5 and the cases the audits' halt candidates
+//! name. Each returns an error when it is run, so a run with `--ignored` fails on them.
 
 use std::error::Error;
 use std::fmt::{self, Write as _};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use api::app::{AppState, app};
@@ -61,7 +64,10 @@ use domain::records::account::AccountRecord;
 use domain::records::card_xref::CardXrefRecord;
 use domain::records::customer::CustomerRecord;
 use domain::{CardNumber, FixedClock, Ssn};
-use persistence::{AccountRepository, CardXrefRepository, CustomerRepository, PgStore};
+use persistence::{
+    AccountRepository, CardXrefRepository, CustomerRepository, PersistenceError, PgStore,
+    ProbeCall, ProbePoint, ProbeVerdict, RepositoryProbe,
+};
 use runtime::config::Config;
 use serde_json::{Map, Value, json};
 use test_support::fixtures::{
@@ -130,13 +136,18 @@ const REENTERED_SSN_PARTS: [&str; 3] = ["345", "11", "8912"];
 /// The SSN another user stores for customer [`CLEAN`] between a fetch and its save: the same
 /// last four digits as [`TEST_SSN`] (COACTUPC-115).
 const OTHER_USER_SSN: &str = "456788912";
-const TEST_SSN_NEEDLES: [&str; 6] = [
+/// The SSN another user stores for customer [`CLEAN`] in `coactupc_change_check_terms`: the
+/// first five digits of [`TEST_SSN`] and other last four (COACTUPC-115).
+const OTHER_LAST4_SSN: &str = "345674321";
+const TEST_SSN_NEEDLES: [&str; 8] = [
     "345678912",
     "345-67-8912",
     "345118912",
     "345-11-8912",
     "456788912",
     "456-78-8912",
+    "345674321",
+    "345-67-4321",
 ];
 
 /// The account number of a test entity, eleven digits.
@@ -559,6 +570,94 @@ impl Harness {
             .await;
         state_over(store)
     }
+
+    /// An API over the loaded pool whose store skips and fails every call at one of `fails`,
+    /// and the probe that records what that store asked it ([`FailingReads`]). The tokens of
+    /// [`Harness::start`] hold against it, as it signs with the same secret.
+    fn probed_state(&self, fails: &[ProbePoint]) -> Fallible<(AppState, Arc<FailingReads>)> {
+        let probe = FailingReads::at(fails);
+        let shared: Arc<dyn RepositoryProbe> = probe.clone();
+        let store = PgStore::new(self.guard.pool().clone()).with_probe(shared);
+        Ok((state_over(store)?, probe))
+    }
+}
+
+/// One call a probe was asked about: its point, and the account or customer ID its first
+/// argument names, `None` when the call is keyed otherwise.
+type Seen = (ProbePoint, Option<u64>);
+
+/// The probed reads of the chain after a found cross-reference: the account's, the customer's,
+/// and both.
+const ACCOUNT_READ: &[ProbePoint] = &[ProbePoint::AccountRead];
+const CUSTOMER_READ: &[ProbePoint] = &[ProbePoint::CustomerRead];
+const BOTH_READS: &[ProbePoint] = &[ProbePoint::AccountRead, ProbePoint::CustomerRead];
+
+/// The probe of [`Harness::probed_state`]: every call at one of `fails` skips its statement and
+/// fails with [`probed_store_error`], every other call runs it, and each call is recorded, in
+/// order. It reaches the account and customer reads that `find_with_customer` issues after the
+/// cross-reference read found exactly one row, which no input fails over a healthy pool.
+struct FailingReads {
+    /// The points whose calls fail.
+    fails: Vec<ProbePoint>,
+    /// The calls asked about so far.
+    seen: Mutex<Vec<Seen>>,
+}
+
+impl FailingReads {
+    /// A probe that fails every call at one of `points`.
+    fn at(points: &[ProbePoint]) -> Arc<Self> {
+        Arc::new(Self {
+            fails: points.to_vec(),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// The calls recorded so far, in order. A test that panicked while recording leaves its
+    /// records readable.
+    fn seen(&self) -> Vec<Seen> {
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl RepositoryProbe for FailingReads {
+    fn answer(&self, call: &ProbeCall<'_>) -> ProbeVerdict {
+        let key = call
+            .arg::<PicU<11>>(0)
+            .copied()
+            .map(PicU::get)
+            .or_else(|| call.arg::<PicU<9>>(0).copied().map(PicU::get));
+        self.seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((call.point(), key));
+        if self.fails.contains(&call.point()) {
+            ProbeVerdict::Fail(probed_store_error())
+        } else {
+            ProbeVerdict::Proceed
+        }
+    }
+}
+
+/// The error a probed call fails with: an SQLSTATE `XX000` internal error with no constraint,
+/// as `persistence::error` maps an unexpected server error.
+fn probed_store_error() -> PersistenceError {
+    PersistenceError::Database {
+        sqlstate: Some("XX000".to_owned()),
+        constraint: None,
+    }
+}
+
+/// What a probe sees of one read chain whose cross-reference was found for account `account`
+/// and names customer `customer`: the account read, then the customer read, whatever the
+/// account read returned (COACTVWC-033, COACTUPC-084).
+fn chain_reads(account: u64, customer: u64) -> [Seen; 2] {
+    [
+        (ProbePoint::AccountRead, Some(account)),
+        (ProbePoint::CustomerRead, Some(customer)),
+    ]
 }
 
 /// An error response: its status, message and field, and nothing else in the body, because a
@@ -643,7 +742,7 @@ const UPDATE_CUSTOMER_MEMBERS: [&str; 22] = [
 ];
 
 /// The customer members of endpoint 5's snapshot (COACTUPC-100).
-const SNAPSHOT_CUSTOMER_MEMBERS: [&str; 17] = [
+const SNAPSHOT_CUSTOMER_MEMBERS: [&str; 18] = [
     "customer_id",
     "first_name",
     "middle_name",
@@ -661,6 +760,7 @@ const SNAPSHOT_CUSTOMER_MEMBERS: [&str; 17] = [
     "dob",
     "eft_account_id",
     "primary_card_holder",
+    "fico_score",
 ];
 
 /// The member names of the object `value`, sorted; none when it is not an object.
@@ -942,14 +1042,17 @@ fn day(year: i32, month: u32, date: u32) -> Fallible<NaiveDate> {
 // Endpoint 4: COACTVWC
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test]
-async fn coactvwc_view_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    view_gate_and_account_edit(&harness).await?;
-    view_fixture_account(&harness).await?;
-    view_test_accounts(&harness).await?;
-    view_read_chain_failures(&harness).await?;
-    Ok(())
+#[test]
+fn coactvwc_view_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let harness = Harness::start().await?;
+        view_gate_and_account_edit(&harness).await?;
+        view_fixture_account(&harness).await?;
+        view_test_accounts(&harness).await?;
+        view_read_chain_failures(&harness).await?;
+        view_reads_after_the_cross_reference(&harness).await?;
+        Ok(())
+    })
 }
 
 /// The token check, the user types and the account-number edit of endpoint 4 (COACTVWC-002,
@@ -1216,17 +1319,146 @@ async fn view_read_chain_failures(h: &Harness) -> TestResult {
     Ok(())
 }
 
+/// Endpoint 4 when the account or the customer read fails after the cross-reference read found
+/// its row, each failure made by [`FailingReads`] on the loaded pool; no outcome writes
+/// (COACTVWC-005).
+async fn view_reads_after_the_cross_reference(h: &Harness) -> TestResult {
+    let account_before = h.account(1).await?;
+    let customer_before = h.customer(1).await?;
+    let healthy = h.view(ACCOUNT_1).await?;
+    assert_eq!(
+        healthy.status,
+        StatusCode::OK,
+        "the unprobed view of account 1"
+    );
+    view_account_read_failing(h, &healthy).await?;
+    view_customer_read_failing(h, &healthy).await?;
+    // audit: COACTVWC-005
+    assert!(
+        h.account(1).await? == account_before,
+        "a failing read rewrote the account"
+    );
+    assert!(
+        h.customer(1).await? == customer_before,
+        "a failing read rewrote the customer"
+    );
+    Ok(())
+}
+
+/// The account read fails: its `ACCTDAT` text, status 500 and field `acct_id`, while the
+/// customer read still runs; a customer it finds is shown beside the message, a missing one
+/// leaves the account's message alone. A chain that ends at the cross-reference asks for
+/// neither read. `healthy` is the unprobed view of account 1 (COACTVWC-008, COACTVWC-033,
+/// COACTVWC-042, COACTVWC-044).
+async fn view_account_read_failing(h: &Harness, healthy: &Reply) -> TestResult {
+    let status = StatusCode::INTERNAL_SERVER_ERROR;
+    // Customer 1 is found: its block beside the account's message, status and field, and an
+    // account block whose values are halt candidate X-COACTVWC-H1's and are not asserted
+    // (`blocked_uninitialised_storage`).
+    let (state, probe) = h.probed_state(ACCOUNT_READ)?;
+    let failed = h.view_as(&state, &h.user, ACCOUNT_1).await?;
+    // audit: COACTVWC-008
+    // audit: COACTVWC-042
+    assert_error_beside(&failed, status, Some("acct_id"), &["account", "customer"]);
+    assert_file_error(&failed, "ACCTDAT  ");
+    assert_eq!(
+        failed.body["customer"],
+        members_of(&healthy.body, &VIEW_CUSTOMER_MEMBERS),
+        "the customer block is fixture customer 1's"
+    );
+    let mut account_members = VIEW_ACCOUNT_MEMBERS.to_vec();
+    account_members.sort_unstable();
+    assert_eq!(
+        sorted_keys(&failed.body["account"]),
+        account_members,
+        "the account block is present with the account members"
+    );
+    // Both reads ran after the cross-reference was found: the account's by the path key, then
+    // the customer's by the cross-reference's customer ID, though the account read failed.
+    // audit: COACTVWC-033
+    // audit: COACTVWC-042
+    assert_eq!(probe.seen(), chain_reads(1, 1));
+
+    // The customer is missing: the account's message stands, with no block.
+    let (state, probe) = h.probed_state(ACCOUNT_READ)?;
+    let no_customer = h.view_as(&state, &h.user, &acct(NO_CUSTOMER)).await?;
+    // audit: COACTVWC-042
+    // audit: COACTVWC-044
+    let message = no_customer.message();
+    assert_screen_error(&no_customer, status, message, Some("acct_id"));
+    assert_file_error(&no_customer, "ACCTDAT  ");
+    assert_eq!(probe.seen(), chain_reads(NO_CUSTOMER, MISSING_CUSTOMER_72));
+
+    // No cross-reference, or two: the chain ends there, and neither later read is asked for.
+    let (state, probe) = h.probed_state(BOTH_READS)?;
+    let unknown = h.view_as(&state, &h.user, ACCOUNT_UNKNOWN).await?;
+    let two_cards = h.view_as(&state, &h.user, &acct(2)).await?;
+    // audit: COACTVWC-033
+    let not_found = StatusCode::NOT_FOUND;
+    assert_screen_error(&unknown, not_found, unknown.message(), Some("acct_id"));
+    assert_account_not_found(&unknown, ACCOUNT_UNKNOWN, " Cross ref file.  Resp:");
+    assert_screen_error(&two_cards, status, two_cards.message(), Some("acct_id"));
+    assert_file_error(&two_cards, "CXACAIX  ");
+    assert!(
+        probe.seen().is_empty(),
+        "a read was asked for after the cross-reference"
+    );
+    Ok(())
+}
+
+/// The customer read fails: its `CUSTDAT` text and status 500 replace any earlier message, with
+/// field `acct_id` only when the account read did not succeed and the account block only when
+/// it found the account. `healthy` is the unprobed view of account 1 (COACTVWC-008,
+/// COACTVWC-033, COACTVWC-040, COACTVWC-046).
+async fn view_customer_read_failing(h: &Harness, healthy: &Reply) -> TestResult {
+    let status = StatusCode::INTERNAL_SERVER_ERROR;
+    let (state, probe) = h.probed_state(CUSTOMER_READ)?;
+    let failed = h.view_as(&state, &h.user, ACCOUNT_1).await?;
+    // audit: COACTVWC-008
+    // audit: COACTVWC-046
+    assert_error_beside(&failed, status, None, &["account"]);
+    assert_file_error(&failed, "CUSTDAT  ");
+    assert_eq!(
+        failed.body["account"],
+        members_of(&healthy.body, &VIEW_ACCOUNT_MEMBERS),
+        "the account block is fixture account 1's"
+    );
+    assert_eq!(probe.seen(), chain_reads(1, 1));
+
+    // The account read fails too: the customer's text with the account's field, and no block.
+    let (state, _) = h.probed_state(BOTH_READS)?;
+    let both = h.view_as(&state, &h.user, ACCOUNT_1).await?;
+    // audit: COACTVWC-033
+    // audit: COACTVWC-046
+    assert_screen_error(&both, status, both.message(), Some("acct_id"));
+    assert_file_error(&both, "CUSTDAT  ");
+
+    // The account is missing: the customer's 500 replaces the account's 404, with no block.
+    let (state, _) = h.probed_state(CUSTOMER_READ)?;
+    let key = acct(NO_ACCOUNT_FIXTURE_CUSTOMER);
+    let no_account = h.view_as(&state, &h.user, &key).await?;
+    // audit: COACTVWC-040
+    // audit: COACTVWC-046
+    let message = no_account.message();
+    assert_screen_error(&no_account, status, message, Some("acct_id"));
+    assert_file_error(&no_account, "CUSTDAT  ");
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------------------------
 // Endpoint 5: COACTUPC fetch
 // ---------------------------------------------------------------------------------------------
 
-#[tokio::test]
-async fn coactupc_fetch_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    fetch_gate_and_account_edit(&harness).await?;
-    fetch_fixture_account(&harness).await?;
-    fetch_read_chain_failures(&harness).await?;
-    Ok(())
+#[test]
+fn coactupc_fetch_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let harness = Harness::start().await?;
+        fetch_gate_and_account_edit(&harness).await?;
+        fetch_fixture_account(&harness).await?;
+        fetch_read_chain_failures(&harness).await?;
+        fetch_reads_after_the_cross_reference(&harness).await?;
+        Ok(())
+    })
 }
 
 /// The token check, the user types and the account edit of endpoints 5 and 6 (COACTUPC-002,
@@ -1505,6 +1737,169 @@ async fn fetch_read_chain_failures(h: &Harness) -> TestResult {
     for failed in [&fetch_failed, &save_failed] {
         assert_screen_error(failed, status, failed.message(), Some("acct_id"));
         assert_file_error(failed, "CXACAIX  ");
+    }
+    Ok(())
+}
+
+/// Endpoints 5 and 6 when the account or the customer read fails after the cross-reference
+/// read found its row, each failure made by [`FailingReads`] on the loaded pool; nothing is
+/// written (COACTUPC-084, COACTUPC-093, COACTUPC-097).
+async fn fetch_reads_after_the_cross_reference(h: &Harness) -> TestResult {
+    let account_before = h.account(CLEAN).await?;
+    let customer_before = h.customer(CLEAN).await?;
+    let account_72_before = h.account(NO_CUSTOMER).await?;
+    fetch_account_read_failing(h).await?;
+    fetch_customer_read_failing(h).await?;
+    save_reads_failing(h).await?;
+    // audit: COACTUPC-084
+    // audit: COACTUPC-093
+    // audit: COACTUPC-097
+    assert_stored(h, CLEAN, &account_before, &customer_before).await?;
+    assert_eq!(
+        h.account(NO_CUSTOMER).await?,
+        account_72_before,
+        "stored account {NO_CUSTOMER}"
+    );
+    Ok(())
+}
+
+/// Endpoint 5 when the account read fails: its `ACCTDAT` text, status 500 and field `acct_id`,
+/// while the customer read still runs; a customer it finds is shown in state `S` beside the
+/// message, a missing one leaves the account's message and no details. A chain that ends at the
+/// cross-reference asks for neither read (COACTUPC-084, COACTUPC-093, COACTUPC-095,
+/// COACTUPC-099).
+async fn fetch_account_read_failing(h: &Harness) -> TestResult {
+    let status = StatusCode::INTERNAL_SERVER_ERROR;
+    let (healthy, _, _) = h.fetched(CLEAN).await?;
+    // Customer 60 is found: state `S` and the details beside the account's message, status and
+    // field, whose customer values are customer 60's. Their account values and the account part
+    // of their snapshot are halt candidate X-COACTUPC-H1's and are not asserted
+    // (`blocked_uninitialised_storage`).
+    let (state, probe) = h.probed_state(ACCOUNT_READ)?;
+    let failed = h.fetch_as(&state, &h.user, &acct(CLEAN)).await?;
+    // audit: COACTUPC-093
+    // audit: COACTUPC-099
+    assert_error_beside(&failed, status, Some("acct_id"), &["details", "state"]);
+    assert_file_error(&failed, "ACCTDAT  ");
+    let details = &failed.body["details"];
+    assert_eq!(failed.body["state"], "S");
+    assert_eq!(details["info_message"], PRESENTED);
+    assert_eq!(details["snapshot"]["state"], "S");
+    assert_eq!(
+        members_of(details, &UPDATE_CUSTOMER_MEMBERS),
+        members_of(&healthy, &UPDATE_CUSTOMER_MEMBERS),
+        "the details show customer 60"
+    );
+    assert_eq!(
+        members_of(&details["snapshot"], &SNAPSHOT_CUSTOMER_MEMBERS),
+        members_of(&healthy["snapshot"], &SNAPSHOT_CUSTOMER_MEMBERS),
+        "the snapshot keeps customer 60"
+    );
+    // The details are what a screen echoes: they read back as the fields and snapshot of an
+    // endpoint 6 request.
+    echoed(details)?;
+    snapshot_of(details)?;
+    // Both reads ran after the cross-reference was found, though the account read failed.
+    // audit: COACTUPC-084
+    // audit: COACTUPC-093
+    assert_eq!(probe.seen(), chain_reads(CLEAN, CLEAN));
+
+    // The customer is missing: the account's message stands, the state stays not fetched.
+    let (state, probe) = h.probed_state(ACCOUNT_READ)?;
+    let no_customer = h.fetch_as(&state, &h.user, &acct(NO_CUSTOMER)).await?;
+    // audit: COACTUPC-093
+    // audit: COACTUPC-095
+    let message = no_customer.message();
+    assert_screen_error(&no_customer, status, message, Some("acct_id"));
+    assert_file_error(&no_customer, "ACCTDAT  ");
+    assert_eq!(probe.seen(), chain_reads(NO_CUSTOMER, MISSING_CUSTOMER_72));
+
+    // No cross-reference, or two: the chain ends there, and neither later read is asked for.
+    let (state, probe) = h.probed_state(BOTH_READS)?;
+    let unknown = h.fetch_as(&state, &h.user, ACCOUNT_UNKNOWN).await?;
+    let two_cards = h.fetch_as(&state, &h.user, &acct(2)).await?;
+    // audit: COACTUPC-084
+    let not_found = StatusCode::NOT_FOUND;
+    assert_screen_error(&unknown, not_found, unknown.message(), Some("acct_id"));
+    assert_account_not_found(&unknown, ACCOUNT_UNKNOWN, " Cross ref file.  Resp:");
+    assert_screen_error(&two_cards, status, two_cards.message(), Some("acct_id"));
+    assert_file_error(&two_cards, "CXACAIX  ");
+    assert!(
+        probe.seen().is_empty(),
+        "a read was asked for after the cross-reference"
+    );
+    Ok(())
+}
+
+/// Endpoint 5 when the customer read fails: its `CUSTDAT` text and status 500 replace any
+/// earlier message, the state stays not fetched and no value is shown, with field `acct_id`
+/// only when the account read did not succeed (COACTUPC-084, COACTUPC-091, COACTUPC-097).
+async fn fetch_customer_read_failing(h: &Harness) -> TestResult {
+    let status = StatusCode::INTERNAL_SERVER_ERROR;
+    let (state, probe) = h.probed_state(CUSTOMER_READ)?;
+    let failed = h.fetch_as(&state, &h.user, &acct(CLEAN)).await?;
+    // audit: COACTUPC-097
+    assert_screen_error(&failed, status, failed.message(), None);
+    assert_file_error(&failed, "CUSTDAT  ");
+    assert_eq!(probe.seen(), chain_reads(CLEAN, CLEAN));
+
+    // The account read fails too: the customer's text with the account's field.
+    let (state, _) = h.probed_state(BOTH_READS)?;
+    let both = h.fetch_as(&state, &h.user, &acct(CLEAN)).await?;
+    // audit: COACTUPC-084
+    // audit: COACTUPC-097
+    assert_screen_error(&both, status, both.message(), Some("acct_id"));
+    assert_file_error(&both, "CUSTDAT  ");
+
+    // The account is missing: the customer's 500 replaces the account's 404.
+    let (state, _) = h.probed_state(CUSTOMER_READ)?;
+    let no_account = h.fetch_as(&state, &h.user, &acct(NO_ACCOUNT)).await?;
+    // audit: COACTUPC-091
+    // audit: COACTUPC-097
+    let message = no_account.message();
+    assert_screen_error(&no_account, status, message, Some("acct_id"));
+    assert_file_error(&no_account, "CUSTDAT  ");
+    Ok(())
+}
+
+/// Endpoint 6 re-reads the chain before its decision, for ENTER and for F5 in state `N` alike,
+/// and answers a read failing after the cross-reference as endpoint 5 does when the re-read
+/// yields no customer; no lock is asked for, so nothing is written (COACTUPC-093,
+/// COACTUPC-097). A re-read whose account read alone fails yields the customer, so its save
+/// goes on to the account lock (COACTUPC-099, COACTUPC-101), which this step does not reach.
+async fn save_reads_failing(h: &Harness) -> TestResult {
+    let status = StatusCode::INTERNAL_SERVER_ERROR;
+    let (_, mut fields, snapshot) = h.fetched(CLEAN).await?;
+    set(&mut fields.fico_score, "751");
+    let payloads = [
+        update_body("ENTER", &fields, &snapshot)?,
+        update_body("PF5", &fields, &in_state(&snapshot, "N"))?,
+    ];
+    for (fails, id, customer, field, file) in [
+        (CUSTOMER_READ, CLEAN, CLEAN, None, "CUSTDAT  "),
+        (BOTH_READS, CLEAN, CLEAN, Some("acct_id"), "CUSTDAT  "),
+        (
+            ACCOUNT_READ,
+            NO_CUSTOMER,
+            MISSING_CUSTOMER_72,
+            Some("acct_id"),
+            "ACCTDAT  ",
+        ),
+    ] {
+        for payload in &payloads {
+            let (state, probe) = h.probed_state(fails)?;
+            let saved = h.save_as(&state, &h.user, &acct(id), payload).await?;
+            // audit: COACTUPC-093
+            // audit: COACTUPC-097
+            assert_screen_error(&saved, status, saved.message(), field);
+            assert_file_error(&saved, file);
+            assert_eq!(
+                probe.seen(),
+                chain_reads(id, customer),
+                "the calls of {} on account {id}",
+                payload["aid"]
+            );
+        }
     }
     Ok(())
 }
@@ -2367,28 +2762,30 @@ const MAP_LENGTHS: &[(&str, usize)] = &[
     ("primary_card_holder", 1),
 ];
 
-#[tokio::test]
-async fn coactupc_field_edits() -> TestResult {
-    let harness = Harness::start().await?;
-    edits_change_check(&harness).await?;
-    edits_failing(&harness).await?;
-    edits_passing(&harness).await?;
-    edits_keys_and_states(&harness).await?;
-    edits_map_lengths(&harness).await?;
-    edits_unstorable_text(&harness).await?;
-    // Every request above was ENTER, a key processed as ENTER, or a restart: nothing written.
-    // audit: COACTUPC-013
-    // audit: COACTUPC-014
-    // audit: COACTUPC-070
-    assert!(
-        harness.account(CLEAN).await? == test_account(CLEAN, "GOLD")?,
-        "a validation rewrote the account"
-    );
-    assert!(
-        harness.customer(CLEAN).await? == test_customer(CLEAN, "62701")?,
-        "a validation rewrote the customer"
-    );
-    Ok(())
+#[test]
+fn coactupc_field_edits() -> TestResult {
+    current_thread()?.block_on(async {
+        let harness = Harness::start().await?;
+        edits_change_check(&harness).await?;
+        edits_failing(&harness).await?;
+        edits_passing(&harness).await?;
+        edits_keys_and_states(&harness).await?;
+        edits_map_lengths(&harness).await?;
+        edits_unstorable_text(&harness).await?;
+        // Every request above was ENTER, a key processed as ENTER, or a restart: nothing written.
+        // audit: COACTUPC-013
+        // audit: COACTUPC-014
+        // audit: COACTUPC-070
+        assert!(
+            harness.account(CLEAN).await? == test_account(CLEAN, "GOLD")?,
+            "a validation rewrote the account"
+        );
+        assert!(
+            harness.customer(CLEAN).await? == test_customer(CLEAN, "62701")?,
+            "a validation rewrote the customer"
+        );
+        Ok(())
+    })
 }
 
 /// Endpoint 6, ENTER on each echo of `id`'s fetch, with `touch` applied.
@@ -2750,18 +3147,20 @@ async fn edits_unstorable_text(h: &Harness) -> TestResult {
 
 /// The saves of endpoint 6, in a fixed order on one database: each step starts from what the
 /// steps before it stored.
-#[tokio::test]
-async fn coactupc_save_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    save_refusals(&harness).await?;
-    save_round_trip(&harness).await?;
-    save_reentered_ssn(&harness).await?;
-    save_change_check(&harness).await?;
-    save_other_user_terms(&harness).await?;
-    save_lock_failures(&harness).await?;
-    save_rewrite_failures(&harness).await?;
-    save_narrowed_zip(&harness).await?;
-    Ok(())
+#[test]
+fn coactupc_save_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let harness = Harness::start().await?;
+        save_refusals(&harness).await?;
+        save_round_trip(&harness).await?;
+        save_reentered_ssn(&harness).await?;
+        save_change_check(&harness).await?;
+        save_other_user_terms(&harness).await?;
+        save_lock_failures(&harness).await?;
+        save_rewrite_failures(&harness).await?;
+        save_narrowed_zip(&harness).await?;
+        Ok(())
+    })
 }
 
 /// Account `id` as fetched now with `touch` applied, validated with ENTER: the fields the screen
@@ -2994,7 +3393,8 @@ async fn save_reentered_ssn(h: &Harness) -> TestResult {
 
 /// The 409 of `9700-CHECK-CHANGE-IN-REC`: F5 on a snapshot an earlier save made stale, then the
 /// screen that 409 leaves, and a snapshot whose SSN term alone differs (COACTUPC-113 to
-/// COACTUPC-116, E32).
+/// COACTUPC-116, E32). Each stored term another user changes alone is a case of
+/// `coactupc_change_check_terms`.
 async fn save_change_check(h: &Harness) -> TestResult {
     let (_, shown, stale) = h.fetched(CLEAN).await?;
     let mut first = shown.clone();
@@ -3051,6 +3451,8 @@ async fn save_change_check(h: &Harness) -> TestResult {
 
 /// Another user's rewrite between the fetch and F5: the SSN's first five digits and the group
 /// ID's letter case go unnoticed, the status's letter case does not (COACTUPC-113, COACTUPC-115).
+/// Every other compared term, and the customer terms compared after `UPPER-CASE`, are the cases
+/// of `coactupc_change_check_terms`.
 async fn save_other_user_terms(h: &Harness) -> TestResult {
     // The stored SSN changes in its first five digits only: the save goes through and, its
     // parts omitted, keeps that SSN (E32).
@@ -3237,13 +3639,307 @@ async fn save_narrowed_zip(h: &Harness) -> TestResult {
     .await
 }
 
+/// Another user's change to one term of the stored account [`CLEAN`].
+type AccountTerm = fn(&mut AccountRecord) -> TestResult;
+/// Another user's change to one term of the stored customer [`CLEAN`].
+type CustomerTerm = fn(&mut CustomerRecord) -> TestResult;
+
+/// `text` into the record field `field`, space-padded.
+fn set_pic<const N: usize>(field: &mut PicX<N>, text: &str) -> TestResult {
+    *field = PicX::from_text(text)?;
+    Ok(())
+}
+
+/// The record field `field` in lower case, every other byte kept.
+fn lowered<const N: usize>(field: &mut PicX<N>) -> TestResult {
+    let text = std::str::from_utf8(field.as_bytes())?.to_ascii_lowercase();
+    set_pic(field, &text)
+}
+
+/// The amount of `cents` into the record field `field`.
+fn set_money(field: &mut Money<10>, cents: i64) -> TestResult {
+    *field = money(cents)?;
+    Ok(())
+}
+
+/// The date `year`-`month`-`date` into the record field `field`.
+fn set_day(field: &mut PicDate, year: i32, month: u32, date: u32) -> TestResult {
+    *field = PicDate::new(Some(day(year, month, date)?))?;
+    Ok(())
+}
+
+/// The account terms `9700-CHECK-CHANGE-IN-REC` compares (COACTUPC-113), each changed alone from
+/// what [`test_account`] stores: the status, each of the five amounts by one cent, each of the
+/// three dates in its year, its month and its day, and the group ID to another word.
+const ACCOUNT_TERMS: &[(&str, AccountTerm)] = &[
+    ("active status", |a| set_pic(&mut a.active_status, "N")),
+    ("current balance", |a| set_money(&mut a.curr_bal, 123_457)),
+    ("credit limit", |a| set_money(&mut a.credit_limit, 500_001)),
+    ("cash credit limit", |a| {
+        set_money(&mut a.cash_credit_limit, 149_999)
+    }),
+    ("cycle credit", |a| set_money(&mut a.curr_cyc_credit, 1)),
+    ("cycle debit", |a| set_money(&mut a.curr_cyc_debit, -2_551)),
+    ("open date year", |a| set_day(&mut a.open_date, 2015, 11, 3)),
+    ("open date month", |a| {
+        set_day(&mut a.open_date, 2014, 12, 3)
+    }),
+    ("open date day", |a| set_day(&mut a.open_date, 2014, 11, 4)),
+    ("expiry date year", |a| {
+        set_day(&mut a.expiraion_date, 2026, 5, 20)
+    }),
+    ("expiry date month", |a| {
+        set_day(&mut a.expiraion_date, 2025, 6, 20)
+    }),
+    ("expiry date day", |a| {
+        set_day(&mut a.expiraion_date, 2025, 5, 21)
+    }),
+    ("reissue date year", |a| {
+        set_day(&mut a.reissue_date, 2026, 5, 20)
+    }),
+    ("reissue date month", |a| {
+        set_day(&mut a.reissue_date, 2025, 6, 20)
+    }),
+    ("reissue date day", |a| {
+        set_day(&mut a.reissue_date, 2025, 5, 21)
+    }),
+    ("group ID", |a| set_pic(&mut a.group_id, "SILVER")),
+];
+
+/// The customer terms `9700-CHECK-CHANGE-IN-REC` compares (COACTUPC-114, COACTUPC-115), each
+/// changed alone from what [`test_customer`] stores: the terms compared after `UPPER-CASE` by
+/// more than their letter case; the ZIP in its first five characters and, apart, in its last
+/// five; each phone number, and the first one in its positions 14 and 15 alone; the SSN in its
+/// last four digits; the date of birth in its year, its month and its day; the EFT account ID,
+/// the primary-holder indicator and the FICO score.
+const CUSTOMER_TERMS: &[(&str, CustomerTerm)] = &[
+    ("first name", |c| set_pic(&mut c.first_name, "Jack")),
+    ("middle name", |c| set_pic(&mut c.middle_name, "Quentin")),
+    ("last name", |c| set_pic(&mut c.last_name, "Private")),
+    ("address line 1", |c| {
+        set_pic(&mut c.addr_line_1, "2 Main Street")
+    }),
+    ("address line 2", |c| {
+        set_pic(&mut c.addr_line_2, "Suite 300")
+    }),
+    ("address line 3", |c| {
+        set_pic(&mut c.addr_line_3, "Shelbyville")
+    }),
+    ("state", |c| set_pic(&mut c.addr_state_cd, "WI")),
+    ("country", |c| set_pic(&mut c.addr_country_cd, "CAN")),
+    ("government ID", |c| {
+        set_pic(&mut c.govt_issued_id, "GOVT-ID-0002")
+    }),
+    ("ZIP positions 1 to 5", |c| {
+        set_pic(&mut c.addr_zip, "62702")
+    }),
+    ("ZIP positions 6 to 10", |c| {
+        set_pic(&mut c.addr_zip, "62701-1234")
+    }),
+    ("phone 1", |c| set_pic(&mut c.phone_num_1, "(312)555-0101")),
+    ("phone 2", |c| set_pic(&mut c.phone_num_2, "(415)555-0198")),
+    ("phone 1 positions 14 and 15", |c| {
+        set_pic(&mut c.phone_num_1, "(312)555-010099")
+    }),
+    // audit: COACTUPC-115
+    ("SSN last four digits", |c| {
+        c.ssn = Ssn::parse(OTHER_LAST4_SSN)?;
+        Ok(())
+    }),
+    ("date of birth year", |c| {
+        set_day(&mut c.dob_yyyy_mm_dd, 1981, 1, 15)
+    }),
+    ("date of birth month", |c| {
+        set_day(&mut c.dob_yyyy_mm_dd, 1980, 2, 15)
+    }),
+    ("date of birth day", |c| {
+        set_day(&mut c.dob_yyyy_mm_dd, 1980, 1, 16)
+    }),
+    ("EFT account ID", |c| {
+        set_pic(&mut c.eft_account_id, "0000000043")
+    }),
+    ("primary card holder", |c| {
+        set_pic(&mut c.pri_card_holder_ind, "N")
+    }),
+    ("FICO score", |c| {
+        c.fico_credit_score = PicU::new(751)?;
+        Ok(())
+    }),
+];
+
+/// The customer terms `9700-CHECK-CHANGE-IN-REC` compares after `UPPER-CASE` (COACTUPC-114),
+/// each lower-cased alone: a change of letter case only, which is no change by another user.
+const CASE_ONLY_TERMS: &[(&str, CustomerTerm)] = &[
+    ("first name in lower case", |c| lowered(&mut c.first_name)),
+    ("middle name in lower case", |c| lowered(&mut c.middle_name)),
+    ("last name in lower case", |c| lowered(&mut c.last_name)),
+    ("address line 1 in lower case", |c| {
+        lowered(&mut c.addr_line_1)
+    }),
+    ("address line 2 in lower case", |c| {
+        lowered(&mut c.addr_line_2)
+    }),
+    ("address line 3 in lower case", |c| {
+        lowered(&mut c.addr_line_3)
+    }),
+    ("state in lower case", |c| lowered(&mut c.addr_state_cd)),
+    ("country in lower case", |c| lowered(&mut c.addr_country_cd)),
+    ("government ID in lower case", |c| {
+        lowered(&mut c.govt_issued_id)
+    }),
+];
+
+/// The account term `9700-CHECK-CHANGE-IN-REC` does not compare (COACTUPC-113): `ACCT-ADDR-ZIP`,
+/// changed from the group code [`test_account`] stores there.
+const UNCOMPARED_ACCOUNT_TERMS: &[(&str, AccountTerm)] =
+    &[("ACCT-ADDR-ZIP", |a| set_pic(&mut a.addr_zip, "B000000001"))];
+
+/// The FICO score each case's request changes, so that its F5 carries a change.
+const CASE_FICO: u64 = 800;
+
+/// Another user's change to one term of the account or of its customer.
+#[derive(Clone, Copy)]
+enum Rewrite {
+    Account(AccountTerm),
+    Customer(CustomerTerm),
+}
+
+/// F5 of the case `name`: account [`CLEAN`] fetched and its FICO score changed in the request to
+/// [`CASE_FICO`], then `rewrite` stored by another user before the save. The reply, then the
+/// account and the customer as that user left them.
+async fn save_over(
+    h: &Harness,
+    name: &str,
+    rewrite: Rewrite,
+) -> Fallible<(Reply, AccountRecord, CustomerRecord)> {
+    let (_, mut fields, snapshot) = h.fetched(CLEAN).await?;
+    set(&mut fields.fico_score, &CASE_FICO.to_string());
+    let mut account = h.account(CLEAN).await?;
+    let mut customer = h.customer(CLEAN).await?;
+    match rewrite {
+        Rewrite::Account(term) => {
+            let fetched = account.clone();
+            term(&mut account)?;
+            assert_ne!(account, fetched, "{name}: the case changes no account term");
+            rewrite_account(h, &account).await?;
+        }
+        Rewrite::Customer(term) => {
+            let fetched = customer.clone();
+            term(&mut customer)?;
+            assert!(
+                customer != fetched,
+                "{name}: the case changes no customer term"
+            );
+            rewrite_customer(h, &customer).await?;
+        }
+    }
+    let reply = confirm(h, CLEAN, &fields, &snapshot).await?;
+    Ok((reply, account, customer))
+}
+
+/// After the case `name`, the stored account [`CLEAN`] equals `account` and its customer equals
+/// `customer`. As in [`assert_stored`], the customer comparison prints nothing of the records.
+async fn assert_case_stored(
+    h: &Harness,
+    name: &str,
+    account: &AccountRecord,
+    customer: &CustomerRecord,
+) -> TestResult {
+    assert_eq!(
+        &h.account(CLEAN).await?,
+        account,
+        "{name}: stored account {CLEAN}"
+    );
+    assert!(
+        &h.customer(CLEAN).await? == customer,
+        "{name}: stored customer {CLEAN} differs from the expected one"
+    );
+    Ok(())
+}
+
+/// Account [`CLEAN`] and its customer rewritten as [`add_test_entities`] stores them.
+async fn restore_clean(h: &Harness) -> TestResult {
+    rewrite_account(h, &test_account(CLEAN, "GOLD")?).await?;
+    rewrite_customer(h, &test_customer(CLEAN, "62701")?).await
+}
+
+/// The case `name` answered with the 409 of `9700-CHECK-CHANGE-IN-REC`, its message alone, and
+/// nothing written: both records stay as the other user stored them. Then the originals return.
+async fn conflicts(h: &Harness, name: &str, rewrite: Rewrite) -> TestResult {
+    let (reply, account, customer) = save_over(h, name, rewrite).await?;
+    assert_eq!(
+        reply.status,
+        StatusCode::CONFLICT,
+        "{name}: another user's change went unnoticed"
+    );
+    assert_screen_error(&reply, StatusCode::CONFLICT, CHANGED, None);
+    assert_case_stored(h, name, &account, &customer).await?;
+    restore_clean(h).await
+}
+
+/// The case `name` committed over the other user's rewrite: the request's FICO score and every
+/// other field as fetched are stored, the group ID received in `ACCT-ADDR-ZIP` (COACTUPC-103,
+/// COACTUPC-104). Then the originals return.
+async fn commits(h: &Harness, name: &str, rewrite: Rewrite) -> TestResult {
+    let (reply, _, _) = save_over(h, name, rewrite).await?;
+    assert_eq!(
+        reply.status,
+        StatusCode::OK,
+        "{name}: no change by another user, yet the save was refused"
+    );
+    assert_committed(&reply);
+    let account = AccountRecord {
+        addr_zip: PicX::from_text("GOLD")?,
+        ..test_account(CLEAN, "GOLD")?
+    };
+    let customer = CustomerRecord {
+        fico_credit_score: PicU::new(CASE_FICO)?,
+        ..test_customer(CLEAN, "62701")?
+    };
+    assert_case_stored(h, name, &account, &customer).await?;
+    restore_clean(h).await
+}
+
+/// `9700-CHECK-CHANGE-IN-REC` term by term on account [`CLEAN`] and its customer, which this test
+/// owns: another user's rewrite of one compared term between the fetch and F5 is the 409 that
+/// writes nothing (COACTUPC-113, COACTUPC-114, COACTUPC-115); a rewrite of a customer term
+/// compared after `UPPER-CASE` in its letter case alone, or of `ACCT-ADDR-ZIP`, which is not
+/// compared, is no change, and the save commits. Both records are restored after each case.
+#[test]
+fn coactupc_change_check_terms() -> TestResult {
+    current_thread()?.block_on(async {
+        let h = Harness::start().await?;
+        let account = test_account(CLEAN, "GOLD")?;
+        let customer = test_customer(CLEAN, "62701")?;
+        assert_case_stored(&h, "before the cases", &account, &customer).await?;
+        for &(name, term) in ACCOUNT_TERMS {
+            // audit: COACTUPC-113
+            conflicts(&h, name, Rewrite::Account(term)).await?;
+        }
+        for &(name, term) in CUSTOMER_TERMS {
+            // audit: COACTUPC-114
+            conflicts(&h, name, Rewrite::Customer(term)).await?;
+        }
+        for &(name, term) in CASE_ONLY_TERMS {
+            // audit: COACTUPC-114
+            commits(&h, name, Rewrite::Customer(term)).await?;
+        }
+        for &(name, term) in UNCOMPARED_ACCOUNT_TERMS {
+            // audit: COACTUPC-113
+            commits(&h, name, Rewrite::Account(term)).await?;
+        }
+        Ok(())
+    })
+}
+
 /// How long another transaction holds a row lock while a save over the request pool waits for
 /// it: longer than the 5 seconds after which a save once gave up, so a wait that ended before
 /// the holder did fails the test.
 const LOCK_HOLD: Duration = Duration::from_secs(6);
 
 /// A current-thread runtime with every driver, the one `#[tokio::test]` builds, made here so
-/// that no test macro expands into a lint suppression or an unchecked pin.
+/// that no test macro expands into a lint suppression or an unchecked pin. Every test of this
+/// file is a plain `#[test]` that blocks on it.
 fn current_thread() -> Fallible<tokio::runtime::Runtime> {
     Ok(tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -3317,12 +4013,14 @@ fn coactupc_lock_wait_rows() -> TestResult {
 /// fills from its reads and the replacement never carries: endpoint 4 takes the account from its
 /// path alone and reads the customer through the account's cross-reference. Account
 /// [`CLEAN`]'s active status is rewritten and restored, so the test owns its database.
-#[tokio::test]
-async fn cocom01y_account_rows() -> TestResult {
-    let harness = Harness::start().await?;
-    commarea_selected_account(&harness).await?;
-    commarea_account_status(&harness).await?;
-    Ok(())
+#[test]
+fn cocom01y_account_rows() -> TestResult {
+    current_thread()?.block_on(async {
+        let harness = Harness::start().await?;
+        commarea_selected_account(&harness).await?;
+        commarea_account_status(&harness).await?;
+        Ok(())
+    })
 }
 
 /// One token views account 1, account [`CLEAN`] and account 1 again: each answer is the account
@@ -3520,27 +4218,6 @@ fn blocked_numeric_data_in_text() -> TestResult {
         "BLOCKED: COACTUPC-122, -126, -128 (X-COACTUPC-H3) for date parts with non-digit text, and \
          COACTUPC-009 (X-ARITH-5) for amounts with more than two decimal places: the COBOL \
          result depends on the code generated for numeric items holding other data"
-            .into(),
-    )
-}
-
-/// Reports as unverified the account and customer reads that fail after the cross-reference
-/// read found its row. The three reads of one fetch run back to back on a healthy pool, and a
-/// plain read waits for no row lock, so no input fails the second or third read without
-/// failing the first; the closed-pool cases above fail at the first.
-// audit: COACTVWC-042
-// audit: COACTVWC-046
-// audit: COACTUPC-093
-// audit: COACTUPC-097
-#[test]
-#[ignore = "UNVERIFIED: account and customer read failures after a found cross-reference; no input reaches them over a real store"]
-fn unverified_reads_failing_after_the_cross_reference() -> TestResult {
-    // An unverified case is reported, never passed, so a run that includes ignored tests fails
-    // here.
-    Err(
-        "UNVERIFIED: COACTVWC-042, COACTVWC-046, COACTUPC-093 and COACTUPC-097: a store that \
-         fails the account or customer read after the cross-reference read succeeded cannot be \
-         produced through the repositories without a test double"
             .into(),
     )
 }

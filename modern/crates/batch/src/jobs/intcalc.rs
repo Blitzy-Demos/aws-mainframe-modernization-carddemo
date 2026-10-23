@@ -8,11 +8,12 @@
 //! # Flow
 //!
 //! 1. `--parm-date` arrives as the domain's typed `ParmDate`: the command line has already
-//!    refused any value that is not 10 or more printable ASCII bytes, so a refused PARM reads no
-//!    table and creates no file (CBACT04C-001).
-//! 2. The opens (CBACT04C-002). The run first opens its session, the `PgSession` that holds its
-//!    writer claim and runs every statement of the run, and claims `accounts` for writing on it,
-//!    the `OPEN I-O` of `0300-ACCTFILE-OPEN` (CBACT04C-039): the opens before it are for input
+//!    refused any value that is not 10 or more printable ASCII bytes, so a refused PARM shows no
+//!    line, reads no table and creates no file (CBACT04C-001).
+//! 2. `START OF EXECUTION OF PROGRAM CBACT04C`, then the opens (CBACT04C-002). The run first
+//!    opens its session, the `PgSession` that holds its writer claim and runs every statement
+//!    of the run, and claims `accounts` for writing on it, the `OPEN I-O` of
+//!    `0300-ACCTFILE-OPEN` (CBACT04C-039): the opens before it are for input
 //!    and claim nothing, so the claim comes before the first read. `accounts`, `card_xref` and
 //!    `disclosure_groups` are then read whole into `Intcalc::new`, which serves the program's
 //!    keyed reads from them, the cross-references grouped by account as the alternate index over
@@ -20,9 +21,10 @@
 //!    then created under
 //!    `Config::systran_dir`, before any category balance is read, as `0400-TRANFILE-OPEN`
 //!    creates `SYSTRAN(+1)` (CBACT04C-024).
-//! 3. Every `tran_cat_balances` row, in the KSDS key order its repository returns
-//!    (CBACT04C-003), goes to `Intcalc::process`, and its effects are applied in the order
-//!    returned: an account update rewrites that `accounts` row (CBACT04C-026), and a system
+//! 3. Every `tran_cat_balances` row, in the KSDS key order its repository returns, is shown as
+//!    its record line (CBACT04C-003), then goes to `Intcalc::process`, and its effects are
+//!    applied in the order returned: an account update rewrites that `accounts` row
+//!    (CBACT04C-026), a `DEFAULT` fallback shows its two lines (CBACT04C-010), and a system
 //!    transaction appends its 350 bytes and LF to the generation file (CBACT04C-024). The
 //!    interest, the running total and the balance store are the domain's (`monthly_interest`
 //!    and `store`, ARITH-001 to ARITH-017); this module does no arithmetic on money.
@@ -34,7 +36,8 @@
 //! 5. The generation file is flushed, synced and kept. Its path is the one path returned, and
 //!    the run returns code 0, as `RETURN-CODE` is never set (CBACT04C-030). The run's session is
 //!    then closed, which gives up the claim on `accounts`, as `9300-ACCTFILE-CLOSE` ends the
-//!    program's hold on the cluster (CBACT04C-039).
+//!    program's hold on the cluster (CBACT04C-039), and `END OF EXECUTION OF PROGRAM CBACT04C`
+//!    is shown (CBACT04C-030).
 //!
 //! # One writer of the account file
 //!
@@ -70,17 +73,19 @@
 //!
 //! # Abends
 //!
-//! Every failure path ends in `9999-ABEND-PROGRAM`, its `DISPLAY` lines emitted in program order
-//! as `ERROR` events whose message is the line (X-INTCALC-4): first, when the failure has an
-//! underlying error, one event naming the file operation the call replaces and carrying the
-//! error, an SQLSTATE, a constraint or column name, or a static step and an I/O error kind; then
-//! the path's failure line; the status line of `9910-DISPLAY-IO-STATUS` (`file_status_line`);
-//! and `ABENDING PROGRAM`, whose field `abend_code` records the abend code 999 `CEE3ABD` receives
-//! (CBACT04C-038). The job then returns [`JobError::Abend`] with the failure line as its reason:
+//! Every failure path ends in `9999-ABEND-PROGRAM`, after the lines the run showed before the
+//! failure, its `DISPLAY` lines emitted in program order as `ERROR` events whose message is the
+//! line (X-INTCALC-4): first, when the failure has an underlying error, one event naming the
+//! file operation the call replaces and carrying the error, an SQLSTATE, a constraint or column
+//! name, or a static step and an I/O error kind; then the path's failure line; the status line
+//! of `9910-DISPLAY-IO-STATUS` (`file_status_line`); and `ABENDING PROGRAM`, whose field
+//! `abend_code` records the abend code 999 `CEE3ABD` receives (CBACT04C-038). The job then
+//! returns [`JobError::Abend`] with the failure line as its reason:
 //!
 //! - `ERROR OPENING TRANSACTION CATEGORY BALANCE`: the one `PostgreSQL` connection that stands
 //!   for the input opens fails (CBACT04C-034, X-INTCALC-7): the run's session cannot be opened,
-//!   or `main` cannot connect at all and the job never starts. In that case `main` emits its
+//!   or `main` cannot connect at all and the job never starts. In that case `main` shows
+//!   `START OF EXECUTION OF PROGRAM CBACT04C` through `show_start` (CBACT04C-002), emits its
 //!   connection event, then these lines through `show_failed_connection`, and reports its own
 //!   connection error, exit status 1, in place of the [`JobError::Abend`].
 //! - `ERROR OPENING ACCOUNT MASTER FILE`: another run holds the claim on `accounts`, status `93`
@@ -128,19 +133,28 @@
 //!
 //! # Job log and cardholder data
 //!
-//! The job emits the `DISPLAY` lines of its failure paths, with their cause events, as "Abends"
-//! lists them, and the warning of a session close that failed, which names the close and the
-//! error only. The lines of a run that ends normally stay unwritten (X-INTCALC-4):
-//! `START OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-002), the record shown for every category
-//! balance read (CBACT04C-003), the pair `DISCLOSURE GROUP RECORD MISSING` and
-//! `TRY WITH DEFAULT GROUP CODE` of every `DEFAULT` fallback, which the domain does not report
-//! for a lookup that succeeds (CBACT04C-010), and `END OF EXECUTION OF PROGRAM CBACT04C`
-//! (CBACT04C-030). Standard output otherwise carries only the path `main` prints from
-//! [`JobOutcome::written`] (AAP 0.3.4.3). Each SYSTRAN record carries the full `XREF-CARD-NUM`
-//! (CBACT04C-021) in the local generation file only, which is batch output and not egress. The
-//! lines emitted show account IDs at most, the cause events never a path or a value, the job's
-//! errors are the fixed texts of [`JobError`] and its counts are plain numbers, so nothing it
-//! emits carries a card number (Cardholder Data Redaction).
+//! Every `DISPLAY` line of `CBACT04C` is one tracing event of the job span whose message is the
+//! displayed text, in program order (X-INTCALC-4). A run that ends normally emits, as `INFO`
+//! events:
+//!
+//! - `START OF EXECUTION OF PROGRAM CBACT04C`, first, before the session opens (CBACT04C-002);
+//! - for every category balance read, its 50 bytes as codec A encodes them, before that record's
+//!   break and lookups (CBACT04C-003);
+//! - for every disclosure lookup that falls back to `DEFAULT`, which the domain reports as
+//!   `IntcalcEffect::DefaultGroupFallback`, `DISCLOSURE GROUP RECORD MISSING` and then
+//!   `TRY WITH DEFAULT GROUP CODE`, after the break's rewrite (CBACT04C-010);
+//! - `END OF EXECUTION OF PROGRAM CBACT04C`, once the generation and the session are closed
+//!   (CBACT04C-030); the path `main` prints from [`JobOutcome::written`] follows it (AAP
+//!   0.3.4.3).
+//!
+//! A run that abends emits the lines it reached, then those of its failure path as `ERROR`
+//! events, with their cause events, as "Abends" lists them, and no end line. A session close
+//! that fails adds a warning that names the close and the error only. Each SYSTRAN record
+//! carries the full `XREF-CARD-NUM` (CBACT04C-021) in the local generation file only, which is
+//! batch output and not egress. The lines emitted show account IDs and category balance records
+//! at most, which hold no card number, CVV, SSN or password; the cause events never show a path
+//! or a value, the job's errors are the fixed texts of [`JobError`] and its counts are plain
+//! numbers, so nothing it emits carries a card number (Cardholder Data Redaction).
 //!
 //! # Rules
 //!
@@ -156,10 +170,10 @@
 
 use copybook::FixedRecord;
 use domain::batch::cbact04c::{
-    ABEND_CODE, ABEND_LINE, CLOSE_TRANSACT_ERROR, Intcalc, IntcalcEffect, IntcalcError,
-    OPEN_ACCOUNT_ERROR, OPEN_TCATBAL_ERROR, OPEN_TRANSACT_ERROR, READ_ACCOUNT_ERROR,
-    READ_DISCGRP_ERROR, READ_TCATBAL_ERROR, READ_XREF_ERROR, REWRITE_ACCOUNT_ERROR,
-    WRITE_TRANSACT_ERROR, file_status_line,
+    ABEND_CODE, ABEND_LINE, CLOSE_TRANSACT_ERROR, DISCLOSURE_MISSING_LINE, END_LINE, Intcalc,
+    IntcalcEffect, IntcalcError, OPEN_ACCOUNT_ERROR, OPEN_TCATBAL_ERROR, OPEN_TRANSACT_ERROR,
+    READ_ACCOUNT_ERROR, READ_DISCGRP_ERROR, READ_TCATBAL_ERROR, READ_XREF_ERROR,
+    REWRITE_ACCOUNT_ERROR, START_LINE, TRY_DEFAULT_LINE, WRITE_TRANSACT_ERROR, file_status_line,
 };
 use domain::clock::Clock;
 use domain::records::{AccountRecord, TranCatBalanceRecord};
@@ -264,6 +278,7 @@ impl Status {
 /// Every rewrite committed before an error stands, the generation file is removed and the run's
 /// session is dropped, which gives up its claim on `accounts` (CBACT04C-038).
 pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobOutcome, JobError> {
+    show_start();
     // Every statement of the run goes to its one session, the one holding its claim on
     // `accounts`, so that a session the server ends takes the claim and the run's next statement
     // with it, and no rewrite follows the loss (CBACT04C-039). Each statement on the session
@@ -309,6 +324,9 @@ pub(crate) async fn run(ctx: &JobContext<'_>, args: &IntcalcArgs) -> Result<JobO
         .await
         .map_err(|error| file_failure(CLOSE_TRANFILE_OP, CLOSE_TRANSACT_ERROR, &error))?;
     close_acctfile(session).await;
+    // Every file is closed: the last line of the job log, which `main`'s path line follows
+    // (CBACT04C-030).
+    tracing::info!("{END_LINE}");
     Ok(JobOutcome {
         written: vec![path],
         return_code: 0,
@@ -363,9 +381,10 @@ async fn close_acctfile(session: PgSession) {
 }
 
 /// The main loop of `CBACT04C` over `balances`, in order (`CBACT04C.cbl:188-222`): each record
-/// goes to `intcalc`, and its effects are applied as returned, an account update through
-/// `accounts` and a SYSTRAN record appended to `systran` (CBACT04C-024, CBACT04C-026). Returns
-/// the number of accounts rewritten.
+/// is shown as its job-log line (CBACT04C-003), then goes to `intcalc`, and its effects are
+/// applied as returned, an account update through `accounts`, a `DEFAULT` fallback as its two
+/// job-log lines (CBACT04C-010) and a SYSTRAN record appended to `systran` (CBACT04C-024,
+/// CBACT04C-026). Returns the number of accounts rewritten.
 ///
 /// # Errors
 ///
@@ -383,6 +402,9 @@ async fn post_interest<A: AccountRepository>(
 ) -> Result<usize, JobError> {
     let mut rewritten = 0;
     for balance in balances {
+        // `DISPLAY TRAN-CAT-BAL-RECORD` follows the read and comes before the break and the
+        // lookups, so a rewrite or lookup that abends follows it (CBACT04C-003).
+        tracing::info!("{}", record_line(balance));
         let effects = match intcalc.process(balance, clock) {
             Ok(effects) => effects,
             Err(error) => {
@@ -398,6 +420,7 @@ async fn post_interest<A: AccountRepository>(
                     rewrite(accounts, &account).await?;
                     rewritten += 1;
                 }
+                IntcalcEffect::DefaultGroupFallback => show_default_fallback(),
                 IntcalcEffect::SystemTransaction(record) => {
                     systran
                         .write_record(&record.encode())
@@ -478,13 +501,41 @@ fn abend(line: &'static str, status: Status) -> JobError {
     }
 }
 
+/// `DISPLAY 'START OF EXECUTION OF PROGRAM CBACT04C'`, the first line of every run whose PARM
+/// was accepted, before any open: one `INFO` event whose message is the line (X-INTCALC-4;
+/// CBACT04C-002). [`run`] shows it first, and `main` shows it before its connection event when
+/// it cannot connect, as the connection is the first open (CBACT04C-034).
+pub(crate) fn show_start() {
+    tracing::info!("{START_LINE}");
+}
+
 /// The job log of the first open's failure when `main` cannot connect to `PostgreSQL`, the
 /// connection that stands for the four input opens: `ERROR OPENING TRANSACTION CATEGORY BALANCE`,
 /// the stand-in status line and `ABENDING PROGRAM`, as for a session that cannot be opened
-/// (CBACT04C-034, CBACT04C-038, X-INTCALC-7). No other line precedes them, as the normal-run
-/// lines stay unwritten (X-INTCALC-4), and `main` reports the connection error itself.
+/// (CBACT04C-034, CBACT04C-038, X-INTCALC-7). `main` shows [`show_start`]'s line and its own
+/// connection event, which carries the error, before them (CBACT04C-002), and reports the
+/// connection error itself.
 pub(crate) fn show_failed_connection() {
     show_abend(OPEN_TCATBAL_ERROR, Status::Permanent);
+}
+
+/// `DISPLAY TRAN-CAT-BAL-RECORD` of the main loop: the 50 bytes of `balance` as codec A encodes
+/// them, the 17-byte key, `TRAN-CAT-BAL` in zoned form and the 22-byte `FILLER`, one character
+/// per byte, so that the line is total over any byte (`CBACT04C.cbl:193`; CBACT04C-003). The
+/// record holds no card number, CVV, SSN or password, so no byte is masked (Cardholder Data
+/// Redaction).
+fn record_line(balance: &TranCatBalanceRecord) -> String {
+    balance.encode().into_iter().map(char::from).collect()
+}
+
+/// The `INVALID KEY` lines of a disclosure lookup that falls back to `DEFAULT`, in order, each
+/// an `INFO` event whose message is the line: `DISCLOSURE GROUP RECORD MISSING`, then
+/// `TRY WITH DEFAULT GROUP CODE` (`CBACT04C.cbl:418-419`; CBACT04C-010, X-INTCALC-4). The lookup
+/// that finds no `DEFAULT` record either shows them as `ERROR` events through [`lookup_abend`]
+/// (CBACT04C-011), never here.
+fn show_default_fallback() {
+    tracing::info!("{DISCLOSURE_MISSING_LINE}");
+    tracing::info!("{TRY_DEFAULT_LINE}");
 }
 
 /// The `DISPLAY` lines of a failure path: the failure line `line` and the status line of
@@ -531,7 +582,8 @@ mod tests {
     use chrono::{NaiveDate, Timelike};
     use copybook::{FixedRecord, PicDate, PicU, PicX, TsForm};
     use domain::batch::cbact04c::{
-        DEFAULT_GROUP, Intcalc, IntcalcError, ParmDate, REWRITE_ACCOUNT_ERROR,
+        DEFAULT_GROUP, DISCLOSURE_MISSING_LINE, Intcalc, IntcalcError, ParmDate,
+        REWRITE_ACCOUNT_ERROR, TRY_DEFAULT_LINE,
     };
     use domain::clock::FixedClock;
     use domain::money::{Decimal, Money, Rate};
@@ -952,7 +1004,7 @@ mod tests {
 
     /// One abending run: the accounts the table holds, whether every update fails, the accounts
     /// of the two category balances, the expected end, the rewrites that stand and the messages
-    /// of the events the run emits, in order.
+    /// of the events the run emits after the second balance's record line, in order.
     struct Case {
         held: &'static [u64],
         failing: bool,
@@ -970,6 +1022,31 @@ mod tests {
         "ABENDING PROGRAM",
     ];
 
+    /// `TRAN-CAT-BAL PIC S9(09)V99` of [`balance`]`(_, 120_000)`, 1200.00, as its record line
+    /// shows it: eleven digits, the last overpunched with the positive sign, `0` as `{`
+    /// (PIC-005).
+    const BALANCE_1200_ZONED: &str = "0000012000{";
+
+    /// The record line of [`balance`]`(acct_id, 120_000)`: the key (`acct_id` in 11 digits, type
+    /// `01`, category `0001`), the zoned balance and the 22 spaces of its `FILLER` (CBACT04C-003).
+    fn record_shown(acct_id: u64) -> String {
+        format!("{acct_id:011}010001{BALANCE_1200_ZONED}{:22}", "")
+    }
+
+    /// The job log of an abending run over the balances of accounts `first` and `second`: the
+    /// first's record line and `DEFAULT` fallback pair, the second's record line, as the line
+    /// comes before the break it causes, then `tail` (CBACT04C-003, CBACT04C-010).
+    fn abend_log([first, second]: [u64; 2], tail: &[&str]) -> Vec<String> {
+        let mut log = vec![
+            record_shown(first),
+            DISCLOSURE_MISSING_LINE.to_owned(),
+            TRY_DEFAULT_LINE.to_owned(),
+            record_shown(second),
+        ];
+        log.extend(tail.iter().map(|line| (*line).to_owned()));
+        log
+    }
+
     /// The messages of the JSON events `capture` holds, in order.
     fn messages(capture: &TraceCapture) -> Vec<String> {
         capture
@@ -986,8 +1063,12 @@ mod tests {
     /// Each abend ends the loop with its error, keeps the rewrites committed before it, the one
     /// made at the failing break included, and leaves no generation file once the output is
     /// dropped. A rewrite that precedes a failed lookup and fails itself is the abend. Its job
-    /// log is the path's lines, after the event carrying the error when the rewrite failed as a
-    /// statement, ending with `ABENDING PROGRAM`, which records abend code 999.
+    /// log is the first balance's record line and `DEFAULT` fallback pair, the second balance's
+    /// record line, as the line comes before the break it causes, then the path's lines, after
+    /// the event carrying the error when the rewrite failed as a statement, ending with
+    /// `ABENDING PROGRAM`, which records abend code 999.
+    // audit: CBACT04C-003
+    // audit: CBACT04C-010
     // audit: CBACT04C-005
     // audit: CBACT04C-032
     // audit: CBACT04C-036
@@ -1075,7 +1156,7 @@ mod tests {
                 ),
             };
             assert!(matched, "{ends:?} ended with {error}");
-            assert_eq!(messages(&capture), log, "{ends:?}");
+            assert_eq!(messages(&capture), abend_log(keys, log), "{ends:?}");
             assert!(
                 capture.lines().iter().any(|line| {
                     line.contains(r#""message":"ABENDING PROGRAM""#)

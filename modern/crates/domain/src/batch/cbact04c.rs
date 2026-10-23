@@ -19,7 +19,9 @@
 //! # Defects reproduced
 //!
 //! - E07: every fixture account has a blank `ACCT-GROUP-ID`, so every lookup misses and reads
-//!   the `DEFAULT` group (CBACT04C-010, FIXINT-902).
+//!   the `DEFAULT` group, and each record's effects carry
+//!   [`IntcalcEffect::DefaultGroupFallback`] for the two lines the miss displays (CBACT04C-010,
+//!   FIXINT-902).
 //! - E08: the loop's `ELSE PERFORM 1050-UPDATE-ACCOUNT` is never reached, so the last account in
 //!   key order is never rewritten and its interest total is discarded. [`Intcalc::finish`]
 //!   returns no account update; [`IntcalcSummary::unapplied_last_account`] names that account
@@ -376,7 +378,9 @@ pub fn file_status_line(status: [u8; 2]) -> String {
 }
 
 /// One effect of a category balance record, in program order; the job applies them in the order
-/// [`Intcalc::process`] returns them.
+/// [`Intcalc::process`] returns them: the break's [`IntcalcEffect::AccountUpdate`], then the
+/// disclosure lookup's [`IntcalcEffect::DefaultGroupFallback`], then the record's
+/// [`IntcalcEffect::SystemTransaction`], each when it occurs.
 ///
 /// The derived `Debug` cannot disclose a card number: [`TransactionRecord`] holds it as a
 /// [`CardNumber`], whose `Debug` redacts it (PIC-024).
@@ -385,6 +389,15 @@ pub enum IntcalcEffect {
     /// `REWRITE FD-ACCTFILE-REC FROM ACCOUNT-RECORD` of the previous account at an account break,
     /// after [`update_account`] (CBACT04C-026). Replacement: update that `accounts` row.
     AccountUpdate(AccountRecord),
+    /// The `INVALID KEY` branch of `1200-GET-INTEREST-RATE`: no disclosure record has the
+    /// account's group with the record's type and category, so the program displays
+    /// [`DISCLOSURE_MISSING_LINE`] and then [`TRY_DEFAULT_LINE`], and the record takes the
+    /// rate of the [`DEFAULT_GROUP`] record of that type and category (`CBACT04C.cbl:415-440`;
+    /// CBACT04C-010; E07, FIXINT-902). It follows the break's lookups, as the disclosure read does
+    /// in the program. A `DEFAULT` record that is missing too is
+    /// [`IntcalcError::DefaultDisclosureMissing`] instead, whose lines include the same two.
+    /// Replacement: emit both lines, in that order, as the job's `INFO` events.
+    DefaultGroupFallback,
     /// `WRITE FD-TRANFILE-REC FROM TRAN-RECORD`: one 350-byte SYSTRAN record, built by
     /// [`systran_record`] (CBACT04C-024). Replacement: append its codec A bytes and LF to the
     /// SYSTRAN generation; never insert it into `transactions` (CBACT04C-029).
@@ -495,7 +508,7 @@ impl IntcalcError {
     fn after(mut self, effects: Vec<IntcalcEffect>) -> Self {
         let update = effects.into_iter().find_map(|effect| match effect {
             IntcalcEffect::AccountUpdate(account) => Some(Box::new(account)),
-            IntcalcEffect::SystemTransaction(_) => None,
+            IntcalcEffect::DefaultGroupFallback | IntcalcEffect::SystemTransaction(_) => None,
         });
         match &mut self {
             Self::ParmDateTooShort { .. } | Self::ParmDateNotPrintable => {}
@@ -644,7 +657,9 @@ impl Intcalc {
     ///    CBACT04C-026); the total restarts at zero, and the new account and its single
     ///    cross-reference are read (CBACT04C-004 to CBACT04C-008).
     /// 2. The rate of the account's group, type and category, or of `DEFAULT` with the same type
-    ///    and category when that record is missing (CBACT04C-009, CBACT04C-010; E07).
+    ///    and category when that record is missing, which adds
+    ///    [`IntcalcEffect::DefaultGroupFallback`] after the break's effect (CBACT04C-009,
+    ///    CBACT04C-010; E07).
     /// 3. A zero rate computes nothing and writes nothing (CBACT04C-012, ARITH-015).
     /// 4. Otherwise [`monthly_interest`] is added to the total, the suffix advances and one
     ///    [`IntcalcEffect::SystemTransaction`] is built from one reading of `clock`
@@ -678,7 +693,11 @@ impl Intcalc {
             }
         };
         let rate = match interest_rate(&self.rates, &current.account, tcatbal) {
-            Ok(rate) => rate,
+            Ok(DisclosureRate::Own(rate)) => rate,
+            Ok(DisclosureRate::Default(rate)) => {
+                effects.push(IntcalcEffect::DefaultGroupFallback);
+                rate
+            }
             Err(error) => return Err(error.after(effects)),
         };
         let current = self.current.insert(current);
@@ -757,6 +776,14 @@ impl Intcalc {
     }
 }
 
+/// The `DIS-INT-RATE` a disclosure lookup reads, and which record it came from.
+enum DisclosureRate {
+    /// The record of the account's own group, read with status `00` (CBACT04C-009).
+    Own(Rate<4>),
+    /// The [`DEFAULT_GROUP`] record, read after the account's group missed (CBACT04C-010).
+    Default(Rate<4>),
+}
+
 /// `1200-GET-INTEREST-RATE` and `1200-A-GET-DEFAULT-INT-RATE`: the `DIS-INT-RATE` keyed by the
 /// account's `ACCT-GROUP-ID` (all ten bytes, a blank group included) and `tcatbal`'s type and
 /// category, or, when no record has that key, the one keyed by [`DEFAULT_GROUP`] and the same
@@ -765,19 +792,20 @@ fn interest_rate(
     rates: &BTreeMap<DisclosureKey, Rate<4>>,
     account: &AccountRecord,
     tcatbal: &TranCatBalanceRecord,
-) -> Result<Rate<4>, IntcalcError> {
+) -> Result<DisclosureRate, IntcalcError> {
     let own = (
         account.group_id.clone(),
         tcatbal.type_cd.clone(),
         tcatbal.cd,
     );
     if let Some(rate) = rates.get(&own) {
-        return Ok(*rate);
+        return Ok(DisclosureRate::Own(*rate));
     }
     let fallback = (DEFAULT_GROUP, tcatbal.type_cd.clone(), tcatbal.cd);
     rates
         .get(&fallback)
         .copied()
+        .map(DisclosureRate::Default)
         .ok_or_else(|| IntcalcError::DefaultDisclosureMissing {
             acct_id: tcatbal.acct_id,
             type_cd: tcatbal.type_cd.clone(),
@@ -932,17 +960,20 @@ mod tests {
         })
     }
 
-    /// The account updates and the SYSTRAN records among `effects`, each in order.
-    fn split(effects: Vec<IntcalcEffect>) -> (Vec<AccountRecord>, Vec<TransactionRecord>) {
+    /// The account updates, the number of `DEFAULT` fallbacks and the SYSTRAN records among
+    /// `effects`, the updates and records each in order.
+    fn split(effects: Vec<IntcalcEffect>) -> (Vec<AccountRecord>, usize, Vec<TransactionRecord>) {
         let mut updates = Vec::new();
+        let mut fallbacks = 0;
         let mut records = Vec::new();
         for effect in effects {
             match effect {
                 IntcalcEffect::AccountUpdate(account) => updates.push(account),
+                IntcalcEffect::DefaultGroupFallback => fallbacks += 1,
                 IntcalcEffect::SystemTransaction(record) => records.push(record),
             }
         }
-        (updates, records)
+        (updates, fallbacks, records)
     }
 
     // audit: CBACT04C-001
@@ -1166,13 +1197,15 @@ mod tests {
         let clock = FixedClock::new(interest_instant()?);
         let mut run = Intcalc::new(ParmDate::DEFAULT, accounts.clone(), xrefs.clone(), groups);
         for (n, balance) in (1_u64..).zip(&balances) {
-            let (updates, records) = split(run.process(balance, &clock)?);
+            let (updates, fallbacks, records) = split(run.process(balance, &clock)?);
             let previous = accounts
                 .iter()
                 .find(|account| account.id.get() + 1 == n)
                 .map(|account| update_account(account.clone(), Money::ZERO));
             assert_eq!(updates.first(), previous.as_ref(), "FIXINT-903, record {n}");
             assert_eq!(updates.len(), usize::from(n > 1));
+            // The blank group misses, so every lookup falls back to DEFAULT (E07).
+            assert_eq!(fallbacks, 1, "FIXINT-902, record {n}");
             let [record] = records.as_slice() else {
                 return Err(format!("record {n} writes one SYSTRAN record").into());
             };
@@ -1227,19 +1260,22 @@ mod tests {
             ],
         );
         let clock = FixedClock::new(interest_instant()?);
-        // (balance, expected monthly interest in cents, or None for a zero rate)
-        let cases: [(TranCatBalanceRecord, Option<i64>); 5] = [
-            (tcatbal(1, *b"01", 1, 123_456)?, Some(1_543)),
-            (tcatbal(1, *b"01", 2, 10_000)?, Some(83)),
-            (tcatbal(1, *b"02", 1, 50_000)?, None),
-            (tcatbal(1, *b"03", 1, -123_456)?, Some(-1_543)),
-            (tcatbal(2, *b"01", 1, -20_000)?, Some(-166)),
+        // (balance, expected monthly interest in cents, or None for a zero rate, and whether the
+        // lookup falls back to DEFAULT: GRP1 has no 02/0001 or 03/0001 record, account 2's
+        // blank group none at all)
+        let cases: [(TranCatBalanceRecord, Option<i64>, bool); 5] = [
+            (tcatbal(1, *b"01", 1, 123_456)?, Some(1_543), false),
+            (tcatbal(1, *b"01", 2, 10_000)?, Some(83), false),
+            (tcatbal(1, *b"02", 1, 50_000)?, None, true),
+            (tcatbal(1, *b"03", 1, -123_456)?, Some(-1_543), true),
+            (tcatbal(2, *b"01", 1, -20_000)?, Some(-166), true),
         ];
         let mut suffix = 0;
         let mut updates = Vec::new();
-        for (balance, monthly) in &cases {
-            let (rewritten, records) = split(run.process(balance, &clock)?);
+        for (balance, monthly, defaulted) in &cases {
+            let (rewritten, fallbacks, records) = split(run.process(balance, &clock)?);
             updates.extend(rewritten);
+            assert_eq!(fallbacks, usize::from(*defaulted), "DEFAULT fallback");
             match (monthly, records.as_slice()) {
                 (None, []) => {}
                 (Some(cents), [record]) => {
@@ -1259,6 +1295,76 @@ mod tests {
         assert_eq!(summary.transactions_written(), 4);
         assert_eq!(summary.unapplied_last_account(), Some(PicU::new(2)?));
         assert_eq!(summary.unapplied_total(), Some(money(-166)?));
+        Ok(())
+    }
+
+    /// The `DEFAULT` fallback is an effect in program order: after the break's rewrite, as the
+    /// disclosure read follows the account and cross-reference reads, and before the record it
+    /// prices; a zero `DEFAULT` rate falls back too and builds no record, and an own-group rate
+    /// falls back never.
+    // audit: CBACT04C-009
+    // audit: CBACT04C-010
+    // audit: CBACT04C-012
+    #[test]
+    fn a_default_fallback_comes_between_the_break_and_the_record() -> TestResult {
+        let group = b"GRP1      ";
+        let mut run = Intcalc::new(
+            ParmDate::DEFAULT,
+            [
+                account(1, BLANK_GROUP, 0)?,
+                account(2, group, 0)?,
+                account(3, BLANK_GROUP, 0)?,
+            ],
+            [
+                xref(1, card(b'1'))?,
+                xref(2, card(b'2'))?,
+                xref(3, card(b'3'))?,
+            ],
+            [
+                rate(DEFAULT_GROUP.as_bytes(), *b"01", 1, 1_200)?,
+                rate(DEFAULT_GROUP.as_bytes(), *b"03", 1, 0)?,
+                rate(group, *b"01", 1, 1_200)?,
+            ],
+        );
+        let clock = FixedClock::new(interest_instant()?);
+        // The first break rewrites nothing; account 1's blank group misses.
+        let effects = run.process(&tcatbal(1, *b"01", 1, 120_000)?, &clock)?;
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    IntcalcEffect::DefaultGroupFallback,
+                    IntcalcEffect::SystemTransaction(_)
+                ]
+            ),
+            "the fallback, then the record"
+        );
+        let effects = run.process(&tcatbal(1, *b"03", 1, 120_000)?, &clock)?;
+        assert_eq!(effects, [IntcalcEffect::DefaultGroupFallback]);
+        // Account 2's own group holds 01/0001.
+        let effects = run.process(&tcatbal(2, *b"01", 1, 120_000)?, &clock)?;
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    IntcalcEffect::AccountUpdate(previous),
+                    IntcalcEffect::SystemTransaction(_)
+                ] if previous.id.get() == 1
+            ),
+            "the rewrite of account 1, then the record, with no fallback"
+        );
+        let effects = run.process(&tcatbal(3, *b"01", 1, 120_000)?, &clock)?;
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [
+                    IntcalcEffect::AccountUpdate(previous),
+                    IntcalcEffect::DefaultGroupFallback,
+                    IntcalcEffect::SystemTransaction(_)
+                ] if previous.id.get() == 2
+            ),
+            "the rewrite of account 2, the fallback, then the record"
+        );
         Ok(())
     }
 

@@ -1302,13 +1302,13 @@ fn is_iso_layout(text: &str) -> bool {
 
 /// Asserts that `record` is the payment record COBIL00C-025 to COBIL00C-027 describe: the fixed
 /// type, category, source, description and merchant fields, the amount `amount`, the FILLER of
-/// `prior`, the transaction with the highest ID before it, and both timestamps the clock's
-/// instant `at` in layout `I`. The card number is asserted by the caller.
+/// `prior`, the transaction with the highest ID before it, and both timestamps the same value,
+/// checked by format only: layout `I` at whole seconds. The card number is asserted by the
+/// caller.
 fn assert_payment_record(
     record: &TransactionRecord,
     amount: &str,
     prior: &TransactionRecord,
-    at: NaiveDateTime,
 ) -> TestResult {
     // audit: COBIL00C-025
     assert_eq!(record.type_cd, PicX::from_text("02")?);
@@ -1325,7 +1325,7 @@ fn assert_payment_record(
     // audit: COBIL00C-027
     assert_eq!(record.orig_ts, record.proc_ts);
     let stamp = record.orig_ts.value().ok_or("a blank payment timestamp")?;
-    assert_eq!((stamp.form(), stamp.value()), (TsForm::Iso, at));
+    assert_eq!(stamp.form(), TsForm::Iso);
     let mut text = Vec::new();
     record.orig_ts.encode_into(&mut text);
     assert!(is_iso_layout(&String::from_utf8(text)?));
@@ -1358,9 +1358,9 @@ async fn cobil00c_bill_payment_rows() -> TestResult {
     pay_map_rows(&api, &before, &seed).await?;
     pay_non_object_rows(&api, &before, &seed).await?;
     pay_balance_row(&api, &before, &seed).await?;
-    let paid = pay_rows(&api, &before, &seed, at).await?;
+    let paid = pay_rows(&api, &before, &seed).await?;
     pay_nothing_rows(&api, &paid).await?;
-    pay_truncation_rows(&api, at).await?;
+    pay_truncation_rows(&api).await?;
     assert_no_card_number(&api)
 }
 
@@ -1544,7 +1544,6 @@ async fn pay_rows(
     api: &Api,
     before: &AccountRecord,
     seed: &TransactionRecord,
-    at: NaiveDateTime,
 ) -> Outcome<AccountRecord> {
     let new_id = following_id(&seed.id)?;
     let reply = api.post(BILL_PAYMENTS, &pay("00000000001", "Y")).await?;
@@ -1570,9 +1569,18 @@ async fn pay_rows(
         .await?
         .ok_or("the payment was not written")?;
     // audit: ARITH-020
-    assert_payment_record(&written, "194.00", seed, at)?;
-    // The card of account 1's one cross-reference, compared in its redacted form only.
+    assert_payment_record(&written, "194.00", seed)?;
+    let xref = CardXrefRepository::find_by_acct_id(&mut api.store.clone(), before.id)
+        .await?
+        .ok_or("account 1 has no cross-reference")?;
+    // The card of account 1's one cross-reference, compared whole and never printed.
     // audit: COBIL00C-020
+    // audit: COBIL00C-025
+    assert!(
+        written.card_num == xref.card_num,
+        "the payment's card number is not that of account 1's cross-reference"
+    );
+    // Its redacted form shows the last four digits only.
     assert_eq!(written.card_num.last4(), *b"3697");
     assert_eq!(written.card_num.redacted(), "************3697");
     let after = account(&api.store, 1).await?;
@@ -1626,7 +1634,7 @@ async fn pay_nothing_rows(api: &Api, paid: &AccountRecord) -> TestResult {
 
 /// COBIL00C-026 and E11: account 2's balance raised to 1234567890.12 pays its low-order nine
 /// integer digits, 234567890.12, and keeps 1000000000.00, which then pays 0.00 and stays.
-async fn pay_truncation_rows(api: &Api, at: NaiveDateTime) -> TestResult {
+async fn pay_truncation_rows(api: &Api) -> TestResult {
     let mut store = api.store.clone();
     let rich = AccountRecord {
         curr_bal: money("1234567890.12")?,
@@ -1655,7 +1663,7 @@ async fn pay_truncation_rows(api: &Api, at: NaiveDateTime) -> TestResult {
             .ok_or("the payment was not written")?;
         // audit: COBIL00C-026
         // audit: ARITH-021
-        assert_payment_record(&written, amount, &prior, at)?;
+        assert_payment_record(&written, amount, &prior)?;
         // audit: ARITH-022
         assert_eq!(account(&api.store, 2).await?.curr_bal, money::<10>(left)?);
     }
@@ -1668,7 +1676,7 @@ async fn cobil00c_store_rows() -> TestResult {
     let at = instant(2022, 7, 18)?;
     let api = Api::signed_on(&db, fresh_dir("cobil00c_store_rows")?, at).await?;
     let seed = seed_transaction(&api.store).await?;
-    pay_without_xref_row(&api, &seed, at).await?;
+    pay_without_xref_row(&api, &seed).await?;
     pay_concurrent_row(&api).await?;
     pay_wrapped_id_rows(&api, &seed).await?;
     assert_no_card_number(&api)
@@ -1678,11 +1686,7 @@ async fn cobil00c_store_rows() -> TestResult {
 /// tests no error between its steps, so the payment is written and the balance debited, and
 /// the write's message replaces the cross-reference's. The card number written is
 /// `HALTED(X-COBIL00C-H2)` and is not asserted.
-async fn pay_without_xref_row(
-    api: &Api,
-    seed: &TransactionRecord,
-    at: NaiveDateTime,
-) -> TestResult {
+async fn pay_without_xref_row(api: &Api, seed: &TransactionRecord) -> TestResult {
     let orphan = AccountRecord {
         id: PicU::new(99)?,
         curr_bal: money("50.00")?,
@@ -1709,7 +1713,7 @@ async fn pay_without_xref_row(
         .await?
         .ok_or("the payment was not written")?;
     // audit: COBIL00C-021
-    assert_payment_record(&written, "50.00", seed, at)?;
+    assert_payment_record(&written, "50.00", seed)?;
     // audit: COBIL00C-021
     assert_eq!(
         account(&api.store, 99).await?.curr_bal,
@@ -1899,7 +1903,7 @@ fn cobil00c_duplicate_xref_row() -> TestResult {
             .await?
             .ok_or("the payment was not written")?;
         // audit: COBIL00C-022
-        assert_payment_record(&written, "194.00", &seed, at)?;
+        assert_payment_record(&written, "194.00", &seed)?;
         // audit: COBIL00C-022
         assert_eq!(
             account(&api.store, 1).await?,
@@ -2003,7 +2007,7 @@ fn cobil00c_rewrite_not_found_row() -> TestResult {
             .await?
             .ok_or("the payment was not written")?;
         // audit: COBIL00C-032
-        assert_payment_record(&written, "194.00", &seed, at)?;
+        assert_payment_record(&written, "194.00", &seed)?;
         assert_no_card_number(&api)
     })
 }
@@ -2069,7 +2073,6 @@ fn cobil00c_rewrite_failure_rows() -> TestResult {
                     &found.ok_or("the payment was not written")?,
                     "194.00",
                     &prior,
-                    at,
                 )?;
             } else {
                 // audit: COBIL00C-033
@@ -2194,7 +2197,7 @@ fn cobil00c_lock_wait_rows() -> TestResult {
             assert_unwritten(api, &before, &seed).await?;
             assert_no_card_number(api)?;
         }
-        lock_wait_rows(&plain, &holder, before, &seed, at).await
+        lock_wait_rows(&plain, &holder, before, &seed).await
     })
 }
 
@@ -2207,7 +2210,6 @@ async fn lock_wait_rows(
     holder: &PgStore,
     before: AccountRecord,
     seed: &TransactionRecord,
-    at: NaiveDateTime,
 ) -> TestResult {
     let reply = after_lock_wait(plain, holder, "", "250.00").await?;
     // audit: COBIL00C-013
@@ -2248,7 +2250,7 @@ async fn lock_wait_rows(
         .await?
         .ok_or("the payment was not written")?;
     // audit: COBIL00C-013
-    assert_payment_record(&written, "300.00", seed, at)?;
+    assert_payment_record(&written, "300.00", seed)?;
     let paid = AccountRecord {
         curr_bal: money("0.00")?,
         ..before

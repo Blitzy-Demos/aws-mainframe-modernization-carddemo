@@ -276,13 +276,14 @@ function ViewHandBackStub() {
 
 /**
  * Renders the screen at `/transactions` with `state`, beside stubs at its transfer targets, or
- * with `view` instead of the stub at `/transactions/view`.
+ * with `view` instead of the stub at `/transactions/view`. Returns the render result and the
+ * query client, whose pending requests {@link clientIdle} reads.
  */
 function renderList(state?: unknown, view = <TransferStub name="View Transaction" />) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COTRN00, state }]}>
         <Routes>
@@ -293,6 +294,7 @@ function renderList(state?: unknown, view = <TransferStub name="View Transaction
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route state the transfer stub `name` shows, parsed back from its JSON. */
@@ -412,17 +414,34 @@ function screenForm(): HTMLFormElement {
 }
 
 /**
- * Lets pending effects, requests and stubbed replies run, so that a request a key would send has
- * been sent before a test counts the requests. The wait runs inside `waitFor`, which lets React
- * render the form-state updates of a key the screen ignores while a request is outstanding, such
- * as the re-validation a selector change starts once ENTER has submitted the form.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoint 11 is a mutation of that client. It stays pending
+ * from the moment the screen starts it until its reply has arrived; the screen's own handling of
+ * the reply, chained on that mutation's promise, runs after. Every request the screen had started
+ * when this is called, the held ones aside, has therefore been answered once it returns. It
+ * cannot see a request the screen has not started yet: a test calls it once it has awaited what
+ * the screen shows at the end of a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
+  });
+}
+
+/**
+ * For keys that must send nothing and leave nothing on screen to wait for, such as the keys the
+ * lock refuses: lets 50 ms pass inside `act`, so whatever the screen does with them within that
+ * window (a render, a request) runs and renders first, then waits as {@link clientIdle} does. It
+ * shows only that nothing was sent within those 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
+  await clientIdle(client, held);
 }
 
 /** The table's two row groups: the caption and rule lines, then the ten list lines. */
@@ -1688,7 +1707,7 @@ describe("COTRN00 List Transactions", () => {
     async (row) => {
       const held = heldReply(json(200, row.page));
       const sent = stubFetch(...row.before, held.reply);
-      renderList();
+      const { client } = renderList();
       if (row.before.length > 0) {
         await answered(sent, row.before.length);
       }
@@ -1698,8 +1717,12 @@ describe("COTRN00 List Transactions", () => {
         expect(lockState()).toEqual(LOCKED);
       });
 
-      // The read-only selector takes no typing; a value set past it is still not acted on.
-      typeInto(selector(3), "S");
+      // The read-only selector takes no typing; a value set past it is still not acted on. Once
+      // ENTER has submitted the form, it re-validates on every change, so the change runs inside
+      // an awaited `act`, where the render of that validation lands.
+      await act(async () => {
+        typeInto(selector(3), "S");
+      });
       press("ENTER=Continue");
       press("ENTER=Continue");
       fireEvent.keyDown(document.body, { key: "Enter" });
@@ -1710,7 +1733,8 @@ describe("COTRN00 List Transactions", () => {
       fireEvent.keyDown(document.body, { key: "F7" });
       fireEvent.keyDown(document.body, { key: "F8" });
       fireEvent.keyDown(document.body, { key: "F2" });
-      await settle();
+      // The held page stays the one request pending.
+      await idleAfter50ms(client, 1);
 
       expect(sent).toHaveLength(row.before.length + 1);
       expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
@@ -1738,7 +1762,7 @@ describe("COTRN00 List Transactions", () => {
   it("takes one ENTER of several pressed before the screen renders again", async () => {
     const held = heldReply(json(200, SECOND_PAGE));
     const sent = stubFetch(json(200, FIRST_PAGE), held.reply);
-    renderList();
+    const { client } = renderList();
     await answered(sent, 1);
     typeInto(searchField(), tranId(11));
 
@@ -1754,7 +1778,8 @@ describe("COTRN00 List Transactions", () => {
       expect(sent).toHaveLength(2);
     });
     expect(lockState()).toEqual(LOCKED);
-    await settle();
+    // The held page of the one ENTER taken stays the one request pending.
+    await idleAfter50ms(client, 1);
     expect(sent).toHaveLength(2);
 
     held.release();
@@ -1766,7 +1791,7 @@ describe("COTRN00 List Transactions", () => {
   it("F3 still returns to the main menu while a page is outstanding", async () => {
     const held = heldReply(json(200, FIRST_PAGE));
     const sent = stubFetch(held.reply);
-    renderList();
+    const { client } = renderList();
     await waitFor(() => {
       expect(lockState()).toEqual(LOCKED);
     });
@@ -1775,7 +1800,8 @@ describe("COTRN00 List Transactions", () => {
 
     await screen.findByRole("region", { name: "Main Menu" });
     held.release();
-    await settle();
+    // The count waits for the released page's answer.
+    await clientIdle(client);
     expect(sent).toHaveLength(1);
   });
 });
@@ -2185,10 +2211,14 @@ describe("COTRN00 while the transaction view loads", () => {
     for (const key of ["F8", "F7", "F2", "Enter"]) {
       fireEvent.keyDown(window, { key });
     }
-    typeInto(selector(5), "S");
+    // ENTER has submitted the form, so it re-validates on this change: the change runs inside an
+    // awaited `act`, where the render of that validation lands.
+    await act(async () => {
+      typeInto(selector(5), "S");
+    });
     press("ENTER=Continue");
     fireEvent.submit(screenForm());
-    await settle();
+    await idleAfter50ms(client);
 
     expect(sent).toHaveLength(1);
     expect(router.state.location.pathname).toBe(PATHS.COTRN00);

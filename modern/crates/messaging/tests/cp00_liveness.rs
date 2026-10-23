@@ -62,7 +62,8 @@ const REPLY_WAIT: Duration = Duration::from_secs(5);
 const NO_REPLY_WAIT: Duration = Duration::from_secs(3);
 /// Bound on the broker moving rejected requests to the dead-letter queue.
 const QUEUE_SETTLE: Duration = Duration::from_secs(10);
-/// How long a queue's length must hold once it is expected to be final.
+/// How long a queue's length must hold once it is expected to be final: from the answer to a
+/// first reading to the issue of a last one.
 const STAY_WINDOW: Duration = Duration::from_secs(1);
 /// Interval between two readings of a queue's length.
 const POLL: Duration = Duration::from_millis(100);
@@ -408,21 +409,26 @@ impl Harness {
         Ok(())
     }
 
-    /// Fails unless `queue` holds `expected` messages at every reading over [`STAY_WINDOW`].
+    /// Fails unless `queue` holds `expected` messages at a first reading, at every reading
+    /// [`POLL`] apart over the [`STAY_WINDOW`] that opens once the first is answered, and at a
+    /// last reading issued once that window has closed.
+    ///
+    /// Only the waits between readings are timed. Each reading runs to the bound of
+    /// [`rabbitmq::message_count`], and one the broker does not answer fails the test, so a
+    /// stalled reading is never taken for a length that held.
     async fn assert_len_stays(&self, queue: &str, expected: u32) -> TestResult {
-        let changed = time::timeout(STAY_WINDOW, async {
-            loop {
-                let len = rabbitmq::message_count(&self.client, queue).await?;
-                if len != expected {
-                    return Ok::<u32, TestError>(len);
-                }
-                time::sleep(POLL).await;
+        let mut window_end = None;
+        loop {
+            let issued = time::Instant::now();
+            let len = rabbitmq::message_count(&self.client, queue).await?;
+            if len != expected {
+                return Err(format!("{queue} holds {len} messages, not {expected}").into());
             }
-        })
-        .await;
-        match changed {
-            Err(_held) => Ok(()),
-            Ok(len) => Err(format!("{queue} holds {} messages, not {expected}", len?).into()),
+            let deadline = *window_end.get_or_insert_with(|| time::Instant::now() + STAY_WINDOW);
+            if issued >= deadline {
+                return Ok(());
+            }
+            time::sleep_until(deadline.min(time::Instant::now() + POLL)).await;
         }
     }
 

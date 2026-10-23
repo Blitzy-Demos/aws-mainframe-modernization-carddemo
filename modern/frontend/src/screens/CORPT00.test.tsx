@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -354,10 +354,46 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+/** A reply hold the test ends itself: `promise` resolves once `release` is called. */
+function held(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+/**
+ * Resolves when `hold` does, or rejects with the signal's reason as soon as `signal` aborts,
+ * already aborted included, as the native `fetch` rejects a request whose signal aborts.
+ */
+function heldUnlessAborted(hold: Promise<void> | undefined, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    void Promise.resolve(hold).then(
+      () => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
+}
+
 /**
  * Replaces `fetch`. The n-th request to endpoint 14 gets the n-th reply, after its `hold`
- * settles; any other request, and any request beyond the replies, gets a 500. Returns every
- * request in the order the screen sent it.
+ * settles, or is rejected with its signal's reason if that signal aborts first; any other
+ * request, and any request beyond the replies, gets a 500. Returns every request in the order
+ * the screen sent it.
  */
 function stubApi(...replies: { status: number; body: unknown; hold?: Promise<void> }[]): Request[] {
   const requests: Request[] = [];
@@ -371,7 +407,7 @@ function stubApi(...replies: { status: number; body: unknown; hold?: Promise<voi
       const reply = req.method === "POST" && pathname === ENDPOINT ? replies[served] : undefined;
       if (reply !== undefined) {
         served += 1;
-        await reply.hold;
+        await heldUnlessAborted(reply.hold, req.signal);
         return json(reply.status, reply.body);
       }
       const unexpected: components["schemas"]["ScreenError"] = {
@@ -399,12 +435,16 @@ function RouteStub() {
   );
 }
 
-/** CORPT00 at `/reports`, and a stub at the main menu, the one route it transfers to. */
+/**
+ * CORPT00 at `/reports`, and a stub at the main menu, the one route it transfers to. Returns the
+ * render result with the `QueryClient` the screen runs on, whose fetching and mutating counts
+ * tell a test when the screen's requests have settled.
+ */
 function renderScreen() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[PATHS.CORPT00]}>
         <Routes>
@@ -414,6 +454,7 @@ function renderScreen() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The `<input>` whose accessible name is `name`, failing the test when it is anything else. */
@@ -659,16 +700,33 @@ async function pressEnter(): Promise<void> {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests. The wait runs inside `waitFor`, so the
- * renders it lets through are React's to batch, as in every other wait of these tests.
+ * Waits until `client` has no query fetching and exactly `holding` mutations pending: the ones the
+ * test holds on purpose, none by default. A mutation stops pending only after its reply has
+ * arrived and its callbacks have run, so every request the screen had started by the time this
+ * is called has then been answered and handled. A test calls it once it has awaited what the
+ * screen shows at the end of the interaction, before it counts or reads the requests; it cannot
+ * see a request the screen starts afterwards.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
+async function settled(client: QueryClient, holding = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(holding);
+  });
+}
+
+/**
+ * For an assertion that nothing was sent, where the screen shows no sign that it has finished
+ * deciding: lets 50 ms pass inside `act`, so whatever the screen does within that window (a
+ * validation, a render, a request) runs and renders first, then waits as {@link settled} does.
+ * It proves only that nothing happened within the window, not that nothing ever will.
+ */
+async function observeQuiet(client: QueryClient, holding = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
+  await settled(client, holding);
 }
 
 beforeEach(() => {
@@ -706,7 +764,7 @@ describe("CORPT00 transaction reports screen", () => {
   // audit: CORPT00-042
   it("opens cleared, cursor on Monthly, message row empty, sending nothing", async () => {
     const requests = stubApi();
-    const { container } = renderScreen();
+    const { container, client } = renderScreen();
 
     const title = screen.getByRole("heading", { level: 1, name: "Transaction Reports" });
     expect(title.textContent).toBe("Transaction Reports");
@@ -758,7 +816,8 @@ describe("CORPT00 transaction reports screen", () => {
       "sm",
     ]);
 
-    await settle();
+    // An idle screen shows no sign that it will not send, so the absence is watched for a window.
+    await observeQuiet(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -927,7 +986,7 @@ describe("CORPT00 transaction reports screen", () => {
     "$via submits the $report report as typed, shows its message as information, empties the form",
     async ({ via, request, reply }) => {
       const requests = stubApi({ status: 200, body: reply });
-      renderScreen();
+      const { client } = renderScreen();
       fill(request);
       expect(shown()).toEqual(typed(request));
       const enter = enterButton();
@@ -965,7 +1024,7 @@ describe("CORPT00 transaction reports screen", () => {
       // The map has no field for the deck's name, so nothing on the screen shows it or a path.
       expect(document.body.textContent).not.toMatch(/TRNRPT00|var\/jobs/);
 
-      await settle();
+      await settled(client);
       expect(requests).toHaveLength(1);
       const [sent] = requests;
       expect(sent?.method).toBe("POST");
@@ -980,7 +1039,7 @@ describe("CORPT00 transaction reports screen", () => {
   // audit: CORPT00C-042
   it("shows the blank-confirmation prompt in red on Confirm, then N empties the form", async () => {
     const requests = stubApi({ status: 400, body: confirmPrompt }, { status: 200, body: declined });
-    renderScreen();
+    const { client } = renderScreen();
     fill(unconfirmedRequest);
     await pressEnter();
 
@@ -1004,7 +1063,7 @@ describe("CORPT00 transaction reports screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(inputOf(MONTHLY));
     });
-    await settle();
+    await settled(client);
     expect(await bodies(requests)).toEqual([unconfirmedRequest, declinedRequest]);
   });
 
@@ -1058,7 +1117,7 @@ describe("CORPT00 transaction reports screen", () => {
     "shows the $status for $title in the red row, keeps every input, focuses its field",
     async ({ request, status, error, focus }) => {
       const requests = stubApi({ status, body: error });
-      renderScreen();
+      const { client } = renderScreen();
       expect(messageRow().textContent).toBe("");
       fill(request);
       await pressEnter();
@@ -1078,7 +1137,7 @@ describe("CORPT00 transaction reports screen", () => {
       await waitFor(() => {
         expect(document.activeElement).toBe(inputOf(focus));
       });
-      await settle();
+      await settled(client);
       expect(await bodies(requests)).toEqual([request]);
     },
   );
@@ -1095,7 +1154,7 @@ describe("CORPT00 transaction reports screen", () => {
       // (`FIELD_NUMERIC_MESSAGE`) in the red row, the inputs kept, and the part marked invalid
       // with that message for screen readers.
       const requests = stubApi();
-      renderScreen();
+      const { client } = renderScreen();
       const request: components["schemas"]["ReportRequest"] = { ...customRequest, [wire]: value };
       fill(request);
       await pressEnter();
@@ -1109,7 +1168,8 @@ describe("CORPT00 transaction reports screen", () => {
       await waitFor(() => {
         expect(document.activeElement).toBe(inputOf(part));
       });
-      await settle();
+      // The refusal's text and focus are the screen's verdict on this ENTER.
+      await settled(client);
       expect(requests).toHaveLength(0);
     },
   );
@@ -1146,14 +1206,14 @@ describe("CORPT00 transaction reports screen", () => {
     "sends $title in exactly one request, every part as typed",
     async ({ request, status, reply }) => {
       const requests = stubApi({ status, body: reply });
-      renderScreen();
+      const { client } = renderScreen();
       fill(request);
       await pressEnter();
 
       await waitFor(() => {
         expect(messageRow().textContent).toBe(reply.message);
       });
-      await settle();
+      await settled(client);
       expect(requests).toHaveLength(1);
       expect(await bodies(requests)).toEqual([request]);
     },
@@ -1246,9 +1306,10 @@ describe("CORPT00 transaction reports screen", () => {
     { state: "after the 400 naming monthly", request: noReportRequest, error: noReport },
   ])("describes each input by rendered elements only, $state", async ({ request, error }) => {
     stubApi(...(error === null ? [] : [{ status: 400, body: error }]));
-    renderScreen();
+    const { client } = renderScreen();
     if (request === null || error === null) {
-      await settle();
+      // Nothing on entry signals that the screen has finished rendering, so a window is watched.
+      await observeQuiet(client);
     } else {
       fill(request);
       await pressEnter();
@@ -1327,7 +1388,7 @@ describe("CORPT00 transaction reports screen", () => {
       { status: 400, body: noEndMonth },
       { status: 200, body: customSubmitted },
     );
-    renderScreen();
+    const { client } = renderScreen();
     fill(noReportRequest);
     await pressEnter();
     await waitFor(() => {
@@ -1336,9 +1397,12 @@ describe("CORPT00 transaction reports screen", () => {
     });
 
     // An edit of another input keeps the mark; the next ENTER drops it, and its answer marks the
-    // input it names.
-    fireEvent.change(inputOf("Custom (Date Range)"), { target: { value: "X" } });
-    await settle();
+    // input it names. The edit's re-validation runs in `act`; a kept mark shows no change to wait
+    // for, so it is read after a window.
+    await act(async () => {
+      fireEvent.change(inputOf("Custom (Date Range)"), { target: { value: "X" } });
+    });
+    await observeQuiet(client);
     expectMarked(MONTHLY, noReport.message);
     await pressEnter();
     await waitFor(() => {
@@ -1362,7 +1426,7 @@ describe("CORPT00 transaction reports screen", () => {
     });
     expectUnmarked();
     expect(shown()).toEqual(BLANK);
-    await settle();
+    await settled(client);
     expect(await bodies(requests)).toEqual([noReportRequest, noEndRequest, customRequest]);
   });
 
@@ -1375,7 +1439,7 @@ describe("CORPT00 transaction reports screen", () => {
       { status: 200, body: monthlySubmitted, hold },
       { status: 400, body: confirmPrompt },
     );
-    const { container } = renderScreen();
+    const { container, client } = renderScreen();
     const form = container.querySelector("form");
     if (form === null) {
       throw new Error("CORPT0A renders no form");
@@ -1404,7 +1468,9 @@ describe("CORPT00 transaction reports screen", () => {
     fireEvent.click(enterButton());
     fireEvent.keyDown(document.body, { key: "Enter" });
     fireEvent.keyDown(document.body, { key: "F5" });
-    await settle();
+    // A refused key changes nothing on the screen, so the window is watched with the first
+    // ENTER's mutation still the one pending.
+    await observeQuiet(client, 1);
     expect(requests).toHaveLength(1);
     expect(messageRow().textContent).toBe("");
 
@@ -1425,13 +1491,13 @@ describe("CORPT00 transaction reports screen", () => {
     await waitFor(() => {
       expect(messageRow().textContent).toBe(confirmPrompt.message);
     });
-    await settle();
+    await settled(client);
     expect(await bodies(requests)).toEqual([monthlyRequest, unconfirmedRequest]);
   });
 
   it("frees the keyboard when the schema refuses ENTER, so a corrected ENTER is sent", async () => {
     const requests = stubApi({ status: 200, body: customSubmitted });
-    renderScreen();
+    const { client } = renderScreen();
     fill({ ...customRequest, start_day: "1a" });
     await pressEnter();
     await waitFor(() => {
@@ -1448,25 +1514,37 @@ describe("CORPT00 transaction reports screen", () => {
     await waitFor(() => {
       expect(messageRow().textContent).toBe(customSubmitted.message);
     });
-    await settle();
+    await settled(client);
     expect(await bodies(requests)).toEqual([customRequest]);
   });
 
   it("F3 goes back to the main menu while ENTER's request is in flight", async () => {
-    const hold = new Promise<void>(() => undefined);
+    const { promise: hold, release } = held();
     const requests = stubApi({ status: 200, body: monthlySubmitted, hold });
-    renderScreen();
-    fill(monthlyRequest);
-    await pressEnter();
-    await waitFor(() => {
-      expect(enterButton().getAttribute("aria-disabled")).toBe("true");
-    });
+    const { client } = renderScreen();
+    try {
+      fill(monthlyRequest);
+      await pressEnter();
+      await waitFor(() => {
+        expect(enterButton().getAttribute("aria-disabled")).toBe("true");
+      });
 
-    fireEvent.click(screen.getByRole("button", { name: "F3=Back" }));
+      fireEvent.click(screen.getByRole("button", { name: "F3=Back" }));
 
-    const stub = await screen.findByRole("region", { name: "Route stub" });
-    expect(within(stub).getByTestId("stub-path").textContent).toBe("/menu");
-    expect(requests).toHaveLength(1);
+      const stub = await screen.findByRole("region", { name: "Route stub" });
+      expect(within(stub).getByTestId("stub-path").textContent).toBe("/menu");
+      expect(requests).toHaveLength(1);
+      // Leaving the screen does not cancel its mutation: the request is still unanswered.
+      expect(client.isMutating()).toBe(1);
+    } finally {
+      // The held reply is answered and its mutation settled inside the test, on success and on
+      // failure alike, so neither the request nor the client's deadline timer outlives the test
+      // into `afterEach`, which restores `fetch` and clears the session.
+      release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   // audit: CORPT00C-005
@@ -1478,7 +1556,7 @@ describe("CORPT00 transaction reports screen", () => {
     "$key (shift: $shiftKey) shows the invalid-key message, keeps the inputs, focuses Monthly",
     async ({ key, shiftKey }) => {
       const requests = stubApi();
-      renderScreen();
+      const { client } = renderScreen();
       fill(customRequest);
       await moveFocus(inputOf(CONFIRM));
 
@@ -1493,7 +1571,8 @@ describe("CORPT00 transaction reports screen", () => {
       });
       expect(shown()).toEqual(typed(customRequest));
       expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Transaction Reports");
-      await settle();
+      // The invalid-key message and focus are the screen's answer to the key.
+      await settled(client);
       expect(requests).toHaveLength(0);
     },
   );
@@ -1505,7 +1584,7 @@ describe("CORPT00 transaction reports screen", () => {
     { via: "the F3 key", byKey: true },
   ])("$via goes back to the main menu at /menu, sending nothing", async ({ byKey }) => {
     const requests = stubApi();
-    renderScreen();
+    const { client } = renderScreen();
     fill(customRequest);
     const back = screen.getByRole("button", { name: "F3=Back" });
     expect([back.getAttribute("type"), back.dataset.variant, back.dataset.size]).toEqual([
@@ -1523,7 +1602,7 @@ describe("CORPT00 transaction reports screen", () => {
     const stub = await screen.findByRole("region", { name: "Route stub" });
     expect(within(stub).getByTestId("stub-path").textContent).toBe("/menu");
     expect(within(stub).getByTestId("stub-state").textContent).toBe("null");
-    await settle();
+    await settled(client);
     expect(requests).toHaveLength(0);
   });
 });
@@ -1609,7 +1688,8 @@ describe("CORPT00 behind the route guard", () => {
     );
     expect(screen.queryByRole("heading", { level: 1, name: "Transaction Reports" })).toBeNull();
     expect(screen.queryByLabelText(MONTHLY)).toBeNull();
-    await settle();
+    // The sign-on screen in its place is the guard's answer to the route.
+    await settled(client);
     expect(requests).toHaveLength(0);
     router.dispose();
   });

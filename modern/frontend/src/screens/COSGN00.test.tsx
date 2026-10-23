@@ -20,7 +20,6 @@ import {
   setSession,
   subscribeSession,
 } from "@/auth/session";
-import { INVALID_KEY, THANK_YOU } from "@/lib/header";
 import { PATHS, routes } from "@/routes";
 import { COSGN00 } from "./COSGN00";
 
@@ -39,6 +38,18 @@ import { COSGN00 } from "./COSGN00";
 const TYPED_USER_ID = "user0001";
 /** A synthetic typed password, sent as typed and never upper-cased by the client (E26). */
 const TYPED_PASSWORD = "password";
+
+/**
+ * COSGN00C-005: `CCDA-MSG-INVALID-KEY PIC X(50)` (`app/cpy/CSMSG01Y.cpy:20-21`), its 40-character
+ * `VALUE` padded with spaces to the 50 bytes of the field.
+ */
+const INVALID_KEY = `Invalid key pressed. Please see below...${" ".repeat(10)}`;
+
+/**
+ * COSGN00C-004: the 43-character `CCDA-MSG-THANK-YOU` value (`app/cpy/CSMSG01Y.cpy:18-19`) moved
+ * into `WS-MESSAGE PIC X(80)` and sent as all 80 bytes (`app/cbl/COSGN00C.cbl:38,89,162-172`).
+ */
+const SESSION_END = `Thank you for using CardDemo application...${" ".repeat(37)}`;
 
 /** COSGN00-016 to COSGN00-024: the note on rows 7 to 15, each `LENGTH=42`, spacing included. */
 const NOTE_ROWS = [
@@ -830,7 +841,7 @@ describe("COSGN00 sign-on screen", () => {
     // COSGN0A labels no F5, so there is no button: the key is pressed in the focused input.
     fireEvent.keyDown(userIdInput(), { key: "F5" });
     expect(errorRow().textContent).toBe(INVALID_KEY);
-    expect(errorRow().textContent?.trimEnd()).toBe("Invalid key pressed. Please see below...");
+    expect(errorRow().textContent).toHaveLength(50);
     expect(sent).toHaveLength(0);
 
     typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
@@ -895,8 +906,8 @@ describe("COSGN00 sign-on screen", () => {
     fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
 
     const text = screen.getByText("Thank you for using CardDemo application...");
-    expect(text.textContent).toBe(THANK_YOU);
-    expect(text.textContent?.trimEnd()).toBe("Thank you for using CardDemo application...");
+    expect(text.textContent).toBe(SESSION_END);
+    expect(text.textContent).toHaveLength(80);
     expect(getSession()).toBeNull();
     expect(fetchStub).not.toHaveBeenCalled();
     // Plain text alone: no map, header or keys.

@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ComponentType } from "react";
 import {
   createMemoryRouter,
@@ -176,7 +176,33 @@ function json(status: number, body: unknown): () => Response {
 }
 
 /**
- * Replaces the global `fetch`. Each `GET /api/v1/users` takes the next of `replies`; any other
+ * `answer`, or a rejection with the reason of `signal` once it aborts while `answer` is still
+ * outstanding, as the native `fetch` rejects a request whose signal aborts before its answer.
+ */
+function unlessAborted(
+  answer: Response | Promise<Response>,
+  signal: AbortSignal,
+): Promise<Response> {
+  return new Promise<Response>((resolve, reject) => {
+    const abort = (): void => {
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    Promise.resolve(answer)
+      .then(resolve, reject)
+      .finally(() => {
+        signal.removeEventListener("abort", abort);
+      });
+  });
+}
+
+/**
+ * Replaces the global `fetch`. Each `GET /api/v1/users` takes the next of `replies`, and fails
+ * with the request signal's reason if that aborts while the reply is outstanding; any other
  * request, and any past the last reply, is answered 500. Returns every request's method, path,
  * full URL, query parameters and `Authorization` header, in order.
  */
@@ -204,7 +230,7 @@ function stubFetch(...replies: (() => Response | Promise<Response>)[]) {
       const reply =
         req.method === "GET" && url.pathname === LIST_PATH ? pending.shift() : undefined;
       if (reply !== undefined) {
-        return reply();
+        return unlessAborted(reply(), req.signal);
       }
       const unexpected: components["schemas"]["ScreenError"] = {
         message: `Unexpected request ${req.method} ${url.pathname}`,
@@ -226,12 +252,16 @@ function TransferStub({ name }: { name: string }) {
   );
 }
 
-/** Renders the screen at `/users` with `state`, beside stubs at its transfer targets. */
+/**
+ * Renders the screen at `/users` with `state`, beside stubs at its transfer targets. Returns the
+ * render result and the query client, whose `isFetching` and `isMutating` tell when the screen's
+ * requests settled.
+ */
 function renderList(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COUSR00, state }]}>
         <Routes>
@@ -243,6 +273,7 @@ function renderList(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route state the transfer stub `name` shows, parsed back from its JSON. */
@@ -508,13 +539,28 @@ function readOnlyStates(): boolean[] {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests.
+ * Waits until `client` has no query fetching and exactly `outstanding` list requests in flight,
+ * the ones the test still holds (none by default), so every request the screen sent before the
+ * call has been answered unless the test holds it. A request the screen sends only later is
+ * beyond this wait: a test first awaits the visible outcome of its keys, or {@link lingers} when
+ * they have none, and then calls this before it counts the requests.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
+async function settled(client: QueryClient, outstanding = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(outstanding);
+  });
+}
+
+/**
+ * Waits 50 ms inside `act`, so React renders whatever the keys just pressed caused. A refused key
+ * shows nothing a test could wait for, so this bounded window is the only wait the absence of its
+ * effect has: it shows that no request or message followed within 50 ms, not that none ever will.
+ */
+async function lingers(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
 }
@@ -1527,7 +1573,7 @@ describe("COUSR00 List Users", () => {
         gate.reply,
         json(200, BOTTOM_KEPT),
       );
-      renderList();
+      const { client } = renderList();
       if (before.length > 0) {
         await listed(sent, 1, "ADMIN001");
       }
@@ -1555,7 +1601,9 @@ describe("COUSR00 List Users", () => {
         pressKey(key);
       }
       fireEvent.submit(mapForm());
-      await settle();
+      // A refused key shows nothing: a bounded window, then only the held request in flight.
+      await lingers();
+      await settled(client, 1);
       expect(sent).toHaveLength(count);
       expect(errorRow().textContent).toBe("");
 
@@ -1572,7 +1620,9 @@ describe("COUSR00 List Users", () => {
       await waitFor(() => {
         expect(sent).toHaveLength(count + 1);
       });
-      await settle();
+      // The F8 page's answer shows, then nothing is left in flight.
+      await shown(sent, count + 1, ALREADY_BOTTOM);
+      await settled(client);
       expect(sent).toHaveLength(count + 1);
       expect(sent[count].query).toMatchObject({ direction: "forward" });
     },
@@ -1581,7 +1631,7 @@ describe("COUSR00 List Users", () => {
   it("acts on no selection while a page request is outstanding, then on the page it answered", async () => {
     const gate = heldReply(json(200, SECOND_PAGE));
     const sent = stubFetch(json(200, FIRST_PAGE), gate.reply);
-    renderList();
+    const { client } = renderList();
     await listed(sent, 1, "ADMIN001");
 
     typeInto(selector(1), "U");
@@ -1592,7 +1642,9 @@ describe("COUSR00 List Users", () => {
     press("ENTER=Continue");
     pressKey("Enter");
     fireEvent.submit(mapForm());
-    await settle();
+    // A refused selection shows nothing: a bounded window, then only the held F8 page in flight.
+    await lingers();
+    await settled(client, 1);
     expect(screen.queryByRole("region", { name: "Update User" })).toBeNull();
     expect(sent).toHaveLength(2);
 
@@ -1614,15 +1666,24 @@ describe("COUSR00 List Users", () => {
   it("F3 returns to the admin menu while the entry list is outstanding", async () => {
     const gate = heldReply(json(200, FIRST_PAGE));
     const sent = stubFetch(gate.reply);
-    renderList();
-    await waitFor(() => {
-      expect(isDisabled("ENTER=Continue")).toBe(true);
-    });
+    const { client } = renderList();
+    try {
+      await waitFor(() => {
+        expect(isDisabled("ENTER=Continue")).toBe(true);
+      });
 
-    press("F3=Back");
+      press("F3=Back");
 
-    await screen.findByRole("region", { name: "Admin Menu" });
-    expect(sent).toHaveLength(1);
+      await screen.findByRole("region", { name: "Admin Menu" });
+      expect(sent).toHaveLength(1);
+    } finally {
+      // The entry list is answered only after F3 left, pass or fail, and the test ends once the
+      // request has settled, so neither it nor the client's deadline outlives the test.
+      gate.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it("refuses a search value longer than the map's 8 characters with no request", async () => {
@@ -1897,12 +1958,14 @@ const TRANSFER_TARGETS = [
  * through `slow`; the other targets render at once, so a key that transferred elsewhere would
  * show. With `outlet`, the screens sit under the application's root element, `ScreenOutlet`,
  * which tells the frame that a transfer is under way; without it only the screen's own lock acts.
+ * Returns the router, whose location and navigation the test reads, and the query client, whose
+ * `isFetching` and `isMutating` tell when the screen's requests settled.
  */
 function renderSlowTransfer(
   slowPath: string,
   slow: ReturnType<typeof slowRoute>,
   outlet: boolean,
-): ReturnType<typeof createMemoryRouter> {
+): { router: ReturnType<typeof createMemoryRouter>; client: QueryClient } {
   const screens: RouteObject[] = [
     { path: PATHS.COUSR00, element: <COUSR00 /> },
     ...TRANSFER_TARGETS.map(
@@ -1924,7 +1987,7 @@ function renderSlowTransfer(
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return router;
+  return { router, client };
 }
 
 /** Selects row 6 (`USER0001`) with `code` and presses ENTER. */
@@ -1996,7 +2059,7 @@ describe("COUSR00 while the screen it transfers to loads", () => {
     async ({ outlet, start, ownLock, path, name, state }) => {
       const sent = stubFetch(json(200, FIRST_PAGE), json(200, SECOND_PAGE));
       const slow = slowRoute(() => <TransferStub name={name} />);
-      const router = renderSlowTransfer(path, slow, outlet);
+      const { router, client } = renderSlowTransfer(path, slow, outlet);
       await listed(sent, 1, "ADMIN001");
 
       start();
@@ -2020,7 +2083,9 @@ describe("COUSR00 while the screen it transfers to loads", () => {
       typeInto(selector(7), "D");
       press("ENTER=Continue");
       pressKey("Enter");
-      await settle();
+      // Every key is refused and shows nothing: a bounded window, then no request in flight.
+      await lingers();
+      await settled(client);
 
       expect(sent).toHaveLength(1);
       expect(router.state.location.pathname).toBe(PATHS.COUSR00);

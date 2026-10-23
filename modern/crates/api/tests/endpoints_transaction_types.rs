@@ -11,7 +11,8 @@
 //! - The Db2 seed is migration 0006's and is never re-seeded: types `01` to `07`, every one with
 //!   categories, so a successful delete always targets a type this file adds without categories.
 //! - Halt H3 (E19): the text a Db2 message carries after its fixed prefix is Db2's, so the prefix
-//!   is asserted and nothing after it; `blocked_h3_db2_messages` reports the halted rows `BLOCKED`.
+//!   is asserted and nothing after it; `blocked_h3_db2_messages` reports the halted rows `BLOCKED`
+//!   and fails when run with `--ignored`.
 //! - E28: the selection-clearing branch of `1210-EDIT-ARRAY` is never taken, so a selection keeps
 //!   its row position when a changed filter brings a new page (COTRTLIC-019, COTRTLIC-041).
 //!
@@ -112,6 +113,7 @@ const CODE_SUPPLIED: &str = "Tran Type code must be supplied.";
 const CODE_NUMERIC: &str = "Tran Type code must be numeric.";
 const CODE_NOT_ZERO: &str = "Tran Type code must not be zero.";
 const COULD_NOT_LOCK: &str = "Could not lock record for update";
+// COTRTUPC's Db2 message prefixes; the rest is halt H3 (COTRTUPC-049).
 const UPDATE_ERROR: &str = "Error updating: TRANSACTION_TYPE Table. SQLCODE:";
 const INSERT_ERROR: &str = "Error inserting record into: TRANSACTION_TYPE Table. SQLCODE:";
 const FETCH_ERROR: &str = "Error accessing: TRANSACTION_TYPE table. SQLCODE:";
@@ -525,6 +527,17 @@ fn refusal(
     (status, message.to_owned(), field.map(str::to_owned))
 }
 
+/// Asserts that a Db2 message begins with `prefix`, the fixed text its audit row states. What
+/// follows the prefix is halt H3's (COTRTLIC-055, COTRTUPC-049), so it is neither read nor
+/// compared.
+#[track_caller]
+fn assert_db2_prefix(message: Option<&str>, prefix: &str) {
+    assert!(
+        message.is_some_and(|text| text.starts_with(prefix)),
+        "expected a Db2 message starting {prefix:?}"
+    );
+}
+
 /// The stored description of `code` in `db2.transaction_type` read through `store`, `None` when
 /// no row has it.
 async fn stored_in(store: &PgStore, code: &str) -> Outcome<Option<String>> {
@@ -794,7 +807,7 @@ async fn cotrtlic_backward_paging_and_short_reads() -> TestResult {
         (status, codes(&short.rows), short.page_no),
         (StatusCode::INTERNAL_SERVER_ERROR, bottom_up.clone(), 2)
     );
-    assert_eq!(short.message.as_deref(), Some(BACKWARD_FETCH));
+    assert_db2_prefix(short.message.as_deref(), BACKWARD_FETCH);
     assert_eq!(short.info_message.as_deref(), Some(RECORD_ACTIONS));
     let keys = (
         short.state.first_key.as_deref(),
@@ -1836,11 +1849,8 @@ async fn cotrtlic_list_actions_case_restricted_delete() -> TestResult {
             .await?;
         // audit: COTRTLIC-050
         // audit: COTRTLIC-054
-        assert_eq!(
-            (status, refused_delete.message.as_deref()),
-            (StatusCode::BAD_REQUEST, Some(LIST_DELETE_RESTRICTED)),
-            "F10 {attempt}"
-        );
+        assert_eq!(status, StatusCode::BAD_REQUEST, "F10 {attempt}");
+        assert_db2_prefix(refused_delete.message.as_deref(), LIST_DELETE_RESTRICTED);
         assert_eq!(
             (
                 refused_delete.info_message.as_deref(),
@@ -1904,10 +1914,8 @@ async fn cotrtlic_commits_on_rows_another_user_removed() -> TestResult {
         .await?;
     // audit: COTRTLIC-046
     // audit: COTRTLIC-054
-    assert_eq!(
-        (status, gone.message.as_deref()),
-        (StatusCode::NOT_FOUND, Some(LIST_UPDATE_NOT_FOUND))
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_db2_prefix(gone.message.as_deref(), LIST_UPDATE_NOT_FOUND);
     assert_eq!(
         (gone.committed, gone.state.pending_action),
         (
@@ -1962,10 +1970,8 @@ async fn cotrtlic_commits_on_rows_another_user_removed() -> TestResult {
         .await?;
     // audit: COTRTLIC-051
     // audit: COTRTLIC-054
-    assert_eq!(
-        (status, vanished.message.as_deref()),
-        (StatusCode::NOT_FOUND, Some(LIST_DELETE_FAILED))
-    );
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_db2_prefix(vanished.message.as_deref(), LIST_DELETE_FAILED);
     assert_eq!(
         (vanished.committed, vanished.state.pending_action),
         (
@@ -2015,17 +2021,15 @@ async fn cotrtlic_commits_that_fail_on_a_held_row() -> TestResult {
         ("08", ""),
         &[(1, "U", "Locked out")],
     );
-    for (client, message) in [(&locking, LIST_DEADLOCK), (&timing, LIST_UPDATE_FAILED)] {
+    for (client, prefix) in [(&locking, LIST_DEADLOCK), (&timing, LIST_UPDATE_FAILED)] {
         let holder = harness.hold_update("08").await?;
         let (status, failed) = client.act(&save).await?;
         holder.rollback().await?;
         // audit: COTRTLIC-047
         // audit: COTRTLIC-048
         // audit: COTRTLIC-054
-        assert_eq!(
-            (status, failed.message.as_deref()),
-            (StatusCode::INTERNAL_SERVER_ERROR, Some(message))
-        );
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_db2_prefix(failed.message.as_deref(), prefix);
         assert_eq!(
             (failed.committed, failed.state.pending_action),
             (
@@ -2055,10 +2059,8 @@ async fn cotrtlic_commits_that_fail_on_a_held_row() -> TestResult {
         .await?;
     holder.rollback().await?;
     // audit: COTRTLIC-051
-    assert_eq!(
-        (status, failed.message.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some(LIST_DELETE_FAILED))
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_db2_prefix(failed.message.as_deref(), LIST_DELETE_FAILED);
     assert_eq!(
         (failed.committed, failed.state.pending_action),
         (
@@ -2087,19 +2089,15 @@ async fn cotrtlic_reads_that_fail_on_a_reachable_database() -> TestResult {
     let (status, unread) = unprivileged.load().await?;
     // audit: COTRTLIC-052
     // audit: COTRTLIC-054
-    assert_eq!(
-        (status, unread.message.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some(FORWARD_OPEN))
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_db2_prefix(unread.message.as_deref(), FORWARD_OPEN);
     assert_eq!(codes(&unread.rows), listed(&[""; 7]));
     let (status, back) = unprivileged
         .page(&third.page_key, "backward", ("", ""))
         .await?;
     // audit: COTRTLIC-052
-    assert_eq!(
-        (status, back.message.as_deref()),
-        (StatusCode::INTERNAL_SERVER_ERROR, Some(BACKWARD_OPEN))
-    );
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_db2_prefix(back.message.as_deref(), BACKWARD_OPEN);
     // Onto page 1 the paging message overwrites the Db2 one; the status stays 500.
     let (status, top) = unprivileged
         .page(&second.page_key, "backward", ("", ""))
@@ -2161,26 +2159,22 @@ async fn store_unreachable_answers_500_and_commits_nothing() -> TestResult {
     ] {
         let (status, bytes) = api.raw(method, uri, body).await?;
         let shown: Value = serde_json::from_slice(&bytes)?;
+        let (status, message, field) = refused((status, bytes))?;
         // audit: COTRTLIC-053
         // audit: COTRTLIC-054
-        assert_eq!(
-            refused((status, bytes))?,
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, ACCESS_FAILURE, None)
-        );
+        assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+        assert_db2_prefix(Some(message.as_str()), ACCESS_FAILURE);
         // audit: COTRTLIC-053
         assert!(shown.get("rows").is_none() && shown.get("state").is_none());
     }
 
-    let fetched = refused(api.fetch("01").await?)?;
+    let (status, message, field) = refused(api.fetch("01").await?)?;
     // audit: COTRTUPC-011
     assert_eq!(
-        fetched,
-        refusal(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            FETCH_ERROR,
-            Some("type_code")
-        )
+        (status, field.as_deref()),
+        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
     );
+    assert_db2_prefix(Some(message.as_str()), FETCH_ERROR);
     // The re-read endpoint 27 makes in place of the COMMAREA fails: a 500 naming no field. The
     // COBOL's abend data carries no text of its own, so none is asserted.
     let (status, _, field) = refused(api.maintain("01", "PF5", Some("PURCHASES")).await?)?;
@@ -2525,26 +2519,17 @@ async fn cotrtupc_delete_rows() -> TestResult {
     };
     assert_eq!(deleted, done);
     assert_eq!(harness.stored("09").await?, None);
-    let gone = refused(api.maintain("09", "PF4", None).await?)?;
+    let (status, message, field) = refused(api.maintain("09", "PF4", None).await?)?;
     // audit: COTRTUPC-034
     assert_eq!(
-        gone,
-        refusal(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            MAINT_DELETE_FAILED,
-            Some("type_code")
-        )
+        (status, field.as_deref()),
+        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
     );
-    let restricted = refused(api.maintain("01", "PF4", None).await?)?;
+    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
+    let (status, message, field) = refused(api.maintain("01", "PF4", None).await?)?;
     // audit: COTRTUPC-033
-    assert_eq!(
-        restricted,
-        refusal(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            MAINT_DELETE_RESTRICTED,
-            None
-        )
-    );
+    assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_RESTRICTED);
     assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
     assert_eq!(harness.categories("01").await?, 5);
     Ok(())
@@ -2557,41 +2542,44 @@ async fn cotrtupc_writes_that_fail_on_a_held_row() -> TestResult {
     let harness = Harness::start().await?;
     let locking = harness.client_with("lock_timeout", "500ms").await?;
     let timing = harness.client_with("statement_timeout", "500ms").await?;
-    for (client, message) in [(&locking, COULD_NOT_LOCK), (&timing, UPDATE_ERROR)] {
+    // The -911 class answers a full literal; any other failure a Db2 message whose text after its
+    // prefix is halt H3.
+    for (client, expected, halted) in [
+        (&locking, COULD_NOT_LOCK, false),
+        (&timing, UPDATE_ERROR, true),
+    ] {
         let holder = harness.hold_update("01").await?;
-        let answer = refused(client.maintain("01", "PF5", Some("Locked out")).await?)?;
+        let (status, message, field) =
+            refused(client.maintain("01", "PF5", Some("Locked out")).await?)?;
         holder.rollback().await?;
         // audit: COTRTUPC-028
         // audit: COTRTUPC-029
-        assert_eq!(
-            answer,
-            refusal(StatusCode::INTERNAL_SERVER_ERROR, message, None)
-        );
+        assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+        if halted {
+            assert_db2_prefix(Some(message.as_str()), expected);
+        } else {
+            assert_eq!(message, expected);
+        }
         assert_eq!(harness.stored("01").await?.as_deref(), Some("PURCHASE"));
     }
     // The update finds no committed 09, and the insert then meets another user's insert of it.
     let holder = harness.hold_insert("09").await?;
-    let answer = refused(locking.maintain("09", "PF5", Some("Racing")).await?)?;
+    let (status, message, field) = refused(locking.maintain("09", "PF5", Some("Racing")).await?)?;
     holder.rollback().await?;
     // audit: COTRTUPC-027
-    assert_eq!(
-        answer,
-        refusal(StatusCode::INTERNAL_SERVER_ERROR, INSERT_ERROR, None)
-    );
+    assert_eq!((status, field), (StatusCode::INTERNAL_SERVER_ERROR, None));
+    assert_db2_prefix(Some(message.as_str()), INSERT_ERROR);
     assert_eq!(harness.stored("09").await?, None);
     harness.insert("08", "OBSOLETE").await?;
     let holder = harness.hold_update("08").await?;
-    let answer = refused(timing.maintain("08", "PF4", None).await?)?;
+    let (status, message, field) = refused(timing.maintain("08", "PF4", None).await?)?;
     holder.rollback().await?;
     // audit: COTRTUPC-034
     assert_eq!(
-        answer,
-        refusal(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            MAINT_DELETE_FAILED,
-            Some("type_code")
-        )
+        (status, field.as_deref()),
+        (StatusCode::INTERNAL_SERVER_ERROR, Some("type_code"))
     );
+    assert_db2_prefix(Some(message.as_str()), MAINT_DELETE_FAILED);
     assert_eq!(harness.stored("08").await?.as_deref(), Some("OBSOLETE"));
     Ok(())
 }
@@ -2600,4 +2588,13 @@ async fn cotrtupc_writes_that_fail_on_a_held_row() -> TestResult {
 // audit: COTRTUPC-049
 #[test]
 #[ignore = "BLOCKED(H3): COTRTLIC-055, COTRTUPC-049 — the SQLCODE and the SQLERRM or DSNTIAC text after each Db2 message prefix are defined by Db2 (E19)"]
-fn blocked_h3_db2_messages() {}
+fn blocked_h3_db2_messages() -> TestResult {
+    // A blocked case is reported, never passed, so a run that includes ignored tests fails here.
+    Err(
+        "BLOCKED(H3): COTRTLIC-055 and COTRTUPC-049: the edited SQLCODE after each Db2 message \
+         prefix, and the DSNTIAC text of COTRTLIC or the SQLERRM of COTRTUPC after that code, \
+         are defined by Db2 (E19), with no PostgreSQL counterpart, so the running tests assert \
+         each message only up to and including its SQLCODE label"
+            .into(),
+    )
+}

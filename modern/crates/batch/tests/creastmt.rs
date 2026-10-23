@@ -244,7 +244,7 @@ async fn run_batch(scratch: &Scratch, database_url: &str, args: &[&str]) -> Outc
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
         .env("RUST_LOG", "error")
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
 /// The plain lines of standard output, the paths the job wrote; every JSON tracing event is a

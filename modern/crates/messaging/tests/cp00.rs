@@ -14,6 +14,10 @@
 //! (COPAUA0C-065), so no body is compared or snapshotted here. The redaction of the reply's card
 //! field is `redaction.rs`'s, and response codes are read here only from the detail rows.
 //!
+//! Every reply's `message_id` is newly generated (COPAUA0C-067): each test that takes several
+//! replies keeps their IDs and asserts that no two are equal and that none is a request's, so a
+//! constant reply ID fails.
+//!
 //! Settlement is read from the broker: closing the worker's connection returns every request it
 //! left unsettled to its queue, so an empty request queue after the close proves an
 //! acknowledgement, and a request back on it proves that none was made.
@@ -51,6 +55,16 @@
 //! included. They implement only the worker's seams (`AuthStore`, `AuthTx`, `Acknowledger`),
 //! never a `persistence` repository trait.
 //!
+//! A reply on its queue is not a confirmed one: the broker queues a message before its
+//! confirmation reaches the publisher. The confirmation-order tests therefore connect the
+//! worker through a `test_support::rabbitmq::ConfirmGate` ([`Harness::open_worker_through`]),
+//! which withholds each confirmation the broker sends while the test reads the call order, the
+//! database and the queues for [`HOLD`], then releases it, which the test records as the
+//! [`CallOrder`]'s `confirm` slot, or refuses it, handing the worker a negative confirmation.
+//! While the reply's confirmation is held, the reply is on its queue, the locking reads are
+//! done, and nothing is acknowledged, rejected, written, logged, committed or rolled back
+//! (COPAUA0C-081); a refused confirmation takes the `M004` path (COPAUA0C-117).
+//!
 //! # Redaction
 //!
 //! A request body holds a full card number, taken from the fixtures through
@@ -58,6 +72,7 @@
 //! number or an event key that is checked for one; card numbers compare through `CardNumber`,
 //! whose `Debug` shows only the redacted form.
 
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -88,7 +103,7 @@ use runtime::config::Config;
 use rust_decimal::Decimal;
 use test_support::fixtures::{fixture_card_numbers, start_loaded_postgres};
 use test_support::postgres::PostgresGuard;
-use test_support::rabbitmq::{self, RabbitMqGuard, start_rabbitmq};
+use test_support::rabbitmq::{self, ConfirmGate, RabbitMqGuard, start_rabbitmq};
 use test_support::trace_capture::{self, TraceCapture};
 use tokio::time::{Instant, sleep, timeout};
 use tracing::instrument::WithSubscriber;
@@ -109,6 +124,24 @@ const DRAIN: Duration = Duration::from_millis(500);
 const REPLY_SUCCESS: u16 = 200;
 /// The reason text of every close this file makes.
 const CLOSE_REASON: &str = "cp00 test done";
+/// How long the confirmation gate withholds a reply's confirmation before the test reads the
+/// call order, the database and the queues. A quarter of the worker's
+/// [`broker::PUBLISH_DEADLINE`] at most, so that the publication and its released confirmation
+/// still finish within it.
+const HOLD: Duration = Duration::from_secs(1);
+const _: () = assert!(
+    HOLD.as_millis() * 4 <= broker::PUBLISH_DEADLINE.as_millis(),
+    "HOLD must stay well within PUBLISH_DEADLINE"
+);
+/// The calls a found card's request makes before its reply is published: the cross-reference
+/// read, the transaction, the summary lock, and the account and customer reads (COPAUA0C-081).
+const LOCKING_READS: [&str; 5] = [
+    "card_xref read",
+    "begin",
+    "summary lock",
+    "account read",
+    "customer read",
+];
 
 /// A `reply_to` naming no queue, so the worker's `mandatory` publication comes back returned.
 const NO_SUCH_REPLY_QUEUE: &str = "CARD.DEMO.NO.SUCH.REPLY";
@@ -275,6 +308,56 @@ impl Harness {
         Ok((session, worker))
     }
 
+    /// A CP00 worker with the production seams on a new connection of its own through `gate`,
+    /// which withholds every confirmation the broker sends it until the test settles it.
+    async fn open_worker_through(&self, gate: &ConfirmGate) -> Result<(Session, Worker), BoxError> {
+        let session = broker::connect(gate.amqp_url()).await?;
+        let worker = Worker::open(
+            session.connection(),
+            &self.config,
+            self.store(),
+            Arc::clone(&self.clock),
+        )
+        .await?;
+        Ok((session, worker))
+    }
+
+    /// Waits until the reply's confirmation has reached `gate`, keeps it withheld for [`HOLD`],
+    /// and reads at its end the queues, whether `acct_id` has a committed summary, the committed
+    /// log rows and, last, the calls `calls` recorded. Then marks `calls.confirm` and settles the
+    /// confirmation with `settle`, whatever the reads returned, so that the worker is never left
+    /// waiting for it.
+    async fn hold_reply(
+        &self,
+        gate: &ConfirmGate,
+        calls: &CallOrder,
+        acct_id: PicU<11>,
+        settle: fn(&ConfirmGate),
+    ) -> Result<Held, BoxError> {
+        let held = async {
+            gate.wait_for_arrivals(1, WAIT).await?;
+            sleep(HOLD).await;
+            let replies = rabbitmq::message_count(&self.channel, &self.reply_queue).await?;
+            let requests = rabbitmq::message_count(&self.channel, self.request_queue()).await?;
+            let dead_letters =
+                rabbitmq::message_count(&self.channel, broker::DEAD_LETTER_QUEUE).await?;
+            let summary_committed = self.summary(acct_id).await?.is_some();
+            let log_rows = self.log_rows().await?.len();
+            Ok(Held {
+                replies,
+                requests,
+                dead_letters,
+                summary_committed,
+                log_rows,
+                made: calls.made(),
+            })
+        }
+        .await;
+        calls.mark(&calls.confirm);
+        settle(gate);
+        held
+    }
+
     /// A store that fails as `fault` names, with a server error ([`Failure::Server`]), and
     /// records its calls in `calls`.
     fn injected(&self, fault: StoreFault, calls: &Arc<CallOrder>) -> InjectedStore {
@@ -295,6 +378,15 @@ impl Harness {
             failure,
             calls: Arc::clone(calls),
         }
+    }
+
+    /// A CP00 worker with the production seams and `clock` instead of the harness clock, on a
+    /// new connection of its own: a clock that reads another instant gives the worker's details
+    /// another key (COPAUA0C-099).
+    async fn open_worker_at(&self, clock: Arc<dyn Clock>) -> Result<(Session, Worker), BoxError> {
+        let session = broker::connect(self.broker.amqp_url()).await?;
+        let worker = Worker::open(session.connection(), &self.config, self.store(), clock).await?;
+        Ok((session, worker))
     }
 
     /// Publishes `body` to the request queue with `reply_to` and the distinct IDs `tag` names,
@@ -524,8 +616,9 @@ fn single<T>(rows: Vec<T>, what: &str) -> Result<T, BoxError> {
 }
 
 /// The properties every CP00 reply carries (COPAUA0C-067, E16): the request's `correlation_id`;
-/// a new, non-empty `message_id` of `messaging::ids`, never the request's (`MQMI-NONE`); the
-/// audited five-second expiry as `expiration` `"5000"`; `delivery_mode` 2; no `reply_to`.
+/// a non-empty `message_id` of `messaging::ids`, never the request's (`MQMI-NONE`); the
+/// audited five-second expiry as `expiration` `"5000"`; `delivery_mode` 2; no `reply_to`. That
+/// each reply's `message_id` is new, never another reply's, is [`assert_fresh_reply_ids`]'s.
 fn assert_cp00_properties(
     reply: &BasicGetMessage,
     request_correlation_id: &str,
@@ -552,6 +645,35 @@ fn assert_cp00_properties(
         properties.reply_to().is_none(),
         "the reply names no reply_to"
     );
+}
+
+/// The `message_id` of `reply`, kept for [`assert_fresh_reply_ids`]; an error when the reply
+/// carries none.
+fn reply_message_id(reply: &BasicGetMessage) -> Result<String, BoxError> {
+    text(reply.delivery.properties.message_id().as_ref())
+        .map(str::to_owned)
+        .ok_or_else(|| BoxError::from("a CP00 reply carries no message_id"))
+}
+
+/// The `message_id`s of one test's replies, `reply_ids`, each newly generated for its reply
+/// (COPAUA0C-067): no two are equal, so no ID served a second reply, and none is the
+/// `message_id` of any of the test's `requests`.
+fn assert_fresh_reply_ids<'a>(reply_ids: &[String], requests: impl IntoIterator<Item = &'a Sent>) {
+    let request_ids: BTreeSet<&str> = requests
+        .into_iter()
+        .map(|sent| sent.message_id.as_str())
+        .collect();
+    let mut seen = BTreeSet::new();
+    for id in reply_ids {
+        assert!(
+            seen.insert(id.as_str()),
+            "two replies carry the message_id {id:?}"
+        );
+        assert!(
+            !request_ids.contains(id.as_str()),
+            "a reply carries a request's message_id {id:?}"
+        );
+    }
 }
 
 /// The text of a short-string property, `None` when absent.
@@ -749,7 +871,8 @@ fn protected_cards(extra: &[&str]) -> Result<Vec<String>, BoxError> {
 }
 
 /// The order of the doubles' calls: each slot holds the 1-based position of the latest call it
-/// names, 0 when none was made.
+/// names, 0 when none was made. `confirm` is the test's own: [`Harness::hold_reply`] marks it
+/// when it settles the reply's withheld confirmation, just before the worker can learn of it.
 #[derive(Debug, Default)]
 struct CallOrder {
     next: AtomicUsize,
@@ -758,6 +881,7 @@ struct CallOrder {
     lock: AtomicUsize,
     account: AtomicUsize,
     customer: AtomicUsize,
+    confirm: AtomicUsize,
     ack: AtomicUsize,
     update: AtomicUsize,
     insert: AtomicUsize,
@@ -777,6 +901,64 @@ impl CallOrder {
     /// The position `slot` recorded.
     fn at(slot: &AtomicUsize) -> usize {
         slot.load(Ordering::SeqCst)
+    }
+
+    /// The names of the slots recorded so far, in the order of their positions.
+    fn made(&self) -> Vec<&'static str> {
+        let mut made: Vec<(usize, &'static str)> = [
+            (&self.xref, "card_xref read"),
+            (&self.begin, "begin"),
+            (&self.lock, "summary lock"),
+            (&self.account, "account read"),
+            (&self.customer, "customer read"),
+            (&self.confirm, "confirmation"),
+            (&self.ack, "acknowledgement"),
+            (&self.update, "summary update"),
+            (&self.insert, "detail insert"),
+            (&self.commit, "commit"),
+            (&self.rollback, "rollback"),
+            (&self.reject, "rejection"),
+            (&self.log, "cssl_error_log write"),
+        ]
+        .into_iter()
+        .map(|(slot, name)| (Self::at(slot), name))
+        .filter(|(position, _)| *position > 0)
+        .collect();
+        made.sort_unstable();
+        made.into_iter().map(|(_, name)| name).collect()
+    }
+}
+
+/// What [`Harness::hold_reply`] read at the end of the hold of a reply's confirmation.
+#[derive(Debug, PartialEq, Eq)]
+struct Held {
+    /// Ready messages on the test's reply queue.
+    replies: u32,
+    /// Ready messages on the request queue.
+    requests: u32,
+    /// Ready messages on `CARD.DEMO.DEADLETTER.PAUTH`.
+    dead_letters: u32,
+    /// Whether the account had a committed summary.
+    summary_committed: bool,
+    /// Committed `cssl_error_log` rows.
+    log_rows: usize,
+    /// The calls the doubles had recorded, in order ([`CallOrder::made`]).
+    made: Vec<&'static str>,
+}
+
+impl Held {
+    /// The state while a found card's reply is unconfirmed: the reply on its queue, the request
+    /// neither requeued nor dead-lettered, nothing committed or logged, and no call made after
+    /// the locking reads (COPAUA0C-081).
+    fn unconfirmed() -> Self {
+        Self {
+            replies: 1,
+            requests: 0,
+            dead_letters: 0,
+            summary_committed: false,
+            log_rows: 0,
+            made: LOCKING_READS.to_vec(),
+        }
     }
 }
 
@@ -1238,6 +1420,10 @@ async fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> T
         process(&mut first, &first_session).await?,
         Processed::Requeued
     );
+    // The reply confirmed before the failed acknowledgement, taken at once, inside its
+    // five-second expiry.
+    let first_reply = harness.next_reply().await?;
+    assert_cp00_properties(&first_reply, &sent.correlation_id, &sent.message_id);
     assert!(
         CallOrder::at(&calls.ack) > 0,
         "the acknowledgement was tried"
@@ -1266,11 +1452,24 @@ async fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> T
         "the broker requeued the unacknowledged request"
     );
 
-    // Redelivery: processed once, as a new request.
+    // Redelivery: processed once, as a new request. Each delivery was answered once, the
+    // first by the reply confirmed before its acknowledgement failed (AAP 0.3.4.2), and each
+    // reply carries a message_id of its own.
     let (second_session, mut second) = harness.open_worker().await?;
     assert_eq!(
         process(&mut second, &second_session).await?,
         Processed::Replied
+    );
+    let second_reply = harness.next_reply().await?;
+    assert_cp00_properties(&second_reply, &sent.correlation_id, &sent.message_id);
+    let reply_ids = [
+        reply_message_id(&first_reply)?,
+        reply_message_id(&second_reply)?,
+    ];
+    assert_fresh_reply_ids(&reply_ids, [&sent]);
+    assert!(
+        harness.remaining_replies().await?.is_empty(),
+        "one reply per delivery: the redelivery was processed once"
     );
     let summary = harness
         .summary(xref.acct_id)
@@ -1287,20 +1486,15 @@ async fn failed_first_ack_writes_nothing_and_redelivery_is_processed_once() -> T
     close_worker(second_session, second).await;
     let left = harness.settled_count(harness.request_queue(), 0).await?;
     assert_eq!(left, 0, "the redelivered request was acknowledged");
-
-    // A reply confirmed before the failed acknowledgement may arrive twice (AAP 0.3.4.2).
-    let replies = harness.remaining_replies().await?;
-    assert!(!replies.is_empty(), "the redelivered request was answered");
-    for reply in &replies {
-        assert_cp00_properties(reply, &sent.correlation_id, &sent.message_id);
-    }
     harness.finish().await
 }
 
 // audit: COPAUA0C-041
+// audit: COPAUA0C-046
 // audit: COPAUA0C-049
 // audit: COPAUA0C-067
 // audit: COPAUA0C-094
+// audit: COPAUA0C-095
 // audit: COPAUA0C-099
 // audit: COPAUA0C-110
 // audit: COPAUA0C-120
@@ -1309,9 +1503,10 @@ async fn two_approvals_same_instant_commit_summary_and_log_i004() -> TestResult 
     let harness = Harness::start().await?;
     let xref = harness.xref(1).await?;
     let card = card_text(&xref.card_num)?;
+    let first_tran_id = "CP00T06 0000001";
     let first_sent = harness
         .send(
-            &auth_request(card, "100.00", "CP00T06 0000001"),
+            &auth_request(card, "100.00", first_tran_id),
             &harness.reply_queue,
             "same-instant-1",
         )
@@ -1326,12 +1521,16 @@ async fn two_approvals_same_instant_commit_summary_and_log_i004() -> TestResult 
 
     // The second decision takes the found-summary path: 2020.00 − 100.00 available, and the
     // guard's 194.00 + 100.00 + 100.00 is within the limit. Under one clock instant both
-    // details get the same key, so the second insert fails.
+    // details get the same key, so the second insert fails. The summary then counts 200.00
+    // and the details 100.00, and the third decision, `summary_guard_declines_past_the_details`
+    // after these assertions, tells the two apart: only a guard over the summary declines it.
     let (session, mut worker) = harness.open_worker().await?;
+    let mut reply_ids = Vec::new();
     for sent in [&first_sent, &second_sent] {
         assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
         let reply = harness.next_reply().await?;
         assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        reply_ids.push(reply_message_id(&reply)?);
     }
 
     let summary = harness
@@ -1366,7 +1565,119 @@ async fn two_approvals_same_instant_commit_summary_and_log_i004() -> TestResult 
     close_worker(session, worker).await;
     let left = harness.settled_count(harness.request_queue(), 0).await?;
     assert_eq!(left, 0, "both requests were acknowledged and none requeued");
+
+    let (third_sent, third_reply_id) =
+        summary_guard_declines_past_the_details(&harness, &xref, first_tran_id, &i004).await?;
+    // Two replies under one clock instant and a third under another: three message_ids.
+    reply_ids.push(third_reply_id);
+    assert_fresh_reply_ids(&reply_ids, [&first_sent, &second_sent, &third_sent]);
     harness.finish().await
+}
+
+/// The third decision of [`two_approvals_same_instant_commit_summary_and_log_i004`], once its
+/// `I004` has left the summary counting 200.00 and the details 100.00: 1700.00 for `xref`'s
+/// card under a clock one second later, so that its detail takes a key of its own
+/// (COPAUA0C-099). COPAUA0C's rule approves it, 2020.00 − 200.00 = 1820.00 being available
+/// (COPAUA0C-041), and so would a guard over the details, 194.00 + 100.00 + 1700.00 = 1994.00;
+/// the guard over the summary, which still counts the approval whose detail failed, declines it
+/// `05`/`4100`, as 194.00 + 200.00 + 1700.00 = 2094.00 exceeds 2020.00 (COPAUA0C-046,
+/// COPAUA0C-049).
+///
+/// Asserts the reply's properties; the summary's approved count, approved amount and credit
+/// balance unchanged and one decline counted (COPAUA0C-095); the decline's detail beside the
+/// detail of `approved_tran_id`, still approved; `i004` still the only log row; and the request
+/// acknowledged. Returns the request and its reply's `message_id`.
+async fn summary_guard_declines_past_the_details(
+    harness: &Harness,
+    xref: &CardXrefRecord,
+    approved_tran_id: &str,
+    i004: &LogExpectation<'_>,
+) -> Result<(Sent, String), BoxError> {
+    let tran_id = "CP00T06 0000003";
+    let body = auth_request(card_text(&xref.card_num)?, "1700.00", tran_id);
+    let sent = harness
+        .send(&body, &harness.reply_queue, "later-instant")
+        .await?;
+    let later = NaiveDate::from_ymd_opt(2022, 7, 18)
+        .and_then(|date| date.and_hms_milli_opt(10, 11, 13, 345))
+        .ok_or("the later instant is not a valid date and time")?;
+    let (session, mut worker) = harness
+        .open_worker_at(Arc::new(FixedClock::new(later)))
+        .await?;
+    // Boxed: the step's future, kept inline beside this helper's own state, would grow the
+    // helper's future past `clippy::large_futures`.
+    assert_eq!(
+        Box::pin(process(&mut worker, &session)).await?,
+        Processed::Replied
+    );
+    let reply = harness.next_reply().await?;
+    assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+    let reply_id = reply_message_id(&reply)?;
+
+    // `declined_auth_amt` is HALTED(H2) (COPAUA0C-096) and is not read.
+    let summary = harness
+        .summary(xref.acct_id)
+        .await?
+        .ok_or("the decline left no summary")?;
+    assert_eq!(
+        summary.approved_auth_cnt.get(),
+        2,
+        "approved_auth_cnt after the guard decline"
+    );
+    assert_eq!(
+        summary.declined_auth_cnt.get(),
+        1,
+        "declined_auth_cnt after the guard decline"
+    );
+    assert_amounts(&[
+        (
+            "approved_auth_amt after the guard decline",
+            summary.approved_auth_amt.as_decimal(),
+            20_000,
+        ),
+        (
+            "credit_balance after the guard decline",
+            summary.credit_balance.as_decimal(),
+            20_000,
+        ),
+    ]);
+    let details = harness.details(xref.acct_id).await?;
+    assert_eq!(
+        details.len(),
+        2,
+        "the surviving approval's detail and the decline's"
+    );
+    let detail_of = |tran_id: &str| {
+        details
+            .iter()
+            .find(|detail| holds_moved(detail.transaction_id.as_bytes(), tran_id))
+            .ok_or_else(|| BoxError::from(format!("no detail row for transaction {tran_id}")))
+    };
+    let guard_declined = Decided {
+        resp_code: "05",
+        reason: "4100",
+        match_status: "D",
+        approved_cents: 0,
+    };
+    let declined = detail_of(tran_id)?;
+    assert_decided(declined, &guard_declined);
+    assert_request_echo(declined, &xref.card_num, tran_id);
+    assert_amounts(&[(
+        "transaction_amt of the decline",
+        declined.transaction_amt.as_decimal(),
+        170_000,
+    )]);
+    assert_decided(detail_of(approved_tran_id)?, &APPROVED);
+    let row = single(
+        harness.log_rows().await?,
+        "cssl_error_log row after the guard decline",
+    )?;
+    assert_log_row(&row, i004);
+
+    close_worker(session, worker).await;
+    let left = harness.settled_count(harness.request_queue(), 0).await?;
+    assert_eq!(left, 0, "the declined request was acknowledged");
+    Ok((sent, reply_id))
 }
 
 // audit: COPAUA0C-067
@@ -1432,23 +1743,35 @@ async fn writes_follow_the_acknowledgement_inside_the_locking_transaction() -> T
     let sent = harness.send(&body, &harness.reply_queue, "order").await?;
 
     let calls = Arc::new(CallOrder::default());
-    let (session, worker) = harness.open_worker().await?;
+    let gate = harness.broker.confirm_gate().await?;
+    let (session, worker) = harness.open_worker_through(&gate).await?;
     let mut worker = worker
         .with_store(harness.injected(StoreFault::Healthy, &calls))
         .with_acknowledger(StandInAcknowledger::new(false, &calls));
-    assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
+    // The worker answers while the test holds the reply's confirmation, then releases it.
+    let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::release);
+    let (processed, held) = tokio::join!(process(&mut worker, &session), held);
+    // Queue presence is not confirmation: the reply was on its queue throughout the hold.
+    assert_eq!(
+        held?,
+        Held::unconfirmed(),
+        "while the reply's confirmation was held: the reply queued after the locking reads, \
+         and nothing settled, written, logged or committed"
+    );
+    assert_eq!(processed?, Processed::Replied);
     let reply = harness.next_reply().await?;
     assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
 
     // The cross-reference read, the transaction, the summary lock, the account and customer
-    // reads, then the acknowledgement of the confirmed reply, and only then the writes and
-    // the commit.
+    // reads, then the reply's confirmation, the acknowledgement of the confirmed reply, and
+    // only then the writes and the commit.
     let order = [
         ("card_xref read", CallOrder::at(&calls.xref)),
         ("begin", CallOrder::at(&calls.begin)),
         ("summary lock", CallOrder::at(&calls.lock)),
         ("account read", CallOrder::at(&calls.account)),
         ("customer read", CallOrder::at(&calls.customer)),
+        ("confirmation", CallOrder::at(&calls.confirm)),
         ("acknowledgement", CallOrder::at(&calls.ack)),
         ("summary update", CallOrder::at(&calls.update)),
         ("detail insert", CallOrder::at(&calls.insert)),
@@ -1478,6 +1801,88 @@ async fn writes_follow_the_acknowledgement_inside_the_locking_transaction() -> T
     assert_eq!(
         left, 1,
         "only the stand-in acknowledger settled the request"
+    );
+    harness.finish().await
+}
+
+// audit: COPAUA0C-066
+// audit: COPAUA0C-110
+// audit: COPAUA0C-117
+#[tokio::test]
+async fn refused_reply_confirmation_logs_m004_writes_nothing_and_dead_letters() -> TestResult {
+    let harness = Harness::start().await?;
+    let xref = harness.xref(1).await?;
+    let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T10 0000001");
+    harness.send(&body, &harness.reply_queue, "refused").await?;
+
+    // The consumer channel settles the request; the healthy store only records its calls.
+    let calls = Arc::new(CallOrder::default());
+    let gate = harness.broker.confirm_gate().await?;
+    let (session, worker) = harness.open_worker_through(&gate).await?;
+    let mut worker = worker.with_store(harness.injected(StoreFault::Healthy, &calls));
+    // The worker answers while the test holds the reply's confirmation, then refuses it.
+    let held = harness.hold_reply(&gate, &calls, xref.acct_id, ConfirmGate::refuse);
+    let (processed, held) = tokio::join!(process(&mut worker, &session), held);
+    // The broker queued the reply and only the worker was told Nack, so the reply is on the
+    // reply queue: a refused confirmation, not an unroutable reply.
+    assert_eq!(
+        held?,
+        Held::unconfirmed(),
+        "while the reply's confirmation was held: no row, no write, the request unsettled"
+    );
+    // Only Ack(None) is a confirmed reply: the refused one takes the M004 path.
+    assert_eq!(processed?, Processed::DeadLettered);
+    assert!(
+        CallOrder::at(&calls.confirm) < CallOrder::at(&calls.log),
+        "the M004 row follows the refused confirmation"
+    );
+
+    // The rollback removed the summary `lock_or_create` had created, so neither table changed.
+    assert!(
+        harness.summary(xref.acct_id).await?.is_none(),
+        "no summary after a refused confirmation"
+    );
+    assert!(
+        harness.details(xref.acct_id).await?.is_empty(),
+        "no detail after a refused confirmation"
+    );
+    for (call, slot) in [
+        ("summary update", &calls.update),
+        ("detail insert", &calls.insert),
+        ("commit", &calls.commit),
+    ] {
+        assert_eq!(
+            CallOrder::at(slot),
+            0,
+            "{call} after a refused confirmation"
+        );
+    }
+    assert!(
+        CallOrder::at(&calls.rollback) > 0,
+        "the authorization transaction was rolled back"
+    );
+    // The event key is COPAUA0C-113's interim value and the codes HALTED(H4): neither is
+    // compared, and the key is only checked for a full card number.
+    let rows = harness.log_rows().await?;
+    assert_keys_redacted(&rows, &protected_cards(&[])?);
+    let row = single(rows, "cssl_error_log row")?;
+    let m004 = LogExpectation {
+        location: "M004",
+        level: "C",
+        subsystem: "M",
+        message: "FAILED TO PUT ON REPLY MQ",
+        event_key: None,
+    };
+    assert_log_row(&row, &m004);
+
+    // Rejected without requeue on the consumer channel, never acknowledged: dead-lettered.
+    close_worker(session, worker).await;
+    let left = harness.settled_count(harness.request_queue(), 0).await?;
+    assert_eq!(left, 0, "the request was rejected, not requeued");
+    let dead = harness.settled_count(broker::DEAD_LETTER_QUEUE, 1).await?;
+    assert_eq!(
+        dead, 1,
+        "the rejected request is retained on the dead-letter queue"
     );
     harness.finish().await
 }
@@ -1622,14 +2027,14 @@ fn critical_reads() -> [FaultRow; 5] {
 /// parity result: one reply carrying the CP00 properties, the request acknowledged and not
 /// dead-lettered, and neither a summary nor a detail for the account. The reply's `05`/`9000`
 /// bytes are the domain's unit test's, as no CP00 body is compared here (HALTED(H6)). Returns
-/// the store's calls.
+/// the store's calls, the request and its reply's `message_id`.
 async fn declined_after_failed_read(
     harness: &Harness,
     xref: &CardXrefRecord,
     case: &FaultRow,
     failure: Failure,
     tran_id: &str,
-) -> Result<Arc<CallOrder>, BoxError> {
+) -> Result<(Arc<CallOrder>, Sent, String), BoxError> {
     let location = case.location;
     let body = auth_request(card_text(&xref.card_num)?, "100.00", tran_id);
     let sent = harness.send(&body, &harness.reply_queue, location).await?;
@@ -1645,6 +2050,7 @@ async fn declined_after_failed_read(
     );
     let reply = harness.next_reply().await?;
     assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+    let reply_id = reply_message_id(&reply)?;
     assert!(
         harness.remaining_replies().await?.is_empty(),
         "{location}: exactly one reply"
@@ -1663,9 +2069,10 @@ async fn declined_after_failed_read(
         harness.details(xref.acct_id).await?.is_empty(),
         "{location}: no detail after a failed read"
     );
-    Ok(calls)
+    Ok((calls, sent, reply_id))
 }
 
+// audit: COPAUA0C-067
 // audit: COPAUA0C-110
 // audit: COPAUA0C-122
 // audit: COPAUA0C-123
@@ -1677,10 +2084,14 @@ async fn store_read_failures_log_their_critical_rows_and_decline_without_writes(
     let harness = Harness::start().await?;
     let xref = harness.xref(1).await?;
     let cards = protected_cards(&[])?;
+    let mut requests = Vec::new();
+    let mut reply_ids = Vec::new();
     for (written, case) in critical_reads().iter().enumerate() {
         let tran_id = format!("CP00T10 000000{written}");
-        let calls =
+        let (calls, sent, reply_id) =
             declined_after_failed_read(&harness, &xref, case, Failure::Server, &tran_id).await?;
+        requests.push(sent);
+        reply_ids.push(reply_id);
         assert!(
             CallOrder::at(&calls.log) > 0,
             "{}: the row was written",
@@ -1698,6 +2109,7 @@ async fn store_read_failures_log_their_critical_rows_and_decline_without_writes(
         let row = rows.last().ok_or("no cssl_error_log row")?;
         assert_log_row(row, &case.expectation(&xref));
     }
+    assert_fresh_reply_ids(&reply_ids, &requests);
     harness.finish().await
 }
 
@@ -1714,6 +2126,7 @@ fn rows_not_written(capture: &TraceCapture) -> usize {
         .count()
 }
 
+// audit: COPAUA0C-067
 // audit: COPAUA0C-122
 // audit: COPAUA0C-123
 // audit: COPAUA0C-124
@@ -1724,13 +2137,17 @@ async fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() 
     let harness = Harness::start().await?;
     let xref = harness.xref(1).await?;
     let capture = trace_capture::capture();
+    let mut requests = Vec::new();
+    let mut reply_ids = Vec::new();
     for (nth, case) in critical_reads().iter().enumerate() {
         let location = case.location;
         let tran_id = format!("CP00T12 000000{nth}");
         capture.clear();
-        let calls =
+        let (calls, sent, reply_id) =
             declined_after_failed_read(&harness, &xref, case, Failure::Unavailable, &tran_id)
                 .await?;
+        requests.push(sent);
+        reply_ids.push(reply_id);
         assert_eq!(
             CallOrder::at(&calls.log),
             0,
@@ -1746,6 +2163,7 @@ async fn an_unavailable_database_declines_the_request_and_attempts_no_log_row() 
             "{location}: no write failed"
         );
     }
+    assert_fresh_reply_ids(&reply_ids, &requests);
     assert!(
         harness.log_rows().await?.is_empty(),
         "an unavailable database leaves no cssl_error_log row"
@@ -1838,6 +2256,8 @@ async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> 
             APPROVED,
         ),
     ];
+    let mut requests = Vec::new();
+    let mut reply_ids = Vec::new();
     for (written, (acct_id, case, decided)) in cases.iter().enumerate() {
         let xref = harness.xref(*acct_id).await?;
         let body = auth_request(card_text(&xref.card_num)?, "100.00", "CP00T11 0000001");
@@ -1850,6 +2270,8 @@ async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> 
         assert_eq!(process(&mut worker, &session).await?, Processed::Replied);
         let reply = harness.next_reply().await?;
         assert_cp00_properties(&reply, &sent.correlation_id, &sent.message_id);
+        reply_ids.push(reply_message_id(&reply)?);
+        requests.push(sent);
 
         let rows = harness.log_rows().await?;
         assert_eq!(
@@ -1873,6 +2295,7 @@ async fn missing_account_or_customer_logs_a_warning_and_processing_goes_on() -> 
         let left = harness.settled_count(harness.request_queue(), 0).await?;
         assert_eq!(left, 0, "{}: the request was acknowledged", case.location);
     }
+    assert_fresh_reply_ids(&reply_ids, &requests);
     harness.finish().await
 }
 

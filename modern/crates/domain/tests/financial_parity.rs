@@ -1196,12 +1196,25 @@ fn run_posttran(masters: &Masters) -> Result<PostedRun, Box<dyn Error>> {
     })
 }
 
-/// One effect `Intcalc::process` returns, as plain values: the account ID a rewrite updates, or
-/// the amount of a SYSTRAN record.
+/// One effect `Intcalc::process` returns, as plain values: the account ID a rewrite updates, the
+/// `DEFAULT` fallback of a disclosure lookup, which carries no amount, or the amount of a
+/// SYSTRAN record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RecordEffect {
     Rewrite(u64),
+    DefaultFallback,
     Systran(Money<9>),
+}
+
+impl RecordEffect {
+    /// `effect` as plain values.
+    fn of(effect: &IntcalcEffect) -> Self {
+        match effect {
+            IntcalcEffect::AccountUpdate(account) => Self::Rewrite(account.id.get()),
+            IntcalcEffect::DefaultGroupFallback => Self::DefaultFallback,
+            IntcalcEffect::SystemTransaction(record) => Self::Systran(record.amt),
+        }
+    }
 }
 
 /// An INTCALC run: each SYSTRAN record with the key of the category balance that wrote it, every
@@ -1235,18 +1248,16 @@ fn run_intcalc(
     for tcatbal in tcatbals {
         let mut record_effects = Vec::new();
         for effect in run.process(tcatbal, &clock)? {
-            match effect {
-                IntcalcEffect::AccountUpdate(account) => {
-                    let acct_id = account.id.get();
-                    record_effects.push(RecordEffect::Rewrite(acct_id));
-                    if updates.insert(acct_id, account).is_some() {
-                        return Err(format!("account {acct_id} is rewritten twice").into());
-                    }
+            // The `DEFAULT` fallback changes no amount and no record, so `record_effects` alone
+            // keeps it, in its place in the order.
+            record_effects.push(RecordEffect::of(&effect));
+            if let IntcalcEffect::AccountUpdate(account) = effect {
+                let acct_id = account.id.get();
+                if updates.insert(acct_id, account).is_some() {
+                    return Err(format!("account {acct_id} is rewritten twice").into());
                 }
-                IntcalcEffect::SystemTransaction(record) => {
-                    record_effects.push(RecordEffect::Systran(record.amt));
-                    systran.push((category_key(tcatbal), record));
-                }
+            } else if let IntcalcEffect::SystemTransaction(record) = effect {
+                systran.push((category_key(tcatbal), record));
             }
         }
         effects.push(record_effects);
@@ -1455,14 +1466,19 @@ fn intcalc_skips_a_zero_rate_and_applies_each_total_at_the_next_break() -> TestR
     let run = run_intcalc(accounts, &records, &masters)?;
     // ARITH-016: `1400-COMPUTE-FEES` computes no fee. A record at a non-zero rate returns its
     // SYSTRAN record of the monthly interest alone, the zero-rate record returns nothing, and the
-    // break adds only the rewrite of the previous account.
+    // break adds only the rewrite of the previous account. Every fixture group is blank, so each
+    // record's lookup falls back to `DEFAULT` before its rate is used (E07, CBACT04C-010).
     assert_eq!(
         run.effects,
         [
-            vec![RecordEffect::Systran(money(1_543)?)],
-            vec![],
+            vec![
+                RecordEffect::DefaultFallback,
+                RecordEffect::Systran(money(1_543)?),
+            ],
+            vec![RecordEffect::DefaultFallback],
             vec![
                 RecordEffect::Rewrite(first.acct_id.get()),
+                RecordEffect::DefaultFallback,
                 RecordEffect::Systran(money(3_000)?),
             ],
         ],
@@ -1639,36 +1655,34 @@ fn intcalc_stores_each_accounts_total_into_s9_09_v99_and_keeps_its_sign() -> Tes
     for record in &records {
         let mut record_effects = Vec::new();
         for effect in run.process(record, &clock)? {
-            match effect {
-                IntcalcEffect::AccountUpdate(account) => {
-                    record_effects.push(RecordEffect::Rewrite(account.id.get()));
-                    rewritten.push((account.id.get(), account.curr_bal));
-                }
-                IntcalcEffect::SystemTransaction(transaction) => {
-                    record_effects.push(RecordEffect::Systran(transaction.amt));
-                }
+            record_effects.push(RecordEffect::of(&effect));
+            if let IntcalcEffect::AccountUpdate(account) = effect {
+                rewritten.push((account.id.get(), account.curr_bal));
             }
         }
         effects.push(record_effects);
     }
     let summary = run.finish();
     // Each monthly interest, and the SYSTRAN amount it writes, is 333324999.91 or -333324999.91
-    // (ARITH-008); the 0.00 balance gives 0.00.
+    // (ARITH-008); the 0.00 balance gives 0.00. Each record's lookup falls back to its
+    // category's `DEFAULT` record first, as the accounts' groups are blank (E07, CBACT04C-010).
+    let fallback = RecordEffect::DefaultFallback;
     let gain = RecordEffect::Systran(money(33_332_499_991)?);
     let loss = RecordEffect::Systran(money(-33_332_499_991)?);
     assert_eq!(
         effects,
         [
-            vec![gain],
-            vec![gain],
-            vec![gain],
-            vec![gain],
-            vec![RecordEffect::Rewrite(first.acct_id.get()), loss],
-            vec![loss],
-            vec![loss],
-            vec![loss],
+            vec![fallback, gain],
+            vec![fallback, gain],
+            vec![fallback, gain],
+            vec![fallback, gain],
+            vec![RecordEffect::Rewrite(first.acct_id.get()), fallback, loss],
+            vec![fallback, loss],
+            vec![fallback, loss],
+            vec![fallback, loss],
             vec![
                 RecordEffect::Rewrite(second.acct_id.get()),
+                fallback,
                 RecordEffect::Systran(Money::ZERO),
             ],
         ],

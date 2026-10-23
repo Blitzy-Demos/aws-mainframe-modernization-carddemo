@@ -398,12 +398,15 @@ function RouteStub() {
   );
 }
 
-/** COTRN02 at `/transactions/add` with `state`, and stubs at the routes F3 can reach. */
+/**
+ * COTRN02 at `/transactions/add` with `state`, and stubs at the routes F3 can reach. Returns the
+ * render result and the query client, whose pending requests {@link clientIdle} reads.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COTRN02, state }]}>
         <Routes>
@@ -414,6 +417,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route stub a transfer reached: its path and the route state it was given. */
@@ -644,16 +648,35 @@ async function moveFocus(element: HTMLElement): Promise<void> {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests. The wait runs inside `waitFor`, which lets
- * React render the form-state updates of a key the screen ignores while a request is outstanding.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoint 13 is a mutation of that client. It stays pending
+ * from the moment the screen starts it until its reply has arrived and, while the screen is
+ * mounted, has been passed to the screen's `onSuccess` or `onError`. Every request the screen had
+ * started when this is called, the held ones aside, has therefore been answered once it returns.
+ * It cannot see a request the screen has not started yet: a test calls it once it has awaited
+ * what the screen shows at the end of a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
+  });
+}
+
+/**
+ * For keys that must send nothing and leave nothing on screen to wait for, such as the first
+ * entry or the keys the lock refuses: lets 50 ms pass inside `act`, so whatever the screen does
+ * within that window (a validation, a render, a request) runs and renders first, then waits as
+ * {@link clientIdle} does. It shows only that nothing was sent within those 50 ms, not that
+ * nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
+  await clientIdle(client, held);
 }
 
 /** Types {@link TYPED_BY_ACCOUNT}, presses ENTER and waits for {@link SHOWN_PROMPT}. */
@@ -701,7 +724,7 @@ describe("COTRN02 Add Transaction screen", () => {
   // audit: COTRN02C-002
   it("renders the map empty: title, 14 labelled inputs, hints, keys, cursor on Acct", async () => {
     const requests = stubApi([]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
 
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Add Transaction");
 
@@ -758,7 +781,7 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(shownValues()).toEqual(BLANK);
     expect(messageRow()).toEqual({ kind: "error", text: "", red: true });
     expect(document.activeElement).toBe(field("acctId"));
-    await settle();
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -1162,7 +1185,7 @@ describe("COTRN02 Add Transaction screen", () => {
     },
   ] as const)("$title shows the map-length message and sends nothing", async (row) => {
     const requests = stubApi([]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     const key = keyButton(row.key);
     await moveFocus(key);
 
@@ -1190,7 +1213,7 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(
       visibleCopies(row.message).map((copy) => copy.closest("[role='alert']") !== null),
     ).toEqual([true]);
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
     // The refusal releases the keyboard the key took.
     expect(lockState()).toEqual(UNLOCKED);
@@ -1245,7 +1268,7 @@ describe("COTRN02 Add Transaction screen", () => {
     },
   ] as const)("$title shows its message, keeps every field, marks its input", async (row) => {
     const requests = stubApi([row.reply]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInto(row.typed);
     const enter = keyButton("ENTER=Continue");
     await moveFocus(enter);
@@ -1264,7 +1287,7 @@ describe("COTRN02 Add Transaction screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(row.focus === undefined ? enter : field(row.focus));
     });
-    await settle();
+    await clientIdle(client);
     expect(document.activeElement).toBe(row.focus === undefined ? enter : field(row.focus));
     // The named input, by its bare or `fields.` wire name, is invalid and names a form message
     // with the row's text for assistive technology only; with no field named, none is marked.
@@ -1301,9 +1324,10 @@ describe("COTRN02 Add Transaction screen", () => {
     },
   ])("describes each input by rendered elements only, $state", async (row) => {
     stubApi(row.error === null ? [] : [json(400, row.error)]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     if (row.typed === null || row.error === null) {
-      await settle();
+      // On entry nothing is pressed, so nothing on screen marks the end of a wait.
+      await idleAfter50ms(client);
     } else {
       typeInto(row.typed);
       fireEvent.click(keyButton("ENTER=Continue"));
@@ -1381,7 +1405,7 @@ describe("COTRN02 Add Transaction screen", () => {
   ] as const)("a server-marked input is unmarked by $title", async (row) => {
     const held = heldReply();
     const requests = stubApi([row.rejection, held.reply]);
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
+    const { container, client } = renderScreen({ from: PATHS.COMEN01 });
     typeInto(row.typed);
     fireEvent.click(keyButton(row.via));
     await waitFor(() => {
@@ -1406,7 +1430,7 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(markedInputs()).toEqual([]);
     const { answer } = row;
     if (answer === undefined) {
-      await settle();
+      await clientIdle(client);
       expect(requests).toHaveLength(1);
       return;
     }
@@ -1434,7 +1458,7 @@ describe("COTRN02 Add Transaction screen", () => {
     { title: "the F4 key", byKey: true },
   ])("$title empties every field and the message, refocuses Acct, no request", async (row) => {
     const requests = stubApi([json(200, promptByAccount)]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     expect(keyKind("F4=Clear")).toEqual(["button", "outline", "sm"]);
     await reachPrompt();
     await waitFor(() => {
@@ -1455,7 +1479,7 @@ describe("COTRN02 Add Transaction screen", () => {
     await waitFor(() => {
       expect(document.activeElement).toBe(field("acctId"));
     });
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(1);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("Add Transaction");
   });
@@ -1495,7 +1519,7 @@ describe("COTRN02 Add Transaction screen", () => {
     },
   ])("$title, recording COTRN02 as the origin, with no request", async (row) => {
     const requests = stubApi([]);
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     expect(keyKind("F3=Back")).toEqual(["button", "outline", "sm"]);
     typeInto(TYPED_BY_ACCOUNT);
 
@@ -1508,7 +1532,7 @@ describe("COTRN02 Add Transaction screen", () => {
     const stub = await reachedStub();
     expect(stub.path).toBe(row.target);
     expect(stub.state).toEqual({ from: PATHS.COTRN02 });
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -1520,7 +1544,7 @@ describe("COTRN02 Add Transaction screen", () => {
     { title: "Shift+F3, PF15, which COTRN02C does not fold onto PF3", key: "F3", shiftKey: true },
   ])("$title shows the invalid-key message and keeps every field, with no request", async (row) => {
     const requests = stubApi([]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInto(TYPED_BY_ACCOUNT);
 
     pressKey(row.key, row.shiftKey);
@@ -1531,7 +1555,7 @@ describe("COTRN02 Add Transaction screen", () => {
     expect(messageRow().text).toHaveLength(50);
     expect(shownValues()).toEqual({ ...BLANK, ...TYPED_BY_ACCOUNT });
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -1549,7 +1573,7 @@ describe("COTRN02 Add Transaction screen", () => {
     async (row) => {
       const held = heldReply();
       const requests = stubApi([held.reply, json(200, promptByAccount)]);
-      const { container } = renderScreen({ from: PATHS.COMEN01 });
+      const { container, client } = renderScreen({ from: PATHS.COMEN01 });
       typeInto(TYPED_BY_ACCOUNT);
       row.start();
       await waitFor(() => {
@@ -1572,7 +1596,8 @@ describe("COTRN02 Add Transaction screen", () => {
       fireEvent.click(keyButton("F4=Clear"));
       pressKey("F4");
       pressKey("F7");
-      await settle();
+      // The held reply stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(requests).toHaveLength(1);
       expect(shownValues()).toEqual({ ...BLANK, ...TYPED_BY_ACCOUNT });
       expect(messageRow().text).toBe("");
@@ -1587,7 +1612,7 @@ describe("COTRN02 Add Transaction screen", () => {
         expect(shownValues()).toEqual(SHOWN_PROMPT);
       });
       expect(messageRow().text).toBe(PROMPT_TEXT);
-      await settle();
+      await clientIdle(client);
       expect(requests).toHaveLength(1);
 
       // Answered, the keyboard takes the next ENTER.
@@ -1606,7 +1631,7 @@ describe("COTRN02 Add Transaction screen", () => {
   it("takes one key of several pressed before the screen renders again", async () => {
     const held = heldReply();
     const requests = stubApi([held.reply]);
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
+    const { container, client } = renderScreen({ from: PATHS.COMEN01 });
     const form = container.querySelector("form");
     if (form === null) {
       throw new Error("no form");
@@ -1626,7 +1651,8 @@ describe("COTRN02 Add Transaction screen", () => {
       expect(requests).toHaveLength(1);
     });
     expect(lockState()).toEqual(LOCKED);
-    await settle();
+    // The held reply of the one key taken stays the one request pending.
+    await idleAfter50ms(client, 1);
     expect(requests).toHaveLength(1);
     expect(requests[0]?.body).toMatchObject({ aid: "ENTER" });
 
@@ -1640,7 +1666,7 @@ describe("COTRN02 Add Transaction screen", () => {
   it("F3 still leaves while a request is outstanding", async () => {
     const held = heldReply();
     const requests = stubApi([held.reply]);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInto(TYPED_BY_ACCOUNT);
     pressEnter();
     await waitFor(() => {
@@ -1652,7 +1678,8 @@ describe("COTRN02 Add Transaction screen", () => {
     const stub = await reachedStub();
     expect(stub.path).toBe(PATHS.COMEN01);
     held.release(json(200, promptByAccount));
-    await settle();
+    // The count waits for the released reply's answer.
+    await clientIdle(client);
     expect(requests).toHaveLength(1);
   });
 });
@@ -1809,7 +1836,8 @@ describe("COTRN02 behind the route guard", () => {
     );
     expect(screen.queryByRole("heading", { level: 1, name: "Add Transaction" })).toBeNull();
     expect(screen.queryByLabelText(LABELS.acctId)).toBeNull();
-    await settle();
+    // Gives a request the guarded screen would send time to leave before the count.
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
     router.dispose();
   });

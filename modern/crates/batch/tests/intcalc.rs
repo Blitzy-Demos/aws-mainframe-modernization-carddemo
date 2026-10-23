@@ -27,9 +27,10 @@
 //!   account, which has no single result (CBACT04C-008, X-INTCALC-H5).
 //!
 //! Every expected value is transcribed from the `CBACT04C-` rows of `INTCALC.md`, the `FIXINT-`
-//! rows of `fixtures.md` and the `ARITH-` rows of `arithmetic.md`. Nothing here computes
-//! interest: the test calls neither `domain::batch::cbact04c` nor `monthly_interest`, and money is
-//! compared as `Decimal` values parsed from the audit's decimal strings (R1).
+//! and `FIXPOST-` rows of `fixtures.md` and the `ARITH-` rows of `arithmetic.md`, or read in place
+//! from the fixture files those rows cite. Nothing here computes interest: the test calls neither
+//! `domain::batch::cbact04c` nor `monthly_interest`, and money is compared as `Decimal` values
+//! parsed from the audit's decimal strings (R1).
 //!
 //! # Failures provoked from outside
 //!
@@ -48,6 +49,31 @@
 //!   writes and syncs them;
 //! - a second cross-reference for one account, inserted through `CardXrefRepository`.
 //!
+//! # The job log
+//!
+//! X-INTCALC-4 gives one tracing event per `DISPLAY` line, in program order, whose message is the
+//! displayed text: `INFO` for the lines of a run that ends normally, `ERROR` for those of the
+//! failure rows. Every run keeps the job's events from `INFO` up and every other target's errors
+//! ([`LOG_FILTER`]).
+//!
+//! - A run that ends normally is compared whole, byte for byte: its standard output is
+//!   `START OF EXECUTION OF PROGRAM CBACT04C`, then for each category balance in key order its
+//!   50-byte record line and the `DEFAULT` fallback pair, then
+//!   `END OF EXECUTION OF PROGRAM CBACT04C`, each an `INFO` event of the job, and the SYSTRAN
+//!   path line last (CBACT04C-002, CBACT04C-003, CBACT04C-010, CBACT04C-030; FIXINT-902,
+//!   FIXINT-903): 152 events before the path in `INTEREST-RAW`, 302 in `INTEREST-POSTED`.
+//! - The expected record lines come from the fixtures, never from the job: the `tcatbal.txt`
+//!   lines read in place for `INTEREST-RAW`, and for `INTEREST-POSTED` those lines with the
+//!   balances FIXINT-001 to FIXINT-050 give `posttran`'s rows, after each of which comes the row
+//!   of type `03` FIXPOST-901 says `posttran` creates, its `FILLER` 22 `0` characters
+//!   (X-FIXTURES-1). The corpus never creates a row before its first category balance read, so
+//!   the `HALTED(H2)` `FILLER` of CBTRN02C-018 is in none of these lines and no byte of them is
+//!   excluded.
+//! - A run that abends starts with the same first line (CBACT04C-002) and ends with the failure
+//!   line, its status line and `ABENDING PROGRAM` recording abend code 999, each an `ERROR` event,
+//!   as the last lines of the job log, which the tests of CBACT04C-031 to CBACT04C-035 assert
+//!   (CBACT04C-038). A refused PARM shows no line at all (CBACT04C-001).
+//!
 //! # Compared by format only, or not at all
 //!
 //! - Timestamps: the binary reads the system clock, so the `FixedClock` text of FIXINT-901
@@ -57,14 +83,7 @@
 //! - Bytes 25 to 100 of `TRAN-DESC` (CBACT04C-019) and the record's `FILLER` (CBACT04C-023) are
 //!   `HALTED(H2)` through the candidates X-INTCALC-H1 and X-INTCALC-H2 (X-FIXTURES-H4): they are
 //!   reported `BLOCKED` and never compared (AAP 0.8.5).
-//! - The job log: X-INTCALC-4 gives one tracing event per `DISPLAY` line. The job emits the lines
-//!   of its failure paths only, as its module documentation states, and the tests of
-//!   CBACT04C-031 to CBACT04C-035 assert them: the failure line, its status line and
-//!   `ABENDING PROGRAM` recording abend code 999, as the last lines of the job log
-//!   (CBACT04C-038). The lines of a run that ends normally
-//!   (CBACT04C-002, CBACT04C-003, CBACT04C-010, CBACT04C-030) stay unwritten, so a successful
-//!   run's standard output is read for its path lines only.
-//! - The four characters after `FILE STATUS IS: NNNN` on these failure paths are `HALTED(H4)`
+//! - The four characters after `FILE STATUS IS: NNNN` on the failure paths are `HALTED(H4)`
 //!   through X-INTCALC-H3: the line's shape is checked and its characters are reported `BLOCKED`
 //!   (CBACT04C-037). The one parity status of a failure, `0023` for a rewrite or a lookup that
 //!   finds no record (CBACT04C-036), is met by no external seam; the job's unit tests assert it.
@@ -198,6 +217,10 @@ const REWRITE_ACCOUNT_LINE: &str = "ERROR RE-WRITING ACCOUNT FILE";
 /// The failure line of a failed read of the account file (CBACT04C-033).
 const READ_ACCOUNT_LINE: &str = "ERROR READING ACCOUNT FILE";
 
+/// The failure line of the account file's open, which another writer's claim on `accounts`
+/// refuses (CBACT04C-034, CBACT04C-039).
+const OPEN_ACCOUNT_LINE: &str = "ERROR OPENING ACCOUNT MASTER FILE";
+
 /// The failure line of a SYSTRAN generation that cannot be created, the open of `TRANSACT-FILE`
 /// (CBACT04C-034).
 const OPEN_TRANSACT_LINE: &str = "ERROR OPENING TRANSACTION FILE";
@@ -221,6 +244,49 @@ const DISCLOSURE_MISSING_LINE: &str = "DISCLOSURE GROUP RECORD MISSING";
 /// `END OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-030), which no abend shows (CBACT04C-035,
 /// CBACT04C-038).
 const END_LINE: &str = "END OF EXECUTION OF PROGRAM CBACT04C";
+
+/// `START OF EXECUTION OF PROGRAM CBACT04C`, the first line of every run whose PARM is accepted
+/// (CBACT04C-002).
+const START_LINE: &str = "START OF EXECUTION OF PROGRAM CBACT04C";
+
+/// The second invalid-key line of a disclosure lookup that falls back to `DEFAULT`, after
+/// [`DISCLOSURE_MISSING_LINE`] (CBACT04C-010).
+const TRY_DEFAULT_LINE: &str = "TRY WITH DEFAULT GROUP CODE";
+
+/// `RUST_LOG` of every run: the job's events, among them every `DISPLAY` line, from `INFO` up,
+/// and every other target's errors only, `main`'s `job failed` among them (`main.rs`, "Standard
+/// output"; X-INTCALC-4).
+const LOG_FILTER: &str = "error,carddemo_batch::jobs::intcalc=info";
+
+/// The `target` member of the job's JSON events.
+const JOB_TARGET: &str = r#""target":"carddemo_batch::jobs::intcalc""#;
+
+/// The `level` member of an `INFO` event, the level of every line of a run that ends normally
+/// (X-INTCALC-4).
+const INFO_LEVEL: &str = r#""level":"INFO""#;
+
+/// The `level` member of an `ERROR` event, the level of every line of a failure row
+/// (X-INTCALC-4).
+const ERROR_LEVEL: &str = r#""level":"ERROR""#;
+
+/// `RECLN = 50` of `CVTRA01Y`: the bytes of a category balance record, which its job-log line
+/// shows one character each (`CVTRA01Y.cpy:2`; CBACT04C-003).
+const TCATBAL_WIDTH: usize = 50;
+
+/// The key of a category balance record: `TRANCAT-ACCT-ID PIC 9(11)`, `TRANCAT-TYPE-CD PIC X(02)`
+/// and `TRANCAT-CD PIC 9(04)`, bytes 1 to 17 (CVTRA01Y-001 to CVTRA01Y-003).
+const TCATBAL_KEY: Range<usize> = 0..17;
+
+/// The `FILLER PIC X(22)` of a category balance record, bytes 29 to 50, after `TRAN-CAT-BAL PIC
+/// S9(09)V99` in bytes 18 to 28 (CVTRA01Y-004, CVTRA01Y-005).
+const TCATBAL_FILLER: Range<usize> = 28..50;
+
+/// The category of every category balance of the corpus, `0001` (FIXINT-001 to FIXINT-050).
+const CORPUS_CATEGORY: &str = "0001";
+
+/// The `FILLER` of each category balance `posttran` creates over `dailytran.txt`: 22 `0`
+/// characters, the `FILLER` of the row it read last (FIXPOST-901, X-FIXTURES-1).
+const CREATED_FILLER: [u8; 22] = [b'0'; 22];
 
 /// The key before the message of a JSON tracing event (`runtime::telemetry`).
 const MESSAGE_KEY: &str = r#""message":""#;
@@ -292,14 +358,28 @@ struct Fixint {
     /// `INTEREST-POSTED`: `ACCT-CURR-BAL` after the rewrite, or `None` for the last account in
     /// key order, which is never rewritten (E08).
     rewritten_bal: Option<&'static str>,
+    /// `INTEREST-POSTED`: `TRAN-CAT-BAL` of (n, `01`, `0001`) and of (n, `03`, `0001`), the
+    /// category balances `POSTED` leaves, in key order.
+    posted_category_bals: [&'static str; 2],
 }
 
 impl Fixint {
     /// The row `text` of [`FIXINT_ROWS`].
     fn parse(text: &'static str) -> Result<Self, String> {
         let columns: Vec<&'static str> = text.split_whitespace().collect();
-        let [xref_line, raw_bal, interest, bal, cr, db, rewritten] = columns.as_slice() else {
-            return Err(format!("FIXINT row {text:?}: not seven columns"));
+        let [
+            xref_line,
+            raw_bal,
+            interest,
+            bal,
+            cr,
+            db,
+            rewritten,
+            interest_category,
+            zero_rate_category,
+        ] = columns.as_slice()
+        else {
+            return Err(format!("FIXINT row {text:?}: not nine columns"));
         };
         Ok(Self {
             xref_line: xref_line
@@ -309,6 +389,7 @@ impl Fixint {
             interest,
             posted: [bal, cr, db],
             rewritten_bal: (*rewritten != NEVER_REWRITTEN).then_some(*rewritten),
+            posted_category_bals: [interest_category, zero_rate_category],
         })
     }
 }
@@ -319,111 +400,113 @@ const NEVER_REWRITTEN: &str = "never";
 /// FIXINT-001 to FIXINT-050 as `fixtures.md` writes them, row n-1 for account n, its columns
 /// separated by spaces: the `cardxref.txt` line k of `{C:k}`; the `INTEREST-RAW` balance; then,
 /// for `INTEREST-POSTED`, the interest, the balance, cycle credit and cycle debit `POSTED`
-/// leaves, and the balance after the rewrite, or `never` (see [`Fixint`]). The RAW columns are
-/// asserted by `intcalc_default_parm_date_matches_audit`, `intcalc_explicit_parm_date` and
+/// leaves, the balance after the rewrite, or `never`, and the balances of the category balances
+/// (n, `01`, `0001`) and (n, `03`, `0001`) as `POSTED` leaves them, which the row's input
+/// condition gives (see [`Fixint`]). The RAW columns are asserted by
+/// `intcalc_default_parm_date_matches_audit`, `intcalc_explicit_parm_date` and
 /// `intcalc_refuses_a_held_account_claim`, the POSTED columns by
 /// `intcalc_after_posttran_matches_audit`.
 const FIXINT_ROWS: [&str; SYSTRAN_RECORDS] = [
     // audit: FIXINT-001
-    "49 194.00 14.56 1288.10 1164.87 -70.77 1302.66",
+    "49 194.00 14.56 1288.10 1164.87 -70.77 1302.66 1164.87 -70.77",
     // audit: FIXINT-002
-    "3 158.00 29.24 1734.97 2339.97 -763.00 1764.21",
+    "3 158.00 29.24 1734.97 2339.97 -763.00 1764.21 2339.97 -763.00",
     // audit: FIXINT-003
-    "17 147.00 32.38 1857.65 2590.87 -880.22 1890.03",
+    "17 147.00 32.38 1857.65 2590.87 -880.22 1890.03 2590.87 -880.22",
     // audit: FIXINT-004
-    "13 40.00 24.32 1662.66 1945.65 -322.99 1686.98",
+    "13 40.00 24.32 1662.66 1945.65 -322.99 1686.98 1945.65 -322.99",
     // audit: FIXINT-005
-    "27 345.00 15.83 1182.86 1266.85 -428.99 1198.69",
+    "27 345.00 15.83 1182.86 1266.85 -428.99 1198.69 1266.85 -428.99",
     // audit: FIXINT-006
-    "11 218.00 34.38 2572.19 2750.41 -396.22 2606.57",
+    "11 218.00 34.38 2572.19 2750.41 -396.22 2606.57 2750.41 -396.22",
     // audit: FIXINT-007
-    "21 193.00 16.08 900.21 1287.09 -579.88 916.29",
+    "21 193.00 16.08 900.21 1287.09 -579.88 916.29 1287.09 -579.88",
     // audit: FIXINT-008
-    "45 605.00 29.60 2138.08 2368.19 -835.11 2167.68",
+    "45 605.00 29.60 2138.08 2368.19 -835.11 2167.68 2368.19 -835.11",
     // audit: FIXINT-009
-    "48 560.00 36.34 3207.55 2907.66 -260.11 3243.89",
+    "48 560.00 36.34 3207.55 2907.66 -260.11 3243.89 2907.66 -260.11",
     // audit: FIXINT-010
-    "14 159.00 19.11 1150.76 1529.20 -537.44 1169.87",
+    "14 159.00 19.11 1150.76 1529.20 -537.44 1169.87 1529.20 -537.44",
     // audit: FIXINT-011
-    "39 212.00 25.90 1539.99 2072.76 -744.77 1565.89",
+    "39 212.00 25.90 1539.99 2072.76 -744.77 1565.89 2072.76 -744.77",
     // audit: FIXINT-012
-    "5 176.00 29.46 1770.65 2357.09 -762.44 1800.11",
+    "5 176.00 29.46 1770.65 2357.09 -762.44 1800.11 2357.09 -762.44",
     // audit: FIXINT-013
-    "18 41.00 35.94 2860.10 2875.87 -56.77 2896.04",
+    "18 41.00 35.94 2860.10 2875.87 -56.77 2896.04 2875.87 -56.77",
     // audit: FIXINT-014
-    "44 15.00 27.14 1475.99 2171.65 -710.66 1503.13",
+    "44 15.00 27.14 1475.99 2171.65 -710.66 1503.13 2171.65 -710.66",
     // audit: FIXINT-015
-    "28 489.00 51.02 4212.54 4081.98 -358.44 4263.56",
+    "28 489.00 51.02 4212.54 4081.98 -358.44 4263.56 4081.98 -358.44",
     // audit: FIXINT-016
-    "32 733.00 16.83 1808.88 1346.87 -270.99 1825.71",
+    "32 733.00 16.83 1808.88 1346.87 -270.99 1825.71 1346.87 -270.99",
     // audit: FIXINT-017
-    "47 33.00 4.29 -621.56 343.77 -998.33 -617.27",
+    "47 33.00 4.29 -621.56 343.77 -998.33 -617.27 343.77 -998.33",
     // audit: FIXINT-018
-    "24 144.00 33.27 2692.65 2661.76 -113.11 2725.92",
+    "24 144.00 33.27 2692.65 2661.76 -113.11 2725.92 2661.76 -113.11",
     // audit: FIXINT-019
-    "16 480.00 32.98 3047.53 2639.19 -71.66 3080.51",
+    "16 480.00 32.98 3047.53 2639.19 -71.66 3080.51 2639.19 -71.66",
     // audit: FIXINT-020
-    "4 369.00 30.66 1903.10 2453.10 -919.00 1933.76",
+    "4 369.00 30.66 1903.10 2453.10 -919.00 1933.76 2453.10 -919.00",
     // audit: FIXINT-021
-    "22 112.00 11.10 958.88 888.65 -41.77 969.98",
+    "22 112.00 11.10 958.88 888.65 -41.77 969.98 888.65 -41.77",
     // audit: FIXINT-022
-    "12 55.00 41.61 2438.20 3328.86 -945.66 2479.81",
+    "12 55.00 41.61 2438.20 3328.86 -945.66 2479.81 3328.86 -945.66",
     // audit: FIXINT-023
-    "42 104.00 23.51 1149.98 1881.42 -835.44 1173.49",
+    "42 104.00 23.51 1149.98 1881.42 -835.44 1173.49 1881.42 -835.44",
     // audit: FIXINT-024
-    "10 400.00 27.04 1922.10 2163.87 -641.77 1949.14",
+    "10 400.00 27.04 1922.10 2163.87 -641.77 1949.14 2163.87 -641.77",
     // audit: FIXINT-025
-    "46 61.00 19.87 743.76 1589.76 -907.00 763.63",
+    "46 61.00 19.87 743.76 1589.76 -907.00 763.63 1589.76 -907.00",
     // audit: FIXINT-026
-    "41 46.00 18.99 1193.87 1519.87 -372.00 1212.86",
+    "41 46.00 18.99 1193.87 1519.87 -372.00 1212.86 1519.87 -372.00",
     // audit: FIXINT-027
-    "2 284.00 44.80 3495.65 3584.64 -372.99 3540.45",
+    "2 284.00 44.80 3495.65 3584.64 -372.99 3540.45 3584.64 -372.99",
     // audit: FIXINT-028
-    "31 68.00 10.11 801.78 809.00 -75.22 811.89",
+    "31 68.00 10.11 801.78 809.00 -75.22 811.89 809.00 -75.22",
     // audit: FIXINT-029
-    "37 339.00 39.63 2657.64 3170.97 -852.33 2697.27",
+    "37 339.00 39.63 2657.64 3170.97 -852.33 2697.27 3170.97 -852.33",
     // audit: FIXINT-030
-    "30 2.00 0.36 -898.89 29.44 -930.33 -898.53",
+    "30 2.00 0.36 -898.89 29.44 -930.33 -898.53 29.44 -930.33",
     // audit: FIXINT-031
-    "34 31.00 8.30 333.10 664.32 -362.22 341.40",
+    "34 31.00 8.30 333.10 664.32 -362.22 341.40 664.32 -362.22",
     // audit: FIXINT-032
-    "36 30.00 14.66 460.56 1173.55 -742.99 475.22",
+    "36 30.00 14.66 460.56 1173.55 -742.99 475.22 1173.55 -742.99",
     // audit: FIXINT-033
-    "33 410.00 42.37 3354.43 3389.98 -445.55 3396.80",
+    "33 410.00 42.37 3354.43 3389.98 -445.55 3396.80 3389.98 -445.55",
     // audit: FIXINT-034
-    "19 253.00 32.17 2369.32 2573.87 -457.55 2401.49",
+    "19 253.00 32.17 2369.32 2573.87 -457.55 2401.49 2573.87 -457.55",
     // audit: FIXINT-035
-    "8 166.00 16.74 1005.21 1339.20 -499.99 1021.95",
+    "8 166.00 16.74 1005.21 1339.20 -499.99 1021.95 1339.20 -499.99",
     // audit: FIXINT-036
-    "20 110.00 28.87 1980.43 2309.76 -439.33 2009.30",
+    "20 110.00 28.87 1980.43 2309.76 -439.33 2009.30 2309.76 -439.33",
     // audit: FIXINT-037
-    "7 7.00 0.00 -125.88 0.00 -132.88 -125.88",
+    "7 7.00 0.00 -125.88 0.00 -132.88 -125.88 0.00 -132.88",
     // audit: FIXINT-038
-    "40 612.00 37.34 3061.53 2987.75 -538.22 3098.87",
+    "40 612.00 37.34 3061.53 2987.75 -538.22 3098.87 2987.75 -538.22",
     // audit: FIXINT-039
-    "9 843.00 25.63 2822.88 2050.87 -70.99 2848.51",
+    "9 843.00 25.63 2822.88 2050.87 -70.99 2848.51 2050.87 -70.99",
     // audit: FIXINT-040
-    "50 43.00 20.43 1652.10 1635.09 -25.99 1672.53",
+    "50 43.00 20.43 1652.10 1635.09 -25.99 1672.53 1635.09 -25.99",
     // audit: FIXINT-041
-    "15 375.00 29.99 2017.87 2399.53 -756.66 2047.86",
+    "15 375.00 29.99 2017.87 2399.53 -756.66 2047.86 2399.53 -756.66",
     // audit: FIXINT-042
-    "26 302.00 27.05 1965.31 2164.75 -501.44 1992.36",
+    "26 302.00 27.05 1965.31 2164.75 -501.44 1992.36 2164.75 -501.44",
     // audit: FIXINT-043
-    "35 610.00 36.72 3305.19 2938.19 -243.00 3341.91",
+    "35 610.00 36.72 3305.19 2938.19 -243.00 3341.91 2938.19 -243.00",
     // audit: FIXINT-044
-    "6 263.00 25.15 2059.87 2012.20 -215.33 2085.02",
+    "6 263.00 25.15 2059.87 2012.20 -215.33 2085.02 2012.20 -215.33",
     // audit: FIXINT-045
-    "38 186.00 30.09 2248.77 2407.54 -344.77 2278.86",
+    "38 186.00 30.09 2248.77 2407.54 -344.77 2278.86 2407.54 -344.77",
     // audit: FIXINT-046
-    "23 396.00 44.71 3538.41 3577.41 -435.00 3583.12",
+    "23 396.00 44.71 3538.41 3577.41 -435.00 3583.12 3577.41 -435.00",
     // audit: FIXINT-047
-    "25 32.00 19.97 1044.66 1598.10 -585.44 1064.63",
+    "25 32.00 19.97 1044.66 1598.10 -585.44 1064.63 1598.10 -585.44",
     // audit: FIXINT-048
-    "29 226.00 18.90 1202.89 1512.77 -535.88 1221.79",
+    "29 226.00 18.90 1202.89 1512.77 -535.88 1221.79 1512.77 -535.88",
     // audit: FIXINT-049
-    "43 100.00 24.95 1133.31 1996.08 -962.77 1158.26",
+    "43 100.00 24.95 1133.31 1996.08 -962.77 1158.26 1996.08 -962.77",
     // audit: FIXINT-050
-    "1 492.00 18.77 1945.87 1501.75 -47.88 never",
+    "1 492.00 18.77 1945.87 1501.75 -47.88 never 1501.75 -47.88",
 ];
 
 /// The rows of [`FIXINT_ROWS`].
@@ -581,8 +664,8 @@ async fn run_batch_with_file_limit(
 ///
 /// The child inherits the test's environment, of which only the variables the run reads are set
 /// here: span export is off, so standard output holds JSON events and path lines only, and
-/// `RUST_LOG=error` keeps the events to errors (`main.rs`, "Standard output"), which every line
-/// of a failure path is (X-INTCALC-4).
+/// `RUST_LOG` is [`LOG_FILTER`], which keeps every job-log line, `INFO` or `ERROR`, and the
+/// errors of every other target (`main.rs`, "Standard output"; X-INTCALC-4).
 async fn output_of(
     mut command: Command,
     database_url: &str,
@@ -595,9 +678,9 @@ async fn output_of(
         .env("CARDDEMO_STATEMENT_DIR", scratch.path().join("statements"))
         .env("CARDDEMO_INTRDR_DIR", scratch.path().join("jobs"))
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
-        .env("RUST_LOG", "error")
+        .env("RUST_LOG", LOG_FILTER)
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    Ok(tokio::task::spawn_blocking(move || command.output()).await??)
+    Ok(test_support::run_child(command, test_support::CHILD_DEADLINE).await?)
 }
 
 /// Fails unless the process of `run` exited with `status`. The message quotes its standard
@@ -708,11 +791,12 @@ fn check_abended(output: &Output, line: &str) -> Result<Vec<String>, Box<dyn Err
 }
 
 /// Checks the job log of `output`, a run that abended on the failure path that shows `line`
-/// (CBACT04C-038): it ends with `line`, a status line and `ABENDING PROGRAM`, which records
-/// abend code 999, followed only by the events whose messages are `after`, so no
-/// `END OF EXECUTION` line; and the run printed no path. Every one of those events is an `ERROR`
-/// event, the only level `RUST_LOG=error` passes (X-INTCALC-4). Returns the events before
-/// `line`, for the caller's checks of what preceded it.
+/// (CBACT04C-038): it begins with `START OF EXECUTION OF PROGRAM CBACT04C`, shown before the
+/// opens on every run whose PARM was accepted (CBACT04C-002), and ends with `line`, a status line
+/// and `ABENDING PROGRAM`, which records abend code 999, each an `ERROR` event of the job
+/// (X-INTCALC-4), followed only by the events whose messages are `after`, so no
+/// `END OF EXECUTION` line; and the run printed no path. Returns the events from the first line
+/// up to `line`, for the caller's checks of what preceded it.
 ///
 /// No message quotes the run's output (Cardholder Data Redaction).
 fn check_abend_log(
@@ -722,6 +806,10 @@ fn check_abend_log(
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let mut events = events(&output.stdout);
     let shown = messages(&events);
+    ensure(
+        shown.first() == Some(&START_LINE),
+        &format!("{line}: the job log does not begin with `{START_LINE}`"),
+    )?;
     let abend = shown
         .iter()
         .rposition(|&message| message == ABEND_LINE)
@@ -742,6 +830,14 @@ fn check_abend_log(
     ensure(
         shown.get(abend + 1..) == Some(after),
         &format!("{line}: the job log goes on after `{ABEND_LINE}`"),
+    )?;
+    ensure(
+        events.get(failure..=abend).is_some_and(|shown| {
+            shown
+                .iter()
+                .all(|event| event.contains(ERROR_LEVEL) && event.contains(JOB_TARGET))
+        }),
+        &format!("{line}: a line of the failure path is no ERROR event of the job"),
     )?;
     ensure(
         events
@@ -805,9 +901,10 @@ fn is_db2_timestamp(field: &[u8]) -> bool {
         })
 }
 
-/// The 11 bytes of `TRAN-AMT PIC S9(09)V99` for the audit's amount `text`, such as `14.56`: ten
-/// digits, then the last digit with the sign overpunched, `{` and `A` to `I` for 0 to 9 when the
-/// value is zero or positive, `}` and `J` to `R` when it is negative (PIC-005, PIC-006).
+/// The 11 bytes of a `PIC S9(09)V99` field, `TRAN-AMT` or `TRAN-CAT-BAL`, for the audit's amount
+/// `text`, such as `14.56`: ten digits, then the last digit with the sign overpunched, `{` and
+/// `A` to `I` for 0 to 9 when the value is zero or positive, `}` and `J` to `R` when it is
+/// negative (PIC-005, PIC-006).
 fn zoned_amount(text: &str) -> Result<Vec<u8>, String> {
     let refused = || format!("{text:?} is no S9(09)V99 amount");
     let (negative, magnitude) = match text.strip_prefix('-') {
@@ -862,6 +959,135 @@ fn xref_cards() -> Result<Vec<XrefCard>, Box<dyn Error>> {
                 })
         })
         .collect()
+}
+
+/// The 50 bytes of every `tcatbal.txt` line, read in place, entry n-1 for line n, terminator
+/// excluded: 50 lines, each LF or CRLF (E06), each the category balance (n, `01`, `0001`) of
+/// account n (FIXINT-001 to FIXINT-050).
+fn tcatbal_lines() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let bytes = fs::read(fixture_path("tcatbal.txt"))?;
+    let lines: Vec<Vec<u8>> = bytes
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line).to_vec())
+        .collect();
+    ensure(
+        lines.len() == SYSTRAN_RECORDS,
+        &format!(
+            "tcatbal.txt: {} lines, expected {SYSTRAN_RECORDS}",
+            lines.len()
+        ),
+    )?;
+    for (index, line) in lines.iter().enumerate() {
+        let key = category_key(index + 1, *INTEREST_TYPE);
+        ensure(
+            line.len() == TCATBAL_WIDTH && line.get(TCATBAL_KEY) == Some(key.as_slice()),
+            &format!(
+                "tcatbal.txt line {}: not the 50-byte category balance of its FIXINT row",
+                index + 1
+            ),
+        )?;
+    }
+    Ok(lines)
+}
+
+/// The 17-byte key of the category balance (`acct_id`, `type_cd`, `0001`): the account ID in 11
+/// digits, the type and the category (CVTRA01Y-001 to CVTRA01Y-003).
+fn category_key(acct_id: usize, type_cd: [u8; 2]) -> Vec<u8> {
+    let mut key = format!("{acct_id:011}").into_bytes();
+    key.extend_from_slice(&type_cd);
+    key.extend_from_slice(CORPUS_CATEGORY.as_bytes());
+    key
+}
+
+/// The category balances `INTEREST-POSTED` reads, in key order, 100 records of 50 bytes: for
+/// account n, the loaded (n, `01`, `0001`) of `tcatbal.txt` line n, its key and `FILLER` as
+/// loaded and its balance the one its FIXINT row gives after `posttran`, then the
+/// (n, `03`, `0001`) row `posttran` creates, with its FIXINT balance and the [`CREATED_FILLER`]
+/// of FIXPOST-901 (CBACT04C-003; FIXINT-903).
+fn posted_category_balances() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut records = Vec::with_capacity(POSTED_CATEGORY_BALANCES);
+    for (index, (loaded, row)) in tcatbal_lines()?.iter().zip(fixint()?).enumerate() {
+        let [interest_bal, zero_rate_bal] = row.posted_category_bals;
+        let (Some(key), Some(filler)) = (loaded.get(TCATBAL_KEY), loaded.get(TCATBAL_FILLER))
+        else {
+            return Err(format!("tcatbal.txt line {}: shorter than a record", index + 1).into());
+        };
+        let mut interest = key.to_vec();
+        interest.extend(zoned_amount(interest_bal)?);
+        interest.extend_from_slice(filler);
+        records.push(interest);
+        let mut created = category_key(index + 1, *ZERO_RATE_TYPE);
+        created.extend(zoned_amount(zero_rate_bal)?);
+        created.extend_from_slice(&CREATED_FILLER);
+        records.push(created);
+    }
+    Ok(records)
+}
+
+/// The job log of a run that ends normally over the category balances `records`, in key order,
+/// each a record whose lookup falls back to `DEFAULT`, as every lookup of the corpus does
+/// (FIXINT-902): `START OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-002); for each record its 50
+/// bytes, one character each (CBACT04C-003), then `DISCLOSURE GROUP RECORD MISSING` and
+/// `TRY WITH DEFAULT GROUP CODE` (CBACT04C-010); and `END OF EXECUTION OF PROGRAM CBACT04C`
+/// (CBACT04C-030). Each line is named by its place, never by its bytes.
+fn normal_log(records: &[Vec<u8>]) -> Result<Vec<(String, String)>, Box<dyn Error>> {
+    let mut log = vec![(START_LINE.to_owned(), START_LINE.to_owned())];
+    for (index, record) in records.iter().enumerate() {
+        let n = index + 1;
+        let shown = String::from_utf8(record.clone())
+            .map_err(|_| format!("category balance {n}: not ASCII"))?;
+        // A quote or backslash would be escaped in the event, which no expectation spells.
+        ensure(
+            !shown.contains(['"', '\\']),
+            &format!("category balance {n}: holds a quote or a backslash"),
+        )?;
+        log.push((format!("the line of category balance {n}"), shown));
+        for line in [DISCLOSURE_MISSING_LINE, TRY_DEFAULT_LINE] {
+            log.push((format!("`{line}` of category balance {n}"), line.to_owned()));
+        }
+    }
+    log.push((END_LINE.to_owned(), END_LINE.to_owned()));
+    Ok(log)
+}
+
+/// Checks the whole standard output of `output`, a run that ended normally over the category
+/// balances `records`: every line but the last is an `INFO` event of the job whose message is
+/// the next line of [`normal_log`], in order and as many as it holds, and the last line is the
+/// path of `generation`, after `END OF EXECUTION OF PROGRAM CBACT04C` (CBACT04C-024,
+/// CBACT04C-030). Every difference is reported at once, by the line's place, never by its bytes.
+fn check_normal_log(output: &Output, records: &[Vec<u8>], generation: &Path) -> TestResult {
+    let stdout =
+        std::str::from_utf8(&output.stdout).map_err(|_| "intcalc: standard output is not UTF-8")?;
+    let lines: Vec<&str> = stdout.lines().collect();
+    let Some((path, log)) = lines.split_last() else {
+        return Err("intcalc: standard output is empty".into());
+    };
+    ensure(
+        Path::new(path) == generation,
+        "intcalc: the last line of standard output is not the SYSTRAN path",
+    )?;
+    let expected = normal_log(records)?;
+    let mut failures = Vec::new();
+    if log.len() != expected.len() {
+        failures.push(format!(
+            "intcalc: {} lines before the path, expected {}",
+            log.len(),
+            expected.len()
+        ));
+    }
+    for (event, (place, line)) in log.iter().zip(&expected) {
+        if !(event.starts_with('{') && event.contains(INFO_LEVEL) && event.contains(JOB_TARGET)) {
+            failures.push(format!("intcalc: {place} is no INFO event of the job"));
+        } else if message_of(event) != Some(line.as_str()) {
+            failures.push(format!("intcalc: {place} differs from the audit"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("\n").into())
+    }
 }
 
 /// The byte spans of SYSTRAN record `expected.n` that differ from the audit, by field name only:
@@ -1166,13 +1392,23 @@ async fn intcalc_default_parm_date_matches_audit() -> TestResult {
     // No option: `PARM-DATE` is the JCL's PARM. The opens succeed, the run reaches its end and
     // its return code is 0.
     // audit: CBACT04C-001
-    // audit: CBACT04C-002
     // audit: CBACT04C-030
     let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
     expect_status(&output, 0, "intcalc")?;
     // audit: CBACT04C-024
     // audit: FIXINT-901
     let systran = first_generation(&output, &scratch)?;
+
+    // The whole job log, then the path: the first line, the 50 records of `tcatbal.txt` in key
+    // order, each with its `DEFAULT` fallback pair, and the end line.
+    // audit: CBACT04C-002
+    // audit: CBACT04C-003
+    // audit: CBACT04C-010
+    // audit: CBACT04C-024
+    // audit: CBACT04C-030
+    // audit: FIXINT-902
+    // audit: FIXINT-903
+    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
 
     // One record per category balance, in key order, each for the account of its break and
     // carrying that account's one card; the amount is the 0.00 interest of ARITH-009.
@@ -1242,6 +1478,10 @@ async fn intcalc_explicit_parm_date() -> TestResult {
         "a refused PARM printed a path",
     )?;
     ensure(
+        events(&refused.stdout).is_empty(),
+        "a refused PARM showed a job-log line",
+    )?;
+    ensure(
         file_names(scratch.path())?.is_empty(),
         "a refused PARM created a directory or file",
     )?;
@@ -1258,6 +1498,12 @@ async fn intcalc_explicit_parm_date() -> TestResult {
     let output = run_batch(&guard, &scratch, &["intcalc", "--parm-date", LONG_PARM]).await?;
     expect_status(&output, 0, "intcalc --parm-date of 13 characters")?;
     let systran = first_generation(&output, &scratch)?;
+    // The PARM shows in no line: the job log is that of the JCL's PARM.
+    // audit: CBACT04C-002
+    // audit: CBACT04C-003
+    // audit: CBACT04C-010
+    // audit: CBACT04C-030
+    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
     report_blocked_spans();
     let records = check_systran(&systran, LONG_PARM_DATE, |_| ZERO)?;
     ensure(
@@ -1318,6 +1564,18 @@ async fn intcalc_after_posttran_matches_audit() -> TestResult {
     let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
     expect_status(&output, 0, "intcalc")?;
     let systran = first_generation(&output, &scratch)?;
+
+    // The whole job log, then the path: the first line, the 100 category balances `posttran`
+    // leaves, in key order, each with its `DEFAULT` fallback pair, the zero-rate ones included,
+    // and the end line.
+    // audit: CBACT04C-002
+    // audit: CBACT04C-003
+    // audit: CBACT04C-010
+    // audit: CBACT04C-024
+    // audit: CBACT04C-030
+    // audit: FIXINT-902
+    // audit: FIXINT-903
+    check_normal_log(&output, &posted_category_balances()?, &systran)?;
 
     // 100 category balances read, 50 records written: the rate-0.00 balances are skipped, and
     // each amount is its balance times the `DEFAULT` rate 15.00, divided by 1200 and truncated,
@@ -1396,6 +1654,16 @@ async fn intcalc_refuses_a_held_account_claim() -> TestResult {
         String::from_utf8_lossy(&refused.stderr) == HELD_CLAIM_STDERR,
         "intcalc against a held claim: standard error is not the account file's open text",
     )?;
+    // The first line, then the account file's open failure: no record line, as no table is read.
+    // audit: CBACT04C-002
+    // audit: CBACT04C-034
+    // audit: CBACT04C-038
+    // audit: CBACT04C-039
+    let before = check_abended(&refused, OPEN_ACCOUNT_LINE)?;
+    ensure(
+        messages(&before) == [START_LINE],
+        "intcalc against a held claim: a line other than the first precedes the open's failure",
+    )?;
     ensure(
         written_paths(&refused.stdout).is_empty(),
         "intcalc against a held claim printed a path",
@@ -1416,6 +1684,9 @@ async fn intcalc_refuses_a_held_account_claim() -> TestResult {
     let output = run_batch(&guard, &scratch, &["intcalc"]).await?;
     expect_status(&output, 0, "intcalc after the claim was given up")?;
     let systran = first_generation(&output, &scratch)?;
+    // audit: CBACT04C-002
+    // audit: CBACT04C-030
+    check_normal_log(&output, &tcatbal_lines()?, &systran)?;
     report_blocked_spans();
     check_systran(&systran, JCL_PARM, |_| ZERO)?;
     Ok(())
@@ -1565,10 +1836,10 @@ async fn intcalc_abends_when_the_generation_cannot_be_created() -> TestResult {
 }
 
 /// `0000-TCATBALF-OPEN` against a server that cannot be reached: the one `PostgreSQL`
-/// connection stands for the four input opens, so after `main`'s connection event the job log
-/// is the first open's failure, and the run exits 1 with `main`'s connection error before it
-/// reads a table or creates a generation (X-INTCALC-7). No container is started, and no output
-/// shows the URL or its password.
+/// connection stands for the four input opens, so after the first line and `main`'s connection
+/// event the job log is the first open's failure, and the run exits 1 with `main`'s connection
+/// error before it reads a table or creates a generation (CBACT04C-002, X-INTCALC-7). No
+/// container is started, and no output shows the URL or its password.
 #[tokio::test(flavor = "multi_thread")]
 async fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestResult {
     let scratch = Scratch::new("connect")?;
@@ -1596,11 +1867,14 @@ async fn intcalc_shows_a_failed_connection_as_the_first_open_failure() -> TestRe
     // audit: CBACT04C-034
     // audit: CBACT04C-038
     let before = check_abend_log(&output, OPEN_TCATBAL_LINE, &[])?;
+    // The first line comes before the opens, so before the failed connection that stands for the
+    // first of them, whose event carries the cause.
+    // audit: CBACT04C-002
     // audit: CBACT04C-034
     ensure(
-        messages(&before) == [CONNECTION_FAILED],
-        "a failed connection: the job log before the first open's failure line is not main's \
-         connection event alone",
+        messages(&before) == [START_LINE, CONNECTION_FAILED],
+        "a failed connection: the job log before the first open's failure line is not the first \
+         line, then main's connection event",
     )?;
     // audit: CBACT04C-038
     check_no_generation(&scratch, OPEN_TCATBAL_LINE)?;

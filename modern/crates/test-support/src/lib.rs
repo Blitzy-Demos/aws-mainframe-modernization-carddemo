@@ -1,6 +1,7 @@
 //! Dev-only test harness for the `CardDemo` workspace: the integration tests of `persistence`,
-//! `api`, `messaging` and `batch` get their containers, fixtures, audit index and trace capture
-//! here. The crate is listed only under their `[dev-dependencies]`, never as a normal dependency.
+//! `api`, `messaging` and `batch` get their containers, fixtures, audit index, trace capture and
+//! child-process runner here. The crate is listed only under their `[dev-dependencies]`, never
+//! as a normal dependency.
 //!
 //! # Public-API boundary
 //!
@@ -75,12 +76,21 @@
 //! removes what one process left; the filter `label=org.carddemo.test-support.instance=<token>`
 //! narrows it to one start.
 //!
+//! # Child processes
+//!
+//! [`run_child`] runs a child process of a test, such as `carddemo-batch`, with its output
+//! captured, for at most a deadline, [`CHILD_DEADLINE`] unless the test chooses another. A child
+//! still running at the deadline, or when the test gives up on the run through a panic, a
+//! timeout or a runtime shutdown, is killed and waited for, so that no process outlives its run.
+//!
 //! # Modules
 //!
 //! - [`audit_index`]: the audit-table index and the scanners for test tags and rule citations.
 //! - [`fixtures`]: fixture paths read in place, fixture loading and redaction needles.
 //! - [`postgres`]: a `postgres:16` container migrated through the `runtime` migration entrypoint.
-//! - [`rabbitmq`]: a `rabbitmq:3.13-management` container with the broker definitions mounted.
+//! - [`rabbitmq`]: a `rabbitmq:3.13-management` container with the broker definitions mounted,
+//!   and [`rabbitmq::ConfirmGate`], which withholds its publisher confirmations until a test
+//!   settles them.
 //! - [`trace_capture`]: an in-memory capture of the JSON tracing output.
 
 // Crate-specific lints can live only here: a member inheriting `[lints] workspace = true` cannot
@@ -100,12 +110,12 @@ use std::fmt;
 use std::fs;
 use std::future::{self, Future};
 use std::hash::{BuildHasher, RandomState};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::mem;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process;
+use std::process::{self, Child, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{LazyLock, OnceLock};
@@ -245,6 +255,175 @@ impl fmt::Display for HarnessError {
 }
 
 impl std::error::Error for HarnessError {}
+
+/// The deadline a test gives each child process it runs through [`run_child`], such as a run of
+/// `carddemo-batch`: five minutes.
+///
+/// The slowest batch run the tests make, a job over the whole fixture set, takes seconds, under
+/// coverage instrumentation and on a loaded machine too, so the bound ends only a child that
+/// hangs, for example on a lock nobody releases or a store that never answers. It still ends
+/// that child, and with it the test, its container and its scratch directory, rather than
+/// leaving the run blocked until someone kills it.
+pub const CHILD_DEADLINE: Duration = Duration::from_secs(300);
+
+/// How often [`run_child`] looks whether its child has exited and its output has closed.
+const CHILD_POLL: Duration = Duration::from_millis(10);
+
+/// Runs `command` as [`Command::output`] does, for at most `deadline`, and returns the child's
+/// exit status and everything it wrote.
+///
+/// The child's standard input is null, and its standard output and standard error are pipes,
+/// each read to its end on a thread of its own, so a child that fills one while the other is
+/// read never blocks. Nothing else of `command` changes: the child inherits the test's
+/// environment, the coverage profile variables included, and a variable the caller set, such
+/// as `LLVM_PROFILE_FILE=/dev/null` for a run under a file-size limit, reaches it as set.
+///
+/// The run is done once the child has exited and both pipes have closed. A run not done at
+/// `deadline` first kills (`SIGKILL`) and waits for its child, unless the child has already
+/// exited, so that no process is left behind, and then fails with an error of kind
+/// [`io::ErrorKind::TimedOut`] that names the program and the deadline, never the arguments or
+/// the output (Cardholder Data Redaction). A run whose future is dropped before it is done, by a
+/// panic, an outer timeout or a runtime shutdown, kills and waits for its child in the drop the
+/// same way. Neither waits for a pipe that a process the child started holds open: the thread
+/// reading it ends when that process closes it.
+///
+/// # Errors
+///
+/// The error of spawning the child, of reading its status or of reading its output, or the
+/// timeout above.
+pub async fn run_child(mut command: Command, deadline: Duration) -> io::Result<Output> {
+    let program = command.get_program().to_string_lossy().into_owned();
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Reaper {
+        child: command.spawn()?,
+        program,
+        killed: false,
+        status: None,
+    };
+    let stdout = read_pipe(child.child.stdout.take(), &child.program, "standard output")?;
+    let stderr = read_pipe(child.child.stderr.take(), &child.program, "standard error")?;
+    let Ok(status) = time::timeout(deadline, child.finish([&stdout, &stderr])).await else {
+        let message = match child.reap() {
+            Ok(true) => format!(
+                "{} did not finish within {deadline:?} and was killed",
+                child.program
+            ),
+            Ok(false) => format!(
+                "{} exited, but its output did not close within {deadline:?}",
+                child.program
+            ),
+            Err(err) => format!(
+                "{} did not finish within {deadline:?} and could not be killed: {err}",
+                child.program
+            ),
+        };
+        return Err(io::Error::new(io::ErrorKind::TimedOut, message));
+    };
+    Ok(Output {
+        status: status?,
+        stdout: collected(stdout, &child.program, "standard output")?,
+        stderr: collected(stderr, &child.program, "standard error")?,
+    })
+}
+
+/// A thread reading one output pipe of a [`run_child`] child to its end.
+type PipeReader = thread::JoinHandle<io::Result<Vec<u8>>>;
+
+/// The child of a [`run_child`] run, which it kills and waits for unless a wait has already read
+/// its exit status.
+struct Reaper {
+    /// The child process.
+    child: Child,
+    /// The program the child runs, which a failure names.
+    program: String,
+    /// Whether a kill reached the child, which is then not signalled again.
+    killed: bool,
+    /// The child's exit status once a wait has read it. From then on its process ID may name
+    /// another process, so nothing signals it.
+    status: Option<ExitStatus>,
+}
+
+impl Reaper {
+    /// Waits, looking every [`CHILD_POLL`], until the child has exited and every one of `pipes`
+    /// has read its pipe to the end, and returns the child's exit status.
+    async fn finish(&mut self, pipes: [&PipeReader; 2]) -> io::Result<ExitStatus> {
+        loop {
+            if self.status.is_none() {
+                self.status = self.child.try_wait()?;
+            }
+            if let Some(status) = self.status {
+                if pipes.iter().all(|pipe| pipe.is_finished()) {
+                    return Ok(status);
+                }
+            }
+            time::sleep(CHILD_POLL).await;
+        }
+    }
+
+    /// Kills the child and waits for it, unless a wait has already read its exit status, and
+    /// returns whether it killed it.
+    fn reap(&mut self) -> io::Result<bool> {
+        if self.status.is_some() {
+            return Ok(false);
+        }
+        if !self.killed {
+            self.child.kill()?;
+            self.killed = true;
+        }
+        self.status = Some(self.child.wait()?);
+        Ok(true)
+    }
+}
+
+impl Drop for Reaper {
+    /// Kills the child and waits for it unless a wait has already read its exit status: its run
+    /// was dropped, or failed, before the child finished. A child that cannot be killed or waited
+    /// for is reported on standard error, as `drop` cannot return the failure.
+    fn drop(&mut self) {
+        if let Err(err) = self.reap() {
+            // `eprintln!` panics when standard error cannot be written, and `drop` must not
+            // panic. Standard error is the last place left to report to, so a failed write of
+            // this line is dropped.
+            let _ = writeln!(
+                io::stderr(),
+                "test-support: {} may still be running: {err}",
+                self.program
+            );
+        }
+    }
+}
+
+/// Starts a thread that reads `pipe`, the child's `stream` (standard output or standard error),
+/// to its end. A `pipe` that is missing, which only a stream that is not piped leaves, fails.
+fn read_pipe<R: Read + Send + 'static>(
+    pipe: Option<R>,
+    program: &str,
+    stream: &str,
+) -> io::Result<PipeReader> {
+    let Some(mut pipe) = pipe else {
+        return Err(io::Error::other(format!(
+            "the {stream} of {program} is not piped"
+        )));
+    };
+    thread::Builder::new()
+        .name("test-support-child-output".to_owned())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes).map(|_| bytes)
+        })
+}
+
+/// What `reader`, which has finished, read from the child's `stream`, or why that failed.
+fn collected(reader: PipeReader, program: &str, stream: &str) -> io::Result<Vec<u8>> {
+    reader.join().unwrap_or_else(|_| {
+        Err(io::Error::other(format!(
+            "the thread reading the {stream} of {program} panicked"
+        )))
+    })
+}
 
 /// The identity one container start owns: the value of its [`INSTANCE_LABEL`] and the container
 /// name built from it.
@@ -965,6 +1144,7 @@ mod tests {
     use std::fs;
     use std::io::{self, BufRead, BufReader, Read};
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
     use std::pin::Pin;
     use std::process::{self, Child, ChildStderr, Command, Stdio};
     use std::sync::Arc;
@@ -991,10 +1171,11 @@ mod tests {
     use tokio::time::{self, Instant};
 
     use super::{
-        DOCKER_ANSWER_TIMEOUT, HANDLED_SIGNALS, HarnessError, INSTANCE_LABEL,
+        CHILD_DEADLINE, DOCKER_ANSWER_TIMEOUT, HANDLED_SIGNALS, HarnessError, INSTANCE_LABEL,
         INTERRUPT_CLEANUP_TIMEOUT, INTERRUPT_ROUND_TIMEOUT, Instance, PANIC_SETTLE_PAUSE,
         PANIC_SETTLE_ROUNDS, PROCESS_LABEL, PROCESS_STATUS, STOPPING, Starting, drain,
-        finish_bound, ignored_signal, modern_dir, process_token, repo_root, start_as, start_with,
+        finish_bound, ignored_signal, modern_dir, process_token, repo_root, run_child, start_as,
+        start_with,
     };
     use crate::postgres::start_postgres;
 
@@ -1054,6 +1235,15 @@ mod tests {
         .saturating_add(CHILD_EXIT_BOUND);
     /// Bound on reading a child's standard error once it has exited.
     const OUTPUT_BOUND: Duration = Duration::from_secs(10);
+
+    /// How long a [`run_child`] case lets its child run before it cuts the run off: ample time
+    /// for the child's shell to write a process ID.
+    const CHILD_CUT: Duration = Duration::from_millis(500);
+    /// How long the `sleep` of a [`run_child`] case runs: far past [`CHILD_CUT`].
+    const CHILD_SLEEP: Duration = Duration::from_secs(30);
+    /// How many zero bytes the child of the [`run_child`] capture case writes to standard error:
+    /// past any pipe buffer.
+    const CHILD_ZEROS: usize = 200_000;
 
     /// What [`cancelled_start_case`] saw of one start it dropped part-way.
     #[derive(Debug)]
@@ -2044,6 +2234,56 @@ mod tests {
         Ok(())
     }
 
+    /// `/bin/sh` writing its process ID to `pid_file`, then running `sleep` for [`CHILD_SLEEP`]
+    /// in its place, under the same ID: a child that outlives every cut a [`run_child`] case
+    /// makes.
+    fn sleeper(pid_file: &Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > \"$0\" && exec sleep {}",
+                CHILD_SLEEP.as_secs()
+            ))
+            .arg(pid_file);
+        command
+    }
+
+    /// A path in the temporary directory, named after this process and `case`, for a child of a
+    /// [`run_child`] case to write a process ID to.
+    fn pid_file(case: &str) -> PathBuf {
+        env::temp_dir().join(format!(
+            "carddemo-test-support-{}-{case}.pid",
+            process::id()
+        ))
+    }
+
+    /// The process ID a child wrote to `pid_file`, which this removes.
+    fn recorded_pid(pid_file: &Path) -> Result<u32, HarnessError> {
+        let written = fs::read_to_string(pid_file);
+        // Best effort: a file left behind holds only a process ID.
+        let _ = fs::remove_file(pid_file);
+        written
+            .map_err(|err| HarnessError::new("read the child's process ID", &err))?
+            .trim()
+            .parse()
+            .map_err(|err| HarnessError::new("read the child's process ID", &err))
+    }
+
+    /// Whether a process with ID `pid` exists, through `kill -0` in `/bin/sh`, as on any POSIX
+    /// system. It finds every process nobody has waited for yet, a killed one included, so
+    /// `false` for a child means it ended and was reaped. It signals nothing, as an ID freed by
+    /// a reaped child may already name an unrelated process.
+    fn process_exists(pid: u32) -> Result<bool, HarnessError> {
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg("kill -0 \"$0\" 2> /dev/null")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| status.success())
+            .map_err(|err| HarnessError::new("look for the child", &err))
+    }
+
     #[test]
     fn instances_are_unique_and_valid_container_names() {
         let first = Instance::new("postgres");
@@ -2082,6 +2322,111 @@ mod tests {
     fn display_is_context_then_message() {
         let err = HarnessError::new("start postgres", &"connection refused");
         assert_eq!(err.to_string(), "start postgres: connection refused");
+    }
+
+    /// [`run_child`] returns the child's exit status and both outputs byte for byte, with
+    /// standard input null, which `cat` reads to its end at once, and the environment as the
+    /// caller left it: inherited, as `PATH` shows, with the variables the caller set. It reads
+    /// both pipes at the same time: the child writes [`CHILD_ZEROS`] bytes to standard error,
+    /// past any pipe buffer, while its standard output is still open.
+    #[tokio::test]
+    async fn a_child_run_returns_its_status_and_both_outputs() -> Result<(), HarnessError> {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "cat; printf '%s|%s' \"$CARDDEMO_TEST_SUPPORT_CHILD\" \"$PATH\"; \
+                 head -c {CHILD_ZEROS} /dev/zero >&2; printf err >&2; exit 3"
+            ))
+            .env("CARDDEMO_TEST_SUPPORT_CHILD", "as set");
+        let output = run_child(command, CHILD_DEADLINE)
+            .await
+            .map_err(|err| HarnessError::new("run the child", &err))?;
+
+        assert_eq!(output.status.code(), Some(3), "{:?}", output.status);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!("as set|{}", env::var("PATH").unwrap_or_default())
+        );
+        assert!(
+            output.stderr.strip_suffix(b"err").is_some_and(
+                |zeros| zeros.len() == CHILD_ZEROS && zeros.iter().all(|&byte| byte == 0)
+            ),
+            "{} bytes of standard error",
+            output.stderr.len()
+        );
+        Ok(())
+    }
+
+    /// A child still running at its deadline is killed and waited for before its run fails with
+    /// [`io::ErrorKind::TimedOut`], naming the program and the deadline: once the error has
+    /// returned, no process has the child's ID.
+    #[tokio::test]
+    async fn a_child_past_its_deadline_is_killed_and_reaped() -> Result<(), HarnessError> {
+        let pid_file = pid_file("deadline");
+        let began = Instant::now();
+        let run = run_child(sleeper(&pid_file), CHILD_CUT).await;
+        let took = began.elapsed();
+        let exists = recorded_pid(&pid_file).and_then(process_exists);
+
+        let Err(err) = run else {
+            panic!("a child past its deadline finished: {run:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "/bin/sh did not finish within 500ms and was killed"
+        );
+        assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
+        assert!(matches!(exists, Ok(false)), "{exists:?}");
+        Ok(())
+    }
+
+    /// A run whose future is dropped while its child runs, here by an outer timeout, kills and
+    /// waits for the child in the drop: once the drop has returned, no process has the child's
+    /// ID.
+    #[tokio::test]
+    async fn a_dropped_run_kills_and_reaps_its_child() -> Result<(), HarnessError> {
+        let pid_file = pid_file("dropped");
+        let cut = time::timeout(CHILD_CUT, run_child(sleeper(&pid_file), CHILD_DEADLINE)).await;
+        let exists = recorded_pid(&pid_file).and_then(process_exists);
+
+        assert!(cut.is_err(), "the run finished before the cut: {cut:?}");
+        assert!(matches!(exists, Ok(false)), "{exists:?}");
+        Ok(())
+    }
+
+    /// A child that exits while a process it started holds its output open ends its run at the
+    /// deadline with [`io::ErrorKind::TimedOut`], rather than waiting for that process, which
+    /// the run leaves alone and the case then ends.
+    #[tokio::test]
+    async fn an_output_held_open_past_the_deadline_ends_the_run() -> Result<(), HarnessError> {
+        let pid_file = pid_file("held-open");
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep {} & echo $! > \"$0\"",
+                CHILD_SLEEP.as_secs()
+            ))
+            .arg(&pid_file);
+        let began = Instant::now();
+        let run = run_child(command, CHILD_CUT).await;
+        let took = began.elapsed();
+        // The holder still runs, as the run left it alone, so its ID is still its own.
+        let ended = recorded_pid(&pid_file).map(|pid| send_signal(pid, "SIGTERM"));
+
+        let Err(err) = run else {
+            panic!("a run whose output stayed open finished: {run:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(
+            err.to_string(),
+            "/bin/sh exited, but its output did not close within 500ms"
+        );
+        assert!(took >= CHILD_CUT && took < CHILD_SLEEP, "{took:?}");
+        assert!(matches!(ended, Ok(Ok(()))), "{ended:?}");
+        Ok(())
     }
 
     #[test]

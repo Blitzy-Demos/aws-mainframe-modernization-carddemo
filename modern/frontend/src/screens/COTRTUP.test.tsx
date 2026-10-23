@@ -302,35 +302,61 @@ function RouteStub() {
   return <p>{`Stub at ${location.pathname}, state ${JSON.stringify(location.state)}`}</p>;
 }
 
-/** COTRTUP at `/transaction-types/maintain` with `state`, and stubs at its two F3 targets. */
+/**
+ * COTRTUP at `/transaction-types/maintain` with `state`, and stubs at its two F3 targets. Returns
+ * the render result with the screen's query client, whose outstanding requests `untilIdle` reads.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
-    <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[{ pathname: PATHS.COTRTUP, state }]}>
-        <Routes>
-          <Route path={PATHS.COTRTUP} element={<COTRTUP />} />
-          <Route path={PATHS.COADM01} element={<RouteStub />} />
-          <Route path={PATHS.COTRTLI} element={<RouteStub />} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
+  return {
+    ...render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[{ pathname: PATHS.COTRTUP, state }]}>
+          <Routes>
+            <Route path={PATHS.COTRTUP} element={<COTRTUP />} />
+            <Route path={PATHS.COADM01} element={<RouteStub />} />
+            <Route path={PATHS.COTRTLI} element={<RouteStub />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    ),
+    client,
+  };
 }
 
 /**
- * Lets every pending promise and timer settle, so any request the screen would send has been sent.
- * Run inside `waitFor`, so the form library's own deferred state updates (its validity pass after
- * a reset that follows an edit, which renders nothing different) land where React expects them.
+ * Waits until `client` has no query fetching and no mutation pending, so every request the screen
+ * has started through it (endpoints 26 and 27 are mutations) has been answered and its result
+ * applied. It cannot see a request that has not started yet: it follows the awaited outcome of
+ * the key that would start one.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 0);
+async function untilIdle(client: QueryClient): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(0);
+  });
+}
+
+/**
+ * Waits a bounded window of 50 ms inside `act`, for the absence checks no screen change can time:
+ * the fresh screen, a key whose screen shows no change, keys pressed while the keyboard is locked.
+ * A request the screen starts within the window has been recorded when it ends; one started later
+ * escapes it.
+ */
+async function lingers(): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
     });
   });
+}
+
+/** {@link lingers}, then {@link untilIdle}: a request started in the window is also answered. */
+async function lingersThenUntilIdle(client: QueryClient): Promise<void> {
+  await lingers();
+  await untilIdle(client);
 }
 
 /** `element` as an `<input>`, failing the test when it is anything else. */
@@ -841,8 +867,8 @@ describe("COTRTUP rendering", () => {
   // audit: COTRTUPC-048
   it("the fresh screen renders the map's title, header, labels, inputs, message rows and keys and sends nothing", async () => {
     const calls = stubApi({});
-    await open();
-    await settle();
+    const { client } = await open();
+    await lingersThenUntilIdle(client);
     expect(calls).toEqual([]);
 
     expect(
@@ -921,13 +947,14 @@ describe("COTRTUP rendering", () => {
   // audit: COTRTUP-008
   // audit: COTRTUP-010
   it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
-    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    // Only `Date` is faked, so the timers that React, TanStack Query, `waitFor` and the window of
+    // `lingers` use stay real.
     vi.useFakeTimers({ toFake: ["Date"] });
     try {
       vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
       const calls = stubApi({});
-      await open();
-      await settle();
+      const { client } = await open();
+      await lingersThenUntilIdle(client);
       expect(calls).toEqual([]);
 
       expectHeaderValues(document, [
@@ -963,6 +990,7 @@ describe("COTRTUP states", () => {
       state: "fresh",
       replies: {},
       reach: open,
+      settled: lingersThenUntilIdle,
       requests: [],
       values: { code: "", description: "" },
       editable: { code: true, description: false },
@@ -976,6 +1004,7 @@ describe("COTRTUP states", () => {
       state: "S",
       replies: { [FETCH]: [reply(200, found)] },
       reach: showFound,
+      settled: untilIdle,
       requests: [FETCH],
       values: { code: CODE, description: STORED },
       editable: { code: false, description: true },
@@ -989,6 +1018,7 @@ describe("COTRTUP states", () => {
       state: "X",
       replies: { [FETCH_NEW]: [reply(200, notFound)] },
       reach: showNotFound,
+      settled: untilIdle,
       requests: [FETCH_NEW],
       values: { code: NEW_CODE, description: "" },
       editable: { code: true, description: false },
@@ -1002,6 +1032,7 @@ describe("COTRTUP states", () => {
       state: "R",
       replies: { [FETCH_NEW]: [reply(200, notFound)] },
       reach: startAdd,
+      settled: untilIdle,
       requests: [FETCH_NEW],
       values: { code: NEW_CODE, description: "" },
       editable: { code: false, description: true },
@@ -1015,6 +1046,7 @@ describe("COTRTUP states", () => {
       state: "N",
       replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(200, validated)] },
       reach: validateEdit,
+      settled: untilIdle,
       requests: [FETCH, ACTIONS],
       values: { code: CODE, description: padded(EDITED) },
       editable: { code: false, description: false },
@@ -1031,6 +1063,7 @@ describe("COTRTUP states", () => {
         [ACTIONS]: [reply(200, validated), reply(200, saved)],
       },
       reach: saveEdit,
+      settled: untilIdle,
       requests: [FETCH, ACTIONS, ACTIONS],
       values: { code: CODE, description: padded(EDITED) },
       editable: { code: false, description: false },
@@ -1044,6 +1077,7 @@ describe("COTRTUP states", () => {
       state: "B",
       replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(200, validated)] },
       reach: cancelEdit,
+      settled: untilIdle,
       requests: [FETCH, ACTIONS],
       values: { code: CODE, description: STORED },
       editable: { code: false, description: true },
@@ -1057,6 +1091,7 @@ describe("COTRTUP states", () => {
       state: "9",
       replies: { [FETCH]: [reply(200, found)] },
       reach: confirmDelete,
+      settled: untilIdle,
       requests: [FETCH],
       values: { code: CODE, description: STORED },
       editable: { code: false, description: false },
@@ -1070,6 +1105,7 @@ describe("COTRTUP states", () => {
       state: "7",
       replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(200, deleted)] },
       reach: deleteShown,
+      settled: untilIdle,
       requests: [FETCH, ACTIONS],
       values: { code: CODE, description: STORED },
       editable: { code: false, description: false },
@@ -1081,10 +1117,24 @@ describe("COTRTUP states", () => {
     },
   ])(
     "state $state: the values, protection, highlight, cursor, message rows and row-24 keys",
-    async ({ replies, reach, requests, values, editable, red, cursor, info, error, keys }) => {
+    async ({
+      replies,
+      reach,
+      settled,
+      requests,
+      values,
+      editable,
+      red,
+      cursor,
+      info,
+      error,
+      keys,
+    }) => {
       const calls = stubApi(replies);
-      await reach();
-      await settle();
+      // Each reach helper but `open` awaits the outcome of its last key, so `untilIdle` follows
+      // it; the fresh screen is reached by no key, so a bounded window watches for a request.
+      const { client } = await reach();
+      await settled(client);
 
       expect(calls.map((call) => call.route)).toEqual(requests);
       expect(shownValues()).toEqual(values);
@@ -1124,8 +1174,9 @@ describe("COTRTUP states", () => {
       state: "after ENTER with a blank code",
       replies: {},
       reach: async () => {
-        await open();
+        const shown = await open();
         press("ENTER=Process");
+        return shown;
       },
       error: MSG.codeNotSupplied,
       marked: "code",
@@ -1135,9 +1186,10 @@ describe("COTRTUP states", () => {
       state: "after ENTER answered by the 400 of a code that is not numeric",
       replies: { "GET /api/v1/transaction-types/A1": [reply(400, codeNotNumeric)] },
       reach: async () => {
-        await open();
+        const shown = await open();
         fireEvent.change(field(LABELS.code), { target: { value: "A1" } });
         press("ENTER=Process");
+        return shown;
       },
       error: codeNotNumeric.message,
       marked: "code",
@@ -1158,9 +1210,10 @@ describe("COTRTUP states", () => {
         [ACTIONS]: [reply(400, descriptionNotAlphanumeric)],
       },
       reach: async () => {
-        await showFound();
+        const shown = await showFound();
         fireEvent.change(field(LABELS.description), { target: { value: "PURCHASE!" } });
         press("ENTER=Process");
+        return shown;
       },
       error: descriptionNotAlphanumeric.message,
       marked: "description",
@@ -1170,8 +1223,9 @@ describe("COTRTUP states", () => {
       state: "after ENTER answered by the 400 of no change, which marks no input",
       replies: { [FETCH]: [reply(200, found)], [ACTIONS]: [reply(400, noChange)] },
       reach: async () => {
-        await showFound();
+        const shown = await showFound();
         press("ENTER=Process");
+        return shown;
       },
       error: noChange.message,
       marked: undefined,
@@ -1180,17 +1234,17 @@ describe("COTRTUP states", () => {
   ] satisfies {
     state: string;
     replies: Parameters<typeof stubApi>[0];
-    reach: () => Promise<unknown>;
+    reach: () => Promise<{ readonly client: QueryClient }>;
     error: string;
     marked: "code" | "description" | undefined;
     searching: boolean;
   }[])("describes each input by rendered elements only, $state", async (row) => {
     stubApi(row.replies);
-    await row.reach();
+    const { client } = await row.reach();
     await waitFor(() => {
       expect(errorText()).toBe(row.error);
     });
-    await settle();
+    await untilIdle(client);
 
     expect(danglingDescriptions()).toEqual([]);
     expect(readOuts()).toEqual(readOutsWith(row.marked, row.error, row.searching));
@@ -1267,7 +1321,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
   // audit: COTRTUPC-015
   it("a code no row holds answers 200 without a description; F5 then starts the add under that code, sending nothing", async () => {
     const calls = stubApi({ [FETCH_NEW]: [reply(200, notFound)] });
-    await showNotFound();
+    const { client } = await showNotFound();
     expect(errorText()).toBe(MSG.notFound);
     expect(shownValues()).toEqual({ code: NEW_CODE, description: "" });
     expect(key("F5=Save").hidden).toBe(false);
@@ -1279,7 +1333,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
     expect(errorText()).toBe("");
     expect(shownValues()).toEqual({ code: NEW_CODE, description: "" });
     await expectFocus(LABELS.description);
-    await settle();
+    await untilIdle(client);
     expect(calls.map((call) => call.route)).toEqual([FETCH_NEW]);
   });
 
@@ -1297,7 +1351,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
     "a code blank at ENTER in state $state is refused before any request: the fresh screen with * in red",
     async ({ replies, reach, requests }) => {
       const calls = stubApi(replies);
-      await reach();
+      const { client } = await reach();
       fireEvent.change(field(LABELS.code), { target: { value: "" } });
       press("ENTER=Process");
       await waitFor(() => {
@@ -1311,7 +1365,7 @@ describe("COTRTUP fetch, endpoint 26", () => {
       expectEditable({ code: true, description: false });
       await expectFocus(LABELS.code);
       expect(infoText()).toBe(INFO.search);
-      await settle();
+      await untilIdle(client);
       expect(calls.map((call) => call.route)).toEqual(requests);
     },
   );
@@ -1442,8 +1496,9 @@ describe("COTRTUP while a request is out", () => {
         [ACTIONS]: [reply(200, validated)],
       }),
       arrange: async () => {
-        await open();
+        const shown = await open();
         fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+        return shown;
       },
       start: () => {
         press("ENTER=Process");
@@ -1466,8 +1521,9 @@ describe("COTRTUP while a request is out", () => {
         [ACTIONS]: [reply(200, validated)],
       }),
       arrange: async () => {
-        await showNotFound();
+        const shown = await showNotFound();
         fireEvent.change(field(LABELS.code), { target: { value: CODE } });
+        return shown;
       },
       start: () => {
         pressKey("Enter");
@@ -1489,8 +1545,9 @@ describe("COTRTUP while a request is out", () => {
         [ACTIONS]: [held, reply(200, saved)],
       }),
       arrange: async () => {
-        await showFound();
+        const shown = await showFound();
         fireEvent.change(field(LABELS.description), { target: { value: EDITED } });
+        return shown;
       },
       start: () => {
         press("ENTER=Process");
@@ -1546,7 +1603,7 @@ describe("COTRTUP while a request is out", () => {
     async ({ replies, arrange, start, route, answer, info, before, after, later, laterRoute }) => {
       const held = heldReply();
       const calls = stubApi(replies(held.reply));
-      await arrange();
+      const { client } = await arrange();
       const sentBefore = calls.length;
       const shownBefore = shownKeys();
       expectEditable(before);
@@ -1573,8 +1630,11 @@ describe("COTRTUP while a request is out", () => {
       // The lock makes no input protected: an input the state leaves enterable stays a Tab stop.
       expectTabStops(before);
 
+      // Nothing marks the moment a refused key would start a request: a bounded window watches
+      // for one, after which the held request is still the only one out.
       pressEveryKey();
-      await settle();
+      await lingers();
+      expect(client.isMutating()).toBe(1);
       expect(calls).toHaveLength(sentBefore + 1);
       expect(screen.queryByText(/^Stub at/)).toBeNull();
 
@@ -1611,7 +1671,7 @@ describe("COTRTUP save, endpoint 27", () => {
     });
     // F5 saves only changes ENTER has validated (state N); F5 straight after an edit in state S
     // is an invalid key (COTRTUPC-042, asserted below), so the edit goes through ENTER first.
-    await validateEdit();
+    const { client } = await validateEdit();
     expect(calls[1]).toEqual({
       route: ACTIONS,
       body: { aid: "ENTER", description: EDITED },
@@ -1620,9 +1680,10 @@ describe("COTRTUP save, endpoint 27", () => {
     expect(shownValues()).toEqual({ code: CODE, description: padded(EDITED) });
     expectEditable({ code: false, description: false });
 
-    // State N: no edit runs, so ENTER shows the same screen again without a request.
+    // State N: no edit runs, so ENTER shows the same screen again without a request. The same
+    // screen marks nothing when ENTER has been handled, so a bounded window watches for a request.
     press("ENTER=Process");
-    await settle();
+    await lingersThenUntilIdle(client);
     expect(calls).toHaveLength(2);
     expect(infoText()).toBe(INFO.validated);
     expect(shownKeys()).toEqual(["ENTER=Process", "F3=Exit", "F5=Save", "F12=Cancel"]);
@@ -1646,7 +1707,7 @@ describe("COTRTUP save, endpoint 27", () => {
     expect(shownValues()).toEqual({ code: "", description: "" });
     expect(infoText()).toBe(INFO.search);
     expectEditable({ code: true, description: false });
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(3);
   });
 
@@ -1763,7 +1824,7 @@ describe("COTRTUP save, endpoint 27", () => {
         [FETCH]: [reply(200, found)],
         [ACTIONS]: [reply(200, validated), reply(500, error)],
       });
-      await validateEdit();
+      const { client } = await validateEdit();
       press("F5=Save");
       await waitFor(() => {
         expect(errorText()).toBe(error.message);
@@ -1780,7 +1841,7 @@ describe("COTRTUP save, endpoint 27", () => {
       expect(shownValues()).toEqual({ code: "", description: "" });
       expect(errorText()).toBe("");
       expect(infoText()).toBe(INFO.search);
-      await settle();
+      await untilIdle(client);
       expect(calls).toHaveLength(3);
     },
   );
@@ -1792,15 +1853,18 @@ describe("COTRTUP delete", () => {
   // audit: COTRTUPC-031
   it("F4 asks to confirm without a request, the second F4 deletes the fetched code, and the next key clears the screen", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)], [ACTIONS]: [reply(200, deleted)] });
-    await showFound();
+    const { client } = await showFound();
     expect(key("F4=Delete").hidden).toBe(false);
 
-    // Nothing typed is received at F4: the edited description does not reach the prompt.
+    // Nothing typed is received at F4: the edited description does not reach the prompt. The
+    // prompt's cursor is on the code, which the form library focuses on a timer after the key;
+    // the blur marks the edited description touched, so the focus is awaited before the count.
     fireEvent.change(field(LABELS.description), { target: { value: EDITED } });
     press("F4=Delete");
     expect(infoText()).toBe(INFO.confirmDelete);
     expect(shownValues()).toEqual({ code: CODE, description: STORED });
-    await settle();
+    await expectFocus(LABELS.code);
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
 
     // The second F4 sends the key alone: the delete takes the fetched code, and no state is sent.
@@ -1818,7 +1882,7 @@ describe("COTRTUP delete", () => {
     expect(shownValues()).toEqual({ code: "", description: "" });
     expect(infoText()).toBe(INFO.search);
     expectEditable({ code: true, description: false });
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(2);
   });
 
@@ -1826,7 +1890,7 @@ describe("COTRTUP delete", () => {
   // audit: COTRTUPC-042
   it("ENTER is refused while a delete awaits confirmation", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    await confirmDelete();
+    const { client } = await confirmDelete();
     expect(key("ENTER=Process").hidden).toBe(true);
 
     pressKey("Enter");
@@ -1834,7 +1898,7 @@ describe("COTRTUP delete", () => {
     expect(infoText()).toBe(INFO.confirmDelete);
     expect(shownValues()).toEqual({ code: CODE, description: STORED });
     expect(shownKeys()).toEqual(["F4=Delete", "F12=Cancel"]);
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
   });
 
@@ -1842,11 +1906,11 @@ describe("COTRTUP delete", () => {
   // audit: COTRTUPC-037
   it("F5 while a delete awaits confirmation ends the conversation with the abend data; the next visit is fresh", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    const { unmount } = await confirmDelete();
+    const { client, unmount } = await confirmDelete();
 
     pressKey("F5");
     expectAbend();
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
 
     unmount();
@@ -1864,7 +1928,7 @@ describe("COTRTUP delete", () => {
         [FETCH]: [reply(200, found)],
         [ACTIONS]: [reply(500, deleteRestricted)],
       });
-      await deleteRefused();
+      const { client } = await deleteRefused();
       expect(infoText()).toBe(INFO.search);
       expect(shownValues()).toEqual({ code: CODE, description: STORED });
       expectEditable({ code: false, description: false });
@@ -1873,7 +1937,7 @@ describe("COTRTUP delete", () => {
 
       pressKey(name);
       expectAbend();
-      await settle();
+      await untilIdle(client);
       expect(calls.map((call) => call.route)).toEqual([FETCH, ACTIONS]);
     },
   );
@@ -1887,14 +1951,14 @@ describe("COTRTUP delete", () => {
         [FETCH]: [reply(200, found)],
         [ACTIONS]: [reply(500, deleteRestricted)],
       });
-      await deleteRefused();
+      const { client } = await deleteRefused();
 
       pressKey(name);
       expect(errorText()).toBe(MSG.invalidKey);
       expect(infoText()).toBe(INFO.search);
       expect(shownValues()).toEqual({ code: CODE, description: STORED });
       expect(shownKeys()).toEqual(["ENTER=Process", "F3=Exit"]);
-      await settle();
+      await untilIdle(client);
       expect(calls).toHaveLength(2);
     },
   );
@@ -1903,7 +1967,7 @@ describe("COTRTUP delete", () => {
   // audit: COTRTUPC-047
   it("a delete that fails leaves state 6: the fetched values, the code red, and the next key starts over", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)], [ACTIONS]: [reply(500, deleteFailed)] });
-    await confirmDelete();
+    const { client } = await confirmDelete();
     press("F4=Delete");
     await waitFor(() => {
       expect(errorText()).toBe(deleteFailed.message);
@@ -1922,7 +1986,7 @@ describe("COTRTUP delete", () => {
     expect(errorText()).toBe("");
     expect(redFields()).toEqual({ code: false, description: false });
     expect(marks()).toEqual({ code: null, description: null });
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(2);
   });
 });
@@ -1938,7 +2002,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     "F12 in state $state shows the fresh screen without a request or a message",
     async ({ replies, reach }) => {
       const calls = stubApi(replies);
-      await reach();
+      const { client } = await reach();
       press("F12=Cancel");
 
       expect(shownValues()).toEqual({ code: "", description: "" });
@@ -1946,7 +2010,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
       expect(infoText()).toBe(INFO.search);
       expectEditable({ code: true, description: false });
       await expectFocus(LABELS.code);
-      await settle();
+      await untilIdle(client);
       expect(calls).toHaveLength(1);
     },
   );
@@ -1987,7 +2051,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
       [FETCH_NEW]: [reply(200, notFound)],
       [ACTIONS_NEW]: [reply(200, newValidated)],
     });
-    await validateNew();
+    const { client } = await validateNew();
     press("F12=Cancel");
 
     expect(errorText()).toBe(MSG.updateCancelled);
@@ -2000,7 +2064,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     press("ENTER=Process");
     expect(errorText()).toBe("");
     expect(shownValues()).toEqual({ code: "", description: "" });
-    await settle();
+    await untilIdle(client);
     expect(calls.map((call) => call.route)).toEqual([FETCH_NEW, ACTIONS_NEW]);
   });
 
@@ -2008,7 +2072,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
   // audit: COTRTUPC-040
   it("F12 with a delete to confirm drops it: Delete was cancelled on the fresh blank screen", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    await confirmDelete();
+    const { client } = await confirmDelete();
     press("F12=Cancel");
 
     expect(errorText()).toBe(MSG.deleteCancelled);
@@ -2017,7 +2081,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     await expectFocus(LABELS.code);
     expect(infoText()).toBe(INFO.search);
     expect(shownKeys()).toEqual(["ENTER=Process", "F3=Exit"]);
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
   });
 
@@ -2034,7 +2098,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     },
   ])("F3 when $title returns to $target without a request", async ({ state, target }) => {
     const calls = stubApi({});
-    renderScreen(state);
+    const { client } = renderScreen(state);
     await expectFocus(LABELS.code);
     // Whatever the caller, the screen opens fresh.
     expect(shownValues()).toEqual({ code: "", description: "" });
@@ -2044,7 +2108,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     expect(await screen.findByText(`Stub at ${target}, state null`)).toBeInstanceOf(
       HTMLParagraphElement,
     );
-    await settle();
+    await untilIdle(client);
     expect(calls).toEqual([]);
   });
 
@@ -2052,14 +2116,14 @@ describe("COTRTUP cancel, exit and refused keys", () => {
   // audit: COTRTUPC-044
   it("F3 exits while a delete awaits confirmation, although its label is dark", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    await confirmDelete();
+    const { client } = await confirmDelete();
     expect(key("F3=Exit").hidden).toBe(true);
 
     pressKey("F3");
     expect(
       await screen.findByText(`Stub at ${PATHS.COADM01}, state null`),
     ).toBeInstanceOf(HTMLParagraphElement);
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
   });
 
@@ -2110,14 +2174,14 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     "$title shows Invalid key pressed over the state's screen, discarding what was typed",
     async ({ replies, reach, label, typed, name, values, requests }) => {
       const calls = stubApi(replies);
-      await reach();
+      const { client } = await reach();
       fireEvent.change(field(label), { target: { value: typed } });
 
       pressKey(name);
       expect(errorText()).toBe(MSG.invalidKey);
       expect(shownValues()).toEqual(values);
       expect(infoText()).toBe(INFO.search);
-      await settle();
+      await untilIdle(client);
       expect(calls).toHaveLength(requests);
     },
   );
@@ -2127,7 +2191,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
   // audit: COTRTUPC-042
   it("the keyboard's F4 and F12 are the screen's F4 and F12, Shift held or not", async () => {
     const calls = stubApi({ [FETCH]: [reply(200, found)] });
-    await showFound();
+    const { client } = await showFound();
 
     // Shift+F4 sends PF16, which COTRTUPC takes as PF4.
     pressKey("F4", true);
@@ -2135,7 +2199,7 @@ describe("COTRTUP cancel, exit and refused keys", () => {
     pressKey("F12");
     expect(errorText()).toBe(MSG.deleteCancelled);
     expect(shownValues()).toEqual({ code: "", description: "" });
-    await settle();
+    await untilIdle(client);
     expect(calls).toHaveLength(1);
   });
 });

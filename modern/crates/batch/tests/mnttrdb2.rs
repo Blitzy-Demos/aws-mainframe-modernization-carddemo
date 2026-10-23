@@ -277,7 +277,8 @@ impl Run {
 }
 
 /// Runs `carddemo-batch` with `args` from `modern/`, against `database_url`, with every output
-/// directory inside `scratch`, on the blocking pool.
+/// directory inside `scratch`, through `test_support::run_child`, which kills a run still going
+/// at `test_support::CHILD_DEADLINE`.
 async fn run_batch(
     database_url: &str,
     scratch: &Scratch,
@@ -295,7 +296,7 @@ async fn run_batch(
         .env("CARDDEMO_FIXTURE_DIR", fixture_dir())
         .env("RUST_LOG", "error")
         .env_remove("CARDDEMO_OTEL_EXPORT");
-    let output = tokio::task::spawn_blocking(move || command.output()).await??;
+    let output = test_support::run_child(command, test_support::CHILD_DEADLINE).await?;
     Ok(Run {
         status: output.status.code(),
         stdout: String::from_utf8(output.stdout)?,
