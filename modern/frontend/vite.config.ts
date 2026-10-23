@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import type { HttpProxy } from "vite";
+import { createLogger, type HttpProxy, type Logger } from "vite";
 import { defineConfig } from "vitest/config";
 
 /**
@@ -32,7 +32,9 @@ const PROXY_ERROR_BODY = JSON.stringify({
  * Vite calls `configure` before it adds its own error listener, so this one runs first. It logs
  * one line naming the variable, the target and the error code, never a header, a body or a
  * token, and, while the response is unsent, answers 502 with the JSON body above. Vite's own
- * listener then finds the response ended and only logs, instead of answering an empty 500.
+ * listener then finds the response ended and, instead of answering an empty 500, only logs its
+ * line naming the request URL. That line goes through `redactingLogger`, so it prints the
+ * request path without the query string.
  */
 function answerUnreachableApi(proxy: HttpProxy.Server): void {
   proxy.on("error", (error, _request, response) => {
@@ -55,6 +57,41 @@ function answerUnreachableApi(proxy: HttpProxy.Server): void {
   });
 }
 
+/**
+ * Removes the query string and fragment from every `/api` URL in a dev server log message,
+ * keeping the path.
+ *
+ * Query values carry card numbers (`card_num` on the card list, view and edit calls), and
+ * the Cardholder Data Redaction rule keeps them out of every log. No path segment carries a
+ * protected value. A URL ends at whitespace or at an ANSI escape, so the colour reset that
+ * follows it on a terminal survives. Vite also passes some errors as `Error` objects despite
+ * its `string` type; they name no request URL and pass unchanged.
+ */
+function withoutApiQuery(message: string): string {
+  return typeof message === "string"
+    ? message.replace(/(\/api(?:\/[^\s?#\u001b]*)?)[?#][^\s\u001b]*/g, "$1")
+    : message;
+}
+
+/**
+ * Vite's default logger with every message passed through `withoutApiQuery` before it prints,
+ * so that no line the dev server logs, its proxy error line included, carries a query value.
+ * The methods are replaced on Vite's own logger object, so its `hasWarned` flag still tracks
+ * what was printed.
+ */
+function redactingLogger(): Logger {
+  const logger = createLogger();
+  const info = logger.info.bind(logger);
+  const warn = logger.warn.bind(logger);
+  const warnOnce = logger.warnOnce.bind(logger);
+  const error = logger.error.bind(logger);
+  logger.info = (message, options) => info(withoutApiQuery(message), options);
+  logger.warn = (message, options) => warn(withoutApiQuery(message), options);
+  logger.warnOnce = (message, options) => warnOnce(withoutApiQuery(message), options);
+  logger.error = (message, options) => error(withoutApiQuery(message), options);
+  return logger;
+}
+
 const DEFAULT_WEB_PORT = 5173;
 
 /** A TCP port given as decimal digits in 1..65535, or the default for anything else. */
@@ -68,6 +105,7 @@ function webPort(value: string | undefined): number {
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  customLogger: redactingLogger(),
   resolve: {
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
