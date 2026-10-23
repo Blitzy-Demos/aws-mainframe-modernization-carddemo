@@ -623,6 +623,55 @@ function rowGroups(): HTMLElement[] {
   return within(screen.getByRole("table")).getAllByRole("rowgroup");
 }
 
+/** A column of the list `Table`: the map column it starts at and its width in map columns. */
+interface ListColumn {
+  readonly start: number;
+  readonly width: number;
+}
+
+/**
+ * The columns of `table` from its `colgroup`, the first starting at map column `first`: each
+ * `col` is a `w-k/n` fraction of the list's `span` map columns, and together they fill it.
+ */
+function listColumns(table: HTMLElement, first: number, span: number): ListColumn[] {
+  const columns: ListColumn[] = [];
+  let start = first;
+  for (const col of table.querySelectorAll("colgroup > col")) {
+    const [, width = "", of = ""] = /^w-(\d+)\/(\d+)$/.exec(col.className) ?? [];
+    expect(of).toBe(String(span));
+    columns.push({ start, width: Number.parseInt(width, 10) });
+    start += Number.parseInt(width, 10);
+  }
+  expect(start).toBe(first + span);
+  return columns;
+}
+
+/**
+ * The map column `element` shows its content at: its column's start, moved by its `left-k/w` or
+ * `-left-k/w` class, `k` of the column's `w` map columns.
+ */
+function shownColumn(element: Element, column: ListColumn | undefined): number {
+  if (column === undefined) {
+    throw new Error("a list cell stands outside the colgroup's columns");
+  }
+  const shift = /(?:^|\s)(-?)left-(\d+)\/(\d+)(?:\s|$)/.exec(element.className);
+  if (shift === null) {
+    return column.start;
+  }
+  const [, sign, moved, of] = shift;
+  expect(element.classList.contains("relative")).toBe(true);
+  expect(of).toBe(String(column.width));
+  const columns = Number.parseInt(moved, 10);
+  return sign === "-" ? column.start - columns : column.start + columns;
+}
+
+/** The map column each cell of `row` shows its text at: its own, or its one wrapper's. */
+function shownColumns(row: Element | undefined, columns: readonly ListColumn[]): number[] {
+  return Array.from(row?.children ?? [], (cell, index) => {
+    return shownColumn(cell.firstElementChild ?? cell, columns.at(index));
+  });
+}
+
 /** The five list lines (map lines 16 to 20). */
 function listLines(): HTMLElement[] {
   const [, body] = rowGroups();
@@ -802,10 +851,12 @@ describe("COPAU00 View Authorizations", () => {
       "STS",
       "   Amount   ",
     ]);
+    // Line 15's dashes are decoration hidden from assistive technology: plain cells, no headers.
     expect(dashLine.getAttribute("aria-hidden")).toBe("true");
+    expect(within(dashLine).queryAllByRole("columnheader", { hidden: true })).toEqual([]);
     expect(
       within(dashLine)
-        .getAllByRole("columnheader", { hidden: true })
+        .getAllByRole("cell", { hidden: true })
         .map((element) => element.textContent),
     ).toEqual([
       "---",
@@ -979,6 +1030,58 @@ describe("COPAU00 View Authorizations", () => {
 
     expect(errorText()).toBe("");
     expect(document.activeElement).toBe(accountField());
+  });
+
+  it.each([
+    { shown: "five authorizations", page: PAGE_1 },
+    { shown: "two authorizations", page: SHORT_PAGE },
+    { shown: "no authorization", page: EMPTY_PAGE },
+  ])("keeps the list on the map's columns and lines with $shown", async ({ page }) => {
+    // audit: COPAU00-041
+    // audit: COPAU00-042
+    // audit: COPAU00-043
+    // audit: COPAU00-044
+    // audit: COPAU00-045
+    // audit: COPAU00-046
+    // audit: COPAU00-047
+    // audit: COPAU00-048
+    // audit: COPAU00-049
+    // audit: COPAU00-050
+    // audit: COPAU00-051
+    // audit: COPAU00-052
+    // audit: COPAU00-053
+    // audit: COPAU00-054
+    // audit: COPAU00-055
+    // audit: COPAU00-056
+    const sent = stubFetch(json(200, page));
+    renderScreen();
+    enter(ACCOUNT);
+    await answered(sent, 1);
+
+    // Fixed columns from the line-16 fields' `POS`: the selector column at 2, the transaction
+    // ID at 8, the date at 27, the time at 38, the type at 49, A/D at 58, STS at 63 and the
+    // amount at 67, to the list's end at 78.
+    const table = screen.getByRole("table", { name: "Authorizations" });
+    expect(table.classList.contains("table-fixed")).toBe(true);
+    const columns = listColumns(table, 2, 77);
+    expect(columns.map((column) => column.start)).toEqual([2, 8, 27, 38, 49, 58, 63, 67]);
+    // Captions at their line-14 `POS` and dashes at their line-15 `POS`.
+    const [captions, dashes] = Array.from(table.querySelectorAll("thead > tr"));
+    expect(shownColumns(captions, columns)).toEqual([2, 8, 27, 38, 49, 56, 61, 67]);
+    expect(shownColumns(dashes, columns)).toEqual([2, 8, 27, 37, 49, 56, 61, 67]);
+    // Every selector at column 3, on every line, empty lines included.
+    for (let row = 1; row <= 5; row += 1) {
+      expect(shownColumn(selector(row), columns.at(0))).toBe(3);
+    }
+    // Seven rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    expect(table.querySelectorAll("tr")).toHaveLength(7);
+    for (const row of table.querySelectorAll("tr")) {
+      expect(row.classList.contains("h-10")).toBe(true);
+    }
+    for (const cell of table.querySelectorAll("th, td")) {
+      expect(cell.classList.contains("px-0")).toBe(true);
+      expect(cell.classList.contains("pt-0")).toBe(true);
+    }
   });
 
   it("a first entry whose route state carries a numeric acct_id, as F3 on COPAU01 sends it, loads that account without typing", async () => {
@@ -1996,4 +2099,3 @@ describe("COPAU00 while the authorization detail loads", () => {
     router.dispose();
   });
 });
-

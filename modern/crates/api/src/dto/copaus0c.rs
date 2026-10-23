@@ -67,6 +67,7 @@ pub struct AuthSummaryQuery {
     pub direction: Option<PageDirection>,
     /// Rows per page, 1 to 100; absent, the 5 rows of the map. A value outside that range is
     /// rejected with 422 (Bounded Pagination). The screen never sends it.
+    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]
@@ -640,6 +641,9 @@ mod tests {
             "/authorizations?page_size=0",
             "/authorizations?page_size=-5",
             "/authorizations?page_key=x&page_size=101",
+            "/authorizations?page_size=five",
+            "/authorizations?page_size=",
+            "/authorizations?page_size=99999999999999999999",
         ] {
             let error = query(uri).await?.err().ok_or("page_size accepted")?;
             assert_eq!(
@@ -678,17 +682,13 @@ mod tests {
             assert!(page_key.is_empty() || !error.message().contains(page_key));
         }
 
-        for uri in [
-            "/authorizations?direction=sideways",
-            "/authorizations?page_size=five",
-        ] {
-            let error = query(uri).await?.err().ok_or("unreadable query accepted")?;
-            assert_eq!(
-                (error.status(), error.message(), error.field()),
-                (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
-                "{uri}"
-            );
-        }
+        let uri = "/authorizations?direction=sideways";
+        let error = query(uri).await?.err().ok_or("unreadable query accepted")?;
+        assert_eq!(
+            (error.status(), error.message(), error.field()),
+            (StatusCode::BAD_REQUEST, INVALID_QUERY, None),
+            "{uri}"
+        );
         Ok(())
     }
 

@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { Suspense, use } from "react";
 import {
   createMemoryRouter,
   MemoryRouter,
@@ -11,7 +12,7 @@ import {
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
-import { getSession, setSession } from "@/auth/session";
+import { getSession, SESSION_KEY, setSession, type StoredSession } from "@/auth/session";
 import { PATHS, PROGRAM_ROUTES, routes } from "@/routes";
 import { COADM01 } from "./COADM01";
 
@@ -124,6 +125,11 @@ const forbidden: components["schemas"]["ScreenError"] = {
   message: "No access - Admin Only function ...",
 };
 
+/** The dev proxy's 502 while the API cannot be reached, shaped as the API's `ScreenError`. */
+const unreachable: components["schemas"]["ScreenError"] = {
+  message: "The dev proxy cannot reach the API at CARDDEMO_API_BIND",
+};
+
 /** Every request the screen sent in the current test, in order. */
 let requests: Request[] = [];
 
@@ -146,6 +152,23 @@ function stubMenu(
   body: components["schemas"]["MenuResponse"] | components["schemas"]["ScreenError"],
   holds: readonly Promise<void>[] = [],
 ): void {
+  stubMenuReplies([{ status, body }], holds);
+}
+
+/** One answer of endpoint 3: the HTTP status and the body. */
+type MenuReply = {
+  readonly status: number;
+  readonly body: components["schemas"]["MenuResponse"] | components["schemas"]["ScreenError"];
+};
+
+/**
+ * {@link stubMenu} with an answer per request: the request at position `n` of the test (from 0)
+ * gets `replies[n]`, and every request past the last reply gets the last one again.
+ */
+function stubMenuReplies(
+  replies: readonly [MenuReply, ...MenuReply[]],
+  holds: readonly Promise<void>[] = [],
+): void {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -154,6 +177,7 @@ function stubMenu(
       requests.push(request);
       if (request.method === "GET" && new URL(request.url).pathname === MENU_PATH) {
         await holds.at(position);
+        const { status, body } = replies[Math.min(position, replies.length - 1)];
         return reply(status, body);
       }
       const unexpected: components["schemas"]["ScreenError"] = {
@@ -184,6 +208,12 @@ function Target() {
       </button>
     </section>
   );
+}
+
+/** A transfer target that suspends until `opened` settles, as a route waits on its loader. */
+function OpensWhen({ opened }: { readonly opened: Promise<void> }) {
+  use(opened);
+  return <Target />;
 }
 
 /** Renders `/admin` under a fresh query client that never retries, with every transfer target. */
@@ -256,6 +286,30 @@ function messageRow(kind: "error" | "info"): HTMLElement | undefined {
 function enter(entry: string): void {
   fireEvent.change(optionInput(), { target: { value: entry } });
   fireEvent.click(screen.getByRole("button", { name: "ENTER=Continue" }));
+}
+
+/**
+ * The cursor is on the option input with all of its text selected, so the next option overtypes
+ * the value shown from the first position.
+ */
+function expectOptionSelected(): void {
+  const input = optionInput();
+  expect(document.activeElement).toBe(input);
+  expect(input.selectionStart).toBe(0);
+  expect(input.selectionEnd).toBe(input.value.length);
+}
+
+/**
+ * Types `key` into `input` as a browser does: the key replaces the selected text, or goes in at
+ * the caret, and a value longer than `maxLength` is refused, leaving the input as it was.
+ */
+function typeKey(input: HTMLInputElement, key: string): void {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  const next = `${input.value.slice(0, start)}${key}${input.value.slice(end)}`;
+  if (input.maxLength < 0 || next.length <= input.maxLength) {
+    fireEvent.change(input, { target: { value: next } });
+  }
 }
 
 /**
@@ -480,6 +534,51 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     await expectMenuRequests(1);
   });
 
+  // audit: COADM01C-022
+  it("stamps the time of every send in the header and shows its text anew, a repeated message included", async () => {
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      stubMenu(200, menu);
+      renderAdminMenu();
+      await loaded();
+      expect(headerInput("CURTIME").value).toBe("03:04:05");
+      const row = messageRow("error");
+      let shown = row?.querySelector('[data-slot="alert-description"]');
+
+      // Each send repeats the text of the one before: two ENTERs of option 99, then two F5s.
+      const sends = [
+        { second: 8, time: "03:04:08", text: INVALID_OPTION, key: "Enter" },
+        { second: 11, time: "03:04:11", text: INVALID_OPTION, key: "Enter" },
+        { second: 14, time: "03:04:14", text: INVALID_KEY_TEXT, key: "F5" },
+        { second: 17, time: "03:04:17", text: INVALID_KEY_TEXT, key: "F5" },
+      ];
+      for (const { second, time, text, key } of sends) {
+        vi.setSystemTime(new Date(2024, 0, 2, 3, 4, second));
+        if (key === "Enter") {
+          enter("99");
+        } else {
+          fireEvent.keyDown(optionInput(), { key });
+        }
+        await waitFor(() => {
+          expect(headerInput("CURTIME").value).toBe(time);
+        });
+        // The live region stays; the text inside it is a new element, which it announces.
+        expect(messageRow("error")).toBe(row);
+        expect(row?.textContent).toBe(text);
+        const replaced = row?.querySelector('[data-slot="alert-description"]');
+        expect(replaced).toBeInstanceOf(HTMLElement);
+        expect(replaced).not.toBe(shown);
+        shown = replaced;
+      }
+      expectNoTransfer();
+      await expectMenuRequests(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it.each([
     // audit: COADM01-002
     {
@@ -624,9 +723,9 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
       expect(messageRow("error")?.classList.contains("text-destructive")).toBe(true);
       await waitFor(() => {
         expect(optionInput().value).toBe(shown);
+        expect(focus).toHaveBeenCalled();
+        expectOptionSelected();
       });
-      expect(focus).toHaveBeenCalled();
-      expect(document.activeElement).toBe(optionInput());
       expectNoTransfer();
       await expectMenuRequests(1);
     },
@@ -838,6 +937,48 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     },
   );
 
+  // The selection is the screen's own, for overtyping; no audit row covers it.
+  it.each([
+    {
+      how: "ENTER with option 7",
+      entry: "7",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+      message: INVALID_OPTION,
+      shown: "07",
+    },
+    {
+      how: "F5",
+      entry: "3",
+      press: () => {
+        fireEvent.keyDown(optionInput(), { key: "F5" });
+      },
+      message: INVALID_KEY_TEXT,
+      shown: "03",
+    },
+  ])(
+    "after $how the input shows $shown selected, and the next option typed replaces it",
+    async ({ entry, press, message, shown }) => {
+      stubMenu(200, served);
+      renderAdminMenu();
+      await loaded();
+      fireEvent.change(optionInput(), { target: { value: entry } });
+      press();
+      await waitFor(() => {
+        expect(messageRow("error")?.textContent).toBe(message);
+        expect(optionInput().value).toBe(shown);
+        expectOptionSelected();
+      });
+
+      typeKey(optionInput(), "1");
+      expect(optionInput().value).toBe("1");
+      fireEvent.click(enterButton());
+      expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+      await expectMenuRequests(1);
+    },
+  );
+
   // audit: COADM01C-004
   it("each key replaces the message of the key before it", async () => {
     stubMenu(200, menu);
@@ -871,9 +1012,10 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
   });
 
   // The admin gate is the server's (COADM01C-001, a `server` row): the screen shows the
-  // `ScreenError` it answers in the error row, builds no option line and never transfers.
+  // `ScreenError` it answers in the error row, builds no option line and never transfers. With no
+  // table to serve it from, each ENTER requests endpoint 3 again, and the gate answers it alike.
   // audit: COADM01-027
-  it("shows the 403 ScreenError of the admin gate in the error row and offers no option", async () => {
+  it("shows the 403 ScreenError of the admin gate in the error row and offers no option, for each ENTER's new request too", async () => {
     stubMenu(403, forbidden);
     renderAdminMenu();
 
@@ -882,18 +1024,226 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     });
     expect(screen.queryAllByRole("row")).toHaveLength(0);
 
-    enter("01");
-    await waitFor(() => {
+    for (const [index, entry] of ["01", "-"].entries()) {
+      enter(entry);
+      await waitFor(() => {
+        expect(requests).toHaveLength(index + 2);
+        expectBusy(false);
+      });
       expect(messageRow("error")?.textContent).toBe(forbidden.message);
-    });
-    expectNoTransfer();
+      expect(screen.queryAllByRole("row")).toHaveLength(0);
+      expectNoTransfer();
+    }
+    await expectMenuRequests(3);
+  });
 
-    enter("-");
+  // A load that failed leaves no table to serve ENTER from, so ENTER requests endpoint 3 again
+  // and decides its entry from the table that answers, as it would have from the first load. The
+  // reload is the screen's own recovery from a failed load, which no audit row covers, so these
+  // tests carry no tag.
+  it("ENTER after a failed load requests endpoint 3 again and transfers to the option it carried", async () => {
+    stubMenuReplies([
+      { status: 502, body: unreachable },
+      { status: 200, body: served },
+    ]);
+    renderAdminMenu();
     await waitFor(() => {
-      expect(messageRow("error")?.textContent).toBe(forbidden.message);
+      expect(messageRow("error")?.textContent).toBe(unreachable.message);
     });
+    expectBusy(false);
+
+    enter("1");
+
+    expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+    await expectMenuRequests(2);
+  });
+
+  it.each([{ entry: "7" }, { entry: "-" }])(
+    "ENTER '$entry' after a failed load requests endpoint 3 again, and its table refuses the entry",
+    async ({ entry }) => {
+      stubMenuReplies([
+        { status: 502, body: unreachable },
+        { status: 200, body: served },
+      ]);
+      renderAdminMenu();
+      await waitFor(() => {
+        expect(messageRow("error")?.textContent).toBe(unreachable.message);
+      });
+
+      enter(entry);
+
+      // The table's message replaces the failure's, and the six options are shown.
+      await waitFor(() => {
+        expect(messageRow("error")?.textContent).toBe(INVALID_OPTION);
+      });
+      await loaded();
+      expectBusy(false);
+      expectNoTransfer();
+      await expectMenuRequests(2);
+    },
+  );
+
+  it("a reload that fails again shows its own failure, and the next ENTER requests the menu once more", async () => {
+    const again: components["schemas"]["ScreenError"] = { message: "Service unavailable" };
+    stubMenuReplies([
+      { status: 502, body: unreachable },
+      { status: 503, body: again },
+      { status: 200, body: served },
+    ]);
+    renderAdminMenu();
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(unreachable.message);
+    });
+
+    enter("1");
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(again.message);
+    });
+    expectBusy(false);
+    expect(screen.queryAllByRole("row")).toHaveLength(0);
     expectNoTransfer();
-    await expectMenuRequests(1);
+    await expectMenuRequests(2);
+
+    enter("1");
+    expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+    await expectMenuRequests(3);
+  });
+
+  it.each([
+    {
+      how: "a click on ENTER=Continue",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      how: "the Enter key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+      },
+    },
+    {
+      how: "a submit of the form",
+      press: () => {
+        fireEvent.submit(menuForm());
+      },
+    },
+  ])(
+    "$how while ENTER's reload is out sends nothing more and decides nothing",
+    async ({ press }) => {
+      const reload = deferred();
+      stubMenuReplies(
+        [
+          { status: 502, body: unreachable },
+          { status: 200, body: served },
+        ],
+        [Promise.resolve(), reload.done],
+      );
+      renderAdminMenu();
+      await waitFor(() => {
+        expect(messageRow("error")?.textContent).toBe(unreachable.message);
+      });
+
+      enter("1");
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+        expectBusy(true);
+      });
+      // The keyboard is locked and the failure's message is gone, cleared for the key; no key
+      // decides anything.
+      expect(messageRow("error")?.textContent).toBe("");
+      press();
+      press();
+      await lingers();
+      expect(messageRow("error")?.textContent).toBe("");
+      expectNoTransfer();
+      expect(requests).toHaveLength(2);
+
+      reload.release();
+      expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+      await expectMenuRequests(2);
+    },
+  );
+
+  it("a failed reload on a return to /admin keeps the cached table, and two ENTERs in one turn request endpoint 3 once", async () => {
+    stubMenuReplies([
+      { status: 200, body: served },
+      { status: 502, body: unreachable },
+      { status: 200, body: served },
+    ]);
+    renderAdminMenu();
+    await loaded();
+    enter("01");
+    expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+    fireEvent.click(screen.getByRole("button", { name: "Return to admin menu" }));
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(unreachable.message);
+      expectBusy(false);
+    });
+    await loaded();
+
+    // Both submits reach the screen before the render that locks the keyboard.
+    fireEvent.change(optionInput(), { target: { value: "5" } });
+    fireEvent.submit(menuForm());
+    fireEvent.submit(menuForm());
+
+    expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
+    await lingers();
+    await expectMenuRequests(3);
+  });
+
+  it("F3 while ENTER's reload is out goes to sign-on, and the reload's answer transfers nowhere", async () => {
+    const reload = deferred();
+    const signon = deferred();
+    stubMenuReplies(
+      [
+        { status: 502, body: unreachable },
+        { status: 200, body: served },
+      ],
+      [Promise.resolve(), reload.done],
+    );
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    // Sign-on opens only once `signon` settles, as a route waits on its loader, so the menu stays
+    // mounted after F3 while the reload answers.
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[PATHS.COADM01]}>
+          <Suspense fallback={null}>
+            <Routes>
+              <Route path={PATHS.COADM01} element={<COADM01 />} />
+              <Route path={PATHS.COSGN00} element={<OpensWhen opened={signon.done} />} />
+              {OPTION_PROGRAMS.map((program) => (
+                <Route key={program} path={PROGRAM_ROUTES[program]} element={<Target />} />
+              ))}
+            </Routes>
+          </Suspense>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(unreachable.message);
+    });
+
+    enter("1");
+    await waitFor(() => {
+      expect(requests).toHaveLength(2);
+      expectBusy(true);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    });
+    reload.release();
+    await waitFor(() => {
+      expect(client.isFetching()).toBe(0);
+    });
+    await lingers();
+    expect(screen.queryByTestId("target")).toBeNull();
+
+    signon.release();
+    expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
+    await expectMenuRequests(2);
   });
 
   // A return from an option screen is a first entry again: the menu is requested once more and
@@ -1084,6 +1434,49 @@ describe("COADM01 in the route table: the admin guard", () => {
       router.dispose();
     },
   );
+
+  // A page restored from the back/forward cache resumes the admin menu it was frozen with, while a
+  // later page of the same tab signed off and signed a user on. That user's session reaches this
+  // page in the shared `sessionStorage`, unannounced; the restore (`pageshow` with `persisted`)
+  // has the admin guard read it and send the non-admin to the main menu.
+  it("a page restored after a user's session replaced the admin's goes to the main menu", async () => {
+    setSession("test-token", "ADMIN001", "A");
+    stubMenu(200, served);
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const router = createMemoryRouter(routes, { initialEntries: [PATHS.COADM01] });
+    render(
+      <QueryClientProvider client={client}>
+        <RouterProvider router={router} />
+      </QueryClientProvider>,
+    );
+    expect(
+      await screen.findByText("01. User List (Security)", {}, { timeout: 5_000 }),
+    ).toBeDefined();
+
+    const user: StoredSession = { token: "test-token-user", userId: "USER0001", userType: "U" };
+    sessionStorage.setItem(SESSION_KEY, JSON.stringify(user));
+    // Nothing announced the change, so the guard still shows the admin menu.
+    expect(screen.getByRole("heading", { level: 1, name: "Admin Menu" })).toBeDefined();
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }));
+    });
+
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+    ).toBeDefined();
+    expect(router.state.location.pathname).toBe(PATHS.COMEN01);
+    expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
+    expect(getSession()).toEqual(user);
+    // Waiting for the main menu's answer keeps its load's last render inside the test's waits.
+    expect(await screen.findByText(MAIN_MENU_ANSWER)).toBeDefined();
+    expect(
+      requests.filter((request) => new URL(request.url).pathname === MENU_PATH),
+    ).toHaveLength(1);
+    router.dispose();
+  });
 });
 
 /** The 401 of the `AdminUser` extractor for a missing, invalid or expired token. */
@@ -1094,8 +1487,8 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/admin`, so the admin guard that only the table
- * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
- * allows 5 s. Returns the router, whose location the test reads.
+ * mounts stands in front of the screen. Each screen is imported by its route's loader, so a wait
+ * for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1155,5 +1548,111 @@ describe("COADM01 in the route table: a 401 ends the session, a 403 keeps it", (
     expect(getSession()).toEqual({ token: "test-token", userId: "ADMIN001", userType: "A" });
     await expectMenuRequests(1);
     router.dispose();
+  });
+});
+
+// A line no option fills draws no row rule. Its `TableRow` keeps the component's `border-b`, so
+// the line keeps a filled line's height, and `border-transparent` hides that rule; a line with an
+// option keeps the component default, the rule under option 06 included. jsdom loads no
+// stylesheet, so the rule is read from the row's border classes; the browser check measures it.
+describe("COADM01: option lines without an option draw no row rule", () => {
+  beforeEach(() => {
+    requests = [];
+    setSession("test-token", "ADMIN001", "A");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+  });
+
+  /** The map field names of the option lines, `OPTN001` to `OPTN012`. */
+  const LINE_FIELDS = Array.from(
+    { length: 12 },
+    (_, index) => `OPTN${String(index + 1).padStart(3, "0")}`,
+  );
+
+  /** The component's rule of a line with an option. */
+  const RULED = "border-b";
+
+  /** The rule of a line without one: the same width, drawn transparent. */
+  const UNRULED = "border-b border-transparent";
+
+  /** The `TableRow` that holds the option line `name`. */
+  function optionLine(name: string): HTMLElement {
+    const line = field(name).closest("tr");
+    if (line === null) {
+      throw new TypeError(`the option line ${name} is in no table row`);
+    }
+    return line;
+  }
+
+  /** Each option line's border classes, in line order. */
+  function lineRules(): string[] {
+    return LINE_FIELDS.map((name) =>
+      Array.from(optionLine(name).classList)
+        .filter((utility) => utility.startsWith("border-"))
+        .join(" "),
+    );
+  }
+
+  /** The component's hover band of a line with an option. */
+  const BANDED = "hover:bg-muted/50";
+
+  /** The hover band of a line without one: none, so its blank field draws nothing on hover. */
+  const UNBANDED = "hover:bg-transparent";
+
+  /** Each option line's hover background classes, in line order. */
+  function lineBands(): string[] {
+    return LINE_FIELDS.map((name) =>
+      Array.from(optionLine(name).classList)
+        .filter((utility) => utility.startsWith("hover:bg-"))
+        .join(" "),
+    );
+  }
+
+  // audit: COADM01-018
+  // audit: COADM01-019
+  // audit: COADM01-020
+  // audit: COADM01-021
+  // audit: COADM01-022
+  // audit: COADM01-023
+  it("every line is unruled and unbanded while endpoint 3 loads; once loaded, lines 6 to 11 keep the rule and hover band and the blank lines 12 to 17 stay unruled and unbanded", async () => {
+    const load = deferred();
+    stubMenu(200, served, [load.done]);
+    renderAdminMenu();
+    expectBusy(true);
+    expect(lineRules()).toEqual(LINE_FIELDS.map(() => UNRULED));
+    expect(lineBands()).toEqual(LINE_FIELDS.map(() => UNBANDED));
+
+    load.release();
+    await loaded();
+    expect(lineRules()).toEqual([
+      ...served.options.map(() => RULED),
+      ...LINE_FIELDS.slice(served.options.length).map(() => UNRULED),
+    ]);
+    expect(lineBands()).toEqual([
+      ...served.options.map(() => BANDED),
+      ...LINE_FIELDS.slice(served.options.length).map(() => UNBANDED),
+    ]);
+    // Lines 12 to 17 (OPTN007 to OPTN012) are the blank TableCells of the map, hidden from
+    // assistive technology, each showing the INITIAL of one space.
+    for (const name of LINE_FIELDS.slice(6)) {
+      expect(field(name).dataset.slot).toBe("table-cell");
+      expect(field(name).textContent).toBe(" ");
+      expect(optionLine(name).getAttribute("aria-hidden")).toBe("true");
+    }
+    await expectMenuRequests(1);
+  });
+
+  it("every line stays unruled after endpoint 3 refuses the load", async () => {
+    stubMenu(403, forbidden);
+    renderAdminMenu();
+    await waitFor(() => {
+      expect(messageRow("error")?.textContent).toBe(forbidden.message);
+    });
+
+    expect(lineRules()).toEqual(LINE_FIELDS.map(() => UNRULED));
+    await expectMenuRequests(1);
   });
 });

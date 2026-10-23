@@ -8,7 +8,7 @@ import { routes } from "@/routes";
  * Nothing retries, so a server `ScreenError` reaches the message row at once, as the 3270 message
  * row showed the program's message. Nothing refetches on window focus or when the network
  * returns, because a COBOL screen re-reads its data only when a key is pressed: the menus read
- * their option table on entry and at no other time.
+ * their option table on entry, and again only when ENTER follows a load that failed.
  *
  * Every query and mutation runs whatever the browser reports about its network (`networkMode`
  * `"always"`): nothing is paused while the browser is offline, and nothing paused is sent by
@@ -28,7 +28,10 @@ const queryClient = new QueryClient({
   },
 });
 
-/** Data mode, because the route table loads each screen through its route's `lazy`. */
+/**
+ * Data mode, because the route table loads each screen through its route's `loader` and shows a
+ * failed one through its root error boundary.
+ */
 const router = createBrowserRouter(routes);
 
 /** The application root: query client and router, nothing else. */

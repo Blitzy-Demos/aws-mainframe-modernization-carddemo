@@ -1,5 +1,6 @@
 import { onlineManager, QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { Suspense, use } from "react";
 import {
   createMemoryRouter,
   Link,
@@ -13,7 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
 import { SESSION_KEY, getSession, setSession } from "@/auth/session";
-import { PATHS, PROGRAM_ROUTES, routes } from "@/routes";
+import { PATHS, PROGRAM_ROUTES, SCREENS, routes } from "@/routes";
 import { COMEN01 } from "./COMEN01";
 
 /**
@@ -63,6 +64,11 @@ const NOT_INSTALLED = "This option Pending Authorization View is not installed..
 
 /** A row no option fills: the 40 spaces of `OPTN012` (COMEN01-023). */
 const BLANK_ROW = " ".repeat(40);
+
+/** The dev proxy's 502 while the API cannot be reached, shaped as the API's `ScreenError`. */
+const UNREACHABLE: components["schemas"]["ScreenError"] = {
+  message: "The dev proxy cannot reach the API at CARDDEMO_API_BIND",
+};
 
 /** The 11 entries of `CARDDEMO-MAIN-MENU-OPTIONS` (`app/cpy/COMEN02Y.cpy:25-90`). */
 const SHIPPED = [
@@ -209,6 +215,12 @@ function Target() {
   );
 }
 
+/** A navigation target that suspends until `opened` settles, as a route waits on its loader. */
+function OpensWhen({ opened }: { readonly opened: Promise<void> }) {
+  use(opened);
+  return <Target />;
+}
+
 /** Renders `/menu`, entered with route `state`, under a fresh client that never retries. */
 function renderMenu(state?: Record<string, unknown>): QueryClient {
   const client = new QueryClient({
@@ -335,16 +347,41 @@ function expectNoTransfer(): void {
 }
 
 /**
+ * The cursor is on the option input with all of its text selected, so the next option overtypes
+ * the value shown from the first position.
+ */
+function expectOptionSelected(): void {
+  const input = optionInput();
+  expect(document.activeElement).toBe(input);
+  expect(input.selectionStart).toBe(0);
+  expect(input.selectionEnd).toBe(input.value.length);
+}
+
+/**
+ * Types `key` into `input` as a browser does: the key replaces the selected text, or goes in at
+ * the caret, and a value longer than `maxLength` is refused, leaving the input as it was.
+ */
+function typeKey(input: HTMLInputElement, key: string): void {
+  const start = input.selectionStart ?? input.value.length;
+  const end = input.selectionEnd ?? start;
+  const next = `${input.value.slice(0, start)}${key}${input.value.slice(end)}`;
+  if (input.maxLength < 0 || next.length <= input.maxLength) {
+    fireEvent.change(input, { target: { value: next } });
+  }
+}
+
+/**
  * ENTER with `typed`: the menu stays, the error row shows `message`, the input shows the 2-digit
- * value `shown`, the cursor is back on the input, and no request follows the load.
+ * value `shown`, the cursor is back on the input with that value selected, and no request follows
+ * the load.
  */
 async function expectStay(typed: string, message: string, shown: string): Promise<void> {
   await enterOption(typed);
   await waitFor(() => {
     expect(optionInput().value).toBe(shown);
     expect(errorRow().textContent).toBe(message);
+    expectOptionSelected();
   });
-  expect(document.activeElement).toBe(optionInput());
   expectNoTransfer();
   expect(requests).toHaveLength(1);
 }
@@ -868,6 +905,95 @@ describe("COMEN01 function keys", () => {
     await expectStay("4", "", "04");
     expectHeader();
   });
+
+  it("stamps the time of every send in the header and shows its text anew, a repeated message included", async () => {
+    // audit: COMEN01C-019
+    // Only `Date` is faked, so the timers that React, TanStack Query and `waitFor` use stay real.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
+      serve(MENU);
+      renderMenu();
+      await loaded();
+      expect(headerValue("CURTIME")).toBe("03:04:05");
+      const row = errorRow();
+      let shown = row.querySelector('[data-slot="alert-description"]');
+
+      // Each send repeats the text of the one before: two ENTERs of option 00, then two F5s.
+      const sends = [
+        { second: 8, time: "03:04:08", text: INVALID_OPTION, key: "Enter" },
+        { second: 11, time: "03:04:11", text: INVALID_OPTION, key: "Enter" },
+        { second: 14, time: "03:04:14", text: INVALID_KEY, key: "F5" },
+        { second: 17, time: "03:04:17", text: INVALID_KEY, key: "F5" },
+      ];
+      for (const { second, time, text, key } of sends) {
+        vi.setSystemTime(new Date(2024, 0, 2, 3, 4, second));
+        if (key === "Enter") {
+          await enterOption("00");
+        } else {
+          fireEvent.keyDown(optionInput(), { key });
+        }
+        await waitFor(() => {
+          expect(headerValue("CURTIME")).toBe(time);
+        });
+        // The live region stays; the text inside it is a new element, which it announces.
+        expect(errorRow()).toBe(row);
+        expect(row.textContent).toBe(text);
+        const replaced = row.querySelector('[data-slot="alert-description"]');
+        expect(replaced).toBeInstanceOf(HTMLElement);
+        expect(replaced).not.toBe(shown);
+        shown = replaced;
+      }
+      expectHeader();
+      expectNoTransfer();
+      expect(requests).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it.each([
+    {
+      how: "ENTER with option 0",
+      typed: "0",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+      message: INVALID_OPTION,
+      shown: "00",
+    },
+    {
+      how: "F5",
+      typed: "7",
+      press: () => {
+        fireEvent.keyDown(optionInput(), { key: "F5" });
+      },
+      message: INVALID_KEY,
+      shown: "7",
+    },
+  ])(
+    "after $how the input shows $shown selected, and the next option typed replaces it",
+    async ({ typed, press, message, shown }) => {
+      // The selection is the screen's own, for overtyping; no audit row covers it.
+      serve(MENU);
+      renderMenu();
+      await loaded();
+      fireEvent.change(optionInput(), { target: { value: typed } });
+      await focusOn(enterButton());
+      press();
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(message);
+        expect(optionInput().value).toBe(shown);
+        expectOptionSelected();
+      });
+
+      typeKey(optionInput(), "1");
+      expect(optionInput().value).toBe("1");
+      fireEvent.click(enterButton());
+      expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+      expect(requests).toHaveLength(1);
+    },
+  );
 });
 
 describe("COMEN01 load failure", () => {
@@ -889,12 +1015,251 @@ describe("COMEN01 load failure", () => {
     );
     expect(getSession()).not.toBeNull();
 
-    // With no table to match, ENTER decides nothing and the load's message stays.
+    // With no table to match, ENTER requests endpoint 2 again; its new failure shows in the row.
     await enterOption("1");
+    await waitFor(() => {
+      expect(menuRequests()).toHaveLength(2);
+      expectBusy(false);
+    });
     await settled();
     expect(errorRow().textContent).toBe(failure.message);
     expectNoTransfer();
-    expect(requests).toHaveLength(1);
+    expect(getSession()).not.toBeNull();
+    expect(requests).toHaveLength(2);
+  });
+
+  // A load that failed leaves no table to decide ENTER from, so ENTER requests endpoint 2 again
+  // and decides its entry from the table that answers, as it would have from the first load. The
+  // reload is the screen's own recovery from a failed load, which no audit row covers, so these
+  // tests carry no tag.
+  it("ENTER after a failed load requests endpoint 2 again and transfers to the option it carried", async () => {
+    stubFetch(() => (menuRequests().length === 1 ? json(502, UNREACHABLE) : json(200, MENU)));
+    renderMenu({ acct_id: "00000000001" });
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(UNREACHABLE.message);
+    });
+    expectBusy(false);
+
+    await enterOption("1");
+
+    expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+    expect(JSON.parse(screen.getByLabelText("Route state").textContent ?? "")).toEqual({
+      acct_id: "00000000001",
+      from: PATHS.COMEN01,
+    });
+    expect(menuRequests()).toHaveLength(2);
+    expect(requests).toHaveLength(2);
+  });
+
+  it.each([
+    { typed: "0", shown: "00" },
+    { typed: "a", shown: "0a" },
+  ])(
+    "ENTER $typed after a failed load requests endpoint 2 again, and its table refuses the entry",
+    async ({ typed, shown }) => {
+      stubFetch(() => (menuRequests().length === 1 ? json(502, UNREACHABLE) : json(200, MENU)));
+      renderMenu();
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(UNREACHABLE.message);
+      });
+
+      await enterOption(typed);
+
+      // The table's message replaces the failure's, and the 11 options are shown.
+      await loaded();
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(INVALID_OPTION);
+        expect(optionInput().value).toBe(shown);
+        expectOptionSelected();
+      });
+      expectBusy(false);
+      expectNoTransfer();
+      expect(requests).toHaveLength(2);
+    },
+  );
+
+  it("a reload that fails again shows its own failure, and the next ENTER requests the menu once more", async () => {
+    const again: components["schemas"]["ScreenError"] = { message: "Service unavailable" };
+    stubFetch(() => {
+      const sent = menuRequests().length;
+      if (sent === 1) {
+        return json(502, UNREACHABLE);
+      }
+      return sent === 2 ? json(503, again) : json(200, MENU);
+    });
+    renderMenu();
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(UNREACHABLE.message);
+    });
+
+    await enterOption("1");
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(again.message);
+      expectBusy(false);
+    });
+    expect(optionCells().map((cell) => cell.textContent)).toEqual(
+      Array.from({ length: 12 }, () => BLANK_ROW),
+    );
+    expectNoTransfer();
+    expect(requests).toHaveLength(2);
+
+    await enterOption("1");
+    expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+    expect(requests).toHaveLength(3);
+  });
+
+  it.each([
+    {
+      how: "a click on ENTER=Continue",
+      press: () => {
+        fireEvent.click(enterButton());
+      },
+    },
+    {
+      how: "the Enter key",
+      press: () => {
+        fireEvent.keyDown(window, { key: "Enter" });
+      },
+    },
+    {
+      how: "a submit of the form",
+      press: () => {
+        fireEvent.submit(menuForm());
+      },
+    },
+  ])(
+    "$how while ENTER's reload is out sends nothing more and decides nothing",
+    async ({ press }) => {
+      const reload = deferred();
+      stubFetch(async () => {
+        if (menuRequests().length === 1) {
+          return json(502, UNREACHABLE);
+        }
+        await reload.done;
+        return json(200, MENU);
+      });
+      renderMenu();
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(UNREACHABLE.message);
+      });
+
+      await enterOption("1");
+      await waitFor(() => {
+        expect(menuRequests()).toHaveLength(2);
+        expectBusy(true);
+      });
+      // The keyboard is locked and the failure's message is gone, cleared for the key; no key
+      // decides anything.
+      expect(errorRow().textContent).toBe("");
+      press();
+      press();
+      await lingers();
+      expect(errorRow().textContent).toBe("");
+      expectNoTransfer();
+      expect(requests).toHaveLength(2);
+
+      reload.release();
+      expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+      expect(requests).toHaveLength(2);
+    },
+  );
+
+  it("a failed reload on a return to the menu keeps the cached table, and two ENTERs in one turn request endpoint 2 once", async () => {
+    stubFetch(() => (menuRequests().length === 2 ? json(502, UNREACHABLE) : json(200, MENU)));
+    renderMenu();
+    await loaded();
+    await enterOption("1");
+    expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+    fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(UNREACHABLE.message);
+      expectBusy(false);
+    });
+    await loaded();
+
+    // Both submits reach the screen before the render that locks the keyboard.
+    fireEvent.change(optionInput(), { target: { value: "6" } });
+    fireEvent.submit(menuForm());
+    fireEvent.submit(menuForm());
+
+    expect(await screen.findByText(`arrived at ${PATHS.COTRN00}`)).toBeTruthy();
+    await lingers();
+    expect(menuRequests()).toHaveLength(3);
+    expect(requests).toHaveLength(3);
+  });
+
+  it("F3 while ENTER's reload is out goes to sign-on, and the reload's answer transfers nowhere", async () => {
+    const reload = deferred();
+    const signon = deferred();
+    stubFetch(async () => {
+      if (menuRequests().length === 1) {
+        return json(502, UNREACHABLE);
+      }
+      await reload.done;
+      return json(200, MENU);
+    });
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    // Sign-on opens only once `signon` settles, as a route waits on its loader, so the menu stays
+    // mounted after F3 while the reload answers.
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={[PATHS.COMEN01]}>
+          <Suspense fallback={null}>
+            <Routes>
+              <Route path={PATHS.COMEN01} element={<COMEN01 />} />
+              <Route path={PATHS.COSGN00} element={<OpensWhen opened={signon.done} />} />
+              {TARGETS.filter((path) => path !== PATHS.COSGN00).map((path) => (
+                <Route key={path} path={path} element={<Target />} />
+              ))}
+            </Routes>
+          </Suspense>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(UNREACHABLE.message);
+    });
+
+    await enterOption("1");
+    await waitFor(() => {
+      expect(menuRequests()).toHaveLength(2);
+      expectBusy(true);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+    });
+    reload.release();
+    await waitFor(() => {
+      expect(client.isFetching()).toBe(0);
+    });
+    await lingers();
+    expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
+
+    signon.release();
+    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+    expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
+    expect(requests).toHaveLength(2);
+  });
+
+  it("a reload refused with 401 clears the session and goes to sign-on", async () => {
+    // The 401 the screen meets on its first load is COMEN01C-003; this one answers ENTER's reload.
+    const refused: components["schemas"]["ScreenError"] = {
+      message: "The sign-on token is missing, invalid or expired",
+    };
+    stubFetch(() => (menuRequests().length === 1 ? json(502, UNREACHABLE) : json(401, refused)));
+    renderMenu();
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(UNREACHABLE.message);
+    });
+    expect(getSession()).not.toBeNull();
+
+    await enterOption("1");
+
+    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+    expect(getSession()).toBeNull();
+    expect(requests).toHaveLength(2);
   });
 });
 
@@ -1043,6 +1408,131 @@ describe("COMEN01 in the route table: no usable session", () => {
   });
 });
 
+/** The map name and path of each screen behind `gate` in the route table, in registry order. */
+function screensBehind(gate: "signon" | "admin"): { name: string; path: string }[] {
+  return Object.entries(SCREENS)
+    .filter(([, entry]) => entry.gate === gate)
+    .map(([name, entry]) => ({ name, path: entry.path }));
+}
+
+/** The map names of the admin screens, which only user type `A` is admitted to. */
+const ADMIN_SCREENS: readonly string[] = screensBehind("admin").map(({ name }) => name);
+
+/**
+ * Waits until no dynamic import is pending, so an import started on the way, even one never
+ * awaited, has reached its module before the test counts imports. `vi.dynamicImportSettled` sees
+ * an import only once its path is resolved, a round trip to the Vitest main thread, so the wait
+ * gives that round trip time and then settles again. The wait runs inside `act`, because the gate's
+ * target screen renders again meanwhile, as the answer to its own load arrives.
+ */
+async function importsSettled(): Promise<void> {
+  await act(async () => {
+    await vi.dynamicImportSettled();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 50);
+    });
+    await vi.dynamicImportSettled();
+  });
+}
+
+/** A refused visitor: what is stored, the path the gate sends them to, and its landmark. */
+const REFUSALS = {
+  "nobody signed on": {
+    install: () => {
+      sessionStorage.removeItem(SESSION_KEY);
+    },
+    target: PATHS.COSGN00,
+    landmark: { role: "button", name: "ENTER=Sign-on" },
+  },
+  "USER0001, user type U": {
+    install: () => {
+      setSession(TOKEN, "USER0001", "U");
+    },
+    target: PATHS.COMEN01,
+    landmark: { role: "heading", name: "Main Menu" },
+  },
+} as const;
+
+// The route loaders decide the sign-on and admin gates before they import a screen's module, so a
+// refused visitor never downloads the screen the gate refuses. Each case replaces that screen's
+// module with a stub that records its own import; the gate's target screen stays real. Once a
+// session the gate admits is stored, the same path imports the stub: the record would have caught
+// an import, and a refusal leaves nothing behind that keeps the screen from loading later. The wait
+// for the target screen, which its route's loader imports, allows 5 s, as one for a screen of the
+// route table does.
+describe("the route table's gates: a refused screen's module is never imported", () => {
+  afterEach(() => {
+    for (const name of Object.keys(SCREENS)) {
+      vi.doUnmock(`./${name}`);
+    }
+  });
+
+  it.each([
+    ...[...screensBehind("signon"), ...screensBehind("admin")].map(({ name, path }) => ({
+      name,
+      path,
+      who: "nobody signed on" as const,
+      admitted: ADMIN_SCREENS.includes(name)
+        ? { userId: "ADMIN001", userType: "A" }
+        : { userId: "USER0001", userType: "U" },
+    })),
+    ...screensBehind("admin").map(({ name, path }) => ({
+      name,
+      path,
+      who: "USER0001, user type U" as const,
+      admitted: { userId: "ADMIN001", userType: "A" },
+    })),
+  ])(
+    "$name at $path for $who goes to the gate's target in place of the path and imports no module, then loads once user type $admitted.userType signs on",
+    async ({ name, path, who, admitted }) => {
+      serve(MENU);
+      const refusal = REFUSALS[who];
+      refusal.install();
+      const imports = vi.fn();
+      vi.doMock(`./${name}`, () => {
+        imports();
+        return { [name]: () => <p>{`Loaded ${name}`}</p> };
+      });
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, { initialEntries: [path] });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      expect(
+        await screen.findByRole(
+          refusal.landmark.role,
+          { name: refusal.landmark.name },
+          { timeout: 5_000 },
+        ),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(refusal.target);
+      // Replaced, not pushed: the refused path is not left behind the target in the history.
+      expect(router.state.historyAction).toBe("REPLACE");
+      await importsSettled();
+      expect(imports).not.toHaveBeenCalled();
+      expect(screen.queryByText(`Loaded ${name}`)).toBeNull();
+
+      // The sign-on is announced to the guard still mounted at the target, which renders again.
+      act(() => {
+        setSession(TOKEN, admitted.userId, admitted.userType);
+      });
+      await act(async () => {
+        await router.navigate(path);
+      });
+
+      expect(await screen.findByText(`Loaded ${name}`)).toBeDefined();
+      expect(router.state.location.pathname).toBe(path);
+      expect(imports).toHaveBeenCalledTimes(1);
+      router.dispose();
+    },
+  );
+});
+
 /**
  * The answer `fetch` gives a request the server accepted and never completes: it settles only when
  * the request's signal aborts, at once for a signal already aborted when `fetch` receives it, and
@@ -1170,6 +1660,67 @@ describe("COMEN01 request deadline: a cancelled load", () => {
       expect(deadlines()).toEqual([true, true]);
     });
     expect(client.isFetching()).toBe(0);
+  });
+});
+
+// A row no option fills draws no row rule. Its `TableRow` keeps the component's `border-b`, so the
+// row keeps a filled row's height, and `border-transparent` hides that rule; a row with an option
+// keeps the component default, the rule under option 11 included. jsdom loads no stylesheet, so
+// the rule is read from the row's border classes; the browser check measures it.
+describe("COMEN01: option rows without an option draw no row rule", () => {
+  /** The component's rule of a row with an option. */
+  const RULED = "border-b";
+
+  /** The rule of a row without one: the same width, drawn transparent. */
+  const UNRULED = "border-b border-transparent";
+
+  /** Each option row's border classes, `OPTN001` to `OPTN012`. */
+  function rowRules(): string[] {
+    return optionCells().map((cell) => {
+      const row = cell.closest("tr");
+      if (row === null) {
+        throw new TypeError(`the option cell ${cell.dataset.field ?? ""} is in no table row`);
+      }
+      return Array.from(row.classList)
+        .filter((utility) => utility.startsWith("border-"))
+        .join(" ");
+    });
+  }
+
+  it("every row is unruled while endpoint 2 loads; once loaded, rows 6 to 16 keep the rule and the blank row 17 stays unruled", async () => {
+    // audit: COMEN01-023
+    const load = deferred();
+    stubFetch(async () => {
+      await load.done;
+      return json(200, MENU);
+    });
+    renderMenu();
+    expectBusy(true);
+    expect(rowRules()).toEqual(Array.from({ length: 12 }, () => UNRULED));
+
+    load.release();
+    await loaded();
+    expect(rowRules()).toEqual([...MENU.options.map(() => RULED), UNRULED]);
+    // Row 17 (OPTN012) is the map's blank TableCell: its 40 spaces, after the 11th option.
+    const last = optionCells()[MENU.options.length];
+    expect(last.dataset.field).toBe("OPTN012");
+    expect(last.dataset.slot).toBe("table-cell");
+    expect(last.textContent).toBe(BLANK_ROW);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("every row stays unruled after the load fails", async () => {
+    const failure: components["schemas"]["ScreenError"] = {
+      message: "Unable to read the menu options",
+    };
+    stubFetch(() => json(500, failure));
+    renderMenu();
+    await waitFor(() => {
+      expect(errorRow().textContent).toBe(failure.message);
+    });
+
+    expect(rowRules()).toEqual(Array.from({ length: 12 }, () => UNRULED));
+    expect(requests).toHaveLength(1);
   });
 });
 

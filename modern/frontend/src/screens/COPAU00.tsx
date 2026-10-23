@@ -4,7 +4,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCopaus0cSummary } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, GridTable, LIST_CELL, LIST_ROW } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -65,16 +65,53 @@ const NUMERIC_ACCOUNT = /^[0-9]{11}$/;
 /** The one field endpoint 21 names in a `ScreenError` (`ScreenError.field`): the account. */
 const ACCT_ID_FIELD = "acct_id";
 
-/** Captions of map line 14 and the dashes of line 15, column by column (COPAU00-041 to -056). */
+/**
+ * Captions of map line 14 and the dashes of line 15, column by column (COPAU00-041 to -056), and
+ * each column's width as a fraction of the list's 77 map columns, from its line-16 field's `POS`
+ * to the next one's: the selector column from 2, the transaction ID from 8, the date from 27, the
+ * time from 38, the type from 49, A/D from 58, STS from 63 and the amount from 67 to the list's
+ * end at 78. A caption or dash whose `POS` lies left of its field is moved back by that many of
+ * the column's map columns (`captionShift`, `dashShift`; empty when it starts on the field).
+ */
 const COLUMNS = [
-  { caption: "Sel", dashes: "---" },
-  { caption: " Transaction ID ", dashes: "----------------" },
-  { caption: "  Date  ", dashes: "--------" },
-  { caption: "  Time  ", dashes: "--------" },
-  { caption: "Type ", dashes: "----" },
-  { caption: "A/D", dashes: "---" },
-  { caption: "STS", dashes: "---" },
-  { caption: "   Amount   ", dashes: "------------" },
+  { caption: "Sel", dashes: "---", width: "w-6/77", captionShift: "", dashShift: "" },
+  {
+    caption: " Transaction ID ",
+    dashes: "----------------",
+    width: "w-19/77",
+    captionShift: "",
+    dashShift: "",
+  },
+  { caption: "  Date  ", dashes: "--------", width: "w-11/77", captionShift: "", dashShift: "" },
+  {
+    caption: "  Time  ",
+    dashes: "--------",
+    width: "w-11/77",
+    captionShift: "",
+    dashShift: "relative -left-1/11",
+  },
+  { caption: "Type ", dashes: "----", width: "w-9/77", captionShift: "", dashShift: "" },
+  {
+    caption: "A/D",
+    dashes: "---",
+    width: "w-5/77",
+    captionShift: "relative -left-2/5",
+    dashShift: "relative -left-2/5",
+  },
+  {
+    caption: "STS",
+    dashes: "---",
+    width: "w-4/77",
+    captionShift: "relative -left-2/4",
+    dashShift: "relative -left-2/4",
+  },
+  {
+    caption: "   Amount   ",
+    dashes: "------------",
+    width: "w-12/77",
+    captionShift: "",
+    dashShift: "",
+  },
 ] as const;
 
 /*
@@ -91,7 +128,8 @@ const COLUMNS = [
 const LABEL = "h-full whitespace-pre text-foreground";
 const FIELD = "w-auto min-w-full";
 const OUTPUT = `${FIELD} px-1 text-muted-foreground`;
-const CELL = "py-0 whitespace-pre text-muted-foreground";
+const CELL = `${LIST_CELL} whitespace-pre text-muted-foreground`;
+const HEADING = `${LIST_CELL} whitespace-pre`;
 
 /** Entries of `CDEMO-CPVS-PAUKEY-PREV-PG PIC X(08) OCCURS 20 TIMES` (`COPAUS0C.cbl:120`). */
 const FIRST_KEY_PAGES = 20;
@@ -734,25 +772,40 @@ export function COPAU00(): ReactNode {
 
             {/*
              * BLITZY [LAYOUT]: the list occupies map lines 14 to 20 (captions, dashes, five rows)
-             * from column 2 to column 78. `GridCell` places a field on one line, and a Table on one
-             * line of FieldGrid's equal-height rows would stretch every line to the Table's height,
-             * so the Table's grid item spans the seven lines it holds on the map.
+             * from column 2 to column 78. A Table on one line of FieldGrid's equal-height rows
+             * would stretch every line to the Table's height, so its block spans the seven lines
+             * it holds on the map, one `LIST_ROW` per line, and its fixed columns start at the
+             * line-16 fields' `POS`.
              */}
-            <div className="col-start-2 col-span-78 row-start-14 row-span-7">
-              <Table>
+            <GridTable row={14} col={2} span={77} rowSpan={7}>
+              <Table aria-label="Authorizations" className="table-fixed">
+                <colgroup>
+                  {COLUMNS.map((column) => (
+                    <col key={column.caption} className={column.width} />
+                  ))}
+                </colgroup>
                 <TableHeader>
-                  <TableRow>
+                  <TableRow className={LIST_ROW}>
                     {COLUMNS.map((column) => (
-                      <TableHead key={column.caption} scope="col" className="whitespace-pre">
-                        {column.caption}
+                      <TableHead key={column.caption} scope="col" className={HEADING}>
+                        {column.captionShift === "" ? (
+                          column.caption
+                        ) : (
+                          <span className={column.captionShift}>{column.caption}</span>
+                        )}
                       </TableHead>
                     ))}
                   </TableRow>
-                  <TableRow aria-hidden="true">
+                  {/* Line 15's dashes are decoration under the captions, not column titles. */}
+                  <TableRow aria-hidden="true" className={LIST_ROW}>
                     {COLUMNS.map((column) => (
-                      <TableHead key={column.caption} className="whitespace-pre">
-                        {column.dashes}
-                      </TableHead>
+                      <TableCell key={column.caption} className={HEADING}>
+                        {column.dashShift === "" ? (
+                          column.dashes
+                        ) : (
+                          <span className={column.dashShift}>{column.dashes}</span>
+                        )}
+                      </TableCell>
                     ))}
                   </TableRow>
                 </TableHeader>
@@ -761,10 +814,10 @@ export function COPAU00(): ReactNode {
                     const row = rows.at(index);
                     const isProtected = pageRead && row === undefined;
                     return (
-                      // BLITZY [LAYOUT]: cells drop the default vertical padding (`py-0`) so a
-                      // list row keeps the height of one map line.
-                      <TableRow key={index}>
-                        <TableCell className="py-0">
+                      // BLITZY [LAYOUT]: cells drop the default padding (`LIST_CELL`) so a list
+                      // row keeps the height of one map line and each value starts on its column.
+                      <TableRow key={index} className={LIST_ROW}>
+                        <TableCell className={LIST_CELL}>
                           <FormField
                             control={form.control}
                             name={`selections.${index}`}
@@ -778,7 +831,7 @@ export function COPAU00(): ReactNode {
                                     autoComplete="off"
                                     readOnly={isProtected || pending}
                                     tabIndex={isProtected ? -1 : undefined}
-                                    className="w-9"
+                                    className="relative left-1/6 w-9"
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />
@@ -799,7 +852,7 @@ export function COPAU00(): ReactNode {
                   })}
                 </TableBody>
               </Table>
-            </div>
+            </GridTable>
 
             <GridCell row={22} col={12} span={52}>
               <p className="flex h-full items-center whitespace-pre font-semibold text-foreground">

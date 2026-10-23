@@ -4,7 +4,14 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useCotrn00cList } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import {
+  FIELD_INPUT,
+  FieldGrid,
+  GridCell,
+  GridTable,
+  LIST_CELL,
+  LIST_ROW,
+} from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -51,28 +58,33 @@ const KEY_ITEMS = keyRowItems(KEY_ROWS.COTRN00);
 
 /**
  * The list's column captions (line 8) and rules (line 9), each its map `INITIAL` with its
- * padding (COTRN00-017 to COTRN00-026).
+ * padding (COTRN00-017 to COTRN00-026), and each column's width as a fraction of the list's 77
+ * map columns: from its field's `POS` to the next one's, the selector column from 2 (6 columns),
+ * the transaction ID from 8 (19), the date from 27 (11), the description from 38 (29) and the
+ * amount from 67 to the list's end at 78 (12).
  */
 const COLUMNS = [
-  { caption: "Sel", rule: "---" },
-  { caption: " Transaction ID ", rule: "----------------" },
-  { caption: "  Date  ", rule: "--------" },
-  { caption: "     Description          ", rule: "--------------------------" },
-  { caption: "   Amount   ", rule: "------------" },
+  { caption: "Sel", rule: "---", width: "w-6/77" },
+  { caption: " Transaction ID ", rule: "----------------", width: "w-19/77" },
+  { caption: "  Date  ", rule: "--------", width: "w-11/77" },
+  { caption: "     Description          ", rule: "--------------------------", width: "w-29/77" },
+  { caption: "   Amount   ", rule: "------------", width: "w-12/77" },
 ] as const;
 
 /*
- * BLITZY [LAYOUT]: list cells use `py-0.5` instead of the cell's `p-2` vertical padding, so each
- * list line is one map line tall, the height of the screen grid's other lines (an input plus the
- * line gap), and the ten lines keep the terminal's 24-line rhythm.
+ * BLITZY [LAYOUT]: every list line is a `LIST_ROW`, one map line pitch tall whatever it holds,
+ * and every cell a `LIST_CELL`, without the cell's `p-2` padding, so each value starts on its
+ * map column and the twelve lines keep the terminal's 24-line rhythm. The selector, at column 3,
+ * is moved one of its column's six map columns to the right (`left-1/6`).
  */
-const LINE = "py-0.5";
-
 /**
  * BLUE list values, shown byte for byte with their trailing spaces (COTRN00C-028 to
  * COTRN00C-032), one map line tall.
  */
-const VALUE = "whitespace-pre py-0.5 text-muted-foreground";
+const VALUE = `${LIST_CELL} whitespace-pre text-muted-foreground`;
+
+/** A caption or rule, shown with its spaces. */
+const HEADING = `${LIST_CELL} whitespace-pre`;
 
 /** `SPACES` or `LOW-VALUES`, the COBOL test for an empty selector or transaction ID. */
 const BLANK = /^[ \u0000]*$/;
@@ -498,28 +510,33 @@ export function COTRN00(): ReactNode {
                 </FormItem>
               )}
             />
-            <GridCell row={8} col={2} span={77}>
+            <GridTable row={8} col={2} span={77}>
               {/*
                * BLITZY [A11Y]: the selectors keep the input's default `h-9` (36px) square, below
                * the 44px touch-target guidance, and its focus ring (`ring-ring/50`) is about 1.5:1
                * against the card, below 3:1. Both are the system's defaults; flagged for designer
                * review.
                */}
-              <Table aria-label="Transactions">
+              <Table aria-label="Transactions" className="table-fixed">
+                <colgroup>
+                  {COLUMNS.map((column) => (
+                    <col key={column.caption} className={column.width} />
+                  ))}
+                </colgroup>
                 <TableHeader>
-                  <TableRow>
+                  <TableRow className={LIST_ROW}>
                     {COLUMNS.map((column) => (
-                      <TableHead key={column.caption} scope="col" className="whitespace-pre">
+                      <TableHead key={column.caption} scope="col" className={HEADING}>
                         {column.caption}
                       </TableHead>
                     ))}
                   </TableRow>
-                  {/* Line 9's rules are decoration under the captions. */}
-                  <TableRow aria-hidden="true">
+                  {/* Line 9's rules are decoration under the captions, not column titles. */}
+                  <TableRow aria-hidden="true" className={LIST_ROW}>
                     {COLUMNS.map((column) => (
-                      <TableHead key={column.caption} className="whitespace-pre">
+                      <TableCell key={column.caption} className={HEADING}>
                         {column.rule}
-                      </TableHead>
+                      </TableCell>
                     ))}
                   </TableRow>
                 </TableHeader>
@@ -527,8 +544,8 @@ export function COTRN00(): ReactNode {
                   {Array.from({ length: COTRN00_LENGTHS.rows }, (_, index) => {
                     const row = rows[index] ?? null;
                     return (
-                      <TableRow key={index}>
-                        <TableCell className={LINE}>
+                      <TableRow key={index} className={LIST_ROW}>
+                        <TableCell className={LIST_CELL}>
                           <FormField
                             control={form.control}
                             name={`selections.${index}`}
@@ -544,7 +561,7 @@ export function COTRN00(): ReactNode {
                                     maxLength={COTRN00_LENGTHS.selection}
                                     size={COTRN00_LENGTHS.selection}
                                     autoComplete="off"
-                                    className={`${FIELD_INPUT} w-9 text-center`}
+                                    className={`${FIELD_INPUT} relative left-1/6 w-9 text-center`}
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />
@@ -561,7 +578,7 @@ export function COTRN00(): ReactNode {
                   })}
                 </TableBody>
               </Table>
-            </GridCell>
+            </GridTable>
             <GridCell row={21} col={12} span={50}>
               <p className="whitespace-pre font-semibold text-foreground">{INSTRUCTION}</p>
             </GridCell>

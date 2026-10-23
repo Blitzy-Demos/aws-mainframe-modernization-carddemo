@@ -898,9 +898,11 @@ pub struct AccountUpdateRequest {
     /// `ENTER` validates, `PF5` saves.
     pub aid: Aid,
     /// The raw text of every enterable map field.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub fields: AccountUpdateFields,
     /// The snapshot of the fetch, with the state of the last response.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub snapshot: AccountUpdateSnapshot,
 }

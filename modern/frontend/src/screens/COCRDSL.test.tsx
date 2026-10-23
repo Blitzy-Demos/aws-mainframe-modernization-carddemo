@@ -1124,8 +1124,8 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/cards/view`, so the sign-on guard that only the
- * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
- * render allows 5 s. Returns the router, whose location the test reads.
+ * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({

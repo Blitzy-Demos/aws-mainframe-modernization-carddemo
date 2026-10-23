@@ -13,7 +13,15 @@ import { useNavigate } from "react-router";
 import { cn } from "cn";
 import { useCotrtlicList, useCotrtlicListActions } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FIELD_INPUT, FieldGrid, GridCell, fieldInputClass } from "@/components/screen/FieldGrid";
+import {
+  FIELD_INPUT,
+  FieldGrid,
+  GridCell,
+  GridTable,
+  LIST_CELL,
+  LIST_ROW,
+  fieldInputClass,
+} from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import {
@@ -46,6 +54,13 @@ const INFO_WIDTH = 45;
 
 /** `PAGENO`, `LENGTH=3` at `POS=(4,76)` (COTRTLI-013). */
 const PAGE_NO_LENGTH = 3;
+
+/**
+ * The list's columns as fractions of its 71 map columns, each from its line-12 field's `POS` to
+ * the next one's: the selector column from 4 (13 columns), the type from 17 (8) and the
+ * description from 25 to the list's end at 74 (50).
+ */
+const COLUMN_WIDTHS = ["w-13/71", "w-8/71", "w-50/71"] as const;
 
 /**
  * A label fills its grid line, so its text, centred by `Label`'s own flex alignment, stands level
@@ -551,8 +566,9 @@ export function COTRTLI(): ReactNode {
               {/*
                * Every input of the screen carries `size` = its map `LENGTH` and takes the shared
                * map-field box (`FIELD_INPUT`, through `fieldInputClass` for the two-character type
-               * filter): a grid field covers its `LENGTH` columns, a list input fills its table
-               * column, and none is narrower than its value plus the inset.
+               * filter): a grid field covers its `LENGTH` columns, a list description fills its
+               * table column, a list selector is a one-character box (`w-9`), and none is
+               * narrower than its value plus the inset.
                */}
               <Input
                 id={pageNoId}
@@ -625,23 +641,38 @@ export function COTRTLI(): ReactNode {
               )}
             />
 
-            {/* From map line 10: the captions, the dashes and seven rows of the map's eight;
-                COTRTLIC never writes the eighth, line 19 (X-SCREENS-13). The cell spans to line
-                24, because the body holds nothing below the table (the message and key lines
-                sit in the frame's footer): the table's height is spread over those empty lines
-                instead of making every line of the grid taller. */}
-            <GridCell row={10} col={4} span={72} rowSpan={15}>
-              <Table aria-label="Transaction types">
+            {/* Map lines 10 to 18, columns 4 to 74: the captions, the dashes and seven rows of
+                the map's eight; COTRTLIC never writes the eighth, line 19 (X-SCREENS-13). One
+                `LIST_ROW` per map line, so the table stands on those nine lines without making
+                any line of the grid taller. Each column starts at its line-12 field's `POS`
+                (selector column 4, type 17, description 25); a caption, dash or selector whose
+                map column differs is moved by a fraction of its own column's width. */}
+            <GridTable row={10} col={4} span={71} rowSpan={9}>
+              <Table aria-label="Transaction types" className="table-fixed">
+                <colgroup>
+                  {COLUMN_WIDTHS.map((width) => (
+                    <col key={width} className={width} />
+                  ))}
+                </colgroup>
                 <TableHeader>
-                  <TableRow>
-                    <TableHead>Select</TableHead>
-                    <TableHead className="text-center">Type</TableHead>
-                    <TableHead className="text-center">Description</TableHead>
+                  <TableRow className={LIST_ROW}>
+                    <TableHead scope="col" className={LIST_CELL}>
+                      Select
+                    </TableHead>
+                    <TableHead scope="col" className={LIST_CELL}>
+                      <span className="relative -left-1/8">Type</span>
+                    </TableHead>
+                    <TableHead scope="col" className={LIST_CELL}>
+                      <span className="relative left-17/50">Description</span>
+                    </TableHead>
                   </TableRow>
-                  <TableRow aria-hidden="true">
-                    <TableHead>------</TableHead>
-                    <TableHead className="text-center">-----</TableHead>
-                    <TableHead>{DESCRIPTION_DASHES}</TableHead>
+                  {/* The dashes under the captions are decoration, not column titles. */}
+                  <TableRow aria-hidden="true" className={LIST_ROW}>
+                    <TableCell className={LIST_CELL}>------</TableCell>
+                    <TableCell className={LIST_CELL}>
+                      <span className="relative -left-2/8">-----</span>
+                    </TableCell>
+                    <TableCell className={LIST_CELL}>{DESCRIPTION_DASHES}</TableCell>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -649,13 +680,21 @@ export function COTRTLI(): ReactNode {
                     const name = row === null ? `row ${index + 1}` : `type ${row.type_code}`;
                     const selectorOpen = row?.selector_enterable === true;
                     const descriptionOpen = row?.description_enterable === true;
+                    const highlighted = row?.highlighted === true;
                     return (
                       // The seven positions are fixed map rows, so the position is the key.
+                      // COTRTLIC marks the pending, deleted or updated row by colour alone
+                      // (`DFHNEUTR` to its type and description, COTRTLIC.cbl:1348-1370), and
+                      // NEUTRAL and DEFAULT both snap to the foreground token. Emphasis, as for
+                      // BRT (`font-semibold`), and `aria-current` make the "HIGHLIGHTED row" the
+                      // messages name perceivable without colour (WCAG 1.4.1).
                       <TableRow
                         key={index}
-                        data-state={row?.highlighted === true ? "selected" : undefined}
+                        data-state={highlighted ? "selected" : undefined}
+                        aria-current={highlighted ? "true" : undefined}
+                        className={cn(LIST_ROW, highlighted && "font-semibold")}
                       >
-                        <TableCell>
+                        <TableCell className={LIST_CELL}>
                           <FormField
                             control={form.control}
                             name={`rows.${index}.selection`}
@@ -670,7 +709,11 @@ export function COTRTLI(): ReactNode {
                                     autoComplete="off"
                                     readOnly={!selectorOpen || busy}
                                     tabIndex={selectorOpen ? undefined : -1}
-                                    className={cn(FIELD_INPUT, "aria-invalid:text-destructive")}
+                                    className={cn(
+                                      FIELD_INPUT,
+                                      "relative left-2/13 w-9 text-center",
+                                      "aria-invalid:text-destructive",
+                                    )}
                                   />
                                 </FormControl>
                                 <FormMessage className="sr-only" />
@@ -678,8 +721,10 @@ export function COTRTLI(): ReactNode {
                             )}
                           />
                         </TableCell>
-                        <TableCell className="text-center">{row?.type_code ?? ""}</TableCell>
-                        <TableCell>
+                        <TableCell className={LIST_CELL}>{row?.type_code ?? ""}</TableCell>
+                        {/* `pr-2` leaves the column gap after column 74 free, so the description
+                            is the 50 columns of the Description Filter above it. */}
+                        <TableCell className={cn(LIST_CELL, "pr-2")}>
                           <FormField
                             control={form.control}
                             name={`rows.${index}.description`}
@@ -707,7 +752,7 @@ export function COTRTLI(): ReactNode {
                   })}
                 </TableBody>
               </Table>
-            </GridCell>
+            </GridTable>
           </FieldGrid>
         </form>
       </Form>

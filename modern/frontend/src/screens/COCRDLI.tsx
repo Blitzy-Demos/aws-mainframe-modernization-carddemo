@@ -4,7 +4,7 @@ import { useForm, type FieldErrors, type FieldPath } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCocrdlicList } from "@/api/hooks";
 import type { components, paths } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FieldGrid, GridCell, GridTable, LIST_CELL, LIST_ROW } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import { Form, FormControl, FormField, FormItem, FormLabel } from "@/components/ui/form";
@@ -71,6 +71,19 @@ const MARKED = "aria-invalid:text-destructive";
 
 /** A one-character field: the cell is narrow, so the input keeps little padding. */
 const ONE_CHARACTER = `w-9 px-1 text-center ${MARKED}`;
+
+/**
+ * The list's columns as fractions of its 63 map columns. Each column starts at its data field's
+ * `POS`, except the rightmost, which starts at its dash rule's column 65 so that no text of the
+ * table's last column is shifted left from beyond the table's right edge: a left shift moves only
+ * the text's paint, and its overhang would scroll the table. The selector runs from column 10
+ * (12 columns), the account number from 22 (21), the card number from 43 to 64 (22) and the
+ * status from 65 to the list's end at 72 (8).
+ */
+const COLUMN_WIDTHS = ["w-12/63", "w-21/63", "w-22/63", "w-8/63"] as const;
+
+/** A list caption, dash or value, shown with its spaces. */
+const LIST_TEXT = `${LIST_CELL} whitespace-pre`;
 
 /** What COCRDLIC's `2250-EDIT-ARRAY` finds in the seven selection codes as received. */
 interface SelectionEdit {
@@ -540,45 +553,57 @@ export function COCRDLI(): ReactNode {
 
             {/*
              * Map lines 9 to 17, columns 10 to 72: the captions, the dashes and the seven rows
-             * (COCRDLI-020 to COCRDLI-068). `GridCell` places one line only, so this block spans
-             * its nine lines itself.
+             * (COCRDLI-020 to COCRDLI-068). Each column starts at its data field's `POS`
+             * (selector column 10, account 22, card 43), except the rightmost, which starts at
+             * its dash rule's column 65 so that no text of the table's last column is shifted
+             * left from beyond the table's right edge: a left shift moves only the text's paint,
+             * and its overhang would scroll the table. A caption, dash, selector or value whose
+             * map column differs is moved by a fraction of its own column's width.
              */}
-            <div className="col-start-10 col-span-63 row-start-9 row-span-9">
-              <Table aria-label="Credit cards">
+            <GridTable row={9} col={10} span={63} rowSpan={9}>
+              <Table aria-label="Credit cards" className="table-fixed">
+                <colgroup>
+                  {COLUMN_WIDTHS.map((width) => (
+                    <col key={width} className={width} />
+                  ))}
+                </colgroup>
                 <TableHeader>
-                  <TableRow>
-                    <TableHead scope="col" className="whitespace-pre">
+                  <TableRow className={LIST_ROW}>
+                    <TableHead scope="col" className={LIST_TEXT}>
                       {"Select    "}
                     </TableHead>
-                    <TableHead scope="col" className="whitespace-pre">
-                      {"Account Number"}
+                    <TableHead scope="col" className={LIST_TEXT}>
+                      <span className="relative -left-1/21">{"Account Number"}</span>
                     </TableHead>
-                    <TableHead scope="col" className="whitespace-pre">
-                      {" Card Number "}
+                    <TableHead scope="col" className={LIST_TEXT}>
+                      <span className="relative left-2/22">{" Card Number "}</span>
                     </TableHead>
-                    <TableHead scope="col" className="whitespace-pre">
-                      {"Active "}
+                    <TableHead scope="col" className={LIST_TEXT}>
+                      <span className="relative left-1/8">{"Active "}</span>
                     </TableHead>
                   </TableRow>
-                  {/* The dashes under the captions are decoration. */}
-                  <TableRow aria-hidden="true">
-                    <TableHead>{"------"}</TableHead>
-                    <TableHead>{"---------------"}</TableHead>
-                    <TableHead>{"---------------"}</TableHead>
-                    <TableHead>{"--------"}</TableHead>
+                  {/* The dashes under the captions are decoration, not column titles. */}
+                  <TableRow aria-hidden="true" className={LIST_ROW}>
+                    <TableCell className={LIST_TEXT}>{"------"}</TableCell>
+                    <TableCell className={LIST_TEXT}>
+                      <span className="relative -left-2/21">{"---------------"}</span>
+                    </TableCell>
+                    <TableCell className={LIST_TEXT}>{"---------------"}</TableCell>
+                    <TableCell className={LIST_TEXT}>{"--------"}</TableCell>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
                   {POSITIONS.map((position) => {
                     const card = cardAt(page, position);
                     return (
-                      // A row without a card shows nothing and keeps its line (COCRDLIC-035).
+                      // A row without a card shows nothing and keeps its line and height
+                      // (COCRDLIC-035).
                       <TableRow
                         key={position}
                         aria-hidden={card === undefined ? true : undefined}
-                        className="h-9"
+                        className={LIST_ROW}
                       >
-                        <TableCell className="py-0">
+                        <TableCell className={LIST_CELL}>
                           {card !== undefined && (
                             <FormField
                               control={form.control}
@@ -593,7 +618,7 @@ export function COCRDLI(): ReactNode {
                                       autoComplete="off"
                                       aria-label={`Select row ${position + 1}`}
                                       aria-invalid={marks.at(position) ?? false}
-                                      className={ONE_CHARACTER}
+                                      className={`relative left-2/12 ${ONE_CHARACTER}`}
                                     />
                                   </FormControl>
                                 </FormItem>
@@ -601,15 +626,17 @@ export function COCRDLI(): ReactNode {
                             />
                           )}
                         </TableCell>
-                        <TableCell className="whitespace-pre py-0">{card?.acct_id}</TableCell>
-                        <TableCell className="whitespace-pre py-0">{card?.card_num}</TableCell>
-                        <TableCell className="whitespace-pre py-0">{card?.status}</TableCell>
+                        <TableCell className={LIST_TEXT}>{card?.acct_id}</TableCell>
+                        <TableCell className={LIST_TEXT}>{card?.card_num}</TableCell>
+                        <TableCell className={LIST_TEXT}>
+                          <span className="relative left-2/8">{card?.status}</span>
+                        </TableCell>
                       </TableRow>
                     );
                   })}
                 </TableBody>
               </Table>
-            </div>
+            </GridTable>
           </FieldGrid>
         </form>
       </Form>

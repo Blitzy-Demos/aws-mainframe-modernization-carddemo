@@ -369,6 +369,24 @@ function expectEditable(editable: { code: boolean; description: boolean }) {
 }
 
 /**
+ * The widths of the two inputs, each `LENGTH` characters (`size`). The 2-column code takes that
+ * intrinsic width (`w-auto`), since a grid column is narrower than a character plus the `Input`
+ * padding; the description keeps the `Input` default `w-full` with no intrinsic or minimum width
+ * of its own, so it fills exactly its 50-column cell at every viewport.
+ */
+function expectInputWidths() {
+  const code = field(LABELS.code);
+  expect(code.size).toBe(2);
+  expect(code.classList.contains("w-auto")).toBe(true);
+  expect(code.classList.contains("w-full")).toBe(false);
+  const description = field(LABELS.description);
+  expect(description.size).toBe(50);
+  expect(description.classList.contains("w-full")).toBe(true);
+  expect(description.classList.contains("w-auto")).toBe(false);
+  expect(description.classList.contains("min-w-full")).toBe(false);
+}
+
+/**
  * Which of the two inputs are Tab stops (`tabIndex` 0); the others are skipped (`tabIndex` -1), as
  * the 3270 Tab key skips protected fields.
  */
@@ -797,6 +815,8 @@ describe("COTRTUP rendering", () => {
     expect(field(LABELS.description).maxLength).toBe(50);
     expect(cellOf(field(LABELS.code))).toBe("row-start-12 col-start-26 col-span-2");
     expect(cellOf(field(LABELS.description))).toBe("row-start-14 col-start-26 col-span-50");
+    // The 2-column code keeps room for its text; the read-only description fills its 50 columns.
+    expectInputWidths();
     // The zero-length stoppers after TRTYPCD (12,29) and TRTYDSC (14,77) render no element.
     expect(occupiedColumns(12).has(29)).toBe(false);
     expect(occupiedColumns(14).has(77)).toBe(false);
@@ -1008,6 +1028,8 @@ describe("COTRTUP states", () => {
       expect(calls.map((call) => call.route)).toEqual(requests);
       expect(shownValues()).toEqual(values);
       expectEditable(editable);
+      // The search form's read-only description and the details form's description alike.
+      expectInputWidths();
       // A protected input is out of the Tab order; the program's cursor still reaches it.
       expectTabStops(editable);
       expect(redFields()).toEqual(red);
@@ -2019,8 +2041,9 @@ describe("COTRTUP: endpoint 26 and 27 requests", () => {
 
 /**
  * Renders the application's route table at `/transaction-types/maintain`, so the admin guard that
- * only the table mounts stands in front of the screen. Its screens load lazily, so a wait for one
- * to render allows 5 s. Returns the router, whose location the test reads.
+ * only the table mounts stands in front of the screen. Each screen is imported by its route's
+ * loader, so a wait for one to render allows 5 s. Returns the router, whose location the test
+ * reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({

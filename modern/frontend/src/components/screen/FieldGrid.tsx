@@ -11,7 +11,8 @@ const SCREEN_COLUMNS = 80;
 /**
  * The classes every map input adds to the `Input`'s own, with `size` = the field's `LENGTH`. A
  * grid field of one or two characters takes them through {@link fieldInputClass}, as does code
- * that places fields of any length; a list input's width is its table column's.
+ * that places fields of any length; a list input's width is set by its list: a selector is a
+ * one-character box (`w-9`), any other list input fills its table column.
  *
  * BLITZY [LAYOUT]: on narrow frames a grid column is narrower than a character, so a cell of
  * `LENGTH` columns can be narrower than `LENGTH` characters plus the padding. At the 768px minimum
@@ -125,3 +126,55 @@ export function GridCell({ row, col, span, rowSpan = 1, children }: GridCellProp
     <div className={`row-start-${r}${lines} col-start-${c} col-span-${s}`}>{children}</div>
   );
 }
+
+/**
+ * Props of {@link GridTable}: the block of map lines and columns a list `Table` covers, from its
+ * first caption to its last row.
+ */
+export type GridTableProps = {
+  /** Line of the list's first caption, 1 to 24. */
+  row: number;
+  /** Column the list's leftmost field starts at, 1 to 80. */
+  col: number;
+  /** How many columns the list covers, from `col` to the end of its rightmost field. */
+  span: number;
+  /** How many map lines the list covers from `row`, one table row per line; one when omitted. */
+  rowSpan?: number;
+  /** The list `Table`, its columns sized as fractions of `span`. */
+  children: ReactNode;
+};
+
+/**
+ * Places a list `Table` on its {@link FieldGrid} block, so that its columns and rows fall on the
+ * map's columns and lines.
+ *
+ * The block is a {@link GridCell} whose content reaches over the column gap after its last
+ * column (`-mr-2`, the grid's `gap-x-2`) and over the line gap after its last line (`-mb-1`, the
+ * grid's `gap-y-1`). It is therefore exactly `span` column pitches wide and `rowSpan` line pitches
+ * tall. A `table-fixed` `Table` whose `col` widths are fractions of `span` starts each column on
+ * its map column, and rows of {@link LIST_ROW} height stand on their map lines without making the
+ * grid's lines taller.
+ */
+export function GridTable({ row, col, span, rowSpan = 1, children }: GridTableProps): ReactNode {
+  return (
+    <GridCell row={row} col={col} span={span} rowSpan={rowSpan}>
+      <div className="-mr-2 -mb-1">{children}</div>
+    </GridCell>
+  );
+}
+
+/**
+ * The height of one list row in a {@link GridTable}: one map line plus the line gap, the `Input`
+ * height (`h-9`) and `gap-y-1`. Every caption, dash and list row has it, whatever it holds, so a
+ * page with fewer rows keeps the same lines.
+ */
+export const LIST_ROW = "h-10";
+
+/**
+ * The padding of every `TableHead` and `TableCell` in a {@link GridTable}. No inline padding, so
+ * the content starts on its column's map column. Below the content, the line gap less the 1px
+ * rule `TableRow` draws under each row (`pb-0.75` and `border-b` make `gap-y-1`), so a row that
+ * holds an `Input` is exactly {@link LIST_ROW} tall and its content is centred on its map line,
+ * as {@link FieldGrid} centres a field.
+ */
+export const LIST_CELL = "px-0 pt-0 pb-0.75";

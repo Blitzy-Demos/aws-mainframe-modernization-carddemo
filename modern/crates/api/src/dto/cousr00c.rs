@@ -86,6 +86,7 @@ pub struct UserListQuery {
     pub has_next_page: Option<bool>,
     /// Rows per page, 1 to 100; absent, the map's 10 (Bounded Pagination). Outside the range,
     /// 422. The screen never sends it.
+    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]

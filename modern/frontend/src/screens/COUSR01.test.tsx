@@ -937,8 +937,8 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/users/add`, so the admin guard that only the table
- * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
- * allows 5 s. Returns the router, whose location the test reads.
+ * mounts stands in front of the screen. Each screen is imported by its route's loader, so a wait
+ * for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1023,7 +1023,7 @@ describe("COUSR01 /users/add opened with no session, through the route table", (
       </QueryClientProvider>,
     );
 
-    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    // Only the sign-on screen loads, through the route tree; the refused screen is never imported.
     await waitFor(
       () => {
         expect(router.state.location.pathname).toBe(PATHS.COSGN00);
@@ -1043,5 +1043,155 @@ describe("COUSR01 /users/add opened with no session, through the route table", (
     });
     expect(fetchStub).not.toHaveBeenCalled();
     router.dispose();
+  });
+});
+
+/** A scroll offset some earlier screen left, which no arrival may keep. */
+const LEFT_TOP = 360;
+const LEFT_LEFT = 24;
+
+/** The page's scrolling element in jsdom, which has no `document.scrollingElement`. */
+function page(): HTMLElement {
+  return document.documentElement;
+}
+
+/** Puts the page at `top` and `left`, as an earlier screen or the operator left it. */
+function scrollPage(top: number, left: number): void {
+  page().scrollTop = top;
+  page().scrollLeft = left;
+}
+
+/** Spies on the writes to the page's scroll offset, from here on. */
+function spyOnScroll() {
+  return {
+    top: vi.spyOn(page(), "scrollTop", "set"),
+    left: vi.spyOn(page(), "scrollLeft", "set"),
+  };
+}
+
+// Every screen renders one `ScreenShell`, so its arrival is the frame's mount: the page opens at
+// its top-left, as a 3270 map replaces the screen before it whole, the browser's own history
+// scroll restoration is off, and the document title names the screen by its map title and README
+// transaction (WCAG 2.4.2). The frame has no test file of its own, so the 21 routes are one table
+// here, each reached through the application's route table, guard and route loader included, with
+// the session its gate requires.
+describe("Every screen's arrival through the route table: the page opens at its top, titled by the screen", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+    scrollPage(0, 0);
+  });
+
+  it.each([
+    {
+      path: PATHS.COSGN00,
+      userType: "U",
+      title: "This is a Credit Card Demo Application for Mainframe Modernization – CC00 – CardDemo",
+    },
+    { path: PATHS.COMEN01, userType: "U", title: "Main Menu – CM00 – CardDemo" },
+    { path: PATHS.COADM01, userType: "A", title: "Admin Menu – CA00 – CardDemo" },
+    { path: PATHS.COACTVW, userType: "U", title: "View Account – CAVW – CardDemo" },
+    { path: PATHS.COACTUP, userType: "U", title: "Update Account – CAUP – CardDemo" },
+    { path: PATHS.COCRDLI, userType: "U", title: "List Credit Cards – CCLI – CardDemo" },
+    { path: PATHS.COCRDSL, userType: "U", title: "View Credit Card Detail – CCDL – CardDemo" },
+    { path: PATHS.COCRDUP, userType: "U", title: "Update Credit Card Details – CCUP – CardDemo" },
+    { path: PATHS.COTRN00, userType: "U", title: "List Transactions – CT00 – CardDemo" },
+    { path: PATHS.COTRN01, userType: "U", title: "View Transaction – CT01 – CardDemo" },
+    { path: PATHS.COTRN02, userType: "U", title: "Add Transaction – CT02 – CardDemo" },
+    { path: PATHS.CORPT00, userType: "U", title: "Transaction Reports – CR00 – CardDemo" },
+    { path: PATHS.COBIL00, userType: "U", title: "Bill Payment – CB00 – CardDemo" },
+    { path: PATHS.COUSR00, userType: "A", title: "List Users – CU00 – CardDemo" },
+    { path: PATHS.COUSR01, userType: "A", title: "Add User – CU01 – CardDemo" },
+    { path: PATHS.COUSR02, userType: "A", title: "Update User – CU02 – CardDemo" },
+    { path: PATHS.COUSR03, userType: "A", title: "Delete User – CU03 – CardDemo" },
+    { path: PATHS.COPAU00, userType: "U", title: "View Authorizations – CPVS – CardDemo" },
+    // With no route state COPAU01 goes on to COPAU00; an empty selection keeps it on its own map.
+    {
+      path: PATHS.COPAU01,
+      userType: "U",
+      state: { acct_id: "", auth_key: "" },
+      title: "View Authorization Details – CPVD – CardDemo",
+    },
+    { path: PATHS.COTRTLI, userType: "A", title: "Maintain Transaction Type – CTLI – CardDemo" },
+    { path: PATHS.COTRTUP, userType: "A", title: "Maintain Transaction Type – CTTU – CardDemo" },
+  ])(
+    "$path opens at the top-left of the page, titled $title",
+    async ({ path, userType, state, title }) => {
+      stubFetch();
+      document.title = "CardDemo";
+      setSession("test-token", userType === "A" ? "ADMIN001" : "USER0001", userType);
+      scrollPage(LEFT_TOP, LEFT_LEFT);
+      window.history.scrollRestoration = "auto";
+      const writes = spyOnScroll();
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, { initialEntries: [{ pathname: path, state }] });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      expect(await screen.findByRole("heading", { level: 1 }, { timeout: 5_000 })).toBeTruthy();
+      expect(router.state.location.pathname).toBe(path);
+      expect(writes.top.mock.calls).toEqual([[0]]);
+      expect(writes.left.mock.calls).toEqual([[0]]);
+      expect([page().scrollTop, page().scrollLeft]).toEqual([0, 0]);
+      expect(window.history.scrollRestoration).toBe("manual");
+      expect(document.title).toBe(title);
+      router.dispose();
+    },
+  );
+});
+
+// The reset is the arrival's alone: a key the operator presses and the answer the screen then
+// shows leave the page where the operator scrolled it. The title lasts as long as the screen: the
+// title it replaced returns when the screen is left for a view that renders no frame.
+describe("COUSR01 after its arrival: the scroll offset stays the operator's, the title the screen's", () => {
+  beforeEach(() => {
+    setSession("test-token", "ADMIN001", "A");
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    sessionStorage.clear();
+    scrollPage(0, 0);
+  });
+
+  it("an add and its answer move no scroll offset", async () => {
+    const { sent } = stubFetch({ status: 200, body: added });
+    renderScreen();
+    scrollPage(LEFT_TOP, LEFT_LEFT);
+    const writes = spyOnScroll();
+
+    typeEntry(typed);
+    fireEvent.click(key("ENTER=Add User"));
+
+    await waitFor(() => {
+      expect(messageRow("info").textContent).toBe("User NEWUSR01 has been added ...");
+    });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(inputFor(LABELS.firstName));
+    });
+    expect(sent).toHaveLength(1);
+    expect(writes.top).not.toHaveBeenCalled();
+    expect(writes.left).not.toHaveBeenCalled();
+    expect([page().scrollTop, page().scrollLeft]).toEqual([LEFT_TOP, LEFT_LEFT]);
+    expect(document.title).toBe("Add User – CU01 – CardDemo");
+  });
+
+  it("F3 to a view with no frame gives back the title the screen replaced", async () => {
+    stubFetch();
+    document.title = "CardDemo";
+    renderScreen();
+    expect(document.title).toBe("Add User – CU01 – CardDemo");
+
+    fireEvent.click(key("F3=Back"));
+
+    expect(await screen.findByText(`Stub at ${PATHS.COADM01} null`)).toBeTruthy();
+    expect(document.title).toBe("CardDemo");
   });
 });

@@ -1635,7 +1635,7 @@ describe("COUSR00 behind the route guard", () => {
         </QueryClientProvider>,
       );
 
-      // Both screens load lazily, through the route tree, before the target screen renders.
+      // Only the target screen loads, through the route tree; the refused screen is never imported.
       await waitFor(
         () => {
           expect(router.state.location.pathname).toBe(target);
@@ -1667,8 +1667,8 @@ const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/users`, so the admin guard that only the table
- * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
- * allows 5 s. Returns the router, whose location the test reads.
+ * mounts stands in front of the screen. Each screen is imported by its route's loader, so a wait
+ * for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1906,4 +1906,3 @@ describe("COUSR00 while the screen it transfers to loads", () => {
     },
   );
 });
-

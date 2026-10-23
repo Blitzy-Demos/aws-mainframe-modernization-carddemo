@@ -35,7 +35,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use api::app::{AppState, DOCUMENT_ROUTE, app};
 use api::auth::extract::{ADMIN_REQUIRED, SIGNON_REQUIRED};
-use api::dto::FIELD_LENGTH_MESSAGE;
+use api::dto::{FIELD_LENGTH_MESSAGE, INVALID_BODY};
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Method, Request, header};
@@ -504,6 +504,32 @@ async fn blank_and_length_edits(app: &Router) -> TestResult {
     Ok(())
 }
 
+/// A body whose top-level value is not a JSON object, an array whose elements would fill the
+/// members in order included, is the request layer's 400 with no field: no edit runs, nothing is
+/// read and no token is issued.
+async fn non_object_bodies(app: &Router) -> TestResult {
+    let bodies = [
+        json!(["ADMIN001", DUSRSECJ_PASSWORD]),
+        json!(["USER0001", DUSRSECJ_PASSWORD]),
+        json!([]),
+        Value::Null,
+        json!("ADMIN001"),
+        json!(1),
+        json!(true),
+    ];
+    for (case, body) in bodies.iter().enumerate() {
+        let (status, response) = post_signon(app, body).await?;
+        // The request layer's text: no COBOL literal and no audit row applies.
+        assert_eq!(
+            (status, &response),
+            (400, &screen_error(INVALID_BODY, None)),
+            "non-object body case {case}"
+        );
+        assert_redacted(&response, DUSRSECJ_PASSWORD, "non-object body");
+    }
+    Ok(())
+}
+
 /// A wrong password and an unknown user (COSGN00C-018, COSGN00C-019).
 async fn failed_signons(app: &Router) -> TestResult {
     let (status, body) = sign_on(app, "USER0001", WRONG_PASSWORD).await?;
@@ -575,6 +601,7 @@ async fn cosgn00c_signon_rows() -> TestResult {
     successful_signons(&app, &state).await?;
     no_state_between_signons(&app).await?;
     blank_and_length_edits(&app).await?;
+    non_object_bodies(&app).await?;
     failed_signons(&app).await?;
     stored_as_typed(&app, &state).await
 }

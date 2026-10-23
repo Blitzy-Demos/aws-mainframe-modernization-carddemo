@@ -79,12 +79,14 @@ const DESCRIPTION_ROW = 14;
 const LABEL_CLASS = "h-full whitespace-pre text-foreground";
 
 /**
- * Inputs are as wide as their map `LENGTH` in characters (`size`) rather than as their cells: a
- * grid column is narrower than the input's own padding, so the 2-column `TRTYPCD` cell would
- * leave no room for its text. The input may extend past its cell into the free columns to its
- * right, as no field follows either input on its line.
+ * The width of the `TRTYPCD` input only. Every input carries `size` = its map `LENGTH`, and every
+ * input but this one keeps the `Input` default `w-full`, so the 50-character `TRTYDSC` input is
+ * exactly its 50 columns at every viewport, as COTRTLI's Description Filter is. A grid column is
+ * narrower than a character plus the `Input` padding, so the 2-column `TRTYPCD` input would hide
+ * its own text at `w-full`; it takes its 2-character intrinsic width instead (`w-auto`), running
+ * into the free columns to its right, as no field follows it on its line.
  */
-const INPUT_CLASS = "w-auto";
+const CODE_INPUT_CLASS = "w-auto";
 
 /** `WS-INFO-MSG PIC X(40)`, the width the info row is centred in (COTRTUPC-045). */
 const INFO_WIDTH = 40;
@@ -545,7 +547,10 @@ function MapInputCell({
           tabIndex={editable ? undefined : -1}
           aria-invalid={red || invalid}
           aria-describedby={described ? formMessageId : undefined}
-          className={cn(INPUT_CLASS, red && "text-destructive")}
+          className={cn(
+            length === COTRTUP_LENGTHS.typeCode && CODE_INPUT_CLASS,
+            red && "text-destructive",
+          )}
         />
       </FormControl>
       <FormMessage className="sr-only">{red ? message : undefined}</FormMessage>
@@ -929,7 +934,6 @@ export function COTRTUP(): ReactNode {
                   value={shown.description}
                   maxLength={COTRTUP_LENGTHS.description}
                   size={COTRTUP_LENGTHS.description}
-                  className={INPUT_CLASS}
                   autoComplete="off"
                   readOnly
                   tabIndex={-1}

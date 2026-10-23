@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use api::app::{AppState, app, check_intrdr_dir};
-use api::dto::{FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE};
+use api::dto::{FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, INVALID_BODY};
 use api::error::UNABLE_TO_PROCESS;
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -490,6 +490,7 @@ async fn corpt00c_report_rows() -> TestResult {
     report_selection_rows(&api, &dir).await?;
     report_confirmation_rows(&api, &dir).await?;
     report_map_rows(&api, &dir).await?;
+    report_non_object_rows(&api, &dir).await?;
     report_submission_rows(&api, &dir).await?;
     report_concurrent_row(&api).await?;
     report_month_end_rows(&api).await?;
@@ -659,6 +660,29 @@ async fn report_map_rows(api: &Api, dir: &Path) -> TestResult {
                 )
             );
         }
+    }
+    assert_eq!(deck_names(dir)?, before);
+    Ok(())
+}
+
+/// A body whose top-level value is not a JSON object, an array whose elements would fill the
+/// members in order included, is the request layer's 400 with no field, before any edit, and
+/// writes no deck.
+async fn report_non_object_rows(api: &Api, dir: &Path) -> TestResult {
+    let before = deck_names(dir)?;
+    let bodies = [
+        json!(["X", "", "", "", "", "", "", "", "", "Y"]),
+        json!(["", "X", "", "", "", "", "", "", "", "Y"]),
+        json!([]),
+        Value::Null,
+        json!("X"),
+    ];
+    for body in bodies {
+        let reply = api.post(REPORTS, &body).await?;
+        assert_eq!(
+            (reply.status, reply.body),
+            (StatusCode::BAD_REQUEST, json!({"message": INVALID_BODY}))
+        );
     }
     assert_eq!(deck_names(dir)?, before);
     Ok(())
@@ -1332,6 +1356,7 @@ async fn cobil00c_bill_payment_rows() -> TestResult {
     pay_token_rows(&api, &before, &seed).await?;
     pay_edit_rows(&api, &before, &seed).await?;
     pay_map_rows(&api, &before, &seed).await?;
+    pay_non_object_rows(&api, &before, &seed).await?;
     pay_balance_row(&api, &before, &seed).await?;
     let paid = pay_rows(&api, &before, &seed, at).await?;
     pay_nothing_rows(&api, &paid).await?;
@@ -1451,6 +1476,31 @@ async fn pay_map_rows(api: &Api, before: &AccountRecord, seed: &TransactionRecor
                 Some(member)
             ),
             "{body}"
+        );
+    }
+    assert_unwritten(api, before, seed).await
+}
+
+/// A body whose top-level value is not a JSON object, an array whose elements would fill the
+/// members in order included, is the request layer's 400 with no field, before any edit or read,
+/// and writes nothing.
+async fn pay_non_object_rows(
+    api: &Api,
+    before: &AccountRecord,
+    seed: &TransactionRecord,
+) -> TestResult {
+    let bodies = [
+        json!(["00000000001", "Y"]),
+        json!(["00000000001", ""]),
+        json!([]),
+        Value::Null,
+        json!("00000000001"),
+    ];
+    for body in bodies {
+        let reply = api.post(BILL_PAYMENTS, &body).await?;
+        assert_eq!(
+            (reply.status, reply.body),
+            (StatusCode::BAD_REQUEST, json!({"message": INVALID_BODY}))
         );
     }
     assert_unwritten(api, before, seed).await

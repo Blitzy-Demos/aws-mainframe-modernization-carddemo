@@ -213,6 +213,7 @@ pub struct TranAddRequest {
     #[validate(length(max = 16))]
     pub card_num: Option<String>,
     /// The eleven data fields.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub fields: TranAddFields,
     /// `CONFIRM`, `Y`, `y`, `N`, `n` or blank as typed, `LENGTH=1` (`COTRN02-057`); any other

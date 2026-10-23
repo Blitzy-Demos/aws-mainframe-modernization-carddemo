@@ -564,7 +564,7 @@ describe("COBIL00 bill payment screen", () => {
       </QueryClientProvider>,
     );
 
-    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    // Only the sign-on screen loads, through the route tree; the refused screen is never imported.
     await waitFor(
       () => {
         expect(router.state.location.pathname).toBe(PATHS.COSGN00);
@@ -1479,8 +1479,8 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/bill-payment`, so the sign-on guard that only the
- * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
- * render allows 5 s. Returns the router, whose location the test reads.
+ * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const router = createMemoryRouter(routes, { initialEntries: [PATHS.COBIL00] });

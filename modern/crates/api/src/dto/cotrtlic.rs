@@ -211,6 +211,7 @@ pub struct TranTypeListState {
     pub desc_filter: String,
     /// The seven rows as the last read returned them, top to bottom; `null` is a position the
     /// read left empty (COTRTLIC-004, COTRTLIC-012).
+    #[serde(deserialize_with = "super::objects_or_null")]
     #[validate(length(max = 7), custom(function = "rows_fit"))]
     #[schema(max_items = 7)]
     pub rows: Vec<Option<TranTypeListRow>>,
@@ -243,6 +244,7 @@ pub struct TranTypeListState {
     /// The seven rows the previous response showed, top to bottom; `null` is a position it
     /// left empty. The 3270 returns these protected fields as displayed (COTRTLIC-017,
     /// COTRTLIC-018).
+    #[serde(deserialize_with = "super::objects_or_null")]
     #[validate(length(max = 7), custom(function = "rows_fit"))]
     #[schema(max_items = 7)]
     pub screen_rows: Vec<Option<TranTypeListRow>>,
@@ -407,6 +409,7 @@ pub struct TranTypeListQuery {
     /// Rows per page, 1 to 100, 7 when absent; a page never holds more than the seven
     /// positions of the map. Outside 1 to 100 the request is rejected with 422 (Bounded
     /// Pagination).
+    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[param(minimum = 1, maximum = 100)]
     #[schema(minimum = 1, maximum = 100)]
@@ -718,22 +721,25 @@ pub struct TranTypeListActionRequest {
     #[schema(max_items = 7)]
     pub rows: Vec<TranTypeListRowInput>,
     /// The `state` of the previous response, echoed unchanged.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub state: TranTypeListState,
     /// Rows per page, 1 to 100, 7 when absent; a page never holds more than the seven
     /// positions of the map. Outside 1 to 100 the request is rejected with 422 (Bounded
     /// Pagination).
+    #[serde(default, deserialize_with = "super::page_size_from_json")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     pub page_size: Option<i64>,
 }
 
-/// The rows of an endpoint 25 body, at most the seven positions of the map.
+/// The rows of an endpoint 25 body, at most the seven positions of the map, each a JSON object
+/// as `super::objects` reads it.
 fn at_most_seven<'de, D>(deserializer: D) -> Result<Vec<TranTypeListRowInput>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let rows = Vec::<TranTypeListRowInput>::deserialize(deserializer)?;
+    let rows: Vec<TranTypeListRowInput> = super::objects(deserializer)?;
     if rows.len() > rules::SCREEN_ROWS {
         Err(D::Error::invalid_length(rows.len(), &"at most seven rows"))
     } else {

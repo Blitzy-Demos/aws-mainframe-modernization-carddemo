@@ -13,7 +13,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
-import { getSession, setSession } from "@/auth/session";
+import { getSession, SESSION_KEY, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
 import { COCRDLI } from "./COCRDLI";
 
@@ -313,6 +313,55 @@ function bodyRows(): Element[] {
   return Array.from(table.querySelectorAll("tbody > tr"));
 }
 
+/** A column of the list `Table`: the map column it starts at and its width in map columns. */
+interface ListColumn {
+  readonly start: number;
+  readonly width: number;
+}
+
+/**
+ * The columns of `table` from its `colgroup`, the first starting at map column `first`: each
+ * `col` is a `w-k/n` fraction of the list's `span` map columns, and together they fill it.
+ */
+function listColumns(table: HTMLElement, first: number, span: number): ListColumn[] {
+  const columns: ListColumn[] = [];
+  let start = first;
+  for (const col of table.querySelectorAll("colgroup > col")) {
+    const [, width = "", of = ""] = /^w-(\d+)\/(\d+)$/.exec(col.className) ?? [];
+    expect(of).toBe(String(span));
+    columns.push({ start, width: Number.parseInt(width, 10) });
+    start += Number.parseInt(width, 10);
+  }
+  expect(start).toBe(first + span);
+  return columns;
+}
+
+/**
+ * The map column `element` shows its content at: its column's start, moved by its `left-k/w` or
+ * `-left-k/w` class, `k` of the column's `w` map columns.
+ */
+function shownColumn(element: Element, column: ListColumn | undefined): number {
+  if (column === undefined) {
+    throw new Error("a list cell stands outside the colgroup's columns");
+  }
+  const shift = /(?:^|\s)(-?)left-(\d+)\/(\d+)(?:\s|$)/.exec(element.className);
+  if (shift === null) {
+    return column.start;
+  }
+  const [, sign, moved, of] = shift;
+  expect(element.classList.contains("relative")).toBe(true);
+  expect(of).toBe(String(column.width));
+  const columns = Number.parseInt(moved, 10);
+  return sign === "-" ? column.start - columns : column.start + columns;
+}
+
+/** The map column each cell of `row` shows its text at: its own, or its one wrapper's. */
+function shownColumns(row: Element | undefined, columns: readonly ListColumn[]): number[] {
+  return Array.from(row?.children ?? [], (cell, index) => {
+    return shownColumn(cell.firstElementChild ?? cell, columns.at(index));
+  });
+}
+
 /** The account, card number and status cells of each list row, in screen order. */
 function listedRows(): string[][] {
   return bodyRows().map((row) =>
@@ -481,11 +530,16 @@ describe("COCRDLI", () => {
       " Card Number ",
       "Active ",
     ]);
+    // The dash line is decoration hidden from assistive technology: plain cells, no headers.
     expect(
-      Array.from(table.querySelectorAll('thead > tr[aria-hidden="true"] > th'), (head) => {
-        return head.textContent;
+      Array.from(table.querySelectorAll('thead > tr[aria-hidden="true"] > td'), (cell) => {
+        return cell.textContent;
       }),
     ).toEqual(["------", "---------------", "---------------", "--------"]);
+    expect(table.querySelectorAll("th")).toHaveLength(4);
+    for (const head of table.querySelectorAll("th")) {
+      expect(head.getAttribute("scope")).toBe("col");
+    }
 
     const keys = within(screen.getByRole("group", { name: "Function keys" })).getAllByRole(
       "button",
@@ -681,6 +735,66 @@ describe("COCRDLI", () => {
     // The form's inputs are the page number, the two filters and the seven selectors.
     expect(form.querySelectorAll("input")).toHaveLength(10);
     expect(form.querySelectorAll('input[type="hidden"]')).toHaveLength(0);
+  });
+
+  it.each([
+    { shown: "seven cards", page: FIRST_PAGE, cards: 7 },
+    { shown: "one card", page: ONE_CARD_PAGE, cards: 1 },
+    { shown: "no card", page: NO_RECORDS_PAGE, cards: 0 },
+  ])("keeps the list on the map's columns and lines with $shown", async ({ page, cards }) => {
+    // audit: COCRDLI-020
+    // audit: COCRDLI-021
+    // audit: COCRDLI-022
+    // audit: COCRDLI-023
+    // audit: COCRDLI-024
+    // audit: COCRDLI-025
+    // audit: COCRDLI-026
+    // audit: COCRDLI-027
+    // audit: COCRDLI-028
+    const requests = stubReplies([200, page]);
+    renderScreen();
+    await answered(requests, 1);
+
+    // Fixed columns from the data fields' `POS`: the selector column at 10, the account number
+    // at 22 and the card number at 43. The status column starts at its dash rule's column 65, so
+    // nothing in the last column is shifted left past the table's right edge; it ends at 72.
+    const table = screen.getByRole("table", { name: "Credit cards" });
+    expect(table.classList.contains("table-fixed")).toBe(true);
+    const columns = listColumns(table, 10, 63);
+    expect(columns.map((column) => column.start)).toEqual([10, 22, 43, 65]);
+    for (const cell of table.querySelectorAll("tr > :last-child")) {
+      const shown = cell.firstElementChild ?? cell;
+      expect(shown.className).not.toMatch(/(?:^|\s)-left-/);
+    }
+    // Captions at (9,10), (9,21), (9,45), (9,66); dashes at (10,10), (10,20), (10,43), (10,65).
+    const [captions, dashes] = Array.from(table.querySelectorAll("thead > tr"));
+    expect(shownColumns(captions, columns)).toEqual([10, 21, 45, 66]);
+    expect(shownColumns(dashes, columns)).toEqual([10, 20, 43, 65]);
+    // Each card's selector at column 12; a row without a card holds no selector.
+    const selectors = Array.from(table.querySelectorAll("tbody input"));
+    expect(selectors).toHaveLength(cards);
+    for (const input of selectors) {
+      expect(shownColumn(input, columns.at(0))).toBe(12);
+    }
+    // Each card's account number at (11,22), card number at (11,43) and status at (11,67).
+    const cardRows = bodyRows().slice(0, cards);
+    expect(cardRows.map((row) => row.textContent)).not.toContain("");
+    for (const row of cardRows) {
+      const values = Array.from(row.children).slice(1);
+      const shown = values.map((cell, index) => {
+        return shownColumn(cell.firstElementChild ?? cell, columns.at(index + 1));
+      });
+      expect(shown).toEqual([22, 43, 67]);
+    }
+    // Nine rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    expect(table.querySelectorAll("tr")).toHaveLength(9);
+    for (const row of table.querySelectorAll("tr")) {
+      expect(row.classList.contains("h-10")).toBe(true);
+    }
+    for (const cell of table.querySelectorAll("th, td")) {
+      expect(cell.classList.contains("px-0")).toBe(true);
+      expect(cell.classList.contains("pt-0")).toBe(true);
+    }
   });
 
   it.each(
@@ -1403,8 +1517,8 @@ const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/cards`, so the sign-on guard that only the table
- * mounts stands in front of the screen. Its screens load lazily, so a wait for one to render
- * allows 5 s. Returns the router, whose location the test reads.
+ * mounts stands in front of the screen. Each screen is imported by its route's loader, so a wait
+ * for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1465,6 +1579,48 @@ describe("COCRDLI in the route table: a 401 ends the session", () => {
       router.dispose();
     },
   );
+});
+
+// A page restored from the back/forward cache resumes the screen it was frozen with, while a later
+// page of the same tab may have signed off in the `sessionStorage` they share. The session leaves
+// storage here unannounced, as that later page's sign-off reaches this one. A restore (`pageshow`
+// with `persisted`) has the sign-on guard read the session again and replace the card list with
+// sign-on; a `pageshow` that is no restore leaves the list and starts no navigation.
+describe("COCRDLI in the route table: a pageshow after the session left storage", () => {
+  it.each([
+    { persisted: true, path: PATHS.COSGN00, shown: "ENTER=Sign-on", gone: "F8=Forward" },
+    { persisted: false, path: PATHS.COCRDLI, shown: "F8=Forward", gone: "ENTER=Sign-on" },
+  ])("with persisted $persisted ends at $path", async ({ persisted, path, shown, gone }) => {
+    const seen = stubReplies([200, FIRST_PAGE]);
+    const router = renderRouteTable();
+    // The screen's module is imported by its route's loader, so the wait for it allows 5 s.
+    expect(
+      await screen.findByRole(
+        "heading",
+        { level: 1, name: "List Credit Cards" },
+        { timeout: 5_000 },
+      ),
+    ).toBeDefined();
+    await firstPageShown();
+    await answered(seen, 1);
+
+    sessionStorage.removeItem(SESSION_KEY);
+    expect(getSession()).toBeNull();
+    // Nothing announced the removal, so the guard still shows the list.
+    expect(screen.getByRole("heading", { level: 1, name: "List Credit Cards" })).toBeDefined();
+
+    act(() => {
+      window.dispatchEvent(new PageTransitionEvent("pageshow", { persisted }));
+    });
+
+    expect(await screen.findByRole("button", { name: shown }, { timeout: 5_000 })).toBeDefined();
+    expect(router.state.navigation.state).toBe("idle");
+    expect(router.state.location.pathname).toBe(path);
+    expect(screen.queryByRole("button", { name: gone })).toBeNull();
+    expect(getSession()).toBeNull();
+    expect(listQueries(seen)).toHaveLength(1);
+    router.dispose();
+  });
 });
 
 /** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */
@@ -1677,4 +1833,3 @@ describe("COCRDLI while the card screen it opens loads", () => {
     },
   );
 });
-

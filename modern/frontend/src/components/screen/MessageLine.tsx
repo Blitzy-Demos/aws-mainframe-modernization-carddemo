@@ -30,6 +30,12 @@ export type MessageLineProps = {
    * it bright.
    */
   bright: boolean;
+  /**
+   * The send the text belongs to (`ShellMessage.send`). A new value replaces the text element
+   * inside the live region, which stays, so a repeated text is announced again; absent, the text
+   * element is kept across renders.
+   */
+  send?: number;
 };
 
 /**
@@ -46,10 +52,14 @@ export type MessageLineProps = {
  * `data-message-empty` marks a row that shows no message, so `src/index.css` can keep its border
  * invisible in forced-colors mode, which overrides `transparent`.
  *
+ * A screen that numbers its sends passes `send`, the key of the `AlertDescription`: a new send
+ * replaces the text element while the `Alert` and its live region stay, so the region announces
+ * the text again even when it equals the last one's, as the terminal showed it again.
+ *
  * The text is shown verbatim, spacing included, and is never composed, formatted or logged here:
  * the server owns every message, and any card number in one already arrives redacted.
  */
-export function MessageLine({ text, kind, bright }: MessageLineProps): ReactNode {
+export function MessageLine({ text, kind, bright, send }: MessageLineProps): ReactNode {
   const isError = kind === "error";
   const isEmpty = !text?.trim();
   return (
@@ -74,6 +84,7 @@ export function MessageLine({ text, kind, bright }: MessageLineProps): ReactNode
        * `BRT` maps to `font-semibold` whatever the colour.
        */}
       <AlertDescription
+        key={send}
         className={cn(
           "min-h-5 whitespace-pre-wrap break-words",
           !isError && "text-inherit",

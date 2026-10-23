@@ -13,6 +13,7 @@ import type { components } from "@/api/schema";
 import {
   SESSION_KEY,
   type StoredSession,
+  clearSession,
   getSession,
   getSessionSnapshot,
   getToken,
@@ -1197,9 +1198,11 @@ describe("COSGN00 in the route table: a session listener that throws", () => {
 // `subscribeSession` and `getSessionSnapshot` are the store `RequireSignon` reads through
 // `useSyncExternalStore`. The screen makes the session changes: every entry and F3 end the session
 // (`clearSession`) and a successful sign-on stores it (`setSession`); only a session left by an
-// earlier sign-on is seeded directly. That a listener reads the session the change made, and that
-// a throwing listener stops neither the listener after it nor the screen, is proven by "COSGN00 in
-// the route table: a session listener that throws".
+// earlier sign-on is seeded directly. A restore from the back/forward cache is the window's
+// `pageshow`, fired directly, and where no window can be reached the store is called directly,
+// because no screen renders without one. That a listener reads the session the change made, and
+// that a throwing listener stops neither the listener after it nor the screen, is proven by
+// "COSGN00 in the route table: a session listener that throws".
 describe("COSGN00 session changes: subscribeSession and getSessionSnapshot", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -1221,6 +1224,16 @@ describe("COSGN00 session changes: subscribeSession and getSessionSnapshot", () 
   function pressF3(): void {
     fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
     expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+  }
+
+  /** Fires the window's `pageshow`: a restore from the back/forward cache when `persisted`. */
+  function showPage(persisted: boolean): void {
+    globalThis.dispatchEvent(new PageTransitionEvent("pageshow", { persisted }));
+  }
+
+  /** The handlers of the `pageshow` calls among `calls` to add or remove a listener, in order. */
+  function pageshowHandlers(calls: readonly (readonly unknown[])[]): unknown[] {
+    return calls.filter((call) => call[0] === "pageshow").map((call) => call[1]);
   }
 
   // Each change calls every listener once, a function subscribed twice is held and called once,
@@ -1356,4 +1369,67 @@ describe("COSGN00 session changes: subscribeSession and getSessionSnapshot", () 
       expect(listener).toHaveBeenCalledTimes(2);
     },
   );
+
+  // A restore from the back/forward cache (`pageshow` with `persisted`) is announced as a session
+  // change is: once to each listener, a function subscribed twice included, through one window
+  // handler that the first listener adds and the last one's removal takes away. Any other
+  // `pageshow` is a fresh load and announces nothing.
+  it("announces each back/forward-cache restore once per listener through one window handler, which leaves with the last listener", () => {
+    const added = vi.spyOn(globalThis, "addEventListener");
+    const removed = vi.spyOn(globalThis, "removeEventListener");
+    const first = vi.fn();
+    const second = vi.fn();
+    const unsubscribeFirst = subscribe(first);
+    const unsubscribeSecond = subscribe(second);
+    subscribe(second);
+    const handlers = pageshowHandlers(added.mock.calls);
+    expect(handlers).toHaveLength(1);
+
+    showPage(false);
+    expect(first).not.toHaveBeenCalled();
+    expect(second).not.toHaveBeenCalled();
+
+    showPage(true);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(1);
+
+    // Another listener still holds the handler on the window.
+    unsubscribeFirst();
+    showPage(true);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(second).toHaveBeenCalledTimes(2);
+    expect(pageshowHandlers(removed.mock.calls)).toEqual([]);
+
+    unsubscribeSecond();
+    expect(pageshowHandlers(removed.mock.calls)).toEqual(handlers);
+    showPage(true);
+    expect(second).toHaveBeenCalledTimes(2);
+    expect(pageshowHandlers(added.mock.calls)).toEqual(handlers);
+  });
+
+  // With no window, or one that takes no listeners, a subscription adds no `pageshow` handler and
+  // cannot throw: session changes are still announced, a restore cannot be, and unsubscribing
+  // still removes the listener.
+  it.each([
+    { why: "there is no window", page: undefined },
+    { why: "the window takes no event listeners", page: {} },
+  ])("holds, notifies and removes a listener, with no pageshow handler, when $why", ({ page }) => {
+    const added = vi.spyOn(globalThis, "addEventListener");
+    vi.stubGlobal("window", page);
+    const listener = vi.fn();
+    const unsubscribe = subscribe(listener);
+
+    setSession("test-token", "USER0001", "U");
+    clearSession();
+    expect(listener).toHaveBeenCalledTimes(2);
+    showPage(true);
+    expect(listener).toHaveBeenCalledTimes(2);
+
+    expect(() => {
+      unsubscribe();
+    }).not.toThrow();
+    setSession("test-token", "USER0001", "U");
+    expect(listener).toHaveBeenCalledTimes(2);
+    expect(pageshowHandlers(added.mock.calls)).toEqual([]);
+  });
 });

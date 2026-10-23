@@ -35,7 +35,13 @@
 //!
 //! - A body, query string or path that does not deserialise into `T`: 400 with
 //!   [`INVALID_BODY`], [`INVALID_QUERY`] or [`INVALID_PATH`] and no field. That covers malformed
-//!   JSON, a missing JSON content type, a path segment whose percent-encoding is not UTF-8, a
+//!   JSON, a missing JSON content type, a body whose top-level value is not a JSON object (an
+//!   array, even one whose elements would fill the members in order, `null`, a string, a number
+//!   or a boolean), the same in a nested request member or list item whose schema is an object,
+//!   which reads through `object`, `objects` or `objects_or_null` (`fields` and `snapshot`
+//!   of endpoints 6 and 10, `fields` of endpoint 13, and the `rows` items, `state`, and the
+//!   `state.rows` and `state.screen_rows` items of endpoint 25, where `null` stays an empty
+//!   position), a path segment whose percent-encoding is not UTF-8, a
 //!   value of the wrong type (text where an integer belongs, for instance) and an unknown enum
 //!   value. An attention key whose program answers unserved keys itself (`cotrtupc`,
 //!   `cotrn02c`) reads every other key name as a hidden variant instead, so that the program's
@@ -44,8 +50,10 @@
 //!   `user_id`, `fields.zip` or `rows[3].description`, with the text of the rule's code
 //!   ([`FIELD_LENGTH_MESSAGE`] for `length` and [`PIC_X_CODE`], [`FIELD_NUMERIC_MESSAGE`] or
 //!   [`FIELD_RANGE_MESSAGE`]).
-//! - `page_size` outside [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`]: 422 with [`PAGE_SIZE_MESSAGE`]
-//!   and field `page_size`, whatever else failed. It is the only 422 of the API.
+//! - A `page_size` that is not an integer from [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`], be it out
+//!   of range, beyond `i64`, beyond the range of the JSON parser or no integer at all: 422 with
+//!   [`PAGE_SIZE_MESSAGE`] and field `page_size`, whatever other rule failed. It is the only 422
+//!   of the API.
 //!
 //! # Redaction
 //!
@@ -59,9 +67,18 @@
 //! Every collection DTO (`CardListQuery`, `TranListQuery`, `UserListQuery`, `AuthSummaryQuery`,
 //! `TranTypeListQuery` and `TranTypeListActionRequest`) declares `page_size: Option<i64>` with
 //! `#[validate(range(min = 1, max = 100))]` and `#[schema(minimum = 1, maximum = 100)]` or
-//! `#[param(minimum = 1, maximum = 100)]`. The field is `i64` rather than an unsigned type so
-//! that `0`, a negative value and `101` all deserialise and reach the range rule, which answers
-//! 422; a value that is not an integer at all fails deserialisation and is a 400. The screens
+//! `#[param(minimum = 1, maximum = 100)]`, and reads it with `#[serde(default, deserialize_with
+//! = ..)]` through `page_size_from_query` on a query string or `page_size_from_json` on
+//! endpoint 25's body. Neither refuses a value, so every `page_size` that is not an integer from
+//! 1 to 100 reaches the range rule as an `i64` outside it, which answers 422: `0`, a negative
+//! value and `101` as themselves, and an integer beyond `i64` and anything else that is no
+//! integer (text such as `abc`, an empty value or `1.5`, and in a body also a string, a boolean,
+//! an array or an object) as a value outside the range. So is a number in the body beyond the
+//! range the JSON parser represents, such as an integer of 310 digits or `1e400`, which
+//! `serde_json` refuses before `page_size_from_json` sees it: [`ValidJson`] reads the body again
+//! with that number replaced by a size outside the range. The field is `i64` rather than an
+//! unsigned type for the same reason. A JSON `null` is an absent size. Another member that does
+//! not deserialise still makes the request the 400 above, whatever its `page_size`. The screens
 //! never send it, and [`resolve_page_size`] gives the program's screen size when it is absent.
 
 // In endpoint order. Each declaration stands alone because rustfmt sorts a run of adjacent `mod`
@@ -108,12 +125,19 @@ pub mod cotrtlic; // endpoints 24 and 25
 
 pub mod cotrtupc; // endpoints 26 and 27
 
+use std::fmt;
+use std::marker::PhantomData;
+
 use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
 use domain::copybook::{PicU, PicX};
-use serde::de::DeserializeOwned;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{DeserializeOwned, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 use utoipa::ToSchema;
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
@@ -198,6 +222,68 @@ pub fn resolve_page_size(requested: Option<i64>, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+/// The `page_size` a value that is not an integer at all reads as: one below [`MIN_PAGE_SIZE`],
+/// so that the range rule answers it with the same 422 as every other size outside the range.
+const NON_INTEGER_PAGE_SIZE: i64 = MIN_PAGE_SIZE - 1;
+
+/// `page_size` from a query string, for `#[serde(default, deserialize_with =
+/// "super::page_size_from_query")]` on the member of a collection query.
+///
+/// It never fails, so that every value reaches the range rule, which answers anything outside
+/// [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`] with the 422 of Bounded Pagination rather than the 400
+/// of a query that does not deserialise. The text is read as [`page_size_from_text`] reads it
+/// and is not kept, so no rejection can echo it.
+fn page_size_from_query<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.map(|text| page_size_from_text(&text)))
+}
+
+/// The integer a query-string `page_size` holds, as `str::parse::<i64>` reads it, so that `7`,
+/// `+7` and `007` are 7 and `0101` is 101. An integer beyond `i64`, digits after an optional
+/// sign, saturates to `i64::MAX` or `i64::MIN`; any other text, the empty value included, is
+/// [`NON_INTEGER_PAGE_SIZE`]. Each of those lies outside the range.
+fn page_size_from_text(text: &str) -> i64 {
+    text.parse::<i64>()
+        .unwrap_or_else(|error| match error.kind() {
+            std::num::IntErrorKind::PosOverflow => i64::MAX,
+            std::num::IntErrorKind::NegOverflow => i64::MIN,
+            _ => NON_INTEGER_PAGE_SIZE,
+        })
+}
+
+/// `page_size` from a JSON body, for `#[serde(default, deserialize_with =
+/// "super::page_size_from_json")]` on the member of endpoint 25's request.
+///
+/// It fails only where `serde_json` cannot read the member's value at all, so that every value
+/// reaches the range rule and its 422, as in [`page_size_from_query`]. A number beyond the range
+/// of a 64-bit float, which the parser refuses before this function runs, reaches it through
+/// `read_past_unrepresentable_page_size` as [`NON_INTEGER_PAGE_SIZE`]. `null` is an absent size
+/// and an integer `i64` holds is itself. One above `i64::MAX` that `u64` holds saturates to
+/// `i64::MAX`. Every other value is [`NON_INTEGER_PAGE_SIZE`]: a number with a fraction or an
+/// exponent, an integer below `i64::MIN` or above `u64::MAX`, which `serde_json` reads as such
+/// a number, a string (`"7"` included, as the member is a JSON integer), a boolean, an array
+/// and an object. The value is not kept, so no rejection can echo it.
+fn page_size_from_json<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::Number(number) => Some(
+            number
+                .as_i64()
+                .or_else(|| number.as_u64().map(|_| i64::MAX))
+                .unwrap_or(NON_INTEGER_PAGE_SIZE),
+        ),
+        serde_json::Value::Bool(_)
+        | serde_json::Value::String(_)
+        | serde_json::Value::Array(_)
+        | serde_json::Value::Object(_) => Some(NON_INTEGER_PAGE_SIZE),
+    })
+}
+
 /// The message of a body that does not deserialise into its DTO.
 ///
 /// A fixed text of this crate: it never includes the deserialiser's error, which quotes the
@@ -260,8 +346,18 @@ const RANGE_CODE: &str = "range";
 ///
 /// A handler that takes it declares `request_body = T` in its `#[utoipa::path]`. The rejection
 /// is a [`ScreenError`]: 400 with [`INVALID_BODY`] when the body does not deserialise (the JSON
-/// content type is required), otherwise the error of the first failing rule, or the 422 of an
-/// out-of-range `page_size`.
+/// content type is required, and so is a JSON object as the top-level value and in every member
+/// or list item whose schema is an object: an array, `null`, a string, a number or a boolean is
+/// refused there before any rule runs, even an array whose elements would fill the members in
+/// order, and `null` stays an empty position where the list admits one), otherwise the error of
+/// the first failing rule, or the 422 of an out-of-range `page_size`.
+///
+/// A top-level `page_size` that holds a JSON number beyond the range the JSON parser represents,
+/// such as an integer of 310 digits or `1e400`, is read as a size outside the range too, so it
+/// gets the same 422. `serde_json` refuses such a number while parsing it, before any rule or
+/// `deserialize_with` function sees it, so the body is buffered under the route's body limit
+/// and read again, as `read_past_unrepresentable_page_size` sets out. A body that does not
+/// deserialise for any other reason, beside that number or without it, stays the 400.
 #[derive(Debug, Clone)]
 pub struct ValidJson<T>(pub T);
 
@@ -273,14 +369,264 @@ where
     type Rejection = ScreenError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        // The rejection's own text quotes the offending input, so it is dropped unread.
-        let Json(value) = Json::<T>::from_request(req, state)
+        // Buffered once, under the route's body limit, so that a body can be read a second time
+        // below; axum's own extractor then reads the copy, its content-type rule included.
+        let (parts, body) = req.into_parts();
+        let bytes = Bytes::from_request(Request::from_parts(parts.clone(), body), state)
             .await
             .map_err(|_| ScreenError::input(INVALID_BODY, None))?;
+        let read = Json::<ObjectBody<T>>::from_request(
+            Request::from_parts(parts, Body::from(bytes.clone())),
+            state,
+        )
+        .await;
+        // A rejection's own text quotes the offending input, so it is dropped unread.
+        let value = match read {
+            Ok(Json(ObjectBody(value))) => value,
+            Err(JsonRejection::JsonSyntaxError(_)) => {
+                read_past_unrepresentable_page_size(&bytes)
+                    .ok_or_else(|| ScreenError::input(INVALID_BODY, None))?
+            }
+            Err(_) => return Err(ScreenError::input(INVALID_BODY, None)),
+        };
         value
             .validate()
             .map_err(|errors| validation_error(&errors))?;
         Ok(Self(value))
+    }
+}
+
+/// `T` read from `bytes` when the one reason it does not deserialise is a top-level `page_size`
+/// holding a JSON number beyond the range `serde_json` represents; `None` otherwise.
+///
+/// `serde_json`, built without arbitrary precision, refuses a number beyond the 64-bit float range
+/// with a syntax error while it parses the number, so `page_size_from_json` never receives it.
+/// Such a number lies outside [`MIN_PAGE_SIZE`] to [`MAX_PAGE_SIZE`] whatever its sign, so it is
+/// replaced by [`NON_INTEGER_PAGE_SIZE`], a size the range rule answers with 422, and the body
+/// is read again. Each step below must hold, or the body stays the 400 of a body that does not
+/// deserialise:
+///
+/// 1. The body is well-formed JSON. `IgnoredAny` checks the grammar of every number without
+///    converting it, so a malformed number such as `1.e5`, a truncated body and text after the
+///    value fail here.
+/// 2. `T` stops at a syntax error, and [`PageSizeMember`], which reads the top-level `page_size`
+///    alone and skips every other member, stops at the same line and column with a syntax
+///    error: the fault lies inside that member's value, and no member before it failed.
+/// 3. That position, just past the last byte the parser consumed, falls inside a run of number
+///    bytes that is, on its own, a well-formed JSON number the parser cannot represent.
+/// 4. `T` deserialises from the body with that number replaced. A member that does not
+///    deserialise after `page_size` still fails here, as one before it fails `T`'s first
+///    reading, so the answer does not depend on member order.
+///
+/// Only error positions and categories are read, never an error's text, which quotes the input.
+fn read_past_unrepresentable_page_size<T: DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    serde_json::from_slice::<IgnoredAny>(bytes).ok()?;
+    let failure = serde_json::from_slice::<ObjectBody<T>>(bytes).err()?;
+    let probe = serde_json::from_slice::<PageSizeMember>(bytes).err()?;
+    let same_fault = failure.classify() == Category::Syntax
+        && probe.classify() == Category::Syntax
+        && (probe.line(), probe.column()) == (failure.line(), failure.column());
+    if !same_fault {
+        return None;
+    }
+    let offset = byte_offset(bytes, failure.line(), failure.column())?;
+    let (start, end) = unrepresentable_number_at(bytes, offset)?;
+    let mut patched = Vec::with_capacity(bytes.len());
+    patched.extend_from_slice(bytes.get(..start)?);
+    patched.extend_from_slice(NON_INTEGER_PAGE_SIZE.to_string().as_bytes());
+    patched.extend_from_slice(bytes.get(end..)?);
+    Json::<ObjectBody<T>>::from_bytes(&patched)
+        .ok()
+        .map(|Json(ObjectBody(value))| value)
+}
+
+/// A JSON object read for its top-level `page_size` member alone, as `page_size_from_json`
+/// reads that member's value, every other member skipped unread: the reading
+/// `read_past_unrepresentable_page_size` compares a DTO's failure with. Anything but an object
+/// fails at once, as [`ObjectBody`] does.
+struct PageSizeMember;
+
+impl<'de> Deserialize<'de> for PageSizeMember {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(PageSizeMember)
+    }
+}
+
+impl<'de> Visitor<'de> for PageSizeMember {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        while let Some(key) = map.next_key::<String>()? {
+            if key == PAGE_SIZE_FIELD {
+                map.next_value::<serde_json::Value>()?;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        Ok(self)
+    }
+}
+
+/// The byte offset in `bytes` of the position a `serde_json` error over a slice reports: `line`
+/// counts from 1, and `column` is the reader's index less the offset at which its line starts.
+/// `None` for line 0, which a syntax error never reports, or for a position beyond the body.
+fn byte_offset(bytes: &[u8], line: usize, column: usize) -> Option<usize> {
+    let line_start = match line {
+        0 => return None,
+        1 => 0,
+        _ => {
+            let (newline, _) = bytes
+                .iter()
+                .enumerate()
+                .filter(|&(_, &byte)| byte == b'\n')
+                .nth(line.checked_sub(2)?)?;
+            newline.checked_add(1)?
+        }
+    };
+    line_start
+        .checked_add(column)
+        .filter(|&offset| offset <= bytes.len())
+}
+
+/// The bounds of the JSON number that `offset`, the parser's index just past the last byte it
+/// consumed, falls inside: the run of number bytes before `offset` and on after it, as the
+/// parser stops inside the exponent of a number whose exponent overflows. `None` unless a
+/// number byte precedes `offset` and the run, on its own, is a well-formed JSON number that
+/// `serde_json` cannot represent: `IgnoredAny` accepts it and `Value` refuses it.
+fn unrepresentable_number_at(bytes: &[u8], offset: usize) -> Option<(usize, usize)> {
+    let (before, after) = bytes.split_at_checked(offset)?;
+    let start = match before.iter().rposition(|&byte| !is_number_byte(byte)) {
+        Some(delimiter) => delimiter.checked_add(1)?,
+        None => 0,
+    };
+    let run_after = after
+        .iter()
+        .position(|&byte| !is_number_byte(byte))
+        .unwrap_or(after.len());
+    let end = offset.checked_add(run_after)?;
+    let token = bytes.get(start..end)?;
+    let unrepresentable = start < offset
+        && serde_json::from_slice::<IgnoredAny>(token).is_ok()
+        && serde_json::from_slice::<serde_json::Value>(token).is_err();
+    unrepresentable.then_some((start, end))
+}
+
+/// Whether `byte` can belong to a JSON number: a digit, a sign, a decimal point or an exponent
+/// marker.
+fn is_number_byte(byte: u8) -> bool {
+    byte.is_ascii_digit() || matches!(byte, b'+' | b'-' | b'.' | b'e' | b'E')
+}
+
+/// A JSON object deserialised into `T`: a request body, or through [`object`], [`objects`] and
+/// [`objects_or_null`] a request member or list item whose schema is an object.
+///
+/// serde's derived `Deserialize` of a struct also reads a JSON array, element by element in
+/// member order, so `["ADMIN001","PASSWORD"]` would read as a sign-on request, `[]` as `{}`, and
+/// `"fields":["Y","2014"]` as an account update's fields. Every request body is a `type: object`
+/// schema, and so is every struct it nests, so this wrapper asks the deserialiser for a map and
+/// nothing else: an array, a string, a number, a boolean or `null` in its place fails to
+/// deserialise, at the top level and at every depth whose member reads through these helpers.
+/// The object's members then reach `T`'s own derived visitor exactly as they arrive, which keeps
+/// its rejection of a duplicate member, its defaults for omitted members, its reading of unknown
+/// ones and the `deserialize_with` rules of its own members.
+struct ObjectBody<T>(T);
+
+impl<'de, T> Deserialize<'de> for ObjectBody<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        object(deserializer).map(Self)
+    }
+}
+
+/// A request member whose schema is an object, for `#[serde(deserialize_with =
+/// "super::object")]` on a struct-typed member of a request DTO.
+///
+/// # Errors
+///
+/// The deserialiser's invalid-type error when the member holds anything but a JSON object, an
+/// array whose elements would fill `T`'s members in order included, or `T`'s own error for the
+/// object's members. Neither reaches a response: [`ValidJson`] answers any of them with
+/// [`INVALID_BODY`] and no field.
+pub(crate) fn object<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_map(ObjectVisitor(PhantomData))
+}
+
+/// A request member whose schema is a list of objects, for `#[serde(deserialize_with =
+/// "super::objects")]` on a `Vec<T>` member of a request DTO, or for a `deserialize_with` rule
+/// that reads the list through it before checking it further.
+///
+/// # Errors
+///
+/// As [`object`], for the member when it is not a JSON array and for each item that is not a
+/// JSON object, `null` included.
+pub(crate) fn objects<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Vec::<ObjectBody<T>>::deserialize(deserializer)?
+        .into_iter()
+        .map(|ObjectBody(item)| item)
+        .collect())
+}
+
+/// A request member whose schema is a list of positions, each an object or `null`, for
+/// `#[serde(deserialize_with = "super::objects_or_null")]` on a `Vec<Option<T>>` member of a
+/// request DTO: `null` is an empty position, as before.
+///
+/// # Errors
+///
+/// As [`object`], for the member when it is not a JSON array and for each item that is neither
+/// a JSON object nor `null`.
+pub(crate) fn objects_or_null<'de, D, T>(deserializer: D) -> Result<Vec<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Vec::<Option<ObjectBody<T>>>::deserialize(deserializer)?
+        .into_iter()
+        .map(|item| item.map(|ObjectBody(item)| item))
+        .collect())
+}
+
+/// The visitor of [`ObjectBody`] and [`object`]: it accepts a map alone and hands it to `T`, so
+/// a sequence or a scalar is the deserialiser's invalid-type error.
+struct ObjectVisitor<T>(PhantomData<T>);
+
+impl<'de, T> Visitor<'de> for ObjectVisitor<T>
+where
+    T: Deserialize<'de>,
+{
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON object")
+    }
+
+    fn visit_map<A>(self, map: A) -> Result<T, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        T::deserialize(MapAccessDeserializer::new(map))
     }
 }
 
@@ -522,13 +868,24 @@ mod tests {
     use axum::routing::get;
     use axum::{Json, Router};
     use domain::copybook::{PicU, PicX};
-    use domain::online::{cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
+    use domain::online::{coactupc, cocrdlic, copaus0c, cotrn00c, cotrtlic, cousr00c};
     use serde::Deserialize;
+    use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
     use tower::ServiceExt as _;
     use utoipa::ToSchema;
     use validator::{Validate, ValidationError};
 
+    use super::coactupc::{AccountUpdateRequest, AccountUpdateSnapshot};
+    use super::cobil00c::BillPaymentRequest;
+    use super::cocrdupc::CardUpdateRequest;
+    use super::corpt00c::ReportRequest;
+    use super::cosgn00c::SignonRequest;
+    use super::cotrn02c::TranAddRequest;
+    use super::cotrtlic::TranTypeListActionRequest;
+    use super::cotrtupc::TranTypeActionRequest;
+    use super::cousr01c::UserAddRequest;
+    use super::cousr02c::UserUpdateRequest;
     use super::{
         FIELD_LENGTH_MESSAGE, FIELD_NUMERIC_MESSAGE, FIELD_RANGE_MESSAGE, INVALID_BODY,
         INVALID_PATH, INVALID_QUERY, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_SIZE_FIELD,
@@ -563,6 +920,7 @@ mod tests {
     #[derive(Debug, Default, Deserialize, Validate)]
     #[serde(default)]
     struct Probe {
+        #[serde(default, deserialize_with = "super::page_size_from_json")]
         #[validate(range(min = 1, max = 100))]
         page_size: Option<i64>,
         #[validate(range(min = 1))]
@@ -571,17 +929,22 @@ mod tests {
         user_id: String,
         #[validate(length(max = 2), custom(function = "super::numeric"))]
         start_month: String,
+        #[serde(deserialize_with = "super::object")]
         #[validate(nested)]
         inner: Inner,
+        #[serde(deserialize_with = "super::objects")]
         #[validate(nested)]
         rows: Vec<Row>,
     }
 
-    /// A query-string request: page size and one text filter.
+    /// A query-string request: page size, page number and one text filter.
     #[derive(Debug, Deserialize, Validate)]
     struct QueryProbe {
+        #[serde(default, deserialize_with = "super::page_size_from_query")]
         #[validate(range(min = 1, max = 100))]
         page_size: Option<i64>,
+        #[validate(range(min = 0))]
+        page_no: Option<i64>,
         #[validate(length(max = 8))]
         start_user_id: Option<String>,
     }
@@ -606,6 +969,62 @@ mod tests {
             .uri("/probe")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(body.to_owned()))
+    }
+
+    /// Asserts that `body`, posted to a `ValidJson<T>` extractor, is the 400 of a body that does
+    /// not deserialise: [`INVALID_BODY`] and no field.
+    async fn assert_unreadable<T: DeserializeOwned + Validate>(body: &str) -> TestResult {
+        let dto = std::any::type_name::<T>();
+        let error = ValidJson::<T>::from_request(json_request(body)?, &())
+            .await
+            .err()
+            .ok_or_else(|| format!("{dto} accepted {body}"))?;
+        assert_eq!(
+            parts(&error),
+            (StatusCode::BAD_REQUEST, INVALID_BODY, None),
+            "{dto}: {body}"
+        );
+        Ok(())
+    }
+
+    /// Asserts that `body` reads through `ValidJson<T>`, then replaces the object at each of
+    /// `members`, a JSON pointer into `body` with the array that fills that object's members in
+    /// order, by that array, an empty array, a string, a number and a boolean in turn. Asserts
+    /// that each refusal is the 400 of a body that does not deserialise, and returns every
+    /// replacement `T` accepted instead, as `type pointer = value`.
+    async fn object_members_accepted<T: DeserializeOwned + Validate>(
+        body: &Value,
+        members: &[(&str, Value)],
+    ) -> Result<Vec<String>, Box<dyn StdError>> {
+        let dto = std::any::type_name::<T>();
+        ValidJson::<T>::from_request(json_request(&body.to_string())?, &())
+            .await
+            .map_err(|error| format!("{dto} refused its object body: {error}"))?;
+        let mut accepted = Vec::new();
+        for (pointer, positional) in members {
+            if !body.pointer(pointer).is_some_and(Value::is_object) {
+                return Err(format!("{dto}: no object at {pointer}").into());
+            }
+            for value in [
+                positional.clone(),
+                json!([]),
+                json!("x"),
+                json!(7),
+                json!(true),
+            ] {
+                let mut altered = body.clone();
+                *altered.pointer_mut(pointer).ok_or(*pointer)? = value.clone();
+                match ValidJson::<T>::from_request(json_request(&altered.to_string())?, &()).await {
+                    Ok(_) => accepted.push(format!("{dto} {pointer} = {value}")),
+                    Err(error) => assert_eq!(
+                        parts(&error),
+                        (StatusCode::BAD_REQUEST, INVALID_BODY, None),
+                        "{dto} {pointer} = {value}"
+                    ),
+                }
+            }
+        }
+        Ok(accepted)
     }
 
     async fn query(uri: &str) -> Result<Result<QueryProbe, ScreenError>, axum::http::Error> {
@@ -950,19 +1369,37 @@ mod tests {
             )
         );
 
-        let oversized =
-            ValidJson::<Probe>::from_request(json_request(r#"{"page_size":101}"#)?, &())
+        // Out of range, beyond `i64` or no integer at all: the 422, which echoes nothing.
+        for size in [
+            "101".to_owned(),
+            format!("{CARD}{CARD}"),
+            format!("\"{CARD}\""),
+            "1.5".to_owned(),
+            "true".to_owned(),
+            format!("[{CARD}]"),
+        ] {
+            let body = format!(r#"{{"page_size":{size},"user_id":"USER00010"}}"#);
+            let error = ValidJson::<Probe>::from_request(json_request(&body)?, &())
                 .await
                 .err()
-                .ok_or("page_size 101 accepted")?;
-        assert_eq!(oversized.status(), StatusCode::UNPROCESSABLE_ENTITY);
+                .ok_or("page_size accepted")?;
+            assert_eq!(
+                parts(&error),
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    PAGE_SIZE_MESSAGE,
+                    Some(PAGE_SIZE_FIELD)
+                )
+            );
+            assert!(!serde_json::to_string(&error)?.contains("4111"));
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn unreadable_bodies_are_a_400_that_echoes_nothing() -> TestResult {
         let mut requests = vec![
-            json_request(&format!(r#"{{"page_size":"{CARD}"}}"#))?,
+            json_request(&format!(r#"{{"page_no":"{CARD}"}}"#))?,
             json_request(&format!(r#"{{"user_id":{CARD}}}"#))?,
             json_request(&format!(r#"{{"user_id":"{CARD}""#))?,
         ];
@@ -995,6 +1432,413 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_body_that_is_not_a_json_object_is_a_400_before_any_rule() -> TestResult {
+        let bodies = [
+            "[]",
+            // Positional arrays that would fill the members in order: a sign-on, the same with a
+            // user ID too long for its rule, a bill payment and a confirmed Monthly report.
+            r#"["ADMIN001","PASSWORD"]"#,
+            r#"["USER00010","PASSWORD"]"#,
+            r#"["00000000033","Y"]"#,
+            r#"["X","","","","","","","","","Y"]"#,
+            "null",
+            r#""x""#,
+            "1",
+            "true",
+        ];
+        for body in bodies {
+            assert_unreadable::<Probe>(body).await?;
+            assert_unreadable::<SignonRequest>(body).await?;
+            assert_unreadable::<AccountUpdateRequest>(body).await?;
+            assert_unreadable::<CardUpdateRequest>(body).await?;
+            assert_unreadable::<TranAddRequest>(body).await?;
+            assert_unreadable::<ReportRequest>(body).await?;
+            assert_unreadable::<BillPaymentRequest>(body).await?;
+            assert_unreadable::<UserAddRequest>(body).await?;
+            assert_unreadable::<UserUpdateRequest>(body).await?;
+            assert_unreadable::<TranTypeListActionRequest>(body).await?;
+            assert_unreadable::<TranTypeActionRequest>(body).await?;
+        }
+        Ok(())
+    }
+
+    /// Object bodies of endpoints 6, 10, 13 and 25, in that order, that read and pass every rule,
+    /// with every nested object present.
+    fn nested_object_bodies() -> [Value; 4] {
+        let row = json!({"type_code": "01", "description": "PURCHASE"});
+        let blank_snapshot = AccountUpdateSnapshot::from(coactupc::Snapshot::from_fields(
+            &coactupc::SnapshotFields::<&str>::default(),
+        ));
+        [
+            json!({
+                "aid": "ENTER",
+                "fields": {"active_status": "Y", "open_year": "2014"},
+                "snapshot": blank_snapshot
+            }),
+            json!({
+                "aid": "ENTER",
+                "fields": {
+                    "embossed_name": "TEST HOLDER",
+                    "status": "N",
+                    "expiry_month": "06",
+                    "expiry_year": "2030"
+                },
+                "snapshot": {
+                    "state": "show_details",
+                    "acct_id": "00000000050",
+                    "embossed_name": "TEST HOLDER",
+                    "expiration_date": "2025-04-30",
+                    "status": "Y"
+                }
+            }),
+            json!({
+                "aid": "ENTER",
+                "acct_id": "00000000050",
+                "fields": {"type_cd": "01", "cat_cd": "0001"},
+                "confirm": "Y"
+            }),
+            json!({
+                "aid": "ENTER",
+                "rows": [{"selection": "U", "description": "NEW"}],
+                "state": {
+                    "type_filter": "",
+                    "desc_filter": "",
+                    "rows": [row, null],
+                    "selected_row": null,
+                    "first_key": "01",
+                    "last_key": "01",
+                    "page_no": 1,
+                    "next_page_exists": false,
+                    "last_page_shown": false,
+                    "pending_action": "none",
+                    "screen_rows": [row, null],
+                    "selectors": "open",
+                    "description_entry": null
+                }
+            }),
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_nested_member_whose_schema_is_an_object_refuses_anything_else() -> TestResult {
+        let [account, card, transaction, list_action] = nested_object_bodies();
+        // `AccountUpdateSnapshot`'s members in declaration order: six texts, three dates,
+        // seventeen texts, the date of birth and three texts.
+        let texts = |count| std::iter::repeat_n(json!(""), count);
+        let positional_snapshot: Vec<Value> = texts(6)
+            .chain(std::iter::repeat_n(Value::Null, 3))
+            .chain(texts(17))
+            .chain([Value::Null])
+            .chain(texts(3))
+            .collect();
+        // Each nested object with the array that fills its members in declaration order.
+        let mut accepted = object_members_accepted::<AccountUpdateRequest>(
+            &account,
+            &[
+                ("/fields", json!(["Y", "2014"])),
+                ("/snapshot", Value::Array(positional_snapshot)),
+            ],
+        )
+        .await?;
+        accepted.extend(
+            object_members_accepted::<CardUpdateRequest>(
+                &card,
+                &[
+                    ("/fields", json!(["TEST HOLDER", "N", "06", "2030"])),
+                    (
+                        "/snapshot",
+                        json!([
+                            "show_details",
+                            "00000000050",
+                            "TEST HOLDER",
+                            "2025-04-30",
+                            "Y"
+                        ]),
+                    ),
+                ],
+            )
+            .await?,
+        );
+        accepted.extend(
+            object_members_accepted::<TranAddRequest>(
+                &transaction,
+                &[("/fields", json!(["01", "0001"]))],
+            )
+            .await?,
+        );
+        accepted.extend(
+            object_members_accepted::<TranTypeListActionRequest>(
+                &list_action,
+                &[
+                    ("/rows/0", json!(["U", "NEW"])),
+                    (
+                        "/state",
+                        json!([
+                            "",
+                            "",
+                            [],
+                            null,
+                            null,
+                            null,
+                            1,
+                            false,
+                            false,
+                            "none",
+                            [],
+                            "open",
+                            null
+                        ]),
+                    ),
+                    ("/state/rows/0", json!(["01", "PURCHASE"])),
+                    ("/state/screen_rows/0", json!(["01", "PURCHASE"])),
+                ],
+            )
+            .await?,
+        );
+        assert!(
+            accepted.is_empty(),
+            "read in place of an object: {accepted:#?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_object_body_reads_as_it_always_has() -> TestResult {
+        // Unknown members are skipped and omitted ones take their defaults.
+        let body = r#" {"rows":[{"description":"X"}],"unknown":[1],"user_id":"USER0001"} "#;
+        let ValidJson(probe) = ValidJson::<Probe>::from_request(json_request(body)?, &())
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            (
+                probe.user_id.as_str(),
+                probe.rows.len(),
+                probe.inner.code.as_str()
+            ),
+            ("USER0001", 1, "")
+        );
+        // The same in a nested object and in each object of a list, which keep their own rules.
+        let body =
+            r#"{"inner":{"code":"ABC","unknown":[1]},"rows":[{},{"description":"X","x":[]}]}"#;
+        let probe = serde_json::from_str::<Probe>(body)?;
+        assert_eq!(
+            (
+                probe.inner.code.as_str(),
+                probe.rows.first().map(|row| row.description.as_str()),
+                probe.rows.get(1).map(|row| row.description.as_str())
+            ),
+            ("ABC", Some(""), Some("X"))
+        );
+        let error = ValidJson::<Probe>::from_request(json_request(body)?, &())
+            .await
+            .err()
+            .ok_or("over-long nested code accepted")?;
+        assert_eq!(
+            parts(&error),
+            (
+                StatusCode::BAD_REQUEST,
+                FIELD_LENGTH_MESSAGE,
+                Some("inner.code")
+            )
+        );
+        // A duplicate member at any depth and text after the object are still unreadable,
+        // before any rule.
+        for body in [
+            r#"{"user_id":"USER0001","user_id":"USER0002"}"#,
+            r#"{"user_id":"USER00010","user_id":"USER0001"}"#,
+            r#"{"inner":{"code":"A","code":"B"}}"#,
+            r#"{"rows":[{"description":"A","description":"B"}]}"#,
+            r#"{"user_id":"USER0001"} []"#,
+        ] {
+            assert_unreadable::<Probe>(body).await?;
+        }
+        Ok(())
+    }
+
+    /// The JSON object text of `object` with `first` as its first member and `last` as its last,
+    /// each the raw text of one member or empty for none, so that a member can hold a number no
+    /// `Value` holds.
+    fn members_around(
+        first: &str,
+        object: &Value,
+        last: &str,
+    ) -> Result<String, Box<dyn StdError>> {
+        let text = object.to_string();
+        let inner = text
+            .strip_prefix('{')
+            .and_then(|rest| rest.strip_suffix('}'))
+            .ok_or("not a JSON object")?;
+        let members: Vec<&str> = [first, inner, last]
+            .into_iter()
+            .filter(|member| !member.is_empty())
+            .collect();
+        Ok(format!("{{{}}}", members.join(",")))
+    }
+
+    /// `object` with a last `page_size` member of the raw value `size`, laid out first, last and
+    /// spread over lines: in the third body the member follows blank CRLF lines, and its value
+    /// starts a line of its own after every other member's line.
+    fn page_size_layouts(object: &Value, size: &str) -> Result<[String; 3], Box<dyn StdError>> {
+        let member = format!(r#""page_size":{size}"#);
+        let pretty = serde_json::to_string_pretty(object)?;
+        let members = pretty.strip_suffix("\n}").ok_or("not a JSON object")?;
+        Ok([
+            members_around(&member, object, "")?,
+            members_around("", object, &member)?,
+            format!("{members},\r\n\r\n\t  \"page_size\":\n{size}\n}}"),
+        ])
+    }
+
+    /// The rejection `body` gets from a `ValidJson<T>` extractor.
+    async fn json_rejection<T: DeserializeOwned + Validate>(
+        body: &str,
+    ) -> Result<ScreenError, Box<dyn StdError>> {
+        let dto = std::any::type_name::<T>();
+        ValidJson::<T>::from_request(json_request(body)?, &())
+            .await
+            .err()
+            .ok_or_else(|| format!("{dto} accepted the body").into())
+    }
+
+    /// A top-level `page_size` holding a JSON number beyond the range `serde_json` represents is
+    /// the 422 of every size outside the range, wherever the member stands and however the body
+    /// is laid out: on the probe, whose user ID also breaks its rule, and on endpoint 25's body.
+    #[tokio::test]
+    async fn a_page_size_beyond_the_parsers_range_is_the_422() -> TestResult {
+        let nines = "9".repeat(310);
+        let sizes = [
+            nines.clone(),
+            format!("-{nines}"),
+            "1e400".to_owned(),
+            "-1e400".to_owned(),
+            // 400 digits, which the rejection must not echo.
+            CARD.repeat(25),
+            // The exponent overflows, so the parser stops inside it.
+            "1E99999999999999999999".to_owned(),
+            format!("{nines}.5e3"),
+            // An array is outside the range whatever it holds.
+            format!("[7,{nines}]"),
+        ];
+        let probe = json!({"user_id": "USER00010"});
+        let [.., list_action] = nested_object_bodies();
+        // A failure names the case by its indexes: some bodies hold card numbers.
+        for (size, value) in sizes.iter().enumerate() {
+            for (layout, body) in page_size_layouts(&probe, value)?.iter().enumerate() {
+                let error = json_rejection::<Probe>(body).await?;
+                assert_eq!(
+                    parts(&error),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        PAGE_SIZE_MESSAGE,
+                        Some(PAGE_SIZE_FIELD)
+                    ),
+                    "probe, size {size}, layout {layout}"
+                );
+                assert!(
+                    !serde_json::to_string(&error)?.contains("4111"),
+                    "probe, size {size}, layout {layout}"
+                );
+            }
+            for (layout, body) in page_size_layouts(&list_action, value)?.iter().enumerate() {
+                let error = json_rejection::<TranTypeListActionRequest>(body).await?;
+                assert_eq!(
+                    parts(&error),
+                    (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        PAGE_SIZE_MESSAGE,
+                        Some(PAGE_SIZE_FIELD)
+                    ),
+                    "endpoint 25, size {size}, layout {layout}"
+                );
+                assert!(
+                    !serde_json::to_string(&error)?.contains("4111"),
+                    "endpoint 25, size {size}, layout {layout}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A body that does not deserialise for any other reason stays the 400, beside a
+    /// `page_size` beyond the parser's range or in its place: a malformed number, a truncated
+    /// body, text after the object, and a member that does not deserialise or holds such a
+    /// number itself, before `page_size` or after it, at the top level or nested.
+    #[tokio::test]
+    async fn a_body_unreadable_beside_a_page_size_beyond_the_parsers_range_is_a_400() -> TestResult
+    {
+        let nines = "9".repeat(310);
+        let huge = format!(r#""page_size":{nines}"#);
+        let huge_page_no = format!(r#""page_no":{nines}"#);
+        let probe = json!({"user_id": "USER0001"});
+        let probe_last = members_around("", &probe, &huge)?;
+        for body in [
+            members_around("", &probe, r#""page_size":1.e5"#)?,
+            members_around("", &probe, r#""page_size":01"#)?,
+            members_around("", &probe, r#""page_size":-"#)?,
+            probe_last.trim_end_matches('}').to_owned(),
+            members_around(&huge, &probe, "")?
+                .trim_end_matches('}')
+                .to_owned(),
+            format!("{probe_last} x"),
+            members_around(r#""page_no":"x""#, &probe, &huge)?,
+            members_around(&huge, &probe, r#""page_no":"x""#)?,
+            members_around(&huge_page_no, &probe, &huge)?,
+            members_around(&huge, &probe, &huge_page_no)?,
+            members_around(&huge_page_no, &probe, "")?,
+        ] {
+            assert_unreadable::<Probe>(&body).await?;
+        }
+
+        let [.., list_action] = nested_object_bodies();
+        let mut without_aid = list_action.clone();
+        without_aid
+            .as_object_mut()
+            .ok_or("the endpoint 25 body is not an object")?
+            .remove("aid");
+        // `state.page_no`, nested, holds the number as well.
+        let nested = |text: String| {
+            let nested = text.replacen(r#""page_no":1"#, &huge_page_no, 1);
+            (nested != text)
+                .then_some(nested)
+                .ok_or("no state.page_no to replace")
+        };
+        for body in [
+            members_around(r#""aid":"PF7""#, &without_aid, &huge)?,
+            members_around(&huge, &without_aid, r#""aid":"PF7""#)?,
+            nested(members_around("", &list_action, &huge)?)?,
+            nested(members_around(&huge, &list_action, "")?)?,
+            members_around("", &list_action, r#""page_size":1.e5"#)?,
+            members_around("", &list_action, &huge)?
+                .trim_end_matches('}')
+                .to_owned(),
+        ] {
+            assert_unreadable::<TranTypeListActionRequest>(&body).await?;
+        }
+        Ok(())
+    }
+
+    /// A DTO without a `page_size` member skips an unknown one unread, as it always has, whatever
+    /// number it holds; a malformed number there is still unreadable.
+    #[tokio::test]
+    async fn an_unknown_page_size_beyond_the_parsers_range_is_skipped_as_before() -> TestResult {
+        let nines = "9".repeat(310);
+        let sign_on = json!({"user_id": "ADMIN001", "password": "PASSWORD"});
+        for body in [
+            members_around("", &sign_on, &format!(r#""page_size":{nines}"#))?,
+            members_around(&format!(r#""page_size":-{nines}"#), &sign_on, "")?,
+            members_around("", &sign_on, r#""page_size":1e400"#)?,
+        ] {
+            let ValidJson(request) =
+                ValidJson::<SignonRequest>::from_request(json_request(&body)?, &())
+                    .await
+                    .map_err(|error| error.to_string())?;
+            assert_eq!(request.user_id, "ADMIN001");
+        }
+        assert_unreadable::<SignonRequest>(&members_around("", &sign_on, r#""page_size":1.e5"#)?)
+            .await
+    }
+
+    #[tokio::test]
     async fn query_strings_are_deserialised_then_validated() -> TestResult {
         let probe = query("/users?page_size=7&start_user_id=USER0001")
             .await?
@@ -1005,12 +1849,24 @@ mod tests {
         let probe = query("/users").await?.map_err(|error| error.to_string())?;
         assert_eq!(probe.page_size, None);
 
-        for uri in [
-            "/users?page_size=101",
-            "/users?page_size=0",
-            "/users?page_size=-1",
-        ] {
-            let error = query(uri)
+        // Out of range, beyond `i64` or no integer at all, whatever other rule fails: the 422,
+        // which echoes nothing. A failure names the case by its index: two of the URIs hold a
+        // card number.
+        for (case, uri) in [
+            "/users?page_size=101".to_owned(),
+            "/users?page_size=0".to_owned(),
+            "/users?page_size=-1".to_owned(),
+            "/users?page_size=101&start_user_id=USER00010".to_owned(),
+            format!("/users?page_size={CARD}{CARD}"),
+            format!("/users?page_size={CARD}x"),
+            "/users?page_size=7.5".to_owned(),
+            "/users?page_size=".to_owned(),
+            "/users?page_size=abc&start_user_id=USER00010".to_owned(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let error = query(&uri)
                 .await?
                 .err()
                 .ok_or("out-of-range page_size accepted")?;
@@ -1021,7 +1877,11 @@ mod tests {
                     PAGE_SIZE_MESSAGE,
                     Some(PAGE_SIZE_FIELD)
                 ),
-                "{uri}"
+                "case {case}"
+            );
+            assert!(
+                !serde_json::to_string(&error)?.contains("4111"),
+                "case {case}"
             );
         }
 
@@ -1038,10 +1898,11 @@ mod tests {
             )
         );
 
+        // Another member that does not deserialise, beside a valid `page_size`.
         for uri in [
-            format!("/users?page_size={CARD}x"),
-            format!("/users?page_size={CARD}{CARD}"),
-            "/users?page_size=7.5".to_owned(),
+            format!("/users?page_size=7&page_no={CARD}x"),
+            format!("/users?page_size=7&page_no={CARD}{CARD}"),
+            "/users?page_size=7&page_no=7.5".to_owned(),
         ] {
             let error = query(&uri)
                 .await?
@@ -1053,6 +1914,76 @@ mod tests {
             );
             assert!(!error.message().contains("4111"));
         }
+        Ok(())
+    }
+
+    /// Every `page_size` value as the two forms read it: an integer `i64` holds as itself, one
+    /// beyond it saturated where the form holds it as an integer, and any other value as
+    /// `NON_INTEGER_PAGE_SIZE`. None fails to deserialise, so the range rule judges each.
+    #[test]
+    fn page_size_reads_every_value_as_an_integer_for_the_range_rule() -> TestResult {
+        let other = super::NON_INTEGER_PAGE_SIZE;
+        assert!(!(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&other));
+        // The query value as sent, percent-encoded, and the size it reads as.
+        let queries = [
+            ("7", Some(7)),
+            ("%2B7", Some(7)),
+            ("007", Some(7)),
+            ("0101", Some(101)),
+            ("0", Some(0)),
+            ("-1", Some(-1)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("9223372036854775808", Some(i64::MAX)),
+            ("99999999999999999999", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("-9223372036854775809", Some(i64::MIN)),
+            ("", Some(other)),
+            ("abc", Some(other)),
+            ("1.5", Some(other)),
+            ("7.0", Some(other)),
+            ("1e2", Some(other)),
+            // A `+` in a query string is a space.
+            ("+7", Some(other)),
+            ("7%20", Some(other)),
+            ("--1", Some(other)),
+            ("%D9%A3", Some(other)),
+        ];
+        for (value, expected) in queries {
+            let uri = format!("/users?page_size={value}").parse()?;
+            let axum::extract::Query(probe) =
+                axum::extract::Query::<QueryProbe>::try_from_uri(&uri)?;
+            assert_eq!(probe.page_size, expected, "{value:?}");
+        }
+        let axum::extract::Query(absent) =
+            axum::extract::Query::<QueryProbe>::try_from_uri(&"/users".parse()?)?;
+        assert_eq!(absent.page_size, None);
+
+        // The JSON value of the member, and the size it reads as.
+        let bodies = [
+            ("7", Some(7)),
+            ("-1", Some(-1)),
+            ("9223372036854775807", Some(i64::MAX)),
+            ("-9223372036854775808", Some(i64::MIN)),
+            ("9223372036854775808", Some(i64::MAX)),
+            ("18446744073709551615", Some(i64::MAX)),
+            ("null", None),
+            ("99999999999999999999", Some(other)),
+            ("-9223372036854775809", Some(other)),
+            ("1.5", Some(other)),
+            ("7.0", Some(other)),
+            ("1e2", Some(other)),
+            (r#""7""#, Some(other)),
+            (r#""""#, Some(other)),
+            ("true", Some(other)),
+            ("false", Some(other)),
+            ("[7]", Some(other)),
+            (r#"{"page_size":7}"#, Some(other)),
+        ];
+        for (value, expected) in bodies {
+            let probe = serde_json::from_str::<Probe>(&format!(r#"{{"page_size":{value}}}"#))?;
+            assert_eq!(probe.page_size, expected, "{value}");
+        }
+        assert_eq!(serde_json::from_str::<Probe>("{}")?.page_size, None);
         Ok(())
     }
 

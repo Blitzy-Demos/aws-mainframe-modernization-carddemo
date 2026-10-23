@@ -71,6 +71,14 @@ type MapFieldSpec = {
    * `EXPYEAR` share the `Expiry Date` caption, and the year's own literal is `/`.
    */
   readonly accessibleName?: string;
+  /**
+   * Utilities the literal's box needs beside `LABEL`: the `/` of `EXPYEAR` has a one-column cell,
+   * narrower than its glyph at every width, so its box is as wide as the glyph (`min-w-max`). The
+   * shared map-field box of `EXPMON` grows past its two-column cell to its two characters and, on
+   * the narrowest frame, ends within half a pixel of the `/` cell; the `pl-1` inset keeps the
+   * glyph clear of that box, between the month and year boxes as the map's attribute columns do.
+   */
+  readonly labelClass?: string;
 };
 
 /**
@@ -110,6 +118,7 @@ const FIELDS = {
     labelCell: { row: 15, col: 28, span: 1 },
     inputCell: { row: 15, col: 30, span: COCRDUP_LENGTHS.expiryYear },
     accessibleName: "Expiry Date year",
+    labelClass: "min-w-max pl-1",
   },
 } as const satisfies Record<FieldPath<CocrdupValues>, MapFieldSpec>;
 
@@ -138,10 +147,10 @@ const BLANK_VALUES: CocrdupValues = {
 };
 
 /**
- * TURQUOISE map literals snap to the foreground token (AAP 0.4.3); `whitespace-pre` keeps their
- * spacing.
+ * TURQUOISE map literals snap to the foreground token (AAP 0.4.3). `h-full` centres each label on
+ * its line beside the inputs; `whitespace-pre` keeps their spacing.
  */
-const LABEL = "whitespace-pre text-foreground";
+const LABEL = "h-full whitespace-pre text-foreground";
 
 /** `KEY_ROWS.COCRDUP.foldShifted`: COCRDUPC folds PF13–PF24 onto PF1–PF12 (`CSSTRPFY`). */
 const KEY_OPTIONS = { foldShifted: KEY_ROWS.COCRDUP.foldShifted };
@@ -232,27 +241,39 @@ const KNOWN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
 type RouteEntry = {
   /** The caller's path, kept only when it is a screen path. */
   readonly from: string | undefined;
-  /** The account of the COCRDLI row, 11 digits. */
-  readonly acctId: string | undefined;
-  /** The `card_ref` of the COCRDLI row. */
-  readonly cardRef: number | undefined;
+  /** The card a COCRDLI `U` selection names, only when COCRDLI is the caller. */
+  readonly selection: ListKeys | undefined;
 };
 
-/** Reads the route state; any other shape is a first entry with no caller recorded. */
+/**
+ * Reads the route state; any other shape is a first entry with no caller recorded. The account
+ * and `card_ref` are a selection only when the card list is the caller, as COCRDUPC fetches on
+ * entry only `WHEN CDEMO-PGM-ENTER AND CDEMO-FROM-PROGRAM EQUAL LIT-CCLISTPGM`
+ * (`app/cbl/COCRDUPC.cbl:482-483`, COCRDUPC-002). The main menu forwards the route state it
+ * received, where an earlier screen may have left an account and a card, so from the menu, from
+ * any other caller or from none the screen opens empty (COCRDUPC-001). An account longer than the
+ * map's `ACCTSID` or a `card_ref` that is not a safe integer is no selection either.
+ */
 function routeEntryOf(state: unknown): RouteEntry {
   if (typeof state !== "object" || state === null) {
-    return { from: undefined, acctId: undefined, cardRef: undefined };
+    return { from: undefined, selection: undefined };
   }
-  const from = "from" in state && typeof state.from === "string" ? state.from : undefined;
-  const acctId =
-    "acct_id" in state && typeof state.acct_id === "string" ? state.acct_id : undefined;
-  const cardRef =
-    "card_ref" in state &&
-    typeof state.card_ref === "number" &&
-    Number.isSafeInteger(state.card_ref)
-      ? state.card_ref
-      : undefined;
-  return { from: from !== undefined && KNOWN_PATHS.has(from) ? from : undefined, acctId, cardRef };
+  const named = "from" in state && typeof state.from === "string" ? state.from : undefined;
+  const from = named !== undefined && KNOWN_PATHS.has(named) ? named : undefined;
+  if (from !== PATHS.COCRDLI) {
+    return { from, selection: undefined };
+  }
+  const acctId = "acct_id" in state ? state.acct_id : undefined;
+  const cardRef = "card_ref" in state ? state.card_ref : undefined;
+  if (
+    typeof acctId !== "string" ||
+    acctId.length > COCRDUP_LENGTHS.acctId ||
+    typeof cardRef !== "number" ||
+    !Number.isSafeInteger(cardRef)
+  ) {
+    return { from, selection: undefined };
+  }
+  return { from, selection: { acctId, cardRef } };
 }
 
 /** The card endpoint 9 last showed: its handle, its values as shown (F12) and its snapshot. */
@@ -385,10 +406,11 @@ function inputAttributes(name: FieldPath<CocrdupValues>, enterable: boolean, bus
  * assistive technology only: `sr-only` takes it out of the grid flow, and it fills no cell.
  */
 function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNode }): ReactNode {
+  const labelClass = spec.labelClass === undefined ? LABEL : `${LABEL} ${spec.labelClass}`;
   return (
     <FormItem className="contents">
       <GridCell {...spec.labelCell}>
-        <FormLabel className={LABEL}>{spec.label}</FormLabel>
+        <FormLabel className={labelClass}>{spec.label}</FormLabel>
       </GridCell>
       <GridCell {...spec.inputCell}>
         <FormControl>{children}</FormControl>
@@ -400,8 +422,9 @@ function FieldCells({ spec, children }: { spec: MapFieldSpec; children: ReactNod
 
 /**
  * The card update screen. Entered from COCRDLI with the row's `acct_id` and `card_ref`, it fetches
- * that card at once (COCRDUPC-002); entered from the menu, it waits for the account and card
- * (COCRDUPC-001).
+ * that card at once (COCRDUPC-002); entered from the menu, from any other caller or with none, it
+ * sends nothing and waits for the account and card, whatever account or card the route state
+ * still carries (COCRDUPC-001).
  */
 export function COCRDUP(): ReactNode {
   const navigate = useNavigate();
@@ -422,7 +445,7 @@ export function COCRDUP(): ReactNode {
 
   const keyForm = useForm<CocrdupKeyValues>({
     resolver: zodResolver(cocrdupKeySchema),
-    defaultValues: { acctId: entry.acctId ?? "", cardNum: "" },
+    defaultValues: { acctId: entry.selection?.acctId ?? "", cardNum: "" },
   });
   const detailForm = useForm<CocrdupValues>({
     resolver: zodResolver(cocrdupSchema),
@@ -491,6 +514,8 @@ export function COCRDUP(): ReactNode {
    * The field error carries the message the error row shows, so the field's `FormMessage` reads
    * it with the input. `flag` is false for the no-change answer, which only moves the cursor to
    * the name. Without a field the cursor goes to the account where it is enterable (`WHEN OTHER`).
+   * Only the one field a `ScreenError` names is marked here; an endpoint 9 not-found marks the
+   * card beside it (`markCardNotFound`).
    */
   function markField(
     error: components["schemas"]["ScreenError"],
@@ -549,10 +574,34 @@ export function COCRDUP(): ReactNode {
   }
 
   /**
+   * COCRDUPC-003, COCRDUPC-018: on `NOTFND`, `9100-GETCARD-BYACCTCARD` sets
+   * `FLG-CARDFILTER-NOT-OK` beside `FLG-ACCTFILTER-NOT-OK`, so the card is marked in error with
+   * the account the `ScreenError` names, its field error carrying the same message. The not-found
+   * answer is told apart by its message, `DID-NOT-FIND-ACCTCARD-COMBO`, which COCRDUPC moves only
+   * on `NOTFND`, as the screen tells its other answers apart by theirs; the file error of
+   * COCRDUPC-019 names the account too but marks it alone.
+   * NOT-OK is red only: the `*` goes into a blank filter, never here, so the card keeps its text
+   * (blank on the list entry, which knows only the `card_ref`), and the cursor stays where
+   * `markField` put it. `state` picks the form that shows the keys, as in `markField`.
+   */
+  function markCardNotFound(error: components["schemas"]["ScreenError"], state: CocrdupKeyState) {
+    if (error.message !== DID_NOT_FIND_ACCTCARD_COMBO) {
+      return;
+    }
+    const cardError = { type: "server", message: error.message };
+    if (state === "not-fetched") {
+      keyForm.setError("cardNum", cardError);
+    } else {
+      detailForm.setError("cardNum", cardError);
+    }
+  }
+
+  /**
    * An endpoint 9 error. On the list entry and the 409 refresh, a card that is not found or
    * cannot be read still leaves state `S`, with the details empty and enterable over a blank
    * snapshot (COCRDUPC-003, COCRDUPC-019). Every other error leaves `otherwise`: not fetched for
-   * a search (COCRDUPC-015, COCRDUPC-018).
+   * a search (COCRDUPC-015, COCRDUPC-018). Either way the error marks the field it names, and a
+   * card that is not found marks the card as well (`markCardNotFound`).
    */
   function fetchFailed(
     error: components["schemas"]["ScreenError"],
@@ -579,6 +628,7 @@ export function COCRDUP(): ReactNode {
         saveEnabled: false,
       });
       markField(error, "S", true);
+      markCardNotFound(error, "S");
       return;
     }
     setModel((current) => ({
@@ -589,6 +639,7 @@ export function COCRDUP(): ReactNode {
       saveEnabled: false,
     }));
     markField(error, otherwise, true);
+    markCardNotFound(error, otherwise);
   }
 
   /** Endpoint 9 by `card_ref`, as the list entry and the 409 refresh call it (COCRDUPC-002). */
@@ -632,6 +683,9 @@ export function COCRDUP(): ReactNode {
   /**
    * A 200 of endpoint 10. The fields keep the text sent, zero fill included; `not_fetched` is
    * the server's restart, the empty search screen (COCRDUPC-034, COCRDUPC-035, COCRDUPC-039).
+   * Every other 200 stays on the card with the cursor on the account, read-only as it is there:
+   * its info line is the confirmation prompt or the commit, no error and no failed edit, so
+   * `POSITION CURSOR` takes `WHEN OTHER` (COCRDUPC-046).
    */
   function saved(
     result: components["schemas"]["CardUpdateResult"],
@@ -659,6 +713,7 @@ export function COCRDUP(): ReactNode {
       info: result.info_message,
       saveEnabled: result.save_enabled,
     });
+    pendingFocus.current = "acctId";
   }
 
   /**
@@ -750,14 +805,15 @@ export function COCRDUP(): ReactNode {
     pendingFocus.current = "acctId";
   }
 
-  // COCRDUPC-002: entered from the list, the row's card is fetched once, before any key.
+  // COCRDUPC-002: entered from the list, the row's card is fetched once, before any key. Only a
+  // COCRDLI selection fetches; any other entry sends nothing (COCRDUPC-001).
   useEffect(() => {
     if (entered.current) {
       return;
     }
     entered.current = true;
-    if (entry.cardRef !== undefined) {
-      fetchByRef({ acctId: entry.acctId ?? "", cardRef: entry.cardRef }, undefined, "not-fetched");
+    if (entry.selection !== undefined) {
+      fetchByRef(entry.selection, undefined, "not-fetched");
     }
   });
 

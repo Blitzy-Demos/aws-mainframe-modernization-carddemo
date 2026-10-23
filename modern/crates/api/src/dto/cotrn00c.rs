@@ -117,6 +117,7 @@ pub struct TranListQuery {
     pub has_next_page: Option<bool>,
     /// Rows of a page, 1 to 100, default 10, the rows of `COTRN0A` (Bounded Pagination); 422
     /// outside that range. The screen never sends it.
+    #[serde(default, deserialize_with = "super::page_size_from_query")]
     #[validate(range(min = 1, max = 100))]
     #[schema(minimum = 1, maximum = 100)]
     #[param(minimum = 1, maximum = 100)]

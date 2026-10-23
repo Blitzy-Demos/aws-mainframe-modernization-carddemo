@@ -665,11 +665,19 @@ function isFetchError(body: unknown): body is components["schemas"]["AccountUpda
   );
 }
 
-/** The form field a `ScreenError.field` names, if any. */
+/**
+ * The form field a `ScreenError.field` names, if any. A program edit names the bare request
+ * member (`zip`) and the request validator its path in the body (`fields.zip`), so both name the
+ * same input; `acct_id` is the path parameter. A `snapshot.` path names no input: the snapshot is
+ * the fetch the screen echoes, not a field the operator enters, so such a failure marks no field
+ * and the cursor goes to the caller's fallback.
+ */
 function fieldOf(wireName: string | null | undefined): FieldName | undefined {
-  return typeof wireName === "string" && Object.hasOwn(FIELD_OF_WIRE_NAME, wireName)
-    ? FIELD_OF_WIRE_NAME[wireName]
-    : undefined;
+  if (wireName === null || wireName === undefined) {
+    return undefined;
+  }
+  const member = wireName.startsWith("fields.") ? wireName.slice("fields.".length) : wireName;
+  return Object.hasOwn(FIELD_OF_WIRE_NAME, member) ? FIELD_OF_WIRE_NAME[member] : undefined;
 }
 
 /**

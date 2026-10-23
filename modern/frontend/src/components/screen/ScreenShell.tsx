@@ -1,9 +1,8 @@
-import { useContext, useId, useMemo, type ReactNode } from "react";
+import { createContext, useContext, useId, useLayoutEffect, useMemo, type ReactNode } from "react";
 import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { TITLE01, TITLE02, formatHeaderDate, formatHeaderTime } from "@/lib/header";
-import { TransferPendingContext } from "@/routes";
 import { GridCell } from "./FieldGrid";
 import { MessageLine, type MessageKind } from "./MessageLine";
 import { PfKeyBar, type PfKeyBarProps } from "./PfKeyBar";
@@ -31,6 +30,12 @@ export type ShellMessage = {
    * error. Either colour keeps the field's `BRT` emphasis.
    */
   kind: MessageKind;
+  /**
+   * The send this message belongs to, for a screen that numbers its sends. A new value replaces
+   * the row's text inside the same live region, so a message that repeats the last one's text is
+   * announced again; absent, the row keeps its text element across renders.
+   */
+  send?: number;
 };
 
 /** Props of {@link ScreenShell}. */
@@ -166,6 +171,20 @@ const HEADER_CELLS: Readonly<Record<HeaderLayout, readonly HeaderCell[]>> = {
 };
 
 /**
+ * Whether a transfer to another screen is under way: the router has been asked for a new
+ * location and has not committed it, which lasts while the target route's loader checks the
+ * route's guard and imports the screen's module. The screen being left stays mounted meanwhile,
+ * and {@link ScreenShell} locks its keys, as the terminal keyboard stays locked until the next
+ * program sends its map.
+ *
+ * The frame defines the context and the root route's element, `ScreenOutlet` of `@/routes`,
+ * provides it; the frame never imports the route table, which imports the frame. `false` outside
+ * `ScreenOutlet`, where no router reports navigations, such as a screen rendered alone inside a
+ * `MemoryRouter`.
+ */
+export const TransferPendingContext = createContext(false);
+
+/**
  * The frame of every screen, one BMS map laid out in a shadcn/ui `Card` (AAP 0.3.5, 0.4.2):
  *
  * - `CardHeader`: header rows 1 and 2 on the 80-column grid of `FieldGrid` (the transaction,
@@ -184,14 +203,24 @@ const HEADER_CELLS: Readonly<Record<HeaderLayout, readonly HeaderCell[]>> = {
  *
  * `PfKeyBar` is the screen's only keyboard binding, so screens never call `usePfKeys`; a screen
  * locks its keys through the keys' `disabled` and `busy`, which `PfKeyBar` receives. While a
- * transfer to another screen is under way (`TransferPendingContext`: the router is loading the
- * target screen and this one stays mounted), the frame locks them all itself: every key it
- * forwards is `disabled` and the row is `busy`, whatever the screen passes, so no key acts on the
- * screen being left and an unserved F-key shows no invalid-key message. Every text passed in is
- * shown verbatim and never logged: card numbers and SSNs arrive already redacted.
+ * transfer to another screen is under way (`TransferPendingContext`, which this module defines and
+ * the root route's `ScreenOutlet` provides: the target route's loader is running and this screen
+ * stays mounted), the frame locks them all itself: every key it forwards is `disabled` and the row
+ * is `busy`, whatever the screen passes, so no key acts on the screen being left and an unserved
+ * F-key shows no invalid-key message. Every text passed in is shown verbatim and never logged:
+ * card numbers and SSNs arrive already redacted.
  *
  * The frame is the page's `main` landmark. The skip link, shown only on keyboard focus, moves past
  * the header rows and the title to the screen body.
+ *
+ * Every screen renders one frame, so the frame's mount is the screen's arrival. As a 3270 map
+ * replaces the screen before it whole, the page then opens at its top-left, with the header rows
+ * and the title in view, whatever offset the previous screen left or the `autoFocus` of the map's
+ * `IC` field scrolled to; that field keeps the cursor. Re-renders of a mounted frame (a response,
+ * route state the screen takes in place) keep the offset the operator has. While the frame is
+ * mounted the document title names the screen by its title and transaction
+ * (`Add User – CU01 – CardDemo`, WCAG 2.4.2); the title it replaced returns when the frame
+ * unmounts, for a view that renders no frame (COSGN00's session-ended text).
  *
  * @throws RangeError when `now` is an invalid `Date` (from `formatHeaderDate`).
  */
@@ -219,6 +248,34 @@ export function ScreenShell({
     [keys, transferPending],
   );
   const at = now ?? new Date();
+
+  // Arrival only, hence no dependencies. A layout effect runs after the commit's `autoFocus`
+  // (React focuses an element while committing it, and a child before its parent) and before the
+  // browser paints, so no frame shows the old offset. The page's scrolling element is moved rather
+  // than calling `window.scrollTo`, which jsdom does not implement; jsdom has no
+  // `document.scrollingElement`, and in standards mode it is the root element. The browser's own
+  // restoration is switched off for this history entry and the entries pushed from it: on Back and
+  // Forward it would otherwise move the screen being left to the offset the target entry saved,
+  // for the frames painted before the next screen replaces it.
+  useLayoutEffect(() => {
+    window.history.scrollRestoration = "manual";
+    const page = document.scrollingElement ?? document.documentElement;
+    page.scrollTop = 0;
+    page.scrollLeft = 0;
+  }, []);
+
+  // The title follows the props; each cleanup gives back the title its effect replaced. A layout
+  // effect, so the title changes in the commit that shows the screen: a passive effect of an
+  // arrival by Back or Forward runs after the browser has painted the new screen under the old
+  // title.
+  useLayoutEffect(() => {
+    const replaced = document.title;
+    document.title = `${title} – ${transaction} – CardDemo`;
+    return () => {
+      document.title = replaced;
+    };
+  }, [title, transaction]);
+
   const values: Readonly<Record<HeaderField, string>> = {
     TRNNAME: transaction,
     TITLE01,
@@ -295,7 +352,12 @@ export function ScreenShell({
            * Every map declares `ERRMSG` `ATTRB=(ASKIP,BRT,FSET)` and no program changes its
            * attribute byte, so the row is bright whatever colour its message takes.
            */}
-          <MessageLine kind={message?.kind ?? "error"} bright text={message?.text} />
+          <MessageLine
+            kind={message?.kind ?? "error"}
+            bright
+            text={message?.text}
+            send={message?.send}
+          />
           <PfKeyBar
             keys={shownKeys}
             formId={formId}

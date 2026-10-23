@@ -359,9 +359,11 @@ pub struct CardUpdateRequest {
     /// `ENTER` validates, `PF5` saves.
     pub aid: Aid,
     /// The raw text of the four detail fields.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub fields: CardUpdateFields,
     /// The snapshot of the fetch, with the state of the last response.
+    #[serde(deserialize_with = "super::object")]
     #[validate(nested)]
     pub snapshot: CardUpdateSnapshot,
 }

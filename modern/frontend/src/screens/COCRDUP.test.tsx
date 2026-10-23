@@ -513,12 +513,16 @@ async function showFromSearch() {
   });
 }
 
-/** Edits the name and presses ENTER; waits for the confirmation (state `N`). */
+/**
+ * Edits the name and presses ENTER; waits for the confirmation (state `N`) and for the cursor on
+ * the account, where that answer moves it (COCRDUPC-046).
+ */
 async function validate() {
   fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
   fireEvent.click(key("ENTER=Process"));
   await waitFor(() => {
     expect(key("F5=Save").hidden).toBe(false);
+    expect(document.activeElement).toBe(field(LABELS.account));
   });
 }
 
@@ -828,6 +832,94 @@ describe("COCRDUP rendering", () => {
     expectNoFullCardDigits();
   });
 
+  /** The account and `card_ref` a card-list visit leaves in the route state. */
+  const listKeys = { acct_id: ACCT_ID, card_ref: CARD_REF };
+  /** COCRDUPC-001: the empty search screen, with nothing sent. */
+  const searchEntry = {
+    requests: [],
+    shown: { account: "", card: "", name: "", status: "", month: "", year: "" },
+    keys: true,
+    details: false,
+    focus: LABELS.account,
+    info: INFO_SEARCH,
+  };
+  /** COCRDUPC-002: the selected card, fetched once by its handle. */
+  const listEntry = {
+    requests: [{ route: CARDS_EDIT, query: { acct_id: ACCT_ID, card_ref: String(CARD_REF) } }],
+    shown: {
+      account: ACCT_ID,
+      card: MASKED_CARD,
+      name: STORED_NAME,
+      status: "Y",
+      month: "06",
+      year: "2030",
+    },
+    keys: false,
+    details: true,
+    focus: LABELS.name,
+    info: INFO_SHOWN,
+  };
+  it.each([
+    // audit: COCRDUPC-001
+    // The menu forwards the route state it received, card-list handles included.
+    {
+      title: "from the main menu",
+      state: { ...listKeys, from: PATHS.COMEN01 },
+      expected: searchEntry,
+    },
+    { title: "with no caller", state: listKeys, expected: searchEntry },
+    {
+      title: "from a path that is no screen",
+      state: { ...listKeys, from: "/not-a-screen" },
+      expected: searchEntry,
+    },
+    { title: "from COCRDSL", state: { ...listKeys, from: PATHS.COCRDSL }, expected: searchEntry },
+    {
+      title: "from COCRDLI with an account over 11 characters",
+      state: { ...FROM_LIST, acct_id: "0".repeat(12) },
+      expected: searchEntry,
+    },
+    {
+      title: "from COCRDLI with an account that is not text",
+      state: { ...FROM_LIST, acct_id: 50 },
+      expected: searchEntry,
+    },
+    {
+      title: "from COCRDLI with a card_ref that is not an integer",
+      state: { ...FROM_LIST, card_ref: 1.5 },
+      expected: searchEntry,
+    },
+    {
+      title: "from COCRDLI with a card_ref that is not a number",
+      state: { ...FROM_LIST, card_ref: "1" },
+      expected: searchEntry,
+    },
+    // audit: COCRDUPC-002
+    { title: "from COCRDLI", state: { ...listKeys, from: PATHS.COCRDLI }, expected: listEntry },
+  ])(
+    "an account and card_ref $title: only a COCRDLI selection fetches on entry",
+    async ({ state, expected }) => {
+      const calls = stubApi({ [CARDS_EDIT]: [{ status: 200, body: view }] });
+      renderScreen(state);
+      // Any request the entry sends, and the screen's answer to it, settles inside `act`.
+      await act(async () => {
+        await settle();
+      });
+      await waitFor(() => {
+        expect(shownValues()).toEqual(expected.shown);
+      });
+
+      expect(
+        calls.map((call) => ({ route: call.route, query: Object.fromEntries(call.query) })),
+      ).toEqual(expected.requests);
+      expectEnterable(expected.keys, expected.details);
+      await expectFocus(expected.focus);
+      expect(infoText()).toBe(expected.info);
+      expect(errorText()).toBe("");
+      expectConfirmationKeys(false);
+    },
+  );
+
   // audit: COCRDUP-014
   // audit: COCRDUP-017
   // audit: COCRDUP-020
@@ -851,6 +943,41 @@ describe("COCRDUP rendering", () => {
     expect(occupied.size).toBeGreaterThan(0);
     expect(columns.filter((column) => occupied.has(column))).toEqual([]);
   });
+
+  // jsdom has no layout: these are the classes that place each literal and box on its line, and
+  // the browser measures the geometry they give.
+  it.each([
+    { name: "ACCTSID", label: LABELS.account, glyphWide: false, short: false, size: "11" },
+    { name: "CARDSID", label: LABELS.card, glyphWide: false, short: false, size: "16" },
+    { name: "CRDNAME", label: LABELS.name, glyphWide: false, short: false, size: "50" },
+    { name: "CRDSTCD", label: LABELS.status, glyphWide: false, short: true, size: "1" },
+    { name: "EXPMON", label: LABELS.month, glyphWide: false, short: true, size: "2" },
+    { name: "EXPYEAR", label: LABELS.year, glyphWide: true, short: false, size: "4" },
+  ])(
+    "the literal '$label' of $name centres beside its input, and both boxes fit their text",
+    async ({ label, glyphWide, short, size }) => {
+      stubApi({});
+      renderScreen();
+      await settle();
+
+      // The label is as tall as the line, which the 36px input sets, and centres its text in it.
+      // The one-column `/` keeps a box as wide as its glyph instead of its cell's, inset clear of
+      // the month box that grows to its value.
+      const literal = screen.getByText(label, { ...exactText, selector: "label" });
+      expect(literal.classList.contains("h-full")).toBe(true);
+      expect(literal.classList.contains("items-center")).toBe(true);
+      expect(literal.classList.contains("min-w-max")).toBe(glyphWide);
+      expect(literal.classList.contains("pl-1")).toBe(glyphWide);
+
+      // The input is the shared map-field box sized to its value (`size` is the fallback): a
+      // field of one or two characters takes the `w-6` short box, a longer one fills its cell.
+      const input = field(label);
+      expect(MAP_FIELD_BOX.filter((name) => !input.classList.contains(name))).toEqual([]);
+      expect(input.classList.contains("w-6")).toBe(short);
+      expect(input.classList.contains("w-full")).toBe(!short);
+      expect(input.getAttribute("size")).toBe(size);
+    },
+  );
 
   it("a typed search sends the account and card, then shows only the redacted number", async () => {
     const calls = stubApi({
@@ -883,6 +1010,7 @@ describe("COCRDUP rendering", () => {
     expectNoFullCardDigits();
   });
 
+  // audit: COCRDUPC-003
   it("a list entry whose card is not found shows the details empty and enterable", async () => {
     const calls = stubApi({
       [CARDS_EDIT]: [{ status: 404, body: notFound }],
@@ -904,6 +1032,10 @@ describe("COCRDUP rendering", () => {
     expectEnterable(false, true);
     expect(field(LABELS.account).getAttribute("aria-invalid")).toBe("true");
     expectFieldMessage(LABELS.account, notFound.message);
+    // `NOTFND` marks the card too; it stays blank, as NOT-OK moves no `*`.
+    expect(field(LABELS.card).getAttribute("aria-invalid")).toBe("true");
+    expectFieldMessage(LABELS.card, notFound.message);
+    expect(field(LABELS.card).value).toBe("");
     expect(infoText()).toBe(INFO_SHOWN);
 
     // ENTER validates against a blank snapshot of the list row's account.
@@ -1007,12 +1139,84 @@ describe("COCRDUP keys", () => {
     // In a field, the browser's implicit submission submits the form itself.
     fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
     fireEvent.submit(screen.getByRole("form", { name: "Update Credit Card Details" }));
+    // The confirmation, and the cursor it moves from the name to the account.
     await waitFor(() => {
       expect(infoText()).toBe(INFO_CONFIRM);
+      expect(document.activeElement).toBe(field(LABELS.account));
     });
     expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT, CARD_PUT]);
     expect(calls[1].body).toMatchObject({ aid: "ENTER", snapshot: view.snapshot });
   });
+
+  // audit: COCRDUPC-046
+  it.each([
+    {
+      title: "ENTER=Process is clicked and the changes are validated",
+      confirmFirst: false,
+      cursorBefore: LABELS.name,
+      used: () => key("ENTER=Process"),
+      submit: "click",
+      info: INFO_CONFIRM,
+    },
+    {
+      title: "the Enter key in the name submits and the changes are validated",
+      confirmFirst: false,
+      cursorBefore: LABELS.name,
+      used: () => field(LABELS.name),
+      submit: "form",
+      info: INFO_CONFIRM,
+    },
+    {
+      title: "F5=Save is clicked and the changes are committed",
+      confirmFirst: true,
+      cursorBefore: LABELS.account,
+      used: () => key("F5=Save"),
+      submit: "click",
+      info: INFO_DONE,
+    },
+  ])(
+    "after $title, the cursor leaves the control used for the read-only account",
+    async ({ confirmFirst, cursorBefore, used, submit, info }) => {
+      stubApi({
+        [CARDS_EDIT]: [{ status: 200, body: view }],
+        [CARD_PUT]: confirmFirst
+          ? [
+              { status: 200, body: validated },
+              { status: 200, body: committed },
+            ]
+          : [{ status: 200, body: validated }],
+      });
+      await showFromList();
+      if (confirmFirst) {
+        await validate();
+      } else {
+        fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
+      }
+      // The cursor the last answer set has moved, so no earlier move can account for the next.
+      await expectFocus(cursorBefore);
+
+      // As in a browser, the clicked button or the field the Enter key is pressed in has focus;
+      // the answer then disables the button, hides F5 or makes the name read-only. Moving the
+      // cursor blurs the field that had it, which the form records, so it moves inside `act`.
+      const control = used();
+      act(() => {
+        control.focus();
+      });
+      expect(document.activeElement).toBe(control);
+      if (submit === "click") {
+        fireEvent.click(control);
+      } else {
+        fireEvent.submit(updateForm());
+      }
+      // The answer's render and the cursor move after it, together.
+      await waitFor(() => {
+        expect(infoText()).toBe(info);
+        expect(document.activeElement).toBe(field(LABELS.account));
+      });
+      expect(document.activeElement).not.toBe(document.body);
+      expect(field(LABELS.account).readOnly).toBe(true);
+    },
+  );
 
   // audit: COCRDUP-032
   // audit: COCRDUP-043
@@ -1031,8 +1235,10 @@ describe("COCRDUP keys", () => {
     await validate();
 
     pressKey("F5");
+    // The values fetched again, and the cursor the fetch moves from the account to the name.
     await waitFor(() => {
       expect(field(LABELS.name).value).toBe(OTHER_NAME);
+      expect(document.activeElement).toBe(field(LABELS.name));
     });
     expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT, CARD_PUT, CARD_PUT, CARDS_EDIT]);
     expect(Object.fromEntries(calls[3].query)).toEqual({
@@ -1095,7 +1301,11 @@ describe("COCRDUP keys", () => {
       const sent = calls.length;
 
       press();
-      await settle();
+      // The form moves the cursor to the name on a timer; in `N` that blurs the account, which
+      // the form records, so the wait for any request runs inside `act`.
+      await act(async () => {
+        await settle();
+      });
 
       expect(calls).toHaveLength(sent);
       expect(shownValues()).toEqual({
@@ -1280,8 +1490,10 @@ describe("COCRDUP keys", () => {
     fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
 
     press();
+    // The confirmation, and the cursor it moves from the name to the account.
     await waitFor(() => {
       expect(infoText()).toBe(INFO_CONFIRM);
+      expect(document.activeElement).toBe(field(LABELS.account));
     });
     expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT, CARD_PUT]);
     expect(calls[1].body).toMatchObject({ aid: "ENTER", snapshot: view.snapshot });
@@ -1374,8 +1586,10 @@ describe("COCRDUP keys", () => {
       fireEvent.change(field(LABELS.year), { target: { value: year } });
 
       fireEvent.click(key("ENTER=Process"));
+      // The confirmation, and the cursor it moves from the name to the account.
       await waitFor(() => {
         expect(infoText()).toBe(INFO_CONFIRM);
+        expect(document.activeElement).toBe(field(LABELS.account));
       });
       expect(calls[1].body).toMatchObject({
         aid: "ENTER",
@@ -1396,11 +1610,13 @@ describe("COCRDUP keys", () => {
       pendingAt: 1,
       stops: [true, false],
       enterable: [false, true],
+      cursor: LABELS.name,
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
         fireEvent.click(key("ENTER=Process"));
         await waitFor(() => {
           expect(infoText()).toBe(INFO_CONFIRM);
+          expect(document.activeElement).toBe(field(LABELS.account));
         });
       },
       routes: [CARDS_EDIT, CARD_PUT],
@@ -1417,11 +1633,13 @@ describe("COCRDUP keys", () => {
       pendingAt: 1,
       stops: [true, false],
       enterable: [false, true],
+      cursor: LABELS.name,
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
         fireEvent.click(key("ENTER=Process"));
         await waitFor(() => {
           expect(infoText()).toBe(INFO_CONFIRM);
+          expect(document.activeElement).toBe(field(LABELS.account));
         });
       },
       routes: [CARDS_EDIT, CARD_PUT],
@@ -1441,6 +1659,7 @@ describe("COCRDUP keys", () => {
       pendingAt: 2,
       stops: [false, true],
       enterable: [false, false],
+      cursor: LABELS.account,
       next: async () => {
         await save(INFO_DONE);
       },
@@ -1461,6 +1680,7 @@ describe("COCRDUP keys", () => {
       pendingAt: 3,
       stops: [false, false],
       enterable: [false, false],
+      cursor: LABELS.account,
       next: async () => {
         fireEvent.click(key("ENTER=Process"));
         expect(await screen.findByText("Stub at /cards, state null")).not.toBeNull();
@@ -1486,11 +1706,13 @@ describe("COCRDUP keys", () => {
       pendingAt: 4,
       stops: [false, true],
       enterable: [false, true],
+      cursor: LABELS.name,
       next: async () => {
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
         fireEvent.click(key("ENTER=Process"));
         await waitFor(() => {
           expect(infoText()).toBe(INFO_CONFIRM);
+          expect(document.activeElement).toBe(field(LABELS.account));
         });
       },
       routes: [CARDS_EDIT, CARD_PUT, CARD_PUT, CARDS_EDIT, CARD_PUT],
@@ -1502,6 +1724,7 @@ describe("COCRDUP keys", () => {
     pendingAt,
     stops,
     enterable,
+    cursor,
     next,
     routes,
   }) => {
@@ -1534,8 +1757,11 @@ describe("COCRDUP keys", () => {
     expect(calls).toHaveLength(pendingAt);
 
     open();
+    // The answer frees the keys and moves the cursor (COCRDUPC-046), waited for together: the
+    // form moves it on a timer, and the move blurs the field that had it, which the form records.
     await waitFor(() => {
       expect(keyRow().getAttribute("aria-busy")).toBe("false");
+      expect(document.activeElement).toBe(field(cursor));
     });
     expect(updateForm().getAttribute("aria-busy")).toBe("false");
     expect(disabledKeys()).toEqual(lockedKeys(false));
@@ -1559,6 +1785,7 @@ describe("COCRDUP keys", () => {
         fireEvent.click(key("ENTER=Process"));
       },
       info: INFO_SHOWN,
+      cursor: LABELS.name,
       routes: [CARDS_EDIT],
       aids: [],
     },
@@ -1573,6 +1800,7 @@ describe("COCRDUP keys", () => {
         fireEvent.submit(updateForm());
       },
       info: INFO_CONFIRM,
+      cursor: LABELS.account,
       routes: [CARDS_EDIT, CARD_PUT],
       aids: ["ENTER"],
     },
@@ -1587,6 +1815,7 @@ describe("COCRDUP keys", () => {
         fireEvent.click(key("ENTER=Process"));
       },
       info: INFO_DONE,
+      cursor: LABELS.account,
       routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
       aids: ["ENTER", "PF5"],
     },
@@ -1601,6 +1830,7 @@ describe("COCRDUP keys", () => {
         pressKey("Enter");
       },
       info: INFO_DONE,
+      cursor: LABELS.account,
       routes: [CARDS_EDIT, CARD_PUT, CARD_PUT],
       aids: ["ENTER", "PF5"],
     },
@@ -1608,6 +1838,7 @@ describe("COCRDUP keys", () => {
     reach,
     keys,
     info,
+    cursor,
     routes,
     aids,
   }) => {
@@ -1628,8 +1859,11 @@ describe("COCRDUP keys", () => {
     await waitFor(() => {
       expect(infoText()).toBe(info);
     });
+    // The cursor the answer moves (COCRDUPC-046) is waited for with the freed keys: the form
+    // moves it on a timer, and the move blurs the field that had it, which the form records.
     await waitFor(() => {
       expect(keyRow().getAttribute("aria-busy")).toBe("false");
+      expect(document.activeElement).toBe(field(cursor));
     });
     await settle();
     expect(calls.map((call) => call.route)).toEqual(routes);
@@ -1708,6 +1942,89 @@ describe("COCRDUP messages", () => {
       expectConfirmationKeys(false);
     },
   );
+
+  /**
+   * The 500 of a failed card read (COCRDUPC-019): `WS-FILE-ERROR-MESSAGE` in its 75 bytes, the
+   * RESP and RESP2 fields left blank, as their values are halted (COCRDUPC-047).
+   */
+  const fileError: components["schemas"]["ScreenError"] = {
+    message: [
+      "File Error: ",
+      "READ".padEnd(8),
+      " on ",
+      "CARDDAT".padEnd(9),
+      " returned RESP ",
+      " ".repeat(10),
+      ",RESP2 ",
+      " ".repeat(10),
+    ].join(""),
+    field: "acct_id",
+  };
+
+  // `NOTFND` sets both filter flags, a file error only the account's; NOT-OK moves no `*`, so the
+  // card keeps what it showed. No cursor is asserted for the list entry (state `S`).
+  // audit: COCRDUPC-018
+  // audit: COCRDUPC-019
+  it.each([
+    {
+      title: "a search whose card is not found marks the account and the card",
+      entry: undefined,
+      reply: { status: 404, body: notFound },
+      card: TYPED_CARD,
+      cardMarked: true,
+      info: INFO_SEARCH,
+      keys: true,
+      details: false,
+      focus: LABELS.account,
+    },
+    {
+      title: "a search whose card read fails marks only the account",
+      entry: undefined,
+      reply: { status: 500, body: fileError },
+      card: TYPED_CARD,
+      cardMarked: false,
+      info: INFO_SEARCH,
+      keys: true,
+      details: false,
+      focus: LABELS.account,
+    },
+    {
+      title: "a list entry whose card read fails marks only the account",
+      entry: FROM_LIST,
+      reply: { status: 500, body: fileError },
+      card: "",
+      cardMarked: false,
+      info: INFO_SHOWN,
+      keys: false,
+      details: true,
+      focus: undefined,
+    },
+  ])("$title", async ({ entry, reply, card, cardMarked, info, keys, details, focus }) => {
+    const calls = stubApi({ [CARDS_EDIT]: [reply] });
+    renderScreen(entry);
+    if (entry === undefined) {
+      typeSearchKeys(ACCT_ID, TYPED_CARD);
+      fireEvent.click(key("ENTER=Process"));
+    }
+
+    await waitFor(() => {
+      expect(errorText()).toBe(reply.body.message);
+    });
+    expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT]);
+    expect(field(LABELS.account).value).toBe(ACCT_ID);
+    expectFieldMessage(LABELS.account, reply.body.message);
+    expect(field(LABELS.card).value).toBe(card);
+    expect(field(LABELS.card).getAttribute("aria-invalid")).toBe(String(cardMarked));
+    if (cardMarked) {
+      expectFieldMessage(LABELS.card, reply.body.message);
+    }
+    if (focus !== undefined) {
+      await expectFocus(focus);
+    }
+    expect(infoText()).toBe(info);
+    expectEnterable(keys, details);
+    expectConfirmationKeys(false);
+  });
 
   // audit: COCRDUPC-005
   // audit: COCRDUPC-045
@@ -1897,8 +2214,8 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/cards/update`, so the sign-on guard that only the
- * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
- * render allows 5 s. Returns the router, whose location the test reads.
+ * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({

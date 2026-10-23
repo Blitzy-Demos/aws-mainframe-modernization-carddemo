@@ -602,6 +602,66 @@ function bodyRow(row: number): HTMLTableRowElement {
   return found;
 }
 
+/**
+ * Asserts whether list row `row` is the highlighted row: shaded (`data-state`), current for
+ * assistive technology (`aria-current`) and emphasised (`font-semibold`), or none of the three.
+ */
+function expectHighlighted(row: number, highlighted: boolean): void {
+  const line = bodyRow(row);
+  expect(line.getAttribute("data-state")).toBe(highlighted ? "selected" : null);
+  expect(line.getAttribute("aria-current")).toBe(highlighted ? "true" : null);
+  expect(line.classList.contains("font-semibold")).toBe(highlighted);
+}
+
+/** A column of the list `Table`: the map column it starts at and its width in map columns. */
+interface ListColumn {
+  readonly start: number;
+  readonly width: number;
+}
+
+/**
+ * The columns of `table` from its `colgroup`, the first starting at map column `first`: each
+ * `col` is a `w-k/n` fraction of the list's `span` map columns, and together they fill it.
+ */
+function listColumns(table: HTMLElement, first: number, span: number): ListColumn[] {
+  const columns: ListColumn[] = [];
+  let start = first;
+  for (const col of table.querySelectorAll("colgroup > col")) {
+    const [, width = "", of = ""] = /^w-(\d+)\/(\d+)$/.exec(col.className) ?? [];
+    expect(of).toBe(String(span));
+    columns.push({ start, width: Number.parseInt(width, 10) });
+    start += Number.parseInt(width, 10);
+  }
+  expect(start).toBe(first + span);
+  return columns;
+}
+
+/**
+ * The map column `element` shows its content at: its column's start, moved by its `left-k/w` or
+ * `-left-k/w` class, `k` of the column's `w` map columns.
+ */
+function shownColumn(element: Element, column: ListColumn | undefined): number {
+  if (column === undefined) {
+    throw new Error("a list cell stands outside the colgroup's columns");
+  }
+  const shift = /(?:^|\s)(-?)left-(\d+)\/(\d+)(?:\s|$)/.exec(element.className);
+  if (shift === null) {
+    return column.start;
+  }
+  const [, sign, moved, of] = shift;
+  expect(element.classList.contains("relative")).toBe(true);
+  expect(of).toBe(String(column.width));
+  const columns = Number.parseInt(moved, 10);
+  return sign === "-" ? column.start - columns : column.start + columns;
+}
+
+/** The map column each cell of `row` shows its text at: its own, or its one wrapper's. */
+function shownColumns(row: Element | undefined, columns: readonly ListColumn[]): number[] {
+  return Array.from(row?.children ?? [], (cell, index) => {
+    return shownColumn(cell.firstElementChild ?? cell, columns.at(index));
+  });
+}
+
 /** The input of list row `row`: its selector (`0`) or its description (`1`). */
 function rowInput(row: number, which: 0 | 1): HTMLInputElement {
   const input = bodyRow(row).querySelectorAll("input").item(which);
@@ -893,11 +953,16 @@ describe("COTRTLI", () => {
       "Type",
       "Description",
     ]);
+    // The dash line is decoration hidden from assistive technology: plain cells, no headers.
     expect(
-      Array.from(table.querySelectorAll('thead > tr[aria-hidden="true"] > th'), (head) => {
-        return head.textContent;
+      Array.from(table.querySelectorAll('thead > tr[aria-hidden="true"] > td'), (cell) => {
+        return cell.textContent;
       }),
     ).toEqual(["------", "-----", "-".repeat(50)]);
+    expect(table.querySelectorAll("th")).toHaveLength(3);
+    for (const head of table.querySelectorAll("th")) {
+      expect(head.getAttribute("scope")).toBe("col");
+    }
 
     // Seven list rows of three cells each: the map's eighth row (line 19) is not rendered.
     expect(bodyRows()).toHaveLength(7);
@@ -915,7 +980,7 @@ describe("COTRTLI", () => {
       expect(descriptionAt(row).getAttribute("maxlength")).toBe("50");
       expect(descriptionAt(row)).toHaveProperty("value", description);
       expect(descriptionAt(row)).toHaveProperty("readOnly", true);
-      expect(bodyRow(row).getAttribute("data-state")).toBeNull();
+      expectHighlighted(row, false);
     }
 
     // The form's inputs are exactly the map's input and output fields, in map order: no
@@ -960,6 +1025,53 @@ describe("COTRTLI", () => {
       ["button", "outline", "sm"],
     ]);
     expect(keys.every((key) => !key.hidden)).toBe(true);
+  });
+
+  it.each([
+    { shown: "seven types", page: LOADED, types: 7 },
+    { shown: "five types and two empty rows", page: FILTERED, types: 5 },
+  ])("keeps the list on the map's columns and lines with $shown", async ({ page, types }) => {
+    // audit: COTRTLI-020
+    // audit: COTRTLI-021
+    // audit: COTRTLI-022
+    // audit: COTRTLI-023
+    // audit: COTRTLI-024
+    // audit: COTRTLI-025
+    const seen = stubFetch([[200, page]]);
+    renderScreen();
+    await answered(seen, 1);
+    expect(codesShown().filter((code) => code !== "")).toHaveLength(types);
+
+    // Fixed columns from the line-12 fields' `POS`: the selector column at 4, the type at 17
+    // and the description at 25, to the list's end at column 74.
+    const table = screen.getByRole("table", { name: "Transaction types" });
+    expect(table.classList.contains("table-fixed")).toBe(true);
+    const columns = listColumns(table, 4, 71);
+    expect(columns.map((column) => column.start)).toEqual([4, 17, 25]);
+    // Captions at (10,4), (10,16), (10,42); dashes at (11,4), (11,15), (11,25).
+    const [captions, dashes] = Array.from(table.querySelectorAll("thead > tr"));
+    expect(shownColumns(captions, columns)).toEqual([4, 16, 42]);
+    expect(shownColumns(dashes, columns)).toEqual([4, 15, 25]);
+    // The description column is the Description Filter's span, `POS=(8,25) LENGTH=50`; its
+    // input fills the column but the trailing column gap, as the filter fills its cell.
+    expect(descFilter().parentElement?.className).toBe("row-start-8 col-start-25 col-span-50");
+    expect(columns.at(2)).toEqual({ start: 25, width: 50 });
+    for (const row of Array.from({ length: 7 }, (_, index) => index + 1)) {
+      // A one-character selector box at column 6, `POS=(12..18,6)`.
+      expect(shownColumn(selectorAt(row), columns.at(0))).toBe(6);
+      expect(selectorAt(row).classList.contains("w-9")).toBe(true);
+      expect(descriptionAt(row).closest("td")?.classList.contains("pr-2")).toBe(true);
+      expect(shownColumn(descriptionAt(row), columns.at(2))).toBe(25);
+    }
+    // Nine rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    expect(table.querySelectorAll("tr")).toHaveLength(9);
+    for (const row of table.querySelectorAll("tr")) {
+      expect(row.classList.contains("h-10")).toBe(true);
+    }
+    for (const cell of table.querySelectorAll("th, td")) {
+      expect(cell.classList.contains("px-0")).toBe(true);
+      expect(cell.classList.contains("pt-0")).toBe(true);
+    }
   });
 
   it("shows the six header values as read-only Inputs in the CardHeader title rows, each at its POS and LENGTH", async () => {
@@ -1040,10 +1152,10 @@ describe("COTRTLI", () => {
     // The single valid `D`: its row highlighted, the cursor on its selector, every description
     // read-only.
     expect(selectorAt(1)).toHaveProperty("value", "D");
-    expect(bodyRow(1).getAttribute("data-state")).toBe("selected");
+    expectHighlighted(1, true);
     await cursorOn(() => selectorAt(1));
     for (const row of [2, 3, 4, 5, 6, 7]) {
-      expect(bodyRow(row).getAttribute("data-state")).toBeNull();
+      expectHighlighted(row, false);
     }
     for (const row of [1, 2, 3, 4, 5, 6, 7]) {
       expect(descriptionAt(row)).toHaveProperty("readOnly", true);
@@ -1083,7 +1195,7 @@ describe("COTRTLI", () => {
     expect(messageRow("error").textContent).toBe(DELETE_RESTRICTED);
     expect(messageRow("info").textContent).toBe(CENTRED_RECORD_ACTIONS);
     expect(selectorAt(1)).toHaveProperty("value", "D");
-    expect(bodyRow(1).getAttribute("data-state")).toBe("selected");
+    expectHighlighted(1, true);
   });
 
   it("a U opens its description; F10 flags a bad one at its row, then saves", async () => {
@@ -1666,8 +1778,8 @@ const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/transaction-types`, so the admin guard that only the
- * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
- * render allows 5 s. Returns the router, whose location the test reads.
+ * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1822,4 +1934,3 @@ describe("COTRTLI: F2 while the maintenance screen loads", () => {
     },
   );
 });
-

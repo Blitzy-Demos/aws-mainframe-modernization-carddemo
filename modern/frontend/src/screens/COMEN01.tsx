@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useEffect, useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import { useLocation, useNavigate } from "react-router";
 import { useComen01cMainMenu } from "@/api/hooks";
@@ -23,9 +23,10 @@ import { COMEN01_LENGTHS, type Comen01Values, comen01Schema } from "@/schemas/CO
  *
  * The screen loads endpoint 2 once when it mounts, as COMEN01C sends its option list on first
  * entry (COMEN01C-005), and decides ENTER, F3 and every other key from that response with no
- * further request (COMEN01-035). Every message it shows is a text the response carries, or the
- * shared invalid-key text, so the screen composes none (COMEN01C-011). The menu is a single
- * resource, not a collection, so no page size is sent (Bounded Pagination).
+ * further request (COMEN01-035). Only after a load has failed does ENTER request endpoint 2 again,
+ * to decide from its answer. Every message it shows is a text the response carries, or the shared
+ * invalid-key text, so the screen composes none (COMEN01C-011). The menu is a single resource, not
+ * a collection, so no page size is sent (Bounded Pagination).
  *
  * The user type the admin-only check compares is the one endpoint 2 states, the verified token's
  * claim (COMEN01C-004, AAP 0.5.1). It only chooses the message; the API's gates are the control.
@@ -136,22 +137,44 @@ function transferState(received: unknown): Record<string, unknown> {
 }
 
 /**
+ * The menu as the last key sent it again: the message that key produced and the number of the
+ * send. Every key the screen answers makes a new send, a repeated message included, so the screen
+ * renders again and the header shows the time of this send (COMEN01C-019), the message row
+ * announces its text again and the cursor returns to the option input.
+ */
+type MenuSend = {
+  /** The key's message; `undefined` leaves the row to the load failure, if any. */
+  readonly text: string | undefined;
+  /** 0 on first entry, then one more for each send a key produces. */
+  readonly number: number;
+};
+
+/** First entry: no key has been answered yet (COMEN01C-005). */
+const FIRST_ENTRY: MenuSend = { text: undefined, number: 0 };
+
+/**
  * The main-menu screen (CM00 / COMEN01C, endpoint 2).
  *
  * - On mount: endpoint 2 loads the option table; while it loads, the 12 rows are blank, and a
- *   load failure shows its `ScreenError` message in the error row. A failure after which the
+ *   load failure shows its `ScreenError` message in the error row. Each failure after which the
  *   session is gone (the API refused the token, and the client cleared the session) sends the
  *   user to sign-on, where the route guard would send a user with no session (COMEN01C-003).
  * - ENTER: `enterOutcome`, decided from the loaded response; while it loads, or reloads, ENTER
  *   decides nothing and is disabled, the key row and the form are busy and the option input is
  *   read-only. The server's texts win over the schema's messages, so none of zod's is shown.
+ * - ENTER after a failed load, the reload on a return to `/menu` included: endpoint 2 is requested
+ *   again, the keyboard locked as for the first load. Its table decides the entry ENTER carried,
+ *   as above, and replaces the failure's message; a new failure shows its own message, and the
+ *   next ENTER tries again. Once F3 or an unmount has left the screen, the reload's answer decides
+ *   nothing.
  * - F3: back to sign-on with no request (COMEN01C-006), at any time, a load in progress included.
  *   The session is not cleared here: the sign-on screen's first entry clears it.
  * - Any other F-key: the invalid-key text, the input left as typed (COMEN01C-007); while endpoint
  *   2 loads or reloads, the busy key row takes it with no message.
  *
  * Every key clears the message of the previous one first (COMEN01C-001). Whenever the menu is
- * shown again with a message, the cursor returns to the option input, the map's `IC` field.
+ * shown again with a message, the cursor returns to the option input, the map's `IC` field, with
+ * the input's text selected so that the next option overtypes it.
  */
 export function COMEN01(): ReactNode {
   const navigate = useNavigate();
@@ -162,36 +185,95 @@ export function COMEN01(): ReactNode {
     resolver: zodResolver(comen01Schema),
     defaultValues: { option: "" },
   });
-  // The message the last key produced; `undefined` until a key has decided one, so until then the
-  // row shows the load failure, if any.
-  const [message, setMessage] = useState<string | undefined>(undefined);
+  // The last send a key produced, with its message; until a key has decided one, the row shows
+  // the load failure, if any.
+  const [sent, setSent] = useState<MenuSend>(FIRST_ENTRY);
   // Whether endpoint 2 is loading or reloading, when ENTER decides nothing. Read here, during
   // render, so the screen renders again when the fetch ends: TanStack Query re-renders only for
   // the result fields a render reads, and a reload on a return to `/menu` brings identical data,
   // so a flag read only in the handler would keep the value of the render that started the reload.
   // The same flag disables ENTER, so the button and the key refuse what the handler would ignore.
   const busy = menu.isFetching;
-
+  // Set while the reload an ENTER started is out, from before the render that marks the query
+  // fetching, so a second ENTER in between neither sends a request nor decides anything.
+  const reloading = useRef(false);
+  // Set once F3 or an unmount has left the screen, so a reload that answers later neither
+  // transfers nor sends the map again. Cleared on every mount, as StrictMode mounts twice.
+  const left = useRef(false);
   useEffect(() => {
-    if (menu.isError && getSession() === null) {
+    left.current = false;
+    return () => {
+      left.current = true;
+    };
+  }, []);
+
+  // Keyed on the failure itself rather than on the error flag, so a reload that ENTER started and
+  // the API refused with 401 is acted on too, though the query was in error already.
+  const loadError = menu.error;
+  useEffect(() => {
+    if (loadError !== null && getSession() === null) {
       void navigate(PATHS.COSGN00, { replace: true });
     }
-  }, [menu.isError, navigate]);
+  }, [loadError, navigate]);
 
-  function enter(typed: string, numeric: boolean): void {
-    const loaded = menu.data;
-    if (loaded === undefined || busy) {
-      return;
+  // Each send puts the cursor back on the option input, the map's `IC` field (COMEN01-025), with
+  // its text selected, so the next option overtypes the value shown from the first position, as on
+  // the terminal; at `maxLength` an unselected value would refuse the digit. The effect follows
+  // the render that wrote that value into the input, so the selection outlasts it.
+  const { setFocus } = form;
+  useEffect(() => {
+    if (sent.number > 0) {
+      setFocus("option", { shouldSelect: true });
     }
+  }, [sent.number, setFocus]);
+
+  /** The map sent again with `text`, as a new send even when the text repeats the last one. */
+  function sendAgain(text: string | undefined): void {
+    setSent((previous) => ({ text, number: previous.number + 1 }));
+  }
+
+  /** ENTER decided from the option table `loaded`: a transfer, or the map sent again. */
+  function decide(
+    loaded: components["schemas"]["MenuResponse"],
+    typed: string,
+    numeric: boolean,
+  ): void {
     const outcome = enterOutcome(loaded, typed, numeric);
     if (outcome.kind === "transfer") {
       void navigate(outcome.route, { state: transferState(received) });
       return;
     }
-    setMessage(outcome.message);
+    // The map is sent again, the input showing the option as the edit produced it.
+    sendAgain(outcome.message);
     form.setValue("option", outcome.option);
-    // The map is sent again, and its `IC` field takes the cursor (COMEN01-025).
-    form.setFocus("option");
+  }
+
+  function enter(typed: string, numeric: boolean): void {
+    if (busy || reloading.current) {
+      return;
+    }
+    if (menu.isError) {
+      // The load failed, so no table is current: endpoint 2 is requested again, and the entry this
+      // ENTER carried is decided from its answer. `refetch` settles with the query's result and
+      // never rejects.
+      reloading.current = true;
+      void menu.refetch().then((result) => {
+        reloading.current = false;
+        if (left.current) {
+          return;
+        }
+        if (result.isSuccess) {
+          decide(result.data, typed, numeric);
+        } else {
+          // The row shows the new failure's message, as a send of its own.
+          sendAgain(undefined);
+        }
+      });
+      return;
+    }
+    if (menu.data !== undefined) {
+      decide(menu.data, typed, numeric);
+    }
   }
 
   const keys = useMemo<readonly PfKeyBarEntry[]>(
@@ -201,6 +283,7 @@ export function COMEN01(): ReactNode {
           ? {
               ...item,
               onPress: () => {
+                left.current = true;
                 void navigate(PATHS.COSGN00);
               },
             }
@@ -213,11 +296,10 @@ export function COMEN01(): ReactNode {
     () => ({
       foldShifted: KEY_ROWS.COMEN01.foldShifted,
       onInvalidKey: () => {
-        setMessage(INVALID_KEY);
-        form.setFocus("option");
+        setSent((previous) => ({ text: INVALID_KEY, number: previous.number + 1 }));
       },
     }),
-    [form],
+    [],
   );
 
   const options = menu.data?.options ?? [];
@@ -232,7 +314,11 @@ export function COMEN01(): ReactNode {
       program={SCREENS.COMEN01.program}
       title="Main Menu"
       formId={formId}
-      message={{ kind: "error", text: message ?? menu.error?.message ?? "" }}
+      message={{
+        kind: "error",
+        text: sent.text ?? loadError?.message ?? "",
+        send: sent.number,
+      }}
       keys={keys}
       keyOptions={keyOptions}
       busy={busy}
@@ -263,7 +349,16 @@ export function COMEN01(): ReactNode {
                 <TableBody>
                   {rows.map((text, index) => (
                     // Read-only rows: the table's hover highlight would mark them as interactive.
-                    <TableRow key={optionField(index)} className="hover:bg-transparent">
+                    // A row no option fills has a transparent rule, so the blank map field draws
+                    // no line, yet keeps the rule's width and with it the height of a filled row.
+                    <TableRow
+                      key={optionField(index)}
+                      className={
+                        options.at(index) === undefined
+                          ? "border-transparent hover:bg-transparent"
+                          : "hover:bg-transparent"
+                      }
+                    >
                       {/* BLUE output field; `whitespace-pre` shows the 40 bytes as sent. */}
                       <TableCell
                         data-field={optionField(index)}

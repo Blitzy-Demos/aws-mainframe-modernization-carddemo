@@ -436,6 +436,55 @@ function listLines(): HTMLElement[] {
   return within(body).getAllByRole("row");
 }
 
+/** A column of the list `Table`: the map column it starts at and its width in map columns. */
+interface ListColumn {
+  readonly start: number;
+  readonly width: number;
+}
+
+/**
+ * The columns of `table` from its `colgroup`, the first starting at map column `first`: each
+ * `col` is a `w-k/n` fraction of the list's `span` map columns, and together they fill it.
+ */
+function listColumns(table: HTMLElement, first: number, span: number): ListColumn[] {
+  const columns: ListColumn[] = [];
+  let start = first;
+  for (const col of table.querySelectorAll("colgroup > col")) {
+    const [, width = "", of = ""] = /^w-(\d+)\/(\d+)$/.exec(col.className) ?? [];
+    expect(of).toBe(String(span));
+    columns.push({ start, width: Number.parseInt(width, 10) });
+    start += Number.parseInt(width, 10);
+  }
+  expect(start).toBe(first + span);
+  return columns;
+}
+
+/**
+ * The map column `element` shows its content at: its column's start, moved by its `left-k/w` or
+ * `-left-k/w` class, `k` of the column's `w` map columns.
+ */
+function shownColumn(element: Element, column: ListColumn | undefined): number {
+  if (column === undefined) {
+    throw new Error("a list cell stands outside the colgroup's columns");
+  }
+  const shift = /(?:^|\s)(-?)left-(\d+)\/(\d+)(?:\s|$)/.exec(element.className);
+  if (shift === null) {
+    return column.start;
+  }
+  const [, sign, moved, of] = shift;
+  expect(element.classList.contains("relative")).toBe(true);
+  expect(of).toBe(String(column.width));
+  const columns = Number.parseInt(moved, 10);
+  return sign === "-" ? column.start - columns : column.start + columns;
+}
+
+/** The map column each cell of `row` shows its text at: its own, or its one wrapper's. */
+function shownColumns(row: Element | undefined, columns: readonly ListColumn[]): number[] {
+  return Array.from(row?.children ?? [], (cell, index) => {
+    return shownColumn(cell.firstElementChild ?? cell, columns.at(index));
+  });
+}
+
 /** The transaction ID, date, description and amount a list line shows, verbatim. */
 function lineValues(line: HTMLElement): (string | null)[] {
   return within(line)
@@ -591,10 +640,12 @@ describe("COTRN00 List Transactions", () => {
       "     Description          ",
       "   Amount   ",
     ]);
+    // Line 9's rules are decoration hidden from assistive technology: plain cells, no headers.
     expect(rules.getAttribute("aria-hidden")).toBe("true");
+    expect(within(rules).queryAllByRole("columnheader", { hidden: true })).toEqual([]);
     expect(
       within(rules)
-        .getAllByRole("columnheader", { hidden: true })
+        .getAllByRole("cell", { hidden: true })
         .map((cell) => cell.textContent),
     ).toEqual(["---", "-".repeat(16), "-".repeat(8), "-".repeat(26), "-".repeat(12)]);
 
@@ -833,6 +884,50 @@ describe("COTRN00 List Transactions", () => {
       expect(cells).toHaveLength(5);
       expect(within(cells[0]).getByRole("textbox")).toBe(selector(index + 1));
     });
+  });
+
+  it.each([
+    { shown: "ten transactions", page: FIRST_PAGE },
+    { shown: "three transactions", page: SHORT_PAGE },
+  ])("keeps the list on the map's columns and lines with $shown", async ({ page }) => {
+    // audit: COTRN00-017
+    // audit: COTRN00-018
+    // audit: COTRN00-019
+    // audit: COTRN00-020
+    // audit: COTRN00-021
+    // audit: COTRN00-022
+    // audit: COTRN00-023
+    // audit: COTRN00-024
+    // audit: COTRN00-025
+    // audit: COTRN00-026
+    // audit: COTRN00-027
+    const sent = stubFetch(json(200, page));
+    renderList();
+    await answered(sent, 1);
+
+    // Fixed columns from the fields' `POS`: the selector column at 2, the transaction ID at 8,
+    // the date at 27, the description at 38 and the amount at 67, to the list's end at 78.
+    const table = screen.getByRole("table", { name: "Transactions" });
+    expect(table.classList.contains("table-fixed")).toBe(true);
+    const columns = listColumns(table, 2, 77);
+    expect(columns.map((column) => column.start)).toEqual([2, 8, 27, 38, 67]);
+    // Captions (line 8) and rules (line 9) start on their columns.
+    const [captions, rules] = Array.from(table.querySelectorAll("thead > tr"));
+    expect(shownColumns(captions, columns)).toEqual([2, 8, 27, 38, 67]);
+    expect(shownColumns(rules, columns)).toEqual([2, 8, 27, 38, 67]);
+    // Every selector at column 3, on every line, blank lines included.
+    for (const row of Array.from({ length: 10 }, (_, index) => index + 1)) {
+      expect(shownColumn(selector(row), columns.at(0))).toBe(3);
+    }
+    // Twelve rows of one line pitch each, whatever they hold, and no cell padding on the line.
+    expect(table.querySelectorAll("tr")).toHaveLength(12);
+    for (const row of table.querySelectorAll("tr")) {
+      expect(row.classList.contains("h-10")).toBe(true);
+    }
+    for (const cell of table.querySelectorAll("th, td")) {
+      expect(cell.classList.contains("px-0")).toBe(true);
+      expect(cell.classList.contains("pt-0")).toBe(true);
+    }
   });
 
   it.each(Array.from({ length: 10 }, (_, index) => index + 1))(
@@ -1600,8 +1695,8 @@ const SIGNON_REQUIRED: components["schemas"]["ScreenError"] = {
 
 /**
  * Renders the application's route table at `/transactions`, so the sign-on guard that only the
- * table mounts stands in front of the screen. Its screens load lazily, so a wait for one to
- * render allows 5 s. Returns the router, whose location the test reads.
+ * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads.
  */
 function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({
@@ -1684,7 +1779,7 @@ describe("COTRN00 behind the route guard", () => {
       </QueryClientProvider>,
     );
 
-    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    // Only the sign-on screen loads, through the route tree; the refused screen is never imported.
     await waitFor(
       () => {
         expect(router.state.location.pathname).toBe(PATHS.COSGN00);
@@ -1701,6 +1796,236 @@ describe("COTRN00 behind the route guard", () => {
     expect(sent).toHaveLength(0);
     router.dispose();
   });
+});
+
+/** The screen title of the frame the route table shows for a route that failed. */
+const UNAVAILABLE_TITLE = "Screen Unavailable";
+
+/** That frame's error row. */
+const UNAVAILABLE = "Unable to load the screen. Press ENTER to try again or F3 to go back.";
+
+/**
+ * Replaces the module of screen `name` with one whose import fails, as a browser's import of a
+ * screen's chunk fails while the network is down, until `restore` is called; from then on each
+ * import gives the real module. `attempts` counts the imports tried so far.
+ */
+function failingImport(name: string): { attempts: () => number; restore: () => void } {
+  let failing = true;
+  let attempts = 0;
+  vi.doMock(`./${name}`, async () => {
+    attempts += 1;
+    if (failing) {
+      throw new TypeError(`Failed to fetch dynamically imported module: /src/screens/${name}.tsx`);
+    }
+    return vi.importActual(`./${name}`);
+  });
+  return {
+    attempts: () => attempts,
+    restore: () => {
+      failing = false;
+    },
+  };
+}
+
+/**
+ * Asserts the frame shown in place of a screen that could not be loaded: the shared `ScreenShell`
+ * headed with the failed route's transaction and program, the frame's title and error row, and
+ * the keys ENTER=Retry and F3=Back.
+ */
+function expectUnavailableFrame(transaction: string, program: string): void {
+  expect(screen.getByRole("heading", { level: 1, name: UNAVAILABLE_TITLE })).toBeDefined();
+  expect(headerField("TRNNAME")).toBe(transaction);
+  expect(headerField("PGMNAME")).toBe(program);
+  expect(errorRow().textContent).toBe(UNAVAILABLE);
+  expect(
+    within(screen.getByRole("group", { name: "Function keys" }))
+      .getAllByRole("button")
+      .map((button) => button.textContent),
+  ).toEqual(["ENTER=Retry", "F3=Back"]);
+  expect(screen.queryByText(/Unexpected Application Error/)).toBeNull();
+}
+
+/**
+ * Waits inside `act` until `router` has finished its first load, which the route's loader ends
+ * only after `render` returns. The frame or screen that load shows is then rendered and its effects
+ * have run, among them the binding of its function keys to the window, so a key the test presses
+ * next reaches it. Outside `act` those effects can still be pending once the frame is in the
+ * document, and a key pressed then is lost.
+ */
+async function firstLoadDone(router: ReturnType<typeof createMemoryRouter>): Promise<void> {
+  await act(async () => {
+    await vi.waitUntil(() => router.state.initialized, { timeout: 5_000 });
+  });
+}
+
+// A screen's module is imported by its route's loader, which keeps no failed import: a screen whose
+// import failed shows the root route's frame inside `ScreenShell`, and the next navigation to it,
+// by the frame's keys or otherwise, imports the module again. Each wait for a route's loader to
+// render its screen or the frame allows 5 s, as one for a screen of the route table does: a module
+// this file has not imported yet, such as a menu, is transformed on its first import. The first
+// load is awaited with `firstLoadDone`, so the frame's keys are bound before one is pressed.
+describe("COTRN00 in the route table: a module that cannot be loaded", () => {
+  afterEach(() => {
+    vi.doUnmock("./COTRN00");
+    vi.doUnmock("./COSGN00");
+  });
+
+  it.each([
+    {
+      how: "a click on ENTER=Retry imports it again in place, with the same route state",
+      recover: async () => {
+        press("ENTER=Retry");
+      },
+      entryKey: "pf3",
+      count: 1,
+      action: "REPLACE",
+    },
+    {
+      how: "the Enter key imports it again in place, with the same route state",
+      recover: async () => {
+        fireEvent.keyDown(document.body, { key: "Enter" });
+      },
+      entryKey: "pf3",
+      count: 1,
+      action: "REPLACE",
+    },
+    {
+      how: "F3=Back to the menu and a new visit from there import it again",
+      recover: async (router: ReturnType<typeof createMemoryRouter>) => {
+        press("F3=Back");
+        expect(
+          await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
+        ).toBeDefined();
+        await act(async () => {
+          await router.navigate(PATHS.COTRN00, { state: { from: PATHS.COMEN01 } });
+        });
+      },
+      entryKey: "enter",
+      // The menu's own load, endpoint 2, answered 500 by the stub, comes before the list.
+      count: 2,
+      action: "PUSH",
+    },
+  ])(
+    "a failed import shows the frame, not the screen, and $how",
+    async ({ recover, entryKey, count, action }) => {
+      const module = failingImport("COTRN00");
+      const sent = stubFetch(json(200, FIRST_PAGE));
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, {
+        initialEntries: [
+          { pathname: PATHS.COTRN00, state: { from: PATHS.COTRN01, entry_key: "pf3" } },
+        ],
+      });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      await firstLoadDone(router);
+
+      expect(
+        await screen.findByRole("heading", { level: 1, name: UNAVAILABLE_TITLE }),
+      ).toBeDefined();
+      expectUnavailableFrame("CT00", "COTRN00C");
+      expect(router.state.location.pathname).toBe(PATHS.COTRN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "List Transactions" })).toBeNull();
+      expect(module.attempts()).toBe(1);
+      expect(sent).toHaveLength(0);
+
+      module.restore();
+      await recover(router);
+
+      expect(
+        await screen.findByRole(
+          "heading",
+          { level: 1, name: "List Transactions" },
+          { timeout: 5_000 },
+        ),
+      ).toBeDefined();
+      await answered(sent, count);
+      expect([sent.at(-1)?.path, sent.at(-1)?.query]).toEqual([
+        LIST_PATH,
+        { entry_key: entryKey, page_no: "0", has_next_page: "false" },
+      ]);
+      expect(router.state.location.pathname).toBe(PATHS.COTRN00);
+      expect(router.state.historyAction).toBe(action);
+      expect(module.attempts()).toBe(2);
+      expect(screen.queryByRole("heading", { level: 1, name: UNAVAILABLE_TITLE })).toBeNull();
+      router.dispose();
+    },
+  );
+
+  it.each([
+    {
+      who: "USER0001, user type U",
+      install: () => {
+        setSession(TOKEN, "USER0001", "U");
+      },
+      name: "COTRN00",
+      path: PATHS.COTRN00,
+      header: ["CT00", "COTRN00C"],
+      target: PATHS.COMEN01,
+      landmark: { role: "heading", name: "Main Menu" },
+    },
+    {
+      who: "ADMIN001, user type A",
+      install: () => {
+        setSession(TOKEN, "ADMIN001", "A");
+      },
+      name: "COTRN00",
+      path: PATHS.COTRN00,
+      header: ["CT00", "COTRN00C"],
+      target: PATHS.COADM01,
+      landmark: { role: "heading", name: "Admin Menu" },
+    },
+    {
+      who: "nobody signed on",
+      install: () => {
+        clearSession();
+      },
+      name: "COSGN00",
+      path: PATHS.COSGN00,
+      header: ["CC00", "COSGN00C"],
+      target: PATHS.COSGN00,
+      landmark: { role: "button", name: "ENTER=Sign-on" },
+    },
+  ])(
+    "the F3 key on the frame of $name for $who goes to $target, the menu sign-on opens for that user",
+    async ({ install, name, path, header, target, landmark }) => {
+      install();
+      const module = failingImport(name);
+      stubFetch();
+      const client = new QueryClient({
+        defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      });
+      const router = createMemoryRouter(routes, { initialEntries: [path] });
+      render(
+        <QueryClientProvider client={client}>
+          <RouterProvider router={router} />
+        </QueryClientProvider>,
+      );
+
+      await firstLoadDone(router);
+
+      expect(
+        await screen.findByRole("heading", { level: 1, name: UNAVAILABLE_TITLE }),
+      ).toBeDefined();
+      expectUnavailableFrame(header[0], header[1]);
+
+      module.restore();
+      fireEvent.keyDown(document.body, { key: "F3" });
+
+      expect(
+        await screen.findByRole(landmark.role, { name: landmark.name }, { timeout: 5_000 }),
+      ).toBeDefined();
+      expect(router.state.location.pathname).toBe(target);
+      expect(screen.queryByRole("heading", { level: 1, name: UNAVAILABLE_TITLE })).toBeNull();
+      router.dispose();
+    },
+  );
 });
 
 /**
@@ -1788,4 +2113,3 @@ describe("COTRN00 while the transaction view loads", () => {
     router.dispose();
   });
 });
-

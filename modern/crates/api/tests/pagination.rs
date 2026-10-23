@@ -61,6 +61,10 @@ type TestResult = Result<(), Box<dyn Error>>;
 /// An endpoint number and a request that endpoint must refuse.
 type Refused = (u8, Request<Body>);
 
+/// An endpoint number, a request whose query or body that endpoint cannot deserialise, and the
+/// message of its 400.
+type Unreadable = (u8, Request<Body>, &'static str);
+
 /// The HS256 secret of the test state: a local-only value.
 const SECRET: &str = "pagination-test-secret";
 
@@ -283,6 +287,21 @@ impl Harness {
         body
     }
 
+    /// Endpoint 25's ENTER of [`Harness::list_action_body`] with a last `page_size` member whose
+    /// value is the raw JSON text `page_size`, for a number that no `Value` holds.
+    fn raw_list_action(&self, page_size: &str) -> Result<Request<Body>, Box<dyn Error>> {
+        let body = self.list_action_body(None).to_string();
+        let members = body
+            .strip_suffix('}')
+            .ok_or("the endpoint 25 body is not an object")?;
+        Ok(Request::post(LIST_ACTIONS)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, bearer(&self.token))
+            .body(Body::from(format!(
+                r#"{members},"{PAGE_SIZE_FIELD}":{page_size}}}"#
+            )))?)
+    }
+
     /// One request to `endpoint`, with `page_size` as given or without the member.
     async fn collection(
         &self,
@@ -406,13 +425,28 @@ fn approved_detail(
     })
 }
 
-/// 101, 0 and -1 on each collection endpoint, and the largest `i64`, which must be refused rather
-/// than wrapped: 422 with the `page_size` message and field, before any rule of the program.
+/// 101, 0 and -1 on each collection endpoint, the largest `i64`, which must be refused rather
+/// than wrapped, integers beyond `i64` either way, and values that are no integer at all, the
+/// empty value included: 422 with the `page_size` message and field, before any rule of the
+/// program. Endpoint 25 receives each as a JSON number where the text is one (`1.5` and the
+/// integers beyond `i64` included) and as a JSON string otherwise, and also, as raw body text,
+/// an unquoted integer of 310 digits either way, beyond the range the JSON parser represents.
 #[tokio::test]
 async fn out_of_range_page_size_is_422() -> TestResult {
     let harness = Harness::start().await?;
     for endpoint in &COLLECTIONS {
-        for size in ["101", "0", "-1", "9223372036854775807"] {
+        for size in [
+            "101",
+            "0",
+            "-1",
+            "9223372036854775807",
+            "9223372036854775808",
+            "99999999999999999999",
+            "-9223372036854775809",
+            "abc",
+            "",
+            "1.5",
+        ] {
             let (status, body) = harness.collection(endpoint, Some(size)).await?;
             let number = endpoint.number;
             assert_eq!(
@@ -436,6 +470,23 @@ async fn out_of_range_page_size_is_422() -> TestResult {
                 "endpoint {number}, page_size {size}"
             );
         }
+    }
+    let nines = "9".repeat(310);
+    for (sign, size) in [("+", nines.clone()), ("-", format!("-{nines}"))] {
+        let (status, body) = harness.send(harness.raw_list_action(&size)?).await?;
+        assert_eq!(
+            (
+                status,
+                body.get("message").and_then(Value::as_str),
+                body.get("field").and_then(Value::as_str)
+            ),
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Some(PAGE_SIZE_MESSAGE),
+                Some(PAGE_SIZE_FIELD)
+            ),
+            "endpoint 25, page_size {sign} 310 nines unquoted"
+        );
     }
     Ok(())
 }
@@ -474,37 +525,24 @@ async fn in_range_and_default_page_sizes_succeed() -> TestResult {
     Ok(())
 }
 
-/// No other refusal is a 422. A `page_size` that is not an integer fails deserialisation (400,
-/// no field); a program edit or a member rule on a collection endpoint, with a valid
-/// `page_size`, is the program's 400; and the endpoints that are no collection, 4, 12 and 18,
+/// No other refusal is a 422. On a collection endpoint, with a valid `page_size`, another member
+/// that does not deserialise is the request layer's 400 with no field, and a program edit or a
+/// member rule is the program's 400; and the endpoints that are no collection, 4, 12 and 18,
 /// ignore a `page_size` and refuse bad keys with 400 or 404.
 #[tokio::test]
 async fn status_422_is_used_for_nothing_else() -> TestResult {
     let harness = Harness::start().await?;
-    for endpoint in &COLLECTIONS {
-        let number = endpoint.number;
-        let refusal = match endpoint.call {
-            Call::Get(_) => INVALID_QUERY,
-            Call::ListActions => INVALID_BODY,
-        };
-        for size in ["abc", "1.5", "9223372036854775808"] {
-            let (status, body) = harness.collection(endpoint, Some(size)).await?;
-            assert_eq!(
+    for (number, request, refusal) in unreadable_requests(&harness)? {
+        let (status, body) = harness.send(request).await?;
+        assert_eq!(
+            (
                 status,
-                StatusCode::BAD_REQUEST,
-                "endpoint {number}, page_size {size}"
-            );
-            assert_eq!(
                 body.get("message").and_then(Value::as_str),
-                Some(refusal),
-                "endpoint {number}, page_size {size}"
-            );
-            assert_eq!(
-                body.get("field"),
-                None,
-                "endpoint {number}, page_size {size}"
-            );
-        }
+                body.get("field")
+            ),
+            (StatusCode::BAD_REQUEST, Some(refusal), None),
+            "endpoint {number}: unreadable member"
+        );
     }
     for (number, request) in edit_failures(&harness)? {
         let (status, _) = harness.send(request).await?;
@@ -519,6 +557,33 @@ async fn status_422_is_used_for_nothing_else() -> TestResult {
         assert_eq!(status, expected, "endpoint {number}: {uri}");
     }
     Ok(())
+}
+
+/// One request per collection endpoint whose query or body does not deserialise, each with an
+/// in-range `page_size`, and the message of its 400: an unknown `direction` in a query string,
+/// an unknown `aid` in endpoint 25's body.
+fn unreadable_requests(harness: &Harness) -> Result<Vec<Unreadable>, Box<dyn Error>> {
+    let mut requests = Vec::with_capacity(COLLECTIONS.len());
+    for endpoint in &COLLECTIONS {
+        let (request, refusal) = match endpoint.call {
+            Call::Get(path) => (
+                harness.get(&format!("{path}?direction=sideways&page_size=5"))?,
+                INVALID_QUERY,
+            ),
+            Call::ListActions => {
+                let mut body = harness.list_action_body(Some("5"));
+                body.as_object_mut()
+                    .ok_or("the endpoint 25 body is not an object")?
+                    .insert("aid".to_owned(), Value::from("PF7"));
+                (
+                    post(LIST_ACTIONS, Some(harness.token.as_str()), &body)?,
+                    INVALID_BODY,
+                )
+            }
+        };
+        requests.push((endpoint.number, request, refusal));
+    }
+    Ok(requests)
 }
 
 /// One request per collection endpoint that the program or a member rule refuses, each with an

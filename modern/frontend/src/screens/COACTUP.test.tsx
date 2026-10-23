@@ -254,6 +254,12 @@ const CUSTOMER_NOT_FOUND: components["schemas"]["ScreenError"] = {
   message: "CustId:000000050 not found in customer master.Resp: 0000000013 REAS:0000080",
 };
 
+/**
+ * `FIELD_LENGTH_MESSAGE`: the request validator's 400 for a member longer than its map `LENGTH`,
+ * whose `field` is the member's path in the body (`fields.zip`, `snapshot.ssn_last4`).
+ */
+const FIELD_TOO_LONG = "Input does not fit the screen field...";
+
 /** The 15-character `+ZZZ,ZZZ,ZZZ.99` text of zero. */
 const ZERO_AMOUNT = "+           .00";
 
@@ -1152,6 +1158,68 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
     expectDetailsEnterable();
     expect(key("F5=Save").hasAttribute("hidden")).toBe(true);
     expect(key("F12=Cancel").hasAttribute("hidden")).toBe(!edit.cancelShown);
+  });
+
+  it.each([
+    {
+      title: "fields.zip marks the ZIP and leaves state E",
+      field: "fields.zip",
+      focus: "Zip",
+      marked: true,
+      shown: "62701",
+    },
+    {
+      title: "fields.ssn_part1 marks SSN part 1 with no * and leaves state E",
+      field: "fields.ssn_part1",
+      focus: "SSN:",
+      marked: true,
+      shown: "***",
+    },
+    {
+      title: "snapshot.ssn_last4 marks no input, puts the cursor on the status and keeps state S",
+      field: "snapshot.ssn_last4",
+      focus: "Active Y/N:",
+      marked: false,
+      shown: "Y",
+    },
+  ])("a validator 400 naming a body path: $title", async (rejection) => {
+    stubApi(
+      get(200, VIEW),
+      put(400, {
+        message: FIELD_TOO_LONG,
+        field: rejection.field,
+      } satisfies components["schemas"]["ScreenError"]),
+    );
+    renderScreen();
+    await fetchAccount();
+    fireEvent.click(key("ENTER=Process"));
+    await waitFor(() => {
+      expect(messageRow("error").textContent).toBe(FIELD_TOO_LONG);
+    });
+    await settled();
+
+    const focused = input(rejection.focus);
+    expect(document.activeElement).toBe(focused);
+    expect(focused.value).toBe(rejection.shown);
+    const invalid = mapInputs().filter((field) => field.getAttribute("aria-invalid") === "true");
+    expect(invalid).toEqual(rejection.marked ? [focused] : []);
+    expect(labelOf(focused).getAttribute("data-error")).toBe(String(rejection.marked));
+    // The marked input is described by its field message, for assistive technology only.
+    const messages = (focused.getAttribute("aria-describedby") ?? "")
+      .split(" ")
+      .map((id) => document.getElementById(id))
+      .filter((element) => element?.getAttribute("data-slot") === "form-message")
+      .map((element) => ({
+        text: element?.textContent,
+        srOnly: element?.classList.contains("sr-only"),
+      }));
+    expect(messages).toEqual(rejection.marked ? [{ text: FIELD_TOO_LONG, srOnly: true }] : []);
+    expect(messageRow("info").textContent).toBe(INFO_DETAILS);
+    expectDetailsEnterable();
+    // State E shows F12=Cancel; the state S of the fetch keeps it dark (COACTUPC-083).
+    expect(key("F5=Save").hasAttribute("hidden")).toBe(true);
+    expect(key("F12=Cancel").hasAttribute("hidden")).toBe(!rejection.marked);
+    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT"]);
   });
 
   it("ENTER without an account number shows * in the red account field", async () => {

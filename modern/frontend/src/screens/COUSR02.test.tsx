@@ -1631,7 +1631,7 @@ describe("COUSR02 /users/update opened with no session, through the route table"
       </QueryClientProvider>,
     );
 
-    // Both screens load lazily, through the route tree, before the sign-on screen renders.
+    // Only the sign-on screen loads, through the route tree; the refused screen is never imported.
     await waitFor(
       () => {
         expect(router.state.location.pathname).toBe(PATHS.COSGN00);
@@ -1696,8 +1696,8 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
   }
 
   /**
-   * Waits until the browser is at `/signon` and the sign-on screen, loaded lazily through the
-   * route tree, shows; then asserts that the update screen is gone and the session ended.
+   * Waits until the browser is at `/signon` and the sign-on screen, imported by its route's loader,
+   * shows; then asserts that the update screen is gone and the session ended.
    */
   async function signonReached(router: ReturnType<typeof createMemoryRouter>): Promise<void> {
     await waitFor(
@@ -1799,8 +1799,9 @@ describe("COUSR02: endpoint 18 and 19 requests", () => {
 
 /**
  * Renders the application's route table at `/users/update` with `state`, so the admin guard that
- * only the table mounts stands in front of the screen. Its screens load lazily, so a wait for one
- * to render allows 5 s. Returns the router, whose location the test reads.
+ * only the table mounts stands in front of the screen. Each screen is imported by its route's
+ * loader, so a wait for one to render allows 5 s. Returns the router, whose location the test
+ * reads.
  */
 function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter> {
   const client = new QueryClient({

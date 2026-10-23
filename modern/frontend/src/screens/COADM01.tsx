@@ -1,5 +1,5 @@
 import { zodResolver } from "@hookform/resolvers/zod";
-import { useId, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useId, useMemo, useRef, useState, type ReactNode } from "react";
 import { useForm } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCoadm01cAdminMenu } from "@/api/hooks";
@@ -43,6 +43,22 @@ const KEY_ITEMS = keyRowItems(KEY_ROWS.COADM01);
 type EnterOutcome =
   | { readonly kind: "transfer"; readonly route: string }
   | { readonly kind: "stay"; readonly message: ShellMessage };
+
+/**
+ * The menu as the last key sent it again: that key's message and the number of the send. Every
+ * key the screen answers makes a new send, a repeated message included, so the screen renders
+ * again with the time of this send in the header (COADM01C-022), the message row announces its
+ * text again and the cursor returns to the option input.
+ */
+type MenuSend = {
+  /** The key's message; `undefined` leaves the row to the load failure, if any. */
+  readonly message: ShellMessage | undefined;
+  /** 0 on first entry, then one more for each send a key produces. */
+  readonly number: number;
+};
+
+/** First entry: no key has been answered yet (COADM01C-003). */
+const FIRST_ENTRY: MenuSend = { message: undefined, number: 0 };
 
 /**
  * The option entry as COADM01C reads it (COADM01C-015): the map right-justifies and zero-fills the
@@ -94,8 +110,16 @@ function enterOutcome(menu: components["schemas"]["MenuResponse"], option: strin
  *   the lines without an option stay blank (COADM01C-003, COADM01C-005).
  * - ENTER and every other key are served from that response, with no further request. Each key
  *   replaces the message of the one before (COADM01C-004).
+ * - ENTER after a failed load, the reload on a return to `/admin` included, requests endpoint 3
+ *   again with the keyboard locked as for the first load. Its table decides the entry ENTER
+ *   carried, as above, and replaces the failure's message; a new failure, the gate's included,
+ *   shows its own message, and the next ENTER tries again. Once F3 or an unmount has left the
+ *   screen, the reload's answer decides nothing.
  * - F3 goes to sign-on, which starts with no session (COADM01C-020).
  * - Any other F-key shows the invalid-key message (COADM01C-021).
+ *
+ * Every send a key produces puts the cursor back on the option input, the map's `IC` field, with
+ * the input's text selected so that the next option overtypes it.
  *
  * While endpoint 3 loads or reloads, the keyboard is locked as the terminal's is until the program
  * answers: ENTER is disabled and decides nothing, so it never matches an entry against a cached
@@ -111,7 +135,19 @@ export function COADM01(): ReactNode {
   // again when the fetch ends: TanStack Query re-renders only for the result fields a render reads.
   // ENTER's guard and its `disabled` flag both follow it.
   const pending = menuQuery.isFetching;
-  const [keyMessage, setKeyMessage] = useState<ShellMessage>();
+  // Set while the reload an ENTER started is out, from before the render that marks the query
+  // fetching, so a second ENTER in between neither sends a request nor decides anything.
+  const reloading = useRef(false);
+  // Set once F3 or an unmount has left the screen, so a reload that answers later neither
+  // transfers nor sends the menu again. Cleared on every mount, as StrictMode mounts twice.
+  const left = useRef(false);
+  useEffect(() => {
+    left.current = false;
+    return () => {
+      left.current = true;
+    };
+  }, []);
+  const [sent, setSent] = useState<MenuSend>(FIRST_ENTRY);
   const form = useForm<Coadm01Values>({
     resolver: zodResolver(coadm01Schema),
     defaultValues: { option: "" },
@@ -126,6 +162,7 @@ export function COADM01(): ReactNode {
               onPress: () => {
                 // COSGN00C is entered without a COMMAREA, so the sign-on screen clears the
                 // stored session on arrival (COSGN00C-002); no route state is passed.
+                left.current = true;
                 void navigate(PATHS.COSGN00);
               },
             }
@@ -134,33 +171,69 @@ export function COADM01(): ReactNode {
     [navigate, pending],
   );
 
-  /** The menu sent again with `message`, the cursor back on the option input (`IC`). */
-  function stay(message: ShellMessage): void {
-    setKeyMessage(message);
-    form.setFocus("option");
+  // Each send puts the cursor back on the option input, the map's `IC` field (COADM01-025), with
+  // its text selected, so the next option overtypes the value shown from the first position, as on
+  // the terminal; at `maxLength` an unselected value would refuse the digit. The effect follows
+  // the render that wrote that value into the input, so the selection outlasts it.
+  const { setFocus } = form;
+  useEffect(() => {
+    if (sent.number > 0) {
+      setFocus("option", { shouldSelect: true });
+    }
+  }, [sent.number, setFocus]);
+
+  /**
+   * The menu sent again with `message`, the cursor back on the option input (`IC`): a new send
+   * even when the message repeats the last one.
+   */
+  function sendAgain(message: ShellMessage | undefined): void {
+    setSent((previous) => ({ message, number: previous.number + 1 }));
+  }
+
+  /**
+   * ENTER served from the option table: `serve` decides from the table the screen holds, or, after
+   * a failed load, from the table endpoint 3 answers when it is requested again. A new failure
+   * shows its own message, the gate's included. `refetch` settles with the query's result and
+   * never rejects. Nothing is decided while a load is out.
+   */
+  function onTable(serve: (table: components["schemas"]["MenuResponse"]) => void): void {
+    if (pending || reloading.current) {
+      return;
+    }
+    if (menuQuery.isError) {
+      reloading.current = true;
+      void menuQuery.refetch().then((result) => {
+        reloading.current = false;
+        if (left.current) {
+          return;
+        }
+        if (result.isSuccess) {
+          serve(result.data);
+        } else {
+          sendAgain(undefined);
+        }
+      });
+      return;
+    }
+    if (menu !== undefined) {
+      serve(menu);
+    }
   }
 
   /** ENTER with an entry the schema accepts: empty, or one or two digits. */
   function onEnter(values: Coadm01Values): void {
-    if (pending) {
-      return;
-    }
-    if (menu === undefined) {
-      // No table to match against after the load failed: the load's own outcome, the gate's
-      // message included, is what the row shows.
-      setKeyMessage(undefined);
-      return;
-    }
-    const option = justified(values.option);
-    const outcome = enterOutcome(menu, option);
-    if (outcome.kind === "transfer") {
-      // The target's F3 or F12 returns here; identity travels only in the token.
-      void navigate(outcome.route, { state: { from: PATHS.COADM01 } });
-      return;
-    }
-    // `MOVE WS-OPTION TO OPTIONO`: the input shows the two-digit option it was read as.
-    form.setValue("option", option);
-    stay(outcome.message);
+    onTable((table) => {
+      const option = justified(values.option);
+      const outcome = enterOutcome(table, option);
+      if (outcome.kind === "transfer") {
+        // The target's F3 or F12 returns here; identity travels only in the token.
+        void navigate(outcome.route, { state: { from: PATHS.COADM01 } });
+        return;
+      }
+      // `MOVE WS-OPTION TO OPTIONO`: the input shows the two-digit option it was read as.
+      form.setValue("option", option);
+      sendAgain(outcome.message);
+    });
   }
 
   /**
@@ -168,14 +241,9 @@ export function COADM01(): ReactNode {
    * the program's invalid-option text is shown rather than the schema's own issue text.
    */
   function onRefusedEntry(): void {
-    if (pending) {
-      return;
-    }
-    if (menu === undefined) {
-      setKeyMessage(undefined);
-      return;
-    }
-    stay({ kind: "error", text: menu.invalid_option_message });
+    onTable((table) => {
+      sendAgain({ kind: "error", text: table.invalid_option_message });
+    });
   }
 
   /** An F-key the program does not serve: the entry is sent back unexamined, as received. */
@@ -184,12 +252,14 @@ export function COADM01(): ReactNode {
     if (entry !== "") {
       form.setValue("option", justified(entry));
     }
-    setKeyMessage({ kind: "error", text: INVALID_KEY });
+    sendAgain({ kind: "error", text: INVALID_KEY });
   }
 
   const loadError = menuQuery.error?.message;
+  const shown: ShellMessage | undefined =
+    sent.message ?? (loadError === undefined ? undefined : { kind: "error", text: loadError });
   const message: ShellMessage | undefined =
-    keyMessage ?? (loadError === undefined ? undefined : { kind: "error", text: loadError });
+    shown === undefined ? undefined : { ...shown, send: sent.number };
 
   return (
     <ScreenShell
@@ -222,8 +292,17 @@ export function COADM01(): ReactNode {
                     const text = menu?.options.at(index)?.text;
                     return (
                       // A line without an option carries nothing to read, so assistive technology
-                      // skips it; it still shows the field's INITIAL and keeps its line.
-                      <TableRow key={field} aria-hidden={text === undefined ? true : undefined}>
+                      // skips it; it still shows the field's INITIAL and keeps its line. Its row
+                      // rule is transparent, so the blank map field draws no line, yet keeps the
+                      // rule's width and with it the height of a filled line; nor does it take the
+                      // table's hover band.
+                      <TableRow
+                        key={field}
+                        aria-hidden={text === undefined ? true : undefined}
+                        className={
+                          text === undefined ? "border-transparent hover:bg-transparent" : undefined
+                        }
+                      >
                         <TableCell
                           data-field={field}
                           className="whitespace-pre text-muted-foreground"

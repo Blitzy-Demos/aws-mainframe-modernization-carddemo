@@ -12,8 +12,12 @@ import { z } from "zod";
  * card number or other payload, and this module logs nothing. The JWT is never decoded:
  * an expired token surfaces as the API's 401, on which `api/client.ts` clears the session.
  * Every sign-on and every clear is announced to the listeners of {@link subscribeSession},
- * through which the route guard follows the session as it changes. The module stays free of
- * React: the subscription is a plain callback set.
+ * through which the route guard follows the session as it changes. So is every restore of the
+ * page from the browser's back/forward cache: the restored page resumes as it was frozen, while a
+ * later page of the same tab may have ended or replaced the session in the `sessionStorage` they
+ * share, so the guard reads it again rather than keep showing a screen signed off elsewhere. The
+ * module stays free of React: the subscription is a plain callback set, and the restore is heard
+ * through the window's `pageshow` event.
  */
 
 /** The single `sessionStorage` key that holds the session. */
@@ -41,16 +45,19 @@ function storage(): Storage | null {
   }
 }
 
-/** The functions {@link subscribeSession} registered, each told of every session change. */
+/**
+ * The functions {@link subscribeSession} registered, each told of every session change and of
+ * every restore of the page from the back/forward cache.
+ */
 const listeners = new Set<() => void>();
 
 /**
  * Tells every registered listener that the session may have changed. It runs whether or not
  * storage took the change, because a failed write or removal can still change what
  * {@link getSession} reads. Each listener runs on its own: one that throws neither stops the
- * others nor reaches the caller, so {@link setSession} and {@link clearSession} never throw.
- * The set is copied first, so a listener added or removed while the round runs does not change
- * that round.
+ * others nor reaches the caller, so {@link setSession}, {@link clearSession} and the `pageshow`
+ * handler never throw. The set is copied first, so a listener added or removed while the round
+ * runs does not change that round.
  */
 function notify(): void {
   for (const listener of [...listeners]) {
@@ -63,15 +70,52 @@ function notify(): void {
 }
 
 /**
- * Registers `listener` to run after every {@link setSession} and {@link clearSession}, and
- * returns the function that removes it. This is the `subscribe` of React's
- * `useSyncExternalStore`, through which `RequireSignon` re-renders as soon as a 401 clears the
- * session. A function registered twice is held, and called, once.
+ * The window whose `pageshow` event reports a restore from the back/forward cache, or `null`
+ * where there is no window or it cannot take event listeners (the Node test environment). It is
+ * looked up on every call and never at import time, so importing this module cannot throw.
+ */
+function pageWindow(): Window | null {
+  const page: Window | undefined = globalThis.window;
+  return page !== undefined &&
+    typeof page.addEventListener === "function" &&
+    typeof page.removeEventListener === "function"
+    ? page
+    : null;
+}
+
+/**
+ * Tells the listeners that the session may have changed when the page is restored from the
+ * back/forward cache (`persisted`). No {@link setSession} or {@link clearSession} ran in the
+ * restored page, yet another page of the tab may have changed the session meanwhile. Any other
+ * `pageshow` is a fresh load, whose guard reads the session as it first renders.
+ */
+function onPageShow(event: PageTransitionEvent): void {
+  if (event.persisted) {
+    notify();
+  }
+}
+
+/**
+ * Registers `listener` to run after every {@link setSession} and {@link clearSession}, and after
+ * every restore of the page from the back/forward cache, and returns the function that removes
+ * it. This is the `subscribe` of React's `useSyncExternalStore`, through which `RequireSignon`
+ * re-renders as soon as a 401 clears the session, and reads the session again when a restored
+ * page resumes. A function registered twice is held, and called, once.
+ *
+ * One `pageshow` handler serves every listener: added to the window when the first listener is
+ * registered and removed once the last is, so a duplicate registration adds none, and nothing
+ * stays on the window once nobody listens. Without a window, only the session changes reach
+ * the listeners.
  */
 export function subscribeSession(listener: () => void): () => void {
+  if (listeners.size === 0) {
+    pageWindow()?.addEventListener("pageshow", onPageShow);
+  }
   listeners.add(listener);
   return () => {
-    listeners.delete(listener);
+    if (listeners.delete(listener) && listeners.size === 0) {
+      pageWindow()?.removeEventListener("pageshow", onPageShow);
+    }
   };
 }
 
