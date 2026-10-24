@@ -230,8 +230,11 @@ function Target({ name }: { readonly name: string }) {
   );
 }
 
-/** Renders `/cards` with a stub at every route the screen opens. */
-function renderScreen(): void {
+/**
+ * Renders `/cards` with a stub at every route the screen opens. Returns the query client, whose
+ * pending requests {@link clientIdle} reads.
+ */
+function renderScreen(): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -247,6 +250,7 @@ function renderScreen(): void {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 /** The route state the target `name` received, once the screen has opened it. */
@@ -269,6 +273,38 @@ async function answered(seen: ReturnType<typeof stubFetch>, count: number): Prom
     expect(seen).toHaveLength(count);
     expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("false");
   });
+}
+
+/**
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoint 7 is a mutation of that client. It stays pending
+ * from the moment the screen starts it until its reply has arrived, by which time the client has
+ * cleared that request's deadline timer; the screen's own handling of the reply, chained on that
+ * mutation's promise, runs after. Every request the screen had started when this is called, the
+ * held ones aside, has therefore been answered once it returns. It cannot see a request the
+ * screen has not started yet: a test calls it once it has released the reads it held, or after
+ * {@link idleAfter50ms}.
+ */
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
+  });
+}
+
+/**
+ * For keys that must send nothing and leave nothing on screen to wait for, such as the keys the
+ * lock refuses: lets 50 ms pass inside `act`, so whatever the screen does with them within that
+ * window (a render, a request) runs and renders first, then waits as {@link clientIdle} does. It
+ * shows only that nothing was sent within those 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+  await clientIdle(client, held);
 }
 
 /** `ACCTSID`, found by its label `Account Number    :`. */
@@ -1047,18 +1083,24 @@ describe("COCRDLI", () => {
       }
       return json(200, direction === "backward" ? BACK_TO_FIRST_PAGE : FIRST_PAGE);
     });
-    renderScreen();
-    await firstPageShown();
+    const client = renderScreen();
+    try {
+      await firstPageShown();
 
-    press("F8=Forward");
-    await waitFor(() => {
-      expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("true");
-    });
-    // The 3270 keyboard stays locked until the program answers: these send nothing.
-    press("F8=Forward");
-    press("F7=Backward");
-    press("ENTER");
-    gate.open?.();
+      press("F8=Forward");
+      await waitFor(() => {
+        expect(document.querySelector("form")?.getAttribute("aria-busy")).toBe("true");
+      });
+      // The 3270 keyboard stays locked until the program answers: these send nothing.
+      press("F8=Forward");
+      press("F7=Backward");
+      press("ENTER");
+    } finally {
+      // The held F8 read is answered, pass or fail, and has settled before the test goes on or
+      // ends, so neither the request nor the client's deadline outlives the test.
+      gate.open?.();
+      await clientIdle(client);
+    }
 
     await waitFor(() => {
       expect(listedRows()).toEqual(cellsOf(SECOND_PAGE));
@@ -1098,35 +1140,41 @@ describe("COCRDLI", () => {
     send,
   }) => {
     const { requests, open } = holdAfter(before);
-    renderScreen();
-    if (send !== undefined) {
-      await firstPageShown();
-      send();
-    }
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
+    const client = renderScreen();
+    try {
+      if (send !== undefined) {
+        await firstPageShown();
+        send();
+      }
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
 
-    expect(disabledKeys()).toEqual({
-      ENTER: true,
-      "F3=Exit": false,
-      "F7=Backward": true,
-      "F8=Forward": true,
-    });
-    expect(listForm().getAttribute("aria-busy")).toBe("true");
-    expect(readOnlyInputs()).toEqual(Array.from({ length: inputs }, () => true));
-    // Neither the buttons nor the keys send a second request, and no key counts as invalid.
-    press("ENTER");
-    press("F7=Backward");
-    press("F8=Forward");
-    for (const key of ["Enter", "F7", "F8", "F5"]) {
-      fireEvent.keyDown(window, { key });
+      expect(disabledKeys()).toEqual({
+        ENTER: true,
+        "F3=Exit": false,
+        "F7=Backward": true,
+        "F8=Forward": true,
+      });
+      expect(listForm().getAttribute("aria-busy")).toBe("true");
+      expect(readOnlyInputs()).toEqual(Array.from({ length: inputs }, () => true));
+      // Neither the buttons nor the keys send a second request, and no key counts as invalid.
+      press("ENTER");
+      press("F7=Backward");
+      press("F8=Forward");
+      for (const key of ["Enter", "F7", "F8", "F5"]) {
+        fireEvent.keyDown(window, { key });
+      }
+      fireEvent.keyDown(window, { key: "F8", shiftKey: true });
+      fireEvent.submit(listForm());
+      expect(messageRow("error").textContent).toBe("");
+    } finally {
+      // The held read is answered, pass or fail, and has settled before the test goes on or ends,
+      // so neither the request nor the client's deadline outlives the test.
+      open();
+      await clientIdle(client);
     }
-    fireEvent.keyDown(window, { key: "F8", shiftKey: true });
-    fireEvent.submit(listForm());
-    expect(messageRow("error").textContent).toBe("");
 
-    open();
     await answered(requests, before + 1);
     expect(keyRow().getAttribute("aria-busy")).toBe("false");
     expect(disabledKeys()).toEqual({
@@ -1182,15 +1230,21 @@ describe("COCRDLI", () => {
   it("exits on F3 while a read is in flight", async () => {
     // audit: COCRDLIC-004
     const { requests, open } = holdAfter(0);
-    renderScreen();
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
+    const client = renderScreen();
+    try {
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
 
-    press("F3=Exit");
+      press("F3=Exit");
 
-    expect(await arrivedAt("COMEN01")).toBeNull();
-    open();
+      expect(await arrivedAt("COMEN01")).toBeNull();
+    } finally {
+      // The held read is answered, pass or fail, and has settled before the test goes on or ends,
+      // so neither the request nor the client's deadline outlives the test.
+      open();
+      await clientIdle(client);
+    }
     expect(listQueries(requests)).toEqual([{}]);
   });
 
@@ -2073,12 +2127,9 @@ describe("COCRDLI while the card screen it opens loads", () => {
       type(selector(5), code === "S" ? "U" : "S");
       press("ENTER");
       fireEvent.submit(listForm());
-      // Gives a request a refused key would send time to leave before the count.
-      await waitFor(async () => {
-        await new Promise((resolve) => {
-          setTimeout(resolve, 20);
-        });
-      });
+      // The refused keys change nothing on screen, so the count follows a bounded window. What
+      // the screen waits for is the card screen's module, not a reply, so no request is pending.
+      await idleAfter50ms(client);
 
       expect(listQueries(requests)).toEqual([{}]);
       expect(router.state.location.pathname).toBe(PATHS.COCRDLI);

@@ -132,12 +132,15 @@ function RouteStub() {
   return <p>{`Stub at ${location.pathname} ${JSON.stringify(location.state)}`}</p>;
 }
 
-/** COUSR01 at `/users/add`, with a stub at `/admin`, the only route it navigates to. */
+/**
+ * COUSR01 at `/users/add`, with a stub at `/admin`, the only route it navigates to. Returns the
+ * render result and the query client, whose pending adds {@link clientIdle} reads.
+ */
 function renderScreen() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[PATHS.COUSR01]}>
         <Routes>
@@ -147,6 +150,7 @@ function renderScreen() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** `element` as an `<input>`, failing the test when it is anything else. */
@@ -473,6 +477,32 @@ function heldAnswer(): { readonly gate: Promise<void>; readonly open: () => void
       }
     },
   };
+}
+
+/**
+ * Waits until `client` has no add pending. Endpoint 17 is a mutation of that client: it stays
+ * pending from the moment the screen starts it until its answer has arrived and, while the screen
+ * is mounted, has been passed to the screen's `onSuccess` or `onError`. Every add the screen had
+ * started when this is called has therefore been answered, and its deadline timer in
+ * `api/client.ts` cleared, once it returns. It cannot see an add the screen has not started yet,
+ * so a test calls it once it has awaited what the screen shows at the end of a key.
+ */
+async function clientIdle(client: QueryClient): Promise<void> {
+  await waitFor(() => {
+    expect(client.isMutating()).toBe(0);
+  });
+}
+
+/**
+ * For keys the lock refuses, which leave nothing on screen to wait for: lets 20 ms pass inside
+ * `act`, so whatever the keys cause within that window (a validation, a render, a request) runs
+ * and renders first. A request started later escapes it, so a check after it shows only that
+ * nothing was sent within those 20 ms.
+ */
+async function boundedWindow(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  });
 }
 
 describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
@@ -863,41 +893,39 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
 
   // audit: COUSR01C-005
   it("each key clears the previous message first: ENTER empties the row before its answer arrives", async () => {
-    const releases: (() => void)[] = [];
-    const gate = new Promise<void>((resolve) => {
-      releases.push(resolve);
-    });
-    const { sent } = stubFetch({ status: 400, body: duplicate, gate });
-    renderScreen();
+    const answer = heldAnswer();
+    const { sent } = stubFetch({ status: 400, body: duplicate, gate: answer.gate });
+    const { client } = renderScreen();
+    try {
+      fireEvent.click(key("F12=Exit"));
+      expect(messageRow("error").textContent).toBe(INVALID_KEY);
+      expect(messageRow("error").textContent).toHaveLength(50);
 
-    fireEvent.click(key("F12=Exit"));
-    expect(messageRow("error").textContent).toBe(INVALID_KEY);
-    expect(messageRow("error").textContent).toHaveLength(50);
+      typeEntry(typed);
+      fireEvent.click(key("ENTER=Add User"));
 
-    typeEntry(typed);
-    fireEvent.click(key("ENTER=Add User"));
-
-    // Cleared before the outcome: the request is out, its answer held back, and the row is empty.
-    await waitFor(() => {
+      // Cleared before the outcome: the request is out, its answer held back, and the row is
+      // empty.
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+        expect(messageRow("error").textContent).toBe("");
+      });
+      // A second ENTER while the add is in flight sends nothing, as the locked 3270 keyboard did:
+      // within the bounded window, while the first answer is still held back.
+      fireEvent.click(key("ENTER=Add User"));
+      await boundedWindow();
       expect(sent).toHaveLength(1);
-      expect(messageRow("error").textContent).toBe("");
-    });
-    // A second ENTER while the add is in flight sends nothing, as the locked 3270 keyboard did.
-    // Its submit validates in microtasks only, so one timer turn lets it finish while the first
-    // answer is still held back; the turn runs inside `act`, which renders the form state the
-    // submit updates.
-    fireEvent.click(key("ENTER=Add User"));
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(sent).toHaveLength(1);
-    for (const release of releases) {
-      release();
+      answer.open();
+      await waitFor(() => {
+        expect(messageRow("error").textContent).toBe("User ID already exist...");
+      });
+      expect(sent).toHaveLength(1);
+    } finally {
+      // Pass or fail, the held answer is let go and the test ends once the add has settled, so
+      // neither the request nor the client's deadline outlives the test.
+      answer.open();
+      await clientIdle(client);
     }
-    await waitFor(() => {
-      expect(messageRow("error").textContent).toBe("User ID already exist...");
-    });
-    expect(sent).toHaveLength(1);
   });
 
   // audit: COUSR01C-006
@@ -905,67 +933,79 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
   it("an add in flight locks ENTER, F4, F12 and the inputs and sends one request; its answer unlocks the screen", async () => {
     const answer = heldAnswer();
     const { sent } = stubFetch({ status: 200, body: added, gate: answer.gate });
-    renderScreen();
-    expect(lockShown()).toEqual(UNLOCKED);
+    const { client } = renderScreen();
+    try {
+      expect(lockShown()).toEqual(UNLOCKED);
 
-    typeEntry(typed);
-    fireEvent.click(key("ENTER=Add User"));
-    await waitFor(() => {
+      typeEntry(typed);
+      fireEvent.click(key("ENTER=Add User"));
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+      });
+      await lockReaches(SENDING_LOCK);
+
+      // ENTER by its button, by the Enter key outside the form and by the form's submission; F4
+      // and F12 by button and key; an unserved key. None acts within the bounded window, while
+      // the answer is held back.
+      fireEvent.click(key("ENTER=Add User"));
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      fireEvent.submit(formOf(inputFor(LABELS.password)));
+      fireEvent.click(key("F4=Clear"));
+      fireEvent.keyDown(inputFor(LABELS.password), { key: "F4" });
+      fireEvent.click(key("F12=Exit"));
+      fireEvent.keyDown(inputFor(LABELS.password), { key: "F12" });
+      fireEvent.keyDown(inputFor(LABELS.password), { key: "F5" });
+      await boundedWindow();
       expect(sent).toHaveLength(1);
-    });
-    await lockReaches(SENDING_LOCK);
+      expect(values()).toEqual(inMapOrder(typed));
+      expect(messageRow("error").textContent).toBe("");
+      expectNoNavigation();
 
-    // ENTER by its button, by the Enter key outside the form and by the form's submission; F4 and
-    // F12 by button and key; an unserved key. None acts while the answer is held back.
-    fireEvent.click(key("ENTER=Add User"));
-    fireEvent.keyDown(document.body, { key: "Enter" });
-    fireEvent.submit(formOf(inputFor(LABELS.password)));
-    fireEvent.click(key("F4=Clear"));
-    fireEvent.keyDown(inputFor(LABELS.password), { key: "F4" });
-    fireEvent.click(key("F12=Exit"));
-    fireEvent.keyDown(inputFor(LABELS.password), { key: "F12" });
-    fireEvent.keyDown(inputFor(LABELS.password), { key: "F5" });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(sent).toHaveLength(1);
-    expect(values()).toEqual(inMapOrder(typed));
-    expect(messageRow("error").textContent).toBe("");
-    expectNoNavigation();
+      answer.open();
+      await waitFor(() => {
+        expect(messageRow("info").textContent).toBe(added.message);
+      });
+      await lockReaches(UNLOCKED);
+      expect(values()).toEqual(["", "", "", "", ""]);
 
-    answer.open();
-    await waitFor(() => {
-      expect(messageRow("info").textContent).toBe(added.message);
-    });
-    await lockReaches(UNLOCKED);
-    expect(values()).toEqual(["", "", "", "", ""]);
-
-    // Answered, the keys act again: a later ENTER sends a second add.
-    typeEntry(typed);
-    fireEvent.click(key("ENTER=Add User"));
-    await waitFor(() => {
-      expect(sent).toHaveLength(2);
-    });
-    await lockReaches(UNLOCKED);
+      // Answered, the keys act again: a later ENTER sends a second add.
+      typeEntry(typed);
+      fireEvent.click(key("ENTER=Add User"));
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      await lockReaches(UNLOCKED);
+    } finally {
+      // Pass or fail, the held answer is let go and the test ends once every add has settled, so
+      // neither a request nor the client's deadline outlives the test.
+      answer.open();
+      await clientIdle(client);
+    }
   });
 
   // audit: COUSR01C-007
   it("F3 while the add is in flight stays enabled and returns to the admin menu", async () => {
     const answer = heldAnswer();
     const { sent } = stubFetch({ status: 200, body: added, gate: answer.gate });
-    renderScreen();
+    const { client } = renderScreen();
+    try {
+      typeEntry(typed);
+      fireEvent.click(key("ENTER=Add User"));
+      await lockReaches(SENDING_LOCK);
+      fireEvent.click(key("F3=Back"));
 
-    typeEntry(typed);
-    fireEvent.click(key("ENTER=Add User"));
-    await lockReaches(SENDING_LOCK);
-    fireEvent.click(key("F3=Back"));
-
-    expect(await screen.findByText(`Stub at ${PATHS.COADM01} null`)).toBeTruthy();
-    answer.open();
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-    expect(sent).toHaveLength(1);
+      expect(await screen.findByText(`Stub at ${PATHS.COADM01} null`)).toBeTruthy();
+      // The answer arrives after F3 left. Once the client has settled the add, it was the one
+      // request sent.
+      answer.open();
+      await clientIdle(client);
+      expect(sent).toHaveLength(1);
+    } finally {
+      // Pass or fail, the held answer is let go and the test ends once the add has settled, so
+      // neither the request nor the client's deadline outlives the test.
+      answer.open();
+      await clientIdle(client);
+    }
   });
 
   // audit: COUSR01C-005
@@ -1163,7 +1203,10 @@ describe("COUSR01 /users/add opened with no session, through the route table", (
     }
     expect(screen.queryByRole("button", { name: "ENTER=Add User" })).toBeNull();
 
-    // One timer turn, inside `act`, lets any effect or request the redirect left pending run.
+    // The refused screen never mounts, so nothing on screen marks the end of a wait: a bounded
+    // window of 20 ms, inside `act`, lets whatever follows within it (a render, a request) run
+    // first. A request sent later escapes it, so the check shows only that nothing was sent
+    // within those 20 ms.
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 20));
     });

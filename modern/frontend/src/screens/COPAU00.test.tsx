@@ -326,12 +326,16 @@ function TransferStub({ name }: { name: string }) {
   );
 }
 
-/** Renders the screen at `/authorizations` with `state`, beside stubs at its transfer targets. */
+/**
+ * Renders the screen at `/authorizations` with `state`, beside stubs at its transfer targets.
+ * Returns the render result and the query client, whose `isMutating` tells when the screen's
+ * reads of endpoint 21, which are mutations of that client, have settled.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COPAU00, state }]}>
         <Routes>
@@ -342,6 +346,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route state the transfer stub `name` shows, parsed back from its JSON. */
@@ -1754,34 +1759,43 @@ describe("COPAU00 View Authorizations", () => {
       await held;
       return json(200, PAGE_1)();
     }, json(200, PAGE_2));
-    renderScreen();
-    expectLocked(false);
-    enter(ACCOUNT);
-    await waitFor(() => expect(sent).toHaveLength(1));
-    expectLocked(true);
+    const { client } = renderScreen();
+    try {
+      expectLocked(false);
+      enter(ACCOUNT);
+      await waitFor(() => expect(sent).toHaveLength(1));
+      expectLocked(true);
 
-    press("ENTER=Continue");
-    press("F3=Back");
-    press("F7=Backward");
-    press("F8=Forward");
-    fireEvent.keyDown(accountField(), { key: "F2" });
-    fireEvent.keyDown(accountField(), { key: "F3" });
-    fireEvent.keyDown(accountField(), { key: "F8" });
-    await idle();
-    expect(sent).toHaveLength(1);
-    expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
-    expect(errorText()).toBe("");
+      press("ENTER=Continue");
+      press("F3=Back");
+      press("F7=Backward");
+      press("F8=Forward");
+      fireEvent.keyDown(accountField(), { key: "F2" });
+      fireEvent.keyDown(accountField(), { key: "F3" });
+      fireEvent.keyDown(accountField(), { key: "F8" });
+      await idle();
+      expect(sent).toHaveLength(1);
+      expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
+      expect(errorText()).toBe("");
 
-    gate.release();
-    await answered(sent, 1);
-    expectLocked(false);
-    expectListed(PAGE_1.rows);
-    expect(shownBlock()).toEqual(expectedBlock(BLOCK));
+      gate.release();
+      await answered(sent, 1);
+      expectLocked(false);
+      expectListed(PAGE_1.rows);
+      expect(shownBlock()).toEqual(expectedBlock(BLOCK));
 
-    // The answer unlocks the keyboard: the next key is served.
-    press("F8=Forward");
-    await answered(sent, 2);
-    expect(sent[1].query).toEqual({ page_key: authKey(5), direction: "forward" });
+      // The answer unlocks the keyboard: the next key is served.
+      press("F8=Forward");
+      await answered(sent, 2);
+      expect(sent[1].query).toEqual({ page_key: authKey(5), direction: "forward" });
+    } finally {
+      // The held read is answered, pass or fail, and the test ends once every read has settled,
+      // so neither a request nor the client's deadline outlives the test.
+      gate.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   // The lock is taken by the key itself, before the edits run: keys pressed in one burst, before
@@ -1822,35 +1836,45 @@ describe("COPAU00 View Authorizations", () => {
       },
       json(200, PAGE_1),
     );
-    renderScreen();
-    enter(ACCOUNT);
-    await answered(sent, 1);
+    const { client } = renderScreen();
+    try {
+      enter(ACCOUNT);
+      await answered(sent, 1);
 
-    // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
-    act(() => {
-      for (const label of presses) {
-        if (label.includes("=")) {
-          press(label);
-        } else {
-          fireEvent.keyDown(window, { key: label });
+      // Every press inside one `act`: a click on a key's button, or a keydown that reaches
+      // `window`.
+      act(() => {
+        for (const label of presses) {
+          if (label.includes("=")) {
+            press(label);
+          } else {
+            fireEvent.keyDown(window, { key: label });
+          }
         }
-      }
-    });
-    await waitFor(() => expect(sent).toHaveLength(2));
-    expectLocked(true);
-    await idle();
-    expect(sent).toHaveLength(2);
-    expect(sent[1].path).toBe(summaryPath(ACCOUNT));
-    expect(sent[1].query).toEqual(query);
-    expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
+      });
+      await waitFor(() => expect(sent).toHaveLength(2));
+      expectLocked(true);
+      await idle();
+      expect(sent).toHaveLength(2);
+      expect(sent[1].path).toBe(summaryPath(ACCOUNT));
+      expect(sent[1].query).toEqual(query);
+      expect(screen.queryByRole("region", { name: "Main Menu" })).toBeNull();
 
-    gate.release();
-    await answered(sent, 2);
-    expectLocked(false);
+      gate.release();
+      await answered(sent, 2);
+      expectLocked(false);
 
-    press("ENTER=Continue");
-    await answered(sent, 3);
-    expect(sent[2].query).toEqual({});
+      press("ENTER=Continue");
+      await answered(sent, 3);
+      expect(sent[2].query).toEqual({});
+    } finally {
+      // The held read is answered, pass or fail, and the test ends once every read has settled,
+      // so neither a request nor the client's deadline outlives the test.
+      gate.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   // The replacement's accessibility wiring, which no audit row states: every `aria-describedby`
@@ -2202,9 +2226,10 @@ describe("COPAU00 while the authorization detail loads", () => {
     }
     typeInto(selector(3), "S");
     press("ENTER=Continue");
-    // Inside `waitFor`, so the form-state updates the refused keys cause render where React
-    // expects them.
-    await waitFor(async () => {
+    // Nothing marks the moment a refused key would send a read, so a bounded window watches for
+    // one inside `act`, where the form-state updates the refused keys cause render. It shows only
+    // that nothing was sent within the window.
+    await act(async () => {
       await idle();
     });
 

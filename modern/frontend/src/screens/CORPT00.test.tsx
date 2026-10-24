@@ -1431,68 +1431,76 @@ describe("CORPT00 transaction reports screen", () => {
   });
 
   it("locks ENTER and the inputs while its request is in flight, keeps F3, then frees them", async () => {
-    let release: () => void = () => undefined;
-    const hold = new Promise<void>((resolve) => {
-      release = resolve;
-    });
+    const { promise: hold, release } = held();
     const requests = stubApi(
       { status: 200, body: monthlySubmitted, hold },
       { status: 400, body: confirmPrompt },
     );
     const { container, client } = renderScreen();
-    const form = container.querySelector("form");
-    if (form === null) {
-      throw new Error("CORPT0A renders no form");
-    }
-    const keyBar = screen.getByRole("group", { name: "Function keys" });
-    const back = screen.getByRole("button", { name: "F3=Back" });
-    expect(keyBar.getAttribute("aria-busy")).toBe("false");
-    expect(form.getAttribute("aria-busy")).toBe("false");
-    fill(monthlyRequest);
+    try {
+      const form = container.querySelector("form");
+      if (form === null) {
+        throw new Error("CORPT0A renders no form");
+      }
+      const keyBar = screen.getByRole("group", { name: "Function keys" });
+      const back = screen.getByRole("button", { name: "F3=Back" });
+      expect(keyBar.getAttribute("aria-busy")).toBe("false");
+      expect(form.getAttribute("aria-busy")).toBe("false");
+      fill(monthlyRequest);
 
-    // The second submit arrives while the first is still being validated, before any request.
-    fireEvent.submit(form);
-    fireEvent.submit(form);
-    await waitFor(() => {
+      // The second submit arrives while the first is still being validated, before any request.
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expect(keyBar.getAttribute("aria-busy")).toBe("true");
+      expect(form.getAttribute("aria-busy")).toBe("true");
+      expect(enterButton().getAttribute("aria-disabled")).toBe("true");
+      expect(back.getAttribute("aria-disabled")).toBeNull();
+      for (const field of FIELDS) {
+        expect(inputOf(field.name).readOnly).toBe(true);
+      }
+
+      // The ENTER button, the Enter key outside the form and an unserved key all do nothing.
+      fireEvent.click(enterButton());
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      fireEvent.keyDown(document.body, { key: "F5" });
+      // A refused key changes nothing on the screen, so the window is watched with the first
+      // ENTER's mutation still the one pending.
+      await observeQuiet(client, 1);
       expect(requests).toHaveLength(1);
-    });
-    expect(keyBar.getAttribute("aria-busy")).toBe("true");
-    expect(form.getAttribute("aria-busy")).toBe("true");
-    expect(enterButton().getAttribute("aria-disabled")).toBe("true");
-    expect(back.getAttribute("aria-disabled")).toBeNull();
-    for (const field of FIELDS) {
-      expect(inputOf(field.name).readOnly).toBe(true);
+      expect(messageRow().textContent).toBe("");
+
+      release();
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(monthlySubmitted.message);
+      });
+      expect(keyBar.getAttribute("aria-busy")).toBe("false");
+      expect(form.getAttribute("aria-busy")).toBe("false");
+      expect(enterButton().getAttribute("aria-disabled")).toBeNull();
+      for (const field of FIELDS) {
+        expect(inputOf(field.name).readOnly).toBe(false);
+      }
+
+      // Once answered, the next ENTER is sent.
+      fill(unconfirmedRequest);
+      await pressEnter();
+      await waitFor(() => {
+        expect(messageRow().textContent).toBe(confirmPrompt.message);
+      });
+      await settled(client);
+      expect(await bodies(requests)).toEqual([monthlyRequest, unconfirmedRequest]);
+    } finally {
+      // The held reply is answered and every mutation settled inside the test, on success and on
+      // failure alike, so neither a request nor the client's deadline timer outlives the test
+      // into `afterEach`, which restores `fetch` and clears the session. Once the body has
+      // released the hold, releasing it again does nothing.
+      release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
     }
-
-    // The ENTER button, the Enter key outside the form and an unserved key all do nothing.
-    fireEvent.click(enterButton());
-    fireEvent.keyDown(document.body, { key: "Enter" });
-    fireEvent.keyDown(document.body, { key: "F5" });
-    // A refused key changes nothing on the screen, so the window is watched with the first
-    // ENTER's mutation still the one pending.
-    await observeQuiet(client, 1);
-    expect(requests).toHaveLength(1);
-    expect(messageRow().textContent).toBe("");
-
-    release();
-    await waitFor(() => {
-      expect(messageRow().textContent).toBe(monthlySubmitted.message);
-    });
-    expect(keyBar.getAttribute("aria-busy")).toBe("false");
-    expect(form.getAttribute("aria-busy")).toBe("false");
-    expect(enterButton().getAttribute("aria-disabled")).toBeNull();
-    for (const field of FIELDS) {
-      expect(inputOf(field.name).readOnly).toBe(false);
-    }
-
-    // Once answered, the next ENTER is sent.
-    fill(unconfirmedRequest);
-    await pressEnter();
-    await waitFor(() => {
-      expect(messageRow().textContent).toBe(confirmPrompt.message);
-    });
-    await settled(client);
-    expect(await bodies(requests)).toEqual([monthlyRequest, unconfirmedRequest]);
   });
 
   it("frees the keyboard when the schema refuses ENTER, so a corrected ENTER is sent", async () => {

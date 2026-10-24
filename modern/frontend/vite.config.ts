@@ -198,10 +198,9 @@ export default defineConfig({
           name: "dom",
           environment: "jsdom",
           include: ["src/**/*.test.tsx"],
-          // A screen render test drives a whole map through several requests in jsdom. On a
-          // shared, loaded host they run 1-5 s each and the heaviest (COACTUP) 3-16 s, past
-          // Vitest's 5 s default, so the budget is widened rather than lost to timeouts; a hung
-          // test still fails.
+          // A screen render test drives a whole map through several requests in jsdom, which
+          // under coverage on a shared, loaded host can outrun Vitest's 5 s default, so the
+          // budget is widened; a hung test still fails.
           testTimeout: 30_000,
         },
       },

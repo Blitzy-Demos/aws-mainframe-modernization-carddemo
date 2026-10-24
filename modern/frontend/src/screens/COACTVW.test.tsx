@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -385,10 +385,11 @@ function json(status: number, body: unknown): Response {
 
 /**
  * Replaces `fetch` with a stub of endpoint 4 that answers with `answer` for the decoded account
- * segment, and 500 for any other request. Returns every request received, in order.
+ * segment and the request's signal, and 500 for any other request. Returns every request
+ * received, in order.
  */
 function stubFetch(
-  answer: (acctId: string) => Response | Promise<Response> = () =>
+  answer: (acctId: string, signal: AbortSignal) => Response | Promise<Response> = () =>
     json(500, { message: "unexpected request" }),
 ): { method: string; path: string; authorization: string | null }[] {
   const requests: { method: string; path: string; authorization: string | null }[] = [];
@@ -405,18 +406,21 @@ function stubFetch(
       if (req.method !== "GET" || !VIEW_PATH.test(pathname)) {
         return json(500, { message: `unexpected ${req.method} ${pathname}` });
       }
-      return answer(decodeURIComponent(pathname.split("/")[4] ?? ""));
+      return answer(decodeURIComponent(pathname.split("/")[4] ?? ""), req.signal);
     }),
   );
   return requests;
 }
 
-/** Renders the screen at its route, with a text stub at the main menu, its only exit. */
-function renderScreen(state?: unknown): ReturnType<typeof render> {
+/**
+ * Renders the screen at its route, with a text stub at the main menu, its only exit. Returns the
+ * render result and the query client, whose `isMutating` tells when the screen's view settled.
+ */
+function renderScreen(state?: unknown): ReturnType<typeof render> & { client: QueryClient } {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COACTVW, state }]}>
         <Routes>
@@ -426,6 +430,7 @@ function renderScreen(state?: unknown): ReturnType<typeof render> {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The input whose `data-field` is the BMS field `name`. */
@@ -570,20 +575,59 @@ function expectLocked(locked: boolean): void {
 
 /**
  * Replaces `fetch` with a stub of endpoint 4 that holds each view until the test answers it.
- * Returns the requests received and the answers still awaited, in order.
+ * Returns the requests received, the answers still awaited, in order, and `release`, which the
+ * test calls in a `finally`: it answers every view still held, and any view asked for after it
+ * at once, with a 500, so no request outlives the test. A view already answered keeps its answer.
  */
 function stubHeldFetch(): {
   requests: ReturnType<typeof stubFetch>;
   answers: ((response: Response) => void)[];
+  release: () => void;
 } {
   const answers: ((response: Response) => void)[] = [];
+  const done = held();
   const requests = stubFetch(
     () =>
       new Promise<Response>((resolve) => {
         answers.push(resolve);
+        void done.promise.then(() => {
+          resolve(json(500, { message: "the test is done" }));
+        });
       }),
   );
-  return { requests, answers };
+  return { requests, answers, release: done.release };
+}
+
+/**
+ * A hold for a stubbed reply: the reply waits on `promise` until `release` is called, which a
+ * test that ends with the reply still held calls in a `finally`. Releasing twice does nothing.
+ */
+function held(): { promise: Promise<void>; release: () => void } {
+  let release: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { promise, release };
+}
+
+/**
+ * Waits for `hold`, or rejects with the reason of `signal` once it aborts, as the native `fetch`
+ * rejects a request whose signal aborts before its answer.
+ */
+async function heldUnlessAborted(hold: Promise<void>, signal: AbortSignal): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const abort = (): void => {
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    hold.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
 }
 
 /** The account-number field in the red of an error, or in its default colour. */
@@ -1403,59 +1447,68 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
   });
 
   it("locks the keyboard while a view is awaited: only the first ENTER is sent, every key repeated before the answer is refused, and the next ENTER is sent", async () => {
-    const { requests, answers } = stubHeldFetch();
-    renderScreen();
-    expectLocked(false);
-
-    typeAccount(ACCOUNT);
-    const enter = screen.getByRole("button", { name: "ENTER" });
-    // Presses in one task, before the screen renders the lock: the button twice, the Enter key
-    // and a key COACTVWC processes as ENTER. The lock taken by the first refuses the others.
-    act(() => {
-      enter.click();
-      enter.click();
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
-    });
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
-    });
-    expectLocked(true);
-
-    // The same presses on the locked screen, and a submission of its form, send nothing.
-    pressEnterButton();
-    fireEvent.keyDown(window, { key: "Enter" });
-    fireEvent.keyDown(window, { key: "F5" });
-    fireEvent.submit(accountForm());
-    expectLocked(true);
-
-    act(() => {
-      answers[0]?.(json(200, view));
-    });
-    await waitFor(() => {
-      expect(field("ACSTSSN").value).toBe("***-**-1234");
-    });
-    await waitFor(() => {
+    const { requests, answers, release } = stubHeldFetch();
+    const { client } = renderScreen();
+    try {
       expectLocked(false);
-    });
 
-    typeAccount(OTHER_ACCOUNT);
-    pressEnterButton();
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    expectLocked(true);
-    act(() => {
-      answers[1]?.(json(200, { ...view, acct_id: OTHER_ACCOUNT }));
-    });
-    await waitFor(() => {
-      expectLocked(false);
-    });
+      typeAccount(ACCOUNT);
+      const enter = screen.getByRole("button", { name: "ENTER" });
+      // Presses in one task, before the screen renders the lock: the button twice, the Enter key
+      // and a key COACTVWC processes as ENTER. The lock taken by the first refuses the others.
+      act(() => {
+        enter.click();
+        enter.click();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+      });
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
 
-    expect(requests.map((request) => [request.method, request.path])).toEqual([
-      ["GET", `/api/v1/accounts/${ACCOUNT}/view`],
-      ["GET", `/api/v1/accounts/${OTHER_ACCOUNT}/view`],
-    ]);
+      // The same presses on the locked screen, and a submission of its form, send nothing.
+      pressEnterButton();
+      fireEvent.keyDown(window, { key: "Enter" });
+      fireEvent.keyDown(window, { key: "F5" });
+      fireEvent.submit(accountForm());
+      expectLocked(true);
+
+      act(() => {
+        answers[0]?.(json(200, view));
+      });
+      await waitFor(() => {
+        expect(field("ACSTSSN").value).toBe("***-**-1234");
+      });
+      await waitFor(() => {
+        expectLocked(false);
+      });
+
+      typeAccount(OTHER_ACCOUNT);
+      pressEnterButton();
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      expectLocked(true);
+      act(() => {
+        answers[1]?.(json(200, { ...view, acct_id: OTHER_ACCOUNT }));
+      });
+      await waitFor(() => {
+        expectLocked(false);
+      });
+
+      expect(requests.map((request) => [request.method, request.path])).toEqual([
+        ["GET", `/api/v1/accounts/${ACCOUNT}/view`],
+        ["GET", `/api/v1/accounts/${OTHER_ACCOUNT}/view`],
+      ]);
+    } finally {
+      // Every view still held is answered here, pass or fail, and the test ends once each request
+      // has settled, so neither a request nor the client's deadline outlives the test.
+      release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it.each([
@@ -1472,21 +1525,30 @@ describe("COACTVW: account view (CAVW, COACTVWC)", () => {
       },
     },
   ])("$label stays available while a view is awaited and returns to the main menu", async ({ press }) => {
-    const { requests, answers } = stubHeldFetch();
-    renderScreen();
-
-    typeAccount(ACCOUNT);
-    pressEnterButton();
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
+    const reply = held();
+    const requests = stubFetch(async (_acctId, signal) => {
+      await heldUnlessAborted(reply.promise, signal);
+      return json(200, view);
     });
-    expectLocked(true);
-    press();
+    const { client } = renderScreen();
+    try {
+      typeAccount(ACCOUNT);
+      pressEnterButton();
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
+      press();
 
-    expect(await screen.findByText("COMEN01 main menu stub")).toBeTruthy();
-    act(() => {
-      answers[0]?.(json(200, view));
-    });
+      expect(await screen.findByText("COMEN01 main menu stub")).toBeTruthy();
+    } finally {
+      // The held view is answered here, pass or fail, and the test goes on once the request has
+      // settled, so neither it nor the client's deadline outlives the test.
+      reply.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
     expect(requests).toHaveLength(1);
   });
 
@@ -1661,9 +1723,13 @@ const signonRequired: components["schemas"]["ScreenError"] = {
 /**
  * Renders the application's route table at `/accounts/view`, so the sign-on guard that only the
  * table mounts stands in front of the screen. Each screen is imported by its route's loader, so a
- * wait for one to render allows 5 s. Returns the router, whose location the test reads.
+ * wait for one to render allows 5 s. Returns the router, whose location the test reads, and the
+ * query client, whose `isMutating` tells when the screen's view settled.
  */
-function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
+function renderRouteTable(): {
+  router: ReturnType<typeof createMemoryRouter>;
+  client: QueryClient;
+} {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -1673,7 +1739,7 @@ function renderRouteTable(): ReturnType<typeof createMemoryRouter> {
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return router;
+  return { router, client };
 }
 
 // The 401 clears the stored session (`api/client.ts`), and the sign-on guard in front of the
@@ -1692,7 +1758,7 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
   // audit: COSGN00C-021
   it("ENTER answered 401 replaces the screen with sign-on and clears the session, with no retry", async () => {
     const requests = stubFetch(() => json(401, signonRequired));
-    const router = renderRouteTable();
+    const { router } = renderRouteTable();
     expect(
       await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
     ).toBeDefined();
@@ -1719,7 +1785,8 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
   /**
    * The body of a 401 whose status and headers have arrived: its first bytes come, and then the
    * rest never does, or the connection fails. `release` fails a body still open, so the request
-   * settles, and its deadline timer is cleared, once the test is done.
+   * settles and its deadline timer is cleared; a test calls it in a `finally` and waits for that.
+   * Once the body has failed, `release` does nothing.
    */
   function partialBody(fails: boolean): { body: ReadableStream<Uint8Array>; release: () => void } {
     let open: ReadableStreamDefaultController<Uint8Array> | undefined;
@@ -1753,34 +1820,46 @@ describe("COACTVW in the route table: a 401 ends the session", () => {
     "ENTER answered 401 $title clears the session at once and replaces the screen with sign-on, with no retry",
     async ({ fails }) => {
       const { body, release } = partialBody(fails);
-      onTestFinished(release);
       const requests = stubFetch(
         () => new Response(body, { status: 401, headers: { "Content-Type": "application/json" } }),
       );
-      const router = renderRouteTable();
-      expect(
-        await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
-      ).toBeDefined();
+      const { router, client } = renderRouteTable();
+      try {
+        expect(
+          await screen.findByRole(
+            "heading",
+            { level: 1, name: "View Account" },
+            { timeout: 5_000 },
+          ),
+        ).toBeDefined();
 
-      typeAccount(ACCOUNT);
-      pressEnterButton();
+        typeAccount(ACCOUNT);
+        pressEnterButton();
 
-      await waitFor(() => {
-        expect(getSession()).toBeNull();
-      });
-      expect(
-        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
-      ).toBeDefined();
-      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
-      expect(screen.queryByRole("heading", { level: 1, name: "View Account" })).toBeNull();
-      expect(requests).toEqual([
-        {
-          method: "GET",
-          path: `/api/v1/accounts/${ACCOUNT}/view`,
-          authorization: "Bearer test-token",
-        },
-      ]);
-      router.dispose();
+        await waitFor(() => {
+          expect(getSession()).toBeNull();
+        });
+        expect(
+          await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+        ).toBeDefined();
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+        expect(screen.queryByRole("heading", { level: 1, name: "View Account" })).toBeNull();
+        expect(requests).toEqual([
+          {
+            method: "GET",
+            path: `/api/v1/accounts/${ACCOUNT}/view`,
+            authorization: "Bearer test-token",
+          },
+        ]);
+      } finally {
+        // A body still open is failed here, pass or fail, and the test ends once the request has
+        // settled, so neither it nor the client's deadline outlives the test.
+        release();
+        await waitFor(() => {
+          expect(client.isMutating()).toBe(0);
+        });
+        router.dispose();
+      }
     },
   );
 });

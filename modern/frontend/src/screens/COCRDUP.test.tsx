@@ -216,7 +216,10 @@ function stubApi(
   return calls;
 }
 
-/** A promise for `stubApi`'s `held`, and the function that settles it. */
+/**
+ * A promise for `stubApi`'s `held`, and the function that settles it. A test that holds a reply
+ * also calls `open` in a `finally`; once the promise has settled, a later `open` changes nothing.
+ */
 function hold(): { held: Promise<void>; open: () => void } {
   let release = (): void => {};
   const held = new Promise<void>((resolve) => {
@@ -236,12 +239,16 @@ function RouteStub() {
   return <p>{`Stub at ${location.pathname}, state ${JSON.stringify(location.state)}`}</p>;
 }
 
-/** COCRDUP at `/cards/update` with `state`, and stubs at its two F3 targets. */
+/**
+ * COCRDUP at `/cards/update` with `state`, and stubs at its two F3 targets. Returns the render
+ * result and the query client, whose `isMutating` tells when the screen's requests settled:
+ * endpoints 9 and 10 are both mutations of that client.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COCRDUP, state }]}>
         <Routes>
@@ -252,6 +259,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /**
@@ -500,12 +508,13 @@ function typeSearchKeys(account: string, card: string) {
   fireEvent.change(field(LABELS.card), { target: { value: card } });
 }
 
-/** Enters from COCRDLI and waits for endpoint 9's card (state `S`). */
-async function showFromList() {
-  renderScreen(FROM_LIST);
+/** Enters from COCRDLI and waits for endpoint 9's card (state `S`); returns the query client. */
+async function showFromList(): Promise<QueryClient> {
+  const { client } = renderScreen(FROM_LIST);
   await waitFor(() => {
     expect(field(LABELS.card).value).toBe(MASKED_CARD);
   });
+  return client;
 }
 
 /** Enters from the menu, searches by the typed keys and waits for endpoint 9's card. */
@@ -937,7 +946,8 @@ describe("COCRDUP rendering", () => {
     async ({ state, expected }) => {
       const calls = stubApi({ [CARDS_EDIT]: [{ status: 200, body: view }] });
       renderScreen(state);
-      // Any request the entry sends, and the screen's answer to it, settles inside `act`.
+      // One turn of `settle` inside `act`: the read a COCRDLI selection sends on mount is answered
+      // within it, and for every other entry the count shows only that nothing was sent within it.
       await act(async () => {
         await settle();
       });
@@ -1341,7 +1351,8 @@ describe("COCRDUP keys", () => {
 
       press();
       // The form moves the cursor to the name on a timer; in `N` that blurs the account, which
-      // the form records, so the wait for any request runs inside `act`.
+      // the form records, so the one turn of `settle` runs inside `act`. The count after it shows
+      // only that F12 sent nothing within that turn.
       await act(async () => {
         await settle();
       });
@@ -1644,7 +1655,8 @@ describe("COCRDUP keys", () => {
       edits: [{ status: 200, body: view, gated: true }],
       puts: [{ status: 200, body: validated, gated: false }],
       reach: async () => {
-        renderScreen(FROM_LIST);
+        const { client } = renderScreen(FROM_LIST);
+        return client;
       },
       pendingAt: 1,
       stops: [true, false],
@@ -1665,9 +1677,10 @@ describe("COCRDUP keys", () => {
       edits: [{ status: 200, body: view, gated: true }],
       puts: [{ status: 200, body: validated, gated: false }],
       reach: async () => {
-        renderScreen();
+        const { client } = renderScreen();
         typeSearchKeys(ACCT_ID, TYPED_CARD);
         fireEvent.click(key("ENTER=Process"));
+        return client;
       },
       pendingAt: 1,
       stops: [true, false],
@@ -1691,9 +1704,10 @@ describe("COCRDUP keys", () => {
         { status: 200, body: committed, gated: false },
       ],
       reach: async () => {
-        await showFromList();
+        const client = await showFromList();
         fireEvent.change(field(LABELS.name), { target: { value: NEW_NAME } });
         fireEvent.click(key("ENTER=Process"));
+        return client;
       },
       pendingAt: 2,
       stops: [false, true],
@@ -1712,9 +1726,10 @@ describe("COCRDUP keys", () => {
         { status: 200, body: committed, gated: true },
       ],
       reach: async () => {
-        await showFromList();
+        const client = await showFromList();
         await validate();
         fireEvent.click(key("F5=Save"));
+        return client;
       },
       pendingAt: 3,
       stops: [false, false],
@@ -1738,9 +1753,10 @@ describe("COCRDUP keys", () => {
         { status: 200, body: validated, gated: false },
       ],
       reach: async () => {
-        await showFromList();
+        const client = await showFromList();
         await validate();
         pressKey("F5");
+        return client;
       },
       pendingAt: 4,
       stops: [false, true],
@@ -1771,45 +1787,54 @@ describe("COCRDUP keys", () => {
     const withGate = ({ gated, ...reply }: { status: number; body: unknown; gated: boolean }) =>
       gated ? { ...reply, held } : reply;
     const calls = stubApi({ [CARDS_EDIT]: edits.map(withGate), [CARD_PUT]: puts.map(withGate) });
-    await reach();
-    await waitFor(() => {
+    const client = await reach();
+    try {
+      await waitFor(() => {
+        expect(calls).toHaveLength(pendingAt);
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
+
+      expect(disabledKeys()).toEqual(lockedKeys(true));
+      expect(updateForm().getAttribute("aria-busy")).toBe("true");
+      expect(Object.values(LABELS).map((label) => field(label).readOnly)).toEqual(
+        Object.values(LABELS).map(() => true),
+      );
+      // The lock makes no field protected: the fields the state leaves enterable stay Tab stops.
+      expectTabStops(stops[0], stops[1]);
+      // Neither the buttons nor the keys send a second request while the first is out.
+      for (const label of ["ENTER=Process", "F5=Save", "F12=Cancel", "F7"]) {
+        fireEvent.click(key(label));
+      }
+      for (const name of ["Enter", "F5", "F12", "F7"]) {
+        pressKey(name);
+      }
+      fireEvent.submit(updateForm());
+      await settle();
       expect(calls).toHaveLength(pendingAt);
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
 
-    expect(disabledKeys()).toEqual(lockedKeys(true));
-    expect(updateForm().getAttribute("aria-busy")).toBe("true");
-    expect(Object.values(LABELS).map((label) => field(label).readOnly)).toEqual(
-      Object.values(LABELS).map(() => true),
-    );
-    // The lock makes no field protected: the fields the state leaves enterable stay Tab stops.
-    expectTabStops(stops[0], stops[1]);
-    // Neither the buttons nor the keys send a second request while the first is out.
-    for (const label of ["ENTER=Process", "F5=Save", "F12=Cancel", "F7"]) {
-      fireEvent.click(key(label));
+      open();
+      // The answer frees the keys and moves the cursor (COCRDUPC-046), waited for together: the
+      // form moves it on a timer, and the move blurs the field that had it, which the form records.
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("false");
+        expect(document.activeElement).toBe(field(cursor));
+      });
+      expect(updateForm().getAttribute("aria-busy")).toBe("false");
+      expect(disabledKeys()).toEqual(lockedKeys(false));
+      expectEnterable(enterable[0], enterable[1]);
+
+      // The next key acts again.
+      await next();
+      await settle();
+      expect(calls.map((call) => call.route)).toEqual(routes);
+    } finally {
+      // The held reply is answered pass or fail, and the test ends once every request the screen
+      // sent has settled, so neither a request nor the client's deadline outlives the test.
+      open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
     }
-    for (const name of ["Enter", "F5", "F12", "F7"]) {
-      pressKey(name);
-    }
-    fireEvent.submit(updateForm());
-    await settle();
-    expect(calls).toHaveLength(pendingAt);
-
-    open();
-    // The answer frees the keys and moves the cursor (COCRDUPC-046), waited for together: the
-    // form moves it on a timer, and the move blurs the field that had it, which the form records.
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("false");
-      expect(document.activeElement).toBe(field(cursor));
-    });
-    expect(updateForm().getAttribute("aria-busy")).toBe("false");
-    expect(disabledKeys()).toEqual(lockedKeys(false));
-    expectEnterable(enterable[0], enterable[1]);
-
-    // The next key acts again.
-    await next();
-    await settle();
-    expect(calls.map((call) => call.route)).toEqual(routes);
   });
 
   it.each([
@@ -1915,17 +1940,26 @@ describe("COCRDUP keys", () => {
   it("F3 returns to COCRDLI while the entry fetch is out", async () => {
     const { held, open } = hold();
     const calls = stubApi({ [CARDS_EDIT]: [{ status: 200, body: view, held }] });
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
 
-    fireEvent.click(key("F3=Exit"));
+      fireEvent.click(key("F3=Exit"));
 
-    expect(await screen.findByText("Stub at /cards, state null")).not.toBeNull();
-    open();
-    await settle();
-    expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT]);
+      expect(await screen.findByText("Stub at /cards, state null")).not.toBeNull();
+      open();
+      await settle();
+      expect(calls.map((call) => call.route)).toEqual([CARDS_EDIT]);
+    } finally {
+      // The read is answered only after F3 left, pass or fail, and the test ends once it has
+      // settled, so neither it nor the client's deadline outlives the test.
+      open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 });
 
@@ -2295,7 +2329,7 @@ describe("COCRDUP input descriptions", () => {
     state: string;
     fetched: { status: number; body: unknown };
     puts: { status: number; body: unknown }[];
-    reach: () => Promise<void>;
+    reach: () => Promise<unknown>;
     marks: { readonly [name in keyof typeof LABELS]?: string };
   }>([
     {

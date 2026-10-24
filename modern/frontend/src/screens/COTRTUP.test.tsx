@@ -1603,59 +1603,70 @@ describe("COTRTUP while a request is out", () => {
     async ({ replies, arrange, start, route, answer, info, before, after, later, laterRoute }) => {
       const held = heldReply();
       const calls = stubApi(replies(held.reply));
-      const { client } = await arrange();
-      const sentBefore = calls.length;
-      const shownBefore = shownKeys();
-      expectEditable(before);
+      let client: QueryClient | undefined;
+      try {
+        client = (await arrange()).client;
+        const sentBefore = calls.length;
+        const shownBefore = shownKeys();
+        expectEditable(before);
 
-      // The key twice and every other key in one batch, before the screen re-renders: only the
-      // lock the first key took refuses the rest.
-      act(() => {
-        start();
-        start();
+        // The key twice and every other key in one batch, before the screen re-renders: only the
+        // lock the first key took refuses the rest.
+        act(() => {
+          start();
+          start();
+          pressEveryKey();
+        });
+        await waitFor(() => {
+          expect(calls).toHaveLength(sentBefore + 1);
+        });
+        expect(calls[sentBefore]?.route).toBe(route);
+
+        expect(functionKeys().getAttribute("aria-busy")).toBe("true");
+        expect(screenForm().getAttribute("aria-busy")).toBe("true");
+        expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
+          ALL_KEYS.map(() => "true"),
+        );
+        expect(shownKeys()).toEqual(shownBefore);
+        expectEditable({ code: false, description: false });
+        // The lock makes no input protected: an input the state leaves enterable stays a Tab stop.
+        expectTabStops(before);
+
+        // Nothing marks the moment a refused key would start a request: a bounded window watches
+        // for one, after which the held request is still the only one out.
         pressEveryKey();
-      });
-      await waitFor(() => {
+        await lingers();
+        expect(client.isMutating()).toBe(1);
         expect(calls).toHaveLength(sentBefore + 1);
-      });
-      expect(calls[sentBefore]?.route).toBe(route);
+        expect(screen.queryByText(/^Stub at/)).toBeNull();
 
-      expect(functionKeys().getAttribute("aria-busy")).toBe("true");
-      expect(screenForm().getAttribute("aria-busy")).toBe("true");
-      expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
-        ALL_KEYS.map(() => "true"),
-      );
-      expect(shownKeys()).toEqual(shownBefore);
-      expectEditable({ code: false, description: false });
-      // The lock makes no input protected: an input the state leaves enterable stays a Tab stop.
-      expectTabStops(before);
+        held.release(json(answer.status, answer.body));
+        await waitFor(() => {
+          expect(screenForm().getAttribute("aria-busy")).toBe("false");
+        });
+        expect(infoText()).toBe(info);
+        expect(functionKeys().getAttribute("aria-busy")).toBe("false");
+        expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
+          ALL_KEYS.map(() => null),
+        );
+        expectEditable(after);
+        expectTabStops(after);
 
-      // Nothing marks the moment a refused key would start a request: a bounded window watches
-      // for one, after which the held request is still the only one out.
-      pressEveryKey();
-      await lingers();
-      expect(client.isMutating()).toBe(1);
-      expect(calls).toHaveLength(sentBefore + 1);
-      expect(screen.queryByText(/^Stub at/)).toBeNull();
-
-      held.release(json(answer.status, answer.body));
-      await waitFor(() => {
-        expect(screenForm().getAttribute("aria-busy")).toBe("false");
-      });
-      expect(infoText()).toBe(info);
-      expect(functionKeys().getAttribute("aria-busy")).toBe("false");
-      expect(ALL_KEYS.map((label) => key(label).getAttribute("aria-disabled"))).toEqual(
-        ALL_KEYS.map(() => null),
-      );
-      expectEditable(after);
-      expectTabStops(after);
-
-      // The keyboard is open again: the next request is sent.
-      later();
-      await waitFor(() => {
-        expect(calls).toHaveLength(sentBefore + 2);
-      });
-      expect(calls[sentBefore + 1]?.route).toBe(laterRoute);
+        // The keyboard is open again: the next request is sent.
+        later();
+        await waitFor(() => {
+          expect(calls).toHaveLength(sentBefore + 2);
+        });
+        expect(calls[sentBefore + 1]?.route).toBe(laterRoute);
+      } finally {
+        // The held reply is answered on every path, an arrangement that fails included. Once the
+        // arrangement has returned the screen's client, the test also ends only after every
+        // request has settled, so neither a request nor the client's deadline outlives it.
+        held.release(json(answer.status, answer.body));
+        if (client !== undefined) {
+          await untilIdle(client);
+        }
+      }
     },
   );
 });

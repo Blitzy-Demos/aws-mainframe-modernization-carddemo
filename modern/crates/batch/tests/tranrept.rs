@@ -298,6 +298,10 @@ const _: () = {
 const JOB_LOG_TARGET: &str = r#""target":"carddemo_batch::jobs::tranrept""#;
 /// What precedes an event's message in the JSON lines of `runtime::telemetry`.
 const MESSAGE_KEY: &str = r#""message":""#;
+/// The target of the job-log events of `carddemo-batch mnttrdb2`: the module of COBTUPDT's job.
+const MAINTENANCE_LOG_TARGET: &str = r#""target":"carddemo_batch::jobs::mnttrdb2""#;
+/// What precedes the message of an event whose `fields` object starts with it.
+const FIELDS_MESSAGE_KEY: &str = r#""fields":{"message":""#;
 
 /// A column of each statement `tranrept` runs that no other of them returns, by which the
 /// [`Relay`] tells the statements apart in their row descriptions (migrations 0001 and 0002).
@@ -1209,6 +1213,22 @@ fn job_log(output: &Output) -> Vec<String> {
         .filter_map(|event| {
             let (_, rest) = event.split_once(MESSAGE_KEY)?;
             rest.split_once('"').map(|(message, _)| message.to_owned())
+        })
+        .collect()
+}
+
+/// The job log of a `mnttrdb2` run: the message of every event of that job's module whose
+/// `fields` hold the message alone, in order, which leaves out its failed-statement events.
+/// COBTUPDT's lines hold no quote or backslash, so each message ends at the first quote after
+/// its key.
+fn maintenance_log(output: &Output) -> Vec<String> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| line.starts_with('{') && line.contains(MAINTENANCE_LOG_TARGET))
+        .filter_map(|event| {
+            let (_, rest) = event.split_once(FIELDS_MESSAGE_KEY)?;
+            let (message, after) = rest.split_once('"')?;
+            after.starts_with('}').then(|| message.to_owned())
         })
         .collect()
 }
@@ -2497,7 +2517,8 @@ fn uncreatable_reports_directory_abends_the_run() -> TestResult {
     })
 }
 
-/// E23: a COBTUPDT update of type `01` in the Db2 data version leaves the VSAM version untouched,
+/// E23: a COBTUPDT update of type `01` in the Db2 data version, whose job log is the four lines
+/// of COBTUPDT-027, leaves the VSAM version untouched,
 /// every type `01` detail still shows `Purchase`, and the report written after the update equals
 /// the one written before it byte for byte.
 #[test]
@@ -2530,7 +2551,7 @@ fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
             OsStr::new("--input"),
             input.as_os_str(),
         ];
-        let output = run_batch(&guard, &scratch, &args, Log::Errors).await?;
+        let output = run_batch(&guard, &scratch, &args, Log::JobLog).await?;
         // audit: COBTUPDT-027
         assert_eq!(
             output.status.code(),
@@ -2539,6 +2560,17 @@ fn db2_maintenance_never_reaches_report_lookups() -> TestResult {
             stderr(&output)
         );
         assert!(written_paths(&output).is_empty(), "mnttrdb2 printed a path");
+        // audit: COBTUPDT-027
+        assert_eq!(
+            maintenance_log(&output),
+            [
+                "OPEN FILE OK".to_owned(),
+                format!("PROCESSING   U01{}", "*".repeat(50)),
+                "UPDATING RECORD".to_owned(),
+                "RECORD UPDATED SUCCESSFULLY".to_owned(),
+            ],
+            "mnttrdb2 job log"
+        );
         let updated = Db2TransactionTypeRepository::find_by_id(&mut store, &code)
             .await?
             .ok_or("no Db2 type 01 after the update")?;

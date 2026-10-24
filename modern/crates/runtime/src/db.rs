@@ -893,7 +893,7 @@ mod tests {
         request_pool_options, server_refuses, socket_path, watch_refusals,
     };
     use crate::config::Config;
-    use crate::telemetry::{event_enabled, json_layer};
+    use crate::telemetry::{event_enabled, json_layer, with_value_set};
 
     /// Stand-in for a credential that a mistyped `DATABASE_URL` carries.
     const SECRET: &str = "s3cr3t-db-credential-7Q";
@@ -1035,8 +1035,9 @@ mod tests {
             return;
         }
         let values: [Option<&dyn Value>; 2] = [Some(&"capture probe"), Some(&CAPTURE_PROBE)];
-        let fields = CAPTURE_PROBE_METADATA.fields();
-        Event::dispatch(&CAPTURE_PROBE_METADATA, &fields.value_set_all(&values));
+        with_value_set(CAPTURE_PROBE_METADATA.fields(), values, |values| {
+            Event::dispatch(&CAPTURE_PROBE_METADATA, values);
+        });
     }
 
     fn assert_free_of(text: &str, secrets: &[&str]) {
@@ -1867,8 +1868,9 @@ mod tests {
     /// accepts one connection and then nothing listens on the port, so every later connection
     /// is refused. It accepts that connection's startup without authentication and answers each
     /// `Sync` with [`READY_FOR_QUERY`] until the client sends `Terminate` or the connection
-    /// ends. Returned: the port, a receiver of the server's end of the connection once it is
-    /// accepted, which a test shuts down to break the connection, and the server's thread.
+    /// ends, whether its next read finds the end of the stream or a reset. Returned: the port,
+    /// a receiver of the server's end of the connection once it is accepted, which a test shuts
+    /// down to break the connection, and the server's thread.
     fn one_connection_server() -> (
         u16,
         mpsc::Receiver<TcpStream>,
@@ -1888,8 +1890,20 @@ mod tests {
             stream.write_all(&READY_FOR_QUERY)?;
             loop {
                 let mut header = [0; 5];
+                // A test breaks the connection by shutting the server's end down, and the pool's
+                // next ping may reach that end before this thread reads from it again. The
+                // kernel answers data arriving at a socket shut down for reading with a reset,
+                // and the read then reports the reset instead of the end of the stream: either
+                // way the conversation is over.
                 match stream.read_exact(&mut header) {
-                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                        ) =>
+                    {
+                        return Ok(());
+                    }
                     read => read?,
                 }
                 let [kind, length @ ..] = header;

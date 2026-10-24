@@ -1706,90 +1706,98 @@ describe("COTRTLI", () => {
         [200, REFRESHED],
       ]);
       const client = renderScreen();
-      for (let shown = 1; shown <= prior.length; shown += 1) {
-        if (shown > 1) {
-          press("ENTER");
+      try {
+        for (let shown = 1; shown <= prior.length; shown += 1) {
+          if (shown > 1) {
+            press("ENTER");
+          }
+          await answered(seen, shown);
         }
-        await answered(seen, shown);
-      }
-      if (description !== undefined) {
-        expect(descriptionAt(description)).toHaveProperty("readOnly", false);
-      }
-      // F2 sends no request, but its transfer takes the same lock, so it waits for the answer too.
-      const refused = ["ENTER", "F2=Add", "F7=Page Up", "F8=Page Dn", "F10=Save"];
-      const available = ["F3=Exit"];
-      /**
-       * Every key that sends a request, and F2, by its button and on the keyboard; F1 counts as
-       * ENTER.
-       */
-      function pressRequestKeys(): void {
+        if (description !== undefined) {
+          expect(descriptionAt(description)).toHaveProperty("readOnly", false);
+        }
+        // F2 sends no request, but its transfer takes the same lock, so it waits for the answer
+        // too.
+        const refused = ["ENTER", "F2=Add", "F7=Page Up", "F8=Page Dn", "F10=Save"];
+        const available = ["F3=Exit"];
+        /**
+         * Every key that sends a request, and F2, by its button and on the keyboard; F1 counts as
+         * ENTER.
+         */
+        function pressRequestKeys(): void {
+          for (const label of refused) {
+            press(label);
+          }
+          for (const key of ["Enter", "F2", "F7", "F8", "F10", "F1"]) {
+            fireEvent.keyDown(window, { key });
+          }
+        }
+        /** The key that starts the request, by its button or on the keyboard. */
+        function startRequest(): void {
+          if (start?.via === "button") {
+            press(start.name);
+          } else if (start?.via === "key") {
+            fireEvent.keyDown(window, { key: start.name });
+          }
+        }
+
+        // The key twice and every other request key in one batch, before the screen re-renders:
+        // only the lock the first key took refuses the rest.
+        act(() => {
+          startRequest();
+          startRequest();
+          pressRequestKeys();
+        });
+        await waitFor(() => {
+          expect(seen).toHaveLength(prior.length + 1);
+        });
+
+        expect(functionKeys().getAttribute("aria-busy")).toBe("true");
+        expect(form().getAttribute("aria-busy")).toBe("true");
         for (const label of refused) {
-          press(label);
+          expect(keyButton(label).getAttribute("aria-disabled")).toBe("true");
         }
-        for (const key of ["Enter", "F2", "F7", "F8", "F10", "F1"]) {
-          fireEvent.keyDown(window, { key });
+        for (const label of available) {
+          expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
         }
-      }
-      /** The key that starts the request, by its button or on the keyboard. */
-      function startRequest(): void {
-        if (start?.via === "button") {
-          press(start.name);
-        } else if (start?.via === "key") {
-          fireEvent.keyDown(window, { key: start.name });
+        expect(typeFilter()).toHaveProperty("readOnly", true);
+        expect(descFilter()).toHaveProperty("readOnly", true);
+        for (const row of [1, 2, 3, 4, 5, 6, 7]) {
+          expect(selectorAt(row)).toHaveProperty("readOnly", true);
+          expect(descriptionAt(row)).toHaveProperty("readOnly", true);
         }
-      }
 
-      // The key twice and every other request key in one batch, before the screen re-renders:
-      // only the lock the first key took refuses the rest.
-      act(() => {
-        startRequest();
-        startRequest();
         pressRequestKeys();
-      });
-      await waitFor(() => {
+        // The held reply stays the one request pending.
+        await idleAfter50ms(client, 1);
         expect(seen).toHaveLength(prior.length + 1);
-      });
 
-      expect(functionKeys().getAttribute("aria-busy")).toBe("true");
-      expect(form().getAttribute("aria-busy")).toBe("true");
-      for (const label of refused) {
-        expect(keyButton(label).getAttribute("aria-disabled")).toBe("true");
-      }
-      for (const label of available) {
-        expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
-      }
-      expect(typeFilter()).toHaveProperty("readOnly", true);
-      expect(descFilter()).toHaveProperty("readOnly", true);
-      for (const row of [1, 2, 3, 4, 5, 6, 7]) {
-        expect(selectorAt(row)).toHaveProperty("readOnly", true);
-        expect(descriptionAt(row)).toHaveProperty("readOnly", true);
-      }
+        held.release(json(answer[0], answer[1]));
+        await answered(seen, prior.length + 1);
+        expect(functionKeys().getAttribute("aria-busy")).toBe("false");
+        for (const label of [...refused, ...available]) {
+          expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
+        }
+        expect(typeFilter()).toHaveProperty("readOnly", !filtersOpen);
+        expect(descFilter()).toHaveProperty("readOnly", !filtersOpen);
+        for (const row of [1, 2, 3, 4, 5, 6, 7]) {
+          expect(selectorAt(row)).toHaveProperty("readOnly", false);
+          expect(descriptionAt(row)).toHaveProperty("readOnly", row !== description);
+        }
 
-      pressRequestKeys();
-      // The held reply stays the one request pending.
-      await idleAfter50ms(client, 1);
-      expect(seen).toHaveLength(prior.length + 1);
-
-      held.release(json(answer[0], answer[1]));
-      await answered(seen, prior.length + 1);
-      expect(functionKeys().getAttribute("aria-busy")).toBe("false");
-      for (const label of [...refused, ...available]) {
-        expect(keyButton(label).getAttribute("aria-disabled")).toBeNull();
+        // The keyboard is open again: the next ENTER is sent.
+        press("ENTER");
+        await answered(seen, prior.length + 2);
+        expect(sent(seen, prior.length + 2, `POST ${ACTIONS_PATH}`).body).toHaveProperty(
+          "aid",
+          "ENTER",
+        );
+      } finally {
+        // The held reply is answered, pass or fail, and the test ends once every request has
+        // settled, so neither a request nor the client's deadline outlives the test.
+        held.release(json(answer[0], answer[1]));
+        await clientIdle(client);
       }
-      expect(typeFilter()).toHaveProperty("readOnly", !filtersOpen);
-      expect(descFilter()).toHaveProperty("readOnly", !filtersOpen);
-      for (const row of [1, 2, 3, 4, 5, 6, 7]) {
-        expect(selectorAt(row)).toHaveProperty("readOnly", false);
-        expect(descriptionAt(row)).toHaveProperty("readOnly", row !== description);
-      }
-
-      // The keyboard is open again: the next ENTER is sent.
-      press("ENTER");
-      await answered(seen, prior.length + 2);
-      expect(sent(seen, prior.length + 2, `POST ${ACTIONS_PATH}`).body).toHaveProperty(
-        "aid",
-        "ENTER",
-      );
     },
   );
 

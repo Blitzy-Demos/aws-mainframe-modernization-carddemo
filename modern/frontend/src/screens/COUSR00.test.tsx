@@ -553,9 +553,10 @@ async function settled(client: QueryClient, outstanding = 0): Promise<void> {
 }
 
 /**
- * Waits 50 ms inside `act`, so React renders whatever the keys just pressed caused. A refused key
- * shows nothing a test could wait for, so this bounded window is the only wait the absence of its
- * effect has: it shows that no request or message followed within 50 ms, not that none ever will.
+ * Waits 50 ms inside `act`, so React renders whatever the keys just pressed, or the route just
+ * opened, caused. A refused key or a screen its guard refuses shows nothing a test could wait for,
+ * so this bounded window is the only wait the absence of its effect has: it shows that no request
+ * or message followed within 50 ms, not that none ever will.
  */
 async function lingers(): Promise<void> {
   await act(async () => {
@@ -1574,57 +1575,67 @@ describe("COUSR00 List Users", () => {
         json(200, BOTTOM_KEPT),
       );
       const { client } = renderList();
-      if (before.length > 0) {
-        await listed(sent, 1, "ADMIN001");
-      }
-      const count = before.length + 1;
-      start();
-      await waitFor(() => {
+      try {
+        if (before.length > 0) {
+          await listed(sent, 1, "ADMIN001");
+        }
+        const count = before.length + 1;
+        start();
+        await waitFor(() => {
+          expect(sent).toHaveLength(count);
+        });
+
+        const keyBar = screen.getByRole("group", { name: "Function keys" });
+        await waitFor(() => {
+          expect(keyBar.getAttribute("aria-busy")).toBe("true");
+        });
+        expect(mapForm().getAttribute("aria-busy")).toBe("true");
+        expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([true, true, true]);
+        expect(isDisabled("F3=Back")).toBe(false);
+        expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => true));
+
+        // Every locked key, by button and by keyboard, a direct submit and an unserved key: no
+        // request, no message.
+        for (const label of LOCKED_KEYS) {
+          press(label);
+        }
+        for (const key of ["Enter", "F7", "F8", "F5"]) {
+          pressKey(key);
+        }
+        fireEvent.submit(mapForm());
+        // A refused key shows nothing: a bounded window, then only the held request in flight.
+        await lingers();
+        await settled(client, 1);
         expect(sent).toHaveLength(count);
-      });
+        expect(errorRow().textContent).toBe("");
 
-      const keyBar = screen.getByRole("group", { name: "Function keys" });
-      await waitFor(() => {
-        expect(keyBar.getAttribute("aria-busy")).toBe("true");
-      });
-      expect(mapForm().getAttribute("aria-busy")).toBe("true");
-      expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([true, true, true]);
-      expect(isDisabled("F3=Back")).toBe(false);
-      expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => true));
+        gate.release();
+        await waitFor(() => {
+          expect(keyBar.getAttribute("aria-busy")).toBe("false");
+        });
+        expect(mapForm().getAttribute("aria-busy")).toBe("false");
+        expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([false, false, false]);
+        expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => false));
 
-      // Every locked key, by button and by keyboard, a direct submit and an unserved key: no
-      // request, no message.
-      for (const label of LOCKED_KEYS) {
-        press(label);
-      }
-      for (const key of ["Enter", "F7", "F8", "F5"]) {
-        pressKey(key);
-      }
-      fireEvent.submit(mapForm());
-      // A refused key shows nothing: a bounded window, then only the held request in flight.
-      await lingers();
-      await settled(client, 1);
-      expect(sent).toHaveLength(count);
-      expect(errorRow().textContent).toBe("");
-
-      gate.release();
-      await waitFor(() => {
-        expect(keyBar.getAttribute("aria-busy")).toBe("false");
-      });
-      expect(mapForm().getAttribute("aria-busy")).toBe("false");
-      expect(LOCKED_KEYS.map((label) => isDisabled(label))).toEqual([false, false, false]);
-      expect(readOnlyStates()).toEqual(Array.from({ length: 11 }, () => false));
-
-      // Once answered, the next key is served.
-      press("F8=Forward");
-      await waitFor(() => {
+        // Once answered, the next key is served.
+        press("F8=Forward");
+        await waitFor(() => {
+          expect(sent).toHaveLength(count + 1);
+        });
+        // The F8 page's answer shows, then nothing is left in flight.
+        await shown(sent, count + 1, ALREADY_BOTTOM);
+        await settled(client);
         expect(sent).toHaveLength(count + 1);
-      });
-      // The F8 page's answer shows, then nothing is left in flight.
-      await shown(sent, count + 1, ALREADY_BOTTOM);
-      await settled(client);
-      expect(sent).toHaveLength(count + 1);
-      expect(sent[count].query).toMatchObject({ direction: "forward" });
+        expect(sent[count].query).toMatchObject({ direction: "forward" });
+      } finally {
+        // The held page is answered and every request settled inside the test, pass or fail, so
+        // neither a request nor the client's deadline outlives the test. Once the body has
+        // released the hold, releasing it again does nothing.
+        gate.release();
+        await waitFor(() => {
+          expect(client.isMutating()).toBe(0);
+        });
+      }
     },
   );
 
@@ -1632,35 +1643,45 @@ describe("COUSR00 List Users", () => {
     const gate = heldReply(json(200, SECOND_PAGE));
     const sent = stubFetch(json(200, FIRST_PAGE), gate.reply);
     const { client } = renderList();
-    await listed(sent, 1, "ADMIN001");
+    try {
+      await listed(sent, 1, "ADMIN001");
 
-    typeInto(selector(1), "U");
-    pressKey("F8");
-    await waitFor(() => {
+      typeInto(selector(1), "U");
+      pressKey("F8");
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      press("ENTER=Continue");
+      pressKey("Enter");
+      fireEvent.submit(mapForm());
+      // A refused selection shows nothing: a bounded window, then only the held F8 page in flight.
+      await lingers();
+      await settled(client, 1);
+      expect(screen.queryByRole("region", { name: "Update User" })).toBeNull();
       expect(sent).toHaveLength(2);
-    });
-    press("ENTER=Continue");
-    pressKey("Enter");
-    fireEvent.submit(mapForm());
-    // A refused selection shows nothing: a bounded window, then only the held F8 page in flight.
-    await lingers();
-    await settled(client, 1);
-    expect(screen.queryByRole("region", { name: "Update User" })).toBeNull();
-    expect(sent).toHaveLength(2);
 
-    gate.release();
-    await listed(sent, 2, "USER0006");
-    expect(valueOf(selector(1))).toBe("U");
-    press("ENTER=Continue");
+      gate.release();
+      await listed(sent, 2, "USER0006");
+      expect(valueOf(selector(1))).toBe("U");
+      press("ENTER=Continue");
 
-    await screen.findByRole("region", { name: "Update User" });
-    expect(transferState("Update User")).toEqual({
-      from: PATHS.COUSR00,
-      user_id: "USER0006",
-      first_key: "USER0006",
-      last_key: "USER0005",
-    });
-    expect(sent).toHaveLength(2);
+      await screen.findByRole("region", { name: "Update User" });
+      expect(transferState("Update User")).toEqual({
+        from: PATHS.COUSR00,
+        user_id: "USER0006",
+        first_key: "USER0006",
+        last_key: "USER0005",
+      });
+      expect(sent).toHaveLength(2);
+    } finally {
+      // The held F8 page is answered and every request settled inside the test, pass or fail, so
+      // neither a request nor the client's deadline outlives the test. Once the body has
+      // released the hold, releasing it again does nothing.
+      gate.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it("F3 returns to the admin menu while the entry list is outstanding", async () => {
@@ -1838,10 +1859,10 @@ describe("COUSR00 behind the route guard", () => {
       await waitFor(() => {
         expect(sent.map((request) => request.path)).toEqual(requested);
       });
-      // Gives a request the guarded screen would send time to leave before the count.
-      await new Promise((resolve) => {
-        setTimeout(resolve, 20);
-      });
+      // The refused screen never mounts, so nothing on screen marks the end of a wait: a bounded
+      // window, then no request in flight. The count covers only requests sent within that window.
+      await lingers();
+      await settled(client);
       expect(sent.map((request) => request.path)).toEqual(requested);
       expect(sent.filter((request) => request.path.startsWith(LIST_PATH))).toEqual([]);
       router.dispose();

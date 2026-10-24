@@ -391,13 +391,14 @@ function RouteStub() {
 
 /**
  * COPAU01 at `/authorizations/detail` with `state`, and a stub at COPAU00, its one target.
- * `reactStrictMode` runs every mount effect twice, as the development build does.
+ * `reactStrictMode` runs every mount effect twice, as the development build does. Returns the
+ * render result and the query client, whose pending requests {@link clientIdle} reads.
  */
 function renderScreen(state?: unknown, reactStrictMode = false) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COPAU01, state }]}>
         <Routes>
@@ -408,6 +409,7 @@ function renderScreen(state?: unknown, reactStrictMode = false) {
     </QueryClientProvider>,
     { reactStrictMode },
   );
+  return { ...rendered, client };
 }
 
 /** The route stub a transfer reached: its path and the route state it was given. */
@@ -647,13 +649,36 @@ function clickKey(label: string): void {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoints 22 and 23 are mutations of that client. Each stays
+ * pending from the moment the screen starts it until its reply has arrived and, while the screen
+ * is mounted, has been passed to the screen's `onSuccess` or `onError`; the keyboard unlock
+ * chained on that mutation's promise runs after. Every request the screen had started when this
+ * is called, the held ones aside, has therefore been answered once it returns. It cannot see a
+ * request the screen has not started yet: a test calls it once it has awaited what the screen
+ * shows at the end of a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await new Promise((resolve) => {
-    setTimeout(resolve, 20);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
   });
+}
+
+/**
+ * For keys that must send nothing and leave nothing on screen to wait for, such as the first
+ * entry of a state the screen cannot read or the keys the lock refuses: lets 50 ms pass inside
+ * `act`, so whatever the screen does within that window (a render, a request) runs and renders
+ * first, then waits as {@link clientIdle} does. It shows only that nothing was sent within those
+ * 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+  await clientIdle(client, held);
 }
 
 /** Everything the screen renders as text: the document's text and every input's value. */
@@ -662,14 +687,17 @@ function renderedText(): string {
   return [document.body.textContent ?? "", ...values].join("\n");
 }
 
-/** Renders the screen from {@link FROM_LIST} and waits for its entry read to be shown. */
-async function renderSelected(): Promise<Request[]> {
+/**
+ * Renders the screen from {@link FROM_LIST} and waits for its entry read to be shown. Returns the
+ * requests the stub records and the query client, whose pending requests {@link clientIdle} reads.
+ */
+async function renderSelected(): Promise<{ requests: Request[]; client: QueryClient }> {
   const requests = stubApi();
-  renderScreen(FROM_LIST);
+  const { client } = renderScreen(FROM_LIST);
   await waitFor(() => {
     expect(shown()).toEqual(SHOWN_SELECTED);
   });
-  return requests;
+  return { requests, client };
 }
 
 beforeEach(() => {
@@ -844,12 +872,12 @@ describe("COPAU01 authorization detail screen", () => {
   // audit: COPAUS1C-002
   it("sends the entry read once when the mount effect runs twice", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST, true);
+    const { client } = renderScreen(FROM_LIST, true);
 
     await waitFor(() => {
       expect(shown()).toEqual(SHOWN_SELECTED);
     });
-    await settle();
+    await clientIdle(client);
     expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
   });
 
@@ -946,7 +974,7 @@ describe("COPAU01 authorization detail screen", () => {
   // audit: COPAU01-063
   // audit: COPAU01-064
   it("F8 shows the next authorization and keeps its key for ENTER, F8 and F5", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     // The generated contract names F8's direction `forward` (`PageDirection`); the audit rows'
     // `next` is the same request.
@@ -961,7 +989,7 @@ describe("COPAU01 authorization detail screen", () => {
     await waitFor(() => {
       expect(requests).toHaveLength(3);
     });
-    await settle();
+    await clientIdle(client);
     expect(shown()).toEqual(SHOWN_NEXT);
 
     // F8 at the account's last authorization keeps it on display and says so; the key stays.
@@ -994,7 +1022,7 @@ describe("COPAU01 authorization detail screen", () => {
   // audit: COPAUS1C-003
   // audit: COPAU01-062
   it("F5 marks, then removes, fraud on the kept key and shows it as replaced", async () => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
     await waitFor(() => {
@@ -1072,12 +1100,12 @@ describe("COPAU01 authorization detail screen", () => {
     { title: "a read that fails (500)", key: FAILING_READ_KEY, text: readFailed.message },
   ])("$title shows every field blank and the ScreenError message", async ({ key, text }) => {
     const requests = stubApi();
-    renderScreen(selection(key));
+    const { client } = renderScreen(selection(key));
 
     await waitFor(() => {
       expect(requests).toHaveLength(1);
     });
-    await settle();
+    await clientIdle(client);
     expect(errorText()).toBe(text);
     expect(shown()).toEqual(BLANK);
     expect(calls(requests)).toEqual([`GET ${ENDPOINT}${key}`]);
@@ -1096,7 +1124,7 @@ describe("COPAU01 authorization detail screen", () => {
     { how: "the F3=Back button", press: () => fireEvent.click(pfKeyButton("F3=Back")) },
     { how: "the F3 key", press: () => pressKey("F3") },
   ])("$how returns to COPAU00 with the account and sends nothing", async ({ press }) => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     press();
 
@@ -1104,7 +1132,9 @@ describe("COPAU01 authorization detail screen", () => {
       path: PATHS.COPAU00,
       state: { from: PATHS.COPAU01, acct_id: ACCT_ID },
     });
-    await settle();
+    // The stub has replaced the screen, whose keys and effects no longer run: the count follows
+    // the answer to every request the screen started.
+    await clientIdle(client);
     expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
   });
 
@@ -1116,13 +1146,15 @@ describe("COPAU01 authorization detail screen", () => {
     state,
   }) => {
     const requests = stubApi();
-    renderScreen(state);
+    const { client } = renderScreen(state);
 
     expect(await reachedStub()).toEqual({
       path: PATHS.COPAU00,
       state: { from: PATHS.COPAU01, acct_id: "00000000000" },
     });
-    await settle();
+    // The stub has replaced the screen, whose effects no longer run: the count follows the answer
+    // to every request the screen started.
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -1138,8 +1170,9 @@ describe("COPAU01 authorization detail screen", () => {
     acct,
   }) => {
     const requests = stubApi();
-    renderScreen(state);
-    await settle();
+    const { client } = renderScreen(state);
+    // On entry the screen shows what it showed at first render, so nothing marks the end of a wait.
+    await idleAfter50ms(client);
 
     // COPAUS1C reads nothing for such a state: every field blank, the message row empty.
     expect(shown()).toEqual(BLANK);
@@ -1148,7 +1181,8 @@ describe("COPAU01 authorization detail screen", () => {
     fireEvent.click(enterButton());
     fireEvent.click(pfKeyButton("F8=Next Auth"));
     fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
-    await settle();
+    // The three keys change nothing on screen either.
+    await idleAfter50ms(client);
     expect(shown()).toEqual(BLANK);
     expect(errorText()).toBe("");
 
@@ -1173,7 +1207,7 @@ describe("COPAU01 authorization detail screen", () => {
     // The screen folds no shifted key: Shift+F3, Shift+F5 and Shift+F8 are PF15, PF17 and PF20.
     ...["F3", "F5", "F8"].map((key) => ({ title: `Shift+${key}`, key, shiftKey: true })),
   ])("$title reads as ENTER, then shows the invalid-key message", async ({ key, shiftKey }) => {
-    const requests = await renderSelected();
+    const { requests } = await renderSelected();
 
     pressKey(key, shiftKey);
     await waitFor(() => {
@@ -1213,13 +1247,13 @@ describe("COPAU01 authorization detail screen", () => {
     { key: "F5", sent: `POST ${ENDPOINT}${SELECTED_KEY}/fraud`, text: "AUTH MARKED FRAUD..." },
     { key: "F8", sent: `GET ${ENDPOINT}${SELECTED_KEY}?direction=forward`, text: "" },
   ])("the $key key acts as its button", async ({ key, sent, text }) => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     pressKey(key);
     await waitFor(() => {
       expect(requests).toHaveLength(2);
     });
-    await settle();
+    await clientIdle(client);
     expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`, sent]);
     expect(errorText()).toBe(text);
   });
@@ -1230,42 +1264,51 @@ describe("COPAU01 authorization detail screen", () => {
       release = resolve;
     });
     const requests = stubApi(hold);
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
+
+      fireEvent.click(enterButton());
+      fireEvent.click(pfKeyButton("F8=Next Auth"));
+      fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
+      pressKey("F2");
+      pressKey("F5");
+      pressKey("F8");
+      // The held entry read stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(requests).toHaveLength(1);
-    });
-    expectLocked(true);
+      expect(shown()).toEqual(BLANK);
+      expect(errorText()).toBe("");
 
-    fireEvent.click(enterButton());
-    fireEvent.click(pfKeyButton("F8=Next Auth"));
-    fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
-    pressKey("F2");
-    pressKey("F5");
-    pressKey("F8");
-    await settle();
-    expect(requests).toHaveLength(1);
-    expect(shown()).toEqual(BLANK);
-    expect(errorText()).toBe("");
+      release();
+      await waitFor(() => {
+        expect(shown()).toEqual(SHOWN_SELECTED);
+      });
+      expectLocked(false);
+      expect(errorText()).toBe("");
+      expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
 
-    release();
-    await waitFor(() => {
-      expect(shown()).toEqual(SHOWN_SELECTED);
-    });
-    expectLocked(false);
-    expect(errorText()).toBe("");
-    expect(calls(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_KEY}`]);
-
-    // The answer unlocks the keyboard: the next key is served.
-    clickKey("ENTER");
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    await settle();
-    expectLocked(false);
-    expect(calls(requests)).toEqual([
-      `GET ${ENDPOINT}${SELECTED_KEY}`,
-      `GET ${ENDPOINT}${SELECTED_KEY}`,
-    ]);
+      // The answer unlocks the keyboard: the next key is served.
+      clickKey("ENTER");
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      await clientIdle(client);
+      expectLocked(false);
+      expect(calls(requests)).toEqual([
+        `GET ${ENDPOINT}${SELECTED_KEY}`,
+        `GET ${ENDPOINT}${SELECTED_KEY}`,
+      ]);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test. After the
+      // release above, a second `release` changes nothing.
+      release();
+      await clientIdle(client);
+    }
   });
 
   // The lock is taken by the key itself: keys pressed in one burst, before React renders the
@@ -1320,43 +1363,52 @@ describe("COPAU01 authorization detail screen", () => {
       kept: SELECTED_KEY,
     },
   ])("$title in one burst send one call until it is answered", async ({ presses, sent, kept }) => {
-    await renderSelected();
+    const { client } = await renderSelected();
     // From here every reply waits for `release`.
     let release: () => void = () => undefined;
     const hold = new Promise<void>((resolve) => {
       release = resolve;
     });
     const requests = stubApi(hold);
-
-    // Every press inside one `act`: a click on a key's button, or a keydown that reaches `window`.
-    act(() => {
-      for (const label of presses) {
-        if (label === "ENTER" || label.includes("=")) {
-          fireEvent.click(screen.getByRole("button", { name: label }));
-        } else {
-          fireEvent.keyDown(window, { key: label });
+    try {
+      // Every press inside one `act`: a click on a key's button, or a keydown that reaches
+      // `window`.
+      act(() => {
+        for (const label of presses) {
+          if (label === "ENTER" || label.includes("=")) {
+            fireEvent.click(screen.getByRole("button", { name: label }));
+          } else {
+            fireEvent.keyDown(window, { key: label });
+          }
         }
-      }
-    });
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
-    });
-    expectLocked(true);
-    await settle();
-    expect(calls(requests)).toEqual([sent]);
+      });
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
+      // The held reply of the one key taken stays the one request pending.
+      await idleAfter50ms(client, 1);
+      expect(calls(requests)).toEqual([sent]);
 
-    release();
-    await waitFor(() => {
-      expectLocked(false);
-    });
-    expect(errorText()).not.toBe(INVALID_KEY_TEXT);
+      release();
+      await waitFor(() => {
+        expectLocked(false);
+      });
+      expect(errorText()).not.toBe(INVALID_KEY_TEXT);
 
-    clickKey("ENTER");
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    await settle();
-    expect(calls(requests)).toEqual([sent, `GET ${ENDPOINT}${kept}`]);
+      clickKey("ENTER");
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      await clientIdle(client);
+      expect(calls(requests)).toEqual([sent, `GET ${ENDPOINT}${kept}`]);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test. After the
+      // release above, a second `release` changes nothing.
+      release();
+      await clientIdle(client);
+    }
   });
 
   it("F3 leaves while a call is in flight", async () => {
@@ -1365,20 +1417,29 @@ describe("COPAU01 authorization detail screen", () => {
       release = resolve;
     });
     const requests = stubApi(hold);
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
-    });
-    expectLocked(true);
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
 
-    fireEvent.click(pfKeyButton("F3=Back"));
-    expect(await reachedStub()).toEqual({
-      path: PATHS.COPAU00,
-      state: { from: PATHS.COPAU01, acct_id: ACCT_ID },
-    });
-    release();
-    await settle();
-    expect(requests).toHaveLength(1);
+      fireEvent.click(pfKeyButton("F3=Back"));
+      expect(await reachedStub()).toEqual({
+        path: PATHS.COPAU00,
+        state: { from: PATHS.COPAU01, acct_id: ACCT_ID },
+      });
+      release();
+      // The count waits for the released read's answer.
+      await clientIdle(client);
+      expect(requests).toHaveLength(1);
+    } finally {
+      // Pass or fail, the held read is answered and the test ends once it has settled, so
+      // neither the request nor the client's deadline outlives the test. After the release
+      // above, a second `release` changes nothing.
+      release();
+      await clientIdle(client);
+    }
   });
 
   // audit: COPAUS1C-036
@@ -1539,18 +1600,18 @@ describe("COPAU01 authorization detail screen", () => {
     text,
   }) => {
     const requests = stubApi();
-    renderScreen(state);
+    const { client } = renderScreen(state);
     await waitFor(() => {
       expect(calls(requests)).toEqual(entry);
     });
-    await settle();
+    await clientIdle(client);
 
     // Every send of the map puts the cursor on Card #, wherever the pressed key had it.
     press();
     await waitFor(() => {
       expect(document.activeElement).toBe(field("Card #:"));
     });
-    await settle();
+    await clientIdle(client);
     expect(calls(requests)).toEqual([...entry, ...sent]);
     expect(errorText()).toBe(text);
     expect(shown()).toEqual(fields);
@@ -1574,13 +1635,13 @@ describe("COPAU01: endpoint 22 and 23 requests", () => {
   }
 
   it("the read and F5's fraud toggle each send the authorization's path with the bearer token, no query and no body, and the toggle shows", async () => {
-    const requests = await renderSelected();
+    const { requests, client } = await renderSelected();
 
     fireEvent.click(pfKeyButton("F5=Mark/Remove Fraud"));
     await waitFor(() => {
       expect(errorText()).toBe(markedFraud.message);
     });
-    await settle();
+    await clientIdle(client);
 
     expect(shown()).toEqual({ ...SHOWN_SELECTED, AUTHFRD: "F-02/01/24" });
     expect(await Promise.all(requests.map(shapeOf))).toEqual([

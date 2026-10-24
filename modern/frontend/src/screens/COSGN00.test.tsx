@@ -129,12 +129,15 @@ function RouteStub() {
   return <p>{`Stub at ${location.pathname}`}</p>;
 }
 
-/** COSGN00 at `/signon`, with stubs at the two `next_route` targets. */
+/**
+ * COSGN00 at `/signon`, with stubs at the two `next_route` targets. Returns the render result and
+ * its query client, whose pending sign-ons {@link mutationsSettled} reads.
+ */
 function renderScreen() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[PATHS.COSGN00]}>
         <Routes>
@@ -145,6 +148,20 @@ function renderScreen() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
+}
+
+/**
+ * Ends a test that held a key-driven request back, once its hold is released: waits until
+ * `client` has no mutation pending. Sign-on (endpoint 1) and every key-driven read are
+ * mutations, which leaving their screen does not cancel. Each stays pending until its reply has
+ * arrived and the client has cleared that request's deadline, so neither the request nor the
+ * deadline outlives the test.
+ */
+async function mutationsSettled(client: QueryClient): Promise<void> {
+  await waitFor(() => {
+    expect(client.isMutating()).toBe(0);
+  });
 }
 
 /** `element` as an `<input>`, failing the test when it is anything else. */
@@ -269,13 +286,29 @@ function expectLocked(locked: boolean): void {
 }
 
 /**
- * Gives a refused key the time a sign-on it had started would take to reach `fetch`. The wait runs
- * inside `act`, as the form's own state updates after an ENTER do.
+ * Lets 50 ms pass inside `act`, as the form's own state updates after an ENTER do, so whatever
+ * the screen starts within that window (a render, a sign-on reaching `fetch`, a navigation) runs
+ * and renders first. A check after it shows only that nothing happened within those 50 ms, not
+ * that nothing would later.
  */
 async function lingers(): Promise<void> {
   await act(async () => {
     await new Promise<void>((resolve) => {
       setTimeout(resolve, 50);
+    });
+  });
+}
+
+/**
+ * Waits, inside `act`, until every reply in `replies` has settled and one timer turn has passed
+ * since, so the promise callbacks their settling queued have run: the client's clearing of a
+ * request's deadline among them.
+ */
+async function repliesSettled(replies: readonly Promise<Response>[]): Promise<void> {
+  await act(async () => {
+    await Promise.allSettled(replies);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
     });
   });
 }
@@ -686,7 +719,7 @@ describe("COSGN00 sign-on screen", () => {
       field: "password",
     };
     stubFetch({ status: 401, body: wrongPassword });
-    const { container } = renderScreen();
+    const { container, client } = renderScreen();
     typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
     const enter = screen.getByRole("button", { name: "ENTER=Sign-on" });
 
@@ -723,16 +756,24 @@ describe("COSGN00 sign-on screen", () => {
       releases.push(resolve);
     });
     const success = stubFetch({ status: 200, body: userSignon, gate });
-    fireEvent.click(enter);
-    await waitFor(() => {
-      expect(success.sent).toHaveLength(1);
-      expect(errorRow().textContent).toBe("");
-    });
-    expectMarked(container, null, "");
-    for (const release of releases) {
-      release();
+    try {
+      fireEvent.click(enter);
+      await waitFor(() => {
+        expect(success.sent).toHaveLength(1);
+        expect(errorRow().textContent).toBe("");
+      });
+      expectMarked(container, null, "");
+      for (const release of releases) {
+        release();
+      }
+      expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
+    } finally {
+      // The hold is released pass or fail, and the test ends once the sign-on has settled.
+      for (const release of releases) {
+        release();
+      }
+      await mutationsSettled(client);
     }
-    expect(await screen.findByText(`Stub at ${PATHS.COMEN01}`)).toBeTruthy();
   });
 
   // audit: COSGN00C-011
@@ -836,31 +877,39 @@ describe("COSGN00 sign-on screen", () => {
       field: "user_id",
     };
     const { sent } = stubFetch({ status: 401, body: notFound, gate });
-    renderScreen();
+    const { client } = renderScreen();
+    try {
+      // COSGN0A labels no F5, so there is no button: the key is pressed in the focused input.
+      fireEvent.keyDown(userIdInput(), { key: "F5" });
+      expect(errorRow().textContent).toBe(INVALID_KEY);
+      expect(errorRow().textContent).toHaveLength(50);
+      expect(sent).toHaveLength(0);
 
-    // COSGN0A labels no F5, so there is no button: the key is pressed in the focused input.
-    fireEvent.keyDown(userIdInput(), { key: "F5" });
-    expect(errorRow().textContent).toBe(INVALID_KEY);
-    expect(errorRow().textContent).toHaveLength(50);
-    expect(sent).toHaveLength(0);
+      typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+      fireEvent.click(screen.getByRole("button", { name: "ENTER=Sign-on" }));
 
-    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
-    fireEvent.click(screen.getByRole("button", { name: "ENTER=Sign-on" }));
-
-    // Cleared before the outcome: the request is out, its answer held back, and the row is empty.
-    await waitFor(() => {
-      expect(sent).toHaveLength(1);
-      expect(errorRow().textContent).toBe("");
-    });
-    for (const release of releases) {
-      release();
+      // Cleared before the outcome: the request is out, its answer held back, and the row is
+      // empty.
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+        expect(errorRow().textContent).toBe("");
+      });
+      for (const release of releases) {
+        release();
+      }
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe("User not found. Try again ...");
+      });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(userIdInput());
+      });
+    } finally {
+      // The hold is released pass or fail, and the test ends once the sign-on has settled.
+      for (const release of releases) {
+        release();
+      }
+      await mutationsSettled(client);
     }
-    await waitFor(() => {
-      expect(errorRow().textContent).toBe("User not found. Try again ...");
-    });
-    await waitFor(() => {
-      expect(document.activeElement).toBe(userIdInput());
-    });
   });
 
   // audit: COSGN00-036
@@ -968,43 +1017,50 @@ describe("COSGN00 sign-on screen", () => {
         field: "password",
       };
       const { fetchStub, sent } = stubFetch({ status: 401, body: wrongPassword, gate });
-      renderScreen();
-      expectLocked(false);
+      const { client } = renderScreen();
+      try {
+        expectLocked(false);
 
-      typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
-      fireEvent.click(enterButton());
-      await waitFor(() => {
+        typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+        fireEvent.click(enterButton());
+        await waitFor(() => {
+          expect(sent).toHaveLength(1);
+          expectLocked(true);
+        });
+
+        press();
+        press();
+        await lingers();
+        // Nothing was sent, ended or shown within that window: the screen is as the first ENTER
+        // left it.
+        expect(fetchStub).toHaveBeenCalledTimes(1);
         expect(sent).toHaveLength(1);
+        expect(errorRow().textContent).toBe("");
+        expect(screen.queryByText("Thank you for using CardDemo application...")).toBeNull();
         expectLocked(true);
-      });
 
-      press();
-      press();
-      await lingers();
-      // Nothing was sent, ended or shown: the screen is as the first ENTER left it.
-      expect(fetchStub).toHaveBeenCalledTimes(1);
-      expect(sent).toHaveLength(1);
-      expect(errorRow().textContent).toBe("");
-      expect(screen.queryByText("Thank you for using CardDemo application...")).toBeNull();
-      expectLocked(true);
+        release();
+        await waitFor(() => {
+          expect(errorRow().textContent).toBe("Wrong Password. Try again ...");
+          expectLocked(false);
+        });
+        expect(userIdInput().value).toBe(TYPED_USER_ID);
+        expect(passwordInput().value).toBe(TYPED_PASSWORD);
 
-      release();
-      await waitFor(() => {
-        expect(errorRow().textContent).toBe("Wrong Password. Try again ...");
-        expectLocked(false);
-      });
-      expect(userIdInput().value).toBe(TYPED_USER_ID);
-      expect(passwordInput().value).toBe(TYPED_PASSWORD);
-
-      // The next ENTER is taken: a new sign-on goes out with the same input.
-      fireEvent.click(enterButton());
-      await waitFor(() => {
-        expect(sent).toHaveLength(2);
-      });
-      expect(sent[1]).toEqual(sent[0]);
-      await waitFor(() => {
-        expectLocked(false);
-      });
+        // The next ENTER is taken: a new sign-on goes out with the same input.
+        fireEvent.click(enterButton());
+        await waitFor(() => {
+          expect(sent).toHaveLength(2);
+        });
+        expect(sent[1]).toEqual(sent[0]);
+        await waitFor(() => {
+          expectLocked(false);
+        });
+      } finally {
+        // The hold is released pass or fail, and the test ends once every sign-on has settled.
+        release();
+        await mutationsSettled(client);
+      }
     },
   );
 
@@ -1243,6 +1299,9 @@ describe("COSGN00 in the route table: a session listener that throws", () => {
     const refusal = new Promise<void>((resolve) => {
       refuse = resolve;
     });
+    // The admin menu's load is held until `refuse`; one whose signal aborts first is rejected
+    // with the abort reason, as `fetch` rejects a request aborted before its answer.
+    const replies: Promise<Response>[] = [];
     const sent: { method: string; path: string; authorization: string | null }[] = [];
     vi.stubGlobal(
       "fetch",
@@ -1254,8 +1313,23 @@ describe("COSGN00 in the route table: a session listener that throws", () => {
           return json(200, adminSignon);
         }
         if (req.method === "GET" && path === "/api/v1/menus/admin") {
-          await refusal;
-          return json(401, refused);
+          const { signal } = req;
+          const reply = new Promise<Response>((resolve, reject) => {
+            const abandon = (): void => {
+              reject(signal.reason);
+            };
+            if (signal.aborted) {
+              abandon();
+              return;
+            }
+            signal.addEventListener("abort", abandon, { once: true });
+            void refusal.then(() => {
+              signal.removeEventListener("abort", abandon);
+              resolve(json(401, refused));
+            });
+          });
+          replies.push(reply);
+          return reply;
         }
         const unexpected: components["schemas"]["ScreenError"] = {
           message: `Unexpected request ${req.method} ${path}`,
@@ -1272,48 +1346,63 @@ describe("COSGN00 in the route table: a session listener that throws", () => {
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    const enter = await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 });
-    // Entry ended the session: the listener was told, threw, and the screen rendered regardless.
-    expect(seen).toEqual([null]);
+    try {
+      const enter = await screen.findByRole(
+        "button",
+        { name: "ENTER=Sign-on" },
+        { timeout: 5_000 },
+      );
+      // Entry ended the session: the listener was told, threw, and the screen rendered regardless.
+      expect(seen).toEqual([null]);
 
-    typeCredentials("admin001", TYPED_PASSWORD);
-    fireEvent.click(enter);
+      typeCredentials("admin001", TYPED_PASSWORD);
+      fireEvent.click(enter);
 
-    expect(
-      await screen.findByRole("heading", { level: 1, name: "Admin Menu" }, { timeout: 5_000 }),
-    ).toBeTruthy();
-    expect(router.state.location.pathname).toBe(adminSignon.next_route);
-    const stored: StoredSession = { token: "test-token", userId: "ADMIN001", userType: "A" };
-    expect(getSession()).toEqual(stored);
-    expect(seen).toEqual([null, stored]);
-    await waitFor(() => {
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "Admin Menu" }, { timeout: 5_000 }),
+      ).toBeTruthy();
+      expect(router.state.location.pathname).toBe(adminSignon.next_route);
+      const stored: StoredSession = { token: "test-token", userId: "ADMIN001", userType: "A" };
+      expect(getSession()).toEqual(stored);
+      expect(seen).toEqual([null, stored]);
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      expect(sent).toEqual([
+        { method: "POST", path: "/api/v1/signon", authorization: null },
+        { method: "GET", path: "/api/v1/menus/admin", authorization: "Bearer test-token" },
+      ]);
+
+      // The admin menu's load is refused: the client clears the session, the throwing listener
+      // is told first, and the guard's listener after it still replaces the screen with sign-on,
+      // whose entry ends the session once more.
+      refuse();
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeTruthy();
+      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
+      expect(getSession()).toBeNull();
+      expect(errorRow().textContent).toBe("");
+      expect(seen).toEqual([null, stored, null, null]);
+
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
+      expect(getSession()).toBeNull();
+      expect(seen).toEqual([null, stored, null, null, null]);
+      expect(failing.mock.results.map((result) => result.type)).toEqual(Array(5).fill("throw"));
       expect(sent).toHaveLength(2);
-    });
-    expect(sent).toEqual([
-      { method: "POST", path: "/api/v1/signon", authorization: null },
-      { method: "GET", path: "/api/v1/menus/admin", authorization: "Bearer test-token" },
-    ]);
-
-    // The admin menu's load is refused: the client clears the session, the throwing listener is
-    // told first, and the guard's listener after it still replaces the screen with sign-on, whose
-    // entry ends the session once more.
-    refuse();
-    expect(
-      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
-    ).toBeTruthy();
-    expect(router.state.location.pathname).toBe(PATHS.COSGN00);
-    expect(screen.queryByRole("heading", { level: 1, name: "Admin Menu" })).toBeNull();
-    expect(getSession()).toBeNull();
-    expect(errorRow().textContent).toBe("");
-    expect(seen).toEqual([null, stored, null, null]);
-
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    expect(screen.getByText("Thank you for using CardDemo application...")).toBeTruthy();
-    expect(getSession()).toBeNull();
-    expect(seen).toEqual([null, stored, null, null, null]);
-    expect(failing.mock.results.map((result) => result.type)).toEqual(Array(5).fill("throw"));
-    expect(sent).toHaveLength(2);
-    router.dispose();
+      router.dispose();
+    } finally {
+      // The hold is released pass or fail. A menu that was left cancels its load, which rejects
+      // that reply; one still shown gets the 401. The test ends once every reply has settled and
+      // no load is fetching, so neither the request nor the client's deadline outlives it.
+      refuse();
+      await repliesSettled(replies);
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+    }
   });
 });
 
@@ -1348,8 +1437,9 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
   /**
    * Replaces `fetch`. Every request is recorded with its method, path and `Authorization`
    * header. The first request `held` matches is answered 401 with `refused` only once `release`
-   * is called, which also runs when the test finishes, so no request outlives it; every other
-   * sign-on gets `userSignon`, every main-menu load `mainMenu`, and anything else a 500.
+   * is called, which each test also does in `finally` before it waits for that request to
+   * settle; every other sign-on gets `userSignon`, every main-menu load `mainMenu`, and anything
+   * else a 500.
    */
   function stubApi(held: (method: string, path: string) => boolean) {
     const sent: { method: string; path: string; authorization: string | null }[] = [];
@@ -1357,7 +1447,6 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
     const released = new Promise<void>((resolve) => {
       release = resolve;
     });
-    onTestFinished(release);
     let holding = false;
     vi.stubGlobal(
       "fetch",
@@ -1385,8 +1474,15 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
     return { sent, release };
   }
 
-  /** The route table at the last of `entries`, the earlier ones behind it in the history. */
-  function renderRouteTable(entries: string[]): ReturnType<typeof createMemoryRouter> {
+  /**
+   * The route table at the last of `entries`, the earlier ones behind it in the history. Returns
+   * the router, whose location the test reads, and the query client, whose pending reads and
+   * sign-ons {@link mutationsSettled} reads.
+   */
+  function renderRouteTable(entries: string[]): {
+    readonly router: ReturnType<typeof createMemoryRouter>;
+    readonly client: QueryClient;
+  } {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -1399,7 +1495,7 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    return router;
+    return { router, client };
   }
 
   /** Waits for the main menu, its load answered: `ENTER=Continue` is no longer refused. */
@@ -1425,14 +1521,18 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
   }
 
   /**
-   * Answers the held request 401 and gives its answer the time to reach the client, the session
-   * and the route guard, then asserts that the later session and the main menu it reached stand.
+   * Answers the held request 401 and waits until `client` has settled it, by which point the
+   * client has read the 401's status and decided on the session. Then, after the bounded window
+   * of {@link lingers}, which shows only that the route guard did not move within it, asserts
+   * that the later session and the main menu it reached stand.
    */
   async function releaseAndExpectLaterSession(
     router: ReturnType<typeof createMemoryRouter>,
+    client: QueryClient,
     release: () => void,
   ): Promise<void> {
     release();
+    await mutationsSettled(client);
     await lingers();
     expect(getSession()).toEqual(later);
     expect(router.state.location.pathname).toBe(PATHS.COMEN01);
@@ -1444,42 +1544,48 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
   it("a read sent with the earlier session's token and answered 401 after F3 and a new sign-on leaves the new session on the main menu", async () => {
     setSession(earlier.token, earlier.userId, earlier.userType);
     const { sent, release } = stubApi((method, path) => method === "GET" && path === VIEW_PATH);
-    const router = renderRouteTable([PATHS.COACTVW]);
-    expect(
-      await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
-    ).toBeTruthy();
+    const { router, client } = renderRouteTable([PATHS.COACTVW]);
+    try {
+      expect(
+        await screen.findByRole("heading", { level: 1, name: "View Account" }, { timeout: 5_000 }),
+      ).toBeTruthy();
 
-    // ENTER sends the view with the earlier token, and the stub holds it. F3 stays free while
-    // the view is out: it returns to the main menu, whose F3 goes to sign-on, and sign-on's entry
-    // ends the earlier session.
-    const account = document.querySelector('input[data-field="ACCTSID"]');
-    if (!(account instanceof HTMLInputElement)) {
-      throw new Error("Expected the account number input");
+      // ENTER sends the view with the earlier token, and the stub holds it. F3 stays free while
+      // the view is out: it returns to the main menu, whose F3 goes to sign-on, and sign-on's
+      // entry ends the earlier session.
+      const account = document.querySelector('input[data-field="ACCTSID"]');
+      if (!(account instanceof HTMLInputElement)) {
+        throw new Error("Expected the account number input");
+      }
+      fireEvent.change(account, { target: { value: ACCOUNT } });
+      fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+      });
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      await mainMenuShown();
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeTruthy();
+      expect(getSession()).toBeNull();
+
+      await signOnAgain();
+      expect(getSession()).toEqual(later);
+
+      await releaseAndExpectLaterSession(router, client, release);
+      expect(sent).toEqual([
+        { method: "GET", path: VIEW_PATH, authorization: `Bearer ${earlier.token}` },
+        { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${earlier.token}` },
+        { method: "POST", path: "/api/v1/signon", authorization: null },
+        { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
+      ]);
+      router.dispose();
+    } finally {
+      // The held view is answered pass or fail, and the test ends once it has settled.
+      release();
+      await mutationsSettled(client);
     }
-    fireEvent.change(account, { target: { value: ACCOUNT } });
-    fireEvent.click(screen.getByRole("button", { name: "ENTER" }));
-    await waitFor(() => {
-      expect(sent).toHaveLength(1);
-    });
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    await mainMenuShown();
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    expect(
-      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
-    ).toBeTruthy();
-    expect(getSession()).toBeNull();
-
-    await signOnAgain();
-    expect(getSession()).toEqual(later);
-
-    await releaseAndExpectLaterSession(router, release);
-    expect(sent).toEqual([
-      { method: "GET", path: VIEW_PATH, authorization: `Bearer ${earlier.token}` },
-      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${earlier.token}` },
-      { method: "POST", path: "/api/v1/signon", authorization: null },
-      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
-    ]);
-    router.dispose();
   });
 
   // The sign-on screen refuses every key while its sign-on is out, so a second sign-on needs a
@@ -1489,33 +1595,39 @@ describe("COSGN00 in the route table: a late 401 leaves a later session in place
     const { sent, release } = stubApi(
       (method, path) => method === "POST" && path === "/api/v1/signon",
     );
-    const router = renderRouteTable(["/", PATHS.COSGN00]);
-    expect(
-      await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
-    ).toBeTruthy();
+    const { router, client } = renderRouteTable(["/", PATHS.COSGN00]);
+    try {
+      expect(
+        await screen.findByRole("button", { name: "ENTER=Sign-on" }, { timeout: 5_000 }),
+      ).toBeTruthy();
 
-    typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
-    fireEvent.click(enterButton());
-    await waitFor(() => {
-      expect(enterButton().getAttribute("aria-disabled")).toBe("true");
-    });
-    await act(async () => {
-      await router.navigate(-1);
-    });
-    await waitFor(() => {
-      expect(router.state.location.pathname).toBe(PATHS.COSGN00);
-    });
+      typeCredentials(TYPED_USER_ID, TYPED_PASSWORD);
+      fireEvent.click(enterButton());
+      await waitFor(() => {
+        expect(enterButton().getAttribute("aria-disabled")).toBe("true");
+      });
+      await act(async () => {
+        await router.navigate(-1);
+      });
+      await waitFor(() => {
+        expect(router.state.location.pathname).toBe(PATHS.COSGN00);
+      });
 
-    await signOnAgain();
-    expect(getSession()).toEqual(later);
+      await signOnAgain();
+      expect(getSession()).toEqual(later);
 
-    await releaseAndExpectLaterSession(router, release);
-    expect(sent).toEqual([
-      { method: "POST", path: "/api/v1/signon", authorization: null },
-      { method: "POST", path: "/api/v1/signon", authorization: null },
-      { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
-    ]);
-    router.dispose();
+      await releaseAndExpectLaterSession(router, client, release);
+      expect(sent).toEqual([
+        { method: "POST", path: "/api/v1/signon", authorization: null },
+        { method: "POST", path: "/api/v1/signon", authorization: null },
+        { method: "GET", path: "/api/v1/menus/main", authorization: `Bearer ${later.token}` },
+      ]);
+      router.dispose();
+    } finally {
+      // The held sign-on is answered pass or fail, and the test ends once it has settled.
+      release();
+      await mutationsSettled(client);
+    }
   });
 });
 

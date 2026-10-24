@@ -22,7 +22,7 @@ use std::io;
 use std::process::ExitCode;
 
 use runtime::config::{Config, OtelExport};
-use runtime::telemetry::event_enabled;
+use runtime::telemetry::{event_enabled, with_value_set};
 use tracing::Instrument;
 use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
 use tracing::field::{self, FieldSet, Value};
@@ -133,14 +133,17 @@ const fn event_metadata<const N: usize>(
 }
 
 /// Emits one event of `site` in the current span with `values`, one per field the site names
-/// and in that order, a `None` leaving its field out, when [`event_enabled`] says so.
+/// and in that order, paired with those fields by [`with_value_set`], a `None` leaving its field
+/// out, when [`event_enabled`] says so.
 fn emit<const N: usize>(site: &'static EventSite<N>, values: [Option<&dyn Value>; N]) {
     let callsite = &site.0;
     if !event_enabled(callsite) {
         return;
     }
     let metadata = callsite.metadata();
-    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+    with_value_set(metadata.fields(), values, |values| {
+        Event::dispatch(metadata, values);
+    });
 }
 
 /// `ERROR` when the configuration is refused, with its `error`, which names the variable and

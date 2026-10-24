@@ -612,6 +612,20 @@ async function boundedWindow(client: QueryClient, held?: () => number): Promise<
 }
 
 /**
+ * Ends a test whose stub holds replies, pass or fail, so that neither a request nor the client's
+ * deadline outlives it: calls `release` on every check, so a reply the stub holds after this is
+ * called goes too, until `client` fetches no query and has no mutation pending. A test calls it
+ * from `finally`.
+ */
+async function releaseHeld(client: QueryClient, release: () => void): Promise<void> {
+  await waitFor(() => {
+    release();
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(0);
+  });
+}
+
+/**
  * Waits until the screen takes keys: the keyboard is unlocked and the cursor is in the user ID.
  * The entry effect locks the keyboard within `render` before a route-state selection's fetch goes
  * out, and the fetch's answer unlocks it, so after first display this is that answer shown, or,
@@ -1128,58 +1142,62 @@ describe("COUSR03 user delete screen", () => {
   it("locks ENTER, F4, F5 and the user ID while the fetch or the delete is outstanding", async () => {
     const { requests, release, held } = stubApi(true);
     const { client } = renderScreen(FROM_LIST);
-    const form = userIdInput().closest("form");
-    await waitFor(() => {
-      expect(form?.getAttribute("aria-busy")).toBe("true");
-    });
-    expectLocked(true);
+    try {
+      const form = userIdInput().closest("form");
+      await waitFor(() => {
+        expect(form?.getAttribute("aria-busy")).toBe("true");
+      });
+      expectLocked(true);
 
-    fireEvent.click(key("F5=Delete"));
-    fireEvent.click(key("F4=Clear"));
-    fireEvent.click(key("ENTER=Fetch"));
-    pressKey("F7");
-    await boundedWindow(client, held);
-    expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
-    expect(userIdInput().value).toBe(SELECTED_ID);
-    // An unserved key while the keyboard is locked shows no invalid-key message.
-    expect(messageRow()).toEqual(EMPTY_ROW);
+      fireEvent.click(key("F5=Delete"));
+      fireEvent.click(key("F4=Clear"));
+      fireEvent.click(key("ENTER=Fetch"));
+      pressKey("F7");
+      await boundedWindow(client, held);
+      expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
+      expect(userIdInput().value).toBe(SELECTED_ID);
+      // An unserved key while the keyboard is locked shows no invalid-key message.
+      expect(messageRow()).toEqual(EMPTY_ROW);
 
-    release();
-    await waitFor(() => {
+      release();
+      await waitFor(() => {
+        expect(shown()).toEqual(SHOWN_SELECTED);
+      });
+      await waitFor(() => {
+        expect(form?.getAttribute("aria-busy")).toBe("false");
+      });
+      expectLocked(false);
+
+      fireEvent.click(key("F5=Delete"));
+      await waitFor(() => {
+        expect(form?.getAttribute("aria-busy")).toBe("true");
+      });
+      expectLocked(true);
+      pressKey("F5");
+      fireEvent.click(key("F4=Clear"));
+      fireEvent.click(key("ENTER=Fetch"));
+      await boundedWindow(client, held);
+      expect(sent(requests)).toEqual([
+        `GET ${ENDPOINT}${SELECTED_ID}`,
+        `DELETE ${ENDPOINT}${SELECTED_ID}`,
+      ]);
       expect(shown()).toEqual(SHOWN_SELECTED);
-    });
-    await waitFor(() => {
-      expect(form?.getAttribute("aria-busy")).toBe("false");
-    });
-    expectLocked(false);
+      expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
 
-    fireEvent.click(key("F5=Delete"));
-    await waitFor(() => {
-      expect(form?.getAttribute("aria-busy")).toBe("true");
-    });
-    expectLocked(true);
-    pressKey("F5");
-    fireEvent.click(key("F4=Clear"));
-    fireEvent.click(key("ENTER=Fetch"));
-    await boundedWindow(client, held);
-    expect(sent(requests)).toEqual([
-      `GET ${ENDPOINT}${SELECTED_ID}`,
-      `DELETE ${ENDPOINT}${SELECTED_ID}`,
-    ]);
-    expect(shown()).toEqual(SHOWN_SELECTED);
-    expect(messageRow()).toEqual(infoRow(DELETE_PROMPT));
-
-    release();
-    await waitFor(() => {
-      expect(messageRow()).toEqual(infoRow(deletedSelected.message));
-    });
-    expect(shown()).toEqual(BLANK);
-    await waitFor(() => {
-      expect(form?.getAttribute("aria-busy")).toBe("false");
-    });
-    expectLocked(false);
-    await requestsAnswered(client, held);
-    expect(requests).toHaveLength(2);
+      release();
+      await waitFor(() => {
+        expect(messageRow()).toEqual(infoRow(deletedSelected.message));
+      });
+      expect(shown()).toEqual(BLANK);
+      await waitFor(() => {
+        expect(form?.getAttribute("aria-busy")).toBe("false");
+      });
+      expectLocked(false);
+      await requestsAnswered(client, held);
+      expect(requests).toHaveLength(2);
+    } finally {
+      await releaseHeld(client, release);
+    }
   });
 
   // The lock is taken by the key itself, before the edits run: keys pressed in one burst, before
@@ -1215,39 +1233,43 @@ describe("COUSR03 user delete screen", () => {
       });
     };
 
-    typeUserId(SELECTED_ID);
-    burst();
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
-    });
-    expectLocked(true);
-    await boundedWindow(client, held);
-    expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
-    expect(userIdInput().value).toBe(SELECTED_ID);
+    try {
+      typeUserId(SELECTED_ID);
+      burst();
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expectLocked(true);
+      await boundedWindow(client, held);
+      expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
+      expect(userIdInput().value).toBe(SELECTED_ID);
 
-    release();
-    await waitFor(() => {
-      expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
-    });
-    expectLocked(false);
+      release();
+      await waitFor(() => {
+        expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
+      });
+      expectLocked(false);
 
-    // A later key is served again, and locks the keyboard again until its own answer.
-    typeUserId(SELECTED_ID);
-    burst();
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    expectLocked(true);
-    release();
-    await waitFor(() => {
-      expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
-    });
-    expectLocked(false);
-    await requestsAnswered(client, held);
-    expect(sent(requests)).toEqual([
-      `${method} ${ENDPOINT}${SELECTED_ID}`,
-      `${method} ${ENDPOINT}${SELECTED_ID}`,
-    ]);
+      // A later key is served again, and locks the keyboard again until its own answer.
+      typeUserId(SELECTED_ID);
+      burst();
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      expectLocked(true);
+      release();
+      await waitFor(() => {
+        expect(userIdInput().closest("form")?.getAttribute("aria-busy")).toBe("false");
+      });
+      expectLocked(false);
+      await requestsAnswered(client, held);
+      expect(sent(requests)).toEqual([
+        `${method} ${ENDPOINT}${SELECTED_ID}`,
+        `${method} ${ENDPOINT}${SELECTED_ID}`,
+      ]);
+    } finally {
+      await releaseHeld(client, release);
+    }
   });
 
   // A clicked key keeps focus while its request is outstanding: the lock marks it `aria-disabled`,
@@ -1261,33 +1283,37 @@ describe("COUSR03 user delete screen", () => {
     async ({ label, method }) => {
       const { requests, release, held } = stubApi(true);
       const { client } = renderScreen({ from: PATHS.COADM01 });
-      typeUserId(SELECTED_ID);
-      const button = key(label);
-      // A mouse click focuses the button, then clicks it.
-      await moveFocus(button);
-      fireEvent.click(button);
-      await waitFor(() => {
-        expect(button.getAttribute("aria-disabled")).toBe("true");
-      });
-      expect(button).toHaveProperty("disabled", false);
-      expect(document.activeElement).toBe(button);
+      try {
+        typeUserId(SELECTED_ID);
+        const button = key(label);
+        // A mouse click focuses the button, then clicks it.
+        await moveFocus(button);
+        fireEvent.click(button);
+        await waitFor(() => {
+          expect(button.getAttribute("aria-disabled")).toBe("true");
+        });
+        expect(button).toHaveProperty("disabled", false);
+        expect(document.activeElement).toBe(button);
 
-      const submits = vi.fn();
-      const form = userIdInput().form;
-      expect(form).toBeInstanceOf(HTMLFormElement);
-      form?.addEventListener("submit", submits);
-      fireEvent.click(button);
-      await boundedWindow(client, held);
-      expect(submits).not.toHaveBeenCalled();
-      expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
-      expect(document.activeElement).toBe(button);
+        const submits = vi.fn();
+        const form = userIdInput().form;
+        expect(form).toBeInstanceOf(HTMLFormElement);
+        form?.addEventListener("submit", submits);
+        fireEvent.click(button);
+        await boundedWindow(client, held);
+        expect(submits).not.toHaveBeenCalled();
+        expect(sent(requests)).toEqual([`${method} ${ENDPOINT}${SELECTED_ID}`]);
+        expect(document.activeElement).toBe(button);
 
-      release();
-      await waitFor(() => {
-        expect(button.getAttribute("aria-disabled")).toBeNull();
-      });
-      await requestsAnswered(client, held);
-      expect(requests).toHaveLength(1);
+        release();
+        await waitFor(() => {
+          expect(button.getAttribute("aria-disabled")).toBeNull();
+        });
+        await requestsAnswered(client, held);
+        expect(requests).toHaveLength(1);
+      } finally {
+        await releaseHeld(client, release);
+      }
     },
   );
 

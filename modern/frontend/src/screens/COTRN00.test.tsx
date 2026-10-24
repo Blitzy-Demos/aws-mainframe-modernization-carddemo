@@ -430,10 +430,10 @@ async function clientIdle(client: QueryClient, held = 0): Promise<void> {
 }
 
 /**
- * For keys that must send nothing and leave nothing on screen to wait for, such as the keys the
- * lock refuses: lets 50 ms pass inside `act`, so whatever the screen does with them within that
- * window (a render, a request) runs and renders first, then waits as {@link clientIdle} does. It
- * shows only that nothing was sent within those 50 ms, not that nothing would be sent later.
+ * For what must send nothing and leaves nothing on screen to wait for, such as the keys the lock
+ * refuses or a screen its guard refuses: lets 50 ms pass inside `act`, so whatever follows within
+ * that window (a render, a request) runs and renders first, then waits as {@link clientIdle} does.
+ * It shows only that nothing was sent within those 50 ms, not that nothing would be sent later.
  */
 async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
   await act(async () => {
@@ -1708,54 +1708,61 @@ describe("COTRN00 List Transactions", () => {
       const held = heldReply(json(200, row.page));
       const sent = stubFetch(...row.before, held.reply);
       const { client } = renderList();
-      if (row.before.length > 0) {
-        await answered(sent, row.before.length);
-      }
-      row.start();
-      await waitFor(() => {
+      try {
+        if (row.before.length > 0) {
+          await answered(sent, row.before.length);
+        }
+        row.start();
+        await waitFor(() => {
+          expect(sent).toHaveLength(row.before.length + 1);
+          expect(lockState()).toEqual(LOCKED);
+        });
+
+        // The read-only selector takes no typing; a value set past it is still not acted on. Once
+        // ENTER has submitted the form, it re-validates on every change, so the change runs inside
+        // an awaited `act`, where the render of that validation lands.
+        await act(async () => {
+          typeInto(selector(3), "S");
+        });
+        press("ENTER=Continue");
+        press("ENTER=Continue");
+        fireEvent.keyDown(document.body, { key: "Enter" });
+        fireEvent.submit(screenForm());
+        fireEvent.submit(screenForm());
+        press("F7=Backward");
+        press("F8=Forward");
+        fireEvent.keyDown(document.body, { key: "F7" });
+        fireEvent.keyDown(document.body, { key: "F8" });
+        fireEvent.keyDown(document.body, { key: "F2" });
+        // The held page stays the one request pending.
+        await idleAfter50ms(client, 1);
+
         expect(sent).toHaveLength(row.before.length + 1);
+        expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
+        expect(errorRow().textContent).toBe("");
         expect(lockState()).toEqual(LOCKED);
-      });
 
-      // The read-only selector takes no typing; a value set past it is still not acted on. Once
-      // ENTER has submitted the form, it re-validates on every change, so the change runs inside
-      // an awaited `act`, where the render of that validation lands.
-      await act(async () => {
-        typeInto(selector(3), "S");
-      });
-      press("ENTER=Continue");
-      press("ENTER=Continue");
-      fireEvent.keyDown(document.body, { key: "Enter" });
-      fireEvent.submit(screenForm());
-      fireEvent.submit(screenForm());
-      press("F7=Backward");
-      press("F8=Forward");
-      fireEvent.keyDown(document.body, { key: "F7" });
-      fireEvent.keyDown(document.body, { key: "F8" });
-      fireEvent.keyDown(document.body, { key: "F2" });
-      // The held page stays the one request pending.
-      await idleAfter50ms(client, 1);
+        held.release();
+        await answered(sent, row.before.length + 1);
+        expectListed(row.page);
+        expect(lockState()).toEqual(UNLOCKED);
+        expect(document.activeElement).toBe(searchField());
 
-      expect(sent).toHaveLength(row.before.length + 1);
-      expect(screen.queryByRole("region", { name: "View Transaction" })).toBeNull();
-      expect(errorRow().textContent).toBe("");
-      expect(lockState()).toEqual(LOCKED);
-
-      held.release();
-      await answered(sent, row.before.length + 1);
-      expectListed(row.page);
-      expect(lockState()).toEqual(UNLOCKED);
-      expect(document.activeElement).toBe(searchField());
-
-      // Answered, ENTER acts on the selection kept in row 3, against the page now shown.
-      press("ENTER=Continue");
-      await screen.findByRole("region", { name: "View Transaction" });
-      expect(transferState("View Transaction")).toEqual({
-        from: PATHS.COTRN00,
-        tran_id: row.page.rows[2]?.tran_id,
-        list: row.list,
-      });
-      expect(sent).toHaveLength(row.before.length + 1);
+        // Answered, ENTER acts on the selection kept in row 3, against the page now shown.
+        press("ENTER=Continue");
+        await screen.findByRole("region", { name: "View Transaction" });
+        expect(transferState("View Transaction")).toEqual({
+          from: PATHS.COTRN00,
+          tran_id: row.page.rows[2]?.tran_id,
+          list: row.list,
+        });
+        expect(sent).toHaveLength(row.before.length + 1);
+      } finally {
+        // Pass or fail, the held page is answered and the test ends once no request is pending,
+        // so neither the request nor the client's deadline outlives the test.
+        held.release();
+        await clientIdle(client);
+      }
     },
   );
 
@@ -1763,46 +1770,60 @@ describe("COTRN00 List Transactions", () => {
     const held = heldReply(json(200, SECOND_PAGE));
     const sent = stubFetch(json(200, FIRST_PAGE), held.reply);
     const { client } = renderList();
-    await answered(sent, 1);
-    typeInto(searchField(), tranId(11));
+    try {
+      await answered(sent, 1);
+      typeInto(searchField(), tranId(11));
 
-    // One batch: React renders the lock only after all four, so only the screen's ref stops them.
-    act(() => {
-      const enter = screen.getByRole("button", { name: "ENTER=Continue" });
-      enter.click();
-      enter.click();
-      screenForm().requestSubmit();
-      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    });
-    await waitFor(() => {
+      // One batch: React renders the lock only after all four, so only the screen's ref stops them.
+      act(() => {
+        const enter = screen.getByRole("button", { name: "ENTER=Continue" });
+        enter.click();
+        enter.click();
+        screenForm().requestSubmit();
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      expect(lockState()).toEqual(LOCKED);
+      // The held page of the one ENTER taken stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(sent).toHaveLength(2);
-    });
-    expect(lockState()).toEqual(LOCKED);
-    // The held page of the one ENTER taken stays the one request pending.
-    await idleAfter50ms(client, 1);
-    expect(sent).toHaveLength(2);
 
-    held.release();
-    await answered(sent, 2);
-    expectListed(SECOND_PAGE);
-    expect(lockState()).toEqual(UNLOCKED);
+      held.release();
+      await answered(sent, 2);
+      expectListed(SECOND_PAGE);
+      expect(lockState()).toEqual(UNLOCKED);
+    } finally {
+      // Pass or fail, the held page is answered and the test ends once no request is pending, so
+      // neither the request nor the client's deadline outlives the test.
+      held.release();
+      await clientIdle(client);
+    }
   });
 
   it("F3 still returns to the main menu while a page is outstanding", async () => {
     const held = heldReply(json(200, FIRST_PAGE));
     const sent = stubFetch(held.reply);
     const { client } = renderList();
-    await waitFor(() => {
-      expect(lockState()).toEqual(LOCKED);
-    });
+    try {
+      await waitFor(() => {
+        expect(lockState()).toEqual(LOCKED);
+      });
 
-    press("F3=Back");
+      press("F3=Back");
 
-    await screen.findByRole("region", { name: "Main Menu" });
-    held.release();
-    // The count waits for the released page's answer.
-    await clientIdle(client);
-    expect(sent).toHaveLength(1);
+      await screen.findByRole("region", { name: "Main Menu" });
+      held.release();
+      // The count waits for the released page's answer.
+      await clientIdle(client);
+      expect(sent).toHaveLength(1);
+    } finally {
+      // Pass or fail, the held page is answered and the test ends once no request is pending, so
+      // neither the request nor the client's deadline outlives the test.
+      held.release();
+      await clientIdle(client);
+    }
   });
 });
 
@@ -1908,10 +1929,9 @@ describe("COTRN00 behind the route guard", () => {
     );
     expect(screen.queryByRole("heading", { level: 1, name: "List Transactions" })).toBeNull();
     expect(screen.queryByLabelText("Search Tran ID:")).toBeNull();
-    // Gives a request the guarded screen would send time to leave before the count.
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
+    // The refused screen never mounts, so nothing on screen marks the end of a wait: a bounded
+    // window, then no request in flight. The count covers only requests sent within that window.
+    await idleAfter50ms(client);
     expect(sent).toHaveLength(0);
     router.dispose();
   });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
   createMemoryRouter,
@@ -220,7 +220,11 @@ function stubApi(
   return requests;
 }
 
-/** A promise and the function that resolves it, for the `hold` of {@link stubApi}. */
+/**
+ * A promise and the function that resolves it, for the `hold` of {@link stubApi}: every request
+ * the hold matches stays unanswered until `open` is called. `open` may be called again and then
+ * does nothing, so a test that holds a reply also calls it in a `finally`, pass or fail.
+ */
 function gate(): { readonly until: Promise<void>; readonly open: () => void } {
   let resolveGate: (() => void) | undefined;
   const until = new Promise<void>((resolve) => {
@@ -259,12 +263,15 @@ function RouteStub() {
   );
 }
 
-/** COUSR02 at `/users/update` with `state`, and stubs at the routes it transfers to. */
+/**
+ * COUSR02 at `/users/update` with `state`, and stubs at the routes it transfers to. Returns the
+ * render result and the QueryClient the screen's requests run in.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COUSR02, state }]}>
         <Routes>
@@ -275,6 +282,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...result, client };
 }
 
 /** The route stub a transfer reached: its path and the route state it was given. */
@@ -576,13 +584,37 @@ async function selectedShown(): Promise<void> {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoints 18 and 19 are mutations of that client. Each stays
+ * pending from the moment the screen starts it until its reply has arrived, whether or not the
+ * screen is still mounted; the screen's own handling of the reply, chained on that mutation's
+ * promise, runs after. Every request the screen had started when this is called, the held ones
+ * aside, has therefore been answered once it returns. It cannot see a request the screen has not
+ * started yet: a test calls it once it has awaited what the screen shows at the end of a key, or
+ * after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await new Promise((resolve) => {
-    setTimeout(resolve, 20);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
   });
+}
+
+/**
+ * For an entry or keys that must send nothing and leave nothing on screen to wait for, such as an
+ * entry with no selection or the keys the lock refuses: lets 50 ms pass inside `act`, so whatever
+ * the screen does within that window (a render, a request) runs and renders first, then waits as
+ * {@link clientIdle} does. It shows only that nothing was sent within those 50 ms, not that
+ * nothing would be sent later. The window runs on the real `setTimeout`, which a test that fakes
+ * only `Date` leaves in place.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+  await clientIdle(client, held);
 }
 
 /** The row-24 labels in map order (COUSR02-029). */
@@ -817,7 +849,7 @@ describe("COUSR02 user update screen", () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date(2024, 0, 2, 3, 4, 5));
     const requests = stubApi();
-    const { container } = renderScreen();
+    const { container, client } = renderScreen();
 
     expectHeaderValues(container, [
       { name: "TRNNAME", row: 1, col: 7, length: 4, value: "CU02", title: false },
@@ -841,7 +873,7 @@ describe("COUSR02 user update screen", () => {
       },
       { name: "CURTIME", row: 2, col: 71, length: 8, value: "03:04:05", title: false },
     ]);
-    await settle();
+    await idleAfter50ms(client);
     expect(requests).toEqual([]);
   });
 
@@ -850,7 +882,7 @@ describe("COUSR02 user update screen", () => {
   // audit: COUSR02C-014
   it("entered from a COUSR00 selection, fetches that user at once and shows it", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
 
     // The selected ID is in the input before the response arrives.
     expect(input("userId").value).toBe(SELECTED_ID);
@@ -866,7 +898,7 @@ describe("COUSR02 user update screen", () => {
     await focusReaches(input("userId"));
 
     // One read, exactly as ENTER sends it, with the session's bearer token.
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer test-token");
   });
@@ -878,12 +910,12 @@ describe("COUSR02 user update screen", () => {
     { title: "with a route state that is no object", state: "USER0001" },
   ])("entered $title, shows empty inputs and message, sends nothing", async (row) => {
     const requests = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
 
     expect(shownInputs()).toEqual(BLANK_INPUTS);
     expect(shownMessage()).toEqual({ kind: "error", text: "" });
     expect(document.activeElement).toBe(input("userId"));
-    await settle();
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -962,7 +994,7 @@ describe("COUSR02 user update screen", () => {
   // the server's in the endpoint tests. This shows what the screen does with the schema's refusal.
   it("ENTER with a blank user ID sends nothing and keeps what the other inputs show", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await selectedShown();
 
     typeInto("password", TYPED_PASSWORD);
@@ -981,7 +1013,7 @@ describe("COUSR02 user update screen", () => {
     });
     await focusReaches(input("userId"));
     expect(input("userId").getAttribute("aria-invalid")).toBe("true");
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1113,7 +1145,7 @@ describe("COUSR02 user update screen", () => {
   // the server's in the endpoint tests. This shows what the screen does with the schema's refusal.
   it("F5 with a blank user ID sends nothing and shows the schema's message in red", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await selectedShown();
 
     typeInto("userId", "");
@@ -1126,7 +1158,7 @@ describe("COUSR02 user update screen", () => {
     });
     expect(shownInputs()).toEqual({ ...SHOWN_SELECTED, userId: "" });
     await focusReaches(input("userId"));
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1195,12 +1227,14 @@ describe("COUSR02 user update screen", () => {
     },
   ])("$title", async (row) => {
     const requests = stubApi(row.reply);
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     // The entry's outcome first, so that only the key's effect remains to observe.
     if (row.selected) {
       await selectedShown();
+      await clientIdle(client);
+    } else {
+      await idleAfter50ms(client);
     }
-    await settle();
     const before = sent(requests);
 
     typeInto("userId", row.userId);
@@ -1218,7 +1252,7 @@ describe("COUSR02 user update screen", () => {
     expect(stub.state).toEqual({ from: "/users/update" });
     // The response's message is never shown: the screen is gone.
     expect(screen.queryAllByRole("alert")).toHaveLength(0);
-    await settle();
+    await clientIdle(client);
     if (row.saves) {
       expect(sent(requests)).toEqual([...before, `PUT ${ENDPOINT}${row.userId}`]);
       expect(await bodyOf(requests.at(-1))).toStrictEqual({
@@ -1239,48 +1273,55 @@ describe("COUSR02 user update screen", () => {
       userId: SELECTED_ID,
       until: put.until,
     });
-    renderScreen(FROM_LIST);
-    await selectedShown();
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await selectedShown();
 
-    typeInto("firstName", "LARRY");
-    fireEvent.click(key("F3=Save&Exit"));
-    await waitFor(() => {
-      expect(sent(requests)).toEqual([
-        `GET ${ENDPOINT}${SELECTED_ID}`,
-        `PUT ${ENDPOINT}${SELECTED_ID}`,
-      ]);
-    });
+      typeInto("firstName", "LARRY");
+      fireEvent.click(key("F3=Save&Exit"));
+      await waitFor(() => {
+        expect(sent(requests)).toEqual([
+          `GET ${ENDPOINT}${SELECTED_ID}`,
+          `PUT ${ENDPOINT}${SELECTED_ID}`,
+        ]);
+      });
 
-    // While the save runs, every key is disabled, F12 included, and the inputs are read-only.
-    await lockReaches(LEAVING_LOCK);
-    // Every key is ignored: no second save, no clear, no cancel, no fetch, no message.
-    fireEvent.click(key("F3=Save&Exit"));
-    fireEvent.click(key("F5=Save"));
-    fireEvent.click(key("F4=Clear"));
-    fireEvent.click(key("F12=Cancel"));
-    fireEvent.click(key("ENTER=Fetch"));
-    for (const name of ["F3", "F5", "F4", "F12", "F7"]) {
-      pressKey(name);
+      // While the save runs, every key is disabled, F12 included, and the inputs are read-only.
+      await lockReaches(LEAVING_LOCK);
+      // Every key is ignored: no second save, no clear, no cancel, no fetch, no message.
+      fireEvent.click(key("F3=Save&Exit"));
+      fireEvent.click(key("F5=Save"));
+      fireEvent.click(key("F4=Clear"));
+      fireEvent.click(key("F12=Cancel"));
+      fireEvent.click(key("ENTER=Fetch"));
+      for (const name of ["F3", "F5", "F4", "F12", "F7"]) {
+        pressKey(name);
+      }
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      await idleAfter50ms(client, 1);
+      expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
+      expect(shownInputs()).toEqual({ ...SHOWN_SELECTED, firstName: "LARRY" });
+      expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+      expect(requests).toHaveLength(2);
+
+      put.open();
+      const stub = await reachedStub();
+      expect(stub.path).toBe("/users");
+      expect(stub.state).toEqual({ from: "/users/update" });
+      expect(requests).toHaveLength(2);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      put.open();
+      await clientIdle(client);
     }
-    fireEvent.keyDown(document.body, { key: "Enter" });
-    await settle();
-    expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-    expect(shownInputs()).toEqual({ ...SHOWN_SELECTED, firstName: "LARRY" });
-    expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
-    expect(requests).toHaveLength(2);
-
-    put.open();
-    const stub = await reachedStub();
-    expect(stub.path).toBe("/users");
-    expect(stub.state).toEqual({ from: "/users/update" });
-    expect(requests).toHaveLength(2);
   });
 
   // audit: COUSR02-038
   // audit: COUSR02C-007
   it("F4 empties every input and the message, cursor on user ID, sends nothing", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await selectedShown();
 
     // F4=Clear by its button, over a shown user and a typed password, the cursor elsewhere.
@@ -1311,7 +1352,7 @@ describe("COUSR02 user update screen", () => {
     expect(marks()).toEqual(UNMARKED);
     await focusReaches(input("userId"));
 
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([
       `GET ${ENDPOINT}${SELECTED_ID}`,
       `GET ${ENDPOINT}${UNKNOWN_ID}`,
@@ -1328,42 +1369,49 @@ describe("COUSR02 user update screen", () => {
       userId: TYPED_ID,
       until: get.until,
     });
-    renderScreen(FROM_LIST);
-    await selectedShown();
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await selectedShown();
 
-    typeInto("userId", TYPED_ID);
-    fireEvent.click(key("ENTER=Fetch"));
-    await waitFor(() => {
-      expect(sent(requests)).toEqual([
-        `GET ${ENDPOINT}${SELECTED_ID}`,
-        `GET ${ENDPOINT}${TYPED_ID}`,
-      ]);
-    });
-    // The program clears the four inputs before its read.
-    expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
-    await lockReaches(REQUEST_LOCK);
+      typeInto("userId", TYPED_ID);
+      fireEvent.click(key("ENTER=Fetch"));
+      await waitFor(() => {
+        expect(sent(requests)).toEqual([
+          `GET ${ENDPOINT}${SELECTED_ID}`,
+          `GET ${ENDPOINT}${TYPED_ID}`,
+        ]);
+      });
+      // The program clears the four inputs before its read.
+      expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+      await lockReaches(REQUEST_LOCK);
 
-    // The keyboard is locked until the program answers: F4 neither clears nor cancels the read.
-    fireEvent.click(key("F4=Clear"));
-    pressKey("F4");
-    await settle();
-    expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
-    expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+      // The keyboard is locked until the program answers: F4 neither clears nor cancels the read.
+      fireEvent.click(key("F4=Clear"));
+      pressKey("F4");
+      await idleAfter50ms(client, 1);
+      expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+      expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
 
-    get.open();
-    await waitFor(() => {
-      expect(shownInputs()).toEqual(SHOWN_TYPED);
-    });
-    expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
-    await lockReaches(UNLOCKED);
+      get.open();
+      await waitFor(() => {
+        expect(shownInputs()).toEqual(SHOWN_TYPED);
+      });
+      expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+      await lockReaches(UNLOCKED);
 
-    // Answered, F4 clears again.
-    fireEvent.click(key("F4=Clear"));
-    await waitFor(() => {
-      expect(shownInputs()).toEqual(BLANK_INPUTS);
-    });
-    expect(shownMessage()).toEqual({ kind: "error", text: "" });
-    expect(requests).toHaveLength(2);
+      // Answered, F4 clears again.
+      fireEvent.click(key("F4=Clear"));
+      await waitFor(() => {
+        expect(shownInputs()).toEqual(BLANK_INPUTS);
+      });
+      expect(shownMessage()).toEqual({ kind: "error", text: "" });
+      expect(requests).toHaveLength(2);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      get.open();
+      await clientIdle(client);
+    }
   });
 
   // audit: COUSR02C-013
@@ -1417,54 +1465,61 @@ describe("COUSR02 user update screen", () => {
         userId: target,
         until: answer.until,
       });
-      renderScreen(FROM_LIST);
-      await selectedShown();
-      await lockReaches(UNLOCKED);
-      if (row.method === "GET") {
-        typeInto("userId", TYPED_ID);
-      } else {
-        typeInto("firstName", "LARRY");
-      }
-      const one = [`GET ${ENDPOINT}${SELECTED_ID}`, `${row.method} ${ENDPOINT}${target}`];
+      const { client } = renderScreen(FROM_LIST);
+      try {
+        await selectedShown();
+        await lockReaches(UNLOCKED);
+        if (row.method === "GET") {
+          typeInto("userId", TYPED_ID);
+        } else {
+          typeInto("firstName", "LARRY");
+        }
+        const one = [`GET ${ENDPOINT}${SELECTED_ID}`, `${row.method} ${ENDPOINT}${target}`];
 
-      row.press();
-      await waitFor(() => {
-        expect(sent(requests)).toEqual(one);
-      });
-      // While the answer is held back: every key but F12 is disabled and the inputs read-only.
-      await lockReaches(REQUEST_LOCK);
-      row.press();
-      row.press();
-      // No other request either, and an unserved key shows nothing.
-      fireEvent.click(key("ENTER=Fetch"));
-      fireEvent.click(key("F5=Save"));
-      fireEvent.click(key("F3=Save&Exit"));
-      for (const name of ["F3", "F5", "F7"]) {
-        pressKey(name);
-      }
-      await settle();
-      expect(sent(requests)).toEqual(one);
-      expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
-      expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-
-      answer.open();
-      await waitFor(() => {
-        expect(shownMessage()).toEqual({
-          kind: "info",
-          text: row.method === "GET" ? UPDATE_PROMPT : updated.message,
+        row.press();
+        await waitFor(() => {
+          expect(sent(requests)).toEqual(one);
         });
-      });
-      await lockReaches(UNLOCKED);
-      expect(shownInputs()).toEqual(
-        row.method === "GET" ? SHOWN_TYPED : { ...SHOWN_SELECTED, firstName: "LARRY" },
-      );
+        // While the answer is held back: every key but F12 is disabled and the inputs read-only.
+        await lockReaches(REQUEST_LOCK);
+        row.press();
+        row.press();
+        // No other request either, and an unserved key shows nothing.
+        fireEvent.click(key("ENTER=Fetch"));
+        fireEvent.click(key("F5=Save"));
+        fireEvent.click(key("F3=Save&Exit"));
+        for (const name of ["F3", "F5", "F7"]) {
+          pressKey(name);
+        }
+        await idleAfter50ms(client, 1);
+        expect(sent(requests)).toEqual(one);
+        expect(shownMessage()).toEqual({ kind: "info", text: UPDATE_PROMPT });
+        expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
 
-      // Settled, the same key sends its request again.
-      row.press();
-      await waitFor(() => {
-        expect(sent(requests)).toEqual([...one, `${row.method} ${ENDPOINT}${target}`]);
-      });
-      await lockReaches(UNLOCKED);
+        answer.open();
+        await waitFor(() => {
+          expect(shownMessage()).toEqual({
+            kind: "info",
+            text: row.method === "GET" ? UPDATE_PROMPT : updated.message,
+          });
+        });
+        await lockReaches(UNLOCKED);
+        expect(shownInputs()).toEqual(
+          row.method === "GET" ? SHOWN_TYPED : { ...SHOWN_SELECTED, firstName: "LARRY" },
+        );
+
+        // Settled, the same key sends its request again.
+        row.press();
+        await waitFor(() => {
+          expect(sent(requests)).toEqual([...one, `${row.method} ${ENDPOINT}${target}`]);
+        });
+        await lockReaches(UNLOCKED);
+      } finally {
+        // Pass or fail, the held reply is answered and the test ends once every request has
+        // settled, so neither a request nor the client's deadline outlives the test.
+        answer.open();
+        await clientIdle(client);
+      }
     },
   );
 
@@ -1476,53 +1531,60 @@ describe("COUSR02 user update screen", () => {
       userId: SELECTED_ID,
       until: put.until,
     });
-    renderScreen(FROM_LIST);
-    await selectedShown();
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await selectedShown();
 
-    // Save A: F5 with the first name LARRY, its answer held back.
-    typeInto("firstName", "LARRY");
-    fireEvent.click(key("F5=Save"));
-    await waitFor(() => {
+      // Save A: F5 with the first name LARRY, its answer held back.
+      typeInto("firstName", "LARRY");
+      fireEvent.click(key("F5=Save"));
+      await waitFor(() => {
+        expect(sent(requests)).toEqual([
+          `GET ${ENDPOINT}${SELECTED_ID}`,
+          `PUT ${ENDPOINT}${SELECTED_ID}`,
+        ]);
+      });
+      await lockReaches(REQUEST_LOCK);
+      fireEvent.click(key("F3=Save&Exit"));
+      pressKey("F3");
+      await idleAfter50ms(client, 1);
+      expect(requests).toHaveLength(2);
+
+      // Save A's answer is shown and the screen stays: the refused F3 was not queued.
+      put.open();
+      await waitFor(() => {
+        expect(shownMessage()).toEqual({ kind: "info", text: updated.message });
+      });
+      await lockReaches(UNLOCKED);
+      expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
+
+      // Value B, then F3: exactly one save of B, then the return to the user list.
+      typeInto("firstName", "LAURENCE");
+      fireEvent.click(key("F3=Save&Exit"));
+      const stub = await reachedStub();
+      expect(stub.path).toBe("/users");
+      await clientIdle(client);
       expect(sent(requests)).toEqual([
         `GET ${ENDPOINT}${SELECTED_ID}`,
         `PUT ${ENDPOINT}${SELECTED_ID}`,
+        `PUT ${ENDPOINT}${SELECTED_ID}`,
       ]);
-    });
-    await lockReaches(REQUEST_LOCK);
-    fireEvent.click(key("F3=Save&Exit"));
-    pressKey("F3");
-    await settle();
-    expect(requests).toHaveLength(2);
-
-    // Save A's answer is shown and the screen stays: the refused F3 was not queued.
-    put.open();
-    await waitFor(() => {
-      expect(shownMessage()).toEqual({ kind: "info", text: updated.message });
-    });
-    await lockReaches(UNLOCKED);
-    expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-
-    // Value B, then F3: exactly one save of B, then the return to the user list.
-    typeInto("firstName", "LAURENCE");
-    fireEvent.click(key("F3=Save&Exit"));
-    const stub = await reachedStub();
-    expect(stub.path).toBe("/users");
-    await settle();
-    expect(sent(requests)).toEqual([
-      `GET ${ENDPOINT}${SELECTED_ID}`,
-      `PUT ${ENDPOINT}${SELECTED_ID}`,
-      `PUT ${ENDPOINT}${SELECTED_ID}`,
-    ]);
-    expect(await bodyOf(requests[1])).toStrictEqual({
-      first_name: "LARRY",
-      last_name: "THOMAS",
-      user_type: "U",
-    });
-    expect(await bodyOf(requests[2])).toStrictEqual({
-      first_name: "LAURENCE",
-      last_name: "THOMAS",
-      user_type: "U",
-    });
+      expect(await bodyOf(requests[1])).toStrictEqual({
+        first_name: "LARRY",
+        last_name: "THOMAS",
+        user_type: "U",
+      });
+      expect(await bodyOf(requests[2])).toStrictEqual({
+        first_name: "LAURENCE",
+        last_name: "THOMAS",
+        user_type: "U",
+      });
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      put.open();
+      await clientIdle(client);
+    }
   });
 
   // audit: COUSR02C-008
@@ -1536,27 +1598,34 @@ describe("COUSR02 user update screen", () => {
       userId: row.userId,
       until: answer.until,
     });
-    renderScreen(FROM_LIST);
-    await selectedShown();
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await selectedShown();
 
-    if (row.method === "GET") {
-      typeInto("userId", TYPED_ID);
-      fireEvent.click(key("ENTER=Fetch"));
-    } else {
-      fireEvent.click(key("F5=Save"));
+      if (row.method === "GET") {
+        typeInto("userId", TYPED_ID);
+        fireEvent.click(key("ENTER=Fetch"));
+      } else {
+        fireEvent.click(key("F5=Save"));
+      }
+      await lockReaches(REQUEST_LOCK);
+      fireEvent.click(key("F12=Cancel"));
+
+      const stub = await reachedStub();
+      expect(stub.path).toBe("/admin");
+      expect(stub.state).toEqual({ from: "/users/update" });
+      answer.open();
+      await clientIdle(client);
+      expect(sent(requests)).toEqual([
+        `GET ${ENDPOINT}${SELECTED_ID}`,
+        `${row.method} ${ENDPOINT}${row.userId}`,
+      ]);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      answer.open();
+      await clientIdle(client);
     }
-    await lockReaches(REQUEST_LOCK);
-    fireEvent.click(key("F12=Cancel"));
-
-    const stub = await reachedStub();
-    expect(stub.path).toBe("/admin");
-    expect(stub.state).toEqual({ from: "/users/update" });
-    answer.open();
-    await settle();
-    expect(sent(requests)).toEqual([
-      `GET ${ENDPOINT}${SELECTED_ID}`,
-      `${row.method} ${ENDPOINT}${row.userId}`,
-    ]);
   });
 
   // audit: COUSR02C-013
@@ -1567,19 +1636,26 @@ describe("COUSR02 user update screen", () => {
       userId: SELECTED_ID,
       until: get.until,
     });
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
-      expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
-    });
-    await lockReaches(REQUEST_LOCK);
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
+      });
+      await lockReaches(REQUEST_LOCK);
 
-    // The input is read-only to the keyboard; a script can still replace its value.
-    typeInto("userId", TYPED_ID);
-    get.open();
-    await lockReaches(UNLOCKED);
-    expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
-    expect(shownMessage()).toEqual({ kind: "error", text: "" });
-    expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
+      // The input is read-only to the keyboard; a script can still replace its value.
+      typeInto("userId", TYPED_ID);
+      get.open();
+      await lockReaches(UNLOCKED);
+      expect(shownInputs()).toEqual({ ...BLANK_INPUTS, userId: TYPED_ID });
+      expect(shownMessage()).toEqual({ kind: "error", text: "" });
+      expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      get.open();
+      await clientIdle(client);
+    }
   });
 
   // audit: COUSR02-040
@@ -1605,12 +1681,14 @@ describe("COUSR02 user update screen", () => {
     },
   ])("$title goes to /admin, saving nothing", async (row) => {
     const requests = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     // The entry's outcome first, so that only the key's effect remains to observe.
     if (row.selected) {
       await selectedShown();
+      await clientIdle(client);
+    } else {
+      await idleAfter50ms(client);
     }
-    await settle();
     const before = sent(requests);
 
     typeInto("firstName", "LARRY");
@@ -1623,7 +1701,7 @@ describe("COUSR02 user update screen", () => {
     const stub = await reachedStub();
     expect(stub.path).toBe("/admin");
     expect(stub.state).toEqual({ from: "/users/update" });
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual(before);
   });
 
@@ -1634,7 +1712,7 @@ describe("COUSR02 user update screen", () => {
     ...ALL_F_KEYS.map((name) => ({ title: `Shift+${name}`, name, shiftKey: true })),
   ])("$title shows the invalid-key message in red and keeps every input", async (row) => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await selectedShown();
     typeInto("firstName", "LARRY");
 
@@ -1645,7 +1723,7 @@ describe("COUSR02 user update screen", () => {
     });
     expect(shownInputs()).toEqual({ ...SHOWN_SELECTED, firstName: "LARRY" });
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1781,7 +1859,7 @@ describe("COUSR02 /users/update opened with no session, through the route table"
     }
     expect(screen.queryByRole("button", { name: "F5=Save" })).toBeNull();
 
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([]);
     router.dispose();
   });
@@ -1815,8 +1893,11 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
     return requests;
   }
 
-  /** The route table at `/users/update`, entered with a COUSR00 `U` selection. */
-  function renderRoutes(): ReturnType<typeof createMemoryRouter> {
+  /**
+   * The route table at `/users/update`, entered with a COUSR00 `U` selection. Returns the router,
+   * whose location the test reads, and the QueryClient the screens' requests run in.
+   */
+  function renderRoutes(): { router: ReturnType<typeof createMemoryRouter>; client: QueryClient } {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -1828,7 +1909,7 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
-    return router;
+    return { router, client };
   }
 
   /**
@@ -1854,12 +1935,12 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
   // audit: COUSR02C-003
   it("the entry fetch answered 401 takes the screen to /signon and ends the session", async () => {
     const requests = stubSignonRequired(false);
-    const router = renderRoutes();
+    const { router, client } = renderRoutes();
 
     await signonReached(router);
     // The guard let the screen mount with the session, so the screen's own entry fetch went out
     // with the token; its 401 alone ended the session, and nothing was sent after it.
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([`GET ${ENDPOINT}${SELECTED_ID}`]);
     expect(requests[0]?.headers.get("Authorization")).toBe("Bearer test-token");
     router.dispose();
@@ -1868,14 +1949,14 @@ describe("COUSR02 /users/update with a request answered 401, through the route t
   // audit: COUSR02C-003
   it("F5=Save answered 401 takes the screen to /signon and ends the session", async () => {
     const requests = stubSignonRequired(true);
-    const router = renderRoutes();
+    const { router, client } = renderRoutes();
     await selectedShown();
     expect(screen.getByRole("heading", { level: 1, name: "Update User" })).toBeTruthy();
 
     fireEvent.click(key("F5=Save"));
 
     await signonReached(router);
-    await settle();
+    await clientIdle(client);
     expect(sent(requests)).toEqual([
       `GET ${ENDPOINT}${SELECTED_ID}`,
       `PUT ${ENDPOINT}${SELECTED_ID}`,
@@ -1904,7 +1985,7 @@ describe("COUSR02: endpoint 18 and 19 requests", () => {
 
   it("the read and F5's update each send the user's path with the bearer token and no query, and the update's message shows", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await selectedShown();
 
     typeInto("firstName", "LARRY");
@@ -1912,7 +1993,7 @@ describe("COUSR02: endpoint 18 and 19 requests", () => {
     await waitFor(() => {
       expect(shownMessage()).toEqual({ kind: "info", text: updated.message });
     });
-    await settle();
+    await clientIdle(client);
 
     expect(await Promise.all(requests.map(shapeOf))).toEqual([
       {
@@ -1937,9 +2018,12 @@ describe("COUSR02: endpoint 18 and 19 requests", () => {
  * Renders the application's route table at `/users/update` with `state`, so the admin guard that
  * only the table mounts stands in front of the screen. Each screen is imported by its route's
  * loader, so a wait for one to render allows 5 s. Returns the router, whose location the test
- * reads.
+ * reads, and the QueryClient the screens' requests run in.
  */
-function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter> {
+function renderRouteTable(state?: unknown): {
+  router: ReturnType<typeof createMemoryRouter>;
+  client: QueryClient;
+} {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
@@ -1951,7 +2035,7 @@ function renderRouteTable(state?: unknown): ReturnType<typeof createMemoryRouter
       <RouterProvider router={router} />
     </QueryClientProvider>,
   );
-  return router;
+  return { router, client };
 }
 
 /** Replaces `fetch` with a stub that answers every request 401; returns them in order sent. */
@@ -1987,10 +2071,10 @@ describe("COUSR02 in the route table: the admin guard and a 401", () => {
   it("opened with no session, goes to sign-on before endpoint 18 gets a request", async () => {
     sessionStorage.clear();
     const requests = stubApi();
-    const router = renderRouteTable(FROM_LIST);
+    const { router, client } = renderRouteTable(FROM_LIST);
 
     await expectSignonShown(router);
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
     expect(getSession()).toBeNull();
     router.dispose();
@@ -2000,7 +2084,7 @@ describe("COUSR02 in the route table: the admin guard and a 401", () => {
   it("opened with a U session, goes to the main menu, and endpoints 18 and 19 get no request", async () => {
     setSession("test-token", "USER0001", "U");
     const requests = stubApi();
-    const router = renderRouteTable(FROM_LIST);
+    const { router, client } = renderRouteTable(FROM_LIST);
 
     await waitFor(
       () => {
@@ -2020,7 +2104,7 @@ describe("COUSR02 in the route table: the admin guard and a 401", () => {
         text: "Unexpected request GET /api/v1/menus/main",
       });
     });
-    await settle();
+    await clientIdle(client);
     expect(sent(requests).filter((request) => request.includes(ENDPOINT))).toEqual([]);
     router.dispose();
   });
@@ -2052,7 +2136,7 @@ describe("COUSR02 in the route table: the admin guard and a 401", () => {
     "$title answered 401 replaces the screen with sign-on and clears the session, with no retry",
     async ({ state, stub, drive, expected }) => {
       const requests = stub();
-      const router = renderRouteTable(state);
+      const { router } = renderRouteTable(state);
       expect(
         await screen.findByRole("heading", { level: 1, name: "Update User" }, { timeout: 5_000 }),
       ).toBeDefined();

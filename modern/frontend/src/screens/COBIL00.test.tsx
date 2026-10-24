@@ -505,23 +505,53 @@ async function showBalance(): Promise<void> {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests. The wait runs inside `waitFor`, so React
- * renders the updates it lets through, as `act` would.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoint 15 is a mutation of that client. It stays pending
+ * from the moment the screen starts it until its reply has arrived and, while the screen is
+ * mounted, has been passed to the screen's `onSuccess` or `onError`. Every request the screen had
+ * started when this is called, the held ones aside, has therefore been answered once it returns.
+ * It cannot see a request the screen has not started yet: a test calls it once it has awaited
+ * what the screen shows at the end of a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await waitFor(async () => {
-    await new Promise((resolve) => {
-      setTimeout(resolve, 20);
-    });
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
   });
 }
 
-/** Retypes the input `element` returns with `value`, then lets the form re-validate it. */
-function retype(element: () => HTMLInputElement, value: string): () => Promise<void> {
-  return async () => {
-    fireEvent.change(element(), { target: { value } });
-    await settle();
+/**
+ * For an entry, a key or an event that must send nothing and leaves nothing on screen to wait
+ * for, such as the first entry, the keys the lock refuses or the network's return: lets 50 ms
+ * pass inside `act`, so whatever the screen does within that window (a validation, a render, a
+ * request) runs and renders first, then waits as {@link clientIdle} does. It shows only that
+ * nothing was sent within those 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+  await clientIdle(client, held);
+}
+
+/**
+ * Retypes the input `element` returns with `value`, which the schema accepts, inside `act`; waits
+ * until the form's re-validation has cleared the input's mark, then until `client` is idle.
+ */
+function retype(
+  element: () => HTMLInputElement,
+  value: string,
+): (client: QueryClient) => Promise<void> {
+  return async (client) => {
+    await act(async () => {
+      fireEvent.change(element(), { target: { value } });
+    });
+    await waitFor(() => {
+      expect(element().getAttribute("aria-invalid")).toBe("false");
+    });
+    await clientIdle(client);
   };
 }
 
@@ -649,9 +679,10 @@ describe("COBIL00 bill payment screen", () => {
     // that tree rather than the screen with stubs.
     clearSession();
     const requests = stubApi();
+    const client = testQueryClient();
     const router = createMemoryRouter(routes, { initialEntries: [PATHS.COBIL00] });
     render(
-      <QueryClientProvider client={testQueryClient()}>
+      <QueryClientProvider client={client}>
         <RouterProvider router={router} />
       </QueryClientProvider>,
     );
@@ -665,7 +696,8 @@ describe("COBIL00 bill payment screen", () => {
       { timeout: 4000 },
     );
     expect(screen.queryByText("Enter Acct ID:")).toBeNull();
-    await settle();
+    // A bounded window: the count shows only that no request left within its 50 ms.
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
     router.dispose();
   });
@@ -673,13 +705,14 @@ describe("COBIL00 bill payment screen", () => {
   // audit: COBIL00C-002
   it("opens cleared, with the cursor on the account, and sends nothing until ENTER", async () => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
 
     expect(shown()).toEqual(BLANK);
     expect(errorText()).toBe("");
     expect(document.activeElement).toBe(acctInput());
 
-    await settle();
+    // On entry nothing is pressed, so nothing on screen marks the end of a wait.
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -858,14 +891,15 @@ describe("COBIL00 bill payment screen", () => {
 
   // audit: COBIL00-017
   it.each([
-    { title: "on first display", reach: settle },
+    // On first display nothing is pressed, so nothing on screen marks the end of a wait.
+    { title: "on first display", reach: (client: QueryClient) => idleAfter50ms(client) },
     { title: "with a balance shown", reach: showBalance },
   ])("keeps the ASKIP balance out of the Tab order and the two inputs in it $title", async ({
     reach,
   }) => {
     stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
-    await reach();
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
+    await reach(client);
 
     // The 3270 Tab key skips a protected field: CURBAL is read-only and no Tab stop, while
     // ACTIDIN and CONFIRM stay enterable Tab stops.
@@ -1158,7 +1192,7 @@ describe("COBIL00 bill payment screen", () => {
     },
   ])("marks the input a ScreenError names invalid until $title", async (row) => {
     stubApi(undefined, row.answer);
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInputs(row.acct, row.confirm);
     pressEnter();
     await waitFor(() => {
@@ -1168,7 +1202,7 @@ describe("COBIL00 bill payment screen", () => {
 
     // From here endpoint 15 answers as the fixtures do.
     const requests = stubApi();
-    await row.clear();
+    await row.clear(client);
 
     await waitFor(() => {
       expect(acctInput().getAttribute("aria-invalid")).toBe("false");
@@ -1186,7 +1220,8 @@ describe("COBIL00 bill payment screen", () => {
       state: "on entry",
       acct: "",
       confirm: "",
-      reach: settle,
+      // On entry nothing is pressed, so nothing on screen marks the end of a wait.
+      reach: (client: QueryClient) => idleAfter50ms(client),
       expected: {
         acct: { invalid: "false", described: null },
         confirm: { invalid: "false", described: [CONFIRM_HINT] },
@@ -1217,9 +1252,9 @@ describe("COBIL00 bill payment screen", () => {
     },
   ])("describes each input by rendered elements only, $state", async (row) => {
     stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInputs(row.acct, row.confirm);
-    await row.reach();
+    await row.reach(client);
 
     expect(danglingDescriptions()).toEqual([]);
     expect({ acct: readOut(acctInput()), confirm: readOut(confirmInput()) }).toEqual(row.expected);
@@ -1317,7 +1352,7 @@ describe("COBIL00 bill payment screen", () => {
   // audit: COBIL00-033
   it("F4 empties every field and the message row, refocuses, sends nothing", async () => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     await showBalance();
     fireEvent.change(confirmInput(), { target: { value: "Y" } });
 
@@ -1345,7 +1380,7 @@ describe("COBIL00 bill payment screen", () => {
     expect(shown()).toEqual(BLANK);
     expect(document.activeElement).toBe(acctInput());
 
-    await settle();
+    await clientIdle(client);
     expect(await bodies(requests)).toStrictEqual([
       { acct_id: ACCT, confirm: "" },
       { acct_id: UNKNOWN_ACCT, confirm: "" },
@@ -1388,7 +1423,7 @@ describe("COBIL00 bill payment screen", () => {
     },
   ])("$title, recording COBIL00 as the origin, with no request", async (row) => {
     const requests = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
 
     const back = pfKeyButton("F3=Back");
     if (row.byKey) {
@@ -1400,7 +1435,7 @@ describe("COBIL00 bill payment screen", () => {
     const stub = await reachedStub();
     expect(stub.path).toBe(row.target);
     expect(stub.state).toEqual({ from: "/bill-payment" });
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -1411,7 +1446,7 @@ describe("COBIL00 bill payment screen", () => {
     ...ALL_F_KEYS.map((key) => ({ title: `Shift+${key}`, key, shiftKey: true })),
   ])("$title shows the invalid-key message in red, keeps every field", async (row) => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     await showBalance();
     fireEvent.change(confirmInput(), { target: { value: "Y" } });
 
@@ -1424,86 +1459,91 @@ describe("COBIL00 bill payment screen", () => {
     expect(shown()).toEqual({ acct: ACCT, balance: BALANCE, confirm: "Y" });
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
 
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(1);
   });
 
   // The terminal keyboard stays locked until the program's reply arrives; the screen disables
   // ENTER and F4 while its request is in flight, so a second ENTER cannot pay twice.
   it("locks ENTER, F4 and the inputs while its request is in flight, keeps F3, then frees them", async () => {
-    const releases: (() => void)[] = [];
-    const hold = new Promise<void>((resolve) => {
-      releases.push(resolve);
-    });
-    const requests = stubApi(hold);
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
-    const form = container.querySelector("form");
-    if (form === null) {
-      throw new Error("COBIL0A renders no form");
-    }
-    const keyBar = screen.getByRole("group", { name: "Function keys" });
-    const enter = screen.getByRole("button", { name: "ENTER=Continue" });
-    const clear = pfKeyButton("F4=Clear");
-    const back = pfKeyButton("F3=Back");
-    expect(keyBar.getAttribute("aria-busy")).toBe("false");
-    expect(form.getAttribute("aria-busy")).toBe("false");
+    const reply = held();
+    const requests = stubApi(reply.promise);
+    const { container, client } = renderScreen({ from: PATHS.COMEN01 });
+    try {
+      const form = container.querySelector("form");
+      if (form === null) {
+        throw new Error("COBIL0A renders no form");
+      }
+      const keyBar = screen.getByRole("group", { name: "Function keys" });
+      const enter = screen.getByRole("button", { name: "ENTER=Continue" });
+      const clear = pfKeyButton("F4=Clear");
+      const back = pfKeyButton("F3=Back");
+      expect(keyBar.getAttribute("aria-busy")).toBe("false");
+      expect(form.getAttribute("aria-busy")).toBe("false");
 
-    typeInputs(ACCT, "");
-    // The second submit arrives while the first is still being validated, before any request.
-    fireEvent.submit(form);
-    fireEvent.submit(form);
-    await waitFor(() => {
+      typeInputs(ACCT, "");
+      // The second submit arrives while the first is still being validated, before any request.
+      fireEvent.submit(form);
+      fireEvent.submit(form);
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expect(keyBar.getAttribute("aria-busy")).toBe("true");
+      expect(form.getAttribute("aria-busy")).toBe("true");
+      expect(enter.getAttribute("aria-disabled")).toBe("true");
+      expect(clear.getAttribute("aria-disabled")).toBe("true");
+      expect(back.getAttribute("aria-disabled")).toBeNull();
+      expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([true, true]);
+
+      // The buttons, the keys and an unserved key all do nothing until the reply arrives.
+      pressEnter();
+      fireEvent.click(clear);
+      fireEvent.keyDown(document.body, { key: "Enter" });
+      pressKey("F4");
+      pressKey("F5");
+      // The held reply stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(requests).toHaveLength(1);
-    });
-    expect(keyBar.getAttribute("aria-busy")).toBe("true");
-    expect(form.getAttribute("aria-busy")).toBe("true");
-    expect(enter.getAttribute("aria-disabled")).toBe("true");
-    expect(clear.getAttribute("aria-disabled")).toBe("true");
-    expect(back.getAttribute("aria-disabled")).toBeNull();
-    expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([true, true]);
+      expect(shown()).toEqual({ acct: ACCT, balance: "", confirm: "" });
+      expect(errorText()).toBe("");
 
-    // The buttons, the keys and an unserved key all do nothing until the reply arrives.
-    pressEnter();
-    fireEvent.click(clear);
-    fireEvent.keyDown(document.body, { key: "Enter" });
-    pressKey("F4");
-    pressKey("F5");
-    await settle();
-    expect(requests).toHaveLength(1);
-    expect(shown()).toEqual({ acct: ACCT, balance: "", confirm: "" });
-    expect(errorText()).toBe("");
+      reply.release();
+      await waitFor(() => {
+        expect(balanceOutput().value).toBe(BALANCE);
+      });
+      expect(errorText()).toBe("Confirm to make a bill payment...");
+      expect(keyBar.getAttribute("aria-busy")).toBe("false");
+      expect(form.getAttribute("aria-busy")).toBe("false");
+      expect([enter.getAttribute("aria-disabled"), clear.getAttribute("aria-disabled")]).toEqual([
+        null,
+        null,
+      ]);
+      expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([false, false]);
 
-    for (const release of releases) {
-      release();
+      // Once answered, the next ENTER is sent.
+      fireEvent.change(confirmInput(), { target: { value: "N" } });
+      pressEnter();
+      await waitFor(() => {
+        expect(shown()).toEqual(BLANK);
+      });
+      await clientIdle(client);
+      expect(await bodies(requests)).toStrictEqual([
+        { acct_id: ACCT, confirm: "" },
+        { acct_id: ACCT, confirm: "N" },
+      ]);
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once every request has
+      // settled, so neither a request nor the client's deadline outlives the test.
+      reply.release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
     }
-    await waitFor(() => {
-      expect(balanceOutput().value).toBe(BALANCE);
-    });
-    expect(errorText()).toBe("Confirm to make a bill payment...");
-    expect(keyBar.getAttribute("aria-busy")).toBe("false");
-    expect(form.getAttribute("aria-busy")).toBe("false");
-    expect([enter.getAttribute("aria-disabled"), clear.getAttribute("aria-disabled")]).toEqual([
-      null,
-      null,
-    ]);
-    expect([acctInput().readOnly, confirmInput().readOnly]).toEqual([false, false]);
-
-    // Once answered, the next ENTER is sent.
-    fireEvent.change(confirmInput(), { target: { value: "N" } });
-    pressEnter();
-    await waitFor(() => {
-      expect(shown()).toEqual(BLANK);
-    });
-    await settle();
-    expect(await bodies(requests)).toStrictEqual([
-      { acct_id: ACCT, confirm: "" },
-      { acct_id: ACCT, confirm: "N" },
-    ]);
   });
 
   it("frees the keyboard when the schema refuses ENTER, so a corrected ENTER is sent", async () => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     typeInputs(ACCT, "YY");
     pressEnter();
     await waitFor(() => {
@@ -1520,7 +1560,7 @@ describe("COBIL00 bill payment screen", () => {
     await waitFor(() => {
       expect(balanceOutput().value).toBe(BALANCE);
     });
-    await settle();
+    await clientIdle(client);
     expect(await bodies(requests)).toStrictEqual([{ acct_id: ACCT, confirm: "" }]);
   });
 
@@ -1572,7 +1612,7 @@ describe("COBIL00 bill payment screen", () => {
     },
   ])("ENTER with $title sends nothing and shows the schema's message", async (row) => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
 
     typeInputs(row.acct, row.confirm);
     const enter = screen.getByRole("button", { name: "ENTER=Continue" });
@@ -1586,7 +1626,7 @@ describe("COBIL00 bill payment screen", () => {
       expect(document.activeElement).toBe(row.refused());
     });
     expect(shown()).toEqual({ acct: row.acct, balance: "", confirm: row.confirm });
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
   });
 });
@@ -1759,6 +1799,9 @@ describe("COBIL00 in the application: ENTER with no network", () => {
   it("fails at once with the browser's message, frees the keys, and sends nothing when the network returns", async () => {
     const network = { up: true };
     const requests = stubNetwork(network);
+    // `App` mounts a query client of its own, which no test can import; this spy on the `mount`
+    // its provider calls records that client, so the wait after the network returns reads it.
+    const mount = vi.spyOn(QueryClient.prototype, "mount");
     const startUrl = window.location.href;
     window.history.replaceState(null, "", PATHS.COBIL00);
     try {
@@ -1804,14 +1847,20 @@ describe("COBIL00 in the application: ENTER with no network", () => {
       });
       expect(paths(requests)).toEqual([ENDPOINT, MENU_ENDPOINT]);
 
-      // The network returns: the abandoned ENTER is not sent from the menu.
+      // The network returns: the abandoned ENTER is not sent from the menu. Nothing on screen
+      // changes, so nothing marks the end of a wait.
       network.up = true;
       fireNetworkEvent("online");
       expect(onlineManager.isOnline()).toBe(true);
-      await settle();
+      const [appClient] = mount.mock.contexts;
+      if (!(appClient instanceof QueryClient)) {
+        throw new Error("App mounted no query client");
+      }
+      await idleAfter50ms(appClient);
       expect(paths(requests).filter((path) => path === ENDPOINT)).toHaveLength(1);
       expect(requests.filter((request) => request.method === "POST")).toHaveLength(1);
     } finally {
+      mount.mockRestore();
       window.history.replaceState(null, "", startUrl);
     }
   });

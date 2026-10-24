@@ -227,6 +227,7 @@ function json(status: number, body: unknown): Response {
 /**
  * A gate for the replies of {@link stubApi}: every reply waits for `held` until `open` is called,
  * so a read stays outstanding while a test presses keys; once open, replies arrive at once.
+ * Calling `open` again has no effect, so a test that holds replies also calls it in a `finally`.
  */
 function gate(): { held: Promise<void>; open: () => void } {
   const opens: (() => void)[] = [];
@@ -301,12 +302,15 @@ function RouteStub() {
   );
 }
 
-/** COTRN01 at `/transactions/view` with `state`, and stubs at the routes it transfers to. */
+/**
+ * COTRN01 at `/transactions/view` with `state`, and stubs at the routes it transfers to. Returns
+ * the render result and the query client, whose pending requests {@link clientIdle} reads.
+ */
 function renderScreen(state?: unknown) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COTRN01, state }]}>
         <Routes>
@@ -317,6 +321,7 @@ function renderScreen(state?: unknown) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The route stub a transfer reached: its path and the route state it was given. */
@@ -533,13 +538,36 @@ function fetchTyped(value: string): void {
 }
 
 /**
- * Lets pending effects, mutations and stubbed responses run, so that a request the screen would
- * send has been sent before a test counts the requests.
+ * Waits until `client` fetches no query and has exactly `held` mutations pending: the replies the
+ * test holds back, none by default. Endpoint 12 is a mutation of that client. It stays pending
+ * from the moment the screen starts it until its reply has arrived and, for a failure of a read
+ * the screen still follows, has been passed to the screen's `onError`; the screen's release of the
+ * keyboard, chained on that mutation's promise, runs after. Every request the screen had started
+ * when this is called, the held ones aside, has therefore been answered once it returns. It
+ * cannot see a request the screen has not started yet: a test calls it once it has awaited what
+ * the screen shows at the end of an entry or a key, or after {@link idleAfter50ms}.
  */
-async function settle(): Promise<void> {
-  await new Promise((resolve) => {
-    setTimeout(resolve, 20);
+async function clientIdle(client: QueryClient, held = 0): Promise<void> {
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+    expect(client.isMutating()).toBe(held);
   });
+}
+
+/**
+ * For an entry, an edit or keys that must send nothing and leave nothing on screen to wait for,
+ * such as an entry with no selection, an edit of the Tran ID or the keys the lock refuses: lets
+ * 50 ms pass inside `act`, so whatever the screen does within that window (a validation, a
+ * render, a request) runs and renders first, then waits as {@link clientIdle} does. It shows only
+ * that nothing was sent within those 50 ms, not that nothing would be sent later.
+ */
+async function idleAfter50ms(client: QueryClient, held = 0): Promise<void> {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 50);
+    });
+  });
+  await clientIdle(client, held);
 }
 
 beforeEach(() => {
@@ -809,14 +837,14 @@ describe("COTRN01 transaction view screen", () => {
     },
   ])("opens empty $title, with the cursor on the Tran ID, sending nothing", async ({ state }) => {
     const requests = stubApi();
-    renderScreen(state);
+    const { client } = renderScreen(state);
 
     expect(tranIdInput().value).toBe("");
     expect(document.activeElement).toBe(tranIdInput());
     expect(shownDetails()).toEqual(BLANK_DETAILS);
     expect(errorText()).toBe("");
 
-    await settle();
+    await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
   });
 
@@ -835,7 +863,7 @@ describe("COTRN01 transaction view screen", () => {
   // audit: COTRN01-053
   it("reads a COTRN00 selection at once, with no ENTER, showing values as received", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
 
     expect(tranIdInput().value).toBe(SELECTED_ID);
     await waitFor(() => {
@@ -850,7 +878,7 @@ describe("COTRN01 transaction view screen", () => {
     expect(document.activeElement).toBe(tranIdInput());
 
     // One read, rendered once: the entry sends endpoint 12 exactly one request.
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(1);
     const [request] = requests;
     expect(request?.method).toBe("GET");
@@ -928,7 +956,7 @@ describe("COTRN01 transaction view screen", () => {
   // the server's in the endpoint tests. This shows what the screen does with the schema's refusal.
   it("ENTER with a blank Tran ID sends nothing, shows its message, blanks details", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await waitFor(() => {
       expect(shownDetails()).toEqual(SHOWN_SELECTED);
     });
@@ -944,7 +972,7 @@ describe("COTRN01 transaction view screen", () => {
     await waitFor(() => {
       expect(shownDetails()).toEqual(BLANK_DETAILS);
     });
-    await settle();
+    await clientIdle(client);
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -970,7 +998,7 @@ describe("COTRN01 transaction view screen", () => {
     "describes the Tran ID by rendered elements only, $state",
     async ({ typed, expected, attribute }) => {
       stubApi();
-      renderScreen({ from: PATHS.COMEN01 });
+      const { client } = renderScreen({ from: PATHS.COMEN01 });
       if (typed !== null) {
         fetchTyped(typed);
       }
@@ -978,7 +1006,7 @@ describe("COTRN01 transaction view screen", () => {
       await waitFor(() => {
         expect(tranIdErrorState()).toEqual(expected);
       });
-      await settle();
+      await clientIdle(client);
       expect(tranIdInput().hasAttribute("aria-describedby")).toBe(attribute);
       expect(danglingDescriptions()).toEqual([]);
     },
@@ -1074,7 +1102,7 @@ describe("COTRN01 transaction view screen", () => {
     },
   ])("after $title, clearing the Tran ID changes nothing until ENTER refuses it", async (row) => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await waitFor(() => {
       expect(shownDetails()).toEqual(SHOWN_SELECTED);
     });
@@ -1087,7 +1115,7 @@ describe("COTRN01 transaction view screen", () => {
     const read = row.read.map((tranId) => `${ENDPOINT}${tranId}`);
 
     fireEvent.change(tranIdInput(), { target: { value: "" } });
-    await settle();
+    await idleAfter50ms(client);
 
     expect(errorText()).toBe("");
     expect(tranIdErrorState()).toEqual(UNMARKED);
@@ -1103,7 +1131,7 @@ describe("COTRN01 transaction view screen", () => {
     await waitFor(() => {
       expect(shownDetails()).toEqual(BLANK_DETAILS);
     });
-    await settle();
+    await clientIdle(client);
     expect(paths(requests)).toEqual(read);
   });
 
@@ -1111,7 +1139,7 @@ describe("COTRN01 transaction view screen", () => {
   // refusal stays, with its message, until the next key is answered, however the input is edited.
   it("a refused blank Tran ID keeps its message and mark through an edit until ENTER", async () => {
     const requests = stubApi();
-    renderScreen({ from: PATHS.COMEN01 });
+    const { client } = renderScreen({ from: PATHS.COMEN01 });
     fetchTyped("");
     await waitFor(() => {
       expect(errorText()).toBe(TRAN_ID_EMPTY);
@@ -1119,7 +1147,7 @@ describe("COTRN01 transaction view screen", () => {
     expect(tranIdErrorState()).toEqual(markedWith(TRAN_ID_EMPTY));
 
     fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
-    await settle();
+    await idleAfter50ms(client);
 
     expect(errorText()).toBe(TRAN_ID_EMPTY);
     expect(tranIdErrorState()).toEqual(markedWith(TRAN_ID_EMPTY));
@@ -1140,7 +1168,7 @@ describe("COTRN01 transaction view screen", () => {
   // audit: COTRN01-065
   it("F4 empties the Tran ID, details and message row, refocuses, sends nothing", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await waitFor(() => {
       expect(shownDetails()).toEqual(SHOWN_SELECTED);
     });
@@ -1168,7 +1196,7 @@ describe("COTRN01 transaction view screen", () => {
     expect(shownDetails()).toEqual(BLANK_DETAILS);
     expect(document.activeElement).toBe(tranIdInput());
 
-    await settle();
+    await clientIdle(client);
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`, `${ENDPOINT}${UNKNOWN_ID}`]);
     expect(screen.getByRole("heading", { level: 1 }).textContent).toBe("View Transaction");
   });
@@ -1221,12 +1249,12 @@ describe("COTRN01 transaction view screen", () => {
     },
   ])("$title, recording COTRN01 and PF3 as the origin, with no request", async (row) => {
     const requests = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     // The entry's outcome first, so that only the key's effect remains to observe.
     await waitFor(() => {
       expect(shownDetails()).toEqual(row.shown);
     });
-    await settle();
+    await clientIdle(client);
     const sent = requests.length;
 
     const back = pfKeyButton("F3=Back");
@@ -1244,7 +1272,7 @@ describe("COTRN01 transaction view screen", () => {
     } else {
       expect(stub.state).toMatchObject({ list: row.list });
     }
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(sent);
   });
 
@@ -1283,12 +1311,12 @@ describe("COTRN01 transaction view screen", () => {
     },
   ])("$title goes to /transactions as PF5 from COTRN01, with no request", async (row) => {
     const requests = stubApi();
-    renderScreen(row.state);
+    const { client } = renderScreen(row.state);
     // The entry's outcome first, so that only the key's effect remains to observe.
     await waitFor(() => {
       expect(shownDetails()).toEqual(row.shown);
     });
-    await settle();
+    await clientIdle(client);
     const sent = requests.length;
 
     const browse = pfKeyButton("F5=Browse Tran.");
@@ -1306,7 +1334,7 @@ describe("COTRN01 transaction view screen", () => {
     } else {
       expect(stub.state).toMatchObject({ list: row.list });
     }
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(sent);
   });
 
@@ -1318,7 +1346,7 @@ describe("COTRN01 transaction view screen", () => {
     ...ALL_F_KEYS.map((key) => ({ title: `Shift+${key}`, key, shiftKey: true })),
   ])("$title shows the invalid-key message, keeps the Tran ID, blanks the details", async (row) => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await waitFor(() => {
       expect(shownDetails()).toEqual(SHOWN_SELECTED);
     });
@@ -1335,7 +1363,7 @@ describe("COTRN01 transaction view screen", () => {
     expect(shownDetails()).toEqual(BLANK_DETAILS);
     expect(screen.queryByRole("region", { name: "Route stub" })).toBeNull();
 
-    await settle();
+    await clientIdle(client);
     expect(paths(requests)).toEqual([`${ENDPOINT}${SELECTED_ID}`]);
   });
 
@@ -1390,90 +1418,105 @@ describe("COTRN01 transaction view screen", () => {
     async (row) => {
       const reply = gate();
       const requests = stubApi(reply.held);
-      const { container } = renderScreen(row.state);
-      if (row.typed !== undefined) {
-        fetchTyped(row.typed);
-      }
-      await waitFor(() => {
-        expect(requests).toHaveLength(1);
-      });
-      await waitFor(() => {
+      const { container, client } = renderScreen(row.state);
+      try {
+        if (row.typed !== undefined) {
+          fetchTyped(row.typed);
+        }
+        await waitFor(() => {
+          expect(requests).toHaveLength(1);
+        });
+        await waitFor(() => {
+          expect(lockState(container)).toEqual(LOCKED);
+        });
+        const form = container.querySelector("form");
+        if (form === null) {
+          throw new Error("no form");
+        }
+
+        fireEvent.click(keyButton("ENTER=Fetch"));
+        fireEvent.click(keyButton("ENTER=Fetch"));
+        fireEvent.keyDown(document.body, { key: "Enter" });
+        fireEvent.submit(form);
+        fireEvent.submit(form);
+        fireEvent.click(keyButton("F4=Clear"));
+        pressKey("F4");
+        pressKey("F7");
+        await idleAfter50ms(client, 1);
+
+        expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`]);
         expect(lockState(container)).toEqual(LOCKED);
-      });
-      const form = container.querySelector("form");
-      if (form === null) {
-        throw new Error("no form");
+        expect(tranIdInput().value).toBe(row.tranId);
+        expect(shownDetails()).toEqual(BLANK_DETAILS);
+        expect(errorText()).toBe("");
+
+        reply.open();
+        await waitFor(() => {
+          expect(shownDetails()).toEqual(row.shown);
+          expect(lockState(container)).toEqual(UNLOCKED);
+        });
+        await waitFor(() => {
+          expect(document.activeElement).toBe(tranIdInput());
+        });
+        await clientIdle(client);
+        expect(requests).toHaveLength(1);
+
+        // Answered, the keyboard takes the next ENTER: a second read of the same ID.
+        fireEvent.click(keyButton("ENTER=Fetch"));
+        await waitFor(() => {
+          expect(requests).toHaveLength(2);
+        });
+        await waitFor(() => {
+          expect(shownDetails()).toEqual(row.shown);
+          expect(lockState(container)).toEqual(UNLOCKED);
+        });
+        expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`, `${ENDPOINT}${row.tranId}`]);
+      } finally {
+        // Pass or fail, the held replies are answered and the test ends once every request has
+        // settled, so neither a request nor the client's deadline outlives the test.
+        reply.open();
+        await clientIdle(client);
       }
-
-      fireEvent.click(keyButton("ENTER=Fetch"));
-      fireEvent.click(keyButton("ENTER=Fetch"));
-      fireEvent.keyDown(document.body, { key: "Enter" });
-      fireEvent.submit(form);
-      fireEvent.submit(form);
-      fireEvent.click(keyButton("F4=Clear"));
-      pressKey("F4");
-      pressKey("F7");
-      await settle();
-
-      expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`]);
-      expect(lockState(container)).toEqual(LOCKED);
-      expect(tranIdInput().value).toBe(row.tranId);
-      expect(shownDetails()).toEqual(BLANK_DETAILS);
-      expect(errorText()).toBe("");
-
-      reply.open();
-      await waitFor(() => {
-        expect(shownDetails()).toEqual(row.shown);
-        expect(lockState(container)).toEqual(UNLOCKED);
-      });
-      await waitFor(() => {
-        expect(document.activeElement).toBe(tranIdInput());
-      });
-      await settle();
-      expect(requests).toHaveLength(1);
-
-      // Answered, the keyboard takes the next ENTER: a second read of the same ID.
-      fireEvent.click(keyButton("ENTER=Fetch"));
-      await waitFor(() => {
-        expect(requests).toHaveLength(2);
-      });
-      await waitFor(() => {
-        expect(shownDetails()).toEqual(row.shown);
-        expect(lockState(container)).toEqual(UNLOCKED);
-      });
-      expect(paths(requests)).toEqual([`${ENDPOINT}${row.tranId}`, `${ENDPOINT}${row.tranId}`]);
     },
   );
 
   it("takes one ENTER of several pressed before the screen renders again", async () => {
     const reply = gate();
     const requests = stubApi(reply.held);
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
-    const form = container.querySelector("form");
-    if (form === null) {
-      throw new Error("no form");
+    const { container, client } = renderScreen({ from: PATHS.COMEN01 });
+    try {
+      const form = container.querySelector("form");
+      if (form === null) {
+        throw new Error("no form");
+      }
+      fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
+
+      // One batch: React renders the lock only after all four, so only the screen's ref
+      // stops them.
+      act(() => {
+        keyButton("ENTER=Fetch").click();
+        keyButton("ENTER=Fetch").click();
+        form.requestSubmit();
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      });
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expect(lockState(container)).toEqual(LOCKED);
+      await idleAfter50ms(client, 1);
+      expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
+
+      reply.open();
+      await waitFor(() => {
+        expect(shownDetails()).toEqual(SHOWN_TYPED);
+        expect(lockState(container)).toEqual(UNLOCKED);
+      });
+    } finally {
+      // Pass or fail, the held reply is answered and the test ends once the request has settled,
+      // so neither it nor the client's deadline outlives the test.
+      reply.open();
+      await clientIdle(client);
     }
-    fireEvent.change(tranIdInput(), { target: { value: TYPED_ID } });
-
-    // One batch: React renders the lock only after all four, so only the screen's ref stops them.
-    act(() => {
-      keyButton("ENTER=Fetch").click();
-      keyButton("ENTER=Fetch").click();
-      form.requestSubmit();
-      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    });
-    await waitFor(() => {
-      expect(requests).toHaveLength(1);
-    });
-    expect(lockState(container)).toEqual(LOCKED);
-    await settle();
-    expect(paths(requests)).toEqual([`${ENDPOINT}${TYPED_ID}`]);
-
-    reply.open();
-    await waitFor(() => {
-      expect(shownDetails()).toEqual(SHOWN_TYPED);
-      expect(lockState(container)).toEqual(UNLOCKED);
-    });
   });
 
   it("ENTER with a blank Tran ID releases the keyboard with no request", async () => {
@@ -1499,19 +1542,26 @@ describe("COTRN01 transaction view screen", () => {
   ])("$label still leaves for the list while a read is outstanding", async (row) => {
     const reply = gate();
     const requests = stubApi(reply.held);
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
+    const { client } = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+
+      fireEvent.click(keyButton(row.label));
+
+      const stub = await reachedStub();
+      expect(stub.path).toBe("/transactions");
+      expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: row.entryKey });
+      reply.open();
+      await clientIdle(client);
       expect(requests).toHaveLength(1);
-    });
-
-    fireEvent.click(keyButton(row.label));
-
-    const stub = await reachedStub();
-    expect(stub.path).toBe("/transactions");
-    expect(stub.state).toMatchObject({ from: "/transactions/view", entry_key: row.entryKey });
-    reply.open();
-    await settle();
-    expect(requests).toHaveLength(1);
+    } finally {
+      // Pass or fail, the held read is answered and the test ends once it has settled, so neither
+      // it nor the client's deadline outlives the test.
+      reply.open();
+      await clientIdle(client);
+    }
   });
 });
 
@@ -1532,11 +1582,11 @@ describe("COTRN01: endpoint 12 request", () => {
 
   it("the read of a COTRN00 selection is one GET of its path with the bearer token, no query and no body", async () => {
     const requests = stubApi();
-    renderScreen(FROM_LIST);
+    const { client } = renderScreen(FROM_LIST);
     await waitFor(() => {
       expect(shownDetails()).toEqual(SHOWN_SELECTED);
     });
-    await settle();
+    await clientIdle(client);
 
     expect(await Promise.all(requests.map(shapeOf))).toEqual([
       {
@@ -1640,7 +1690,7 @@ describe("COTRN01 behind the route guard", () => {
     );
     expect(screen.queryByRole("heading", { level: 1, name: "View Transaction" })).toBeNull();
     expect(screen.queryByLabelText("Enter Tran ID:")).toBeNull();
-    await settle();
+    await clientIdle(client);
     expect(requests).toHaveLength(0);
     router.dispose();
   });

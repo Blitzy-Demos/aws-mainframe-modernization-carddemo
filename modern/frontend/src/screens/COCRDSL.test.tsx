@@ -736,27 +736,35 @@ describe("COCRDSL", () => {
       await held;
       return json(200, view);
     });
-    renderScreen(FROM_LIST);
+    const client = renderScreen(FROM_LIST);
+    try {
+      // Entered from the card list, no message is set until endpoint 8 answers.
+      await waitFor(() => {
+        expect(form().getAttribute("aria-busy")).toBe("true");
+      });
+      const pending = messageRow("info");
+      expect(pending.textContent).toBe("");
+      expect(pending.className).toContain("border-transparent");
 
-    // Entered from the card list, no message is set until endpoint 8 answers.
-    await waitFor(() => {
-      expect(form().getAttribute("aria-busy")).toBe("true");
-    });
-    const pending = messageRow("info");
-    expect(pending.textContent).toBe("");
-    expect(pending.className).toContain("border-transparent");
+      release();
+      await requestsSettled(seen, 1);
 
-    release();
-    await requestsSettled(seen, 1);
-
-    const info = messageRow("info");
-    expect(info.dataset.slot).toBe("alert");
-    expect(info.className).toContain("text-card-foreground");
-    expect(info.className).not.toContain("text-destructive");
-    expect(info.className).not.toContain("border-transparent");
-    const description = info.querySelector('[data-slot="alert-description"]');
-    expect(description?.textContent).toBe(FOUND_INFO);
-    expect(FOUND_INFO.length).toBeLessThanOrEqual(40);
+      const info = messageRow("info");
+      expect(info.dataset.slot).toBe("alert");
+      expect(info.className).toContain("text-card-foreground");
+      expect(info.className).not.toContain("text-destructive");
+      expect(info.className).not.toContain("border-transparent");
+      const description = info.querySelector('[data-slot="alert-description"]');
+      expect(description?.textContent).toBe(FOUND_INFO);
+      expect(FOUND_INFO.length).toBeLessThanOrEqual(40);
+    } finally {
+      // The read is answered pass or fail, and the test ends once it has settled, so neither the
+      // read nor the client's deadline outlives the test.
+      release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it("looks up a typed card number, then reads the shown card again by its card_ref", async () => {
@@ -986,20 +994,28 @@ describe("COCRDSL", () => {
       await held;
       return json(200, typedView);
     });
-    renderScreen();
+    const client = renderScreen();
+    try {
+      typeInto(ACCOUNT, ACCT_ID);
+      typeInto(CARD, TYPED_CARD);
+      fireEvent.click(enterButton());
+      await waitFor(() => {
+        expect(form().getAttribute("aria-busy")).toBe("true");
+      });
+      fireEvent.click(enterButton());
+      release();
+      await requestsSettled(seen, 1);
 
-    typeInto(ACCOUNT, ACCT_ID);
-    typeInto(CARD, TYPED_CARD);
-    fireEvent.click(enterButton());
-    await waitFor(() => {
-      expect(form().getAttribute("aria-busy")).toBe("true");
-    });
-    fireEvent.click(enterButton());
-    release();
-    await requestsSettled(seen, 1);
-
-    expect(field(CARD).value).toBe("************5678");
-    expect(seen).toHaveLength(1);
+      expect(field(CARD).value).toBe("************5678");
+      expect(seen).toHaveLength(1);
+    } finally {
+      // The read is answered pass or fail, and the test ends once it has settled, so neither the
+      // read nor the client's deadline outlives the test.
+      release();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it.each([
@@ -1031,43 +1047,52 @@ describe("COCRDSL", () => {
     editable,
   }) => {
     const { seen, open } = heldReplies(reply);
-    renderScreen(state);
-    if (send !== undefined) {
-      typeInto(ACCOUNT, ACCT_ID);
-      typeInto(CARD, TYPED_CARD);
-      send();
+    const client = renderScreen(state);
+    try {
+      if (send !== undefined) {
+        typeInto(ACCOUNT, ACCT_ID);
+        typeInto(CARD, TYPED_CARD);
+        send();
+      }
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
+
+      expect(disabledKeys()).toEqual({ "ENTER=Search Cards": true, "F3=Exit": false });
+      expect(form().getAttribute("aria-busy")).toBe("true");
+      expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([true, true]);
+      // The lock leaves the Tab order as it was: only the list's protection takes them out of it.
+      const tabOrder = editable ? [0, 0] : [-1, -1];
+      expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
+      // Neither the button nor the keys send a second request, and no key counts as invalid.
+      fireEvent.click(enterButton());
+      for (const key of ["Enter", "F5"]) {
+        fireEvent.keyDown(window, { key });
+      }
+      fireEvent.keyDown(window, { key: "F7", shiftKey: true });
+      fireEvent.submit(form());
+      expect(messageRow("error").textContent).toBe("");
+
+      open();
+      await requestsSettled(seen, 1);
+      expect(keyRow().getAttribute("aria-busy")).toBe("false");
+      expect(disabledKeys()).toEqual({ "ENTER=Search Cards": false, "F3=Exit": false });
+      // Entered from the list, both inputs stay protected for the visit (COCRDSLC-002).
+      expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([!editable, !editable]);
+      expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
+
+      // The next ENTER reads again.
+      fireEvent.click(enterButton());
+      await requestsSettled(seen, 2);
+      expect(sentQueries(seen)).toHaveLength(2);
+    } finally {
+      // The reads are answered pass or fail, and the test ends once every read has settled, so
+      // neither a read nor the client's deadline outlives the test.
+      open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
     }
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
-
-    expect(disabledKeys()).toEqual({ "ENTER=Search Cards": true, "F3=Exit": false });
-    expect(form().getAttribute("aria-busy")).toBe("true");
-    expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([true, true]);
-    // The lock leaves the Tab order as it was: only the list's protection takes them out of it.
-    const tabOrder = editable ? [0, 0] : [-1, -1];
-    expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
-    // Neither the button nor the keys send a second request, and no key counts as invalid.
-    fireEvent.click(enterButton());
-    for (const key of ["Enter", "F5"]) {
-      fireEvent.keyDown(window, { key });
-    }
-    fireEvent.keyDown(window, { key: "F7", shiftKey: true });
-    fireEvent.submit(form());
-    expect(messageRow("error").textContent).toBe("");
-
-    open();
-    await requestsSettled(seen, 1);
-    expect(keyRow().getAttribute("aria-busy")).toBe("false");
-    expect(disabledKeys()).toEqual({ "ENTER=Search Cards": false, "F3=Exit": false });
-    // Entered from the list, both inputs stay protected for the visit (COCRDSLC-002).
-    expect([field(ACCOUNT).readOnly, field(CARD).readOnly]).toEqual([!editable, !editable]);
-    expect([field(ACCOUNT).tabIndex, field(CARD).tabIndex]).toEqual(tabOrder);
-
-    // The next ENTER reads again.
-    fireEvent.click(enterButton());
-    await requestsSettled(seen, 2);
-    expect(sentQueries(seen)).toHaveLength(2);
   });
 
   it.each([
@@ -1110,15 +1135,24 @@ describe("COCRDSL", () => {
   it("F3 returns to the card list while the entry read is out", async () => {
     // audit: COCRDSLC-004
     const { seen, open } = heldReplies(view);
-    renderScreen(FROM_LIST);
-    await waitFor(() => {
-      expect(keyRow().getAttribute("aria-busy")).toBe("true");
-    });
+    const client = renderScreen(FROM_LIST);
+    try {
+      await waitFor(() => {
+        expect(keyRow().getAttribute("aria-busy")).toBe("true");
+      });
 
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
 
-    expect(await screen.findByText(LIST_STUB)).toBeTruthy();
-    open();
+      expect(await screen.findByText(LIST_STUB)).toBeTruthy();
+    } finally {
+      // The read is answered only after F3 left, pass or fail, and the test ends once it has
+      // settled, so neither the read nor the client's deadline outlives the test.
+      open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
+    // One request in all: the read's late answer leads to no other.
     expect(seen).toHaveLength(1);
   });
 

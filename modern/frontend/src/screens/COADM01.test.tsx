@@ -145,14 +145,15 @@ function reply(status: number, body: unknown): Response {
  * Replaces the global `fetch`: `GET` endpoint 3 answers `status` with `body`, and any other request
  * answers 500. No test expects another request, except the main menu's load after the admin guard
  * sends a non-admin there. The request at position `n` of the test (from 0) is answered only once
- * `holds[n]`, when there is one, settles.
+ * `holds[n]`, when there is one, settles. Returns every held reply, as
+ * {@link stubMenuReplies} does.
  */
 function stubMenu(
   status: number,
   body: components["schemas"]["MenuResponse"] | components["schemas"]["ScreenError"],
   holds: readonly Promise<void>[] = [],
-): void {
-  stubMenuReplies([{ status, body }], holds);
+): Promise<Response>[] {
+  return stubMenuReplies([{ status, body }], holds);
 }
 
 /** One answer of endpoint 3: the HTTP status and the body. */
@@ -163,12 +164,15 @@ type MenuReply = {
 
 /**
  * {@link stubMenu} with an answer per request: the request at position `n` of the test (from 0)
- * gets `replies[n]`, and every request past the last reply gets the last one again.
+ * gets `replies[n]`, and every request past the last reply gets the last one again. A held
+ * request whose signal aborts before its hold settles is rejected with the abort reason, as
+ * `fetch` rejects a request aborted before its answer. Returns every held reply, in order.
  */
 function stubMenuReplies(
   replies: readonly [MenuReply, ...MenuReply[]],
   holds: readonly Promise<void>[] = [],
-): void {
+): Promise<Response>[] {
+  const held: Promise<Response>[] = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -176,9 +180,28 @@ function stubMenuReplies(
       const position = requests.length;
       requests.push(request);
       if (request.method === "GET" && new URL(request.url).pathname === MENU_PATH) {
-        await holds.at(position);
         const { status, body } = replies[Math.min(position, replies.length - 1)];
-        return reply(status, body);
+        const hold = holds.at(position);
+        if (hold === undefined) {
+          return reply(status, body);
+        }
+        const { signal } = request;
+        const answer = new Promise<Response>((resolve, reject) => {
+          const abandon = (): void => {
+            reject(signal.reason);
+          };
+          if (signal.aborted) {
+            abandon();
+            return;
+          }
+          signal.addEventListener("abort", abandon, { once: true });
+          void hold.then(() => {
+            signal.removeEventListener("abort", abandon);
+            resolve(reply(status, body));
+          });
+        });
+        held.push(answer);
+        return answer;
       }
       const unexpected: components["schemas"]["ScreenError"] = {
         message: `Unexpected request ${request.method} ${request.url}`,
@@ -186,6 +209,7 @@ function stubMenuReplies(
       return reply(500, unexpected);
     }),
   );
+  return held;
 }
 
 /**
@@ -216,13 +240,16 @@ function OpensWhen({ opened }: { readonly opened: Promise<void> }) {
   return <Target />;
 }
 
-/** Renders `/admin` under a fresh query client that never retries, with every transfer target. */
-function renderAdminMenu() {
+/**
+ * Renders `/admin` under a fresh query client that never retries, with every transfer target.
+ * Returns that client, whose fetching state {@link loadsSettled} reads.
+ */
+function renderAdminMenu(): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   const targets = [PATHS.COSGN00, ...OPTION_PROGRAMS.map((program) => PROGRAM_ROUTES[program])];
-  return render(
+  render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[PATHS.COADM01]}>
         <Routes>
@@ -234,6 +261,7 @@ function renderAdminMenu() {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return client;
 }
 
 /** Waits until the six option rows of the response are shown. */
@@ -346,6 +374,36 @@ function deferred(): { readonly done: Promise<void>; readonly release: () => voi
   return { done, release: () => release() };
 }
 
+/**
+ * Waits, inside `act`, until every reply in `replies` has settled and one timer turn has passed
+ * since, so the promise callbacks their settling queued have run: the client's clearing of a
+ * request's deadline among them.
+ */
+async function repliesSettled(replies: readonly Promise<Response>[]): Promise<void> {
+  await act(async () => {
+    await Promise.allSettled(replies);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
+/**
+ * Ends a test that held replies back, once its holds are released: waits until every held reply
+ * has settled, as {@link repliesSettled} does, and `client` fetches no query. A screen that was
+ * left cancels the load it left out, which rejects that reply; one still mounted gets its answer.
+ * Either way neither a request nor the client's deadline for it outlives the test.
+ */
+async function loadsSettled(
+  client: QueryClient,
+  replies: readonly Promise<Response>[],
+): Promise<void> {
+  await repliesSettled(replies);
+  await waitFor(() => {
+    expect(client.isFetching()).toBe(0);
+  });
+}
+
 /** The `ENTER=Continue` button (COADM01-035). */
 function enterButton(): HTMLElement {
   return screen.getByRole("button", { name: "ENTER=Continue" });
@@ -376,8 +434,10 @@ function expectBusy(busy: boolean): void {
 }
 
 /**
- * Gives a refused key the time its submit handler would take to decide and render. The wait runs
- * inside `act`, as the form's own state updates after an ENTER do.
+ * Lets 50 ms pass inside `act`, as the form's own state updates after an ENTER do, so whatever a
+ * refused key's submit handler starts within that window (a render, a request, a transfer) runs
+ * and renders first. A check after it shows only that the key did nothing within those 50 ms,
+ * not that it never would.
  */
 async function lingers(): Promise<void> {
   await act(async () => {
@@ -916,19 +976,25 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
   // audit: COADM01-036
   it("F3 still goes to sign-on while endpoint 3 loads, and an unserved key is refused", async () => {
     const load = deferred();
-    stubMenu(200, served, [load.done]);
-    renderAdminMenu();
-    expectBusy(true);
+    const replies = stubMenu(200, served, [load.done]);
+    const client = renderAdminMenu();
+    try {
+      expectBusy(true);
 
-    // The locked keyboard takes the unserved key without the invalid-key text.
-    fireEvent.keyDown(optionInput(), { key: "F5" });
-    await lingers();
-    expect(messageRow("error")?.textContent).toBe("");
+      // The locked keyboard takes the unserved key without the invalid-key text.
+      fireEvent.keyDown(optionInput(), { key: "F5" });
+      await lingers();
+      expect(messageRow("error")?.textContent).toBe("");
 
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
-    load.release();
-    await expectMenuRequests(1);
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
+      load.release();
+      await expectMenuRequests(1);
+    } finally {
+      // The hold is released pass or fail, whichever screen the test stopped on.
+      load.release();
+      await loadsSettled(client, replies);
+    }
   });
 
   // audit: COADM01-035
@@ -954,49 +1020,55 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
   ])("$how decides nothing while endpoint 3 loads or reloads", async ({ press }) => {
     const load = deferred();
     const reload = deferred();
-    stubMenu(200, served, [load.done, reload.done]);
-    renderAdminMenu();
-
-    // First entry: the load is out. The input is read-only, so the entry is set, not typed.
-    expectBusy(true);
-    fireEvent.change(optionInput(), { target: { value: "1" } });
-    press();
-    press();
-    await lingers();
-    expectNoTransfer();
-    expect(messageRow("error")?.textContent).toBe("");
-    load.release();
-    await loaded();
-    expectBusy(false);
-
-    enter("01");
-    expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
-    fireEvent.click(screen.getByRole("button", { name: "Return to admin menu" }));
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-
-    // A return to /admin: the cached table shows while the reload is out, and neither an entry
-    // it would refuse nor one the schema refuses is matched against it.
-    await loaded();
-    expectBusy(true);
-    for (const entry of ["99", "-"]) {
-      fireEvent.change(optionInput(), { target: { value: entry } });
+    const replies = stubMenu(200, served, [load.done, reload.done]);
+    const client = renderAdminMenu();
+    try {
+      // First entry: the load is out. The input is read-only, so the entry is set, not typed.
+      expectBusy(true);
+      fireEvent.change(optionInput(), { target: { value: "1" } });
       press();
       press();
       await lingers();
       expectNoTransfer();
       expect(messageRow("error")?.textContent).toBe("");
-    }
-
-    reload.release();
-    await waitFor(() => {
+      load.release();
+      await loaded();
       expectBusy(false);
-    });
-    fireEvent.change(optionInput(), { target: { value: "5" } });
-    press();
-    expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
-    await expectMenuRequests(2);
+
+      enter("01");
+      expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+      fireEvent.click(screen.getByRole("button", { name: "Return to admin menu" }));
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+
+      // A return to /admin: the cached table shows while the reload is out, and neither an entry
+      // it would refuse nor one the schema refuses is matched against it.
+      await loaded();
+      expectBusy(true);
+      for (const entry of ["99", "-"]) {
+        fireEvent.change(optionInput(), { target: { value: entry } });
+        press();
+        press();
+        await lingers();
+        expectNoTransfer();
+        expect(messageRow("error")?.textContent).toBe("");
+      }
+
+      reload.release();
+      await waitFor(() => {
+        expectBusy(false);
+      });
+      fireEvent.change(optionInput(), { target: { value: "5" } });
+      press();
+      expect(await transferTarget()).toBe(`/transaction-types {"from":"/admin"}`);
+      await expectMenuRequests(2);
+    } finally {
+      // Both holds are released pass or fail, whichever screen the test stopped on.
+      load.release();
+      reload.release();
+      await loadsSettled(client, replies);
+    }
   });
 
   // audit: COADM01C-021
@@ -1224,36 +1296,42 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
     "$how while ENTER's reload is out sends nothing more and decides nothing",
     async ({ press }) => {
       const reload = deferred();
-      stubMenuReplies(
+      const replies = stubMenuReplies(
         [
           { status: 502, body: unreachable },
           { status: 200, body: served },
         ],
         [Promise.resolve(), reload.done],
       );
-      renderAdminMenu();
-      await waitFor(() => {
-        expect(messageRow("error")?.textContent).toBe(unreachable.message);
-      });
+      const client = renderAdminMenu();
+      try {
+        await waitFor(() => {
+          expect(messageRow("error")?.textContent).toBe(unreachable.message);
+        });
 
-      enter("1");
-      await waitFor(() => {
+        enter("1");
+        await waitFor(() => {
+          expect(requests).toHaveLength(2);
+          expectBusy(true);
+        });
+        // The keyboard is locked and the failure's message is gone, cleared for the key; no key
+        // decides anything.
+        expect(messageRow("error")?.textContent).toBe("");
+        press();
+        press();
+        await lingers();
+        expect(messageRow("error")?.textContent).toBe("");
+        expectNoTransfer();
         expect(requests).toHaveLength(2);
-        expectBusy(true);
-      });
-      // The keyboard is locked and the failure's message is gone, cleared for the key; no key
-      // decides anything.
-      expect(messageRow("error")?.textContent).toBe("");
-      press();
-      press();
-      await lingers();
-      expect(messageRow("error")?.textContent).toBe("");
-      expectNoTransfer();
-      expect(requests).toHaveLength(2);
 
-      reload.release();
-      expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
-      await expectMenuRequests(2);
+        reload.release();
+        expect(await transferTarget()).toBe(`/users {"from":"/admin"}`);
+        await expectMenuRequests(2);
+      } finally {
+        // The hold is released pass or fail, whichever screen the test stopped on.
+        reload.release();
+        await loadsSettled(client, replies);
+      }
     },
   );
 
@@ -1287,7 +1365,7 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
   it("F3 while ENTER's reload is out goes to sign-on, and the reload's answer transfers nowhere", async () => {
     const reload = deferred();
     const signon = deferred();
-    stubMenuReplies(
+    const replies = stubMenuReplies(
       [
         { status: 502, body: unreachable },
         { status: 200, body: served },
@@ -1314,28 +1392,35 @@ describe("COADM01 admin menu (CA00, COADM01C, /admin)", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    await waitFor(() => {
-      expect(messageRow("error")?.textContent).toBe(unreachable.message);
-    });
+    try {
+      await waitFor(() => {
+        expect(messageRow("error")?.textContent).toBe(unreachable.message);
+      });
 
-    enter("1");
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-      expectBusy(true);
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    });
-    reload.release();
-    await waitFor(() => {
-      expect(client.isFetching()).toBe(0);
-    });
-    await lingers();
-    expect(screen.queryByTestId("target")).toBeNull();
+      enter("1");
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+        expectBusy(true);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      });
+      reload.release();
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+      await lingers();
+      expect(screen.queryByTestId("target")).toBeNull();
 
-    signon.release();
-    expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
-    await expectMenuRequests(2);
+      signon.release();
+      expect(await transferTarget()).toBe(`${PATHS.COSGN00} null`);
+      await expectMenuRequests(2);
+    } finally {
+      // Both holds are released pass or fail: the reload's answer, and the sign-on route.
+      reload.release();
+      signon.release();
+      await loadsSettled(client, replies);
+    }
   });
 
   // A return from an option screen is a first entry again: the menu is requested once more and
@@ -1795,30 +1880,36 @@ describe("COADM01: option lines without an option draw no row rule", () => {
   // audit: COADM01-023
   it("every line is unruled and unbanded while endpoint 3 loads; once loaded, lines 6 to 11 keep the rule and hover band and the blank lines 12 to 17 stay unruled and unbanded", async () => {
     const load = deferred();
-    stubMenu(200, served, [load.done]);
-    renderAdminMenu();
-    expectBusy(true);
-    expect(lineRules()).toEqual(LINE_FIELDS.map(() => UNRULED));
-    expect(lineBands()).toEqual(LINE_FIELDS.map(() => UNBANDED));
+    const replies = stubMenu(200, served, [load.done]);
+    const client = renderAdminMenu();
+    try {
+      expectBusy(true);
+      expect(lineRules()).toEqual(LINE_FIELDS.map(() => UNRULED));
+      expect(lineBands()).toEqual(LINE_FIELDS.map(() => UNBANDED));
 
-    load.release();
-    await loaded();
-    expect(lineRules()).toEqual([
-      ...served.options.map(() => RULED),
-      ...LINE_FIELDS.slice(served.options.length).map(() => UNRULED),
-    ]);
-    expect(lineBands()).toEqual([
-      ...served.options.map(() => BANDED),
-      ...LINE_FIELDS.slice(served.options.length).map(() => UNBANDED),
-    ]);
-    // Lines 12 to 17 (OPTN007 to OPTN012) are the blank TableCells of the map, hidden from
-    // assistive technology, each showing the INITIAL of one space.
-    for (const name of LINE_FIELDS.slice(6)) {
-      expect(field(name).dataset.slot).toBe("table-cell");
-      expect(field(name).textContent).toBe(" ");
-      expect(optionLine(name).getAttribute("aria-hidden")).toBe("true");
+      load.release();
+      await loaded();
+      expect(lineRules()).toEqual([
+        ...served.options.map(() => RULED),
+        ...LINE_FIELDS.slice(served.options.length).map(() => UNRULED),
+      ]);
+      expect(lineBands()).toEqual([
+        ...served.options.map(() => BANDED),
+        ...LINE_FIELDS.slice(served.options.length).map(() => UNBANDED),
+      ]);
+      // Lines 12 to 17 (OPTN007 to OPTN012) are the blank TableCells of the map, hidden from
+      // assistive technology, each showing the INITIAL of one space.
+      for (const name of LINE_FIELDS.slice(6)) {
+        expect(field(name).dataset.slot).toBe("table-cell");
+        expect(field(name).textContent).toBe(" ");
+        expect(optionLine(name).getAttribute("aria-hidden")).toBe("true");
+      }
+      await expectMenuRequests(1);
+    } finally {
+      // The hold is released pass or fail, and the still-mounted menu gets its answer.
+      load.release();
+      await loadsSettled(client, replies);
     }
-    await expectMenuRequests(1);
   });
 
   it("every line stays unruled after endpoint 3 refuses the load", async () => {

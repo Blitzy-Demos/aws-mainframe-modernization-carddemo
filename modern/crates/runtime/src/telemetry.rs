@@ -109,7 +109,7 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::export::trace::SpanExporter;
 use opentelemetry_sdk::trace::{Tracer, TracerProvider};
 use tracing::callsite::{Callsite as _, DefaultCallsite, Identifier};
-use tracing::field::{Empty, FieldSet, Value};
+use tracing::field::{Empty, Field, FieldSet, Value, ValueSet};
 use tracing::level_filters::STATIC_MAX_LEVEL;
 use tracing::metadata::Kind;
 use tracing::{Event, Level, Metadata, Span, Subscriber};
@@ -885,12 +885,53 @@ pub fn record_job_outcome(span: &Span, return_code: u8, counts: &[(JobCounter, u
 ///
 /// It serves code that writes an event's callsite out by hand, a `DefaultCallsite` static over a
 /// `Metadata` static, and dispatches the event with `tracing::Event::dispatch` only when this
-/// returns `true`. Such code exists because the expansion of `tracing::info!` and the other event
-/// macros carries a lint suppression, an `allow(unused_imports)` attribute, and no source of this
-/// workspace, hand-written or generated, holds one.
+/// returns `true`, with the values that [`with_value_set`] pairs with the event's fields. Such
+/// code exists because the expansion of `tracing::info!` and the other event macros carries a lint
+/// suppression, an `allow(unused_imports)` attribute, and no source of this workspace,
+/// hand-written or generated, holds one.
 #[must_use]
 pub fn event_enabled(callsite: &'static DefaultCallsite) -> bool {
     callsite_enabled(callsite)
+}
+
+/// Calls `with` with the `ValueSet` that gives each field of `fields`, in the order the set
+/// declares them, the value at the same position of `values`, and returns what `with` returns.
+///
+/// It serves the hand-written callsites that [`event_enabled`] serves: their spans and events
+/// take one value, or `None`, per field they declare, and this hands the values to
+/// `tracing::Span::new`, `Span::record_all` or `tracing::Event::dispatch` as explicit pairs of a
+/// field and its value, built by `FieldSet::value_set`. `tracing-core` has two `ValueSet`
+/// constructors, `value_set`, there since 0.1.0, and a positional one added in 0.1.35, and hides
+/// both from its documentation, so none is documented. `value_set` is the one that no
+/// `tracing-core` 0.1 release can drop or change: `tracing`'s own `Span::record`, library code
+/// rather than a macro, calls it, and so does every span and event macro expansion of `tracing`
+/// up to 0.1.41. Each pair names its field, so a subscriber records a value only under the field
+/// it is paired with, and a `None` records nothing, which leaves its field out. The positional
+/// constructor matches values to fields by their order alone and leaves a count mismatch
+/// unspecified; its own documentation warns of panics or mismatched pairs.
+///
+/// The pairing is total, whatever number of fields the set declares: a value past the set's last
+/// field is left out, a field past the last value gets none, and a set that declares no field
+/// gives an empty `ValueSet`. Metadata that names its fields with a `&[&str; N]` tied to the
+/// callsite's `N` therefore records every value under its own field. Nothing is allocated.
+pub fn with_value_set<const N: usize, R>(
+    fields: &FieldSet,
+    values: [Option<&dyn Value>; N],
+    with: impl FnOnce(&ValueSet<'_>) -> R,
+) -> R {
+    let Some(first) = fields.iter().next() else {
+        let none: [(&Field, Option<&dyn Value>); 0] = [];
+        return with(&fields.value_set(&none));
+    };
+    // A value with no field at its position is paired with the first field and no value, which
+    // records nothing, so the pairs fill a fixed array, the only form `value_set` takes.
+    let mut declared = fields.iter();
+    let owned: [(Field, Option<&dyn Value>); N] = values.map(|value| match declared.next() {
+        Some(field) => (field, value),
+        None => (first.clone(), None),
+    });
+    let pairs = owned.each_ref().map(|(field, value)| (field, *value));
+    with(&fields.value_set(&pairs))
 }
 
 /// Whether a span or an event of `callsite` is enabled now, decided in the steps that
@@ -954,31 +995,36 @@ const fn site_metadata<const N: usize>(
 /// `tracing`'s span macros make one: a span in the current context when [`callsite_enabled`]
 /// says so, and a disabled span otherwise.
 ///
-/// A disabled span is still handed `values` through `Span::record_all`, as the macros hand them:
+/// Either span is handed the values as [`with_value_set`] pairs them with the site's fields. A
+/// disabled span is still handed them through `Span::record_all`, as the macros hand them:
 /// `tracing` built with its `log` feature passes them on to the `log` crate while no `tracing`
 /// dispatcher has been set, and otherwise does nothing with them.
 fn new_span<const N: usize>(site: &'static Site<N>, values: [Option<&dyn Value>; N]) -> Span {
     let callsite = &site.0;
     let metadata = callsite.metadata();
-    let values = metadata.fields().value_set_all(&values);
-    if callsite_enabled(callsite) {
-        Span::new(metadata, &values)
-    } else {
-        let span = Span::new_disabled(metadata);
-        span.record_all(&values);
-        span
-    }
+    with_value_set(metadata.fields(), values, |values| {
+        if callsite_enabled(callsite) {
+            Span::new(metadata, values)
+        } else {
+            let span = Span::new_disabled(metadata);
+            span.record_all(values);
+            span
+        }
+    })
 }
 
 /// Emits one event of `site` in the current span with `values`, one per field the site names
-/// and in that order, a `None` leaving its field out, when [`event_enabled`] says so.
+/// and in that order, paired with those fields by [`with_value_set`], a `None` leaving its field
+/// out, when [`event_enabled`] says so.
 fn emit_event<const N: usize>(site: &'static Site<N>, values: [Option<&dyn Value>; N]) {
     let callsite = &site.0;
     if !event_enabled(callsite) {
         return;
     }
     let metadata = callsite.metadata();
-    Event::dispatch(metadata, &metadata.fields().value_set_all(&values));
+    with_value_set(metadata.fields(), values, |values| {
+        Event::dispatch(metadata, values);
+    });
 }
 
 #[cfg(test)]
@@ -1233,6 +1279,47 @@ mod tests {
         &["message", "step"],
         &STEP_PROBE,
     );
+
+    /// The metadata of an `INFO` probe event of this module with the field `names`, however
+    /// many, for the callsite `site` of two values.
+    const fn pairing_probe(
+        names: &'static [&'static str],
+        site: &'static Site<2>,
+    ) -> Metadata<'static> {
+        Metadata::new(
+            "probe",
+            module_path!(),
+            Level::INFO,
+            None,
+            None,
+            Some(module_path!()),
+            FieldSet::new(names, Identifier(&site.0)),
+            Kind::EVENT,
+        )
+    }
+
+    /// The callsites of the pairing probes, each emitted with two values: one declaring
+    /// `message` and `applied`, one declaring `message` alone, one declaring a third field,
+    /// `latest_version`, and one declaring no field.
+    static PAIRING_PROBES: [Site<2>; 4] = [
+        Site::new(&PAIRING_PROBE_METADATA[0]),
+        Site::new(&PAIRING_PROBE_METADATA[1]),
+        Site::new(&PAIRING_PROBE_METADATA[2]),
+        Site::new(&PAIRING_PROBE_METADATA[3]),
+    ];
+
+    static PAIRING_PROBE_METADATA: [Metadata<'static>; 4] = [
+        pairing_probe(&["message", "applied"], &PAIRING_PROBES[0]),
+        pairing_probe(&["message"], &PAIRING_PROBES[1]),
+        pairing_probe(
+            &["message", "applied", "latest_version"],
+            &PAIRING_PROBES[2],
+        ),
+        pairing_probe(&[], &PAIRING_PROBES[3]),
+    ];
+
+    /// The two values a pairing probe event is emitted with.
+    type PairingValues = [Option<&'static dyn Value>; 2];
 
     /// The callsite of a span of the request span's name and fields made in another module, this
     /// test module.
@@ -2333,5 +2420,51 @@ mod tests {
             assert!(!event_enabled(&PROBE));
             assert!(!event_enabled(&WARN_PROBE));
         });
+    }
+
+    /// A written-out event records each value under the field at its position, in the order the
+    /// site declares its fields, and a `None` leaves its field out. Metadata that declares fewer
+    /// or more fields than the site has values records exactly the fields that have a value at
+    /// their position, never a value under another field's name, and does not panic.
+    #[test]
+    fn written_out_events_record_each_value_under_the_field_at_its_position() {
+        // Probe, its two values, and the `fields` member of the one line it writes.
+        let cases: [(&Site<2>, PairingValues, &str); 6] = [
+            (
+                &PAIRING_PROBES[0],
+                [Some(&"probe"), Some(&2_u8)],
+                r#""fields":{"message":"probe","applied":2}"#,
+            ),
+            (
+                &PAIRING_PROBES[0],
+                [None, Some(&2_u8)],
+                r#""fields":{"applied":2}"#,
+            ),
+            (
+                &PAIRING_PROBES[0],
+                [Some(&"probe"), None],
+                r#""fields":{"message":"probe"}"#,
+            ),
+            (
+                &PAIRING_PROBES[1],
+                [Some(&"probe"), Some(&2_u8)],
+                r#""fields":{"message":"probe"}"#,
+            ),
+            (
+                &PAIRING_PROBES[2],
+                [Some(&"probe"), Some(&2_u8)],
+                r#""fields":{"message":"probe","applied":2}"#,
+            ),
+            (
+                &PAIRING_PROBES[3],
+                [Some(&"probe"), Some(&2_u8)],
+                r#""fields":{}"#,
+            ),
+        ];
+        for (site, values, fields) in cases {
+            let output = capture(|| emit_event(site, values));
+            assert_eq!(output.lines().count(), 1, "{fields}: {output}");
+            assert_contains_all(&output, &[fields]);
+        }
     }
 }

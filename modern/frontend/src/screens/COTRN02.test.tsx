@@ -334,7 +334,9 @@ function json(status: number, body: unknown): Response {
 
 /**
  * A reply that arrives only when released, for the keys pressed while a request is outstanding.
- * The executor runs synchronously, so `release` holds the resolver at once.
+ * The executor runs synchronously, so `release` holds the resolver at once. A test that holds a
+ * reply also releases it in a `finally`; once the reply has arrived, a later `release` changes
+ * nothing.
  */
 function heldReply(): { reply: Promise<Response>; release: (response: Response) => void } {
   const resolvers: ((response: Response) => void)[] = [];
@@ -973,77 +975,86 @@ describe("COTRN02 Add Transaction screen", () => {
     // releases it and waits for the form to stop being busy before the next key.
     const second = heldReply();
     const requests = stubApi([json(200, promptByAccount), second.reply, json(200, added)]);
-    const { container } = renderScreen({ from: PATHS.COMEN01 });
-    expect(keyKind("ENTER=Continue")).toEqual(["submit", "default", "sm"]);
+    const { container, client } = renderScreen({ from: PATHS.COMEN01 });
+    try {
+      expect(keyKind("ENTER=Continue")).toEqual(["submit", "default", "sm"]);
 
-    // The account typed, the card left blank, the dates typed as `YYYY-MM-DD`.
-    typeInto(TYPED_BY_ACCOUNT);
-    if (row.byButton) {
+      // The account typed, the card left blank, the dates typed as `YYYY-MM-DD`.
+      typeInto(TYPED_BY_ACCOUNT);
+      if (row.byButton) {
+        pressEnter();
+      } else {
+        const form = container.querySelector("form");
+        expect(form).not.toBeNull();
+        fireEvent.submit(form ?? document.body);
+      }
+
+      await waitFor(() => {
+        expect(shownValues()).toEqual(SHOWN_PROMPT);
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.method).toBe("POST");
+      expect(requests[0]?.path).toBe(ENDPOINT);
+      expect(requests[0]?.authorization).toBe("Bearer test-token");
+      // No `card_num` member: a blank card is not sent, and the dates go exactly as typed.
+      expect(requests[0]?.body).toStrictEqual(enterByAccount);
+      expect(field("cardNum").value).toBe(REDACTED_CARD);
+      // The 200 prompt is red, as every message but the success message (COTRN02C-058).
+      expect(messageRow()).toEqual({ kind: "error", text: PROMPT_TEXT, red: true });
+      await waitFor(() => {
+        expect(document.activeElement).toBe(field("confirm"));
+      });
+
+      // A second ENTER with the card untouched: the filled-in redacted card is never sent back.
       pressEnter();
-    } else {
-      const form = container.querySelector("form");
-      expect(form).not.toBeNull();
-      fireEvent.submit(form ?? document.body);
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      await waitFor(() => {
+        expect(formBusy(container)).toBe("true");
+      });
+      expect(requests[1]?.body).toStrictEqual(enterShownPrompt);
+      expect(JSON.stringify(requests[1]?.body)).not.toContain("*");
+      second.release(json(200, promptByAccount));
+      await waitFor(() => {
+        expect(formBusy(container)).toBe("false");
+      });
+      await waitFor(() => {
+        expect(shownValues()).toEqual(SHOWN_PROMPT);
+      });
+      expect(messageRow()).toEqual({ kind: "error", text: PROMPT_TEXT, red: true });
+
+      // `Y` confirms: the add empties every field and shows the green success message.
+      typeInto({ confirm: "Y" });
+      pressEnter();
+      await waitFor(() => {
+        expect(shownValues()).toEqual(BLANK);
+      });
+      const confirmed: components["schemas"]["TranAddRequest"] = {
+        ...enterShownPrompt,
+        confirm: "Y",
+      };
+      expect(requests[2]?.body).toStrictEqual(confirmed);
+      expect(JSON.stringify(requests[2]?.body)).not.toContain("*");
+      const success = messageRow();
+      expect(success).toEqual({ kind: "info", text: added.message, red: false });
+      // ERRMSG is `BRT` whatever its colour, so the green success text is semibold.
+      const description = screen
+        .getByRole("alert")
+        .querySelector('[data-slot="alert-description"]');
+      expect(description?.classList.contains("font-semibold")).toBe(true);
+      // The longest COTRN02C message, 66 characters, fits the 78 columns of ERRMSG uncut.
+      expect(success.text).toHaveLength(66);
+      await waitFor(() => {
+        expect(document.activeElement).toBe(field("acctId"));
+      });
+      expect(requests).toHaveLength(3);
+    } finally {
+      // The held reply is answered pass or fail, and the test ends once every request the screen
+      // sent has settled, so neither a request nor the client's deadline outlives the test.
+      second.release(json(200, promptByAccount));
+      await clientIdle(client);
     }
-
-    await waitFor(() => {
-      expect(shownValues()).toEqual(SHOWN_PROMPT);
-    });
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.method).toBe("POST");
-    expect(requests[0]?.path).toBe(ENDPOINT);
-    expect(requests[0]?.authorization).toBe("Bearer test-token");
-    // No `card_num` member: a blank card is not sent, and the dates go exactly as typed.
-    expect(requests[0]?.body).toStrictEqual(enterByAccount);
-    expect(field("cardNum").value).toBe(REDACTED_CARD);
-    // The 200 prompt is red, as every message but the success message (COTRN02C-058).
-    expect(messageRow()).toEqual({ kind: "error", text: PROMPT_TEXT, red: true });
-    await waitFor(() => {
-      expect(document.activeElement).toBe(field("confirm"));
-    });
-
-    // A second ENTER with the card untouched: the filled-in redacted card is never sent back.
-    pressEnter();
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    await waitFor(() => {
-      expect(formBusy(container)).toBe("true");
-    });
-    expect(requests[1]?.body).toStrictEqual(enterShownPrompt);
-    expect(JSON.stringify(requests[1]?.body)).not.toContain("*");
-    second.release(json(200, promptByAccount));
-    await waitFor(() => {
-      expect(formBusy(container)).toBe("false");
-    });
-    await waitFor(() => {
-      expect(shownValues()).toEqual(SHOWN_PROMPT);
-    });
-    expect(messageRow()).toEqual({ kind: "error", text: PROMPT_TEXT, red: true });
-
-    // `Y` confirms: the add empties every field and shows the green success message.
-    typeInto({ confirm: "Y" });
-    pressEnter();
-    await waitFor(() => {
-      expect(shownValues()).toEqual(BLANK);
-    });
-    const confirmed: components["schemas"]["TranAddRequest"] = {
-      ...enterShownPrompt,
-      confirm: "Y",
-    };
-    expect(requests[2]?.body).toStrictEqual(confirmed);
-    expect(JSON.stringify(requests[2]?.body)).not.toContain("*");
-    const success = messageRow();
-    expect(success).toEqual({ kind: "info", text: added.message, red: false });
-    // ERRMSG is `BRT` whatever its colour, so the green success text is semibold.
-    const description = screen.getByRole("alert").querySelector('[data-slot="alert-description"]');
-    expect(description?.classList.contains("font-semibold")).toBe(true);
-    // The longest COTRN02C message, 66 characters, fits the 78 columns of ERRMSG uncut.
-    expect(success.text).toHaveLength(66);
-    await waitFor(() => {
-      expect(document.activeElement).toBe(field("acctId"));
-    });
-    expect(requests).toHaveLength(3);
   });
 
   // audit: COTRN02C-060
@@ -1406,49 +1417,57 @@ describe("COTRN02 Add Transaction screen", () => {
     const held = heldReply();
     const requests = stubApi([row.rejection, held.reply]);
     const { container, client } = renderScreen({ from: PATHS.COMEN01 });
-    typeInto(row.typed);
-    fireEvent.click(keyButton(row.via));
-    await waitFor(() => {
-      expect(fieldError("acctId")).toEqual({
-        invalid: "true",
-        message: row.message,
-        srOnly: true,
+    try {
+      typeInto(row.typed);
+      fireEvent.click(keyButton(row.via));
+      await waitFor(() => {
+        expect(fieldError("acctId")).toEqual({
+          invalid: "true",
+          message: row.message,
+          srOnly: true,
+        });
       });
-    });
-    expect(markedInputs()).toEqual(["acctId"]);
+      expect(markedInputs()).toEqual(["acctId"]);
 
-    if (row.then === "type") {
-      typeInto({ acctId: ACCOUNT });
-    } else {
-      fireEvent.click(keyButton(row.then));
-    }
+      if (row.then === "type") {
+        typeInto({ acctId: ACCOUNT });
+      } else {
+        fireEvent.click(keyButton(row.then));
+      }
 
-    const unmarked = { invalid: "false", message: null, srOnly: false };
-    await waitFor(() => {
-      expect(fieldError("acctId")).toEqual(unmarked);
-    });
-    expect(markedInputs()).toEqual([]);
-    const { answer } = row;
-    if (answer === undefined) {
+      const unmarked = { invalid: "false", message: null, srOnly: false };
+      await waitFor(() => {
+        expect(fieldError("acctId")).toEqual(unmarked);
+      });
+      expect(markedInputs()).toEqual([]);
+      const { answer } = row;
+      if (answer === undefined) {
+        await clientIdle(client);
+        expect(requests).toHaveLength(1);
+        return;
+      }
+      // The send itself clears the mark: its answer is still held.
+      await waitFor(() => {
+        expect(requests).toHaveLength(2);
+      });
+      await waitFor(() => {
+        expect(formBusy(container)).toBe("true");
+      });
+      expect(markedInputs()).toEqual([]);
+      held.release(json(200, answer));
+      await waitFor(() => {
+        expect(messageRow().text).toBe(answer.message);
+      });
+      // Neither the add nor the confirmation prompt marks an input: the prompt rejects no value.
+      expect(markedInputs()).toEqual([]);
+      expect(fieldError("confirm")).toEqual(unmarked);
+    } finally {
+      // The held reply, which only a row whose correction sends a request asks for, is answered
+      // pass or fail, and the test ends once every request the screen sent has settled, so
+      // neither a request nor the client's deadline outlives the test.
+      held.release(json(200, row.answer ?? promptByAccount));
       await clientIdle(client);
-      expect(requests).toHaveLength(1);
-      return;
     }
-    // The send itself clears the mark: its answer is still held.
-    await waitFor(() => {
-      expect(requests).toHaveLength(2);
-    });
-    await waitFor(() => {
-      expect(formBusy(container)).toBe("true");
-    });
-    expect(markedInputs()).toEqual([]);
-    held.release(json(200, answer));
-    await waitFor(() => {
-      expect(messageRow().text).toBe(answer.message);
-    });
-    // Neither the add nor the confirmation prompt marks an input: the prompt rejects no value.
-    expect(markedInputs()).toEqual([]);
-    expect(fieldError("confirm")).toEqual(unmarked);
   });
 
   // audit: COTRN02-070
@@ -1574,57 +1593,64 @@ describe("COTRN02 Add Transaction screen", () => {
       const held = heldReply();
       const requests = stubApi([held.reply, json(200, promptByAccount)]);
       const { container, client } = renderScreen({ from: PATHS.COMEN01 });
-      typeInto(TYPED_BY_ACCOUNT);
-      row.start();
-      await waitFor(() => {
+      try {
+        typeInto(TYPED_BY_ACCOUNT);
+        row.start();
+        await waitFor(() => {
+          expect(requests).toHaveLength(1);
+          expect(lockState()).toEqual(LOCKED);
+        });
+        expect(requests[0]?.body).toMatchObject({ aid: row.aid });
+        const form = container.querySelector("form");
+        if (form === null) {
+          throw new Error("no form");
+        }
+
+        pressEnter();
+        pressEnter();
+        fireEvent.keyDown(document.body, { key: "Enter" });
+        fireEvent.submit(form);
+        fireEvent.submit(form);
+        fireEvent.click(keyButton("F5=Copy Last Tran."));
+        pressKey("F5");
+        fireEvent.click(keyButton("F4=Clear"));
+        pressKey("F4");
+        pressKey("F7");
+        // The held reply stays the one request pending.
+        await idleAfter50ms(client, 1);
         expect(requests).toHaveLength(1);
+        expect(shownValues()).toEqual({ ...BLANK, ...TYPED_BY_ACCOUNT });
+        expect(messageRow().text).toBe("");
         expect(lockState()).toEqual(LOCKED);
-      });
-      expect(requests[0]?.body).toMatchObject({ aid: row.aid });
-      const form = container.querySelector("form");
-      if (form === null) {
-        throw new Error("no form");
+
+        held.release(json(200, promptByAccount));
+        await waitFor(() => {
+          expect(formBusy(container)).toBe("false");
+          expect(lockState()).toEqual(UNLOCKED);
+        });
+        await waitFor(() => {
+          expect(shownValues()).toEqual(SHOWN_PROMPT);
+        });
+        expect(messageRow().text).toBe(PROMPT_TEXT);
+        await clientIdle(client);
+        expect(requests).toHaveLength(1);
+
+        // Answered, the keyboard takes the next ENTER.
+        pressEnter();
+        await waitFor(() => {
+          expect(requests).toHaveLength(2);
+        });
+        await waitFor(() => {
+          expect(lockState()).toEqual(UNLOCKED);
+          expect(shownValues()).toEqual(SHOWN_PROMPT);
+        });
+        expect(requests[1]?.body).toMatchObject({ aid: "ENTER" });
+      } finally {
+        // The held reply is answered pass or fail, and the test ends once every request the screen
+        // sent has settled, so neither a request nor the client's deadline outlives the test.
+        held.release(json(200, promptByAccount));
+        await clientIdle(client);
       }
-
-      pressEnter();
-      pressEnter();
-      fireEvent.keyDown(document.body, { key: "Enter" });
-      fireEvent.submit(form);
-      fireEvent.submit(form);
-      fireEvent.click(keyButton("F5=Copy Last Tran."));
-      pressKey("F5");
-      fireEvent.click(keyButton("F4=Clear"));
-      pressKey("F4");
-      pressKey("F7");
-      // The held reply stays the one request pending.
-      await idleAfter50ms(client, 1);
-      expect(requests).toHaveLength(1);
-      expect(shownValues()).toEqual({ ...BLANK, ...TYPED_BY_ACCOUNT });
-      expect(messageRow().text).toBe("");
-      expect(lockState()).toEqual(LOCKED);
-
-      held.release(json(200, promptByAccount));
-      await waitFor(() => {
-        expect(formBusy(container)).toBe("false");
-        expect(lockState()).toEqual(UNLOCKED);
-      });
-      await waitFor(() => {
-        expect(shownValues()).toEqual(SHOWN_PROMPT);
-      });
-      expect(messageRow().text).toBe(PROMPT_TEXT);
-      await clientIdle(client);
-      expect(requests).toHaveLength(1);
-
-      // Answered, the keyboard takes the next ENTER.
-      pressEnter();
-      await waitFor(() => {
-        expect(requests).toHaveLength(2);
-      });
-      await waitFor(() => {
-        expect(lockState()).toEqual(UNLOCKED);
-        expect(shownValues()).toEqual(SHOWN_PROMPT);
-      });
-      expect(requests[1]?.body).toMatchObject({ aid: "ENTER" });
     },
   );
 
@@ -1632,55 +1658,69 @@ describe("COTRN02 Add Transaction screen", () => {
     const held = heldReply();
     const requests = stubApi([held.reply]);
     const { container, client } = renderScreen({ from: PATHS.COMEN01 });
-    const form = container.querySelector("form");
-    if (form === null) {
-      throw new Error("no form");
-    }
-    typeInto(TYPED_BY_ACCOUNT);
+    try {
+      const form = container.querySelector("form");
+      if (form === null) {
+        throw new Error("no form");
+      }
+      typeInto(TYPED_BY_ACCOUNT);
 
-    // One batch: React renders the lock only after all five, so only the screen's ref stops them.
-    act(() => {
-      const enter = keyButton("ENTER=Continue");
-      enter.click();
-      enter.click();
-      form.requestSubmit();
-      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-      document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "F5", bubbles: true }));
-    });
-    await waitFor(() => {
+      // One batch: React renders the lock only after all five, so only the screen's ref stops them.
+      act(() => {
+        const enter = keyButton("ENTER=Continue");
+        enter.click();
+        enter.click();
+        form.requestSubmit();
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+        document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "F5", bubbles: true }));
+      });
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+      expect(lockState()).toEqual(LOCKED);
+      // The held reply of the one key taken stays the one request pending.
+      await idleAfter50ms(client, 1);
       expect(requests).toHaveLength(1);
-    });
-    expect(lockState()).toEqual(LOCKED);
-    // The held reply of the one key taken stays the one request pending.
-    await idleAfter50ms(client, 1);
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.body).toMatchObject({ aid: "ENTER" });
+      expect(requests[0]?.body).toMatchObject({ aid: "ENTER" });
 
-    held.release(json(200, promptByAccount));
-    await waitFor(() => {
-      expect(shownValues()).toEqual(SHOWN_PROMPT);
-      expect(lockState()).toEqual(UNLOCKED);
-    });
+      held.release(json(200, promptByAccount));
+      await waitFor(() => {
+        expect(shownValues()).toEqual(SHOWN_PROMPT);
+        expect(lockState()).toEqual(UNLOCKED);
+      });
+    } finally {
+      // The held reply is answered pass or fail, and the test ends once it has settled, so
+      // neither it nor the client's deadline outlives the test.
+      held.release(json(200, promptByAccount));
+      await clientIdle(client);
+    }
   });
 
   it("F3 still leaves while a request is outstanding", async () => {
     const held = heldReply();
     const requests = stubApi([held.reply]);
     const { client } = renderScreen({ from: PATHS.COMEN01 });
-    typeInto(TYPED_BY_ACCOUNT);
-    pressEnter();
-    await waitFor(() => {
+    try {
+      typeInto(TYPED_BY_ACCOUNT);
+      pressEnter();
+      await waitFor(() => {
+        expect(requests).toHaveLength(1);
+      });
+
+      fireEvent.click(keyButton("F3=Back"));
+
+      const stub = await reachedStub();
+      expect(stub.path).toBe(PATHS.COMEN01);
+      held.release(json(200, promptByAccount));
+      // The count waits for the released reply's answer.
+      await clientIdle(client);
       expect(requests).toHaveLength(1);
-    });
-
-    fireEvent.click(keyButton("F3=Back"));
-
-    const stub = await reachedStub();
-    expect(stub.path).toBe(PATHS.COMEN01);
-    held.release(json(200, promptByAccount));
-    // The count waits for the released reply's answer.
-    await clientIdle(client);
-    expect(requests).toHaveLength(1);
+    } finally {
+      // The reply is answered only after F3 left, pass or fail, and the test ends once it has
+      // settled, so neither it nor the client's deadline outlives the test.
+      held.release(json(200, promptByAccount));
+      await clientIdle(client);
+    }
   });
 });
 
@@ -1836,7 +1876,7 @@ describe("COTRN02 behind the route guard", () => {
     );
     expect(screen.queryByRole("heading", { level: 1, name: "Add Transaction" })).toBeNull();
     expect(screen.queryByLabelText(LABELS.acctId)).toBeNull();
-    // Gives a request the guarded screen would send time to leave before the count.
+    // A bounded window: the count shows only that no request left within its 50 ms.
     await idleAfter50ms(client);
     expect(requests).toHaveLength(0);
     router.dispose();

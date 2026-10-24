@@ -200,6 +200,56 @@ function deferred(): { readonly done: Promise<void>; readonly release: () => voi
   return { done, release: () => release() };
 }
 
+/**
+ * Replaces the global `fetch` as {@link stubFetch} does. Endpoint 2's `n`th request, counted from
+ * 1, is answered by `answerTo(n)`: a `Response` goes back at once, and a hold makes the request
+ * wait for 200 with `MENU` until the hold settles. A held request whose signal aborts first is
+ * rejected with the abort reason, as `fetch` rejects a request aborted before its answer. Returns
+ * every held reply, in order.
+ */
+function serveHeld(answerTo: (n: number) => Promise<void> | Response): Promise<Response>[] {
+  const replies: Promise<Response>[] = [];
+  stubFetch(() => {
+    const sent = menuRequests();
+    const hold = answerTo(sent.length);
+    if (hold instanceof Response) {
+      return hold;
+    }
+    const { signal } = sent[sent.length - 1];
+    const reply = new Promise<Response>((answer, fail) => {
+      const abandon = (): void => {
+        fail(signal.reason);
+      };
+      if (signal.aborted) {
+        abandon();
+        return;
+      }
+      signal.addEventListener("abort", abandon, { once: true });
+      hold.then(() => {
+        signal.removeEventListener("abort", abandon);
+        answer(json(200, MENU));
+      });
+    });
+    replies.push(reply);
+    return reply;
+  });
+  return replies;
+}
+
+/**
+ * Waits, inside `act`, until every reply in `replies` has settled and one timer turn has passed
+ * since, so the promise callbacks their settling queued have run: the client's clearing of a
+ * rejected request's deadline among them.
+ */
+async function repliesSettled(replies: readonly Promise<Response>[]): Promise<void> {
+  await act(async () => {
+    await Promise.allSettled(replies);
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 0);
+    });
+  });
+}
+
 /** Every screen the menu can reach. */
 const TARGETS = Object.values(PATHS).filter((path) => path !== PATHS.COMEN01);
 
@@ -322,8 +372,10 @@ function expectBusy(busy: boolean): void {
 }
 
 /**
- * Gives a refused key the time its submit handler would take to decide and render. The wait runs
- * inside `act`, as the form's own state updates after an ENTER do.
+ * Lets 50 ms pass inside `act`, as the form's own state updates after an ENTER do, so whatever a
+ * refused key's submit handler or the network's return starts within that window (a render, a
+ * request, a transfer) runs and renders first. A check after it shows only that the key or the
+ * return did nothing within those 50 ms, not that it never would.
  */
 async function lingers(): Promise<void> {
   await act(async () => {
@@ -818,49 +870,57 @@ describe("COMEN01 ENTER", () => {
     // audit: COMEN01-035
     const load = deferred();
     const reload = deferred();
-    stubFetch(async () => {
-      await (menuRequests().length === 1 ? load.done : reload.done);
-      return json(200, MENU);
-    });
+    const replies = serveHeld((n) => (n === 1 ? load.done : reload.done));
     const client = renderMenu();
-
-    // First entry: the load is out. The input is read-only, so the entry is set, not typed.
-    expectBusy(true);
-    fireEvent.change(optionInput(), { target: { value: "1" } });
-    press();
-    press();
-    await lingers();
-    expectNoTransfer();
-    expect(errorRow().textContent).toBe("");
-    load.release();
-    await loaded();
-    expectBusy(false);
-
-    await enterOption("1");
-    expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
-    fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
-    await waitFor(() => {
-      expect(menuRequests()).toHaveLength(2);
-    });
-
-    // A return to the menu: the cached table shows while the reload is out.
-    expectBusy(true);
-    fireEvent.change(optionInput(), { target: { value: "6" } });
-    press();
-    press();
-    await lingers();
-    expectNoTransfer();
-    expect(errorRow().textContent).toBe("");
-
-    reload.release();
-    await waitFor(() => {
-      expect(client.isFetching()).toBe(0);
+    try {
+      // First entry: the load is out. The input is read-only, so the entry is set, not typed.
+      expectBusy(true);
+      fireEvent.change(optionInput(), { target: { value: "1" } });
+      press();
+      press();
+      await lingers();
+      expectNoTransfer();
+      expect(errorRow().textContent).toBe("");
+      load.release();
+      await loaded();
       expectBusy(false);
-    });
-    expectNoTransfer();
-    press();
-    expect(await screen.findByText(`arrived at ${PATHS.COTRN00}`)).toBeTruthy();
-    expect(menuRequests()).toHaveLength(2);
+
+      await enterOption("1");
+      expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+      fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
+      await waitFor(() => {
+        expect(menuRequests()).toHaveLength(2);
+      });
+
+      // A return to the menu: the cached table shows while the reload is out.
+      expectBusy(true);
+      fireEvent.change(optionInput(), { target: { value: "6" } });
+      press();
+      press();
+      await lingers();
+      expectNoTransfer();
+      expect(errorRow().textContent).toBe("");
+
+      reload.release();
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+        expectBusy(false);
+      });
+      expectNoTransfer();
+      press();
+      expect(await screen.findByText(`arrived at ${PATHS.COTRN00}`)).toBeTruthy();
+      expect(menuRequests()).toHaveLength(2);
+    } finally {
+      // Both holds are released pass or fail. A key that left the screen cancels the read it left
+      // out, which rejects that reply; the test ends once every reply has settled and no load is
+      // fetching, so neither a request nor the client's deadline outlives the test.
+      load.release();
+      reload.release();
+      await repliesSettled(replies);
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+    }
   });
 
   it("serves ENTER on a return to the menu once its identical reload has settled", async () => {
@@ -927,22 +987,29 @@ describe("COMEN01 function keys", () => {
     // audit: COMEN01C-006
     // audit: COMEN01-036
     const load = deferred();
-    stubFetch(async () => {
-      await load.done;
-      return json(200, MENU);
-    });
-    renderMenu();
-    expectBusy(true);
+    const replies = serveHeld(() => load.done);
+    const client = renderMenu();
+    try {
+      expectBusy(true);
 
-    // The locked keyboard takes the unserved key without the invalid-key text.
-    fireEvent.keyDown(optionInput(), { key: "F5" });
-    await lingers();
-    expect(errorRow().textContent).toBe("");
+      // The locked keyboard takes the unserved key without the invalid-key text.
+      fireEvent.keyDown(optionInput(), { key: "F5" });
+      await lingers();
+      expect(errorRow().textContent).toBe("");
 
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
-    expect(screen.getByLabelText("Route state").textContent).toBe("null");
-    load.release();
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+      expect(screen.getByLabelText("Route state").textContent).toBe("null");
+    } finally {
+      // The hold is released pass or fail. F3 cancels the load, which stops it fetching at once
+      // and rejects its reply; the test ends once every reply has settled and no load is
+      // fetching, so neither the request nor the client's deadline outlives the test.
+      load.release();
+      await repliesSettled(replies);
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+    }
     expect(requests).toHaveLength(1);
   });
 
@@ -1313,36 +1380,41 @@ describe("COMEN01 load failure", () => {
     "$how while ENTER's reload is out sends nothing more and decides nothing",
     async ({ press }) => {
       const reload = deferred();
-      stubFetch(async () => {
-        if (menuRequests().length === 1) {
-          return json(502, UNREACHABLE);
-        }
-        await reload.done;
-        return json(200, MENU);
-      });
-      renderMenu();
-      await waitFor(() => {
-        expect(errorRow().textContent).toBe(UNREACHABLE.message);
-      });
+      const replies = serveHeld((n) => (n === 1 ? json(502, UNREACHABLE) : reload.done));
+      const client = renderMenu();
+      try {
+        await waitFor(() => {
+          expect(errorRow().textContent).toBe(UNREACHABLE.message);
+        });
 
-      await enterOption("1");
-      await waitFor(() => {
-        expect(menuRequests()).toHaveLength(2);
-        expectBusy(true);
-      });
-      // The keyboard is locked and the failure's message is gone, cleared for the key; no key
-      // decides anything.
-      expect(errorRow().textContent).toBe("");
-      press();
-      press();
-      await lingers();
-      expect(errorRow().textContent).toBe("");
-      expectNoTransfer();
-      expect(requests).toHaveLength(2);
+        await enterOption("1");
+        await waitFor(() => {
+          expect(menuRequests()).toHaveLength(2);
+          expectBusy(true);
+        });
+        // The keyboard is locked and the failure's message is gone, cleared for the key; no key
+        // decides anything.
+        expect(errorRow().textContent).toBe("");
+        press();
+        press();
+        await lingers();
+        expect(errorRow().textContent).toBe("");
+        expectNoTransfer();
+        expect(requests).toHaveLength(2);
 
-      reload.release();
-      expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
-      expect(requests).toHaveLength(2);
+        reload.release();
+        expect(await screen.findByText(`arrived at ${PATHS.COACTVW}`)).toBeTruthy();
+        expect(requests).toHaveLength(2);
+      } finally {
+        // The hold is released pass or fail. A key that left the screen cancels the reload, which
+        // rejects its reply; the test ends once every reply has settled and no load is fetching,
+        // so neither a request nor the client's deadline outlives the test.
+        reload.release();
+        await repliesSettled(replies);
+        await waitFor(() => {
+          expect(client.isFetching()).toBe(0);
+        });
+      }
     },
   );
 
@@ -1373,13 +1445,7 @@ describe("COMEN01 load failure", () => {
   it("F3 while ENTER's reload is out goes to sign-on, and the reload's answer transfers nowhere", async () => {
     const reload = deferred();
     const signon = deferred();
-    stubFetch(async () => {
-      if (menuRequests().length === 1) {
-        return json(502, UNREACHABLE);
-      }
-      await reload.done;
-      return json(200, MENU);
-    });
+    const replies = serveHeld((n) => (n === 1 ? json(502, UNREACHABLE) : reload.done));
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
@@ -1400,29 +1466,40 @@ describe("COMEN01 load failure", () => {
         </MemoryRouter>
       </QueryClientProvider>,
     );
-    await waitFor(() => {
-      expect(errorRow().textContent).toBe(UNREACHABLE.message);
-    });
+    try {
+      await waitFor(() => {
+        expect(errorRow().textContent).toBe(UNREACHABLE.message);
+      });
 
-    await enterOption("1");
-    await waitFor(() => {
-      expect(menuRequests()).toHaveLength(2);
-      expectBusy(true);
-    });
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    });
-    reload.release();
-    await waitFor(() => {
-      expect(client.isFetching()).toBe(0);
-    });
-    await lingers();
-    expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
+      await enterOption("1");
+      await waitFor(() => {
+        expect(menuRequests()).toHaveLength(2);
+        expectBusy(true);
+      });
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      });
+      reload.release();
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+      await lingers();
+      expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
 
-    signon.release();
-    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
-    expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
-    expect(requests).toHaveLength(2);
+      signon.release();
+      expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+      expect(screen.queryByText(`arrived at ${PATHS.COACTVW}`)).toBeNull();
+      expect(requests).toHaveLength(2);
+    } finally {
+      // The reload's hold is released pass or fail. An unmount that left the screen cancels the
+      // reload, which rejects its reply; the test ends once every reply has settled and no load is
+      // fetching, so neither a request nor the client's deadline outlives the test.
+      reload.release();
+      await repliesSettled(replies);
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+    }
   });
 
   it("a reload refused with 401 clears the session and goes to sign-on", async () => {
@@ -1773,35 +1850,48 @@ describe("COMEN01 request deadline: a cancelled load", () => {
       return sent.length === 1 ? unansweredUntilAborted(sent[0]) : json(200, MENU);
     });
     const deadlines = watchDeadlines();
-    renderMenu();
-    await waitFor(() => {
-      expect(menuRequests()).toHaveLength(1);
-    });
-    const [load] = menuRequests();
-    expect(load.signal.aborted).toBe(false);
-    expect(deadlines()).toEqual([false]);
+    const client = renderMenu();
+    try {
+      await waitFor(() => {
+        expect(menuRequests()).toHaveLength(1);
+      });
+      const [load] = menuRequests();
+      expect(load.signal.aborted).toBe(false);
+      expect(deadlines()).toEqual([false]);
 
-    fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
-    // Leaving the screen unmounts its query, and TanStack Query cancels it: the request is aborted
-    // before the click returns, so no timer, the deadline's included, has had a turn to run.
-    expect(load.signal.aborted).toBe(true);
-    expect(reasonName(load.signal)).not.toBe("TimeoutError");
-    expect(reasonName(load.signal)).toBe("AbortError");
-    expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
-    await waitFor(() => {
-      expect(deadlines()).toEqual([true]);
-    });
+      fireEvent.click(screen.getByRole("button", { name: "F3=Exit" }));
+      // Leaving the screen unmounts its query, and TanStack Query cancels it: the request is
+      // aborted before the click returns, so no timer, the deadline's included, has had a turn to
+      // run.
+      expect(load.signal.aborted).toBe(true);
+      expect(reasonName(load.signal)).not.toBe("TimeoutError");
+      expect(reasonName(load.signal)).toBe("AbortError");
+      expect(await screen.findByText(`arrived at ${PATHS.COSGN00}`)).toBeTruthy();
+      await waitFor(() => {
+        expect(deadlines()).toEqual([true]);
+      });
 
-    // Back on the menu, a fresh load fills the table; the cancellation shows nowhere.
-    fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
-    await loaded();
-    expect(errorRow().textContent).toBe("");
-    expect(menuRequests()).toHaveLength(2);
-    expect(menuRequests()[1].signal.aborted).toBe(false);
-    await waitFor(() => {
-      expect(deadlines()).toEqual([true, true]);
-    });
-    expect(reasonName(load.signal)).toBe("AbortError");
+      // Back on the menu, a fresh load fills the table; the cancellation shows nowhere.
+      fireEvent.click(screen.getByRole("link", { name: "Back to the menu" }));
+      await loaded();
+      expect(errorRow().textContent).toBe("");
+      expect(menuRequests()).toHaveLength(2);
+      expect(menuRequests()[1].signal.aborted).toBe(false);
+      await waitFor(() => {
+        expect(deadlines()).toEqual([true, true]);
+      });
+      expect(reasonName(load.signal)).toBe("AbortError");
+    } finally {
+      // The unanswered load settles only once its signal aborts. Cancelling the queries aborts a
+      // load still out, pass or fail, and the test ends once every deadline armed has been
+      // cleared, so neither the request nor the client's deadline outlives the test.
+      await act(async () => {
+        await client.cancelQueries();
+      });
+      await waitFor(() => {
+        expect(deadlines().every((cleared) => cleared)).toBe(true);
+      });
+    }
   });
 
   it("StrictMode's double mount cancels the first load before fetch receives it, clears its deadline and shows the second load's table", async () => {
@@ -1872,23 +1962,30 @@ describe("COMEN01: option rows without an option draw no row rule", () => {
   it("every row is unruled while endpoint 2 loads; once loaded, rows 6 to 16 keep the rule and the blank row 17 stays unruled", async () => {
     // audit: COMEN01-023
     const load = deferred();
-    stubFetch(async () => {
-      await load.done;
-      return json(200, MENU);
-    });
-    renderMenu();
-    expectBusy(true);
-    expect(rowRules()).toEqual(Array.from({ length: 12 }, () => UNRULED));
+    const replies = serveHeld(() => load.done);
+    const client = renderMenu();
+    try {
+      expectBusy(true);
+      expect(rowRules()).toEqual(Array.from({ length: 12 }, () => UNRULED));
 
-    load.release();
-    await loaded();
-    expect(rowRules()).toEqual([...MENU.options.map(() => RULED), UNRULED]);
-    // Row 17 (OPTN012) is the map's blank TableCell: its 40 spaces, after the 11th option.
-    const last = optionCells()[MENU.options.length];
-    expect(last.dataset.field).toBe("OPTN012");
-    expect(last.dataset.slot).toBe("table-cell");
-    expect(last.textContent).toBe(BLANK_ROW);
-    expect(requests).toHaveLength(1);
+      load.release();
+      await loaded();
+      expect(rowRules()).toEqual([...MENU.options.map(() => RULED), UNRULED]);
+      // Row 17 (OPTN012) is the map's blank TableCell: its 40 spaces, after the 11th option.
+      const last = optionCells()[MENU.options.length];
+      expect(last.dataset.field).toBe("OPTN012");
+      expect(last.dataset.slot).toBe("table-cell");
+      expect(last.textContent).toBe(BLANK_ROW);
+      expect(requests).toHaveLength(1);
+    } finally {
+      // The hold is released pass or fail, and the test ends once every reply has settled and no
+      // load is fetching, so neither the request nor the client's deadline outlives the test.
+      load.release();
+      await repliesSettled(replies);
+      await waitFor(() => {
+        expect(client.isFetching()).toBe(0);
+      });
+    }
   });
 
   it("every row stays unruled after the load fails", async () => {

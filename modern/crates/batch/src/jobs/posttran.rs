@@ -493,8 +493,8 @@ pub(crate) async fn run(ctx: &JobContext<'_>, dalytran: &Path) -> Result<JobOutc
     }
     let summary = posttran.finish();
     let path = close_dalyrejs(rejects).await?;
-    // Unlike jobs that discard their program's job log, this one emits it: the POSTTRAN audit
-    // maps every `DISPLAY` to one event, and these lines carry counts only (CBTRN02C-034).
+    // The job log is emitted as every batch job emits its program's: the POSTTRAN audit maps
+    // every `DISPLAY` to one event, and these lines carry counts only (CBTRN02C-034).
     for line in summary.sysout_lines() {
         display_line(&line);
     }

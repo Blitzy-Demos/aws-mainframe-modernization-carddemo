@@ -36,10 +36,10 @@ import { COACTUP } from "./COACTUP";
  */
 
 /*
- * Each flow re-renders the 43-field form after every typed value and every answer. Alone a test
- * takes under a second, but under coverage on a host shared with other suites it took up to 13 s
- * and its steps several seconds each, past Vitest's 5 s test and Testing Library's 1 s wait
- * defaults. The wider budgets change no assertion: a condition that never holds still fails.
+ * Each flow re-renders the 43-field form after every typed value and every answer, so under
+ * coverage on a host shared with other suites a test and its steps can run past Vitest's 5 s test
+ * and Testing Library's 1 s wait defaults. The wider budgets change no assertion: a condition that
+ * never holds still fails.
  */
 const TEST_TIMEOUT_MS = 30_000;
 configure({ asyncUtilTimeout: 10_000 });
@@ -327,7 +327,11 @@ function put(status: number, body: unknown) {
   return { method: "PUT", path: ACCOUNT_PATH, status, body } as const;
 }
 
-/** A gate a stubbed answer waits on, and the call that lets the answer go. */
+/**
+ * A gate a stubbed answer waits on, and the call that lets the answer go, which every test that
+ * holds an answer also calls in a `finally`, so a failing assertion leaves no answer held.
+ * Opening an open gate does nothing.
+ */
 function gate(): { until: Promise<void>; open: () => void } {
   const opener: { open?: () => void } = {};
   const until = new Promise<void>((resolve) => {
@@ -342,10 +346,37 @@ function gate(): { until: Promise<void>; open: () => void } {
 }
 
 /**
+ * Waits for `until`, as a held reply of {@link stubApi} does, or rejects with the reason of
+ * `signal` once it aborts, as the native `fetch` rejects a request whose signal aborts before its
+ * answer. With no `until` it resolves at once.
+ */
+async function heldUnlessAborted(
+  until: Promise<void> | undefined,
+  signal: AbortSignal,
+): Promise<void> {
+  if (until === undefined) {
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    const abort = (): void => {
+      reject(signal.reason);
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener("abort", abort, { once: true });
+    until.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
+}
+
+/**
  * Replaces `fetch` with a stub that records every request and answers them in order from
  * `replies`, each only when the request has its method and decoded path; any other request gets a
- * 500. A reply with `until` is held until that gate opens. No request leaves the process
- * (Local-Only Runtime).
+ * 500. A reply with `until` is held until that gate opens, and fails with the request signal's
+ * reason if that aborts first. No request leaves the process (Local-Only Runtime).
  */
 function stubApi(
   ...replies: {
@@ -370,7 +401,7 @@ function stubApi(
         return reply(500, { message: `Unexpected ${req.method} ${path}` });
       }
       pending.shift();
-      await next.until;
+      await heldUnlessAborted(next.until, req.signal);
       return reply(next.status, next.body);
     }),
   );
@@ -384,12 +415,15 @@ function Arrived({ name }: { name: string }) {
   return <p>{`Arrived at ${name} from ${from}`}</p>;
 }
 
-/** Renders the screen at its route, with `state` as the route state the caller set. */
+/**
+ * Renders the screen at its route, with `state` as the route state the caller set. Returns the
+ * render result and the query client, whose `isMutating` tells when the screen's request settled.
+ */
 function renderScreen(state?: { from: string }) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
+  const rendered = render(
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[{ pathname: PATHS.COACTUP, state }]}>
         <Routes>
@@ -400,6 +434,7 @@ function renderScreen(state?: { from: string }) {
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...rendered, client };
 }
 
 /** The input whose label or `aria-label` is `name`. */
@@ -1524,46 +1559,56 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
   it("locks the keyboard while ENTER's fetch is awaited: keys repeated before the answer send nothing, and the next ENTER is sent", async () => {
     const fetched = gate();
     stubApi({ ...get(200, VIEW), until: fetched.until }, put(200, VALIDATED));
-    renderScreen();
-    typeInto("Account Number :", ACCOUNT);
-    expectLocked(false);
+    const { client } = renderScreen();
+    try {
+      typeInto("Account Number :", ACCOUNT);
+      expectLocked(false);
 
-    // Presses in one task, before the screen renders the lock: the button twice, the Enter key,
-    // and F12 and F7, which COACTUPC processes as ENTER before a fetch. The lock taken by the
-    // first refuses the others.
-    act(() => {
-      key("ENTER=Process").click();
-      key("ENTER=Process").click();
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F7" }));
-    });
-    await waitFor(() => {
-      expect(sent).toHaveLength(1);
-    });
-    expectLocked(true);
-    expect([key("F5=Save").hasAttribute("hidden"), key("F12=Cancel").hasAttribute("hidden")]).toEqual(
-      [true, true],
-    );
+      // Presses in one task, before the screen renders the lock: the button twice, the Enter key,
+      // and F12 and F7, which COACTUPC processes as ENTER before a fetch. The lock taken by the
+      // first refuses the others.
+      act(() => {
+        key("ENTER=Process").click();
+        key("ENTER=Process").click();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F7" }));
+      });
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+      });
+      expectLocked(true);
+      expect([
+        key("F5=Save").hasAttribute("hidden"),
+        key("F12=Cancel").hasAttribute("hidden"),
+      ]).toEqual([true, true]);
 
-    // The same presses on the locked screen, and a submission of its form, send nothing.
-    fireEvent.click(key("ENTER=Process"));
-    fireEvent.keyDown(window, { key: "Enter" });
-    fireEvent.keyDown(window, { key: "F12" });
-    fireEvent.submit(mapForm());
-    expectLocked(true);
+      // The same presses on the locked screen, and a submission of its form, send nothing.
+      fireEvent.click(key("ENTER=Process"));
+      fireEvent.keyDown(window, { key: "Enter" });
+      fireEvent.keyDown(window, { key: "F12" });
+      fireEvent.submit(mapForm());
+      expectLocked(true);
 
-    fetched.open();
-    await waitFor(() => {
-      expect(input("Opened :").value).toBe("2014");
-    });
-    await settled();
-    expectLocked(false);
-    expectDetailsEnterable();
-    expect(document.activeElement).toBe(input("Active Y/N:"));
+      fetched.open();
+      await waitFor(() => {
+        expect(input("Opened :").value).toBe("2014");
+      });
+      await settled();
+      expectLocked(false);
+      expectDetailsEnterable();
+      expect(document.activeElement).toBe(input("Active Y/N:"));
 
-    await validate();
-    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT"]);
+      await validate();
+      expect(sent.map((request) => request.method)).toEqual(["GET", "PUT"]);
+    } finally {
+      // The fetch is let go here as well, pass or fail, and the test ends once every request has
+      // settled, so neither a held request nor the client's deadline outlives the test.
+      fetched.open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it("locks the keyboard while ENTER's validation and F5's save are awaited, F5=Save and F12=Cancel staying shown but disabled, and opens it with each answer", async () => {
@@ -1574,57 +1619,69 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
       { ...put(200, VALIDATED), until: validated.until },
       { ...put(200, COMMITTED), until: saved.until },
     );
-    renderScreen();
-    await fetchAccount();
-    typeInto("First Name", "Grace");
+    const { client } = renderScreen();
+    try {
+      await fetchAccount();
+      typeInto("First Name", "Grace");
 
-    // ENTER twice, F5, which is ENTER outside state N, and F12, which in state S would discard
-    // the edit: all in one task, so only the lock taken by the first refuses the others.
-    act(() => {
-      key("ENTER=Process").click();
-      key("ENTER=Process").click();
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
-    });
-    await waitFor(() => {
-      expect(sent).toHaveLength(2);
-    });
-    expectLocked(true);
-    expect(input("First Name").value).toBe("Grace");
+      // ENTER twice, F5, which is ENTER outside state N, and F12, which in state S would discard
+      // the edit: all in one task, so only the lock taken by the first refuses the others.
+      act(() => {
+        key("ENTER=Process").click();
+        key("ENTER=Process").click();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+      });
+      await waitFor(() => {
+        expect(sent).toHaveLength(2);
+      });
+      expectLocked(true);
+      expect(input("First Name").value).toBe("Grace");
 
-    validated.open();
-    expect(await screen.findByRole("button", { name: "F5=Save" })).toBe(key("F5=Save"));
-    await settled();
-    expectLocked(false);
+      validated.open();
+      expect(await screen.findByRole("button", { name: "F5=Save" })).toBe(key("F5=Save"));
+      await settled();
+      expectLocked(false);
 
-    // F5 twice by its button and once by its key, F12 and the Enter key, in one task.
-    act(() => {
-      key("F5=Save").click();
-      key("F5=Save").click();
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
-      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
-    });
-    await waitFor(() => {
-      expect(sent).toHaveLength(3);
-    });
-    expectLocked(true);
-    expect([key("F5=Save").hasAttribute("hidden"), key("F12=Cancel").hasAttribute("hidden")]).toEqual(
-      [false, false],
-    );
-    expect(messageRow("info").textContent).toBe("Changes validated.Press F5 to save");
+      // F5 twice by its button and once by its key, F12 and the Enter key, in one task.
+      act(() => {
+        key("F5=Save").click();
+        key("F5=Save").click();
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F5" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "F12" }));
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+      });
+      await waitFor(() => {
+        expect(sent).toHaveLength(3);
+      });
+      expectLocked(true);
+      expect([
+        key("F5=Save").hasAttribute("hidden"),
+        key("F12=Cancel").hasAttribute("hidden"),
+      ]).toEqual([false, false]);
+      expect(messageRow("info").textContent).toBe("Changes validated.Press F5 to save");
 
-    saved.open();
-    await waitFor(() => {
-      expect(messageRow("info").textContent).toBe("Changes committed to database");
-    });
-    await settled();
-    expectLocked(false);
-    expect(sent.map((request) => request.method)).toEqual(["GET", "PUT", "PUT"]);
-    expect(sent.slice(1).map((request) => request.body)).toMatchObject([
-      { aid: "ENTER", fields: { first_name: "Grace" } },
-      { aid: "PF5", fields: { first_name: "Grace" } },
-    ]);
+      saved.open();
+      await waitFor(() => {
+        expect(messageRow("info").textContent).toBe("Changes committed to database");
+      });
+      await settled();
+      expectLocked(false);
+      expect(sent.map((request) => request.method)).toEqual(["GET", "PUT", "PUT"]);
+      expect(sent.slice(1).map((request) => request.body)).toMatchObject([
+        { aid: "ENTER", fields: { first_name: "Grace" } },
+        { aid: "PF5", fields: { first_name: "Grace" } },
+      ]);
+    } finally {
+      // The validation and the save are let go here as well, pass or fail, and the test ends
+      // once every request has settled, so neither a held request nor the client's deadline
+      // outlives the test.
+      validated.open();
+      saved.open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
   });
 
   it("opens the lock when the schema refuses a length, so the corrected ENTER is sent", async () => {
@@ -1661,17 +1718,25 @@ describe("COACTUP render", { timeout: TEST_TIMEOUT_MS }, () => {
   ])("$title stays available while the fetch is awaited and opens the main menu", async (exit) => {
     const fetched = gate();
     stubApi({ ...get(200, VIEW), until: fetched.until });
-    renderScreen();
-    typeInto("Account Number :", ACCOUNT);
-    fireEvent.click(key("ENTER=Process"));
-    await waitFor(() => {
-      expect(sent).toHaveLength(1);
-    });
-    expectLocked(true);
+    const { client } = renderScreen();
+    try {
+      typeInto("Account Number :", ACCOUNT);
+      fireEvent.click(key("ENTER=Process"));
+      await waitFor(() => {
+        expect(sent).toHaveLength(1);
+      });
+      expectLocked(true);
 
-    exit.press();
-    expect(await screen.findByText("Arrived at COMEN01 from /accounts/update")).toBeTruthy();
-    fetched.open();
+      exit.press();
+      expect(await screen.findByText("Arrived at COMEN01 from /accounts/update")).toBeTruthy();
+    } finally {
+      // The fetch is answered only after F3 left, pass or fail, and the test goes on once it has
+      // settled, so neither the request nor the client's deadline outlives the test.
+      fetched.open();
+      await waitFor(() => {
+        expect(client.isMutating()).toBe(0);
+      });
+    }
     expect(sent).toHaveLength(1);
   });
 });
