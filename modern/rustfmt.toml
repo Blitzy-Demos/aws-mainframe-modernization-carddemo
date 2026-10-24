@@ -1,0 +1,4 @@
+# Stable options only: rustfmt on Rust 1.85.0 warns about nightly-only keys, and
+# `cargo fmt --all -- --check` must run warning-free. style_edition matches edition 2024.
+style_edition = "2024"
+max_width = 100

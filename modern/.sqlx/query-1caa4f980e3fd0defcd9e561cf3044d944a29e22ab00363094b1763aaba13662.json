@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE cards\n           SET acct_id = $2, card_cvv_cd = $3, card_embossed_name = $4,\n               card_expiraion_date = $5, card_active_status = $6, filler = $7\n           WHERE card_num = $1::bpchar",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8",
+        "Int8",
+        "Bpchar",
+        "Date",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1caa4f980e3fd0defcd9e561cf3044d944a29e22ab00363094b1763aaba13662"
+}

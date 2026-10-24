@@ -1,0 +1,193 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COPAUS0C GET-AUTHORIZATIONS GNP PAUTDTL1\n-- (app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:458-486) under GU PAUTSUM0 (973-976),\n-- repositioned by REPOSITION-AUTHORIZATIONS WHERE PAUT9CTS = key (488-519).\n-- Twin order = ascending PAUT9CTS (DBPAUTP0.dbd:36-37): inverted date and time keys, newest first.\n-- Audit rows COPAUS0C-031, COPAUS0C-041 and COPAUS0C-047 of modern/audit/online/COPAUS0C.md.\n-- Endpoint 21 GET /api/v1/accounts/{acct_id}/authorizations. Rule: Bounded Pagination\n-- (served by pending_auth_details_pkey). Forward only.\n-- Parameters: 1 account ID, 2 start inverted date key, 3 start inverted time key (inclusive),\n-- 4 limit.\nSELECT\n    acct_id,\n    auth_date_9c,\n    auth_time_9c,\n    auth_orig_date,\n    auth_orig_time,\n    card_num,\n    auth_type,\n    card_expiry_date,\n    message_type,\n    message_source,\n    auth_id_code,\n    auth_resp_code,\n    auth_resp_reason,\n    processing_code,\n    transaction_amt,\n    approved_amt,\n    merchant_catagory_code,\n    acqr_country_code,\n    pos_entry_mode,\n    merchant_id,\n    merchant_name,\n    merchant_city,\n    merchant_state,\n    merchant_zip,\n    transaction_id,\n    match_status,\n    auth_fraud,\n    fraud_rpt_date,\n    filler\nFROM pending_auth_details\nWHERE acct_id = $1::bigint\n    AND (auth_date_9c, auth_time_9c) >= ($2::bigint, $3::bigint)\nORDER BY auth_date_9c ASC, auth_time_9c ASC\nLIMIT $4::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "auth_date_9c",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "auth_time_9c",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "auth_orig_date",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "auth_orig_time",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "auth_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "card_expiry_date",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "message_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "message_source",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "auth_id_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "auth_resp_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "auth_resp_reason",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "processing_code",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "transaction_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 15,
+        "name": "approved_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 16,
+        "name": "merchant_catagory_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 17,
+        "name": "acqr_country_code",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 18,
+        "name": "pos_entry_mode",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 19,
+        "name": "merchant_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 20,
+        "name": "merchant_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 21,
+        "name": "merchant_city",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "merchant_state",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 23,
+        "name": "merchant_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 24,
+        "name": "transaction_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 25,
+        "name": "match_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 26,
+        "name": "auth_fraud",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 27,
+        "name": "fraud_rpt_date",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 28,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0dfe57570700849f91954a5fdbd771d815fc7395da8cd240bb848fc534248c42"
+}

@@ -1,0 +1,7 @@
+---
+source: crates/messaging/tests/cdrd.rs
+expression: reply_rendering(&reply.data)?
+snapshot_kind: text
+---
+SYSTEM DATE : NN-NN-NNNNSYSTEM TIME : NN:NN:NN
+len=1000 trailing_spaces=954

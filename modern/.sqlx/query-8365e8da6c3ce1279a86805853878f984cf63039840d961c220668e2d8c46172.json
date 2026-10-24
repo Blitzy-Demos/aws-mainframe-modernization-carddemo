@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transaction_categories (tran_type_cd, tran_cat_cd, tran_cat_type_desc, filler) VALUES ($1, $2, $3, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8365e8da6c3ce1279a86805853878f984cf63039840d961c220668e2d8c46172"
+}

@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(1) AS \"matching!\"\nFROM db2.transaction_type\nWHERE ($1::bpchar IS NULL OR tr_type = $1::bpchar)\n    AND ($2::varchar IS NULL OR tr_description LIKE TRIM($2::varchar) ESCAPE '')",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "matching!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "28388f786597b7e22878208c23c520fc39e8714044dc16ae7812909d6678f7db"
+}

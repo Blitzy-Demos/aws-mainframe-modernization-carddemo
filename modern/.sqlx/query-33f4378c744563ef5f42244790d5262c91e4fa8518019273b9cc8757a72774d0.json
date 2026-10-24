@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tran_type, tran_type_desc, filler FROM transaction_types WHERE tran_type = $1::bpchar",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tran_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_desc",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "33f4378c744563ef5f42244790d5262c91e4fa8518019273b9cc8757a72774d0"
+}

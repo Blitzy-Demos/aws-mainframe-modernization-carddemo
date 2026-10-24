@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users\n         SET usr_fname = $2, usr_lname = $3, password_hash = $4, usr_type = $5, filler = $6\n         WHERE usr_id = $1::bpchar",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Text",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d68fa435de72798a783036fde01b9593a377821d4103e8b679078c1b540f4380"
+}

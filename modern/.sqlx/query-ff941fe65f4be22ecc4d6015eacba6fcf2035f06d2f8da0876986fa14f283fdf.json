@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COCRDLIC 9100-READ-BACKWARDS (app/cbl/COCRDLIC.cbl:1264-1380), 9500-FILTER-RECORDS (1382-1411):\n-- STARTBR GTEQ + READPREV over CARDDAT by card number, the first READPREV returning the start\n-- record itself (inclusive), filters applied per record.\n-- Endpoint 7 GET /api/v1/cards (PF7). Rule: Bounded Pagination (served by cards_pkey).\n-- Parameters: 1 start card number (inclusive), 2 account filter or NULL, 3 card filter or NULL, 4 limit.\n-- Audit rows COCRDLIC-010, COCRDLIC-027 and COCRDLIC-029. The program discards the start record\n-- unfiltered, so callers drop it by key equality (a filter may already have excluded it) and\n-- reverse the rows, which arrive in descending card-number order, for display.\nSELECT\n    card_num,\n    acct_id,\n    card_cvv_cd,\n    card_embossed_name,\n    card_expiraion_date,\n    card_active_status,\n    filler,\n    card_ref\nFROM cards\nWHERE card_num <= $1::bpchar\n    AND ($2::bigint IS NULL OR acct_id = $2::bigint)\n    AND ($3::bpchar IS NULL OR card_num = $3::bpchar)\nORDER BY card_num DESC\nLIMIT $4::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "card_cvv_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "card_embossed_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "card_expiraion_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 5,
+        "name": "card_active_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "filler",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "card_ref",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8",
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ff941fe65f4be22ecc4d6015eacba6fcf2035f06d2f8da0876986fa14f283fdf"
+}

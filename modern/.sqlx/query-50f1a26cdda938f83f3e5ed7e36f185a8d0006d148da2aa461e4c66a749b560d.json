@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT max(tran_id) AS \"max_id?\" FROM transactions",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "max_id?",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "50f1a26cdda938f83f3e5ed7e36f185a8d0006d148da2aa461e4c66a749b560d"
+}

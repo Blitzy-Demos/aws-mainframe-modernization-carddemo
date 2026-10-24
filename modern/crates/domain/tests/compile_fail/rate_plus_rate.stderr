@@ -1,0 +1,13 @@
+error[E0369]: cannot add `Rate<4>` to `Rate<4>`
+  --> tests/compile_fail/rate_plus_rate.rs:10:19
+   |
+10 |     let _ = first + second;
+   |             ----- ^ ------ Rate<4>
+   |             |
+   |             Rate<4>
+   |
+note: the foreign item type `Rate<4>` doesn't implement `Add`
+  --> src/money.rs
+   |
+   | pub struct Rate<const INT: u32>(Decimal);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not implement `Add`

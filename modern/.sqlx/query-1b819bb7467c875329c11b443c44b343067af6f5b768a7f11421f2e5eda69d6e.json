@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM tran_cat_balances",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "1b819bb7467c875329c11b443c44b343067af6f5b768a7f11421f2e5eda69d6e"
+}

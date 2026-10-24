@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pending_auth_details (acct_id, auth_date_9c, auth_time_9c, auth_orig_date, auth_orig_time, card_num, auth_type, card_expiry_date, message_type, message_source, auth_id_code, auth_resp_code, auth_resp_reason, processing_code, transaction_amt, approved_amt, merchant_catagory_code, acqr_country_code, pos_entry_mode, merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip, transaction_id, match_status, auth_fraud, fraud_rpt_date, filler) VALUES ($1, 0, 0, '', '', '', '', '', '', '', '', '', '', 0, 0, 0, '', '', 0, '', '', '', '', '', '', '', '', '', '')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2c5019d1f149c02b0de15a660c1dcb14801dc03cb72846157c96e3a363b35c0"
+}

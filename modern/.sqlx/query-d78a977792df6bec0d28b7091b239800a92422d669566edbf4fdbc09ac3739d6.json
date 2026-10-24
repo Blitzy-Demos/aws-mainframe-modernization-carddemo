@@ -1,0 +1,113 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,\n                  tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,\n                  card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler\n           FROM transactions\n           WHERE proc_ts >= $1::date AND proc_ts < ($2::date + 1)\n           ORDER BY card_num, tran_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tran_id",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_source",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "tran_desc",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "tran_amt",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 6,
+        "name": "tran_merchant_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "tran_merchant_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "tran_merchant_city",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "tran_merchant_zip",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 10,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "orig_ts",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 12,
+        "name": "orig_ts_form",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 13,
+        "name": "proc_ts",
+        "type_info": "Timestamp"
+      },
+      {
+        "ordinal": 14,
+        "name": "proc_ts_form",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 15,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date",
+        "Date"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "d78a977792df6bec0d28b7091b239800a92422d669566edbf4fdbc09ac3739d6"
+}

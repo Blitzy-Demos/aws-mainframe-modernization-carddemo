@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO db2.transaction_type_category\n                  (trc_type_code, trc_type_category, trc_cat_data)\n           VALUES ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8028efce5b215947b7670fd8a66d2b82247dfbab1ec6625bde46088f6561a88b"
+}

@@ -1,0 +1,179 @@
+//! COCRDUPC, the card update (transaction `CCUP`, map `CCRDUPA`): the handlers of endpoint 9,
+//! `GET /api/v1/cards/edit` (ENTER fetch), and endpoint 10, `PUT /api/v1/cards/{card_ref}`
+//! (`aid` ENTER validates, `aid` PF5 saves).
+//!
+//! Each handler extracts the verified [`SignedOnUser`] and the validated DTO, calls one function
+//! of `crate::services::cocrdupc` and maps what it returns through the `From` conversions of
+//! `crate::dto::cocrdupc` and [`ScreenError`] (Thin Request Handlers). The identity is extracted
+//! before the query or the body, so a request without a valid token is a 401 whatever its input.
+//!
+//! - The attention key, the echoed state and the change check belong to the service and the
+//!   domain: PF5 outside state `N` is processed as ENTER (COCRDUPC-007), and a save compares the
+//!   card read for update with the echoed snapshot (COCRDUPC-037, COCRDUPC-044).
+//! - F3 and F12 are the screen's own and send no request (COCRDUPC-004, COCRDUPC-006).
+//! - The path segment of endpoint 10 is the card's `card_ref` handle as raw text, never parsed
+//!   here: the service resolves it, and a handle that names no card is the program's lock
+//!   failure (COCRDUPC-036, COCRDUPC-043).
+//!
+//! # Cardholder data
+//!
+//! The fetch response of endpoint 9 carries the card number only redacted, twelve `*` and its
+//! last four digits, beside its `card_ref` handle; the result of endpoint 10 carries neither the
+//! number nor the handle, and no response carries a CVV (COCRDUPC-042, `E32`). A save rewrites
+//! four values: the embossed name and the active status as received, the expiry date from the
+//! year and month received and the snapshot's day, and the account of the echoed snapshot, the
+//! account entered for the search or the list row's, which replaces the card's stored account
+//! even when it differs (COCRDUPC-038, `X-COCRDUPC-2`). The stored card number and CVV come from
+//! the card read for update, never from the request. Neither handler logs or traces anything,
+//! because the query of endpoint 9 may hold a typed card number.
+
+use axum::Json;
+use axum::extract::State;
+
+use crate::app::AppState;
+use crate::auth::extract::SignedOnUser;
+use crate::dto::cocrdslc::CardLookupQuery;
+use crate::dto::cocrdupc::{CardUpdateRequest, CardUpdateResult, CardUpdateView};
+use crate::dto::{RawPath, ValidJson, ValidQuery};
+use crate::error::ScreenError;
+use crate::services;
+
+/// The `utoipa::Path` of [`fetch`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct FetchOperation;
+
+/// Fetch a card for update (CCUP / COCRDUPC).
+///
+/// ENTER with the account and card search keys, or with the `card_ref` handle of a card list row
+/// in place of the card number: the card as the update screen shows it, its number redacted
+/// beside its `card_ref` handle, and the snapshot that every request of the save operation
+/// echoes. The account shown is the one requested.
+///
+/// # Errors
+///
+/// A `ScreenError` carrying the program's message: 400 when a search key fails its edit or the
+/// query does not fit its screen fields, 401 without a valid bearer token, 404 when no card has
+/// the number or handle, and 500 when the card read fails.
+#[utoipa::path(
+    impl_for = FetchOperation,
+    get,
+    path = "/api/v1/cards/edit",
+    operation_id = "cocrdupc_fetch",
+    tag = "COCRDUPC",
+    params(CardLookupQuery),
+    responses(
+        (
+            status = 200,
+            description = "The card with its number redacted, and the snapshot to echo",
+            body = CardUpdateView
+        ),
+        (
+            status = 400,
+            description = "A search key failed its edit, or the query does not fit its fields",
+            body = ScreenError
+        ),
+        (
+            status = 401,
+            description = "The request carries no valid bearer token",
+            body = ScreenError
+        ),
+        (
+            status = 404,
+            description = "No card has the number or handle searched for",
+            body = ScreenError
+        ),
+        (
+            status = 500,
+            description = "The card read failed",
+            body = ScreenError
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn fetch(
+    State(state): State<AppState>,
+    user: SignedOnUser,
+    ValidQuery(query): ValidQuery<CardLookupQuery>,
+) -> Result<Json<CardUpdateView>, ScreenError> {
+    services::cocrdupc::fetch(&state, &user, query)
+        .await
+        .map(CardUpdateView::from)
+        .map(Json)
+        .map_err(ScreenError::from)
+}
+
+/// The `utoipa::Path` of [`save`], from its `#[utoipa::path]`, for `crate::app::router`.
+pub(crate) struct SaveOperation;
+
+/// Validate or save a card update (CCUP / COCRDUPC).
+///
+/// `aid` ENTER edits the name, the status and the expiry month and year against the echoed
+/// snapshot and, when they pass, asks for confirmation. `aid` PF5 in state
+/// `changes_ok_not_confirmed` runs the change check and the edits again and rewrites the card
+/// the `card_ref` path segment names; PF5 in any other state is processed as ENTER. After a
+/// save, a lock failure or a rewrite failure, the next request restarts the search. The stored
+/// card number and verification code are never taken from the request.
+///
+/// # Errors
+///
+/// A `ScreenError` carrying the program's message: 400 when nothing changed, a field fails its
+/// edit or the body does not fit its screen fields; 401 without a valid bearer token; 409 when
+/// the card changed after it was fetched; 500 when the card cannot be locked for update, a
+/// `card_ref` that names no card included, or when its rewrite fails. A segment that is not
+/// UTF-8 once percent-decoded is a 400 with the API's `Invalid path parameters...` and no
+/// field, before the body is read.
+#[utoipa::path(
+    impl_for = SaveOperation,
+    put,
+    path = "/api/v1/cards/{card_ref}",
+    operation_id = "cocrdupc_save",
+    tag = "COCRDUPC",
+    // Documented as the integer handle the fetch and list responses carry, so a client passes it
+    // back unchanged; the handler still extracts the raw segment for the service to resolve.
+    params(
+        ("card_ref" = i64, Path, description = "Card handle from the fetch or list response")
+    ),
+    request_body = CardUpdateRequest,
+    // No 404: a save reads the card only for update, and a `card_ref` that names no card is
+    // the program's lock failure, a 500, so this operation has no not-found answer to declare.
+    responses(
+        (
+            status = 200,
+            description = "The changes validated, the card saved, or the search restarted",
+            body = CardUpdateResult
+        ),
+        (
+            status = 400,
+            description = "Nothing changed, a field failed its edit, or the body does not fit; \
+                           or a path segment that is not UTF-8 once percent-decoded",
+            body = ScreenError
+        ),
+        (
+            status = 401,
+            description = "The request carries no valid bearer token",
+            body = ScreenError
+        ),
+        (
+            status = 409,
+            description = "The card changed after it was fetched",
+            body = ScreenError
+        ),
+        (
+            status = 500,
+            description = "The card could not be locked for update, or its rewrite failed",
+            body = ScreenError
+        )
+    ),
+    security(("bearer_auth" = []))
+)]
+pub(crate) async fn save(
+    State(state): State<AppState>,
+    user: SignedOnUser,
+    RawPath(card_ref): RawPath<String>,
+    ValidJson(request): ValidJson<CardUpdateRequest>,
+) -> Result<Json<CardUpdateResult>, ScreenError> {
+    services::cocrdupc::save(&state, &user, &card_ref, request)
+        .await
+        .map(CardUpdateResult::from)
+        .map(Json)
+        .map_err(ScreenError::from)
+}

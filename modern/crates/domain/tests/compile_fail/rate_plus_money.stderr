@@ -1,0 +1,13 @@
+error[E0369]: cannot add `Money<9>` to `Rate<4>`
+  --> tests/compile_fail/rate_plus_money.rs:11:26
+   |
+11 |     let _ = dis_int_rate + tran_cat_bal;
+   |             ------------ ^ ------------ Money<9>
+   |             |
+   |             Rate<4>
+   |
+note: the foreign item type `Rate<4>` doesn't implement `Add<Money<9>>`
+  --> src/money.rs
+   |
+   | pub struct Rate<const INT: u32>(Decimal);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ not implement `Add<Money<9>>`

@@ -1,0 +1,67 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COCRDLIC 9000-READ-FORWARD (app/cbl/COCRDLIC.cbl:1123-1263) and 9500-FILTER-RECORDS (1382-1411):\n-- STARTBR GTEQ + READNEXT over CARDDAT by card number, filters applied per record.\n-- Endpoint 7 GET /api/v1/cards. Rule: Bounded Pagination (served by cards_pkey).\n-- Parameters: 1 start card number (inclusive), 2 account filter or NULL, 3 card filter or NULL, 4 limit.\n-- Audit rows COCRDLIC-010, COCRDLIC-017, COCRDLIC-018 and COCRDLIC-023. The look-ahead read of\n-- COCRDLIC-019 ignores the filters, so callers issue it with parameters 2 and 3 NULL.\nSELECT\n    card_num,\n    acct_id,\n    card_cvv_cd,\n    card_embossed_name,\n    card_expiraion_date,\n    card_active_status,\n    filler,\n    card_ref\nFROM cards\nWHERE card_num >= $1::bpchar\n    AND ($2::bigint IS NULL OR acct_id = $2::bigint)\n    AND ($3::bpchar IS NULL OR card_num = $3::bpchar)\nORDER BY card_num ASC\nLIMIT $4::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "card_num",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "card_cvv_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "card_embossed_name",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "card_expiraion_date",
+        "type_info": "Date"
+      },
+      {
+        "ordinal": 5,
+        "name": "card_active_status",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "filler",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "card_ref",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Int8",
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "14e625041ed72b89a2f006c35f70ecb5d8731ef746ba81b7715c724cba4a157d"
+}

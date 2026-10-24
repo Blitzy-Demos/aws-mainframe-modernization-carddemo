@@ -1,0 +1,27 @@
+# Dev-only harness: listed only under [dev-dependencies] of persistence, api, messaging and batch.
+# persistence dev-depends on this crate while this crate depends on persistence, so Cargo builds
+# persistence twice; the public API therefore exposes only sqlx, lapin and std types.
+[package]
+name = "test-support"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Dev-only test harness for the CardDemo workspace: containers, fixtures, audit index, trace capture"
+
+[dependencies]
+persistence = { workspace = true }
+runtime = { workspace = true }
+copybook = { workspace = true }
+testcontainers = { workspace = true }
+lapin = { workspace = true }
+# Pool and readiness probe only: this crate issues no query and embeds no migrations.
+sqlx = { workspace = true, features = ["postgres", "runtime-tokio"] }
+# `signal`: the watcher that removes this process's containers when SIGINT or SIGTERM ends a run.
+tokio = { workspace = true, features = ["time", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json"] }
+
+[lints]
+workspace = true

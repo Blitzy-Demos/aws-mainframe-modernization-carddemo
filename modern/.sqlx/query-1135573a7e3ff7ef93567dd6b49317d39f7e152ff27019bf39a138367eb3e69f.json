@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO pending_auth_summaries (acct_id, cust_id, auth_status, account_status_1, account_status_2, account_status_3, account_status_4, account_status_5, credit_limit, cash_limit, credit_balance, cash_balance, approved_auth_cnt, declined_auth_cnt, approved_auth_amt, declined_auth_amt, filler) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) ON CONFLICT (acct_id) DO NOTHING RETURNING acct_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Int2",
+        "Int2",
+        "Numeric",
+        "Numeric",
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1135573a7e3ff7ef93567dd6b49317d39f7e152ff27019bf39a138367eb3e69f"
+}

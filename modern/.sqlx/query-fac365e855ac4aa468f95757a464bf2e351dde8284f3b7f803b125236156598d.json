@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO cssl_error_log (err_date, err_time, err_application, err_program, err_location, err_level, err_subsystem, err_code_1, err_code_2, err_message, err_event_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fac365e855ac4aa468f95757a464bf2e351dde8284f3b7f803b125236156598d"
+}

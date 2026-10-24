@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transactions SET proc_ts = TIMESTAMP '2022-06-10 19:27:53'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "10e4bf81c38bf170994605a3e39fc62e795f0c2f7c3729faf383d20c79cbbe06"
+}

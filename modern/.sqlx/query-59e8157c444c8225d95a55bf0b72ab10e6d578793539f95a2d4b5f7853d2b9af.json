@@ -1,0 +1,74 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT n.nspname::text AS \"schema!\",\n                  t.relname::text AS \"table!\",\n                  c.conname::text AS \"name!\",\n                  c.contype::text AS \"kind!\",\n                  pg_get_constraintdef(c.oid) AS \"def!\",\n                  ARRAY(SELECT a.attname::text\n                          FROM unnest(c.conkey) WITH ORDINALITY AS k (attnum, ord)\n                          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum\n                         ORDER BY k.ord) AS \"columns!\",\n                  rn.nspname::text AS \"ref_schema?\",\n                  r.relname::text AS \"ref_table?\",\n                  ARRAY(SELECT a.attname::text\n                          FROM unnest(c.confkey) WITH ORDINALITY AS k (attnum, ord)\n                          JOIN pg_attribute a ON a.attrelid = c.confrelid AND a.attnum = k.attnum\n                         ORDER BY k.ord) AS \"ref_columns!\",\n                  c.confdeltype::text AS \"on_delete!\"\n             FROM pg_constraint c\n             JOIN pg_class t ON t.oid = c.conrelid\n             JOIN pg_namespace n ON n.oid = t.relnamespace\n             LEFT JOIN pg_class r ON r.oid = c.confrelid\n             LEFT JOIN pg_namespace rn ON rn.oid = r.relnamespace\n            WHERE n.nspname IN ('public', 'db2')\n            ORDER BY 1, 2, 3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "schema!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "table!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "kind!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "def!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "columns!",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 6,
+        "name": "ref_schema?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "ref_table?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "ref_columns!",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 9,
+        "name": "on_delete!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "59e8157c444c8225d95a55bf0b72ab10e6d578793539f95a2d4b5f7853d2b9af"
+}

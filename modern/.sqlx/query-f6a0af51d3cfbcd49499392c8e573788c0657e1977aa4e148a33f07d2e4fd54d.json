@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_auth_summaries SET cust_id = $2, auth_status = $3, account_status_1 = $4, account_status_2 = $5, account_status_3 = $6, account_status_4 = $7, account_status_5 = $8, credit_limit = $9, cash_limit = $10, credit_balance = $11, cash_balance = $12, approved_auth_cnt = $13, declined_auth_cnt = $14, approved_auth_amt = $15, declined_auth_amt = $16, filler = $17 WHERE acct_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Numeric",
+        "Int2",
+        "Int2",
+        "Numeric",
+        "Numeric",
+        "Bpchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6a0af51d3cfbcd49499392c8e573788c0657e1977aa4e148a33f07d2e4fd54d"
+}

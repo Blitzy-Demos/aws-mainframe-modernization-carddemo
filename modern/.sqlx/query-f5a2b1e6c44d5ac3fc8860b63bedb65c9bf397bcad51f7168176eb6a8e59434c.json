@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "LOCK TABLE tran_cat_balances IN SHARE ROW EXCLUSIVE MODE",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f5a2b1e6c44d5ac3fc8860b63bedb65c9bf397bcad51f7168176eb6a8e59434c"
+}

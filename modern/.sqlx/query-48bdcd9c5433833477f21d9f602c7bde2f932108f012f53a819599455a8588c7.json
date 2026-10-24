@@ -1,0 +1,48 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT acct_id, tran_type_cd, tran_cat_cd, tran_cat_bal, filler\n           FROM tran_cat_balances\n          WHERE acct_id = $1 AND tran_type_cd = $2::bpchar AND tran_cat_cd = $3",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "acct_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "tran_type_cd",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "tran_cat_cd",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "tran_cat_bal",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "filler",
+        "type_info": "Bpchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Bpchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "48bdcd9c5433833477f21d9f602c7bde2f932108f012f53a819599455a8588c7"
+}

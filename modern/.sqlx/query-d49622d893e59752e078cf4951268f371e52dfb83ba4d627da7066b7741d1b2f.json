@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO auth_fraud (\n             card_num, auth_ts, auth_type, card_expiry_date, message_type, message_source,\n             auth_id_code, auth_resp_code, auth_resp_reason, processing_code, transaction_amt,\n             approved_amt, merchant_catagory_code, acqr_country_code, pos_entry_mode,\n             merchant_id, merchant_name, merchant_city, merchant_state, merchant_zip,\n             transaction_id, match_status, auth_fraud, fraud_rpt_date, acct_id, cust_id\n         ) VALUES (\n             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,\n             $19, $20, $21, $22, $23, $24::date, $25, $26\n         )",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Timestamp",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Numeric",
+        "Numeric",
+        "Bpchar",
+        "Bpchar",
+        "Int2",
+        "Bpchar",
+        "Varchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Bpchar",
+        "Date",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d49622d893e59752e078cf4951268f371e52dfb83ba4d627da7066b7741d1b2f"
+}

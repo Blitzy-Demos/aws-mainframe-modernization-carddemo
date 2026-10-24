@@ -1,0 +1,68 @@
+# CardDemo local stores: PostgreSQL 16 and RabbitMQ 3.13, nothing else.
+#
+# The Rust binaries (carddemo-api, carddemo-mq, carddemo-batch, carddemo-migrate) and the Vite
+# dev server run from the toolchain, so no service here builds or runs application code.
+# `docker compose up -d --wait` returns once both healthchecks pass.
+#
+# Every value is a literal local-only default, identical to modern/.env.example and
+# docs/SETUP.md; no credential here is used outside this machine. Ports bind to loopback only.
+
+name: carddemo
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: carddemo
+      POSTGRES_PASSWORD: carddemo
+      POSTGRES_DB: carddemo
+    ports:
+      - "127.0.0.1:5432:5432"
+    # No /docker-entrypoint-initdb.d mount: the schema reaches the database only through
+    # carddemo-migrate (runtime::migrate::apply), never through the image's init scripts.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # `-h 127.0.0.1` checks the TCP listener. The image's first-boot init server listens on the
+      # Unix socket only, so a socket check could report healthy before clients can connect.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U carddemo -d carddemo"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    # The node is named rabbit@<hostname> and keeps its message store under
+    # /var/lib/rabbitmq/mnesia/rabbit@<hostname>. A fixed hostname and the named volume
+    # rabbitmq-data keep both stable across container recreation, so durable queues and
+    # persistent messages survive `docker compose down` and `up` as the database does, and no
+    # anonymous volume is left behind. `docker compose down -v` removes rabbitmq-data with pgdata.
+    hostname: rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    # rabbitmq.conf imports definitions.json at boot: vhost "/", user carddemo and its
+    # permissions, and the seven durable queues. The user comes from that file only, so no
+    # RABBITMQ_DEFAULT_USER/RABBITMQ_DEFAULT_PASS is set. test-support mounts the same two files.
+    volumes:
+      - ./rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro
+      - ./rabbitmq/definitions.json:/etc/rabbitmq/definitions.json:ro
+      - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      # The probe runs as the rabbitmq user through the image's gosu. Healthchecks run as root, and
+      # a root probe that runs before the server creates /var/lib/rabbitmq/.erlang.cookie writes it
+      # root-only, so the server cannot read it (eacces) and exits.
+      test:
+        - CMD-SHELL
+        - >-
+          gosu rabbitmq rabbitmq-diagnostics -q check_running &&
+          gosu rabbitmq rabbitmq-diagnostics -q check_port_connectivity
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+
+volumes:
+  pgdata: {}
+  rabbitmq-data: {}

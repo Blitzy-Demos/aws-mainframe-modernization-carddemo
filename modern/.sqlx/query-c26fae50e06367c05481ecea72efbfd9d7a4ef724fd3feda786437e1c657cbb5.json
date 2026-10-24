@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE pending_auth_summaries SET acct_id = -99999999999",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "c26fae50e06367c05481ecea72efbfd9d7a4ef724fd3feda786437e1c657cbb5"
+}

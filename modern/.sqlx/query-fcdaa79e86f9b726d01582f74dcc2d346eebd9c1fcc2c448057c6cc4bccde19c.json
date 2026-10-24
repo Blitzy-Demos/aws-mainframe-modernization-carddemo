@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- COTRTLIC cursor C-TR-TYPE-BACKWARD (app/app-transaction-type-db2/cbl/COTRTLIC.cbl:355-367) over the\n-- Db2 data version. The start key is exclusive, as the cursor declares. A NULL filter parameter means\n-- the COBOL edit flag is off. ESCAPE '' keeps Db2 LIKE semantics (no escape character).\n-- Endpoints 24 and 25 (transaction-types, PF7) [A]. Rule: Bounded Pagination (served by xtran_type).\n-- Audit: COTRTLIC-011 (backward read), COTRTLIC-012 (short backward read), COTRTLIC-005 (filter\n-- predicates).\n-- Bounded Pagination with a description filter: as for the forward page, COTRTLIC always builds the\n-- pattern as '%', the trimmed filter text, '%' (COTRTLIC.cbl:1155-1163). A pattern that starts with\n-- '%' is never a B-tree index condition, so xtran_type, the table's only index (the Db2 DDL key),\n-- serves every page by positioning below the start code and reading in descending tr_type order\n-- while the pattern is applied as a filter. With sequential scans disabled, EXPLAIN (GENERIC_PLAN)\n-- plans the query on that index: a bitmap scan plus a sort on a freshly migrated table, a backward\n-- index scan once it has statistics. By cost the planner may instead choose a sequential scan plus\n-- a sort on a small table. Either plan reads at most the whole table, which the two-character key\n-- keeps small, as db2_transaction_types_page_forward.sql states.\n-- Parameters: 1 start type code (exclusive), 2 type filter or NULL, 3 description pattern or NULL, 4 limit.\nSELECT\n    tr_type,\n    tr_description\nFROM db2.transaction_type\nWHERE tr_type < $1::bpchar\n    AND ($2::bpchar IS NULL OR tr_type = $2::bpchar)\n    AND ($3::varchar IS NULL OR tr_description LIKE TRIM($3::varchar) ESCAPE '')\nORDER BY tr_type DESC\nLIMIT $4::bigint\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "tr_type",
+        "type_info": "Bpchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "tr_description",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bpchar",
+        "Bpchar",
+        "Varchar",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "fcdaa79e86f9b726d01582f74dcc2d346eebd9c1fcc2c448057c6cc4bccde19c"
+}

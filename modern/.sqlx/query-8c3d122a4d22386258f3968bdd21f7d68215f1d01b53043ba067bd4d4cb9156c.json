@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transactions (tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt, tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip, card_num, orig_ts, orig_ts_form, proc_ts, proc_ts_form, filler) VALUES ('0000000000000001', '01', 1, 'SCHEMA', 'schema test', 0.00, 0, ' ', ' ', ' ', '0000000000000000', TIMESTAMP '2022-06-10 19:27:53.123456', 'I', NULL, NULL, ' ')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "8c3d122a4d22386258f3968bdd21f7d68215f1d01b53043ba067bd4d4cb9156c"
+}

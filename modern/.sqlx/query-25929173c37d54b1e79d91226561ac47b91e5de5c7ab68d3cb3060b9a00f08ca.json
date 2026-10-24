@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT count(*) FROM transactions) AS \"transactions!\",\n                  (SELECT count(*) FROM pending_auth_summaries) AS \"pending_auth_summaries!\",\n                  (SELECT count(*) FROM pending_auth_details) AS \"pending_auth_details!\",\n                  (SELECT count(*) FROM auth_fraud) AS \"auth_fraud!\",\n                  (SELECT count(*) FROM cssl_error_log) AS \"cssl_error_log!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transactions!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "pending_auth_summaries!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "pending_auth_details!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "auth_fraud!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "cssl_error_log!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "25929173c37d54b1e79d91226561ac47b91e5de5c7ab68d3cb3060b9a00f08ca"
+}
