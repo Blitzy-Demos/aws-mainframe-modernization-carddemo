@@ -475,7 +475,6 @@ dependencies = [
  "clap",
  "copybook",
  "domain",
- "insta",
  "persistence",
  "printpdf",
  "runtime",

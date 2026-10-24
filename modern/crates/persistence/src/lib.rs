@@ -651,9 +651,13 @@ impl<'c> PgTx<'c> {
     ///
     /// # Errors
     ///
-    /// [`PersistenceError::Unavailable`] when the connection is lost;
-    /// [`PersistenceError::Database`] when the server refuses the commit, as for a
-    /// serialization failure (`40001`). The transaction is rolled back either way.
+    /// - [`PersistenceError::Database`] when the server refuses the commit, as for a
+    ///   serialization failure (`40001`). The transaction, or the savepoint's work, is rolled
+    ///   back.
+    /// - [`PersistenceError::Unavailable`] when the connection is lost. For a savepoint, the
+    ///   enclosing transaction is discarded with the connection, so nothing of it commits. For a
+    ///   transaction, the outcome is unknown: `PostgreSQL` can commit before its answer is lost,
+    ///   and this method cannot tell which.
     pub fn commit(self) -> impl Future<Output = Result<(), PersistenceError>> + Send + 'c {
         let commit = self.tx.commit();
         async move { commit.await.map_err(PersistenceError::from) }

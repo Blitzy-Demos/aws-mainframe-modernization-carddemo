@@ -1021,6 +1021,10 @@ fn acctdata_fields_round_trip() {
         let body = line.body;
         let id = pic_u_field::<11>(body, 0, &format!("{name}:{number} ACCT-ID"));
         assert!(
+            // TRUNCATION: `u64` to `usize`: the key equals the fixture's line number, at most 50
+            // (line n holds account n), so it converts exactly on 64-bit targets; on a narrower
+            // target a key beyond `usize` would give `None` and fail the assertion rather than
+            // wrap.
             usize::try_from(id.get()).ok() == Some(number),
             "{name}:{number}: line n holds account n"
         );
@@ -1089,6 +1093,10 @@ fn custdata_fields_round_trip() {
         let at = |field_name: &str| format!("{name}:{number} {field_name}");
         let id = pic_u_field::<9>(body, 0, &at("CUST-ID"));
         assert!(
+            // TRUNCATION: `u64` to `usize`: the key equals the fixture's line number, at most 50
+            // (line n holds customer n), so it converts exactly on 64-bit targets; on a narrower
+            // target a key beyond `usize` would give `None` and fail the assertion rather than
+            // wrap.
             usize::try_from(id.get()).ok() == Some(number),
             "{name}:{number}: line n holds customer n"
         );
@@ -1268,6 +1276,10 @@ fn tcatbal_fields_round_trip() {
         let type_cd = pic_x_field::<2>(body, 11, &at("TRANCAT-TYPE-CD"));
         let cat_cd = pic_u_field::<4>(body, 13, &at("TRANCAT-CD"));
         assert!(
+            // TRUNCATION: `u64` to `usize`: the account key equals the fixture's line number, at
+            // most 50 (line n holds account n), so it converts exactly on 64-bit targets; on a
+            // narrower target a key beyond `usize` would give `None` and fail the assertion rather
+            // than wrap.
             usize::try_from(account.get()).ok() == Some(number)
                 && type_cd.as_bytes() == b"01"
                 && cat_cd.get() == 1,

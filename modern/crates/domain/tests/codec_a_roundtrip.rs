@@ -38,6 +38,7 @@ use domain::records::{
     TransactionRecord, TransactionTypeRecord, UserSecurityRecord,
 };
 use domain::sensitive::{CardNumber, Cvv, Password, Ssn};
+use insta::internals::SnapshotContents;
 use proptest::prelude::*;
 use proptest::strategy::Union;
 use rust_decimal::Decimal;
@@ -934,13 +935,50 @@ impl DecodedCorpus {
     }
 }
 
+/// Fails the test unless `rendered` matches this file's committed snapshot `name`,
+/// `tests/snapshots/codec_a_roundtrip__<name>.snap`, as insta matches a named file snapshot: both
+/// texts with their leading line breaks and trailing whitespace trimmed and every CRLF read as LF.
+/// The snapshot is only read, never written or refreshed. A mismatch names the snapshot, both
+/// lengths and the first differing byte offset, never the text, which holds fixture values.
+fn compare_snapshot(name: &str, rendered: &str) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("snapshots")
+        .join(format!("codec_a_roundtrip__{name}.snap"));
+    let snapshot = insta::Snapshot::from_file(&path)
+        .unwrap_or_else(|err| panic!("the committed snapshot {name} cannot be read: {err}"));
+    let SnapshotContents::Text(committed) = snapshot.contents() else {
+        panic!("the committed snapshot {name} is not a text snapshot");
+    };
+    let expected = committed.to_string();
+    let actual = rendered
+        .trim_start_matches(['\r', '\n'])
+        .trim_end()
+        .replace("\r\n", "\n");
+    if actual == expected {
+        return;
+    }
+    let differs_at = actual
+        .bytes()
+        .zip(expected.bytes())
+        .position(|(got, want)| got != want)
+        .unwrap_or_else(|| actual.len().min(expected.len()));
+    panic!(
+        "the rendering differs from the committed snapshot {name} at byte {differs_at}: {} bytes \
+         rendered, {} committed",
+        actual.len(),
+        expected.len()
+    );
+}
+
 // audit: FIXFRM-010
 #[test]
 fn decoded_corpus_matches_its_snapshot() {
     let corpus = DecodedCorpus::decode();
     assert_eq!(corpus.fixture_records(), 626, "fixture records");
     assert_eq!(corpus.usrsec.len(), USERS.len(), "USRSEC records");
-    insta::assert_debug_snapshot!("decoded_corpus", corpus);
+    // The pretty `Debug` rendering, `{:#?}`, as insta's debug snapshots render a value.
+    compare_snapshot("decoded_corpus", &format!("{corpus:#?}"));
 }
 
 // ---------------------------------------------------------------------------------------------

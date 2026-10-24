@@ -51,7 +51,8 @@
 //! | acknowledgement fails | confirmed | none | requeued by the broker, nothing written (COPAUA0C-118) |
 //! | summary update fails | confirmed | `I003` | acknowledged, nothing written (COPAUA0C-119) |
 //! | detail insert fails | confirmed | `I004` | acknowledged, summary committed alone (COPAUA0C-120) |
-//! | commit fails | confirmed | none; an `ERROR` event | acknowledged, nothing written (COPAUA0C-121) |
+//! | commit refused by the server | confirmed | none; an `ERROR` event | acknowledged, rolled back, nothing written (COPAUA0C-121) |
+//! | connection lost during the commit | confirmed | none; an `ERROR` event | acknowledged, outcome unknown: the summary update and any detail insert may have committed; not reconciled (COPAUA0C-121) |
 //! | a store read fails | interim `05`/`9000` | `C001`, `C002`, `C003`, `I001` or `I002`, unless the database is unavailable | acknowledged, nothing written (COPAUA0C-122 to COPAUA0C-126, `X-COPAUA0C-1`) |
 //!
 //! A failed store read ends the COBOL task before its reply, with the request already removed by
@@ -234,8 +235,10 @@ pub trait AuthTx: Send {
     ///
     /// # Errors
     ///
-    /// The [`PersistenceError`] of the failed commit; the transaction is rolled back then
-    /// (COPAUA0C-121).
+    /// The [`PersistenceError`] of the failed commit (COPAUA0C-121). A commit the server refuses
+    /// is rolled back, so nothing of the transaction is written. On
+    /// [`PersistenceError::Unavailable`], a connection lost during the commit, whether the
+    /// transaction committed is unknown: `PostgreSQL` can commit before its answer is lost.
     fn commit(self) -> impl Future<Output = Result<(), PersistenceError>> + Send;
 
     /// Rolls the transaction back, which releases the summary lock and removes a summary this
@@ -760,8 +763,9 @@ impl<S: AuthStore, A: Acknowledger> Message<'_, S, A> {
     ///   changes (COPAUA0C-119).
     /// - A failed detail insert: `I004`, and the summary update still commits (COPAUA0C-099,
     ///   COPAUA0C-120).
-    /// - A failed commit: an `ERROR` event only; the confirmed reply stands unrecorded
-    ///   (COPAUA0C-121, E29).
+    /// - A failed commit: an `ERROR` event only (COPAUA0C-121, E29). A commit the server refuses
+    ///   is rolled back, and the confirmed reply stands unrecorded. After a connection lost
+    ///   during the commit, the outcome is unknown, and the worker does not reconcile it.
     async fn write_after_ack(
         &self,
         mut tx: S::Tx,
@@ -1184,7 +1188,10 @@ fn detail_insert_failed(error: &PersistenceError) {
     );
 }
 
-/// `ERROR` when the authorization did not commit, with the store `error`.
+/// `ERROR` when the authorization commit failed with the store `error`. Its message tells the
+/// two cases apart: [`PersistenceError::Unavailable`], a connection lost during the commit,
+/// leaves the outcome unknown and unreconciled; any other error is a commit the server refused
+/// and rolled back, so the confirmed reply stands unrecorded.
 fn commit_failed(error: &PersistenceError) {
     static SITE: EventSite<2> = EventSite::new(&METADATA);
     static METADATA: Metadata<'static> = event_metadata(
@@ -1194,13 +1201,14 @@ fn commit_failed(error: &PersistenceError) {
         &["message", "error"],
         &SITE,
     );
-    emit(
-        &SITE,
-        [
-            Some(&"the authorization did not commit; the confirmed reply stands unrecorded"),
-            Some(&field::display(error)),
-        ],
-    );
+    let message = if matches!(error, PersistenceError::Unavailable) {
+        "the connection was lost during the authorization commit; whether it committed is \
+         unknown, and it is not reconciled"
+    } else {
+        "the server refused the authorization commit and rolled it back; the confirmed reply \
+         stands unrecorded"
+    };
+    emit(&SITE, [Some(&message), Some(&field::display(error))]);
 }
 
 /// `WARN` when the acknowledgement of a confirmed reply failed with `error`, so nothing is
@@ -1411,10 +1419,11 @@ fn rollback_failed(error: &PersistenceError) {
 #[cfg(test)]
 mod tests {
     use domain::messaging::copaua0c::{CardNumberCause, CardNumberError};
+    use persistence::PersistenceError;
     use runtime::telemetry::{ALERT_TARGET, IdKey, ScreenedText};
     use test_support::trace_capture;
 
-    use super::{Undelivered, reply_queue, unparseable_alert};
+    use super::{Undelivered, commit_failed, reply_queue, unparseable_alert};
     use crate::broker::Request;
 
     // audit: COPAUA0C-006
@@ -1488,6 +1497,50 @@ mod tests {
             ",ABC",
         ] {
             assert!(!text.contains(value), "{value:?} in {text}");
+        }
+    }
+
+    // audit: COPAUA0C-121
+    #[test]
+    fn the_commit_failed_event_tells_a_refused_commit_from_a_lost_connection() {
+        let cases = [
+            (
+                PersistenceError::Database {
+                    sqlstate: Some("40001".to_owned()),
+                    constraint: None,
+                },
+                concat!(
+                    r#""message":"the server refused the authorization commit and rolled it "#,
+                    r#"back; the confirmed reply stands unrecorded""#
+                ),
+                r#""error":"database error (SQLSTATE 40001)""#,
+            ),
+            (
+                PersistenceError::Unavailable,
+                concat!(
+                    r#""message":"the connection was lost during the authorization commit; "#,
+                    r#"whether it committed is unknown, and it is not reconciled""#
+                ),
+                r#""error":"database unavailable""#,
+            ),
+        ];
+        for (error, message, shown_error) in cases {
+            let capture = trace_capture::capture();
+            commit_failed(&error);
+
+            let lines = capture.lines();
+            let [line] = lines.as_slice() else {
+                panic!("expected exactly one line for {error:?}, got {lines:?}");
+            };
+            for member in [r#""level":"ERROR""#, message, shown_error] {
+                assert!(line.contains(member), "{member} missing from {line}");
+            }
+            assert_eq!(
+                shown_error,
+                format!(r#""error":"{error}""#),
+                "{}",
+                capture.text()
+            );
         }
     }
 

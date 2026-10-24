@@ -57,12 +57,15 @@
 //! requester receives when a write fails.
 //!
 //! The order keeps the COBOL's exposure too: a requester can hold a delivered decision that is
-//! never recorded. When the summary write fails (`I003`, COPAUA0C-119), or the commit fails or
-//! the process or connection is lost after the acknowledgement (COPAUA0C-121), the transaction
-//! rolls back and the lock is released with the summary unchanged. The approval is not counted in
-//! `approved_auth_amt`, so the account's real exposure can exceed the committed figure the
-//! credit-limit lock guards, and nothing is redelivered, as the request was acknowledged. A
-//! failed detail insert (`I004`, COPAUA0C-120) commits the summary without its detail.
+//! never recorded. When the summary write fails (`I003`, COPAUA0C-119), or the server refuses
+//! the commit, or the process or connection is lost after the acknowledgement and before the
+//! commit (COPAUA0C-121), the transaction rolls back and the lock is released with the summary
+//! unchanged. The approval is not counted in `approved_auth_amt`, so the account's real exposure
+//! can exceed the committed figure the credit-limit lock guards, and nothing is redelivered, as
+//! the request was acknowledged. When the connection is lost during the commit (COPAUA0C-121),
+//! the outcome is unknown: the approval may be counted in `approved_auth_amt`, and it is not
+//! reconciled. A failed detail insert (`I004`, COPAUA0C-120) commits the summary without its
+//! detail.
 //!
 //! The order stands only with the named reviewer's dated signature in the
 //! `E29 — CP00 reply before write` row of `modern/audit/README.md`; until then
