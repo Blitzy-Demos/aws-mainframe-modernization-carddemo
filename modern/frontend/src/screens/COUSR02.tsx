@@ -5,7 +5,7 @@ import { useLocation, useNavigate } from "react-router";
 import { useCousr02cFetch, useCousr02cUpdate } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldControl } from "@/components/screen/FieldControl";
-import { FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_BOX_HEIGHT, FIELD_INPUT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
@@ -55,7 +55,8 @@ const EMPTY: Cousr02Values = {
  * Colour tokens of AAP 0.4.3. The GREEN and TURQUOISE labels and the GREEN inputs are the
  * foreground; the BLUE hints keep `FormDescription`'s muted foreground; the YELLOW rule has no
  * token and is emphasis on the foreground. Static texts never wrap (`whitespace-pre`) and are
- * centred on their line, which every input makes `h-9` tall, so they stand level with the inputs.
+ * centred on their line, which every input makes as tall as the shared map-field box
+ * (`FIELD_BOX_HEIGHT`, `h-7`), so they stand level with the inputs.
  * The inputs of two or more characters take the shared map-field box (`FIELD_INPUT`, with `size`
  * = their `LENGTH`), so a full-length value shows on the narrowest frame.
  */
@@ -73,10 +74,10 @@ const RULE_TEXT = "*".repeat(70);
  * `FIELD_INPUT` box holding its character, would both reach that hint on the frame's minimum
  * width, so this input keeps the narrowest padding step instead of the shared inset and takes the
  * width of one character: it reaches into the empty attribute column after it (column 18) but not
- * into the hint. Its type size is the inputs' `text-sm` (AAP 0.4.3); its border and focus ring
- * stay the component's.
+ * into the hint. Its type size is the inputs' `text-sm` (AAP 0.4.3) and its height the shared
+ * map-field box height (`FIELD_BOX_HEIGHT`); its border and focus ring stay the component's.
  */
-const ONE_CHAR_VALUE = "min-w-4 px-0.5 text-center text-sm text-foreground";
+const ONE_CHAR_VALUE = `${FIELD_BOX_HEIGHT} min-w-4 px-0.5 text-center text-sm text-foreground`;
 
 /** `ScreenError.field` wire name → the input it names; the input of `MOVE -1 TO <field>L`. */
 const FIELD_BY_WIRE: Readonly<Record<string, FieldName>> = {

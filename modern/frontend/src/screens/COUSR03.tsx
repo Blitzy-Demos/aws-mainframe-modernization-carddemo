@@ -13,7 +13,7 @@ import { useLocation, useNavigate } from "react-router";
 import { useCousr02cFetch, useCousr03cDelete } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldControl } from "@/components/screen/FieldControl";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_BOX_HEIGHT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
@@ -71,6 +71,7 @@ const SCREEN_PATHS: ReadonlySet<string> = new Set(Object.values(PATHS));
  * Width of an input: its `LENGTH` columns, and never fewer characters than its `size`, which each
  * input sets to its `LENGTH`. BLITZY [LAYOUT]: on narrow screens the 80 columns are narrower than
  * the characters, and the floor keeps the user ID and the full 20-character names unclipped.
+ * Every input's height is the shared map-field box height (`FIELD_BOX_HEIGHT`), set beside it.
  */
 const FIELD_WIDTH = "min-w-max";
 
@@ -134,7 +135,10 @@ type OutputFieldProps = {
   value: string;
   /** Focus target for a `ScreenError` that names this field. */
   inputRef: RefObject<HTMLInputElement | null>;
-  /** Width and colour utilities in place of the default `FIELD_WIDTH` and BLUE value colour. */
+  /**
+   * Width and colour utilities in place of the default `FIELD_WIDTH` and BLUE value colour; the
+   * shared map-field box height (`FIELD_BOX_HEIGHT`) applies either way.
+   */
   inputClassName?: string;
   /** The text of a red `ScreenError` that names this field, while the message row shows it. */
   error?: string;
@@ -168,6 +172,7 @@ function OutputField({
   const messageId = `${id}-message`;
   const invalid = error !== undefined;
   const describedBy = [hintId ?? "", invalid ? messageId : ""].filter((name) => name !== "");
+  const widthAndColour = inputClassName ?? `${FIELD_WIDTH} text-muted-foreground`;
   return (
     <>
       <GridCell row={row} col={labelCol} span={labelSpan}>
@@ -186,7 +191,7 @@ function OutputField({
           size={span}
           aria-invalid={invalid || undefined}
           aria-describedby={describedBy.length > 0 ? describedBy.join(" ") : undefined}
-          className={inputClassName ?? `${FIELD_WIDTH} text-muted-foreground`}
+          className={`${FIELD_BOX_HEIGHT} ${widthAndColour}`}
         />
         {invalid && (
           <p id={messageId} className="sr-only">
@@ -480,7 +485,7 @@ export function COUSR03(): ReactNode {
                         autoFocus
                         autoComplete="off"
                         spellCheck={false}
-                        className={FIELD_WIDTH}
+                        className={`${FIELD_BOX_HEIGHT} ${FIELD_WIDTH}`}
                       />
                     </FieldControl>
                   </GridCell>

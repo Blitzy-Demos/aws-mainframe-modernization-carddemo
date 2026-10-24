@@ -403,8 +403,8 @@ function isObjectOrNull(value: unknown): value is object | null {
 /**
  * Whether a thrown body is endpoint 4's error: a `ScreenError` whose `account` and `customer`
  * members, when present, are blocks (COACTVWC-008). A failure without a body, such as the
- * browser's network `TypeError`, has a string `message` and neither member, and passes as an
- * error with no block.
+ * network `TypeError` of `api/client.ts`, has a string `message` and neither member, and passes
+ * as an error with no block.
  */
 function isViewError(body: unknown): body is components["schemas"]["AccountViewError"] {
   return (

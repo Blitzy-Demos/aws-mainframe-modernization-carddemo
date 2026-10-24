@@ -1141,6 +1141,12 @@ describe("COTRTUP states", () => {
       expectEditable(editable);
       // The search form's read-only description and the details form's description alike.
       expectInputWidths();
+      // Every input, the header values included, has the one map-field box height (`h-7`, 28px).
+      expect(
+        Array.from(document.querySelectorAll("input")).filter(
+          (box) => !box.classList.contains("h-7") || !box.classList.contains("py-0"),
+        ),
+      ).toEqual([]);
       // A protected input is out of the Tab order; the program's cursor still reaches it.
       expectTabStops(editable);
       expect(redFields()).toEqual(red);

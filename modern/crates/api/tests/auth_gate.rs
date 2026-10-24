@@ -15,7 +15,9 @@
 //! The acting identity comes only from the verified token (AAP 0.5.1, 0.3.4.6): valid tokens come
 //! only from endpoint 1, and a spoofed header or query value does not change the gate's answer.
 //! The 401 and 403 texts are this crate's own, so they are compared with the
-//! `api::auth::extract` constants; the sign-on literals are copied from the audit rows.
+//! `api::auth::extract` constants; the sign-on literals are copied from the audit rows. Every
+//! response read here is checked for the bearer challenge: a 401 carries exactly one
+//! `WWW-Authenticate: Bearer` (RFC 9110 §11.6.1, RFC 6750 §3), and any other status none.
 //!
 //! Every request goes to the router in process. Each test runs against its own `postgres:16`
 //! container, which `test_support` prepares and loads with the fixtures and removes when its
@@ -33,7 +35,7 @@ use api::auth::jwt::{JwtError, JwtKeys};
 use api::dto::INVALID_PATH;
 use axum::Router;
 use axum::body::{Body, to_bytes};
-use axum::http::{Method, Request, header};
+use axum::http::{HeaderMap, Method, Request, header};
 use chrono::NaiveDate;
 use domain::clock::FixedClock;
 use domain::copybook::PicX;
@@ -104,11 +106,31 @@ fn api(pg: &PostgresGuard) -> TestResult<Router> {
     Ok(app(state))
 }
 
+/// The bearer challenge of a response of `status` with `headers`: exactly one `WWW-Authenticate`
+/// value, `Bearer`, on a 401, and none on any other status.
+fn check_challenge(status: u16, headers: &HeaderMap) -> TestResult {
+    let challenges: Vec<String> = headers
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+        .collect();
+    let expected: &[&str] = if status == 401 { &["Bearer"] } else { &[] };
+    if challenges == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "a {status} response carries the WWW-Authenticate values {challenges:?}, not {expected:?}"
+        )
+        .into())
+    }
+}
+
 /// Sends `request` to `api` and returns the status and the JSON body, `Value::Null` when the
-/// body is empty.
+/// body is empty, once [`check_challenge`] has passed the response's headers.
 async fn send(api: &Router, request: Request<Body>) -> TestResult<(u16, Value)> {
     let response = api.clone().oneshot(request).await?;
     let status = response.status().as_u16();
+    check_challenge(status, response.headers())?;
     let bytes = to_bytes(response.into_body(), usize::MAX).await?;
     let json = if bytes.is_empty() {
         Value::Null
@@ -952,7 +974,8 @@ fn undecodable_path_operations() -> Vec<Operation> {
 }
 
 /// Sends `operation` with `authorization` and returns the status, the `Content-Type` and the
-/// body as text, so that a body that is not JSON is reported rather than failing the parse.
+/// body as text, so that a body that is not JSON is reported rather than failing the parse, once
+/// [`check_challenge`] has passed the response's headers.
 async fn send_untyped(
     api: &Router,
     operation: &Operation,
@@ -970,6 +993,7 @@ async fn send_untyped(
     };
     let response = api.clone().oneshot(request).await?;
     let status = response.status().as_u16();
+    check_challenge(status, response.headers())?;
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)

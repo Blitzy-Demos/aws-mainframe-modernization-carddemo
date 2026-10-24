@@ -13,8 +13,9 @@ import { routes } from "@/routes";
  * Every query and mutation runs whatever the browser reports about its network (`networkMode`
  * `"always"`): nothing is paused while the browser is offline, and nothing paused is sent by
  * itself when the network returns, perhaps from another screen. A request made offline goes to
- * `fetch` at once, whose network `TypeError` reaches the message row and frees the keys as any
- * other failure does; only the operator's next key sends anything again.
+ * `fetch` at once, whose network `TypeError` reaches the message row as the fixed no-answer
+ * message of `api/client.ts` and frees the keys as any other failure does; only the operator's
+ * next key sends anything again.
  */
 const queryClient = new QueryClient({
   defaultOptions: {

@@ -8,8 +8,10 @@
 //!
 //! - Every level down to `TRACE` is recorded, whatever `RUST_LOG` says, for every target but the
 //!   [`runtime::telemetry::SILENCED_TARGETS`] (the AMQP client `lapin`, its `amq_protocol`
-//!   crates and `pinky_swear`, and the I/O reactor crates `polling` and `async_io`).
-//!   [`runtime::telemetry::dependency_filter`] keeps those off here exactly as it does on
+//!   crates and `pinky_swear`, and the I/O reactor crates `polling` and `async_io`) and
+//!   [`runtime::telemetry::SERVER_NOTICE_TARGET`], the `PostgreSQL` server's notices, which are
+//!   recorded only at [`runtime::telemetry::SERVER_NOTICE_CEILING`] (`WARN`) and above.
+//!   [`runtime::telemetry::dependency_filter`] holds those back here exactly as it does on
 //!   standard output, so the capture records only what standard output can carry.
 //! - Every span writes one line when it opens and one when it closes, each with the span's
 //!   recorded fields. A span therefore shows its fields even when no event fires inside it,

@@ -10,6 +10,19 @@ const SCREEN_ROWS = 24;
 const SCREEN_COLUMNS = 80;
 
 /**
+ * The height of every map field's box, the one box metric of all 21 screens: the boxes sized to
+ * the value ({@link FIELD_INPUT}, {@link fieldInputClass}), those sized to the `LENGTH`
+ * ({@link fieldBox}, the `ScreenShell` header values included), the list selectors and the boxes
+ * a screen sizes itself all take it, so a body field stands as tall as the header boxes and a list
+ * input fits its {@link LIST_ROW} line.
+ *
+ * BLITZY [LAYOUT]: `h-7` (1.75rem, 28px) in place of the `Input` default `h-9`, and `py-0` in
+ * place of its `py-1`: the box's 26px inside its border holds the 20px `text-sm` line, which the
+ * default vertical padding would leave 18px for. Merged after the `Input`'s own classes by `cn`.
+ */
+export const FIELD_BOX_HEIGHT = "h-7 py-0";
+
+/**
  * The classes a map input sized to its value adds to the `Input`'s own, with `size` = the field's
  * `LENGTH`; {@link fieldBox} is the box sized to the `LENGTH` instead. A grid field of one or two
  * characters takes them through {@link fieldInputClass}, as does code that places fields of any
@@ -31,15 +44,18 @@ const SCREEN_COLUMNS = 80;
  *   `px-3`.
  * - `text-sm` is the input type size of AAP 0.4.3. It is set here because below the `md`
  *   breakpoint the Input uses `text-base`, whose wider glyphs would widen the box further.
+ * - {@link FIELD_BOX_HEIGHT} is the box height {@link fieldBox} shares, in place of the Input's
+ *   `h-9` and `py-1`.
  */
-export const FIELD_INPUT = "min-w-max px-1 text-sm field-sizing-content";
+export const FIELD_INPUT = `${FIELD_BOX_HEIGHT} min-w-max px-1 text-sm field-sizing-content`;
 
 /** The longest `LENGTH` whose grid field takes the short-field box of {@link fieldInputClass}. */
 const SHORT_FIELD_LENGTH = 2;
 
 /**
- * The `Input` classes of a grid field `length` characters long: {@link FIELD_INPUT}, and for a
- * field of one or two characters a `w-6` box in place of `w-full`.
+ * The `Input` classes of a grid field `length` characters long: {@link FIELD_INPUT}, with its
+ * {@link FIELD_BOX_HEIGHT}, and for a field of one or two characters a `w-6` box in place of
+ * `w-full`.
  *
  * BLITZY [LAYOUT]: a cell of one or two columns is at most about 22px wide, even on the widest
  * frame, and a box sized to an empty value is only its inset and border, about 11px. The short
@@ -94,15 +110,16 @@ function clamp(value: number, min: number, max: number): number {
  * can be narrower than a character, so at such a pitch the box extends into the field's trailing
  * attribute column: every character shows at any width, and the box stays within the field's
  * terminal footprint, `POS` to `POS + LENGTH`, before the next field starts. The text is
- * `text-sm` at every width (AAP 0.4.3), and the height and padding are shared, so the same
- * `LENGTH` gives the same box on every screen that takes it.
+ * `text-sm` at every width (AAP 0.4.3), the height is the {@link FIELD_BOX_HEIGHT} every map
+ * field's box shares, and the padding is shared, so the same `LENGTH` gives the same box on every
+ * screen that takes it.
  *
  * Callers merge it with `cn`, which lets it replace the `Input`'s own height, minimum width,
  * padding and text size.
  */
 export function fieldBox(length: number): string {
   const n = clamp(length, 1, SCREEN_COLUMNS);
-  return `h-7 w-full min-w-(--field-width) px-0.5 py-0 text-sm field-length-${n}`;
+  return `${FIELD_BOX_HEIGHT} w-full min-w-(--field-width) px-0.5 text-sm field-length-${n}`;
 }
 
 /**
@@ -204,13 +221,13 @@ export function GridTable({ row, col, span, rowSpan = 1, children }: GridTablePr
 
 /**
  * The height of one list row in a {@link GridTable}: one map line, as tall as a map field's box
- * ({@link fieldBox}, `h-7`). Every caption, dash and list row has it, whatever it holds, so a page
- * with fewer rows keeps the same lines.
+ * ({@link FIELD_BOX_HEIGHT}, `h-7`). Every caption, dash and list row has it, whatever it holds, so
+ * a page with fewer rows keeps the same lines.
  *
  * BLITZY [LAYOUT]: `h-7` instead of the 40px caption row of the `TableHead` default `h-10`
- * (which {@link LIST_CELL} lifts), and the row's input as compact as a field box, so the list lines
- * stand one after another as the terminal's do and a list screen, up to the twelve list lines of
- * COTRN00, fits a 1024 × 768 viewport with its message row and keys.
+ * (which {@link LIST_CELL} lifts), and the row's input in the shared field-box height, so the list
+ * lines stand one after another as the terminal's do and a list screen, up to the twelve list
+ * lines of COTRN00, fits a 1024 × 768 viewport with its message row and keys.
  */
 export const LIST_ROW = "h-7";
 

@@ -9,6 +9,7 @@ import {
   Routes,
   useLocation,
 } from "react-router";
+import { NO_ANSWER_MESSAGE } from "@/api/client";
 import type { components } from "@/api/schema";
 import { clearSession, getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -32,13 +33,22 @@ import { COBIL00 } from "./COBIL00";
 const ENDPOINT = "/api/v1/bill-payments";
 
 /**
- * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `h-7` and `py-0` are the
+ * one box height every map field shares (`FIELD_BOX_HEIGHT`, 28px), `min-w-max` and
  * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
- * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
- * contract imports no module beside the screen, the session, the routes and the generated types,
- * so a box is checked against this list rather than against the constant that renders it.
+ * map input shares and `text-sm` the inputs' type size. Restated here, not imported from
+ * FieldGrid, so a box is checked against the map's contract rather than against the constant that
+ * renders it; the only client constant this file imports is `NO_ANSWER_MESSAGE`, which the
+ * client, not the map, owns.
  */
-const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+const MAP_FIELD_BOX = [
+  "h-7",
+  "py-0",
+  "min-w-max",
+  "px-1",
+  "text-sm",
+  "field-sizing-content",
+] as const;
 
 /** The account of the last `acctdata.txt` record, whose balance is shown and paid. */
 const ACCT = "00000000050";
@@ -1786,9 +1796,10 @@ function fireNetworkEvent(type: "offline" | "online"): void {
 
 // The application's own query client (`App.tsx`), not a test client, decides whether a request
 // made with no network is sent at once or held until the network returns. It is sent: `fetch`
-// rejects with the browser's network `TypeError`, which the message row shows as any failure, and
-// the keyboard is free again. Nothing is held, so the network's return after F3 sends nothing:
-// only the operator's next key sends a request again (`api/client.ts`).
+// rejects with the browser's network `TypeError`, the message row shows the client's fixed
+// no-answer message in place of the browser's words as it shows any failure, and the keyboard is
+// free again. Nothing is held, so the network's return after F3 sends nothing: only the
+// operator's next key sends a request again (`api/client.ts`).
 describe("COBIL00 in the application: ENTER with no network", () => {
   afterEach(() => {
     // The online state lives in TanStack Query's process-wide `onlineManager`: the next test
@@ -1796,7 +1807,7 @@ describe("COBIL00 in the application: ENTER with no network", () => {
     onlineManager.setOnline(true);
   });
 
-  it("fails at once with the browser's message, frees the keys, and sends nothing when the network returns", async () => {
+  it("fails at once with the client's no-answer message, frees the keys, and sends nothing when the network returns", async () => {
     const network = { up: true };
     const requests = stubNetwork(network);
     // `App` mounts a query client of its own, which no test can import; this spy on the `mount`
@@ -1819,11 +1830,13 @@ describe("COBIL00 in the application: ENTER with no network", () => {
       typeInputs(OFFLINE_ACCT, "");
       pressEnter();
 
-      // The request is attempted at once and fails at once: the message row shows why, and ENTER,
-      // F4 and the inputs are free, the typed account kept.
+      // The request is attempted at once and fails at once: the message row shows the client's
+      // fixed message, never the browser's, and ENTER, F4 and the inputs are free, the typed
+      // account kept.
       await waitFor(() => {
-        expect(messageRow().textContent).toBe(NO_NETWORK);
+        expect(messageRow().textContent).toBe(NO_ANSWER_MESSAGE);
       });
+      expect(container.textContent).not.toContain(NO_NETWORK);
       expect(paths(requests)).toEqual([ENDPOINT]);
       expect(await bodies(requests)).toStrictEqual([{ acct_id: OFFLINE_ACCT, confirm: "" }]);
       expect(container.querySelector("form")?.getAttribute("aria-busy")).toBe("false");
@@ -1843,8 +1856,9 @@ describe("COBIL00 in the application: ENTER with no network", () => {
         await screen.findByRole("heading", { level: 1, name: "Main Menu" }, { timeout: 5_000 }),
       ).toBeDefined();
       await waitFor(() => {
-        expect(errorText()).toBe(NO_NETWORK);
+        expect(errorText()).toBe(NO_ANSWER_MESSAGE);
       });
+      expect(container.textContent).not.toContain(NO_NETWORK);
       expect(paths(requests)).toEqual([ENDPOINT, MENU_ENDPOINT]);
 
       // The network returns: the abandoned ENTER is not sent from the menu. Nothing on screen

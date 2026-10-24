@@ -38,13 +38,21 @@ import { CORPT00 } from "./CORPT00";
 const ENDPOINT = "/api/v1/reports/transactions";
 
 /**
- * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `min-w-max` and
+ * The classes of the shared map-field box, FieldGrid's `FIELD_INPUT`: `h-7` and `py-0` are the
+ * one box height every map field shares (`FIELD_BOX_HEIGHT`, 28px), `min-w-max` and
  * `field-sizing-content` keep a box never narrower than its value, `px-1` is the one inset every
  * map input shares and `text-sm` the inputs' type size. Restated here because the render-test
  * contract imports no module beside the screen, the session, the routes and the generated types,
  * so a box is checked against this list rather than against the constant that renders it.
  */
-const MAP_FIELD_BOX = ["min-w-max", "px-1", "text-sm", "field-sizing-content"] as const;
+const MAP_FIELD_BOX = [
+  "h-7",
+  "py-0",
+  "min-w-max",
+  "px-1",
+  "text-sm",
+  "field-sizing-content",
+] as const;
 
 /** Accessible names of the inputs the tests address directly. */
 const MONTHLY = "Monthly (Current Month)";

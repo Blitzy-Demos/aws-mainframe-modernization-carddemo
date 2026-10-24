@@ -2,12 +2,13 @@
 //! `OpenTelemetry` span export to standard output, and the span shapes every service uses.
 //!
 //! [`init`] installs the global subscriber once per process: the [`dependency_filter`] that
-//! silences the AMQP client's and its I/O reactor's own diagnostics, an `EnvFilter` read from
-//! `RUST_LOG` (unset means `info`), the JSON layer of [`json_layer`] over standard output, a
-//! second layer of that format that writes only the closing of each HTTP request span and,
-//! when `CARDDEMO_OTEL_EXPORT=stdout`, a `tracing-opentelemetry` layer whose finished spans the
-//! `opentelemetry-stdout` exporter prints. Output goes to standard output only: there is no
-//! collector, no network exporter and no cloud service.
+//! silences the AMQP client's and its I/O reactor's own diagnostics and holds back the database
+//! server's notices below `WARN`, an `EnvFilter` read from `RUST_LOG` (unset means `info`), the
+//! JSON layer of [`json_layer`] over standard output, a second layer of that format that writes
+//! only the closing of each HTTP request span and, when `CARDDEMO_OTEL_EXPORT=stdout`, a
+//! `tracing-opentelemetry` layer whose finished spans the `opentelemetry-stdout` exporter prints.
+//! Output goes to standard output only: there is no collector, no network exporter and no cloud
+//! service.
 //!
 //! # Standard output format
 //!
@@ -77,12 +78,16 @@
 //! broker password included, and at `ERROR` the close text the broker composes. The reactor
 //! crates `polling` and `async_io` under `lapin`'s executor log every poll at `TRACE` through the
 //! `log` crate, dozens of lines a second while idle, each naming its source file under the host's
-//! cargo registry, and log nothing above `TRACE` on Linux. [`init`] therefore installs
+//! cargo registry, and log nothing above `TRACE` on Linux. The database driver `sqlx` logs each
+//! notice the `PostgreSQL` server sends under [`SERVER_NOTICE_TARGET`], a `NOTICE` at `INFO`, with
+//! text the server composes; the migrator draws one, `relation "_sqlx_migrations" already exists,
+//! skipping`, on every run of `carddemo-migrate`. [`init`] therefore installs
 //! [`dependency_filter`] as a global filter of its own, ahead of the `RUST_LOG` filter. An event
 //! or span is recorded only when both filters enable it, so no `RUST_LOG` directive (`trace`,
-//! `lapin=trace`, `lapin::channels=trace`, `polling=trace`, …) re-enables one of the
-//! [`SILENCED_TARGETS`], while `RUST_LOG` alone, `info` by default, governs every other target in
-//! every binary.
+//! `lapin=trace`, `lapin::channels=trace`, `polling=trace`, `sqlx::postgres::notice=trace`, …)
+//! re-enables one of the [`SILENCED_TARGETS`] or a server notice below [`SERVER_NOTICE_CEILING`],
+//! while `RUST_LOG` alone, `info` by default, governs every other target, `sqlx::query` and the
+//! server's `WARNING` and `ERROR` notices included, in every binary.
 //!
 //! # Alerts
 //!
@@ -179,6 +184,31 @@ pub const SILENCED_TARGETS: [&str; 5] = [
     "async_io",
 ];
 
+/// The target under which the database driver `sqlx` logs each notice a `PostgreSQL` server
+/// sends on a connection; [`dependency_filter`] records one only at [`SERVER_NOTICE_CEILING`] or
+/// above, whatever `RUST_LOG` says.
+///
+/// The driver gives the event a level from the notice's severity: `ERROR`, `FATAL` and `PANIC`
+/// become `ERROR`, `WARNING` becomes `WARN`, `NOTICE` becomes `INFO`, `DEBUG` stays `DEBUG`, and
+/// `INFO` and `LOG` become `TRACE`. A notice below `WARNING` is informational chatter, such as
+/// the server's answer to `CREATE TABLE IF NOT EXISTS` on a table that exists. The `sqlx`
+/// migrator issues that statement for its bookkeeping table `_sqlx_migrations` on every run,
+/// after the entrypoint of [`crate::migrate`] has ensured the table itself, so without the
+/// ceiling every run of `carddemo-migrate`, against a fresh database too, would print `relation
+/// "_sqlx_migrations" already exists, skipping` at `INFO`. The server composes a notice's text,
+/// and that text passes no redaction of this workspace. A `WARNING` or `ERROR` notice still reaches
+/// standard output whenever `RUST_LOG` enables it.
+///
+/// A target matches by string prefix, as `tracing_subscriber::filter::Targets` compares them, so
+/// the ceiling holds for this target alone: `sqlx::query`, the driver's log of each statement it
+/// runs, and every other `sqlx` target stay for `RUST_LOG` to decide.
+pub const SERVER_NOTICE_TARGET: &str = "sqlx::postgres::notice";
+
+/// The most verbose level at which an event of [`SERVER_NOTICE_TARGET`] is recorded: `WARN`, so a
+/// server's `WARNING` and `ERROR` notices pass and its `NOTICE`, `INFO`, `LOG` and `DEBUG`
+/// notices never do.
+pub const SERVER_NOTICE_CEILING: LevelFilter = LevelFilter::WARN;
+
 /// The JSON format layer of the `CardDemo` tracing output, writing through `make_writer`.
 ///
 /// Each event is one JSON line with its level, target, fields, the current span and the list of
@@ -200,15 +230,16 @@ where
         .with_writer(make_writer)
 }
 
-/// The filter that turns every target of [`SILENCED_TARGETS`] off and passes every other target
-/// at every level.
+/// The filter that turns every target of [`SILENCED_TARGETS`] off, passes [`SERVER_NOTICE_TARGET`]
+/// only at [`SERVER_NOTICE_CEILING`] and above, and passes every other target at every level.
 ///
 /// [`init`] installs it as a global layer ahead of the `RUST_LOG` filter. Every global filter of
 /// a subscriber must enable an event or span for any layer to record it, so the two filters
-/// combine as an AND: no `RUST_LOG` directive re-enables a silenced target, and `RUST_LOG` alone
-/// decides every other one. A record a dependency writes through the `log` crate is checked
-/// against its own target, such as `polling::epoll`, before the `tracing-log` bridge dispatches
-/// it, so the filter drops a silenced crate's `log` records as well as its `tracing` events.
+/// combine as an AND: no `RUST_LOG` directive re-enables a silenced target or a server notice
+/// below the ceiling, and `RUST_LOG` alone decides every other target and the server notices at
+/// or above it. A record a dependency writes through the `log` crate is checked against its own
+/// target, such as `polling::epoll`, before the `tracing-log` bridge dispatches it, so the filter
+/// drops a silenced crate's `log` records as well as its `tracing` events.
 /// `test-support`'s trace capture installs it too, so that a capture records exactly what
 /// standard output can carry.
 #[must_use]
@@ -216,6 +247,7 @@ pub fn dependency_filter() -> Targets {
     Targets::new()
         .with_default(LevelFilter::TRACE)
         .with_targets(SILENCED_TARGETS.map(|target| (target, LevelFilter::OFF)))
+        .with_target(SERVER_NOTICE_TARGET, SERVER_NOTICE_CEILING)
 }
 
 /// The layer that writes one `INFO` line in the [`json_layer`] format when a [`request_span`]
@@ -285,15 +317,17 @@ where
 
 /// Installs the process-wide tracing subscriber.
 ///
-/// The subscriber drops every event and span of the [`SILENCED_TARGETS`] through
-/// [`dependency_filter`], whatever `RUST_LOG` says, filters every other target with `RUST_LOG`
-/// (unset or empty means `info`), writes JSON lines to standard output through [`json_layer`],
-/// one for each event and, through its request close layer, one `INFO` line for each closed
-/// [`request_span`] carrying its method, route template, status and latency, and, for
-/// [`OtelExport::Stdout`], also bridges spans into an `OpenTelemetry` tracer provider
+/// The subscriber drops every event and span of the [`SILENCED_TARGETS`], and every server notice
+/// of [`SERVER_NOTICE_TARGET`] below [`SERVER_NOTICE_CEILING`], through [`dependency_filter`],
+/// whatever `RUST_LOG` says, filters every other target and every server notice at or above the
+/// ceiling with `RUST_LOG` (unset or empty means `info`), writes JSON lines to standard output
+/// through [`json_layer`], one for each event and, through its request close layer, one `INFO`
+/// line for each closed [`request_span`] carrying its method, route template, status and latency,
+/// and, for [`OtelExport::Stdout`], also bridges spans into an `OpenTelemetry` tracer provider
 /// whose simple span processor prints each finished span to standard output. [`OtelExport::Off`]
 /// adds no `OpenTelemetry` layer. A binary calls it before it connects to a broker or a
-/// database, so the silenced targets are off from the first frame.
+/// database, so the silenced targets and the server notices below the ceiling are off from the
+/// first frame and the first query.
 ///
 /// With [`OtelExport::Stdout`], the `opentelemetry-stdout` exporter writes each finished span as a
 /// multi-line, human-readable text block between the JSON event lines, so standard output is no
@@ -1269,6 +1303,33 @@ mod tests {
         message_probe("messaging::workers", Level::TRACE, &APPLICATION_PROBES[2]),
     ];
 
+    /// The callsites of the server notice probes: a `TRACE`, `DEBUG`, `INFO`, `WARN` and `ERROR`
+    /// event of target `sqlx::postgres::notice`, the target and levels under which `sqlx` logs a
+    /// `PostgreSQL` server's notices, whose one field is their `message`.
+    static NOTICE_PROBES: [Site<1>; 5] = [
+        Site::new(&NOTICE_PROBE_METADATA[0]),
+        Site::new(&NOTICE_PROBE_METADATA[1]),
+        Site::new(&NOTICE_PROBE_METADATA[2]),
+        Site::new(&NOTICE_PROBE_METADATA[3]),
+        Site::new(&NOTICE_PROBE_METADATA[4]),
+    ];
+
+    static NOTICE_PROBE_METADATA: [Metadata<'static>; 5] = [
+        message_probe("sqlx::postgres::notice", Level::TRACE, &NOTICE_PROBES[0]),
+        message_probe("sqlx::postgres::notice", Level::DEBUG, &NOTICE_PROBES[1]),
+        message_probe("sqlx::postgres::notice", Level::INFO, &NOTICE_PROBES[2]),
+        message_probe("sqlx::postgres::notice", Level::WARN, &NOTICE_PROBES[3]),
+        message_probe("sqlx::postgres::notice", Level::ERROR, &NOTICE_PROBES[4]),
+    ];
+
+    /// The callsite of the query log probe, a `DEBUG` event of target `sqlx::query`, the target
+    /// and level under which `sqlx` logs each statement it runs, whose one field is its
+    /// `message`.
+    static QUERY_PROBE: Site<1> = Site::new(&QUERY_PROBE_METADATA);
+
+    static QUERY_PROBE_METADATA: Metadata<'static> =
+        message_probe("sqlx::query", Level::DEBUG, &QUERY_PROBE);
+
     /// The callsite of the `INFO` step probe of this module, whose fields are its `message` and
     /// `step`.
     static STEP_PROBE: Site<2> = Site::new(&STEP_PROBE_METADATA);
@@ -1860,6 +1921,85 @@ mod tests {
             for level in levels {
                 assert!(filter.would_enable(target, &level), "{target} at {level}");
             }
+        }
+    }
+
+    /// The dependency filter passes `sqlx`'s server notice target at `WARN` and `ERROR` only,
+    /// and every other `sqlx` target, the query log included, at every level, so only `RUST_LOG`
+    /// decides the latter.
+    #[test]
+    fn the_dependency_filter_caps_server_notices_at_warn_and_no_other_sqlx_target() {
+        let filter = dependency_filter();
+        let levels = [
+            Level::TRACE,
+            Level::DEBUG,
+            Level::INFO,
+            Level::WARN,
+            Level::ERROR,
+        ];
+        // Target, and whether the filter enables it at each of `levels`.
+        let cases = [
+            ("sqlx::postgres::notice", [false, false, false, true, true]),
+            ("sqlx::query", [true; 5]),
+            ("sqlx::postgres", [true; 5]),
+            ("sqlx", [true; 5]),
+        ];
+        for (target, enabled) in cases {
+            for (level, expected) in levels.into_iter().zip(enabled) {
+                assert_eq!(
+                    filter.would_enable(target, &level),
+                    expected,
+                    "{target} at {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_rust_log_directive_writes_a_server_notice_below_warn() {
+        // `RUST_LOG` value, whether it writes each of the `TRACE`, `DEBUG`, `INFO`, `WARN` and
+        // `ERROR` notice probes, and whether it writes the `DEBUG` query log probe.
+        let cases = [
+            ("trace", [false, false, false, true, true], true),
+            (
+                "sqlx::postgres::notice=trace,info",
+                [false, false, false, true, true],
+                false,
+            ),
+            ("sqlx=trace,info", [false, false, false, true, true], true),
+            ("info", [false, false, false, true, true], false),
+            ("error", [false, false, false, false, true], false),
+        ];
+        let messages = [
+            "notice trace probe",
+            "notice debug probe",
+            "notice info probe",
+            "notice warn probe",
+            "notice error probe",
+        ];
+        for (directives, notices, query) in cases {
+            let captured = Captured::default();
+            let subscriber = json_subscriber(EnvFilter::new(directives), captured.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                for (site, message) in NOTICE_PROBES.iter().zip(messages) {
+                    emit_event(site, [Some(&message)]);
+                }
+                emit_event(&QUERY_PROBE, [Some(&"query probe")]);
+            });
+            let output = captured.text();
+
+            for (message, written) in messages.into_iter().zip(notices) {
+                assert_eq!(
+                    output.contains(message),
+                    written,
+                    "{directives}: {message} in {output}"
+                );
+            }
+            assert_eq!(
+                output.contains("query probe"),
+                query,
+                "{directives}: query probe in {output}"
+            );
         }
     }
 

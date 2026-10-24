@@ -44,7 +44,7 @@ use std::marker::PhantomData;
 use axum::extract::{FromRequestParts, Path};
 use axum::http::request::Parts;
 use domain::online::cotrtupc as rules;
-use serde::de::{self, Deserializer, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{self, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -418,7 +418,7 @@ fn error_row(text: &str) -> Option<String> {
 // under their Rust names, in declaration order, an absent `Option` written as `null`; it reads
 // its members in any order, refuses one sent twice or a required one missing, takes `None` for
 // an absent `Option`, and skips an unknown member unread as `IgnoredAny`. A unit variant is its
-// wire name.
+// wire name, written as a JSON string and read from one alone.
 
 impl<'de> Deserialize<'de> for TypeCodePath {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -775,32 +775,29 @@ trait UnitEnum: Sized {
     fn from_wire(name: &str) -> Option<Self>;
 }
 
-/// `T` read from `deserializer` as a unit variant, through [`VariantVisitor`].
+/// `T` read from `deserializer` as a unit variant named by a JSON string alone, through
+/// [`VariantVisitor`]; any other value, serde's map form `{"PF4": null}` included, is refused.
 fn read_unit_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: UnitEnum,
 {
-    deserializer.deserialize_enum(T::NAME, T::VARIANTS, VariantVisitor(PhantomData))
+    deserializer.deserialize_str(VariantVisitor(PhantomData))
 }
 
-/// The visitor of [`read_unit_enum`]: a variant name `T` admits, carrying no value. A name it
-/// refuses is the unknown-variant error.
+/// The visitor of [`read_unit_enum`]: a text naming a variant `T` admits. A name it refuses is
+/// the unknown-variant error, and a value that is not text is the invalid-type error.
 struct VariantVisitor<T>(PhantomData<T>);
 
-impl<'de, T: UnitEnum> Visitor<'de> for VariantVisitor<T> {
+impl<T: UnitEnum> Visitor<'_> for VariantVisitor<T> {
     type Value = T;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "enum {}", T::NAME)
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
-        let (name, variant) = data.variant::<String>()?;
-        let value = T::from_wire(&name)
-            .ok_or_else(|| <A::Error as de::Error>::unknown_variant(&name, T::VARIANTS))?;
-        variant.unit_variant()?;
-        Ok(value)
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<T, E> {
+        T::from_wire(name).ok_or_else(|| E::unknown_variant(name, T::VARIANTS))
     }
 }
 
@@ -925,8 +922,20 @@ mod tests {
             assert_eq!(failure.message(), INVALID_KEY, "{wire}");
             assert_eq!(failure.class().http_status(), 400, "{wire}");
         }
-        for body in [json!({"aid": 5}), json!({"aid": null}), json!({})] {
-            assert!(serde_json::from_value::<TranTypeActionRequest>(body).is_err());
+        // serde's map form is no JSON string, whether it names a served key or another, so it
+        // is refused rather than read as an unserved key.
+        for body in [
+            json!({"aid": 5}),
+            json!({"aid": null}),
+            json!({}),
+            json!({"aid": {"PF4": null}}),
+            json!({"aid": {"PF5": null}}),
+            json!({"aid": {"PF12": null}}),
+        ] {
+            assert!(
+                serde_json::from_value::<TranTypeActionRequest>(body.clone()).is_err(),
+                "{body}"
+            );
         }
         Ok(())
     }
@@ -941,6 +950,8 @@ mod tests {
                 serde_json::from_value::<TranTypeMaintState>(json!(wire))?,
                 shown
             );
+            // serde's map form of the same name is no JSON string.
+            assert!(serde_json::from_value::<TranTypeMaintState>(json!({ wire: null })).is_err());
             assert!(!seen.contains(&shown), "{wire}");
             seen.push(shown);
         }

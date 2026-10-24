@@ -55,10 +55,11 @@
 //!   of endpoints 6 and 10, `fields` of endpoint 13, and the `rows` items, `state`, and the
 //!   `state.rows` and `state.screen_rows` items of endpoint 25, where `null` stays an empty
 //!   position), a path segment whose percent-encoding is not UTF-8, a
-//!   value of the wrong type (text where an integer belongs, for instance) and an unknown enum
-//!   value. An attention key whose program answers unserved keys itself (`cotrtupc`,
-//!   `cotrn02c`) reads every other key name as a hidden variant instead, so that the program's
-//!   invalid-key message, not this rejection, answers it.
+//!   value of the wrong type (text where an integer belongs, for instance), an unknown enum
+//!   value, and an enum member given as anything but a JSON string, serde's map form
+//!   `{"PF5": null}` included. An attention key whose program answers unserved keys itself
+//!   (`cotrtupc`, `cotrn02c`) reads every other key name in a JSON string as a hidden variant
+//!   instead, so that the program's invalid-key message, not this rejection, answers it.
 //! - A rule a DTO declares: 400 naming the first failing field in key order, as a path such as
 //!   `user_id`, `fields.zip` or `rows[3].description`, with the text of the rule's code
 //!   ([`FIELD_LENGTH_MESSAGE`] for `length` and [`PIC_X_CODE`], [`FIELD_NUMERIC_MESSAGE`] or
@@ -149,9 +150,7 @@ use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use axum::http::request::Parts;
 use domain::copybook::{PicU, PicX};
 use serde::de::value::MapAccessDeserializer;
-use serde::de::{
-    self, DeserializeOwned, Deserializer, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor,
-};
+use serde::de::{self, DeserializeOwned, Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::error::Category;
@@ -250,33 +249,31 @@ impl Serialize for PageDirection {
     }
 }
 
-/// `forward` or `backward`, from a JSON string, a query-string value or the map form
-/// `{"forward": null}`; any other text is serde's unknown-variant error.
+/// `forward` or `backward`, from a JSON string or a query-string value alone; any other text is
+/// serde's unknown-variant error, and any other JSON value, serde's map form `{"forward": null}`
+/// included, is an error too.
 impl<'de> Deserialize<'de> for PageDirection {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum("PageDirection", PAGE_DIRECTIONS, PageDirectionVisitor)
+        deserializer.deserialize_str(PageDirectionVisitor)
     }
 }
 
-/// The visitor of [`PageDirection`]'s `Deserialize`: a unit variant named by its text.
+/// The visitor of [`PageDirection`]'s `Deserialize`: a text naming a unit variant.
 struct PageDirectionVisitor;
 
-impl<'de> Visitor<'de> for PageDirectionVisitor {
+impl Visitor<'_> for PageDirectionVisitor {
     type Value = PageDirection;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum PageDirection")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<PageDirection, A::Error> {
-        let (text, variant) = data.variant::<String>()?;
-        let direction = match text.as_str() {
-            "forward" => PageDirection::Forward,
-            "backward" => PageDirection::Backward,
-            _ => return Err(de::Error::unknown_variant(&text, PAGE_DIRECTIONS)),
-        };
-        variant.unit_variant()?;
-        Ok(direction)
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<PageDirection, E> {
+        match text {
+            "forward" => Ok(PageDirection::Forward),
+            "backward" => Ok(PageDirection::Backward),
+            _ => Err(E::unknown_variant(text, PAGE_DIRECTIONS)),
+        }
     }
 }
 
@@ -1844,13 +1841,13 @@ mod tests {
         assert_maps!(cocrdlic, cotrn00c, cousr00c, copaus0c, cotrtlic);
     }
 
-    /// `PageDirection` from each form a request carries it in, a JSON string, the map form and a
-    /// query-string value; any other text, and any other JSON value, is refused.
+    /// `PageDirection` from each form a request carries it in, a JSON string and a query-string
+    /// value; any other text, and any other JSON value, serde's map form included, is refused.
     #[test]
     fn page_direction_reads_its_two_texts_in_every_form_and_nothing_else() -> TestResult {
         let bodies = [
             (r#""forward""#, Some(PageDirection::Forward)),
-            (r#"{"backward":null}"#, Some(PageDirection::Backward)),
+            (r#"{"backward":null}"#, None),
             (r#""Backward""#, None),
             (r#""sideways""#, None),
             (r#"{"forward":1}"#, None),
@@ -2135,12 +2132,13 @@ mod tests {
     }
 
     /// The request readers through the extractor: a member given twice, at the top level or in
-    /// a nested object, a missing required member and a value of the wrong type are each the 400
-    /// of a body that does not deserialise; an unknown member is skipped, and an absent or `null`
-    /// optional member and an absent defaulted one take their defaults, at every depth.
+    /// a nested object, a missing required member and a value of the wrong type, an enum member
+    /// in serde's map form `{"PF5": null}` included, are each the 400 of a body that does not
+    /// deserialise; an unknown member is skipped, and an absent or `null` optional member and an
+    /// absent defaulted one take their defaults, at every depth.
     #[test]
     fn request_bodies_refuse_repeated_missing_and_mistyped_members() -> TestResult {
-        let [account, ..] = nested_object_bodies();
+        let [account, _, _, list_action] = nested_object_bodies();
         let snapshot = account.get("snapshot").ok_or("no snapshot")?.to_string();
         // The endpoint 6 body with the member at `pointer` set to `value`, or removed for `None`.
         let with = |pointer: &str, value: Option<Value>| -> Result<String, Box<dyn StdError>> {
@@ -2162,6 +2160,7 @@ mod tests {
             with("/snapshot", None)?,
             with("/aid", Some(json!(5)))?,
             with("/aid", Some(json!({"PF5": 1})))?,
+            with("/aid", Some(json!({"PF5": null})))?,
             with("/fields/zip", Some(json!(7)))?,
             with("/fields/ssn_part1", Some(json!(123)))?,
             with("/snapshot/state", None)?,
@@ -2181,6 +2180,18 @@ mod tests {
             with("/fields/ssn_part1", Some(Value::Null))?,
             with("/fields", Some(json!({})))?,
         ];
+        // Endpoint 25's body with one enum member at a time in serde's map form, which names a
+        // variant the member admits as a JSON string.
+        let mut unreadable_list_actions = Vec::new();
+        for (pointer, map_form) in [
+            ("/aid", json!({"PF10": null})),
+            ("/state/pending_action", json!({"delete": null})),
+            ("/state/selectors", json!({"open": null})),
+        ] {
+            let mut body = list_action.clone();
+            *body.pointer_mut(pointer).ok_or(pointer)? = map_form;
+            unreadable_list_actions.push(body.to_string());
+        }
         block_on(async {
             for body in [
                 r#"{"user_id":"ADMIN001","user_id":"ADMIN002"}"#,
@@ -2206,6 +2217,15 @@ mod tests {
             }
             for body in &unreadable_account_updates {
                 assert_unreadable::<AccountUpdateRequest>(body).await?;
+            }
+            for body in &unreadable_list_actions {
+                assert_unreadable::<TranTypeListActionRequest>(body).await?;
+            }
+            // Endpoint 27's served keys and an unserved one, which a JSON string reads as the
+            // program's invalid key.
+            for aid in ["PF4", "PF5", "PF12"] {
+                let body = json!({"aid": {aid: null}, "description": "PURCHASE"});
+                assert_unreadable::<TranTypeActionRequest>(&body.to_string()).await?;
             }
             for body in &readable_account_updates {
                 let ValidJson(request) =

@@ -10,7 +10,7 @@ import {
   useLocation,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { REQUEST_DEADLINE_MS } from "@/api/client";
+import { NO_ANSWER_MESSAGE, REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -1979,9 +1979,6 @@ describe("COACTUP F3 in a data router", { timeout: TEST_TIMEOUT_MS }, () => {
   });
 });
 
-/** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */
-const TIMED_OUT = "No answer from the server within 30 seconds";
-
 /** The `aid` an endpoint 6 request body carries; `undefined` for a request without one. */
 function aidOf(body: unknown): unknown {
   return typeof body === "object" && body !== null && "aid" in body ? body.aid : undefined;
@@ -2054,14 +2051,14 @@ describe("COACTUP request deadline", { timeout: TEST_TIMEOUT_MS }, () => {
     vi.useRealTimers();
 
     await waitFor(() => {
-      expect(messageRow("error").textContent).toBe(TIMED_OUT);
+      expect(messageRow("error").textContent).toBe(NO_ANSWER_MESSAGE);
     });
     await settled();
     expect(signal.aborted).toBe(true);
     const reason: unknown = signal.reason;
     expect(reason instanceof DOMException ? [reason.name, reason.message] : reason).toEqual([
       "TimeoutError",
-      TIMED_OUT,
+      NO_ANSWER_MESSAGE,
     ]);
     expect(sent.map((request) => [request.method, aidOf(request.body)])).toEqual([
       ["GET", undefined],

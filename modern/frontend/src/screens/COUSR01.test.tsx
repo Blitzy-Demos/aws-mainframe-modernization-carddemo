@@ -562,6 +562,12 @@ describe("COUSR01 add user (CU01, COUSR01C, /users/add)", () => {
       expect(input.value).toBe("");
       expect(input.getAttribute("autocomplete")).toBe("off");
     }
+    // Every input, the header values included, has the one map-field box height (`h-7`, 28px).
+    expect(
+      Array.from(document.querySelectorAll("input")).filter(
+        (box) => !box.classList.contains("h-7") || !box.classList.contains("py-0"),
+      ),
+    ).toEqual([]);
     // The cursor starts on FNAME, the map's IC field.
     expect(document.activeElement).toBe(inputFor(LABELS.firstName));
 

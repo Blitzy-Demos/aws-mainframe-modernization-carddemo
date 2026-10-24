@@ -13,7 +13,7 @@ import { useForm, type FieldErrors } from "react-hook-form";
 import { useNavigate } from "react-router";
 import { useCousr01cAdd } from "@/api/hooks";
 import { FieldControl } from "@/components/screen/FieldControl";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_BOX_HEIGHT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell, type ShellMessage } from "@/components/screen/ScreenShell";
 import {
@@ -131,14 +131,15 @@ const HOME_FIELD: FieldName = "firstName";
  * the shell's minimum width while the start inset keeps the text off the border. A one-character
  * field (`USRTYPE`) drops the side padding, centres its character and has `min-w-3`, its border
  * plus the widest character: at the shell's minimum width its two columns are a fraction of a
- * pixel narrower, and the input then extends only into the column gap. Height, border, radius and
- * colours stay the component's.
+ * pixel narrower, and the input then extends only into the column gap. Every input takes the
+ * shared map-field box height (`FIELD_BOX_HEIGHT`) in place of the component's; border, radius
+ * and colours stay the component's.
  */
 function inputLayout(name: FieldName): { readonly span: number; readonly className: string } {
   const length = COUSR01_LENGTHS[name];
   return {
     span: length + 1,
-    className: length === 1 ? "min-w-3 px-0 text-center" : "ps-1 pe-0",
+    className: `${FIELD_BOX_HEIGHT} ${length === 1 ? "min-w-3 px-0 text-center" : "ps-1 pe-0"}`,
   };
 }
 

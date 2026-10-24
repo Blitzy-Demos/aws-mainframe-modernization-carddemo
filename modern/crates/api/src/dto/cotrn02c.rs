@@ -39,7 +39,7 @@ use chrono::NaiveDate;
 use domain::copybook::PicX;
 use domain::online::cotrn02c as rules;
 use domain::sensitive::CardNumber;
-use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{self, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
@@ -51,8 +51,8 @@ use super::{digits, text};
 /// input need not be a card number at all, so not even its last four characters are shown.
 const CARD_INPUT_REDACTED: &str = "****************";
 
-/// A member or variant name of this module's types, read as the entry of its list that it
-/// equals, or `None` for a name the list does not hold.
+/// A member name of this module's types, read as the entry of its list that it equals, or
+/// `None` for a name the list does not hold.
 #[derive(Clone, Copy)]
 struct WireName(&'static [&'static str]);
 
@@ -68,7 +68,7 @@ impl Visitor<'_> for WireName {
     type Value = Option<&'static str>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a member or variant name")
+        formatter.write_str("a member name")
     }
 
     fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
@@ -137,33 +137,29 @@ impl Serialize for Aid {
     }
 }
 
-/// The key names [`Aid`] serves, in declaration order.
-const AID_NAMES: &[&str] = &["ENTER", "PF5"];
-
 /// `ENTER` and `PF5` by name, and any other text, the empty text included, as
-/// [`Aid::Unserved`]; a value that is not text is refused.
+/// [`Aid::Unserved`], each from a JSON string alone; a value that is not a JSON string, serde's
+/// map form `{"ENTER": null}` included, is refused.
 impl<'de> Deserialize<'de> for Aid {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum("Aid", AID_NAMES, AidVisitor)
+        deserializer.deserialize_str(AidVisitor)
     }
 }
 
 /// The visitor of an [`Aid`] key name.
 struct AidVisitor;
 
-impl<'de> Visitor<'de> for AidVisitor {
+impl Visitor<'_> for AidVisitor {
     type Value = Aid;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum Aid")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Aid, A::Error> {
-        let (name, variant) = data.variant_seed(WireName(AID_NAMES))?;
-        variant.unit_variant()?;
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Aid, E> {
         Ok(match name {
-            Some("ENTER") => Aid::Enter,
-            Some("PF5") => Aid::Pf5,
+            "ENTER" => Aid::Enter,
+            "PF5" => Aid::Pf5,
             _ => Aid::Unserved,
         })
     }
@@ -1189,7 +1185,16 @@ mod tests {
             let mut missing = full_body();
             missing.as_object_mut().ok_or("body")?.remove("aid");
             let mut bodies = vec![missing];
-            for aid in [json!(5), Value::Null, json!(["PF4"]), json!({"key": "PF4"})] {
+            // serde's map form, whether it names a served key or another, is no JSON string, so
+            // it is unreadable rather than an unserved key.
+            for aid in [
+                json!(5),
+                Value::Null,
+                json!(["PF4"]),
+                json!({"key": "PF4"}),
+                json!({"ENTER": null}),
+                json!({"FOO": null}),
+            ] {
                 let mut body = full_body();
                 *body.pointer_mut("/aid").ok_or("aid")? = aid;
                 bodies.push(body);

@@ -68,15 +68,15 @@ const COLUMNS = [
 ] as const;
 
 /*
- * BLITZY [LAYOUT]: each list line is one compact line, as tall as a compact input: the caption
- * and rule heads take `h-7` instead of the `TableHead` default `h-10`, the selectors the
- * `Input`'s `h-7` and `py-0` instead of its `h-9` and `py-1`, and the cells drop the `p-2`
- * vertical padding (`py-0`). The twelve lines then fit their map lines and the whole screen fits
- * a 1024 × 768 viewport.
+ * BLITZY [LAYOUT]: each list line is one compact line, as tall as a map field's box: the caption
+ * and rule heads take `h-7` instead of the `TableHead` default `h-10`, the selectors take their
+ * height from the shared map-field box (`FIELD_INPUT`, with its `FIELD_BOX_HEIGHT`), and the cells
+ * drop the `p-2` vertical padding (`py-0`). The twelve lines then fit their map lines and the whole
+ * screen fits a 1024 × 768 viewport.
  */
 const HEAD = "h-7 whitespace-pre";
 const LINE = "py-0";
-const SELECTOR = "h-7 w-10 py-0 text-center";
+const SELECTOR = "w-10 text-center";
 
 /** A list value: a BLUE output shown with its spaces, one compact list line tall. */
 const VALUE = `${LINE} whitespace-pre text-muted-foreground`;

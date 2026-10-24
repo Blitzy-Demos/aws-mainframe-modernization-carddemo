@@ -658,8 +658,8 @@ function stateOfCode(code: string): CoactupKeyState {
 /**
  * Whether a thrown body is endpoint 5's error: a `ScreenError` whose `state` and `details`, when
  * present, are a state code and the details shown in it (COACTUPC-099). A failure without a body,
- * such as the browser's network `TypeError`, has a string `message` and neither member, and passes
- * as an error that shows nothing.
+ * such as the network `TypeError` of `api/client.ts`, has a string `message` and neither member,
+ * and passes as an error that shows nothing.
  */
 function isFetchError(body: unknown): body is components["schemas"]["AccountUpdateViewError"] {
   return (

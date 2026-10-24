@@ -786,6 +786,12 @@ describe("COPAU01 authorization detail screen", () => {
     expect(document.querySelectorAll('[data-slot="card-content"] input')).toHaveLength(
       FIELDS.length,
     );
+    // Every input, the header values included, has the one map-field box height (`h-7`, 28px).
+    expect(
+      Array.from(document.querySelectorAll("input")).filter(
+        (box) => !box.classList.contains("h-7") || !box.classList.contains("py-0"),
+      ),
+    ).toEqual([]);
 
     const caption = screen.getByText(`Merchant Details ${"-".repeat(59)}`);
     expect(caption.textContent).toHaveLength(76);

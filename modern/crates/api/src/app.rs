@@ -1600,10 +1600,12 @@ mod tests {
                     Some("application/json")
                 );
                 assert_protected(&headers, DOCUMENT_ROUTE);
+                assert_eq!(headers.get_all(header::WWW_AUTHENTICATE).iter().count(), 0);
             }
             assert!(traces.contains(r#""route":"/api-docs/openapi.json""#));
 
-            // No token: the extractor answers 401 before the path or the store is read.
+            // No token: the extractor answers 401 before the path or the store is read, with the
+            // one bearer challenge that the response layers keep beside their own headers.
             let (status, headers, _) = exchange(
                 app(state.clone()),
                 get("/api/v1/accounts/00000000050/view", None)?,
@@ -1611,6 +1613,8 @@ mod tests {
             .await?;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             assert_protected(&headers, "a request without a token");
+            let challenges: Vec<_> = headers.get_all(header::WWW_AUTHENTICATE).iter().collect();
+            assert_eq!(challenges, ["Bearer"], "a request without a token");
             assert!(traces.contains(r#""route":"/api/v1/accounts/{acct_id}/view""#));
             assert!(traces.contains(r#""method":"GET""#));
             assert!(traces.contains(r#""status":401"#));

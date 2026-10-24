@@ -11,7 +11,7 @@ import {
   type RouteObject,
 } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { REQUEST_DEADLINE_MS } from "@/api/client";
+import { NO_ANSWER_MESSAGE, REQUEST_DEADLINE_MS } from "@/api/client";
 import type { components } from "@/api/schema";
 import { getSession, SESSION_KEY, setSession } from "@/auth/session";
 import { PATHS, routes } from "@/routes";
@@ -1939,9 +1939,6 @@ describe("COCRDLI in the route table: a pageshow after the session left storage"
   });
 });
 
-/** The message of the shared request deadline's `TimeoutError` (`api/client.ts`). */
-const TIMED_OUT = "No answer from the server within 30 seconds";
-
 /**
  * Replaces `fetch` as `stubFetch` does and answers the list requests in order from `replies`,
  * except list request number `unanswered` (from 1): like a request the server accepted and never
@@ -2012,14 +2009,14 @@ describe("COCRDLI request deadline", () => {
     vi.useRealTimers();
 
     await waitFor(() => {
-      expect(messageRow("error").textContent).toBe(TIMED_OUT);
+      expect(messageRow("error").textContent).toBe(NO_ANSWER_MESSAGE);
     });
     await answered(seen, 2);
     expect(signal.aborted).toBe(true);
     const reason: unknown = signal.reason;
     expect(reason instanceof DOMException ? [reason.name, reason.message] : reason).toEqual([
       "TimeoutError",
-      TIMED_OUT,
+      NO_ANSWER_MESSAGE,
     ]);
     expect(listQueries(seen)).toEqual([{}, { ...FIRST_PAGE_ECHO, direction: "forward" }]);
     expect(listedRows()).toEqual(cellsOf(FIRST_PAGE));

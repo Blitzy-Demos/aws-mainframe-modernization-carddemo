@@ -46,7 +46,9 @@
 //! unserved method and 503 for a request refused at the in-flight limit. 422 is reserved for
 //! `page_size` (Bounded Pagination), and only [`ScreenError::page_size`] produces it. The only
 //! other 503 is that of a saturated password-work budget, which only [`ServiceError::Saturated`]
-//! produces. Every 503 carries `Retry-After`.
+//! produces. Every 503 carries `Retry-After`. Every 401, the token gate's and sign-on's alike,
+//! carries one `WWW-Authenticate: Bearer`, the challenge of the bearer scheme the operations
+//! declare (RFC 9110 §11.6.1, RFC 6750 §3), and no other status carries it.
 //!
 //! # Thin Request Handlers
 //!
@@ -63,7 +65,7 @@
 use core::fmt;
 
 use axum::Json;
-use axum::http::header::RETRY_AFTER;
+use axum::http::header::{RETRY_AFTER, WWW_AUTHENTICATE};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use domain::online::{
@@ -92,6 +94,13 @@ pub const UNABLE_TO_PROCESS: &str = "Unable to process request...";
 /// place coming free, so a retry sooner would most likely meet the same backlog. The router's
 /// in-flight refusal replaces it with its own `Retry-After: 1` (see `api::app`).
 pub const RETRY_AFTER_SECONDS: u64 = PASSWORD_WAIT.as_secs();
+
+/// The `WWW-Authenticate` that [`ScreenError`]'s response gives a 401: the bearer scheme every
+/// operation except sign-on declares, the challenge a 401 must carry
+/// (RFC 9110 §11.6.1, RFC 6750 §3). It has no `realm` and no `error` parameter: the token gate
+/// answers one 401 whatever the cause, so the challenge, like the body, says nothing about the
+/// token it refuses.
+const BEARER_CHALLENGE: HeaderValue = HeaderValue::from_static("Bearer");
 
 /// The message of the router's 404: no route matches the request's path, so no program answers.
 ///
@@ -189,7 +198,8 @@ impl ScreenError {
         Self::new(StatusCode::BAD_REQUEST, message, field)
     }
 
-    /// 401: the credentials did not sign on, or the request carries no valid token.
+    /// 401: the credentials did not sign on, or the request carries no valid token. Its response
+    /// carries `WWW-Authenticate: Bearer`.
     #[must_use]
     pub fn unauthorized(message: impl Into<String>, field: Option<String>) -> Self {
         Self::new(StatusCode::UNAUTHORIZED, message, field)
@@ -269,13 +279,18 @@ impl ScreenError {
 }
 
 /// The response: the status, and the body as JSON without the status. A 503 also carries
-/// `Retry-After` with [`RETRY_AFTER_SECONDS`], which the router's in-flight refusal replaces.
+/// `Retry-After` with [`RETRY_AFTER_SECONDS`], which the router's in-flight refusal replaces,
+/// and a 401 one `WWW-Authenticate: Bearer`.
 impl IntoResponse for ScreenError {
     fn into_response(self) -> Response {
         let status = self.status;
         if status == StatusCode::SERVICE_UNAVAILABLE {
             let retry_after = [(RETRY_AFTER, HeaderValue::from(RETRY_AFTER_SECONDS))];
             return (status, retry_after, Json(self)).into_response();
+        }
+        if status == StatusCode::UNAUTHORIZED {
+            let challenge = [(WWW_AUTHENTICATE, BEARER_CHALLENGE)];
+            return (status, challenge, Json(self)).into_response();
         }
         (status, Json(self)).into_response()
     }
@@ -806,7 +821,7 @@ mod tests {
     use std::error::Error as StdError;
 
     use axum::http::StatusCode;
-    use axum::http::header::{CONTENT_TYPE, RETRY_AFTER};
+    use axum::http::header::{CONTENT_TYPE, RETRY_AFTER, WWW_AUTHENTICATE};
     use axum::response::IntoResponse;
     use domain::online::{
         coactupc, coactvwc, cobil00c, cocrdlic, cocrdslc, cocrdupc, copaus0c, copaus1c, corpt00c,
@@ -1136,6 +1151,59 @@ mod tests {
             let response = error.into_response();
             assert!(response.headers().get(RETRY_AFTER).is_none(), "{status}");
         }
+    }
+
+    /// A 401, the token gate's and the audited sign-on failures' alike, carries exactly one
+    /// `WWW-Authenticate: Bearer` beside its unchanged status and body; an answer of any other
+    /// status, sign-on's 400 and 500 included, carries none.
+    #[test]
+    fn a_401_alone_carries_one_bearer_challenge() -> TestResult {
+        let cases = [
+            (ScreenError::unauthorized("token", None), 401),
+            (
+                ScreenError::from(cosgn00c::SignonFailure::WrongPassword),
+                401,
+            ),
+            (
+                ScreenError::from(cosgn00c::SignonFailure::UserNotFound),
+                401,
+            ),
+            (ScreenError::input("in", None), 400),
+            (ScreenError::from(cosgn00c::SignonFailure::UserIdBlank), 400),
+            (ScreenError::forbidden("gate"), 403),
+            (ScreenError::not_found("none", None), 404),
+            (ScreenError::method_not_allowed("method"), 405),
+            (ScreenError::conflict("changed", None), 409),
+            (ScreenError::page_size("size"), 422),
+            (ScreenError::store("store", None), 500),
+            (
+                ScreenError::from(cosgn00c::SignonFailure::UnableToVerify),
+                500,
+            ),
+            (ScreenError::service_unavailable("busy"), 503),
+            (
+                ScreenError::from(ServiceError::<cosgn00c::SignonFailure>::Saturated),
+                503,
+            ),
+        ];
+        block_on(async {
+            for (error, status) in cases {
+                assert_eq!(error.status().as_u16(), status, "{error:?}");
+                let body = serde_json::to_value(&error)?;
+                let response = error.into_response();
+                assert_eq!(response.status().as_u16(), status);
+                let challenges: Vec<_> = response
+                    .headers()
+                    .get_all(WWW_AUTHENTICATE)
+                    .iter()
+                    .collect();
+                let expected: &[&str] = if status == 401 { &["Bearer"] } else { &[] };
+                assert_eq!(challenges, expected, "{status}");
+                let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
+                assert_eq!(serde_json::from_slice::<Value>(&bytes)?, body, "{status}");
+            }
+            Ok(())
+        })
     }
 
     #[test]

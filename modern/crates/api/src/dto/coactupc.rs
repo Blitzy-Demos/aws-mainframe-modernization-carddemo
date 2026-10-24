@@ -47,7 +47,7 @@ use axum::response::{IntoResponse, Response};
 use chrono::NaiveDate;
 use domain::online::coactupc as rules;
 use domain::sensitive::Ssn;
-use serde::de::{self, Deserializer, EnumAccess, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -79,9 +79,6 @@ pub enum Aid {
     Enter,
 }
 
-/// The wire texts of [`Aid`]'s variants, in declaration order.
-const AIDS: &[&str] = &["PF5", "ENTER"];
-
 /// `"PF5"` or `"ENTER"`.
 impl Serialize for Aid {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -93,27 +90,25 @@ impl Serialize for Aid {
     }
 }
 
-/// `PF5`, and `ENTER` for every other key text, from a JSON string or the map form
-/// `{"PF5": null}`; a value that names no key, such as a number, is an error.
+/// `PF5`, and `ENTER` for every other key text, from a JSON string alone; any other value, such
+/// as a number or serde's map form `{"PF5": null}`, is an error.
 impl<'de> Deserialize<'de> for Aid {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum("Aid", AIDS, AidVisitor)
+        deserializer.deserialize_str(AidVisitor)
     }
 }
 
-/// The visitor of [`Aid`]'s `Deserialize`: a unit variant named by its key text.
+/// The visitor of [`Aid`]'s `Deserialize`: a key text, read as `PF5` or `ENTER`.
 struct AidVisitor;
 
-impl<'de> Visitor<'de> for AidVisitor {
+impl Visitor<'_> for AidVisitor {
     type Value = Aid;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum Aid")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Aid, A::Error> {
-        let (text, variant) = data.variant::<String>()?;
-        variant.unit_variant()?;
+    fn visit_str<E: de::Error>(self, text: &str) -> Result<Aid, E> {
         // COACTUPC-004: every key other than PF5 is processed as ENTER.
         Ok(if text == "PF5" { Aid::Pf5 } else { Aid::Enter })
     }
@@ -1731,16 +1726,16 @@ mod tests {
         Ok(())
     }
 
-    /// The key from either form it travels in, its text as a JSON string or the map form with a
-    /// `null` value: `PF5` alone is F5 and every other text ENTER (COACTUPC-004); any other JSON
-    /// value is refused.
+    /// The key from the one form it travels in, its text as a JSON string: `PF5` alone is F5 and
+    /// every other text ENTER (COACTUPC-004); any other JSON value, serde's map form with a `null`
+    /// value included, is refused.
     #[test]
-    fn aid_reads_pf5_and_every_other_key_text_as_enter_in_both_forms() {
+    fn aid_reads_pf5_and_every_other_key_text_as_enter_from_a_json_string_alone() {
         let cases = [
-            (r#"{"PF5":null}"#, Some(Aid::Pf5)),
-            (r#"{"ENTER":null}"#, Some(Aid::Enter)),
-            (r#"{"PF12":null}"#, Some(Aid::Enter)),
             (r#""pf5""#, Some(Aid::Enter)),
+            (r#"{"PF5":null}"#, None),
+            (r#"{"ENTER":null}"#, None),
+            (r#"{"PF12":null}"#, None),
             (r#"{"PF5":1}"#, None),
             (r#"["PF5"]"#, None),
             ("null", None),

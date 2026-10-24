@@ -43,10 +43,10 @@ declare module "@tanstack/react-query" {
    *   narrows the thrown body before it reads it as a `ScreenError`, as COTRTLI's `isListPage` and
    *   `isActionResult` guards do.
    *
-   * The three failures without a body, the browser's network `TypeError`, the `TimeoutError`
-   * `DOMException` of the request deadline in `client.ts` and the status `Error` of `settle`,
-   * carry a string `message` too. `errorStatus` gives the HTTP status of every failure `settle`
-   * threw.
+   * The three failures without a body carry a string `message` too: the network `TypeError` and
+   * the `TimeoutError` `DOMException` of the request deadline, both of which `client.ts` gives its
+   * one fixed `NO_ANSWER_MESSAGE` whatever the browser, and the status `Error` of `settle`, which
+   * names the HTTP status. `errorStatus` gives the HTTP status of every failure `settle` threw.
    */
   interface Register {
     defaultError: components["schemas"]["ScreenError"];
@@ -95,8 +95,8 @@ async function settle<Data>(
  * The HTTP status of the response a hook's error came from, for a screen whose program reacts to
  * the outcome class and not only to the message: COCRDSLC marks both inputs on a not-found read
  * (404) but only the account on a file error (500). `undefined` for anything `settle` did not
- * throw, such as the browser's network `TypeError` or the request deadline's `TimeoutError`, when
- * no response arrived.
+ * throw, such as the network `TypeError` or the request deadline's `TimeoutError` of `client.ts`,
+ * when no response arrived.
  */
 export function errorStatus(error: unknown): number | undefined {
   return typeof error === "object" && error !== null ? failureStatus.get(error) : undefined;

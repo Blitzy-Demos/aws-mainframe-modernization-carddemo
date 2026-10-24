@@ -63,6 +63,14 @@ static MIGRATOR: Migrator = sqlx::migrate!("../persistence/migrations");
 /// error it stays held by the pooled connection until that connection closes. Both callers end on
 /// an error, which closes it.
 ///
+/// The migrator ensures the bookkeeping table again on every run, with the same `CREATE TABLE IF
+/// NOT EXISTS` this function issues before its first read. `PostgreSQL` answers that statement on
+/// an existing table with a `NOTICE`, `relation "_sqlx_migrations" already exists, skipping`: once
+/// per run against a fresh database and twice against a migrated one. The driver logs it at
+/// `INFO` under [`crate::telemetry::SERVER_NOTICE_TARGET`], and the telemetry dependency filter
+/// keeps every server notice below `WARN` off standard output and out of a trace capture, so this
+/// one reaches neither.
+///
 /// # Errors
 ///
 /// Returns the [`MigrateError`] of the first failure:

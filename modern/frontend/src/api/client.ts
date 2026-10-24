@@ -62,8 +62,14 @@ function sentToken(request: Request): string | null {
  */
 export const REQUEST_DEADLINE_MS = 30_000;
 
-/** The `message` of the deadline's `TimeoutError`, which the screen's error row shows. */
-const DEADLINE_MESSAGE = `No answer from the server within ${REQUEST_DEADLINE_MS / 1000} seconds`;
+/**
+ * What a screen's error row shows when a call got no response at all: the network failed, or
+ * `REQUEST_DEADLINE_MS` passed first. It is the `message` of both failures `fetchWithinDeadline`
+ * rejects with when no response arrived, the same in every browser, in place of the engine's own
+ * wording of a network failure. A response that did arrive keeps its own message: the server owns
+ * every program message, so no `ScreenError` is ever replaced by this one.
+ */
+export const NO_ANSWER_MESSAGE = "No answer from the server. Please try again ...";
 
 /**
  * The global `fetch`'s answer to `request`, once its body has arrived in full.
@@ -96,11 +102,16 @@ async function answered(request: Request): Promise<Response> {
  * has arrived, or rejects when `REQUEST_DEADLINE_MS` passes first.
  *
  * The request goes out with a signal of its own. The caller's signal, which TanStack Query
- * aborts to cancel a menu read, aborts it with the caller's reason, so a cancellation stays a
- * cancellation. The deadline aborts it with a `TimeoutError` `DOMException` and rejects with
- * that same error, which openapi-fetch rethrows and the screen shows in its message row as any
- * other failure. The race against the deadline settles even when a `fetch` ignores its signal.
- * On every outcome the timer is cleared and the listener on the caller's signal removed.
+ * aborts to cancel a menu read, aborts it with the caller's reason, and the failure that follows
+ * is rethrown unchanged, so a cancellation stays a cancellation. The deadline aborts it with a
+ * `TimeoutError` `DOMException` whose message is `NO_ANSWER_MESSAGE` and rejects with that same
+ * error. A network failure, the `TypeError` that `fetch` or the body read rejects with in the
+ * browser's own words, is rethrown as a `TypeError` carrying `NO_ANSWER_MESSAGE`, the original as
+ * its `cause`. Either reaches openapi-fetch, which rethrows it, and the screen shows that one
+ * message in its message row as any other failure. Only a rejection of the sent request is
+ * mapped; the `Request` is built before the race, so a fault in building it is not reported as
+ * an unanswered call. The race against the deadline settles even when a `fetch` ignores its
+ * signal. On every outcome the timer is cleared and the listener on the caller's signal removed.
  *
  * Nothing is retried: a write the deadline cut off may have committed, so only the operator's
  * next key sends anything again. The body is read from a clone only to wait for its end, then
@@ -110,13 +121,14 @@ async function answered(request: Request): Promise<Response> {
 async function fetchWithinDeadline(request: Request): Promise<Response> {
   const controller = new AbortController();
   const { signal } = request;
+  const sending = new Request(request, { signal: controller.signal });
   const forwardAbort = (): void => {
     controller.abort(signal.reason);
   };
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      const timeout = new DOMException(DEADLINE_MESSAGE, "TimeoutError");
+      const timeout = new DOMException(NO_ANSWER_MESSAGE, "TimeoutError");
       controller.abort(timeout);
       reject(timeout);
     }, REQUEST_DEADLINE_MS);
@@ -127,10 +139,12 @@ async function fetchWithinDeadline(request: Request): Promise<Response> {
     signal.addEventListener("abort", forwardAbort, { once: true });
   }
   try {
-    return await Promise.race([
-      deadline,
-      answered(new Request(request, { signal: controller.signal })),
-    ]);
+    return await Promise.race([deadline, answered(sending)]);
+  } catch (failure) {
+    if (!signal.aborted && failure instanceof TypeError) {
+      throw new TypeError(NO_ANSWER_MESSAGE, { cause: failure });
+    }
+    throw failure;
   } finally {
     clearTimeout(timer);
     signal.removeEventListener("abort", forwardAbort);

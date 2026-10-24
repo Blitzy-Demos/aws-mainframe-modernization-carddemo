@@ -36,7 +36,7 @@ use std::fmt;
 use chrono::NaiveDateTime;
 use domain::copybook::{PicU, PicX};
 use domain::online::cotrn00c as rules;
-use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::{IntoParams, ToSchema};
@@ -82,30 +82,30 @@ impl Serialize for TranListEntryKey {
     }
 }
 
+/// `enter`, `pf3` or `pf5`, from a JSON string or a query-string value alone; any other name,
+/// and any other JSON value, serde's map form `{"pf5": null}` included, is refused.
 impl<'de> Deserialize<'de> for TranListEntryKey {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum("TranListEntryKey", ENTRY_KEY_NAMES, EntryKeyVisitor)
+        deserializer.deserialize_str(EntryKeyVisitor)
     }
 }
 
 /// The visitor of [`TranListEntryKey`]'s variant names.
 struct EntryKeyVisitor;
 
-impl<'de> Visitor<'de> for EntryKeyVisitor {
+impl Visitor<'_> for EntryKeyVisitor {
     type Value = TranListEntryKey;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum TranListEntryKey")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<TranListEntryKey, A::Error> {
-        let (name, variant) = data.variant_seed(WireName(ENTRY_KEY_NAMES))?;
-        variant.unit_variant()?;
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<TranListEntryKey, E> {
         match name {
-            Some("enter") => Ok(TranListEntryKey::Enter),
-            Some("pf3") => Ok(TranListEntryKey::Pf3),
-            Some("pf5") => Ok(TranListEntryKey::Pf5),
-            _ => Err(de::Error::invalid_value(de::Unexpected::Enum, &self)),
+            "enter" => Ok(TranListEntryKey::Enter),
+            "pf3" => Ok(TranListEntryKey::Pf3),
+            "pf5" => Ok(TranListEntryKey::Pf5),
+            _ => Err(E::unknown_variant(name, ENTRY_KEY_NAMES)),
         }
     }
 }
@@ -566,8 +566,8 @@ impl<'de> Visitor<'de> for TranListResponseVisitor {
     }
 }
 
-/// A member or variant name of this module's types, read as the entry of its list that it
-/// equals, or `None` for a name the list does not hold.
+/// A member name of this module's types, read as the entry of its list that it equals, or
+/// `None` for a name the list does not hold.
 #[derive(Clone, Copy)]
 struct WireName(&'static [&'static str]);
 
@@ -583,7 +583,7 @@ impl Visitor<'_> for WireName {
     type Value = Option<&'static str>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a member or variant name")
+        formatter.write_str("a member name")
     }
 
     fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
@@ -1145,7 +1145,8 @@ mod tests {
         })
     }
 
-    /// Each entry key is written and read as its lowercase name, and no other text is read.
+    /// Each entry key is written and read as its lowercase name in a JSON string, and no other
+    /// text is read, nor any other JSON value, serde's map form included.
     #[test]
     fn an_entry_key_travels_as_its_lowercase_name_alone() -> TestResult {
         use TranListEntryKey::{Enter, Pf3, Pf5};
@@ -1164,6 +1165,14 @@ mod tests {
             if let Some(key) = key {
                 assert_eq!(serde_json::to_value(key)?, text, "{name:?}");
             }
+        }
+        for refused in [
+            serde_json::json!({"pf5": null}),
+            serde_json::json!({"enter": null}),
+            serde_json::json!(5),
+        ] {
+            let read = serde_json::from_value::<TranListEntryKey>(refused.clone());
+            assert!(read.is_err(), "{refused}");
         }
         Ok(())
     }

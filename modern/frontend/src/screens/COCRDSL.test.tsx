@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createMemoryRouter, MemoryRouter, Route, RouterProvider, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NO_ANSWER_MESSAGE } from "@/api/client";
 import { errorStatus } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { getSession, setSession } from "@/auth/session";
@@ -918,24 +919,47 @@ describe("COCRDSL", () => {
     expect(document.activeElement).toBe(field(CARD));
   });
 
+  /** A `fetch` answer that rejects as a browser's `fetch` does with no connection, in its words. */
+  function refusedWith(engineText: string): () => Response {
+    return () => {
+      throw new TypeError(engineText);
+    };
+  }
+
+  // Each engine words its network `TypeError` its own way; the error row shows the client's one
+  // fixed message for all of them, and the engine's text is kept only as the failure's cause.
   it.each([
     {
       failure: "an empty 502",
       answer: (): Response => new Response(null, { status: 502, statusText: "Bad Gateway" }),
       message: "HTTP 502 Bad Gateway",
+      cause: undefined,
       status: 502,
     },
     {
-      failure: "a request that got no response",
-      answer: (): Response => {
-        throw new TypeError("Failed to fetch");
-      },
-      message: "Failed to fetch",
+      failure: "a request that got no response in Chrome",
+      answer: refusedWith("Failed to fetch"),
+      message: NO_ANSWER_MESSAGE,
+      cause: "Failed to fetch",
+      status: undefined,
+    },
+    {
+      failure: "a request that got no response in Firefox",
+      answer: refusedWith("NetworkError when attempting to fetch resource."),
+      message: NO_ANSWER_MESSAGE,
+      cause: "NetworkError when attempting to fetch resource.",
+      status: undefined,
+    },
+    {
+      failure: "a request that got no response in Safari",
+      answer: refusedWith("Load failed"),
+      message: NO_ANSWER_MESSAGE,
+      cause: "Load failed",
       status: undefined,
     },
   ])(
     "shows $failure without a ScreenError body and leaves the inputs as sent",
-    async ({ answer, message, status }) => {
+    async ({ answer, message, cause, status }) => {
       const seen = stubFetch(answer);
       const client = renderScreen();
 
@@ -952,7 +976,13 @@ describe("COCRDSL", () => {
         expect(field(label).className).not.toContain("text-destructive");
       }
       // `settle` records the status of a reply it turned into an `Error`; no reply, no status.
-      expect(errorStatus(lastFailure(client))).toBe(status);
+      const failure: unknown = lastFailure(client);
+      expect(errorStatus(failure)).toBe(status);
+      expect(
+        failure instanceof Error && failure.cause instanceof Error
+          ? failure.cause.message
+          : undefined,
+      ).toBe(cause);
     },
   );
 

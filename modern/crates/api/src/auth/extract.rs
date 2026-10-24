@@ -19,7 +19,9 @@
 //! - [`SignedOnUser`] is the COMMAREA identity of a request. It is rebuilt from the claims
 //!   [`JwtKeys::verify`] accepts and from nothing else: never from a body, a query string, a
 //!   cookie, a path segment or any header other than one `Authorization: Bearer` header. A request
-//!   without a valid token is refused with 401 and [`SIGNON_REQUIRED`] (COMEN01C-002).
+//!   without a valid token is refused with 401 and [`SIGNON_REQUIRED`] (COMEN01C-002), whose
+//!   response carries the challenge `WWW-Authenticate: Bearer`, as every 401 does
+//!   (`crate::error`).
 //! - [`AdminUser`] is the admin gate: a valid token whose user type is not `A` is refused with 403
 //!   and [`ADMIN_REQUIRED`], before any service runs (COADM01C-001). The frontend's route guard
 //!   only hides the admin screens; this extractor is the control.
@@ -150,7 +152,7 @@ fn from_claims(claims: &Claims) -> Option<SignedOnUser> {
     })
 }
 
-/// The 401 of a request without a valid token.
+/// The 401 of a request without a valid token; its response carries `WWW-Authenticate: Bearer`.
 fn signon_required() -> ScreenError {
     ScreenError::unauthorized(SIGNON_REQUIRED, None)
 }
@@ -204,7 +206,7 @@ mod tests {
     use axum::Router;
     use axum::body::Body;
     use axum::extract::{FromRef, FromRequestParts};
-    use axum::http::header::AUTHORIZATION;
+    use axum::http::header::{AUTHORIZATION, WWW_AUTHENTICATE};
     use axum::http::request::Parts;
     use axum::http::{HeaderValue, Request, StatusCode};
     use axum::routing::get;
@@ -515,9 +517,12 @@ mod tests {
         user.user_id.to_text()
     }
 
-    /// The status and the body of `GET path` with `authorization`, through a router whose state
-    /// is a [`GatedState`].
-    async fn call(path: &str, authorization: Option<HeaderValue>) -> (StatusCode, Vec<u8>) {
+    /// The status, every `WWW-Authenticate` value and the body of `GET path` with
+    /// `authorization`, through a router whose state is a [`GatedState`].
+    async fn call(
+        path: &str,
+        authorization: Option<HeaderValue>,
+    ) -> (StatusCode, Vec<HeaderValue>, Vec<u8>) {
         let router = Router::new()
             .route("/admin", get(admin_only))
             .route("/menu", get(any_user))
@@ -531,10 +536,16 @@ mod tests {
             .await
             .expect("an infallible router");
         let status = response.status();
+        let challenges = response
+            .headers()
+            .get_all(WWW_AUTHENTICATE)
+            .iter()
+            .cloned()
+            .collect();
         let body = axum::body::to_bytes(response.into_body(), 4_096)
             .await
             .expect("a small body");
-        (status, body.to_vec())
+        (status, challenges, body.to_vec())
     }
 
     fn json_body(body: &[u8]) -> Value {
@@ -547,33 +558,35 @@ mod tests {
             let admin_token = token("ADMIN001", &UserType::ADMIN);
             let user_token = token("USER0001", &UserType::USER);
 
-            let (status, body) = call("/admin", Some(bearer(&admin_token))).await;
+            // Only a 401 challenges: a served request and the gate's 403 carry no challenge.
+            let (status, challenges, body) = call("/admin", Some(bearer(&admin_token))).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, b"ADMIN001");
-            let (status, body) = call("/menu", Some(bearer(&user_token))).await;
+            assert!(challenges.is_empty(), "{challenges:?}");
+            let (status, challenges, body) = call("/menu", Some(bearer(&user_token))).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, b"USER0001");
+            assert!(challenges.is_empty(), "{challenges:?}");
 
-            let (status, body) = call("/admin", Some(bearer(&user_token))).await;
+            let (status, challenges, body) = call("/admin", Some(bearer(&user_token))).await;
             assert_eq!(status, StatusCode::FORBIDDEN);
             assert_eq!(json_body(&body), json!({ "message": ADMIN_REQUIRED }));
+            assert!(challenges.is_empty(), "{challenges:?}");
 
             for path in ["/admin", "/menu"] {
-                let (status, body) = call(path, None).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-                assert_eq!(
-                    json_body(&body),
-                    json!({ "message": SIGNON_REQUIRED }),
-                    "{path}"
-                );
-
-                let (status, body) = call(path, Some(bearer(ALG_NONE))).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}");
-                assert_eq!(
-                    json_body(&body),
-                    json!({ "message": SIGNON_REQUIRED }),
-                    "{path}"
-                );
+                for (label, authorization) in
+                    [("no token", None), ("alg none", Some(bearer(ALG_NONE)))]
+                {
+                    let case = format!("{path} with {label}");
+                    let (status, challenges, body) = call(path, authorization).await;
+                    assert_eq!(status, StatusCode::UNAUTHORIZED, "{case}");
+                    assert_eq!(
+                        json_body(&body),
+                        json!({ "message": SIGNON_REQUIRED }),
+                        "{case}"
+                    );
+                    assert_eq!(challenges, ["Bearer"], "{case}");
+                }
             }
             Ok(())
         })

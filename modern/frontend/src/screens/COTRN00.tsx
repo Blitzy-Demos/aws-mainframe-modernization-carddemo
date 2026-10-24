@@ -75,8 +75,9 @@ const COLUMNS = [
  * BLITZY [LAYOUT]: every list line is a `LIST_ROW`, one compact map line tall whatever it holds,
  * and every cell a `LIST_CELL`, without the cell's `p-2` padding, so each value starts on its
  * map column and the twelve lines fit their map lines: the whole screen fits a 1024 × 768
- * viewport. The selector is the compact `h-7 py-0` box, and at column 3 it is moved one of its
- * column's six map columns to the right (`left-1/6`).
+ * viewport. The selector takes its height from the shared map-field box (`FIELD_INPUT`, with its
+ * `FIELD_BOX_HEIGHT`), and at column 3 it is moved one of its column's six map columns to the
+ * right (`left-1/6`).
  */
 /**
  * BLUE list values, shown byte for byte with their trailing spaces (COTRN00C-028 to
@@ -440,7 +441,7 @@ export function COTRN00(): ReactNode {
         // `Page:` and PAGENUM, on the title's line 4 of the map.
         <>
           <GridCell row={1} col={65} span={5}>
-            <Label htmlFor={pageId} className="h-9 whitespace-pre font-semibold text-foreground">
+            <Label htmlFor={pageId} className="h-7 whitespace-pre font-semibold text-foreground">
               Page:
             </Label>
           </GridCell>
@@ -486,7 +487,7 @@ export function COTRN00(): ReactNode {
                 // `contents` makes the label and input cells items of the screen grid.
                 <FormItem className="contents">
                   <GridCell row={6} col={5} span={15}>
-                    <FormLabel className="h-9 whitespace-pre text-foreground">
+                    <FormLabel className="h-7 whitespace-pre text-foreground">
                       Search Tran ID:
                     </FormLabel>
                   </GridCell>
@@ -568,7 +569,7 @@ export function COTRN00(): ReactNode {
                                     maxLength={COTRN00_LENGTHS.selection}
                                     size={COTRN00_LENGTHS.selection}
                                     autoComplete="off"
-                                    className={`${FIELD_INPUT} relative left-1/6 h-7 w-9 py-0 text-center`}
+                                    className={`${FIELD_INPUT} relative left-1/6 w-9 text-center`}
                                   />
                                 </FieldControl>
                                 <FormMessage className="sr-only" />

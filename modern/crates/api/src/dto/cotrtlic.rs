@@ -57,7 +57,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use domain::copybook::PicX;
 use domain::online::cotrtlic as rules;
-use serde::de::{self, EnumAccess, Error as _, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::ser::{SerializeStruct, Serializer};
 use serde::{Deserialize, Deserializer, Serialize};
 use utoipa::openapi::RefOr;
@@ -955,7 +955,8 @@ const fn status_not_carried() -> StatusCode {
 // an absent `Option` and the default for an absent request text or row list, and skips an
 // unknown member unread as `IgnoredAny`, which is how `api::dto` reads past a number its parser
 // cannot represent. A member whose schema is an object, a list of objects or `page_size` reads
-// through the parent module's reader for it. A unit variant is its wire name.
+// through the parent module's reader for it. A unit variant is its wire name, written as a JSON
+// string and read from one alone.
 
 /// A state's `rows` or `screen_rows`: positions, each an object or `null`, as
 /// `super::objects_or_null` reads them.
@@ -1787,32 +1788,29 @@ trait UnitEnum: Sized {
     fn from_wire(name: &str) -> Option<Self>;
 }
 
-/// `T` read from `deserializer` as a unit variant, through [`VariantVisitor`].
+/// `T` read from `deserializer` as a unit variant named by a JSON string alone, through
+/// [`VariantVisitor`]; any other value, serde's map form `{"delete": null}` included, is refused.
 fn read_unit_enum<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: Deserializer<'de>,
     T: UnitEnum,
 {
-    deserializer.deserialize_enum(T::NAME, T::VARIANTS, VariantVisitor(PhantomData))
+    deserializer.deserialize_str(VariantVisitor(PhantomData))
 }
 
-/// The visitor of [`read_unit_enum`]: a variant name `T` admits, carrying no value. A name it
-/// refuses is the unknown-variant error.
+/// The visitor of [`read_unit_enum`]: a text naming a variant `T` admits. A name it refuses is
+/// the unknown-variant error, and a value that is not text is the invalid-type error.
 struct VariantVisitor<T>(PhantomData<T>);
 
-impl<'de, T: UnitEnum> Visitor<'de> for VariantVisitor<T> {
+impl<T: UnitEnum> Visitor<'_> for VariantVisitor<T> {
     type Value = T;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "enum {}", T::NAME)
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<T, A::Error> {
-        let (name, variant) = data.variant::<String>()?;
-        let value =
-            T::from_wire(&name).ok_or_else(|| A::Error::unknown_variant(&name, T::VARIANTS))?;
-        variant.unit_variant()?;
-        Ok(value)
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<T, E> {
+        T::from_wire(name).ok_or_else(|| E::unknown_variant(name, T::VARIANTS))
     }
 }
 
@@ -2633,14 +2631,20 @@ mod tests {
         Ok(())
     }
 
-    /// Asserts each unit variant travels as its wire name, both ways, and that the schema's
-    /// `enum` lists exactly those names in declaration order.
+    /// Asserts each unit variant travels as its wire name, both ways, that serde's map form of
+    /// that name, `{"<name>": null}`, is refused, and that the schema's `enum` lists exactly those
+    /// names in declaration order.
     fn assert_variants<T>(variants: &[(T, &str)]) -> TestResult
     where
         T: Serialize + DeserializeOwned + PartialEq + Debug + PartialSchema,
     {
         for (variant, name) in variants {
             assert_wire(variant, &format!("\"{name}\""))?;
+            let map_form = json!({ *name: null });
+            assert!(
+                serde_json::from_value::<T>(map_form.clone()).is_err(),
+                "{map_form}"
+            );
         }
         let names: Vec<&str> = variants.iter().map(|&(_, name)| name).collect();
         assert_eq!(serde_json::to_value(T::schema())?["enum"], json!(names));

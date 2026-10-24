@@ -6,7 +6,7 @@ import { useLocation, useNavigate } from "react-router";
 import { useCotrtupcAction, useCotrtupcFetch } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldControl } from "@/components/screen/FieldControl";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_BOX_HEIGHT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
@@ -77,7 +77,8 @@ const LABEL_CLASS = "h-full whitespace-pre text-foreground";
  * exactly its 50 columns at every viewport, as COTRTLI's Description Filter is. A grid column is
  * narrower than a character plus the `Input` padding, so the 2-column `TRTYPCD` input would hide
  * its own text at `w-full`; it takes its 2-character intrinsic width instead (`w-auto`), running
- * into the free columns to its right, as no field follows it on its line.
+ * into the free columns to its right, as no field follows it on its line. Both inputs take the
+ * shared map-field box height (`FIELD_BOX_HEIGHT`) in place of the `Input` default.
  */
 const CODE_INPUT_CLASS = "w-auto";
 
@@ -539,6 +540,7 @@ function MapInputCell({
           tabIndex={editable ? undefined : -1}
           aria-invalid={red || invalid}
           className={cn(
+            FIELD_BOX_HEIGHT,
             length === COTRTUP_LENGTHS.typeCode && CODE_INPUT_CLASS,
             red && "text-destructive",
           )}
@@ -928,6 +930,7 @@ export function COTRTUP(): ReactNode {
                   autoComplete="off"
                   readOnly
                   tabIndex={-1}
+                  className={FIELD_BOX_HEIGHT}
                 />
               </GridCell>
             </FieldGrid>

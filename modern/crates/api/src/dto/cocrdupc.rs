@@ -66,7 +66,7 @@ use core::fmt;
 use chrono::NaiveDate;
 use domain::online::cocrdupc as rules;
 use domain::sensitive::CardNumber;
-use serde::de::{self, DeserializeSeed, EnumAccess, IgnoredAny, MapAccess, VariantAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use utoipa::ToSchema;
@@ -74,8 +74,8 @@ use validator::Validate;
 
 use super::{digits, full_text};
 
-/// A member or variant name of this module's types, read as the entry of its list that it
-/// equals, or `None` for a name the list does not hold.
+/// A member name of this module's types, read as the entry of its list that it equals, or
+/// `None` for a name the list does not hold.
 #[derive(Clone, Copy)]
 struct WireName(&'static [&'static str]);
 
@@ -91,7 +91,7 @@ impl Visitor<'_> for WireName {
     type Value = Option<&'static str>;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a member or variant name")
+        formatter.write_str("a member name")
     }
 
     fn visit_str<E: de::Error>(self, name: &str) -> Result<Self::Value, E> {
@@ -153,30 +153,29 @@ impl Serialize for Aid {
     }
 }
 
-/// `ENTER` or `PF5`; any other name is refused.
+/// `ENTER` or `PF5` in a JSON string; any other name, and any value that is not a JSON string,
+/// serde's map form `{"PF5": null}` included, is refused.
 impl<'de> Deserialize<'de> for Aid {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum("Aid", AID_NAMES, AidVisitor)
+        deserializer.deserialize_str(AidVisitor)
     }
 }
 
 /// The visitor of [`Aid`]'s wire names.
 struct AidVisitor;
 
-impl<'de> Visitor<'de> for AidVisitor {
+impl Visitor<'_> for AidVisitor {
     type Value = Aid;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum Aid")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Aid, A::Error> {
-        let (name, variant) = data.variant_seed(WireName(AID_NAMES))?;
-        variant.unit_variant()?;
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<Aid, E> {
         match name {
-            Some("ENTER") => Ok(Aid::Enter),
-            Some("PF5") => Ok(Aid::Pf5),
-            _ => Err(de::Error::invalid_value(de::Unexpected::Enum, &self)),
+            "ENTER" => Ok(Aid::Enter),
+            "PF5" => Ok(Aid::Pf5),
+            _ => Err(E::unknown_variant(name, AID_NAMES)),
         }
     }
 }
@@ -256,39 +255,34 @@ impl Serialize for CardUpdateState {
     }
 }
 
-/// One of the seven wire names; any other name is refused (`X-COCRDUPC-8`).
+/// One of the seven wire names in a JSON string; any other name (`X-COCRDUPC-8`), and any value
+/// that is not a JSON string, serde's map form `{"show_details": null}` included, is refused.
 impl<'de> Deserialize<'de> for CardUpdateState {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_enum(
-            "CardUpdateState",
-            CARD_UPDATE_STATE_NAMES,
-            CardUpdateStateVisitor,
-        )
+        deserializer.deserialize_str(CardUpdateStateVisitor)
     }
 }
 
 /// The visitor of [`CardUpdateState`]'s wire names.
 struct CardUpdateStateVisitor;
 
-impl<'de> Visitor<'de> for CardUpdateStateVisitor {
+impl Visitor<'_> for CardUpdateStateVisitor {
     type Value = CardUpdateState;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("enum CardUpdateState")
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<CardUpdateState, A::Error> {
-        let (name, variant) = data.variant_seed(WireName(CARD_UPDATE_STATE_NAMES))?;
-        variant.unit_variant()?;
+    fn visit_str<E: de::Error>(self, name: &str) -> Result<CardUpdateState, E> {
         match name {
-            Some("not_fetched") => Ok(CardUpdateState::NotFetched),
-            Some("show_details") => Ok(CardUpdateState::ShowDetails),
-            Some("changes_not_ok") => Ok(CardUpdateState::ChangesNotOk),
-            Some("changes_ok_not_confirmed") => Ok(CardUpdateState::ChangesOkNotConfirmed),
-            Some("changes_okayed_and_done") => Ok(CardUpdateState::ChangesOkayedAndDone),
-            Some("lock_error") => Ok(CardUpdateState::LockError),
-            Some("update_failed") => Ok(CardUpdateState::UpdateFailed),
-            _ => Err(de::Error::invalid_value(de::Unexpected::Enum, &self)),
+            "not_fetched" => Ok(CardUpdateState::NotFetched),
+            "show_details" => Ok(CardUpdateState::ShowDetails),
+            "changes_not_ok" => Ok(CardUpdateState::ChangesNotOk),
+            "changes_ok_not_confirmed" => Ok(CardUpdateState::ChangesOkNotConfirmed),
+            "changes_okayed_and_done" => Ok(CardUpdateState::ChangesOkayedAndDone),
+            "lock_error" => Ok(CardUpdateState::LockError),
+            "update_failed" => Ok(CardUpdateState::UpdateFailed),
+            _ => Err(E::unknown_variant(name, CARD_UPDATE_STATE_NAMES)),
         }
     }
 }
@@ -1268,10 +1262,15 @@ mod tests {
                 .as_object_mut()
                 .ok_or("the snapshot is an object")?
                 .remove("state");
+            // serde's map form names a known state or key, but is no JSON string.
+            let mut map_form_state = snapshot.clone();
+            map_form_state["state"] = json!({"show_details": null});
             for body in [
                 json!({"aid": "ENTER", "fields": {}, "snapshot": unknown_state}),
                 json!({"aid": "ENTER", "fields": {}, "snapshot": missing_state}),
+                json!({"aid": "ENTER", "fields": {}, "snapshot": map_form_state}),
                 json!({"aid": "PF12", "fields": {}, "snapshot": snapshot}),
+                json!({"aid": {"PF5": null}, "fields": {}, "snapshot": snapshot}),
                 json!({"aid": "ENTER", "fields": {}}),
             ] {
                 let error = extract(&body)

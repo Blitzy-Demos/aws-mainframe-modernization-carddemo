@@ -2,7 +2,7 @@ import { Fragment, useEffect, useId, useRef, useState, type ReactNode } from "re
 import { Navigate, useLocation, useNavigate } from "react-router";
 import { useCopaus1cDetail, useCopaus1cToggleFraud } from "@/api/hooks";
 import type { components } from "@/api/schema";
-import { FieldGrid, GridCell } from "@/components/screen/FieldGrid";
+import { FIELD_BOX_HEIGHT, FieldGrid, GridCell } from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import { Input } from "@/components/ui/input";
@@ -85,8 +85,11 @@ const LABEL_CLASS = "h-full whitespace-pre text-foreground";
  * default, the one-character Auth Resp box runs into `Resp Reason:` and Auth Date into
  * `Auth Time:` once the frame nears its minimum width; with `px-1` every box ends before the next
  * field down to that width.
+ *
+ * Every box is as tall as the shared map-field box (`FIELD_BOX_HEIGHT`), so the body fields stand
+ * as tall as the header values above them.
  */
-const VALUE_CLASS = "w-auto min-w-full px-1";
+const VALUE_CLASS = `${FIELD_BOX_HEIGHT} w-auto min-w-full px-1`;
 
 /** One output field of the map with the literal that labels it, both on the same line. */
 type DetailField = {

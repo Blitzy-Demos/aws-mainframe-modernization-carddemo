@@ -5,7 +5,14 @@ import { useLocation, useNavigate } from "react-router";
 import { useCopaus0cSummary } from "@/api/hooks";
 import type { components } from "@/api/schema";
 import { FieldControl } from "@/components/screen/FieldControl";
-import { FieldGrid, GridCell, GridTable, LIST_CELL, LIST_ROW } from "@/components/screen/FieldGrid";
+import {
+  FIELD_BOX_HEIGHT,
+  FieldGrid,
+  GridCell,
+  GridTable,
+  LIST_CELL,
+  LIST_ROW,
+} from "@/components/screen/FieldGrid";
 import type { PfKeyBarEntry } from "@/components/screen/PfKeyBar";
 import { ScreenShell } from "@/components/screen/ScreenShell";
 import { Form, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
@@ -119,14 +126,15 @@ const COLUMNS = [
  * empty attribute-byte columns that follow it on the map. Output inputs also use `px-1` instead of
  * the default `px-3`, which keeps that overhang inside those columns.
  *
- * BLITZY [LAYOUT]: every input is the compact `h-7 py-0` box of COACTUP instead of the `Input`
- * default `h-9 py-1`. The map holds fields on 15 of its lines, the five list rows included, and at
- * the default height those lines make the screen taller than a 768px viewport, so the message row
- * and the keys would open below it. With the compact box and the compact list lines
- * (`LIST_ROW`), the whole screen shows at 1024x768.
+ * BLITZY [LAYOUT]: every input, the list selectors included, takes the height every map field's
+ * box shares (`FIELD_BOX_HEIGHT`, `h-7 py-0`) instead of the `Input` default `h-9 py-1`. The map
+ * holds fields on 15 of its lines, the five list rows included, and at the default height those
+ * lines make the screen taller than a 768px viewport, so the message row and the keys would open
+ * below it. With the shared box height and the compact list lines (`LIST_ROW`), the whole screen
+ * shows at 1024x768.
  */
 const LABEL = "h-full whitespace-pre text-foreground";
-const FIELD = "h-7 w-auto min-w-full py-0";
+const FIELD = `${FIELD_BOX_HEIGHT} w-auto min-w-full`;
 const OUTPUT = `${FIELD} px-1 text-muted-foreground`;
 const CELL = `${LIST_CELL} whitespace-pre text-muted-foreground`;
 const HEADING = `${LIST_CELL} whitespace-pre`;
@@ -816,9 +824,9 @@ export function COPAU00(): ReactNode {
                     const isProtected = pageRead && row === undefined;
                     return (
                       // BLITZY [LAYOUT]: cells drop the default padding (`LIST_CELL`) and the
-                      // selector is the compact `h-7 py-0` input, so a list row keeps the height of
-                      // one map line, as tall as an input line of the block above it, and each
-                      // value starts on its column.
+                      // selector takes the shared map-field box height (`FIELD_BOX_HEIGHT`), so a
+                      // list row keeps the height of one map line, as tall as an input line of the
+                      // block above it, and each value starts on its column.
                       <TableRow key={index} className={LIST_ROW}>
                         <TableCell className={LIST_CELL}>
                           <FormField
@@ -834,7 +842,7 @@ export function COPAU00(): ReactNode {
                                     autoComplete="off"
                                     readOnly={isProtected || pending}
                                     tabIndex={isProtected ? -1 : undefined}
-                                    className="relative left-1/6 h-7 w-9 py-0"
+                                    className={`${FIELD_BOX_HEIGHT} relative left-1/6 w-9`}
                                   />
                                 </FieldControl>
                                 <FormMessage className="sr-only" />
