@@ -36,8 +36,11 @@
 //! A sequential output is written as fixed-length records, each followed by LF (AAP 0.3.4.3).
 //! A `(+1)` generation (`DALYREJS`, `SYSTRAN`, `TRANREPT`) takes its name from
 //! `runtime::gdg::next_generation` and is created exclusively, as a `NEW` data set never replaces
-//! another; the statement files of `creastmt` keep fixed names and replace the previous run's,
-//! which only the holder of the directory's [`DirectoryLock`] may do (CBSTM03A-002).
+//! another; a run that finds the generation it named taken by a concurrent run names the next
+//! one and creates that, so runs started together each write a generation of their own
+//! ([`OutputFile::next_generation`]). The statement files of `creastmt` keep fixed names and
+//! replace the previous run's, which only the holder of the directory's [`DirectoryLock`] may do
+//! (CBSTM03A-002).
 //! A job returns every path it wrote in [`JobOutcome::written`], and `main` prints them.
 //!
 //! Every output file is created readable and writable by its owner only, and every output
@@ -522,6 +525,20 @@ fn generation_failure(base: &'static str) -> impl FnOnce(std::io::Error) -> JobE
     }
 }
 
+/// Whether a run whose exclusive create of generation file `refused` found it taken names the
+/// generation again ([`OutputFile::next_generation`]): only when no create was refused before,
+/// or `refused` is a later generation than `last_refused`, the path refused before it.
+///
+/// Both paths are `<NAME>.G` and four digits in the same directory, so their order as paths is
+/// the order of their generation numbers. A path no later than the one refused before means
+/// that what stands in the way is not a generation a concurrent run has just added: a name the
+/// generation scan does not count, such as a differently cased name on a case-insensitive
+/// filesystem, which a retry would meet again without end, or a generation another run removed
+/// again when it failed. Such a refusal is the create's failure.
+fn retries(refused: &Path, last_refused: Option<&Path>) -> bool {
+    last_refused.is_none_or(|last| refused > last)
+}
+
 /// `len`, a number of records or lines, as a counter of [`JobOutcome::counts`].
 fn count(len: usize) -> u64 {
     // TRUNCATION: `usize` is at most 64 bits wide on every target Rust supports, so the
@@ -941,23 +958,45 @@ pub(crate) struct OutputFile {
 impl OutputFile {
     /// Creates generation `(+1)` of base `name` in `dir`, `<dir>/<name>.G<nnnn>`, through
     /// `runtime::gdg::next_generation` (`posttran` `DALYREJS`, `intcalc` `SYSTRAN`, `tranrept`
-    /// `TRANREPT`). A missing `dir` is created owner-only first, so the generation naming finds
-    /// it in place and creates nothing.
+    /// `TRANREPT`). A missing `dir` is created owner-only before each naming, so the generation
+    /// naming finds it in place and creates nothing.
+    ///
+    /// The file is created exclusively, so it never replaces another. Runs started together
+    /// each get a generation of their own, as jobs allocating `(+1)` of one base on z/OS each
+    /// catalogue their own: a run whose create is refused because another run took the
+    /// generation first names the generation again and creates that one. It retries only while
+    /// [`retries`] allows: each refused name must be a later generation than the one refused
+    /// before it. A concurrent run always leaves a later name to take, because the rescan counts
+    /// the generation it took, while generation numbers end at `runtime::gdg::MAX_GENERATION`,
+    /// after which the naming fails; so a run makes at most one attempt per generation number.
     ///
     /// # Errors
     ///
     /// - [`JobError::GenerationLimit`] when generation 9999 of `name` already exists, which is
-    ///   left as it is.
+    ///   left as it is, whether the first naming or one after a refused create finds it.
     /// - [`JobError::Io`] with context `allocating generation` when the directory cannot be
     ///   created or read, or `name` is no valid base, and with context `creating output file`
-    ///   when the file cannot be created, as when another run took the same generation first.
+    ///   when the file cannot be created or its identity read, a refused create that
+    ///   [`retries`] does not retry included.
     pub(crate) async fn next_generation(dir: &Path, name: &'static str) -> Result<Self, JobError> {
         let dir = dir.to_path_buf();
         blocking(ALLOCATING_GENERATION, move || {
-            create_output_dir(&dir).map_err(io(ALLOCATING_GENERATION))?;
-            let path =
-                runtime::gdg::next_generation(&dir, name).map_err(generation_failure(name))?;
-            Self::create(path)
+            let mut last_refused: Option<PathBuf> = None;
+            loop {
+                create_output_dir(&dir).map_err(io(ALLOCATING_GENERATION))?;
+                let path =
+                    runtime::gdg::next_generation(&dir, name).map_err(generation_failure(name))?;
+                match output_file_options().open(&path) {
+                    Ok(file) => return Self::adopt(path, file),
+                    Err(error)
+                        if error.kind() == ErrorKind::AlreadyExists
+                            && retries(&path, last_refused.as_deref()) =>
+                    {
+                        last_refused = Some(path);
+                    }
+                    Err(error) => return Err(io(CREATING_OUTPUT_FILE)(error).into()),
+                }
+            }
         })
         .await?
         .map_err(Failure::reported)
@@ -988,12 +1027,9 @@ impl OutputFile {
         .map_err(Failure::reported)
     }
 
-    /// Creates the file at `path`, failing when anything is already there, and records its
-    /// identity from the open handle. The guard is armed only once both are done, so a failed
-    /// creation never removes another file. A file whose identity cannot be read is removed
-    /// again by name, as the call created it a moment ago under a name only this run uses: a
-    /// fresh generation, or a fixed name under the directory's lock. Runs inside a [`blocking`]
-    /// step.
+    /// Creates the file at `path`, failing when anything is already there, and takes it as this
+    /// run's output with [`OutputFile::adopt`]. A failed creation arms no guard, so it never
+    /// removes another file. Runs inside a [`blocking`] step.
     ///
     /// # Errors
     ///
@@ -1004,6 +1040,21 @@ impl OutputFile {
         let file = output_file_options()
             .open(&path)
             .map_err(io(CREATING_OUTPUT_FILE))?;
+        Self::adopt(path, file)
+    }
+
+    /// Takes `file`, which this run has just created exclusively at `path` with
+    /// [`output_file_options`], as its output: records the file's identity from the open handle,
+    /// then arms the guard, so the guard is armed only once both are done. A file whose identity
+    /// cannot be read is removed again by name, as the run created it a moment ago under a name
+    /// only this run uses: a fresh generation, or a fixed name under the directory's lock. Runs
+    /// inside a [`blocking`] step.
+    ///
+    /// # Errors
+    ///
+    /// [`JobError::Io`] with context `creating output file` when the identity cannot be read,
+    /// with cleanup `removing unfinished output` when the file then cannot be removed.
+    fn adopt(path: PathBuf, file: File) -> Result<Self, Failure> {
         let identity = match file.metadata() {
             Ok(metadata) => FileIdentity::of(&metadata),
             Err(error) => {
@@ -1826,11 +1877,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
+    use std::sync::Barrier;
+    #[cfg(target_os = "linux")]
+    use std::sync::OnceLock;
     #[cfg(target_os = "linux")]
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::{AtomicU32, Ordering};
-    #[cfg(target_os = "linux")]
-    use std::sync::{Barrier, OnceLock};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use copybook::PicU;
@@ -1841,7 +1893,7 @@ mod tests {
 
     use super::{
         Attempt, DirectoryLock, Failure, Held, JobError, LOCK_NAME, LOCK_RETRY, OutputFile,
-        blocking, read_input, read_named_input, remove_outputs,
+        blocking, read_input, read_named_input, remove_outputs, retries,
     };
     #[cfg(target_os = "linux")]
     use super::{Claim, Dead, FileIdentity, HOLDER_SOCKET, Probe};
@@ -2064,6 +2116,94 @@ mod tests {
             assert!(first.exists() && second.exists());
             Ok(())
         })
+    }
+
+    /// Writes `record` to the next generation of `TRANREPT` in `dir` and finishes it on a
+    /// runtime of its own, as one `carddemo-batch tranrept` run does, and returns the
+    /// generation's path, or the error's text.
+    fn write_generation(dir: &Path, record: &[u8]) -> Result<PathBuf, String> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(async {
+                let mut output = OutputFile::next_generation(dir, "TRANREPT").await?;
+                output.write_record(record).await?;
+                output.finish().await
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    /// Runs started at once over one directory each create a generation: a run whose
+    /// generation another took first names the next one, so the names are exactly `G0001`
+    /// onward, every file holds the whole record of the run that got its path, and nothing else
+    /// is left in the directory.
+    #[test]
+    fn concurrent_runs_each_take_a_generation_of_their_own() -> TestResult {
+        const RUNS: usize = 32;
+        let scratch = Scratch::new()?;
+        let dir = scratch.path().join("reports");
+        let start = Barrier::new(RUNS);
+        let written: Vec<Result<(PathBuf, Vec<u8>), String>> = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..RUNS)
+                .map(|run| {
+                    let (dir, start) = (&dir, &start);
+                    scope.spawn(move || {
+                        let record = format!("{run:>133}").into_bytes();
+                        start.wait();
+                        write_generation(dir, &record).map(|path| (path, record))
+                    })
+                })
+                .collect();
+            runs.into_iter()
+                .map(|run| {
+                    run.join()
+                        .unwrap_or_else(|_| Err("a run panicked".to_owned()))
+                })
+                .collect()
+        });
+
+        let mut written = written
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("a concurrent run failed: {error}"))?;
+        written.sort_unstable();
+        let expected: Vec<String> = (1..=RUNS)
+            .map(|generation| format!("TRANREPT.G{generation:04}"))
+            .collect();
+        let paths: Vec<PathBuf> = written.iter().map(|(path, _)| path.clone()).collect();
+        let expected_paths: Vec<PathBuf> = expected.iter().map(|name| dir.join(name)).collect();
+        assert_eq!(paths, expected_paths);
+        for (path, record) in &written {
+            let mut whole = record.clone();
+            whole.push(b'\n');
+            assert_eq!(fs::read(path)?, whole, "{}", path.display());
+        }
+        assert_eq!(names(&dir)?, expected);
+        Ok(())
+    }
+
+    /// A refused create is retried only while each refused path is a later generation than the
+    /// one refused before it.
+    #[test]
+    fn a_refused_generation_is_retried_only_while_the_names_advance() {
+        let dir = Path::new("var").join("reports");
+        let cases = [
+            ("TRANREPT.G0001", None, true),
+            ("TRANREPT.G0010", Some("TRANREPT.G0009"), true),
+            ("TRANREPT.G0100", Some("TRANREPT.G0099"), true),
+            ("TRANREPT.G9999", Some("TRANREPT.G0001"), true),
+            ("TRANREPT.G0009", Some("TRANREPT.G0009"), false),
+            ("TRANREPT.G0008", Some("TRANREPT.G0009"), false),
+        ];
+        for (refused, last_refused, retried) in cases {
+            let last_refused = last_refused.map(|name| dir.join(name));
+            assert_eq!(
+                retries(&dir.join(refused), last_refused.as_deref()),
+                retried,
+                "{refused} after {last_refused:?}"
+            );
+        }
     }
 
     /// No generation is named past generation 9999, whose file is left as it was: the error
