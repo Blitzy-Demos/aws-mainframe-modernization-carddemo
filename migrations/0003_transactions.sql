@@ -23,7 +23,9 @@
 --   Unsigned 9(n) maps to INTEGER for n <= 9 and BIGINT for n >= 10, with
 --   CHECK (0 <= v < 10^n).
 --   S9(09)V99 maps to NUMERIC(11,2): the precision bounds the value to the 9 integer digits
---   of the PIC and the scale to its 2 decimals.
+--   of the PIC and the scale to its 2 decimals. PostgreSQL NUMERIC also stores NaN, which
+--   no PIC clause and no rust_decimal newtype (Money in crates/domain/src/numeric/money.rs)
+--   can hold, so each money column carries CHECK (v <> 'NaN') and no sign check.
 --   Every copybook column is NOT NULL, as every field of a VSAM record holds a value.
 --   Text columns carry no value-domain check.
 --   FILLER is not stored; the codec layouts keep its bytes.
@@ -49,8 +51,14 @@
 -- keeps such rows, and the live TRANSACT file is the subset of rows with in_master:
 --   transaction_id  the row identity and the foreign key target, generated, never reused.
 --   tran_id         the COBOL TRAN-ID, the KSDS key. It is unique among live rows only: a
---                   TRAN-ID held only by non-live rows may be issued again, as the COBOL
---                   issues it again on an emptied file.
+--                   TRAN-ID held only by non-live rows may be issued again, and the new row
+--                   gets its own transaction_id. After TRANBKP no TRAN-ID is issued again
+--                   until `batch posttran` or a `batch combtran` reload makes rows live
+--                   again, because an online add (CT02, CB00) on the empty live master
+--                   fails and adds nothing (E-27) [app/cbl/COTRN02C.cbl:L642-668]
+--                   [app/cbl/COBIL00C.cbl:L441-505]. A later online add then takes the
+--                   highest live TRAN-ID + 1 (the allocation under Read path below), which
+--                   can equal the TRAN-ID of a non-live row.
 --   in_master       true for the rows of the live TRANSACT file.
 -- `batch tranbkp` writes TRANSACT.BKUP(+1) from the live rows, then sets in_master = false
 -- on every live row and deletes the non-live rows no accrual references (P-TRANBKP-004,
@@ -114,7 +122,8 @@ CREATE TABLE transactions (
         CHECK (tran_cat_cd >= 0 AND tran_cat_cd < 10000),
     tran_source        VARCHAR(10)  COLLATE "C" NOT NULL,
     tran_desc          VARCHAR(100) COLLATE "C" NOT NULL,
-    tran_amt           NUMERIC(11,2)            NOT NULL,
+    tran_amt           NUMERIC(11,2)            NOT NULL
+        CHECK (tran_amt <> 'NaN'),
     tran_merchant_id   INTEGER                  NOT NULL
         CHECK (tran_merchant_id >= 0 AND tran_merchant_id < 1000000000),
     tran_merchant_name VARCHAR(50)  COLLATE "C" NOT NULL,
@@ -173,6 +182,7 @@ CREATE TABLE transaction_category_balances (
     trancat_type_cd VARCHAR(2) COLLATE "C" NOT NULL,
     trancat_cd      INTEGER                NOT NULL
         CHECK (trancat_cd >= 0 AND trancat_cd < 10000),
-    tran_cat_bal    NUMERIC(11,2)          NOT NULL,
+    tran_cat_bal    NUMERIC(11,2)          NOT NULL
+        CHECK (tran_cat_bal <> 'NaN'),
     PRIMARY KEY (trancat_acct_id, trancat_type_cd, trancat_cd)
 );

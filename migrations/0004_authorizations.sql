@@ -45,6 +45,14 @@
 --   the precision bounds the value to the n integer digits and the scale to the 2 decimals.
 --   Db2 DECIMAL(p,s) maps to NUMERIC(p,s), TIMESTAMP to TIMESTAMP(6) without time zone, DATE
 --   to DATE and SMALLINT to SMALLINT.
+--   PostgreSQL NUMERIC also stores NaN, which no PIC clause, no Db2 DECIMAL and no
+--   rust_decimal newtype (Money in crates/domain/src/numeric/money.rs) can hold, so every
+--   NUMERIC column carries CHECK (v <> 'NaN') and no sign check. The check passes NULL, so
+--   the nullable Db2 amounts stay nullable.
+--   PostgreSQL TIMESTAMP and DATE also store infinity and -infinity, which Db2 TIMESTAMP and
+--   DATE and the finite chrono types (NaiveDateTime, NaiveDate) cannot hold, so auth_ts and
+--   fraud_rpt_date carry CHECK (isfinite(v)). It passes NULL too, so fraud_rpt_date stays
+--   nullable.
 --   Every IMS segment field is NOT NULL, as every byte of a segment holds a value. The Db2
 --   columns keep their DDL nullability.
 --   Text columns carry no value-domain check: the 88-level values of PA-MATCH-STATUS (P, D,
@@ -186,16 +194,22 @@ CREATE TABLE pending_auth_summaries (
             AND cardinality(pa_account_status) = 5
             AND array_position(pa_account_status, NULL) IS NULL
         ),
-    pa_credit_limit      NUMERIC(11,2)              NOT NULL,
-    pa_cash_limit        NUMERIC(11,2)              NOT NULL,
-    pa_credit_balance    NUMERIC(11,2)              NOT NULL,
-    pa_cash_balance      NUMERIC(11,2)              NOT NULL,
+    pa_credit_limit      NUMERIC(11,2)              NOT NULL
+        CHECK (pa_credit_limit <> 'NaN'),
+    pa_cash_limit        NUMERIC(11,2)              NOT NULL
+        CHECK (pa_cash_limit <> 'NaN'),
+    pa_credit_balance    NUMERIC(11,2)              NOT NULL
+        CHECK (pa_credit_balance <> 'NaN'),
+    pa_cash_balance      NUMERIC(11,2)              NOT NULL
+        CHECK (pa_cash_balance <> 'NaN'),
     pa_approved_auth_cnt SMALLINT                   NOT NULL
         CHECK (pa_approved_auth_cnt > -10000 AND pa_approved_auth_cnt < 10000),
     pa_declined_auth_cnt SMALLINT                   NOT NULL
         CHECK (pa_declined_auth_cnt > -10000 AND pa_declined_auth_cnt < 10000),
-    pa_approved_auth_amt NUMERIC(11,2)              NOT NULL,
+    pa_approved_auth_amt NUMERIC(11,2)              NOT NULL
+        CHECK (pa_approved_auth_amt <> 'NaN'),
     pa_declined_auth_amt NUMERIC(11,2)              NOT NULL
+        CHECK (pa_declined_auth_amt <> 'NaN')
 );
 
 -- A detail is a PAUTDTL1 twin under its summary.
@@ -230,8 +244,10 @@ CREATE TABLE pending_auth_details (
     pa_auth_resp_reason       VARCHAR(4)  COLLATE "C"  NOT NULL,
     pa_processing_code        INTEGER                  NOT NULL
         CHECK (pa_processing_code >= 0 AND pa_processing_code < 1000000),
-    pa_transaction_amt        NUMERIC(12,2)            NOT NULL,
-    pa_approved_amt           NUMERIC(12,2)            NOT NULL,
+    pa_transaction_amt        NUMERIC(12,2)            NOT NULL
+        CHECK (pa_transaction_amt <> 'NaN'),
+    pa_approved_amt           NUMERIC(12,2)            NOT NULL
+        CHECK (pa_approved_amt <> 'NaN'),
     pa_merchant_catagory_code VARCHAR(4)  COLLATE "C"  NOT NULL,
     pa_acqr_country_code      VARCHAR(3)  COLLATE "C"  NOT NULL,
     pa_pos_entry_mode         INTEGER                  NOT NULL
@@ -262,7 +278,8 @@ CREATE TABLE pending_auth_details (
 -- leaves its fraud row in place.
 CREATE TABLE auth_fraud (
     card_num               VARCHAR(16) COLLATE "C" NOT NULL,
-    auth_ts                TIMESTAMP(6)            NOT NULL,
+    auth_ts                TIMESTAMP(6)            NOT NULL
+        CHECK (isfinite(auth_ts)),
     auth_type              VARCHAR(4)  COLLATE "C",
     card_expiry_date       VARCHAR(4)  COLLATE "C",
     message_type           VARCHAR(6)  COLLATE "C",
@@ -271,8 +288,10 @@ CREATE TABLE auth_fraud (
     auth_resp_code         VARCHAR(2)  COLLATE "C",
     auth_resp_reason       VARCHAR(4)  COLLATE "C",
     processing_code        VARCHAR(6)  COLLATE "C",
-    transaction_amt        NUMERIC(12,2),
-    approved_amt           NUMERIC(12,2),
+    transaction_amt        NUMERIC(12,2)
+        CHECK (transaction_amt <> 'NaN'),
+    approved_amt           NUMERIC(12,2)
+        CHECK (approved_amt <> 'NaN'),
     merchant_catagory_code VARCHAR(4)  COLLATE "C",
     acqr_country_code      VARCHAR(3)  COLLATE "C",
     pos_entry_mode         SMALLINT,
@@ -284,7 +303,8 @@ CREATE TABLE auth_fraud (
     transaction_id         VARCHAR(15) COLLATE "C",
     match_status           VARCHAR(1)  COLLATE "C",
     auth_fraud             VARCHAR(1)  COLLATE "C",
-    fraud_rpt_date         DATE,
+    fraud_rpt_date         DATE
+        CHECK (isfinite(fraud_rpt_date)),
     acct_id                BIGINT
         CHECK (acct_id >= 0 AND acct_id < 100000000000),
     cust_id                BIGINT

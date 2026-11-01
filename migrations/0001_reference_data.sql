@@ -17,7 +17,9 @@
 --   Text is stored right-trimmed of trailing spaces; the codec and persistence layers pad
 --   it back to the PIC width.
 --   Unsigned 9(n) with n <= 9 maps to INTEGER with CHECK (0 <= v < 10^n).
---   S9(04)V99 maps to NUMERIC(6,2).
+--   S9(04)V99 maps to NUMERIC(6,2) with CHECK (v <> 'NaN'): PostgreSQL NUMERIC also stores
+--   NaN, which no PIC clause and no rust_decimal newtype (InterestRate in
+--   crates/domain/src/numeric/rates.rs) can hold.
 --   FILLER is not stored; the codec layouts keep its bytes.
 --
 -- The masters and the processing copies are separate tables with no link between them.
@@ -107,11 +109,12 @@ CREATE TABLE trancatg_file (
 -- Disclosure groups, loaded by `batch seed` from discgrp.txt (51 records). CBACT04C
 -- 1200-GET-INTEREST-RATE reads by the full 16-byte key and falls back to group DEFAULT on
 -- status 23. dis_int_rate is signed, as the InterestRate newtype is; NUMERIC(6,2) bounds it
--- to the S9(04)V99 range, so no further CHECK applies.
+-- to the S9(04)V99 range, and its CHECK rejects NaN, which InterestRate cannot hold. No
+-- sign check applies.
 CREATE TABLE disclosure_groups (
     dis_acct_group_id VARCHAR(10) COLLATE "C" NOT NULL,
     dis_tran_type_cd  VARCHAR(2)  COLLATE "C" NOT NULL,
     dis_tran_cat_cd   INTEGER                 NOT NULL CHECK (dis_tran_cat_cd >= 0 AND dis_tran_cat_cd < 10000),
-    dis_int_rate      NUMERIC(6,2)            NOT NULL,
+    dis_int_rate      NUMERIC(6,2)            NOT NULL CHECK (dis_int_rate <> 'NaN'),
     PRIMARY KEY (dis_acct_group_id, dis_tran_type_cd, dis_tran_cat_cd)
 );

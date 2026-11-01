@@ -21,7 +21,10 @@
 --   Unsigned 9(n) maps to INTEGER for n <= 9 and BIGINT for n >= 10, with
 --   CHECK (0 <= v < 10^n).
 --   S9(10)V99 maps to NUMERIC(12,2): the precision bounds the value to the 10 integer
---   digits of the PIC and the scale to its 2 decimals.
+--   digits of the PIC and the scale to its 2 decimals. PostgreSQL NUMERIC also stores NaN,
+--   which no PIC clause and no rust_decimal newtype (Money in
+--   crates/domain/src/numeric/money.rs) can hold, so each money column carries
+--   CHECK (v <> 'NaN') and no sign check.
 --   Every column is NOT NULL, as every field of a VSAM record holds a value.
 --   Text columns carry no value-domain check: COUSR01C stores any non-blank user type
 --   [app/cbl/COUSR01C.cbl:L142-158], and the status flags hold whatever the files hold.
@@ -142,14 +145,19 @@ CREATE TABLE accounts (
     account_id             BIGINT                  NOT NULL PRIMARY KEY
         CHECK (account_id >= 0 AND account_id < 100000000000),
     acct_active_status     VARCHAR(1)  COLLATE "C" NOT NULL,
-    acct_curr_bal          NUMERIC(12,2)           NOT NULL,
-    acct_credit_limit      NUMERIC(12,2)           NOT NULL,
-    acct_cash_credit_limit NUMERIC(12,2)           NOT NULL,
+    acct_curr_bal          NUMERIC(12,2)           NOT NULL
+        CHECK (acct_curr_bal <> 'NaN'),
+    acct_credit_limit      NUMERIC(12,2)           NOT NULL
+        CHECK (acct_credit_limit <> 'NaN'),
+    acct_cash_credit_limit NUMERIC(12,2)           NOT NULL
+        CHECK (acct_cash_credit_limit <> 'NaN'),
     acct_open_date         VARCHAR(10) COLLATE "C" NOT NULL,
     acct_expiraion_date    VARCHAR(10) COLLATE "C" NOT NULL,
     acct_reissue_date      VARCHAR(10) COLLATE "C" NOT NULL,
-    acct_curr_cyc_credit   NUMERIC(12,2)           NOT NULL,
-    acct_curr_cyc_debit    NUMERIC(12,2)           NOT NULL,
+    acct_curr_cyc_credit   NUMERIC(12,2)           NOT NULL
+        CHECK (acct_curr_cyc_credit <> 'NaN'),
+    acct_curr_cyc_debit    NUMERIC(12,2)           NOT NULL
+        CHECK (acct_curr_cyc_debit <> 'NaN'),
     acct_addr_zip          VARCHAR(10) COLLATE "C" NOT NULL,
     acct_group_id          VARCHAR(10) COLLATE "C" NOT NULL
 );
@@ -183,8 +191,13 @@ CREATE TABLE card_xref (
 -- [app/csd/CARDDEMO.CSD:L63-65].
 CREATE INDEX cxacaix ON card_xref (xref_acct_id);
 
--- The prefix check accepts only the argon2id PHC strings crates/domain/src/auth/password.rs
--- writes, so no plaintext SEC-USR-PWD value can be stored.
+-- The prefix check enforces only the '$argon2id$' prefix of the PHC string format, not the
+-- rest of its syntax, so '$argon2id$garbage' passes it. The full format is owned by
+-- crates/domain/src/auth/password.rs: hash_stored_password generates every stored value as
+-- the PHC string $argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>, and verify_padded parses the
+-- stored value with PasswordHash::new, rejecting one that does not parse or lacks a salt or
+-- hash output as PasswordError::MalformedHash. The prefix alone is 10 bytes and SEC-USR-PWD
+-- is X(08), so no plaintext SEC-USR-PWD value can be stored.
 CREATE TABLE users (
     user_id       VARCHAR(8)  COLLATE "C" NOT NULL PRIMARY KEY,
     sec_usr_fname VARCHAR(20) COLLATE "C" NOT NULL,

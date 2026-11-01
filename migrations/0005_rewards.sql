@@ -18,16 +18,24 @@
 --   match is a plain equality: the type code is VARCHAR(2) COLLATE "C" like
 --   transactions.tran_type_cd, and the category code is INTEGER 0 to 9999 like
 --   transactions.tran_cat_cd (the fixture category 0001 is stored as 1).
---   Amounts are NUMERIC(11,2): the 9 integer digits and 2 decimals of S9(09)V99.
+--   Amounts are NUMERIC(11,2): the 9 integer digits and 2 decimals of S9(09)V99, signed.
+--   PostgreSQL NUMERIC also stores NaN, which no rust_decimal newtype (Money and RewardRate
+--   in crates/domain/src/numeric/) can hold, so every NUMERIC column carries
+--   CHECK (v <> 'NaN'). The check passes NULL, so a NULL amount bound stays unbounded.
 --   reward_rate is NUMERIC(9,4): at most 5 integer and 4 fraction digits, the RewardRate
 --   range. PostgreSQL rounds a value with more fraction digits to 4; RewardRate rejects a
---   non-zero fifth fraction digit (TooManyDecimals) before any value reaches SQL.
---   Points are BIGINT, the 0 to i64::MAX range of RewardPoints. The API carries them as
---   decimal digit strings, so a value above 2^53 - 1, such as 9007199254740993, reaches the
---   browser exactly.
---   Instants are TIMESTAMPTZ. No column defaults to the current time: writers supply the
---   processing clock (crates/domain/src/clock.rs, CARDDEMO_CLOCK_OVERRIDE when set), so
---   accrual and soft-delete instants follow the pinned clock in tests.
+--   non-zero fifth fraction digit (TooManyDecimals) before any value reaches SQL. Its check
+--   is reward_rate >= 0 AND reward_rate <> 'NaN', because PostgreSQL sorts NaN above every
+--   number and reward_rate >= 0 alone accepts it.
+--   Points are BIGINT, the 0 to i64::MAX range of RewardPoints, and every points column
+--   carries CHECK (v >= 0): RewardPoints rejects a negative BIGINT
+--   (crates/domain/src/numeric/points.rs). The API carries them as decimal digit strings,
+--   so a value above 2^53 - 1, such as 9007199254740993, reaches the browser exactly.
+--   Instants are TIMESTAMPTZ with CHECK (isfinite(v)): PostgreSQL also stores infinity and
+--   -infinity, which the finite chrono DateTime<Utc> cannot hold. The check passes NULL, so
+--   a NULL active_to stays open-ended. No column defaults to the current time: writers
+--   supply the processing clock (crates/domain/src/clock.rs, CARDDEMO_CLOCK_OVERRIDE when
+--   set), so accrual and soft-delete instants follow the pinned clock in tests.
 --   rule_id and accrual_id are GENERATED ALWAYS identities; no writer supplies them.
 --   Nothing here blocks TRUNCATE reward_accruals, reward_balances, reward_rules
 --   RESTART IDENTITY, the seed refresh that restarts rule IDs at 1.
@@ -55,12 +63,12 @@
 --   account_id            | account the balance belongs to                        | BIGINT NOT NULL, PK, FK accounts | AccountId
 --   total_points_earned   | sum of the account's accruals                         | BIGINT NOT NULL DEFAULT 0, >= 0  | RewardPoints (i64)
 --   total_points_redeemed | points spent; redemption is out of scope, so always 0 | BIGINT NOT NULL DEFAULT 0, >= 0  | RewardPoints (i64)
---   available_points      | total_points_earned - total_points_redeemed           | BIGINT NOT NULL DEFAULT 0        | RewardPoints (i64)
+--   available_points      | total_points_earned - total_points_redeemed           | BIGINT NOT NULL DEFAULT 0, >= 0  | RewardPoints (i64)
 --
 -- reward_accruals: the points one qualifying transaction earned
 --   column         | meaning                                      | SQL type                                 | Rust type
 --   accrual_id     | accrual identity; reward history page key    | BIGINT NOT NULL, identity, PK            | AccrualId (i64)
---   account_id     | account credited                             | BIGINT NOT NULL                          | AccountId
+--   account_id     | account credited                             | BIGINT NOT NULL, 0 to 99999999999        | AccountId
 --   transaction_id | transaction row that earned the points       | BIGINT NOT NULL, unique, FK transactions | TransactionRowId (i64)
 --   rule_id        | winning rule                                 | BIGINT NOT NULL, FK reward_rules         | RuleId (i64)
 --   points_earned  | ceil(amount x reward_rate)                   | BIGINT NOT NULL, >= 0                    | RewardPoints (i64)
@@ -88,11 +96,15 @@ CREATE TABLE reward_rules (
     transaction_category_cd INTEGER                NOT NULL
         CHECK (transaction_category_cd >= 0 AND transaction_category_cd < 10000),
     reward_rate             NUMERIC(9,4)           NOT NULL
-        CHECK (reward_rate >= 0),
-    min_transaction_amount  NUMERIC(11,2)          NULL,
-    max_transaction_amount  NUMERIC(11,2)          NULL,
-    active_from             TIMESTAMPTZ            NOT NULL,
-    active_to               TIMESTAMPTZ            NULL,
+        CHECK (reward_rate >= 0 AND reward_rate <> 'NaN'),
+    min_transaction_amount  NUMERIC(11,2)          NULL
+        CHECK (min_transaction_amount <> 'NaN'),
+    max_transaction_amount  NUMERIC(11,2)          NULL
+        CHECK (max_transaction_amount <> 'NaN'),
+    active_from             TIMESTAMPTZ            NOT NULL
+        CHECK (isfinite(active_from)),
+    active_to               TIMESTAMPTZ            NULL
+        CHECK (isfinite(active_to)),
     CONSTRAINT reward_rules_amount_range_check CHECK (
         min_transaction_amount IS NULL
         OR max_transaction_amount IS NULL
@@ -107,8 +119,12 @@ CREATE INDEX reward_rules_match_idx
 
 -- One row per account that has accrued; an existing account without a row has a zero
 -- balance. The engine computes available_points by the same subtraction before the upsert,
--- and the check holds the invariant for every other writer too, such as the e2e fixture's
--- psql update.
+-- and reward_balances_available_points_check holds that invariant for every other writer
+-- too, such as the e2e fixture's psql update. The invariant alone admits earned 0,
+-- redeemed 1 and available -1, which RewardPoints rejects, so
+-- reward_balances_available_points_nonnegative_check also holds available_points >= 0. It
+-- is a named table constraint because a column CHECK would take the name the invariant
+-- holds.
 CREATE TABLE reward_balances (
     account_id            BIGINT NOT NULL PRIMARY KEY,
     total_points_earned   BIGINT NOT NULL DEFAULT 0
@@ -118,6 +134,8 @@ CREATE TABLE reward_balances (
     available_points      BIGINT NOT NULL DEFAULT 0,
     CONSTRAINT reward_balances_account_id_fkey
         FOREIGN KEY (account_id) REFERENCES accounts (account_id),
+    CONSTRAINT reward_balances_available_points_nonnegative_check
+        CHECK (available_points >= 0),
     CONSTRAINT reward_balances_available_points_check
         CHECK (available_points = total_points_earned - total_points_redeemed)
 );
@@ -131,15 +149,19 @@ CREATE TABLE reward_balances (
 -- transaction, and its index serves the RESTRICT check of that delete.
 -- account_id carries no foreign key: the request's model names only the three below. The
 -- writer takes it from the account the transaction posted to, whose reward_balances row,
--- upserted in the same database transaction, references accounts.
+-- upserted in the same database transaction, references accounts. Without that foreign
+-- key, its CHECK (0 <= v < 10^11) holds it to the ACCT-ID 9(11) range of AccountId
+-- (crates/domain/src/numeric/ids.rs), as accounts.account_id is held.
 CREATE TABLE reward_accruals (
     accrual_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    account_id     BIGINT      NOT NULL,
+    account_id     BIGINT      NOT NULL
+        CHECK (account_id >= 0 AND account_id < 100000000000),
     transaction_id BIGINT      NOT NULL,
     rule_id        BIGINT      NOT NULL,
     points_earned  BIGINT      NOT NULL
         CHECK (points_earned >= 0),
-    created_at     TIMESTAMPTZ NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL
+        CHECK (isfinite(created_at)),
     CONSTRAINT reward_accruals_transaction_id_fkey
         FOREIGN KEY (transaction_id) REFERENCES transactions (transaction_id)
         ON DELETE RESTRICT,
