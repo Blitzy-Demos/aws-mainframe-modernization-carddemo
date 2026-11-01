@@ -6,3 +6,10 @@ batch-app/markers/*
 /.idea/
 .DS_Store
 **/.DS_Store
+/target/
+/var/
+web/node_modules/
+web/dist/
+web/test-results/
+web/playwright-report/
+.env
