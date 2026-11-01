@@ -4,9 +4,11 @@
 //! The derive-lane audits (`parity-oracle-audit.md`, `validation-audit.md`,
 //! `function-map.md` and `escalations.md`) are GitHub pipe tables under `##` and `###`
 //! headings. This crate is their one parser: [`Document::parse`] reads a file into
-//! [`Table`]s that keep their heading context and 1-based source lines; the cell helpers
-//! [`citations`], [`code_span`], [`key_values`] and [`no_message_escalation`] read the cell
-//! conventions the audits define; [`ids_with_prefix`], [`scan_cited_ids`] and [`coverage`]
+//! [`Table`]s that keep their heading context and 1-based source lines, and keeps the
+//! [`Document::stray_table_lines`] that no table reads; the cell helpers
+//! [`citations`], [`malformed_citations`], [`code_span`], [`key_values`] and
+//! [`no_message_escalation`] read the cell conventions the audits define;
+//! [`ids_with_prefix`], [`scan_cited_ids`] and [`coverage`]
 //! prove that every audit row ID is cited by a test and that no test cites an ID the audit
 //! does not define. [`Repo`] resolves the repository paths that citations name, ignoring
 //! ASCII case where the stored case differs from the cited one (E-03).
@@ -114,10 +116,12 @@ pub const ESCALATIONS_RAISED: &str = "Escalations raised";
 /// The words an escalation `Status` cell may start with, optionally followed by `: <note>`.
 pub const ESCALATION_STATUSES: [&str; 3] = ["resolved", "open", "halt"];
 
-/// A parsed audit document: every pipe table it holds, in document order.
+/// A parsed audit document: every pipe table it holds, in document order, and the lines
+/// that look like table lines but belong to no table.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Document {
     tables: Vec<Table>,
+    stray_table_lines: Vec<usize>,
 }
 
 impl Document {
@@ -137,6 +141,8 @@ impl Document {
     /// - A line starting with `|` directly followed by a delimiter row such as `|---|:--:|`
     ///   starts a table. The table takes the current section, subsection and keys, and its
     ///   rows continue while lines start with `|`.
+    /// - Any other line starting with `|` outside a fenced block starts and continues no
+    ///   table; its number is kept in [`Document::stray_table_lines`].
     /// - Cells split at each `|` outside code spans, and `\|` stands for a literal `|`,
     ///   inside code spans too. Cells keep their backticks and are trimmed of spaces and
     ///   tabs.
@@ -148,9 +154,7 @@ impl Document {
         while index < lines.len() {
             index += state.step(&lines, index);
         }
-        Self {
-            tables: state.finish(),
-        }
+        state.finish()
     }
 
     /// Reads the UTF-8 file at `path` and parses it with [`Document::parse`].
@@ -167,6 +171,27 @@ impl Document {
     #[must_use]
     pub fn tables(&self) -> &[Table] {
         &self.tables
+    }
+
+    /// The 1-based lines, ascending, that start with `|` after leading whitespace but are
+    /// neither a table header, its delimiter row nor a row of a table, and sit outside every
+    /// fenced block.
+    ///
+    /// A pipe block whose delimiter row is missing, or rows left without their header, are
+    /// read into no [`Table`]; their lines land here, so the structure check can report a
+    /// table that would otherwise vanish from [`Document::tables`]:
+    ///
+    /// ```text
+    /// | ID | Program |         <- stray: no delimiter row follows
+    /// | P-ZZTEST-001 | X |     <- stray
+    ///
+    /// | ID | Program |         <- a table header
+    /// |---|---|                <- its delimiter row
+    /// | P-ZZTEST-002 | Y |     <- a row
+    /// ```
+    #[must_use]
+    pub fn stray_table_lines(&self) -> &[usize] {
+        &self.stray_table_lines
     }
 
     /// Every table whose `##` section starts with `section_prefix`, for example `"D."`.
@@ -286,11 +311,15 @@ struct ParseState {
     fence: Option<(char, usize)>,
     open: Option<Table>,
     tables: Vec<Table>,
+    /// The 1-based lines starting with `|` that no table reads (see
+    /// [`Document::stray_table_lines`]).
+    stray_table_lines: Vec<usize>,
 }
 
 impl ParseState {
     /// Processes `lines[index]` and returns how many lines it consumed: 2 when that line and
-    /// the delimiter row after it start a table, else 1.
+    /// the delimiter row after it start a table, else 1. A line starting with `|` that
+    /// neither starts nor continues a table is recorded as stray.
     fn step(&mut self, lines: &[&str], index: usize) -> usize {
         let line = lines[index];
         if let Some(fence) = self.fence {
@@ -315,18 +344,19 @@ impl ParseState {
             self.enter_heading(level, text);
         } else if let Some(keys) = line.trim().strip_prefix("Keys:") {
             self.keys = Some(keys.trim().to_owned());
-        } else if line.trim_start().starts_with('|')
-            && lines.get(index + 1).copied().is_some_and(is_delimiter_row)
-        {
-            self.open = Some(Table {
-                section: self.section.clone(),
-                subsection: self.subsection.clone(),
-                keys: self.keys.clone(),
-                line: index + 1,
-                header: split_cells(line),
-                rows: Vec::new(),
-            });
-            return 2;
+        } else if line.trim_start().starts_with('|') {
+            if lines.get(index + 1).copied().is_some_and(is_delimiter_row) {
+                self.open = Some(Table {
+                    section: self.section.clone(),
+                    subsection: self.subsection.clone(),
+                    keys: self.keys.clone(),
+                    line: index + 1,
+                    header: split_cells(line),
+                    rows: Vec::new(),
+                });
+                return 2;
+            }
+            self.stray_table_lines.push(index + 1);
         }
         1
     }
@@ -352,9 +382,12 @@ impl ParseState {
         }
     }
 
-    fn finish(mut self) -> Vec<Table> {
+    fn finish(mut self) -> Document {
         self.close_table();
-        self.tables
+        Document {
+            tables: self.tables,
+            stray_table_lines: self.stray_table_lines,
+        }
     }
 }
 
@@ -566,7 +599,8 @@ pub struct Citation {
 /// ```
 ///
 /// Ranges are returned as written, reversed ranges and line 0 included, so the structure
-/// check can report them; so are bare file names, which the caller resolves.
+/// check can report them; so are bare file names, which the caller resolves. A rejected
+/// bracket shaped like a line citation is reported by [`malformed_citations`].
 #[must_use]
 pub fn citations(cell: &str) -> Vec<Citation> {
     let chars: Vec<char> = cell.chars().collect();
@@ -577,8 +611,61 @@ pub fn citations(cell: &str) -> Vec<Citation> {
     found
 }
 
+/// The brackets of a cell that [`citations`] rejects although they are shaped like line
+/// citations, in order, each written with its brackets.
+///
+/// A bracket is read as [`citations`] reads it: outside every code span, from a `[` to the
+/// next `]`. It is shaped like a line citation when its content splits at its first `:`
+/// into a path [`citations`] accepts (non-empty, without whitespace, `[` or `]`) and
+/// `,`-separated items of which at least one, trimmed, is `L` followed by an ASCII digit.
+/// It is malformed when [`citations`] still rejects it: an item is not `L<n>` or
+/// `L<n>-<m>`, or a line number does not fit `usize`. Line ranges are not judged here;
+/// line 0 and reversed ranges are well formed and left to the caller:
+///
+/// ```text
+/// [app/cbl/CBACT04C.cbl:L99999999999999999999999]  -> itself
+/// [app/cbl/CBACT04C.cbl:L167, 1300-PARA]           -> itself
+/// [app/cbl/CBACT04C.cbl:L12a]                      -> itself
+/// [app/cbl/CBACT04C.cbl:L167] [a.cbl:L9-3]         -> nothing
+/// [app/jcl/DUSRSECJ.jcl:STEP01]                    -> nothing
+/// [x.txt:type columns 17-22]                       -> nothing
+/// [E-09] [exhaustive] items=[]                     -> nothing
+/// [see [app/x.cbl:L1]]                             -> nothing
+/// ```
+#[must_use]
+pub fn malformed_citations(cell: &str) -> Vec<String> {
+    let chars: Vec<char> = cell.chars().collect();
+    let mut found = Vec::new();
+    for (from, to) in gaps(&chars) {
+        scan_brackets(&chars[from..to], |inner| {
+            if parse_citation(inner).is_some() {
+                return true;
+            }
+            if is_citation_shaped(inner) {
+                found.push(format!("[{inner}]"));
+            }
+            false
+        });
+    }
+    found
+}
+
 /// Appends the citations of every bracket in `gap`, a stretch of text outside code spans.
 fn bracket_citations(gap: &[char], found: &mut Vec<Citation>) {
+    scan_brackets(gap, |inner| {
+        let Some(cited) = parse_citation(inner) else {
+            return false;
+        };
+        found.extend(cited);
+        true
+    });
+}
+
+/// Passes the content of every bracket in `gap`, a stretch of text outside code spans, to
+/// `visit`, in order. A bracket runs from a `[` to the next `]`. The scan resumes after
+/// that `]` when `visit` returns true and after the `[` otherwise, so a bracket nested in a
+/// rejected one is visited too. A `[` with no `]` after it ends the scan.
+fn scan_brackets(gap: &[char], mut visit: impl FnMut(&str) -> bool) {
     let mut at = 0;
     while at < gap.len() {
         if gap[at] != '[' {
@@ -590,8 +677,7 @@ fn bracket_citations(gap: &[char], found: &mut Vec<Citation>) {
         };
         let close = at + 1 + offset;
         let inner: String = gap[at + 1..close].iter().collect();
-        if let Some(cited) = parse_citation(&inner) {
-            found.extend(cited);
+        if visit(&inner) {
             at = close + 1;
         } else {
             at += 1;
@@ -599,14 +685,33 @@ fn bracket_citations(gap: &[char], found: &mut Vec<Citation>) {
     }
 }
 
+/// Whether `path`, the text of a bracket before its first `:`, may name a cited file: it is
+/// non-empty and holds no whitespace, `[` or `]`.
+fn is_citation_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch == '[' || ch == ']')
+}
+
+/// Whether a bracket's content is shaped like a line citation (see [`malformed_citations`]).
+fn is_citation_shaped(inner: &str) -> bool {
+    let Some((path, items)) = inner.split_once(':') else {
+        return false;
+    };
+    is_citation_path(path)
+        && items.split(',').any(|item| {
+            item.trim_matches([' ', '\t'])
+                .strip_prefix('L')
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|ch| ch.is_ascii_digit())
+        })
+}
+
 /// The citations of one bracket's content, or `None` when it is not a line citation.
 fn parse_citation(inner: &str) -> Option<Vec<Citation>> {
     let (path, items) = inner.split_once(':')?;
-    if path.is_empty()
-        || path
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch == '[' || ch == ']')
-    {
+    if !is_citation_path(path) {
         return None;
     }
     items
@@ -1444,6 +1549,41 @@ mod tests {
     }
 
     #[test]
+    fn stray_table_lines_are_pipe_lines_no_table_reads() {
+        let text = "## C. Arithmetic\n\
+            | ID | Program |\n\
+            | P-ZZTEST-001 | X |\n\
+            \n\
+            ```text\n\
+            | ID | Program |\n\
+            | P-ZZTEST-009 | fenced |\n\
+            ```\n\
+            | ID | Program |\n\
+            |---|---|\n\
+            | P-ZZTEST-002 | Y |\n\
+            text\n\
+            \t|---|---|\n\
+            | P-ZZTEST-003 | Z |\n\
+            ### Review log — C\n\
+            | Row ID | Verdict | Note | Reviewer |\n\
+            |---|---|---|---|\n";
+        let doc = Document::parse(text);
+        assert_eq!(doc.stray_table_lines(), [2, 3, 13, 14]);
+        let headers: Vec<usize> = doc.tables().iter().map(|table| table.line).collect();
+        assert_eq!(headers, [9, 16]);
+        assert_eq!(doc.tables()[0].rows.len(), 1);
+        assert_eq!(
+            Document::parse(&text.replace('\n', "\r\n")).stray_table_lines(),
+            doc.stray_table_lines()
+        );
+
+        let clean = Document::parse("| ID | A |\n|---|---|\n| P-ZZTEST-001 | a |\n");
+        assert!(clean.stray_table_lines().is_empty());
+        assert!(Document::default().stray_table_lines().is_empty());
+        assert!(Document::parse("").stray_table_lines().is_empty());
+    }
+
+    #[test]
     fn find_row_cell_and_section_filters() {
         let text = "## D. Fixture expectations\n\
             ### Review log — D\n\
@@ -1593,6 +1733,58 @@ mod tests {
             "`[app/x.cbl:L1]`",
         ] {
             assert!(citations(cell).is_empty(), "{cell}");
+        }
+    }
+
+    #[test]
+    fn malformed_citations_report_rejected_citation_shaped_brackets() {
+        let overflow = "[app/cbl/CBACT04C.cbl:L99999999999999999999999]";
+        let cases: [(&str, &[&str]); 30] = [
+            (overflow, &[overflow]),
+            (
+                "[app/cbl/CBACT04C.cbl:L167] [app/cbl/CBACT04C.cbl:L99999999999999999999999]",
+                &[overflow],
+            ),
+            (
+                "[app/x.cbl:L5-99999999999999999999999]",
+                &["[app/x.cbl:L5-99999999999999999999999]"],
+            ),
+            (
+                "[app/cbl/CBACT04C.cbl:L167, 1300-PARA]",
+                &["[app/cbl/CBACT04C.cbl:L167, 1300-PARA]"],
+            ),
+            ("[app/x.cbl:L12a]", &["[app/x.cbl:L12a]"]),
+            ("[app/x.cbl:L1,]", &["[app/x.cbl:L1,]"]),
+            ("[app/x.cbl:L1-]", &["[app/x.cbl:L1-]"]),
+            ("[app/x.cbl:L1-2-3]", &["[app/x.cbl:L1-2-3]"]),
+            ("[app/x.cbl:x, \tL7z]", &["[app/x.cbl:x, \tL7z]"]),
+            ("[see [app/x.cbl:L1x]]", &["[app/x.cbl:L1x]"]),
+            (
+                "[a.cbl:L1x] `[b.cbl:L2x]` [c.cbl:L3x]",
+                &["[a.cbl:L1x]", "[c.cbl:L3x]"],
+            ),
+            ("[app/cbl/CBACT04C.cbl:L167]", &[]),
+            ("[a.cbl:L9-3] [b.cbl:L0]", &[]),
+            ("[app/x.cbl:L46, L730-731]", &[]),
+            ("[see [app/x.cbl:L1]]", &[]),
+            ("[app/jcl/DUSRSECJ.jcl:STEP01]", &[]),
+            ("[app/data/ASCII/dailytran.txt:type columns 17-22]", &[]),
+            ("[E-09]", &[]),
+            ("[exhaustive]", &[]),
+            ("items=[]", &[]),
+            ("[app/cbl]", &[]),
+            ("[app/x.cbl:]", &[]),
+            ("[app/x.cbl:L]", &[]),
+            ("[app/x.cbl:L-1]", &[]),
+            ("[:L1x]", &[]),
+            ("[a b:L1x]", &[]),
+            ("[app/x.cbl:`L1x`]", &[]),
+            ("[app/x.cbl:L1x", &[]),
+            ("`[app/x.cbl:L1x]`", &[]),
+            ("", &[]),
+        ];
+        for (cell, expected) in cases {
+            assert_eq!(malformed_citations(cell), expected, "{cell}");
         }
     }
 
