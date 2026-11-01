@@ -4,8 +4,8 @@
 //! ([`entities`]), the ported COBOL rules, the message catalog ([`messages`]),
 //! the edited-picture formatting ([`format`](mod@format)), the processing clock
 //! ([`clock`]), the business error ([`error`]), the password policy
-//! ([`auth`]) and the repository port traits the persistence adapters
-//! implement ([`ports`]).
+//! ([`auth`]), the reward engine and rule validation ([`rewards`]) and the
+//! repository port traits the persistence adapters implement ([`ports`]).
 //!
 //! It performs no I/O, starts no async runtime and serializes nothing: the
 //! persistence, HTTP, AMQP and CLI adapters do that around it. Money, rates and
@@ -20,7 +20,9 @@ pub mod format;
 pub mod messages;
 pub mod numeric;
 pub mod ports;
+pub mod rewards;
 
 pub use clock::Clock;
 pub use error::{DomainError, ErrorKind};
 pub use numeric::{InterestRate, Money, MoneyExpr, RewardPoints, RewardRate};
+pub use rewards::RewardEngine;
