@@ -39,7 +39,7 @@
 //! the list is always empty; a non-empty list on fixture data is an escalation
 //! for `docs/parity/escalations.md`, never a repair.
 
-use carddemo_domain::numeric::Alnum;
+use carddemo_domain::numeric::{Alnum, NumericError};
 
 use crate::error::{CodecError, CodecErrorKind};
 
@@ -215,12 +215,19 @@ pub struct Signed {
 impl Signed {
     /// The signed value in units of the last digit. A negative zero yields 0.
     ///
-    /// A magnitude above `i64::MAX` saturates to `i64::MAX` (or its negation);
-    /// decoded values have at most 18 digits and never reach it.
-    #[must_use]
-    pub fn value(self) -> i64 {
-        let magnitude = i64::try_from(self.magnitude).unwrap_or(i64::MAX);
-        if self.negative { -magnitude } else { magnitude }
+    /// # Errors
+    ///
+    /// [`NumericError::OutOfRange`] when the signed value lies outside the
+    /// `i64` range: a magnitude above `i64::MAX` with the sign `+`, or above
+    /// 2^63 with the sign `-`. Values read by [`signed`] and
+    /// [`signed_preserving`] have at most 18 digits and always succeed.
+    pub fn value(self) -> Result<i64, NumericError> {
+        if self.negative {
+            0_i64.checked_sub_unsigned(self.magnitude)
+        } else {
+            0_i64.checked_add_unsigned(self.magnitude)
+        }
+        .ok_or(NumericError::OutOfRange)
     }
 
     /// Whether this is a negative zero: every digit `0` with the sign `-`.
@@ -624,12 +631,12 @@ mod tests {
         {
             assert_eq!(encode_signed(1, digit), [plus]);
             let positive = signed(LAYOUT, &[plus], &one).unwrap();
-            assert_eq!(positive.value(), digit);
+            assert_eq!(positive.value(), Ok(digit));
             assert!(!positive.negative);
 
             let negative = signed(LAYOUT, &[minus], &one).unwrap();
             assert!(negative.negative);
-            assert_eq!(negative.value(), -digit);
+            assert_eq!(negative.value(), Ok(-digit));
             if digit == 0 {
                 // An `i64` has no negative zero: -0 is written with the `+` glyph.
                 assert_eq!(encode_signed(1, -digit), [plus]);
@@ -671,9 +678,9 @@ mod tests {
                 },
                 "{bytes:?}"
             );
-            assert_eq!(decoded.value(), value);
+            assert_eq!(decoded.value(), Ok(value));
             assert!(!decoded.is_negative_zero());
-            assert_eq!(encode_signed(bytes.len(), decoded.value()), bytes);
+            assert_eq!(encode_signed(bytes.len(), decoded.value().unwrap()), bytes);
         }
     }
 
@@ -851,7 +858,7 @@ mod tests {
         let mut preserved = PreservedFields::new();
         let decoded = signed_preserving(LAYOUT, b"000}", &field, &mut preserved).unwrap();
         assert!(decoded.is_negative_zero());
-        assert_eq!(decoded.value(), 0);
+        assert_eq!(decoded.value(), Ok(0));
         let raw = RawField {
             field: "TEST-AMT",
             offset: 0,
@@ -913,22 +920,28 @@ mod tests {
     }
 
     #[test]
-    fn signed_value_saturates_beyond_the_i64_range() {
+    fn signed_value_is_checked_against_the_i64_range() {
+        let max = i64::MAX.unsigned_abs();
+        let two_pow_63 = i64::MIN.unsigned_abs();
+        let out_of_range = Err(NumericError::OutOfRange);
         let cases = [
-            (u64::MAX, false, i64::MAX),
-            (u64::MAX, true, -i64::MAX),
-            (0, true, 0),
-            (42, true, -42),
+            (max, false, Ok(i64::MAX)),
+            (max, true, Ok(-i64::MAX)),
+            (two_pow_63, true, Ok(i64::MIN)),
+            (two_pow_63, false, out_of_range),
+            (two_pow_63 + 1, true, out_of_range),
+            (u64::MAX, false, out_of_range),
+            (u64::MAX, true, out_of_range),
+            (0, true, Ok(0)),
+            (42, false, Ok(42)),
+            (42, true, Ok(-42)),
         ];
-        for (magnitude, negative, value) in cases {
-            assert_eq!(
-                Signed {
-                    magnitude,
-                    negative
-                }
-                .value(),
-                value
-            );
+        for (magnitude, negative, expected) in cases {
+            let sample = Signed {
+                magnitude,
+                negative,
+            };
+            assert_eq!(sample.value(), expected, "{sample:?}");
         }
     }
 }
