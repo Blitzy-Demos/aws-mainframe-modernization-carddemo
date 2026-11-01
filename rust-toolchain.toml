@@ -1,0 +1,5 @@
+# 1.88.0, not the requested 1.85 floor: patched `time` (RUSTSEC-2026-0009) needs Rust 1.88 (escalation E-12).
+[toolchain]
+channel = "1.88.0"
+components = ["clippy", "rustfmt", "llvm-tools-preview"]
+profile = "minimal"
