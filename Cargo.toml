@@ -1,0 +1,101 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+# Zero-suppression gate: no lint may be relaxed here, in a crate manifest or in source.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+# Every Rust version in the workspace is declared here and nowhere else. Members
+# inherit with `name.workspace = true` and add crate-local `features` only.
+# A `~` requirement holds a dependency to the minor line its pin names.
+[workspace.dependencies]
+# Internal crates. Which crate may depend on which is fixed by the crate graph and
+# checked by manifest_boundary.rs and hygiene.rs.
+carddemo-api = { path = "crates/api" }
+carddemo-audit = { path = "crates/audit" }
+carddemo-batch = { path = "crates/batch" }
+carddemo-codec = { path = "crates/codec" }
+carddemo-domain = { path = "crates/domain" }
+carddemo-messaging = { path = "crates/messaging" }
+carddemo-persistence = { path = "crates/persistence" }
+carddemo-runtime = { path = "crates/runtime" }
+carddemo-testkit = { path = "crates/testkit" }
+
+# Async runtime and HTTP
+axum = "~0.8.9"
+futures-util = "0.3.34"
+# `net` provides the TcpListener that axum::serve binds.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
+tower = "~0.5.3"
+tower-http = { version = "~0.6.11", features = ["trace", "cors"] }
+
+# API contract and authentication
+# HS256 only: the PEM key-parsing default is not needed.
+jsonwebtoken = { version = "~9.3.1", default-features = false }
+serde = { version = "~1.0.229", features = ["derive"] }
+serde_json = "~1.0.154"
+utoipa = { version = "5.5.0", features = ["axum_extras", "chrono", "decimal"] }
+# 0.2 is the last line on utoipa 5 and axum 0.8; 0.3 requires utoipa 6.
+utoipa-axum = "0.2.0"
+validator = { version = "~0.19.0", features = ["derive"] }
+
+# Persistence. sqlx 0.9 requires Rust 1.94 and is outside the toolchain pin.
+sqlx = { version = "~0.8.6", default-features = false, features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "chrono",
+    "rust_decimal",
+    "migrate",
+] }
+
+# Numeric, time and password hashing
+argon2 = "~0.5.3"
+chrono = "~0.4.45"
+# `getrandom` supplies OS-random argon2 salts; 0.5.0 is the line argon2 0.5 uses.
+password-hash = { version = "0.5.0", features = ["getrandom"] }
+rust_decimal = "~1.36.0"
+rust_decimal_macros = "~1.36.0"
+
+# Errors
+thiserror = "2.0.21"
+
+# Telemetry. tracing-opentelemetry 0.28 is the bridge built on opentelemetry 0.27,
+# so the graph holds a single opentelemetry.
+opentelemetry = "~0.27.1"
+opentelemetry_sdk = "~0.27.1"
+tracing = "~0.1.44"
+tracing-opentelemetry = "0.28.0"
+tracing-subscriber = { version = "~0.3.23", features = ["json", "env-filter"] }
+
+# Messaging. Plain AMQP to the local broker: the rustls default is not needed.
+lapin = { version = "2.5.5", default-features = false }
+tokio-executor-trait = "2.4.0"
+tokio-reactor-trait = "1.1.0"
+
+# Batch CLI and statement PDF
+clap = { version = "~4.5.61", features = ["derive", "env"] }
+printpdf = "~0.7.0"
+
+# Development and test only
+criterion = "~0.5.1"
+insta = { version = "~1.41.1", features = ["yaml"] }
+# The lopdf release printpdf 0.7 links; used to extract statement PDF text in tests.
+lopdf = "0.31.0"
+proptest = "~1.5.0"
+reqwest = { version = "~0.12.28", default-features = false, features = ["json"] }
+testcontainers = "~0.23.3"
+testcontainers-modules = { version = "0.11.6", features = ["postgres", "rabbitmq"] }
+trybuild = "~1.0.122"
