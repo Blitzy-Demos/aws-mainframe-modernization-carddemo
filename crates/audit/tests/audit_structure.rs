@@ -4,7 +4,8 @@
 //! and `docs/parity/function-map.md`, and the escalation log `docs/parity/escalations.md`,
 //! passes this check before its COBOL-informed review; the code a section gates is written
 //! only after both. The check proves structure: the sections and columns each audit
-//! declares, well-formed and unique row IDs, `path:line` citations that land on lines of
+//! declares, well-formed and unique row IDs whose key equals the row's `Program` cell (the
+//! `BMS map` cell in the function map), `path:line` citations that land on lines of
 //! repository files, rows for every carried program and BMS map, escalation references that
 //! resolve to the log, and well-formed review logs. It never requires a verdict to be
 //! `pass`: passing review is recorded in `docs/parity/signoff.md`, which this check does not
@@ -81,13 +82,16 @@ const VERDICTS: [&str; 2] = ["pass", "fail"];
 /// The line a violation of a whole file points at: the file's first line.
 const FILE_LINE: usize = 1;
 
-/// One of the three audits, with the path its violations name and the ID kind its data rows
-/// define.
+/// One of the three audits, with the path its violations name, the ID kind its data rows
+/// define and the column that keys those IDs.
 #[derive(Clone, Copy)]
 struct Audit<'a> {
     path: &'static str,
     doc: &'a Document,
     kind: IdKind,
+    /// The column whose trimmed cell each data row's ID key ([`id_key`]) equals: `Program`
+    /// for `P-<PROGRAM>-<nnn>` and `V-<PROGRAM>-<nnn>`, `BMS map` for `F-<MAP>-<nnn>`.
+    key_column: &'static str,
 }
 
 /// The three audits in a fixed order: parity, validation, function map.
@@ -101,16 +105,19 @@ fn audits<'a>(
             path: PARITY_AUDIT_PATH,
             doc: parity,
             kind: IdKind::Parity,
+            key_column: PROGRAM,
         },
         Audit {
             path: VALIDATION_AUDIT_PATH,
             doc: validation,
             kind: IdKind::Validation,
+            key_column: VALIDATION_PROGRAM,
         },
         Audit {
             path: FUNCTION_MAP_PATH,
             doc: function_map,
             kind: IdKind::Function,
+            key_column: BMS_MAP,
         },
     ]
 }
@@ -280,6 +287,39 @@ fn duplicate_violation(
             None
         }
     }
+}
+
+/// The key of a P-, V- or F- `id` that [`classify_id`] accepts: the text between its prefix
+/// and its final `-<nnn>`, a multi-segment key with its segments joined by `-` as written
+/// (`COACTUPC` of `V-COACTUPC-012`, `AB-CD` of `P-AB-CD-001`).
+fn id_key(id: &str) -> Option<&str> {
+    let (_, rest) = id.split_once('-')?;
+    let (key, _) = rest.rsplit_once('-')?;
+    Some(key)
+}
+
+/// The violation of a data row whose well-formed `id` has a key ([`id_key`]) other than the
+/// row's trimmed `column` cell, compared exactly: the ID patterns `P-<PROGRAM>-<nnn>`,
+/// `V-<PROGRAM>-<nnn>` and `F-<MAP>-<nnn>` key each ID by its `Program` or `BMS map` cell.
+/// A table lacking `column` is reported by [`missing_columns`] and not again per row.
+fn id_key_violation(
+    path: &str,
+    table: &Table,
+    row: &Row,
+    id: &str,
+    column: &str,
+) -> Option<String> {
+    let key = id_key(id)?;
+    let value = table.column(column).map(|_| cell(table, row, column))?;
+    if key == value {
+        return None;
+    }
+    let problem = if value.is_empty() {
+        format!("`{id}` key `{key}` differs from its empty `{column}` cell")
+    } else {
+        format!("`{id}` key `{key}` differs from its `{column}` cell `{value}`")
+    };
+    Some(violation(path, row.line, &problem))
 }
 
 /// The `###` heading every review log sits under starts with this text:
@@ -690,8 +730,10 @@ fn status_problem(status: &str) -> Option<String> {
         .then(|| format!("status `{status}`: a note after `{word}` must follow `:` or `;`"))
 }
 
-/// Test 4: every data row ID of each audit is well formed for that audit and unique within
-/// it. Handoff and review rows define no audit ID and are not checked here.
+/// Test 4: every data row ID of each audit is well formed for that audit, unique within it,
+/// and keyed by its row: the key of a P- or V- ID equals the row's `Program` cell, that of
+/// an F- ID the row's `BMS map` cell ([`id_key_violation`]). Handoff and review rows define
+/// no audit ID and are not checked here.
 fn ids_are_well_formed_and_unique_violations(
     parity: &Document,
     validation: &Document,
@@ -706,6 +748,13 @@ fn ids_are_well_formed_and_unique_violations(
                 violations.push(violation(audit.path, row.line, &problem));
             } else {
                 violations.extend(duplicate_violation(audit.path, &mut first, id, row.line));
+                violations.extend(id_key_violation(
+                    audit.path,
+                    table,
+                    row,
+                    id,
+                    audit.key_column,
+                ));
             }
         }
     }
@@ -774,9 +823,30 @@ fn citation_row_label(table: &Table, row: &Row) -> String {
     }
 }
 
+/// The problem with citing lines `start` to `end` of a file of `lines` lines, if any: every
+/// defect the range has, in this order, joined with `; `. Lines count from 1, so a bound of
+/// 0 names no line; a start after the end is a reversed range; a bound after the last line
+/// lies outside the file. [`citations`] returns ranges as written, so each defect gets its
+/// own reason and none hides another. The last line is inside the file: `L20` of a 20-line
+/// file has no problem.
+fn citation_range_problem(start: usize, end: usize, lines: usize) -> Option<String> {
+    let mut defects = Vec::new();
+    if start == 0 || end == 0 {
+        defects.push("line 0, but lines count from 1".to_owned());
+    }
+    if start > end {
+        defects.push(format!("a reversed range: start {start} > end {end}"));
+    }
+    if start.max(end) > lines {
+        defects.push(format!("outside 1..={lines}, the file's line count"));
+    }
+    (!defects.is_empty()).then(|| defects.join("; "))
+}
+
 /// The citation violations of one row: every bracket shaped like a line citation that
 /// [`citations`] rejects (see [`malformed_citations`]), a `required` row citing no
-/// `path:line`, and every citation naming no readable repository file or lines outside it.
+/// `path:line`, every citation naming no readable repository file, and every citation whose
+/// lines [`citation_range_problem`] rejects, with each of its reasons.
 fn row_citation_violations(
     path: &str,
     table: &Table,
@@ -817,10 +887,10 @@ fn row_citation_violations(
             .or_insert_with(|| repo.line_count(file).ok().flatten());
         let problem = match count {
             None => format!("{label} cites `{file}`, which is no readable repository file"),
-            Some(lines) if !((1..=*end).contains(start) && *end <= lines) => format!(
-                "{label} cites {file}:L{start}-{end}, outside 1..={lines}, the file's line count"
-            ),
-            Some(_) => continue,
+            Some(lines) => match citation_range_problem(*start, *end, lines) {
+                Some(range) => format!("{label} cites {file}:L{start}-{end}, {range}"),
+                None => continue,
+            },
         };
         violations.push(violation(path, row.line, &problem));
     }
@@ -1170,6 +1240,160 @@ fn ids_are_well_formed_and_unique() {
     );
 }
 
+/// An inline audit of test 4: under `## <section>`, one data table with `columns` as its
+/// header and one row per `(id, key)` of `rows`, holding `id` in the first cell, `key` in
+/// the second (the `Program` or `BMS map` column of the audits' headers) and `x` in every
+/// other cell.
+fn id_key_audit(section: &str, columns: &[&str], rows: &[(&str, &str)]) -> String {
+    let mut lines = vec![
+        format!("## {section}"),
+        String::new(),
+        format!("| {} |", columns.join(" | ")),
+        format!("|{}", "---|".repeat(columns.len())),
+    ];
+    for (id, key) in rows {
+        let mut cells = vec![*id, *key];
+        cells.resize(columns.len(), "x");
+        lines.push(format!("| {} |", cells.join(" | ")));
+    }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// One case of [`id_keys_equal_their_program_or_map_cells`]: the inline audit `text` read
+/// as the audit at `path`, and the violations test 4 must report for it, in order, each as
+/// the ID of the row it points at and its problem. A case expecting none is a positive
+/// control.
+struct IdKeyCase {
+    label: &'static str,
+    path: &'static str,
+    text: String,
+    expected: Vec<(&'static str, &'static str)>,
+}
+
+/// The cases of [`id_keys_equal_their_program_or_map_cells`]: rows of each audit keyed by
+/// another program or map, an empty and a lower-case key cell, multi-segment keys, rows
+/// keyed by their own cells, and a table lacking the key column.
+fn id_key_cases() -> [IdKeyCase; 6] {
+    let mut renamed = VALIDATION_COLUMNS;
+    renamed[1] = "Programme";
+    let case = |label, path, text, expected| IdKeyCase {
+        label,
+        path,
+        text,
+        expected,
+    };
+    [
+        case(
+            "validation row keyed by another program",
+            VALIDATION_AUDIT_PATH,
+            id_key_audit(
+                "COACTUPC",
+                &VALIDATION_COLUMNS,
+                &[
+                    ("V-COACTUPC-001", "COACTUPC"),
+                    ("V-COSGN00C-901", "COACTUPC"),
+                ],
+            ),
+            vec![(
+                "V-COSGN00C-901",
+                "`V-COSGN00C-901` key `COSGN00C` differs from its `Program` cell `COACTUPC`",
+            )],
+        ),
+        case(
+            "validation rows with an empty and a lower-case `Program` cell",
+            VALIDATION_AUDIT_PATH,
+            id_key_audit(
+                "COACTUPC",
+                &VALIDATION_COLUMNS,
+                &[("V-COACTUPC-003", ""), ("V-COACTUPC-004", "coactupc")],
+            ),
+            vec![
+                (
+                    "V-COACTUPC-003",
+                    "`V-COACTUPC-003` key `COACTUPC` differs from its empty `Program` cell",
+                ),
+                (
+                    "V-COACTUPC-004",
+                    "`V-COACTUPC-004` key `COACTUPC` differs from its `Program` cell `coactupc`",
+                ),
+            ],
+        ),
+        case(
+            "parity rows keyed by another program, a multi-segment key included",
+            PARITY_AUDIT_PATH,
+            id_key_audit(
+                PARITY_SECTIONS[1],
+                &PARITY_COMMON_COLUMNS,
+                &[("P-CBTRN02C-004", "CBACT04C"), ("P-AB-CD-002", "CD")],
+            ),
+            vec![
+                (
+                    "P-CBTRN02C-004",
+                    "`P-CBTRN02C-004` key `CBTRN02C` differs from its `Program` cell `CBACT04C`",
+                ),
+                (
+                    "P-AB-CD-002",
+                    "`P-AB-CD-002` key `AB-CD` differs from its `Program` cell `CD`",
+                ),
+            ],
+        ),
+        case(
+            "function map row keyed by another map",
+            FUNCTION_MAP_PATH,
+            id_key_audit(
+                BMS_MAPS[9],
+                &FUNCTION_MAP_COLUMNS,
+                &[("F-COSGN00-001", "COSGN00"), ("F-COMEN01-001", "COSGN00")],
+            ),
+            vec![(
+                "F-COMEN01-001",
+                "`F-COMEN01-001` key `COMEN01` differs from its `BMS map` cell `COSGN00`",
+            )],
+        ),
+        case(
+            "parity rows keyed by their `Program` cells, a multi-segment key included",
+            PARITY_AUDIT_PATH,
+            id_key_audit(
+                PARITY_SECTIONS[0],
+                &PARITY_COMMON_COLUMNS,
+                &[("P-CVACT01Y-001", "CVACT01Y"), ("P-AB-CD-001", "AB-CD")],
+            ),
+            Vec::new(),
+        ),
+        case(
+            "validation table lacking the `Program` column",
+            VALIDATION_AUDIT_PATH,
+            id_key_audit("COACTUPC", &renamed, &[("V-COSGN00C-901", "COACTUPC")]),
+            Vec::new(),
+        ),
+    ]
+}
+
+/// The key of a well-formed P-, V- or F- ID must equal its row's `Program` or `BMS map`
+/// cell exactly; a table lacking that column is left to tests 1 and 2.
+#[test]
+fn id_keys_equal_their_program_or_map_cells() {
+    let empty = Document::default();
+    for case in id_key_cases() {
+        let doc = Document::parse(&case.text);
+        let [parity, validation, function_map] =
+            [PARITY_AUDIT_PATH, VALIDATION_AUDIT_PATH, FUNCTION_MAP_PATH]
+                .map(|audit| if audit == case.path { &doc } else { &empty });
+        let expected: Vec<String> = case
+            .expected
+            .iter()
+            .map(|(id, problem)| violation(case.path, recognition_line(&case.text, id), problem))
+            .collect();
+        assert_eq!(
+            ids_are_well_formed_and_unique_violations(parity, validation, function_map),
+            expected,
+            "{}",
+            case.label
+        );
+    }
+}
+
 #[test]
 fn citations_resolve_to_repository_lines() {
     let repo = repo();
@@ -1326,7 +1550,8 @@ const CITATION_CASES: [CitationCase; 8] = [
             ),
             (
                 7,
-                "review row `V-COSGN00C-001` cites app/cbl/COSGN00C.cbl:L140-120, outside",
+                "review row `V-COSGN00C-001` cites app/cbl/COSGN00C.cbl:L140-120, a reversed \
+                 range: start 140 > end 120",
             ),
             (
                 7,
@@ -1352,11 +1577,13 @@ const CITATION_CASES: [CitationCase; 8] = [
         expected: &[
             (
                 5,
-                "row P-CBACT04C-001 cites app/cbl/CBACT04C.cbl:L0-0, outside",
+                "row P-CBACT04C-001 cites app/cbl/CBACT04C.cbl:L0-0, line 0, but lines count \
+                 from 1",
             ),
             (
                 5,
-                "row P-CBACT04C-001 cites app/cbl/CBACT04C.cbl:L470-460, outside",
+                "row P-CBACT04C-001 cites app/cbl/CBACT04C.cbl:L470-460, a reversed range: \
+                 start 470 > end 460",
             ),
             (
                 5,
@@ -1486,6 +1713,54 @@ fn citations_are_checked_in_every_table_of_the_four_documents() {
         "citations_are_checked_in_every_table_of_the_four_documents",
         &mismatches,
     );
+}
+
+/// The fragment matching of test 5's inline cases cannot show that a wrong reason is
+/// absent, so each range is held here to the exact reasons it must get.
+#[test]
+fn citation_ranges_get_each_of_their_reasons_and_no_other() {
+    let cases = [
+        (20, 15, 20, Some("a reversed range: start 20 > end 15")),
+        (0, 0, 652, Some("line 0, but lines count from 1")),
+        (21, 21, 20, Some("outside 1..=20, the file's line count")),
+        (1, 21, 20, Some("outside 1..=20, the file's line count")),
+        (
+            30,
+            25,
+            20,
+            Some("a reversed range: start 30 > end 25; outside 1..=20, the file's line count"),
+        ),
+        (
+            25,
+            15,
+            20,
+            Some("a reversed range: start 25 > end 15; outside 1..=20, the file's line count"),
+        ),
+        (
+            3,
+            0,
+            20,
+            Some("line 0, but lines count from 1; a reversed range: start 3 > end 0"),
+        ),
+        (
+            30,
+            0,
+            20,
+            Some(
+                "line 0, but lines count from 1; a reversed range: start 30 > end 0; \
+                 outside 1..=20, the file's line count",
+            ),
+        ),
+        (20, 20, 20, None),
+        (1, 20, 20, None),
+    ];
+    for (start, end, lines, expected) in cases {
+        assert_eq!(
+            citation_range_problem(start, end, lines).as_deref(),
+            expected,
+            "L{start}-{end} of a {lines}-line file"
+        );
+    }
 }
 
 #[test]
