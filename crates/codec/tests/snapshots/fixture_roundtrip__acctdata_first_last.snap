@@ -1,0 +1,75 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    AccountRecord {
+        account: Account {
+            acct_id: AccountId(
+                1,
+            ),
+            acct_active_status: Alnum<1>("Y"),
+            acct_curr_bal: Money(
+                194.00,
+            ),
+            acct_credit_limit: Money(
+                2020.00,
+            ),
+            acct_cash_credit_limit: Money(
+                1020.00,
+            ),
+            acct_open_date: Alnum<10>("2014-11-20"),
+            acct_expiraion_date: Alnum<10>("2025-05-20"),
+            acct_reissue_date: Alnum<10>("2025-05-20"),
+            acct_curr_cyc_credit: Money(
+                0.00,
+            ),
+            acct_curr_cyc_debit: Money(
+                0.00,
+            ),
+            acct_addr_zip: Alnum<10>("A000000000"),
+            acct_group_id: AccountGroupId(
+                Alnum<10>("          "),
+            ),
+        },
+        filler: Alnum<178>("                                                                                                                                                                                  "),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+    AccountRecord {
+        account: Account {
+            acct_id: AccountId(
+                50,
+            ),
+            acct_active_status: Alnum<1>("Y"),
+            acct_curr_bal: Money(
+                492.00,
+            ),
+            acct_credit_limit: Money(
+                6169.00,
+            ),
+            acct_cash_credit_limit: Money(
+                4587.00,
+            ),
+            acct_open_date: Alnum<10>("2011-04-22"),
+            acct_expiraion_date: Alnum<10>("2023-03-09"),
+            acct_reissue_date: Alnum<10>("2023-03-09"),
+            acct_curr_cyc_credit: Money(
+                0.00,
+            ),
+            acct_curr_cyc_debit: Money(
+                0.00,
+            ),
+            acct_addr_zip: Alnum<10>("A000000000"),
+            acct_group_id: AccountGroupId(
+                Alnum<10>("          "),
+            ),
+        },
+        filler: Alnum<178>("                                                                                                                                                                                  "),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+)

@@ -1,0 +1,35 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    CardXrefRecord {
+        xref: CardXref {
+            xref_card_num: CardNumber(
+                "************5740",
+            ),
+            xref_cust_id: CustomerId(
+                50,
+            ),
+            xref_acct_id: AccountId(
+                50,
+            ),
+        },
+        filler: Alnum<14>("              "),
+    },
+    CardXrefRecord {
+        xref: CardXref {
+            xref_card_num: CardNumber(
+                "************6588",
+            ),
+            xref_cust_id: CustomerId(
+                40,
+            ),
+            xref_acct_id: AccountId(
+                40,
+            ),
+        },
+        filler: Alnum<14>("              "),
+    },
+)

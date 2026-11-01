@@ -1,0 +1,51 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    TranCatBalanceRecord {
+        balance: TranCatBalance {
+            key: TranCatBalanceKey {
+                trancat_acct_id: AccountId(
+                    1,
+                ),
+                trancat_type_cd: TranTypeCode(
+                    Alnum<2>("01"),
+                ),
+                trancat_cd: TranCategoryCode(
+                    1,
+                ),
+            },
+            tran_cat_bal: Money(
+                0.00,
+            ),
+        },
+        filler: Alnum<22>("0000000000000000000000"),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+    TranCatBalanceRecord {
+        balance: TranCatBalance {
+            key: TranCatBalanceKey {
+                trancat_acct_id: AccountId(
+                    50,
+                ),
+                trancat_type_cd: TranTypeCode(
+                    Alnum<2>("01"),
+                ),
+                trancat_cd: TranCategoryCode(
+                    1,
+                ),
+            },
+            tran_cat_bal: Money(
+                0.00,
+            ),
+        },
+        filler: Alnum<22>("0000000000000000000000"),
+        preserved: PreservedFields(
+            [],
+        ),
+    },
+)

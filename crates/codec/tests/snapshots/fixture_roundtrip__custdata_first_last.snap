@@ -1,0 +1,65 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    CustomerRecord {
+        customer: Customer {
+            cust_id: CustomerId(
+                1,
+            ),
+            cust_first_name: Alnum<25>("Immanuel                 "),
+            cust_middle_name: Alnum<25>("Madeline                 "),
+            cust_last_name: Alnum<25>("Kessler                  "),
+            cust_addr_line_1: Alnum<50>("618 Deshaun Route                                 "),
+            cust_addr_line_2: Alnum<50>("Apt. 802                                          "),
+            cust_addr_line_3: Alnum<50>("Altenwerthshire                                   "),
+            cust_addr_state_cd: Alnum<2>("NC"),
+            cust_addr_country_cd: Alnum<3>("USA"),
+            cust_addr_zip: Alnum<10>("12546     "),
+            cust_phone_num_1: Alnum<15>("(908)119-8310  "),
+            cust_phone_num_2: Alnum<15>("(373)693-8684  "),
+            cust_ssn: CustSsn(
+                <redacted>,
+            ),
+            cust_govt_issued_id: Alnum<20>("00000000000049368437"),
+            cust_dob_yyyy_mm_dd: Alnum<10>("1961-06-08"),
+            cust_eft_account_id: Alnum<10>("0053581756"),
+            cust_pri_card_holder_ind: Alnum<1>("Y"),
+            cust_fico_credit_score: FicoScore(
+                274,
+            ),
+        },
+        filler: Alnum<168>("                                                                                                                                                                        "),
+    },
+    CustomerRecord {
+        customer: Customer {
+            cust_id: CustomerId(
+                50,
+            ),
+            cust_first_name: Alnum<25>("Aniya                    "),
+            cust_middle_name: Alnum<25>("Alba                     "),
+            cust_last_name: Alnum<25>("Von                      "),
+            cust_addr_line_1: Alnum<50>("1588 Nienow Cape                                  "),
+            cust_addr_line_2: Alnum<50>("Suite 187                                         "),
+            cust_addr_line_3: Alnum<50>("New Aricchester                                   "),
+            cust_addr_state_cd: Alnum<2>("OR"),
+            cust_addr_country_cd: Alnum<3>("USA"),
+            cust_addr_zip: Alnum<10>("04257     "),
+            cust_phone_num_1: Alnum<15>("(325)301-0827  "),
+            cust_phone_num_2: Alnum<15>("(493)985-9283  "),
+            cust_ssn: CustSsn(
+                <redacted>,
+            ),
+            cust_govt_issued_id: Alnum<20>("00000000000030387824"),
+            cust_dob_yyyy_mm_dd: Alnum<10>("1960-12-01"),
+            cust_eft_account_id: Alnum<10>("0074883577"),
+            cust_pri_card_holder_ind: Alnum<1>("Y"),
+            cust_fico_credit_score: FicoScore(
+                623,
+            ),
+        },
+        filler: Alnum<168>("                                                                                                                                                                        "),
+    },
+)

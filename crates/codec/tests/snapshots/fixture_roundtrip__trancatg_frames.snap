@@ -1,0 +1,9 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "frame_summary(&records, file_bytes)"
+snapshot_kind: text
+---
+count: "18"
+file_bytes: "1116"
+stored_lengths: 60 x18
+terminators: CRLF x18

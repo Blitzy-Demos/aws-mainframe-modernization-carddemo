@@ -1,0 +1,41 @@
+---
+source: crates/codec/tests/fixture_roundtrip.rs
+expression: "(&first.record, &last.record)"
+snapshot_kind: text
+---
+(
+    CardRecord {
+        card: Card {
+            card_num: CardNumber(
+                "************5740",
+            ),
+            card_acct_id: AccountId(
+                50,
+            ),
+            card_cvv_cd: Cvv(
+                <redacted>,
+            ),
+            card_embossed_name: Alnum<50>("Aniya Von                                         "),
+            card_expiraion_date: Alnum<10>("2023-03-09"),
+            card_active_status: Alnum<1>("Y"),
+        },
+        filler: Alnum<59>("                                                           "),
+    },
+    CardRecord {
+        card: Card {
+            card_num: CardNumber(
+                "************6588",
+            ),
+            card_acct_id: AccountId(
+                40,
+            ),
+            card_cvv_cd: Cvv(
+                <redacted>,
+            ),
+            card_embossed_name: Alnum<50>("Davon Emmerich                                    "),
+            card_expiraion_date: Alnum<10>("2023-10-27"),
+            card_active_status: Alnum<1>("Y"),
+        },
+        filler: Alnum<59>("                                                           "),
+    },
+)
