@@ -4,8 +4,11 @@
 //
 // Paging is the API's cursor paging: a request names `start_key`, `direction`
 // and `page_size`, and the page answers `{ items, next_key, prev_key }`. The
-// keys are opaque strings handed back to the caller's callbacks unread, so no
-// page number is ever computed and no key is ever converted. Rows render in the
+// keys are opaque strings the table reads only to enable or disable Previous
+// and Next. The `onPrevious` and `onNext` callbacks take no arguments: the
+// caller requests the adjacent page with the `prev_key` or `next_key` it
+// already holds, closing over the matching key and direction, so no page
+// number is ever computed and no key is ever converted. Rows render in the
 // order the API returns them, which is the COBOL key order, so the table has no
 // client-side sorting, filtering or pagination row models.
 //

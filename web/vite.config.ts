@@ -10,11 +10,15 @@ import { defineConfig } from "vitest/config";
 const apiProxyTarget =
   process.env.CARDDEMO_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
 
-// Vendor chunks, so no chunk reaches Vite's 500 kB warning; pages are split
-// further by route-level React.lazy. Raising the warning limit instead counts
-// as a lint suppression. Rollup also places every unassigned dependency of a
-// group's modules into the first group (by name) that reaches it, so only the
-// packages the app imports are named here.
+// Vendor chunks, which aim to keep each chunk under Vite's 500 kB warning;
+// pages are split further by route-level React.lazy. The warning-free
+// `pnpm build` verifies the result: a chunk it still reports is split further,
+// and raising the warning limit instead counts as a suppression. Rollup takes
+// the modules assigned here in execution order and adds to each one's group
+// every ungrouped module its static imports reach, directly or through other
+// ungrouped modules, so a dependency left unassigned joins the group of the
+// earliest-executing assigned module that reaches it. Only the packages the
+// app imports therefore need naming here.
 const vendorChunks: Record<string, readonly string[]> = {
   react: ["react", "react-dom", "react-router"],
   tanstack: ["@tanstack/react-query", "@tanstack/react-table"],

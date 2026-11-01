@@ -76,10 +76,13 @@ export function ThemeProvider({
     readStoredTheme(defaultTheme),
   );
 
-  // A layout effect runs before the browser paints, so a reload in the dark
-  // theme never shows the light tokens first. index.css switches the tokens on
-  // the `dark` class of the root element; `light` is set for symmetry and
-  // selects the :root defaults.
+  // The theme class is applied after React commits the provider's render and
+  // before the browser paints that commit, so the first frame React renders,
+  // and every later theme change, already shows the chosen theme's tokens. It
+  // does not govern what the document paints before the bundle runs and React
+  // mounts, when the :root (light) defaults of index.css apply. index.css
+  // switches the tokens on the `dark` class of the root element; `light` is
+  // set for symmetry and selects the :root defaults.
   useLayoutEffect(() => {
     const root = window.document.documentElement;
     root.classList.remove("light", "dark");
