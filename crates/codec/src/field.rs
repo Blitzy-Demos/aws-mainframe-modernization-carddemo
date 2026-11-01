@@ -623,27 +623,50 @@ mod tests {
 
     #[test]
     fn overpunch_glyphs_encode_and_decode_every_digit() {
+        // Each last digit with its `+` and `-` overpunch glyph, written out
+        // one digit at a time so that the expected glyphs never come from the
+        // tables the encoder and decoder read.
+        let oracle: [(i64, u8, u8); 10] = [
+            (0, b'{', b'}'),
+            (1, b'A', b'J'),
+            (2, b'B', b'K'),
+            (3, b'C', b'L'),
+            (4, b'D', b'M'),
+            (5, b'E', b'N'),
+            (6, b'F', b'O'),
+            (7, b'G', b'P'),
+            (8, b'H', b'Q'),
+            (9, b'I', b'R'),
+        ];
         let one = signed_spec(1);
-        for ((&plus, &minus), digit) in POSITIVE_OVERPUNCH
-            .iter()
-            .zip(NEGATIVE_OVERPUNCH)
-            .zip(0_i64..)
-        {
-            assert_eq!(encode_signed(1, digit), [plus]);
+        for (digit, plus, minus) in oracle {
+            let index = usize::try_from(digit).unwrap();
+            assert_eq!(POSITIVE_OVERPUNCH[index], plus, "+ table at digit {digit}");
+            assert_eq!(NEGATIVE_OVERPUNCH[index], minus, "- table at digit {digit}");
+
+            assert_eq!(encode_signed(1, digit), [plus], "encode +{digit}");
             let positive = signed(LAYOUT, &[plus], &one).unwrap();
-            assert_eq!(positive.value(), Ok(digit));
-            assert!(!positive.negative);
+            assert_eq!(positive.value(), Ok(digit), "decode +{digit}");
+            assert!(!positive.negative, "sign of +{digit}");
+            assert!(!positive.is_negative_zero(), "+{digit} is not -0");
 
             let negative = signed(LAYOUT, &[minus], &one).unwrap();
-            assert!(negative.negative);
-            assert_eq!(negative.value(), Ok(-digit));
+            assert!(negative.negative, "sign of -{digit}");
+            assert_eq!(negative.value(), Ok(-digit), "decode -{digit}");
+            assert_eq!(negative.is_negative_zero(), digit == 0, "-{digit} as -0");
             if digit == 0 {
-                // An `i64` has no negative zero: -0 is written with the `+` glyph.
-                assert_eq!(encode_signed(1, -digit), [plus]);
-                assert!(negative.is_negative_zero());
+                // An `i64` has no negative zero: zero is written with the `+` glyph.
+                assert_eq!(encode_signed(1, 0), [b'{'], "encode -0");
             } else {
-                assert_eq!(encode_signed(1, -digit), [minus]);
-                assert!(!negative.is_negative_zero());
+                assert_eq!(encode_signed(1, -digit), [minus], "encode -{digit}");
+            }
+
+            // Round trip: every decoded value but -0 re-encodes to its own glyph.
+            let decoded = positive.value().unwrap();
+            assert_eq!(encode_signed(1, decoded), [plus], "round trip +{digit}");
+            if digit != 0 {
+                let decoded = negative.value().unwrap();
+                assert_eq!(encode_signed(1, decoded), [minus], "round trip -{digit}");
             }
         }
     }
