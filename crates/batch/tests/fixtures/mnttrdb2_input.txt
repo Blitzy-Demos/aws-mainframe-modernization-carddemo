@@ -1,0 +1,10 @@
+* COBTUPDT INPFILE: COL 1 TYPE, 2-3 CODE, 4-53 DESC  
+A08BALANCE TRANSFER                                  
+A09ANNUAL FEE                                        
+A01PURCHASE DUPLICATE KEY                            
+U06REVERSAL                                          
+U99UNKNOWN TRANSACTION TYPE                          
+D09                                                  
+D01                                                  
+D99                                                  
+u03CREDIT LOWER CASE RECORD TYPE                     
