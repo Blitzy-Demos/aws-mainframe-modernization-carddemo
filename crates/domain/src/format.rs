@@ -752,6 +752,11 @@ fn group(items: &[(&str, usize)]) -> String {
         .collect()
 }
 
+/// What a `Debug` rendering shows in place of the money amounts and the
+/// transaction source, so diagnostics never carry an account's financial data
+/// or where its transactions came from.
+const REDACTED: &str = "<redacted>";
+
 // CVTRA07Y report lines: CBTRN03C, written by `batch tranrept` and returned by
 // the CR00 report endpoint. Every group is moved into the 133-byte record, so
 // each line is padded with spaces to `REPORT_RECORD_LEN`.
@@ -759,7 +764,11 @@ fn group(items: &[(&str, usize)]) -> String {
 /// One detail line of the transaction report, the fields CBTRN03C
 /// `1120-WRITE-DETAIL` moves into `TRANSACTION-DETAIL-REPORT`
 /// [app/cbl/CBTRN03C.cbl:L361-374] — P-CBTRN03C-007.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Its `Debug` output withholds the amount, which is financial data, and the
+/// source of the transaction, while [`report_detail_line`] still writes both
+/// into the line.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ReportDetail<'a> {
     /// `TRAN-ID`, into `TRAN-REPORT-TRANS-ID X(16)`.
     pub tran_id: &'a str,
@@ -778,6 +787,34 @@ pub struct ReportDetail<'a> {
     pub source: &'a str,
     /// `TRAN-AMT S9(09)V99`, edited into `TRAN-REPORT-AMT -ZZZ,ZZZ,ZZZ.ZZ`.
     pub amount: Money<9>,
+}
+
+/// Every field in declaration order, the source and the amount shown as
+/// `<redacted>`. The exhaustive pattern makes a new field a compile error until
+/// it is listed.
+impl fmt::Debug for ReportDetail<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            tran_id,
+            account_id,
+            type_cd,
+            type_desc,
+            cat_cd,
+            cat_desc,
+            source: _,
+            amount: _,
+        } = self;
+        f.debug_struct("ReportDetail")
+            .field("tran_id", tran_id)
+            .field("account_id", account_id)
+            .field("type_cd", type_cd)
+            .field("type_desc", type_desc)
+            .field("cat_cd", cat_cd)
+            .field("cat_desc", cat_desc)
+            .field("source", &format_args!("{REDACTED}"))
+            .field("amount", &format_args!("{REDACTED}"))
+            .finish()
+    }
 }
 
 /// CVTRA07Y `REPORT-NAME-HEADER` [app/cpy/CVTRA07Y.cpy:L4-13] with the DATEPARM
@@ -1369,7 +1406,11 @@ pub fn cp00_reply(
 /// The account fields COACCT01 moves into `WS-ACCT-RESPONSE`
 /// [app/app-vsam-mq/cbl/COACCT01.cbl:L406-427] after a successful read —
 /// P-COACCT01-013.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Its `Debug` output withholds the balance, the two limits and the cycle
+/// totals, which are financial data, while [`acct_response`] still writes them
+/// into the reply.
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AccountResponse<'a> {
     /// `ACCT-ID 9(11)`, into `WS-ACCT-ID 9(11)`.
     pub acct_id: u64,
@@ -1393,6 +1434,40 @@ pub struct AccountResponse<'a> {
     pub curr_cyc_debit: Money<10>,
     /// `ACCT-GROUP-ID`, into `WS-ACCT-GROUP-ID X(10)`.
     pub group_id: &'a str,
+}
+
+/// Every field in declaration order, the five money fields shown as
+/// `<redacted>`. The exhaustive pattern makes a new field a compile error until
+/// it is listed.
+impl fmt::Debug for AccountResponse<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            acct_id,
+            active_status,
+            curr_bal: _,
+            credit_limit: _,
+            cash_credit_limit: _,
+            open_date,
+            expiration_date,
+            reissue_date,
+            curr_cyc_credit: _,
+            curr_cyc_debit: _,
+            group_id,
+        } = self;
+        f.debug_struct("AccountResponse")
+            .field("acct_id", acct_id)
+            .field("active_status", active_status)
+            .field("curr_bal", &format_args!("{REDACTED}"))
+            .field("credit_limit", &format_args!("{REDACTED}"))
+            .field("cash_credit_limit", &format_args!("{REDACTED}"))
+            .field("open_date", open_date)
+            .field("expiration_date", expiration_date)
+            .field("reissue_date", reissue_date)
+            .field("curr_cyc_credit", &format_args!("{REDACTED}"))
+            .field("curr_cyc_debit", &format_args!("{REDACTED}"))
+            .field("group_id", group_id)
+            .finish()
+    }
 }
 
 /// COACCT01 `WS-ACCT-RESPONSE` [app/app-vsam-mq/cbl/COACCT01.cbl:L130-169], the
@@ -2223,6 +2298,67 @@ mod tests {
         let response = acct_response(&negative);
         assert_eq!(&response[52..64], "00000000123M");
         assert_eq!(&response[242..], "DEFAULT   ");
+    }
+
+    #[test]
+    fn debug_withholds_amounts_and_transaction_source() {
+        // The P-CBTRN03C-020 detail, its source replaced by a marker no other
+        // field holds, and the P-COACCT01-020 account above.
+        let detail = ReportDetail {
+            tran_id: "0000000058866561",
+            account_id: 50,
+            type_cd: "01",
+            type_desc: "Purchase",
+            cat_cd: 1,
+            cat_desc: "Regular Sales Draft",
+            source: "SRC-MARKER",
+            amount: money("183.88"),
+        };
+        let account = AccountResponse {
+            acct_id: 1,
+            active_status: "Y",
+            curr_bal: money("194.00"),
+            credit_limit: money("2020.00"),
+            cash_credit_limit: money("1020.00"),
+            open_date: "2014-11-20",
+            expiration_date: "2025-05-20",
+            reissue_date: "2025-05-20",
+            curr_cyc_credit: Money::ZERO,
+            curr_cyc_debit: Money::ZERO,
+            group_id: "",
+        };
+        // (compact, pretty, expected compact, a kept field, every withheld
+        // value: each amount as `Money` displays it or as its cent count, and
+        // the detail's source as set here and as the audited record has it)
+        let cases = [
+            (
+                format!("{detail:?}"),
+                format!("{detail:#?}"),
+                "ReportDetail { tran_id: \"0000000058866561\", account_id: 50, type_cd: \"01\", type_desc: \"Purchase\", cat_cd: 1, cat_desc: \"Regular Sales Draft\", source: <redacted>, amount: <redacted> }",
+                "tran_id: \"0000000058866561\"",
+                &["183.88", "18388", "SRC-MARKER", "POS TERM"][..],
+            ),
+            (
+                format!("{account:?}"),
+                format!("{account:#?}"),
+                "AccountResponse { acct_id: 1, active_status: \"Y\", curr_bal: <redacted>, credit_limit: <redacted>, cash_credit_limit: <redacted>, open_date: \"2014-11-20\", expiration_date: \"2025-05-20\", reissue_date: \"2025-05-20\", curr_cyc_credit: <redacted>, curr_cyc_debit: <redacted>, group_id: \"\" }",
+                "open_date: \"2014-11-20\"",
+                &[
+                    "194.00", "2020.00", "1020.00", "0.00", "19400", "202000", "102000",
+                ][..],
+            ),
+        ];
+        for (compact, pretty, expected, kept, withheld) in cases {
+            assert_eq!(compact, expected);
+            for debug in [&compact, &pretty] {
+                assert!(debug.contains("<redacted>"), "{debug}");
+                assert!(debug.contains(kept), "{debug}");
+                assert!(!debug.contains("Money"), "{debug}");
+                for value in withheld {
+                    assert!(!debug.contains(value), "{debug} shows {value}");
+                }
+            }
+        }
     }
 
     #[test]

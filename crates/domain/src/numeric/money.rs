@@ -34,7 +34,7 @@
 //! | COBIL00C `COMPUTE ACCT-CURR-BAL = ACCT-CURR-BAL - TRAN-AMT` | `(balance - amount).store::<10>()` | P-COBIL00C-022 |
 //! | CBTRN02C `COMPUTE WS-TEMP-BAL = ACCT-CURR-CYC-CREDIT - ACCT-CURR-CYC-DEBIT + DALYTRAN-AMT` | `(credit - debit + amount).store::<9>()`, then compared with the `Money<10>` credit limit | P-CBTRN02C-022 |
 //! | CBTRN02C `ADD DALYTRAN-AMT TO TRAN-CAT-BAL` | `(balance + amount).store::<9>()` | P-CBTRN02C-024, P-CBTRN02C-025 |
-//! | CBTRN02C `ADD DALYTRAN-AMT TO ACCT-CURR-BAL` and the cycle totals | `(balance + amount).store::<10>()` | P-CBTRN02C-026 |
+//! | CBTRN02C `ADD DALYTRAN-AMT TO ACCT-CURR-BAL` and the cycle totals | `(balance + amount).store::<10>()` | P-CBTRN02C-026, P-CBTRN02C-226, P-CBTRN02C-227 |
 //! | CBACT04C `ADD WS-MONTHLY-INT TO WS-TOTAL-INT` | `(total + monthly).store::<9>()` | P-CBACT04C-020 |
 //! | CBACT04C `ADD WS-TOTAL-INT TO ACCT-CURR-BAL` | `(balance + total).store::<10>()` | P-CBACT04C-021 |
 //! | CBPAUP0C `SUBTRACT PA-APPROVED-AMT FROM PA-APPROVED-AUTH-AMT` | `(total - approved).store::<9>()` | P-CBPAUP0C-004 |
@@ -295,9 +295,9 @@ impl MoneyExpr {
     /// Excess fraction digits are truncated toward zero, the sign and the
     /// low-order `D` integer digits are kept, and a zero result is positive
     /// zero (P-CBACT04C-011, P-CBACT04C-018, P-CBACT04C-020, P-CBACT04C-021,
-    /// P-COBIL00C-022, P-CBTRN02C-022, P-CBTRN02C-024 to P-CBTRN02C-026). For
-    /// example 1500000000.00 stored into `S9(09)V99` is 500000000.00, and
-    /// -1000000000.00 is 0.00.
+    /// P-COBIL00C-022, P-CBTRN02C-022, P-CBTRN02C-024 to P-CBTRN02C-026,
+    /// P-CBTRN02C-226, P-CBTRN02C-227). For example 1500000000.00 stored into
+    /// `S9(09)V99` is 500000000.00, and -1000000000.00 is 0.00.
     ///
     /// # Panics
     ///

@@ -10,6 +10,12 @@ description = "PostgreSQL adapters, unit of work, TRAN-ID allocation, migrator a
 # embedded by sqlx::migrate! always carries the current SQL files.
 build = "build.rs"
 
+# The library target is declared rather than discovered, so this manifest loads even
+# before src/lib.rs exists: Cargo loads every workspace member to run any one package,
+# and the std-only audit structure check runs ahead of this crate's sources.
+[lib]
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 

@@ -7,6 +7,13 @@ license.workspace = true
 publish = false
 description = "ASCII and EBCDIC (CP037) record codecs for the CardDemo copybook layouts"
 
+# The library target is declared rather than discovered, so this manifest
+# loads even before src/lib.rs exists: Cargo loads every workspace member to
+# run any one package, and the std-only audit structure check runs ahead of
+# this crate's sources.
+[lib]
+path = "src/lib.rs"
+
 [lints]
 workspace = true
 
@@ -21,6 +28,9 @@ criterion.workspace = true
 insta = { workspace = true, features = ["yaml"] }
 proptest.workspace = true
 
+# The bench path is declared for the same reason as the [lib] path: Cargo
+# fails to load a manifest whose inferred bench file is missing.
 [[bench]]
 name = "codec"
+path = "benches/codec.rs"
 harness = false

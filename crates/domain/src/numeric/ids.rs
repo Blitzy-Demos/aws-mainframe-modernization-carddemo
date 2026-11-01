@@ -169,19 +169,53 @@ macro_rules! digit_field_api {
 }
 
 /// A named unsigned `9(n)` identifier or code over the integer `$inner`.
+///
+/// A leading `sensitive` marks a field whose value diagnostics must not show:
+/// the type then derives no `Debug`, and implements it by hand.
 macro_rules! digit_id {
     (
+        @define [$($debug:ident)?]
         $(#[$attr:meta])*
         $name:ident($inner:ty), width = $width:literal, limit = $limit:literal, $to_i64:ident
     ) => {
         $(#[$attr])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive($($debug,)? Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name($inner);
 
         digit_field_api!(
             impl[] $name, $inner, width = $width, limit = $limit, $to_i64
         );
     };
+    (
+        $(#[$attr:meta])*
+        sensitive $name:ident($inner:ty), width = $width:literal, limit = $limit:literal,
+        $to_i64:ident
+    ) => {
+        digit_id! {
+            @define []
+            $(#[$attr])*
+            $name($inner), width = $width, limit = $limit, $to_i64
+        }
+    };
+    (
+        $(#[$attr:meta])*
+        $name:ident($inner:ty), width = $width:literal, limit = $limit:literal, $to_i64:ident
+    ) => {
+        digit_id! {
+            @define [Debug]
+            $(#[$attr])*
+            $name($inner), width = $width, limit = $limit, $to_i64
+        }
+    };
+}
+
+/// The `Debug` form of a field whose value diagnostics must not show: the type
+/// name around `<redacted>`, whatever the value.
+fn debug_redacted(formatter: &mut fmt::Formatter<'_>, name: &str) -> fmt::Result {
+    formatter
+        .debug_tuple(name)
+        .field(&format_args!("<redacted>"))
+        .finish()
 }
 
 digit_id! {
@@ -230,7 +264,18 @@ digit_id! {
     ///
     /// `CARD-CVV-CD` P-CVACT02Y-003 [app/cpy/CVACT02Y.cpy:L7]. SQL
     /// `INTEGER CHECK (0 <= v < 10^3)`.
-    Cvv(u16), width = 3, limit = 1_000, from
+    ///
+    /// `Debug` shows `Cvv(<redacted>)` and no digit of the code, because a card
+    /// verification code is sensitive card data that diagnostics must never
+    /// show; `Display` and the SQL conversions keep the full value.
+    sensitive Cvv(u16), width = 3, limit = 1_000, from
+}
+
+/// The code withheld: `Cvv(<redacted>)`.
+impl fmt::Debug for Cvv {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_redacted(formatter, "Cvv")
+    }
 }
 
 digit_id! {
@@ -249,7 +294,18 @@ digit_id! {
     ///
     /// `CUST-SSN` P-CVCUS01Y-013 [app/cpy/CVCUS01Y.cpy:L17], which the audit
     /// row labels `Ssn`. SQL `INTEGER CHECK (0 <= v < 10^9)`.
-    CustSsn(u32), width = 9, limit = 1_000_000_000, from
+    ///
+    /// `Debug` shows `CustSsn(<redacted>)` and no digit of the number, because a
+    /// social security number is sensitive customer data; `Display` and the SQL
+    /// conversions keep the full value.
+    sensitive CustSsn(u32), width = 9, limit = 1_000_000_000, from
+}
+
+/// The number withheld: `CustSsn(<redacted>)`.
+impl fmt::Debug for CustSsn {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        debug_redacted(formatter, "CustSsn")
+    }
 }
 
 digit_id! {
@@ -300,10 +356,19 @@ digit_field_api!(
 );
 
 /// A named `X(n)` key or code over the item `Alnum<$width>`.
+///
+/// A leading `sensitive` marks a key whose text diagnostics must not show in
+/// full: the type then derives no `Debug`, and implements it by hand.
 macro_rules! text_key {
+    ($(#[$attr:meta])* sensitive $name:ident(Alnum<$width:literal>)) => {
+        text_key!(@define [] $(#[$attr])* $name(Alnum<$width>));
+    };
     ($(#[$attr:meta])* $name:ident(Alnum<$width:literal>)) => {
+        text_key!(@define [Debug] $(#[$attr])* $name(Alnum<$width>));
+    };
+    (@define [$($debug:ident)?] $(#[$attr:meta])* $name:ident(Alnum<$width:literal>)) => {
         $(#[$attr])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        #[derive($($debug,)? Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub struct $name(Alnum<$width>);
 
         impl $name {
@@ -364,7 +429,28 @@ text_key! {
     /// [app/app-authorization-ims-db2-mq/cpy/CIPAUDTY.cpy:L24], `PA-RQ-CARD-NUM`
     /// P-CCPAURQY-003, `PA-RL-CARD-NUM` P-CCPAURLY-001 and the Db2
     /// `CARD_NUM CHAR(16)` P-AUTHFRDS-001. SQL `VARCHAR(16)`.
-    CardNumber(Alnum<16>)
+    ///
+    /// `Debug` shows the number masked to its last four characters, for example
+    /// `CardNumber("************1111")`, because a full card number is sensitive
+    /// card data; `Display`, [`CardNumber::trimmed`] and the stored bytes keep
+    /// the full text.
+    sensitive CardNumber(Alnum<16>)
+}
+
+/// The trimmed number with every character but the last four replaced by `*`,
+/// and every character when it has four or fewer.
+impl fmt::Debug for CardNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The trailing characters a masked number keeps.
+        const SHOWN: usize = 4;
+        let text = self.trimmed();
+        let count = text.chars().count();
+        let hidden = if count > SHOWN { count - SHOWN } else { count };
+        let masked: String = std::iter::repeat_n('*', hidden)
+            .chain(text.chars().skip(hidden))
+            .collect();
+        formatter.debug_tuple("CardNumber").field(&masked).finish()
+    }
 }
 
 text_key! {
@@ -614,6 +700,7 @@ impl AuthCount {
 mod tests {
     use std::borrow::Cow;
     use std::cmp::Ordering;
+    use std::fmt;
 
     use super::{
         AccountGroupId, AccountId, AccrualId, Alnum, AuthCount, AuthId, CardNumber, CustSsn,
@@ -861,6 +948,83 @@ mod tests {
             AccountId::new(10)?.cmp(&AccountId::new(9)?),
             Ordering::Greater
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sensitive_fields_withhold_their_value_from_debug_only() -> Result<(), NumericError> {
+        // (Debug, Display, expected Debug, expected Display, text Debug must not hold)
+        let cases: [(String, String, &str, &str, &str); 7] = [
+            debug_case(&Cvv::new(123)?, "Cvv(<redacted>)", "123", "123"),
+            debug_case(&Cvv::new(7)?, "Cvv(<redacted>)", "007", "7"),
+            debug_case(
+                &CustSsn::new(123_456_789)?,
+                "CustSsn(<redacted>)",
+                "123456789",
+                "123456789",
+            ),
+            debug_case(
+                &CardNumber::move_from("4111111111111111"),
+                r#"CardNumber("************1111")"#,
+                "4111111111111111",
+                "411111111111",
+            ),
+            debug_case(
+                &CardNumber::move_from("12345"),
+                r#"CardNumber("*2345")"#,
+                "12345           ",
+                "1",
+            ),
+            debug_case(
+                &CardNumber::move_from("123"),
+                r#"CardNumber("***")"#,
+                "123             ",
+                "123",
+            ),
+            debug_case(
+                &CardNumber::move_from(""),
+                r#"CardNumber("")"#,
+                "                ",
+                " ",
+            ),
+        ];
+        for (debug, display, expected_debug, expected_display, hidden) in cases {
+            assert_eq!(debug, expected_debug, "{expected_display}");
+            assert!(!debug.contains(hidden), "{expected_debug} shows {hidden}");
+            assert_eq!(display, expected_display, "{expected_debug}");
+        }
+        Ok(())
+    }
+
+    /// The `Debug` and `Display` text of `value`, with the expected texts.
+    fn debug_case<'a, T: fmt::Debug + fmt::Display>(
+        value: &T,
+        expected_debug: &'a str,
+        expected_display: &'a str,
+        hidden: &'a str,
+    ) -> (String, String, &'a str, &'a str, &'a str) {
+        (
+            format!("{value:?}"),
+            value.to_string(),
+            expected_debug,
+            expected_display,
+            hidden,
+        )
+    }
+
+    #[test]
+    fn other_fields_keep_the_derived_debug() -> Result<(), NumericError> {
+        let cases = [
+            (format!("{:?}", AccountId::new(42)?), "AccountId(42)"),
+            (format!("{:?}", FicoScore::new(750)?), "FicoScore(750)"),
+            (
+                format!("{:?}", TranId::move_from("0000000000000001")),
+                r#"TranId(Alnum<16>("0000000000000001"))"#,
+            ),
+        ];
+        for (debug, expected) in cases {
+            assert_eq!(debug, expected);
+        }
         Ok(())
     }
 

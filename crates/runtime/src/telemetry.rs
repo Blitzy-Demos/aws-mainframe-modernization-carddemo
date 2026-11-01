@@ -8,9 +8,9 @@
 //!   OpenTelemetry SDK tracer provider whose simple span processor hands each one
 //!   to [`JsonSpanExporter`], which writes it as one `"type":"span"` line.
 //!
-//! Standard output therefore holds JSON lines only. Nothing in this module prints
-//! anywhere else, except a failed shutdown at drop time, which goes to standard
-//! error.
+//! Standard output therefore holds JSON lines only, and nothing in this module
+//! prints anywhere else. A failed shutdown at drop time is reported the same way,
+//! as one more JSON log line on the same writer (see [`TelemetryGuard`]).
 //!
 //! # Filtering
 //!
@@ -18,6 +18,15 @@
 //! a span below the filter level is neither formatted nor exported. A span meant
 //! to reach the span lines under the default filter must be created at INFO level
 //! or above, for example with `tracing::info_span!`.
+//!
+//! A second, fixed filter drops every TRACE-level span and event of lapin, the
+//! AMQP client, whatever the directives say: it writes every outgoing frame,
+//! the one carrying the broker username and password included. lapin's DEBUG
+//! level and above stay subject to the directives alone.
+//!
+//! Every span the filters enable is exported with its attributes: the tracer
+//! provider samples all spans and keeps the SDK's default span limits, whatever
+//! the `OTEL_TRACES_SAMPLER` and `OTEL_SPAN_*_COUNT_LIMIT` variables say.
 //!
 //! # Spans the consumers emit
 //!
@@ -49,13 +58,14 @@
 //! # Ok::<(), TelemetryError>(())
 //! ```
 
-use std::io::Write;
-
 use opentelemetry::KeyValue;
 use opentelemetry::trace::{TraceError, TracerProvider as _};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::trace::TracerProvider;
-use tracing_subscriber::filter::{EnvFilter, ParseError};
+use opentelemetry_sdk::trace::{Sampler, SpanLimits, TracerProvider};
+use tracing::{Level, Metadata};
+use tracing_subscriber::filter::{EnvFilter, ParseError, filter_fn};
+use tracing_subscriber::fmt::format::{Format, Json, JsonFields};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{self, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
@@ -66,6 +76,34 @@ use crate::json_span_exporter::JsonSpanExporter;
 /// Resource attribute naming the emitting process; the exporter writes its value
 /// as the `service` key of every span line.
 const SERVICE_NAME_KEY: &str = "service.name";
+
+/// Target of the lapin crate's root module; its submodules' targets continue
+/// with `::`.
+const LAPIN_TARGET: &str = "lapin";
+
+/// Whether a span or event may reach the JSON formatter and the OpenTelemetry
+/// layer: everything except lapin's TRACE level.
+///
+/// lapin writes every outgoing AMQP frame at TRACE (`will write to buffer`,
+/// target `lapin::io_loop`). Among them is the `connection.start-ok` frame, whose
+/// SASL PLAIN response holds the broker username and password, debug-formatted
+/// as a list of bytes. Its other TRACE output debug-formats frames, protocol
+/// methods and connection state as well. Its DEBUG level and above carries no
+/// credentials, so it is left to the filter directives.
+///
+/// The predicate runs as a filter layer of its own, and the subscriber enables a
+/// span or event only when every filter layer does. No `RUST_LOG` directive can
+/// therefore re-enable this output, not even a span directive such as
+/// `[outer]=trace`, which enables every event inside `outer` whatever the target
+/// directives say. A target is lapin's when it is `lapin` or starts with
+/// `lapin::`; a target such as `lapin_ext` names another crate and passes.
+fn is_credential_safe(metadata: &Metadata<'_>) -> bool {
+    let is_lapin = metadata
+        .target()
+        .strip_prefix(LAPIN_TARGET)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"));
+    !is_lapin || *metadata.level() != Level::TRACE
+}
 
 /// Failure to set up or shut down telemetry.
 #[derive(Debug, thiserror::Error)]
@@ -87,16 +125,23 @@ pub enum TelemetryError {
 /// provider, and a global subscriber is never dropped, so dropping the provider
 /// handle alone would never shut it down. Call [`TelemetryGuard::shutdown`]
 /// before the process exits to learn about a failure. A guard dropped without
-/// that call shuts the provider down itself and reports a failure on standard
-/// error, never on standard output.
+/// that call shuts the provider down itself and reports a failure as one ERROR
+/// event, `telemetry shutdown failed` with an `error` field, written as a JSON
+/// log line to the subscriber's writer, standard output in the binaries. The
+/// line comes from a JSON formatter of its own with the same settings as the
+/// subscriber's, so it has the shape of every other log line, is written
+/// whatever the filter directives say, and never passes through the provider
+/// that failed to shut down.
 ///
 /// The provider is held in an `Option` and taken on the first shutdown, so a
 /// guard dropped after an explicit shutdown does not shut down a second time,
-/// which would fail and print a spurious error line.
+/// which would fail and write a spurious error line.
 #[must_use]
 #[derive(Debug)]
 pub struct TelemetryGuard {
     provider: Option<TracerProvider>,
+    /// The subscriber's writer, taken by the drop-time failure report.
+    writer: Option<BoxMakeWriter>,
 }
 
 impl TelemetryGuard {
@@ -122,12 +167,36 @@ impl TelemetryGuard {
 
 impl Drop for TelemetryGuard {
     fn drop(&mut self) {
-        if let Err(err) = self.shut_down_provider() {
-            // Standard output carries JSON lines only. A failed write to standard
-            // error leaves nothing further to report to, so its result is dropped.
-            let _ = writeln!(std::io::stderr(), "telemetry shutdown failed: {err}");
-        }
+        let Err(err) = self.shut_down_provider() else {
+            return;
+        };
+        let Some(writer) = self.writer.take() else {
+            return;
+        };
+        // A subscriber of its own, with the JSON formatter alone, installed for
+        // this one event: the line keeps the JSON shape of standard output, and
+        // no OpenTelemetry layer routes it to the provider that failed. The
+        // formatter drops a failed write, as there is nothing further to report to.
+        let reporter = tracing_subscriber::registry().with(json_log_layer(writer));
+        tracing::subscriber::with_default(reporter, || {
+            tracing::error!(error = %err, "telemetry shutdown failed");
+        });
     }
+}
+
+/// The JSON formatter of the log event lines, writing to `writer`: the current
+/// span (`span`) and the list of entered spans (`spans`) on every event line,
+/// and no ANSI colour codes.
+fn json_log_layer<S, W>(writer: W) -> fmt::Layer<S, JsonFields, Format<Json>, W>
+where
+    W: for<'a> MakeWriter<'a> + 'static,
+{
+    fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_ansi(false)
+        .with_writer(writer)
 }
 
 /// Builds the subscriber [`init`] installs, writing every JSON line to `writer`.
@@ -136,19 +205,28 @@ impl Drop for TelemetryGuard {
 ///
 /// 1. an `EnvFilter` parsed from `directives`, which gates events and spans for
 ///    the layers after it;
-/// 2. the `tracing-subscriber` JSON formatter, with the current span and the
+/// 2. a fixed filter that drops lapin's TRACE-level spans and events, whose
+///    outgoing `connection.start-ok` frame holds the broker credentials, for the
+///    layers after it, whatever `directives` say;
+/// 3. the `tracing-subscriber` JSON formatter, with the current span and the
 ///    span list on every event line and no ANSI colour codes;
-/// 3. the `tracing-opentelemetry` layer, on a tracer named `service_name` from a
+/// 4. the `tracing-opentelemetry` layer, on a tracer named `service_name` from a
 ///    tracer provider of its own whose simple span processor feeds a
 ///    [`JsonSpanExporter`] on `writer`, with `service_name` as the resource's
-///    `service.name`.
+///    `service.name`. The provider samples every span (`Sampler::AlwaysOn`)
+///    and keeps the SDK's default span limits (128 attributes, events and
+///    links per span), both set explicitly.
 ///
 /// No global state is touched: the tracer provider is not registered globally,
 /// so tests can build several subscribers side by side and install each one
 /// with `tracing::subscriber::with_default`. Each subscriber's spans go only to
-/// its own writer. `directives` are used as given; the environment is not read.
+/// its own writer. `directives` are used as given, and the SDK's sampler and
+/// span limit variables (`OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG`,
+/// `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, `OTEL_SPAN_EVENT_COUNT_LIMIT`,
+/// `OTEL_SPAN_LINK_COUNT_LIMIT`) have no effect.
 ///
-/// The returned guard shuts the provider down; see [`TelemetryGuard`].
+/// The returned guard shuts the provider down and reports a failed drop-time
+/// shutdown as a JSON line on `writer`; see [`TelemetryGuard`].
 ///
 /// # Errors
 ///
@@ -170,6 +248,8 @@ where
 {
     let filter = EnvFilter::try_new(directives)?;
     let provider = TracerProvider::builder()
+        .with_sampler(Sampler::AlwaysOn)
+        .with_span_limits(SpanLimits::default())
         .with_simple_exporter(JsonSpanExporter::new(writer.clone()))
         .with_resource(Resource::new([KeyValue::new(
             SERVICE_NAME_KEY,
@@ -177,23 +257,16 @@ where
         )]))
         .build();
     let tracer = provider.tracer(service_name.to_owned());
+    let guard = TelemetryGuard {
+        provider: Some(provider),
+        writer: Some(BoxMakeWriter::new(writer.clone())),
+    };
     let subscriber = tracing_subscriber::registry()
         .with(filter)
-        .with(
-            fmt::layer()
-                .json()
-                .with_current_span(true)
-                .with_span_list(true)
-                .with_ansi(false)
-                .with_writer(writer),
-        )
+        .with(filter_fn(is_credential_safe))
+        .with(json_log_layer(writer))
         .with(tracing_opentelemetry::layer().with_tracer(tracer));
-    Ok((
-        subscriber,
-        TelemetryGuard {
-            provider: Some(provider),
-        },
-    ))
+    Ok((subscriber, guard))
 }
 
 /// Installs the JSON telemetry of the process `service_name` (`api`, `batch` or
@@ -223,8 +296,10 @@ pub fn init(service_name: &str) -> Result<TelemetryGuard, TelemetryError> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::error::Error;
     use std::io::{self, Write};
+    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     use serde_json::Value as Json;
@@ -355,5 +430,188 @@ mod tests {
             );
             assert!(err.to_string().starts_with("invalid log filter: "), "{err}");
         }
+    }
+
+    /// Path of [`every_span_is_exported_with_its_attributes`] in this test binary,
+    /// which `ambient_sdk_variables_drop_no_span` runs in a child process.
+    const EXPORT_TEST: &str = "telemetry::tests::every_span_is_exported_with_its_attributes";
+
+    #[test]
+    fn every_span_is_exported_with_its_attributes() -> TestResult {
+        let capture = Capture::default();
+        let (subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("write", transaction = "CAUP").in_scope(|| {});
+        });
+        guard.shutdown()?;
+
+        let lines = capture.json_lines()?;
+        let [write_line] = span_lines(&lines)[..] else {
+            return Err(format!("expected exactly one span line: {lines:?}").into());
+        };
+        assert_eq!(write_line["name"], "write");
+        assert_eq!(write_line["attributes"]["transaction"], "CAUP");
+        Ok(())
+    }
+
+    /// The SDK's default configuration reads its sampler and span limits from
+    /// the environment. The process environment cannot be changed from a test,
+    /// so the export test runs in a child process with each setting that would
+    /// drop the span or its attribute.
+    #[test]
+    fn ambient_sdk_variables_drop_no_span() -> TestResult {
+        let cases: [&[(&str, &str)]; 4] = [
+            &[("OTEL_TRACES_SAMPLER", "always_off")],
+            &[
+                ("OTEL_TRACES_SAMPLER", "traceidratio"),
+                ("OTEL_TRACES_SAMPLER_ARG", "0"),
+            ],
+            &[("OTEL_TRACES_SAMPLER", "parentbased_always_off")],
+            &[("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "0")],
+        ];
+        for vars in cases {
+            let output = Command::new(env::current_exe()?)
+                .args([EXPORT_TEST, "--exact", "--test-threads=1"])
+                .envs(vars.iter().copied())
+                .output()?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{vars:?}: {stdout}{stderr}");
+            assert!(stdout.contains("1 passed"), "{vars:?}: {stdout}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_shutdown_at_drop_is_one_json_error_line() -> TestResult {
+        let capture = Capture::default();
+        let (subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("job").in_scope(|| tracing::info!("posted"));
+        });
+        // Shut the provider down through another handle, so that the guard's own
+        // shutdown at drop time fails.
+        guard
+            .provider
+            .clone()
+            .ok_or("guard without a provider")?
+            .shutdown()?;
+        drop(guard);
+
+        let lines = capture.json_lines()?;
+        let [.., last] = &lines[..] else {
+            return Err("telemetry wrote nothing".into());
+        };
+        assert_eq!(last["level"], "ERROR", "{last}");
+        assert_eq!(
+            last["fields"]["message"], "telemetry shutdown failed",
+            "{last}"
+        );
+        let error = last["fields"]["error"].as_str().unwrap_or_default();
+        assert!(
+            error.starts_with("failed to shut down the tracer provider: "),
+            "{last}"
+        );
+        let errors = lines.iter().filter(|line| line["level"] == "ERROR").count();
+        assert_eq!(errors, 1, "{lines:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn an_explicit_shutdown_leaves_nothing_for_drop_to_write() -> TestResult {
+        let capture = Capture::default();
+        let (_subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        guard.shutdown()?;
+        assert!(capture.json_lines()?.is_empty(), "drop wrote a line");
+
+        // A failing explicit shutdown is the caller's to report; drop adds nothing.
+        let (_subscriber, guard) = subscriber_with_writer("test-svc", "info", capture.clone())?;
+        guard
+            .provider
+            .clone()
+            .ok_or("guard without a provider")?
+            .shutdown()?;
+        let result = guard.shutdown();
+        assert!(
+            matches!(result, Err(TelemetryError::Shutdown(_))),
+            "{result:?}"
+        );
+        assert!(capture.json_lines()?.is_empty(), "drop wrote a line");
+        Ok(())
+    }
+
+    /// Stand-in for the SASL PLAIN response lapin debug-formats into its
+    /// `connection.start-ok` frame line.
+    const SASL_MARKER: &str = "SASL-PLAIN-PASSWORD-MARKER";
+
+    #[test]
+    fn lapin_trace_output_is_never_written() -> TestResult {
+        const CHANNELS_DEBUG: &str = "create channel";
+        const IO_LOOP_DEBUG: &str = "io loop debug control";
+        const NEIGHBOUR_TRACE: &str = "neighbour crate trace control";
+        const APP_TRACE: &str = "application trace control";
+        // Each directive list enables lapin's TRACE output; the messages are the
+        // controls it also enables, which must still be written.
+        let cases: [(&str, &[&str]); 4] = [
+            (
+                "trace",
+                &[CHANNELS_DEBUG, IO_LOOP_DEBUG, NEIGHBOUR_TRACE, APP_TRACE],
+            ),
+            // A target directive matches by prefix, so `lapin` covers `lapin_ext`.
+            (
+                "lapin=trace",
+                &[CHANNELS_DEBUG, IO_LOOP_DEBUG, NEIGHBOUR_TRACE],
+            ),
+            ("lapin::io_loop=trace", &[IO_LOOP_DEBUG]),
+            (
+                "info,[outer]=trace",
+                &[CHANNELS_DEBUG, IO_LOOP_DEBUG, NEIGHBOUR_TRACE, APP_TRACE],
+            ),
+        ];
+        for (directives, expected) in cases {
+            let capture = Capture::default();
+            let (subscriber, guard) = subscriber_with_writer("mq", directives, capture.clone())?;
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info_span!("outer").in_scope(|| {
+                    tracing::trace!(
+                        target: "lapin::io_loop",
+                        next_msg = SASL_MARKER,
+                        "will write to buffer"
+                    );
+                    tracing::trace!(
+                        target: "lapin",
+                        next_msg = SASL_MARKER,
+                        "will write to buffer"
+                    );
+                    tracing::trace_span!(target: "lapin::io_loop", "io_loop", frame = SASL_MARKER)
+                        .in_scope(|| tracing::debug!(target: "lapin::io_loop", "{IO_LOOP_DEBUG}"));
+                    tracing::debug!(target: "lapin::channels", "{CHANNELS_DEBUG}");
+                    tracing::trace!(target: "lapin_ext", "{NEIGHBOUR_TRACE}");
+                    tracing::trace!("{APP_TRACE}");
+                });
+            });
+            guard.shutdown()?;
+
+            let lines = capture.json_lines()?;
+            for line in &lines {
+                let text = line.to_string();
+                assert!(!text.contains(SASL_MARKER), "{directives:?}: {text}");
+                let target = line["target"].as_str().unwrap_or_default();
+                assert!(
+                    !(line["level"] == "TRACE"
+                        && (target == "lapin" || target.starts_with("lapin::"))),
+                    "{directives:?}: {text}"
+                );
+            }
+            let mut messages: Vec<&str> = lines
+                .iter()
+                .filter_map(|line| line["fields"]["message"].as_str())
+                .collect();
+            messages.sort_unstable();
+            let mut expected = expected.to_vec();
+            expected.sort_unstable();
+            assert_eq!(messages, expected, "{directives:?}: {lines:?}");
+        }
+        Ok(())
     }
 }

@@ -122,9 +122,10 @@ pub mod defaults {
 /// Settings of one process, resolved from the environment over [`defaults`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
-    /// `CARDDEMO_DATABASE_URL`: database connection URL.
+    /// `CARDDEMO_DATABASE_URL`: database connection URL. `Debug` never prints
+    /// it.
     pub database_url: String,
-    /// `CARDDEMO_AMQP_URL`: broker connection URL.
+    /// `CARDDEMO_AMQP_URL`: broker connection URL. `Debug` never prints it.
     pub amqp_url: String,
     /// `CARDDEMO_HTTP_ADDR`: listen address of the `api` binary.
     pub http_addr: SocketAddr,
@@ -156,7 +157,8 @@ pub struct Settings {
     pub rust_log: String,
 }
 
-/// Text `Debug` prints in place of the token signing secret.
+/// Text `Debug` prints in place of every value that may carry a credential:
+/// the database URL, the broker URL and the token signing secret.
 const REDACTED: &str = "<redacted>";
 
 impl fmt::Debug for Settings {
@@ -164,8 +166,8 @@ impl fmt::Debug for Settings {
         // Exhaustive destructuring: a field added to `Settings` fails to compile
         // here until it is listed below.
         let Self {
-            database_url,
-            amqp_url,
+            database_url: _,
+            amqp_url: _,
             http_addr,
             jwt_secret: _,
             jwt_ttl_secs,
@@ -179,9 +181,11 @@ impl fmt::Debug for Settings {
             clock_override,
             rust_log,
         } = self;
+        // The URLs are redacted whole: a password can sit in the user-info part
+        // or, for PostgreSQL, in a `password=` query parameter.
         f.debug_struct("Settings")
-            .field("database_url", database_url)
-            .field("amqp_url", amqp_url)
+            .field("database_url", &REDACTED)
+            .field("amqp_url", &REDACTED)
             .field("http_addr", http_addr)
             .field("jwt_secret", &REDACTED)
             .field("jwt_ttl_secs", jwt_ttl_secs)
@@ -224,8 +228,11 @@ impl Settings {
     /// Resolves the settings from `lookup`, which returns the value of a
     /// variable or `None` when it is not set.
     ///
-    /// A value of `None` keeps the field's default. Text and path fields take a
-    /// value as given; an empty `CARDDEMO_CLOCK_OVERRIDE` counts as unset.
+    /// A value of `None` keeps the field's default. `CARDDEMO_DATABASE_URL`,
+    /// `CARDDEMO_AMQP_URL` and `CARDDEMO_JWT_SECRET` reject a blank value
+    /// (empty or only whitespace) and take any other value as given. The other
+    /// text and path fields take a value as given; an empty
+    /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset.
     ///
     /// ```
     /// use carddemo_runtime::config::{Settings, keys};
@@ -238,6 +245,9 @@ impl Settings {
     ///
     /// # Errors
     ///
+    /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
+    ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
+    ///   whitespace-only value.
     /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not an
     ///   unsigned integer.
     /// - [`ConfigError::InvalidAddress`] when `CARDDEMO_HTTP_ADDR` is not an IP
@@ -257,6 +267,9 @@ impl Settings {
     ///
     /// - [`ConfigError::NotUnicode`] when a variable is set to a value that is
     ///   not valid Unicode.
+    /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
+    ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
+    ///   whitespace-only value.
     /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not an
     ///   unsigned integer.
     /// - [`ConfigError::InvalidAddress`] when `CARDDEMO_HTTP_ADDR` is not an IP
@@ -275,10 +288,10 @@ impl Settings {
         lookup: impl Fn(&'static str) -> Result<Option<String>, ConfigError>,
     ) -> Result<Self, ConfigError> {
         let mut settings = Self::default();
-        if let Some(value) = lookup(keys::DATABASE_URL)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::DATABASE_URL)? {
             settings.database_url = value;
         }
-        if let Some(value) = lookup(keys::AMQP_URL)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::AMQP_URL)? {
             settings.amqp_url = value;
         }
         if let Some(value) = lookup(keys::HTTP_ADDR)? {
@@ -290,7 +303,7 @@ impl Settings {
                     source,
                 })?;
         }
-        if let Some(value) = lookup(keys::JWT_SECRET)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::JWT_SECRET)? {
             settings.jwt_secret = value;
         }
         if let Some(value) = lookup(keys::JWT_TTL_SECS)? {
@@ -329,10 +342,34 @@ impl Settings {
     }
 }
 
+/// Looks up `key`, a setting that must not be blank once it is set: a
+/// connection URL or the token signing secret.
+///
+/// An unset variable gives `None`, so its field keeps the default. Any other
+/// non-blank value is returned as given.
+///
+/// # Errors
+///
+/// - [`ConfigError::Blank`] when the value is empty or only whitespace. The
+///   error names `key` alone, never the value.
+/// - Any error `lookup` returns for `key`.
+fn lookup_non_blank(
+    lookup: &impl Fn(&'static str) -> Result<Option<String>, ConfigError>,
+    key: &'static str,
+) -> Result<Option<String>, ConfigError> {
+    match lookup(key)? {
+        Some(value) if value.trim().is_empty() => Err(ConfigError::Blank { key }),
+        value => Ok(value),
+    }
+}
+
 /// A setting that is present but unusable.
 ///
-/// Errors name the variable and echo the rejected value. `CARDDEMO_JWT_SECRET`
-/// is never parsed, so no error can carry the secret.
+/// [`ConfigError::InvalidNumber`] and [`ConfigError::InvalidAddress`] name the
+/// variable and echo the rejected value. [`ConfigError::Blank`] and
+/// [`ConfigError::NotUnicode`] name only the variable. The database URL, the
+/// broker URL and `CARDDEMO_JWT_SECRET` are never parsed, only checked for
+/// blankness, so no error can carry a credential.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     /// A numeric setting is not an unsigned integer.
@@ -356,6 +393,13 @@ pub enum ConfigError {
         /// Address parse failure.
         #[source]
         source: AddrParseError,
+    },
+    /// `CARDDEMO_DATABASE_URL`, `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET`
+    /// is set to an empty or whitespace-only value.
+    #[error("{key} is set but blank")]
+    Blank {
+        /// Variable name.
+        key: &'static str,
     },
     /// A variable is set to a value that is not valid Unicode.
     #[error("{key} is not valid Unicode")]
@@ -603,6 +647,33 @@ mod tests {
     }
 
     #[test]
+    fn blank_connection_urls_and_jwt_secret_are_rejected_naming_only_the_key() {
+        for key in [keys::DATABASE_URL, keys::AMQP_URL, keys::JWT_SECRET] {
+            for blank in ["", "   ", "\t"] {
+                let Err(err) = Settings::from_lookup(lookup_from(&[(key, blank)])) else {
+                    panic!("{key}={blank:?} was accepted");
+                };
+                assert!(
+                    matches!(&err, ConfigError::Blank { key: rejected } if *rejected == key),
+                    "{key}={blank:?}: {err:?}"
+                );
+                let message = err.to_string();
+                assert_eq!(message, format!("{key} is set but blank"));
+                // Neither the quoted value (which also covers "") nor the raw
+                // value appears in the message or the error's `Debug`.
+                let quoted = format!("{blank:?}");
+                let debug = format!("{err:?}");
+                assert!(!message.contains(&quoted), "{key}: {message}");
+                assert!(!debug.contains(&quoted), "{key}: {debug}");
+                assert!(
+                    blank.is_empty() || !message.contains(blank),
+                    "{key}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn empty_clock_override_counts_as_unset() -> Result<(), ConfigError> {
         let settings = Settings::from_lookup(lookup_from(&[(keys::CLOCK_OVERRIDE, "")]))?;
         assert_eq!(settings.clock_override, None);
@@ -617,14 +688,18 @@ mod tests {
     }
 
     #[test]
-    fn debug_redacts_the_jwt_secret() {
+    fn debug_redacts_the_connection_urls_and_the_jwt_secret() {
         let settings = Settings {
+            database_url: "postgres://u:db-pass-marker@db:5432/x".to_owned(),
+            amqp_url: "amqp://u:mq-pass-marker@mq:5672/%2f".to_owned(),
             jwt_secret: "jwt-test-value".to_owned(),
             ..Settings::default()
         };
         let shown = format!("{settings:?}");
+        for marker in ["db-pass-marker", "mq-pass-marker", "jwt-test-value"] {
+            assert!(!shown.contains(marker), "{marker} is shown: {shown}");
+        }
         assert!(shown.contains("<redacted>"), "{shown}");
-        assert!(!shown.contains("jwt-test-value"), "{shown}");
         assert!(shown.contains(defaults::QUEUE_PAUTH_REQUEST), "{shown}");
     }
 }
