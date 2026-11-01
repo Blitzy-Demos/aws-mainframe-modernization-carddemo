@@ -155,7 +155,9 @@ pub struct Settings {
     /// domain clock, `carddemo_domain::clock::AnyClock::from_override`, which
     /// rejects any value that is not an RFC 3339 instant.
     pub clock_override: Option<String>,
-    /// `RUST_LOG`: log filter directives.
+    /// `RUST_LOG`: log filter directives, from [`rust_log_directives`]: the
+    /// default `info` when unset, empty or not valid Unicode, else the value
+    /// verbatim. It equals the filter `telemetry::init` applies.
     pub rust_log: String,
 }
 
@@ -237,7 +239,9 @@ impl Settings {
     /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset; any other value of it,
     /// whitespace-only included, is passed through verbatim, and
     /// `AnyClock::from_override` in the domain clock rejects what is not an
-    /// RFC 3339 instant.
+    /// RFC 3339 instant. An empty `RUST_LOG` likewise counts as unset and gives
+    /// the default `info`; any other value of it is kept verbatim (see
+    /// [`rust_log_directives`]).
     ///
     /// ```
     /// use carddemo_runtime::config::{Settings, keys};
@@ -271,7 +275,8 @@ impl Settings {
     /// # Errors
     ///
     /// - [`ConfigError::NotUnicode`] when a variable is set to a value that is
-    ///   not valid Unicode.
+    ///   not valid Unicode. `RUST_LOG` is the exception: such a value counts as
+    ///   unset and gives the default `info`, as in `telemetry::init`.
     /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
     ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
     ///   whitespace-only value.
@@ -340,11 +345,31 @@ impl Settings {
             settings.cors_origin = value;
         }
         settings.clock_override = lookup(keys::CLOCK_OVERRIDE)?.filter(|value| !value.is_empty());
-        if let Some(value) = lookup(keys::RUST_LOG)? {
-            settings.rust_log = value;
-        }
+        // `RUST_LOG` alone treats a value that is not valid Unicode as unset:
+        // `telemetry::init` applies the default to such a value, and the field
+        // must name the filter in effect.
+        let rust_log = match lookup(keys::RUST_LOG) {
+            Err(ConfigError::NotUnicode { .. }) => None,
+            other => other?,
+        };
+        settings.rust_log = rust_log_directives(rust_log);
         Ok(settings)
     }
+}
+
+/// The log filter directives for the `RUST_LOG` value `value`: the value as
+/// given, or [`defaults::RUST_LOG`] when it is `None` or empty.
+///
+/// Only an empty value counts as unset, as with `CARDDEMO_CLOCK_OVERRIDE`; any
+/// other value, whitespace-only included, is returned verbatim. Both
+/// [`Settings`] and [`telemetry::init`](crate::telemetry::init) take their
+/// directives from here, so the filter [`Settings::rust_log`] reports is the
+/// one in effect.
+#[must_use]
+pub fn rust_log_directives(value: Option<String>) -> String {
+    value
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| defaults::RUST_LOG.to_owned())
 }
 
 /// Looks up `key`, a setting that must not be blank once it is set: a
@@ -422,7 +447,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::path::PathBuf;
 
-    use super::{ConfigError, Settings, defaults, keys};
+    use super::{ConfigError, Settings, defaults, keys, rust_log_directives};
 
     /// The repository root's `.env.example`; `CARGO_MANIFEST_DIR` is `crates/runtime`.
     const ENV_EXAMPLE: &str =
@@ -461,6 +486,20 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         move |key| map.get(key).cloned()
+    }
+
+    /// A lookup that finds every variable unset except `bad`, whose value is
+    /// not valid Unicode, the way `Settings::from_env` reports one.
+    fn not_unicode_at(
+        bad: &'static str,
+    ) -> impl Fn(&'static str) -> Result<Option<String>, ConfigError> {
+        move |key| {
+            if key == bad {
+                Err(ConfigError::NotUnicode { key })
+            } else {
+                Ok(None)
+            }
+        }
     }
 
     #[test]
@@ -684,6 +723,43 @@ mod tests {
         for (value, expected) in [("", None), ("   ", Some("   ")), ("\t\n", Some("\t\n"))] {
             let settings = Settings::from_lookup(lookup_from(&[(keys::CLOCK_OVERRIDE, value)]))?;
             assert_eq!(settings.clock_override.as_deref(), expected, "{value:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn empty_rust_log_counts_as_unset_and_other_values_pass_verbatim() -> Result<(), ConfigError> {
+        assert_eq!(rust_log_directives(None), defaults::RUST_LOG);
+        for (value, expected) in [
+            ("", "info"),
+            ("debug", "debug"),
+            ("warn,carddemo=trace", "warn,carddemo=trace"),
+            ("   ", "   "),
+        ] {
+            let settings = Settings::from_lookup(lookup_from(&[(keys::RUST_LOG, value)]))?;
+            assert_eq!(settings.rust_log, expected, "{value:?}");
+            assert_eq!(
+                settings.rust_log,
+                rust_log_directives(Some(value.to_owned())),
+                "{value:?}: Settings and telemetry::init disagree"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_unicode_rust_log_counts_as_unset_and_every_other_key_still_fails()
+    -> Result<(), ConfigError> {
+        let settings = Settings::resolve(not_unicode_at(keys::RUST_LOG))?;
+        assert_eq!(settings.rust_log, "info");
+        assert_eq!(settings, Settings::default());
+
+        for bad in keys::ALL.into_iter().filter(|key| *key != keys::RUST_LOG) {
+            let result = Settings::resolve(not_unicode_at(bad));
+            assert!(
+                matches!(&result, Err(ConfigError::NotUnicode { key }) if *key == bad),
+                "{bad}: {result:?}"
+            );
         }
         Ok(())
     }

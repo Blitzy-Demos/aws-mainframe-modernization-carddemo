@@ -70,7 +70,7 @@ use tracing_subscriber::fmt::{self, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::{SubscriberInitExt, TryInitError};
 
-use crate::config::{defaults, keys};
+use crate::config::{keys, rust_log_directives};
 use crate::json_span_exporter::JsonSpanExporter;
 
 /// Resource attribute naming the emitting process; the exporter writes its value
@@ -273,8 +273,9 @@ where
 /// `mq`) as the global default subscriber, writing to standard output.
 ///
 /// The filter directives come from `RUST_LOG`. When that variable is not set,
-/// not valid Unicode, or empty, the default `info` applies, the same default the
-/// settings carry.
+/// not valid Unicode, or empty, the default `info` applies. The rule is
+/// [`rust_log_directives`], the one the settings use as well, so
+/// `Settings::rust_log` names the filter in effect.
 ///
 /// Call it once, at the start of the process, and keep the guard alive until
 /// exit, then call [`TelemetryGuard::shutdown`].
@@ -285,10 +286,7 @@ where
 /// - [`TelemetryError::Install`] when a global default subscriber is already
 ///   installed, for example by an earlier call.
 pub fn init(service_name: &str) -> Result<TelemetryGuard, TelemetryError> {
-    let directives = std::env::var(keys::RUST_LOG)
-        .ok()
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| defaults::RUST_LOG.to_owned());
+    let directives = rust_log_directives(std::env::var(keys::RUST_LOG).ok());
     let (subscriber, guard) = subscriber_with_writer(service_name, &directives, std::io::stdout)?;
     subscriber.try_init()?;
     Ok(guard)
