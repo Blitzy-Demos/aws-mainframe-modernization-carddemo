@@ -1400,6 +1400,21 @@ pub const ERROR_READING_TRANSACTION_CATEGORY_FILE: &str = "ERROR READING TRANSAC
 /// app/cbl/CBACT04C.cbl:L375, app/cbl/CBACT04C.cbl:L397
 pub const ACCOUNT_NOT_FOUND_CBACT04C: &str = "ACCOUNT NOT FOUND: ";
 
+/// The account read's abend display, a member of the abend family of
+/// P-CBACT04C-188 at the lines P-CBACT04C-002 cites ·
+/// app/cbl/CBACT04C.cbl:L386
+pub const ERROR_READING_ACCOUNT_FILE: &str = "ERROR READING ACCOUNT FILE";
+
+/// The cross-reference read's abend display, a member of the abend family of
+/// P-CBACT04C-188 at the lines P-CBACT04C-002 cites ·
+/// app/cbl/CBACT04C.cbl:L408
+pub const ERROR_READING_XREF_FILE: &str = "ERROR READING XREF FILE";
+
+/// The disclosure group read's abend display for a status other than 00 and
+/// 23, a member of the abend family of P-CBACT04C-188 at the lines
+/// P-CBACT04C-004 cites · app/cbl/CBACT04C.cbl:L431
+pub const ERROR_READING_DISCLOSURE_GROUP_FILE: &str = "ERROR READING DISCLOSURE GROUP FILE";
+
 /// P-CBACT04C-010 · app/cbl/CBACT04C.cbl:L365
 pub const ERROR_RE_WRITING_ACCOUNT_FILE: &str = "ERROR RE-WRITING ACCOUNT FILE";
 
@@ -1613,9 +1628,25 @@ pub const FAILED_TO_READ_XREF_FILE: &str = "FAILED TO READ XREF FILE";
 /// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L544
 pub const ACCT_NOT_FOUND_IN_XREF: &str = "ACCT NOT FOUND IN XREF";
 
+/// Location C002 critical; the task ends without a reply — P-COPAUA0C-007 ·
+/// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L557
+pub const FAILED_TO_READ_ACCT_FILE: &str = "FAILED TO READ ACCT FILE";
+
 /// Location A003 warning — P-COPAUA0C-007 ·
 /// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L592
 pub const CUST_NOT_FOUND_IN_XREF: &str = "CUST NOT FOUND IN XREF";
+
+/// Location C003 critical; the task ends without a reply — P-COPAUA0C-007 ·
+/// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L605
+pub const FAILED_TO_READ_CUST_FILE: &str = "FAILED TO READ CUST FILE";
+
+/// Location I002 critical; the task ends without a reply — P-COPAUA0C-008 ·
+/// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L637
+pub const IMS_GET_SUMMARY_FAILED: &str = "IMS GET SUMMARY FAILED";
+
+/// Location M003 critical; the task ends — P-COPAUA0C-002 ·
+/// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L426
+pub const FAILED_TO_READ_REQUEST_MQ: &str = "FAILED TO READ REQUEST MQ";
 
 /// Location M004 critical; no database write follows — P-COPAUA0C-012 ·
 /// app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L775
