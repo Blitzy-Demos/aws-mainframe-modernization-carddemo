@@ -38,6 +38,16 @@
 --   order of COBOL comparisons and of the Db2 index on CARD_NUM.
 --   Text is stored right-trimmed of trailing spaces; persistence pads it back to the PIC
 --   width.
+--   Every VARCHAR column carries CHECK (v = rtrim(v) AND v !~ '[^\x01-\xff]'), which
+--   admits only that stored form, and the pa_account_status check holds each of its five
+--   occurrences to the same form. A value must equal its rtrim, so a trailing-space
+--   variant is rejected and one COBOL or Db2 key is one row: PostgreSQL VARCHAR equality
+--   counts trailing spaces, where COBOL and Db2 comparisons pad the shorter operand with
+--   spaces, so ('4859', t) and ('4859 ', t) would otherwise be two auth_fraud keys for the
+--   one Db2 key. Each character must lie in U+0001..U+00FF, the ISO 8859-1 range that
+--   Alnum::from_trimmed (crates/domain/src/numeric/alnum.rs) reads back one byte per
+--   character; NUL cannot be stored in PostgreSQL text at all. The check passes NULL, so
+--   the nullable Db2 text columns stay nullable.
 --   Unsigned 9(n) maps to INTEGER for n <= 9 with CHECK (0 <= v < 10^n). A signed binary or
 --   packed integer S9(n) maps to INTEGER with CHECK (-10^n < v < 10^n), unless its audit row
 --   names another type (below).
@@ -55,9 +65,11 @@
 --   nullable.
 --   Every IMS segment field is NOT NULL, as every byte of a segment holds a value. The Db2
 --   columns keep their DDL nullability.
---   Text columns carry no value-domain check: the 88-level values of PA-MATCH-STATUS (P, D,
---   E, M) and PA-AUTH-FRAUD (F, R) are not enforced, and COPAUA0C stores the fraud fields as
---   spaces [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L908-909].
+--   That storage-form check is the only check on a VARCHAR column. No text column checks
+--   a value domain: the 88-level values of PA-MATCH-STATUS (P, D, E, M) and PA-AUTH-FRAUD
+--   (F, R) are not enforced, and COPAUA0C stores the fraud fields as spaces
+--   [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L908-909], which are stored
+--   right-trimmed as ''.
 --   FILLER is not stored.
 --   No column defaults to the current time: writers supply the processing clock
 --   (CARDDEMO_CLOCK_OVERRIDE when set), FRAUD_RPT_DATE included, which COPAUS2C sets to the
@@ -78,7 +90,7 @@
 --                        pa_account_status VARCHAR(2)[5]: occurrence i is subscript i. A check
 --                        holds the array to one dimension of exactly 5 non-null elements
 --                        from subscript 1, because PostgreSQL does not enforce a declared
---                        array size.
+--                        array size, and holds each element to the storage form above.
 --   P-CIPAUSMY-009, -010 the S9(04) COMP counts are SMALLINT, the binary halfword the
 --                        AuthCount newtype holds, with CHECK (-10^4 < v < 10^4) for the four
 --                        PIC digits.
@@ -186,13 +198,19 @@ CREATE TABLE pending_auth_summaries (
         CHECK (pa_acct_id >= 0 AND pa_acct_id < 100000000000),
     pa_cust_id           INTEGER                    NOT NULL
         CHECK (pa_cust_id >= 0 AND pa_cust_id < 1000000000),
-    pa_auth_status       VARCHAR(1)    COLLATE "C"  NOT NULL,
+    pa_auth_status       VARCHAR(1)    COLLATE "C"  NOT NULL
+        CHECK (pa_auth_status = rtrim(pa_auth_status) AND pa_auth_status !~ '[^\x01-\xff]'),
     pa_account_status    VARCHAR(2)[5] COLLATE "C"  NOT NULL
         CHECK (
             array_ndims(pa_account_status) = 1
             AND array_lower(pa_account_status, 1) = 1
             AND cardinality(pa_account_status) = 5
             AND array_position(pa_account_status, NULL) IS NULL
+            AND pa_account_status[1] = rtrim(pa_account_status[1]) AND pa_account_status[1] !~ '[^\x01-\xff]'
+            AND pa_account_status[2] = rtrim(pa_account_status[2]) AND pa_account_status[2] !~ '[^\x01-\xff]'
+            AND pa_account_status[3] = rtrim(pa_account_status[3]) AND pa_account_status[3] !~ '[^\x01-\xff]'
+            AND pa_account_status[4] = rtrim(pa_account_status[4]) AND pa_account_status[4] !~ '[^\x01-\xff]'
+            AND pa_account_status[5] = rtrim(pa_account_status[5]) AND pa_account_status[5] !~ '[^\x01-\xff]'
         ),
     pa_credit_limit      NUMERIC(11,2)              NOT NULL
         CHECK (pa_credit_limit <> 'NaN'),
@@ -232,35 +250,56 @@ CREATE TABLE pending_auth_details (
         CHECK (pa_auth_date_9c > -100000 AND pa_auth_date_9c < 100000),
     pa_auth_time_9c           INTEGER                  NOT NULL
         CHECK (pa_auth_time_9c > -1000000000 AND pa_auth_time_9c < 1000000000),
-    pa_auth_orig_date         VARCHAR(6)  COLLATE "C"  NOT NULL,
-    pa_auth_orig_time         VARCHAR(6)  COLLATE "C"  NOT NULL,
-    pa_card_num               VARCHAR(16) COLLATE "C"  NOT NULL,
-    pa_auth_type              VARCHAR(4)  COLLATE "C"  NOT NULL,
-    pa_card_expiry_date       VARCHAR(4)  COLLATE "C"  NOT NULL,
-    pa_message_type           VARCHAR(6)  COLLATE "C"  NOT NULL,
-    pa_message_source         VARCHAR(6)  COLLATE "C"  NOT NULL,
-    pa_auth_id_code           VARCHAR(6)  COLLATE "C"  NOT NULL,
-    pa_auth_resp_code         VARCHAR(2)  COLLATE "C"  NOT NULL,
-    pa_auth_resp_reason       VARCHAR(4)  COLLATE "C"  NOT NULL,
+    pa_auth_orig_date         VARCHAR(6)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_orig_date = rtrim(pa_auth_orig_date) AND pa_auth_orig_date !~ '[^\x01-\xff]'),
+    pa_auth_orig_time         VARCHAR(6)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_orig_time = rtrim(pa_auth_orig_time) AND pa_auth_orig_time !~ '[^\x01-\xff]'),
+    pa_card_num               VARCHAR(16) COLLATE "C"  NOT NULL
+        CHECK (pa_card_num = rtrim(pa_card_num) AND pa_card_num !~ '[^\x01-\xff]'),
+    pa_auth_type              VARCHAR(4)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_type = rtrim(pa_auth_type) AND pa_auth_type !~ '[^\x01-\xff]'),
+    pa_card_expiry_date       VARCHAR(4)  COLLATE "C"  NOT NULL
+        CHECK (pa_card_expiry_date = rtrim(pa_card_expiry_date) AND pa_card_expiry_date !~ '[^\x01-\xff]'),
+    pa_message_type           VARCHAR(6)  COLLATE "C"  NOT NULL
+        CHECK (pa_message_type = rtrim(pa_message_type) AND pa_message_type !~ '[^\x01-\xff]'),
+    pa_message_source         VARCHAR(6)  COLLATE "C"  NOT NULL
+        CHECK (pa_message_source = rtrim(pa_message_source) AND pa_message_source !~ '[^\x01-\xff]'),
+    pa_auth_id_code           VARCHAR(6)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_id_code = rtrim(pa_auth_id_code) AND pa_auth_id_code !~ '[^\x01-\xff]'),
+    pa_auth_resp_code         VARCHAR(2)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_resp_code = rtrim(pa_auth_resp_code) AND pa_auth_resp_code !~ '[^\x01-\xff]'),
+    pa_auth_resp_reason       VARCHAR(4)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_resp_reason = rtrim(pa_auth_resp_reason) AND pa_auth_resp_reason !~ '[^\x01-\xff]'),
     pa_processing_code        INTEGER                  NOT NULL
         CHECK (pa_processing_code >= 0 AND pa_processing_code < 1000000),
     pa_transaction_amt        NUMERIC(12,2)            NOT NULL
         CHECK (pa_transaction_amt <> 'NaN'),
     pa_approved_amt           NUMERIC(12,2)            NOT NULL
         CHECK (pa_approved_amt <> 'NaN'),
-    pa_merchant_catagory_code VARCHAR(4)  COLLATE "C"  NOT NULL,
-    pa_acqr_country_code      VARCHAR(3)  COLLATE "C"  NOT NULL,
+    pa_merchant_catagory_code VARCHAR(4)  COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_catagory_code = rtrim(pa_merchant_catagory_code) AND pa_merchant_catagory_code !~ '[^\x01-\xff]'),
+    pa_acqr_country_code      VARCHAR(3)  COLLATE "C"  NOT NULL
+        CHECK (pa_acqr_country_code = rtrim(pa_acqr_country_code) AND pa_acqr_country_code !~ '[^\x01-\xff]'),
     pa_pos_entry_mode         INTEGER                  NOT NULL
         CHECK (pa_pos_entry_mode >= 0 AND pa_pos_entry_mode < 100),
-    pa_merchant_id            VARCHAR(15) COLLATE "C"  NOT NULL,
-    pa_merchant_name          VARCHAR(22) COLLATE "C"  NOT NULL,
-    pa_merchant_city          VARCHAR(13) COLLATE "C"  NOT NULL,
-    pa_merchant_state         VARCHAR(2)  COLLATE "C"  NOT NULL,
-    pa_merchant_zip           VARCHAR(9)  COLLATE "C"  NOT NULL,
-    pa_transaction_id         VARCHAR(15) COLLATE "C"  NOT NULL,
-    pa_match_status           VARCHAR(1)  COLLATE "C"  NOT NULL,
-    pa_auth_fraud             VARCHAR(1)  COLLATE "C"  NOT NULL,
-    pa_fraud_rpt_date         VARCHAR(8)  COLLATE "C"  NOT NULL,
+    pa_merchant_id            VARCHAR(15) COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_id = rtrim(pa_merchant_id) AND pa_merchant_id !~ '[^\x01-\xff]'),
+    pa_merchant_name          VARCHAR(22) COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_name = rtrim(pa_merchant_name) AND pa_merchant_name !~ '[^\x01-\xff]'),
+    pa_merchant_city          VARCHAR(13) COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_city = rtrim(pa_merchant_city) AND pa_merchant_city !~ '[^\x01-\xff]'),
+    pa_merchant_state         VARCHAR(2)  COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_state = rtrim(pa_merchant_state) AND pa_merchant_state !~ '[^\x01-\xff]'),
+    pa_merchant_zip           VARCHAR(9)  COLLATE "C"  NOT NULL
+        CHECK (pa_merchant_zip = rtrim(pa_merchant_zip) AND pa_merchant_zip !~ '[^\x01-\xff]'),
+    pa_transaction_id         VARCHAR(15) COLLATE "C"  NOT NULL
+        CHECK (pa_transaction_id = rtrim(pa_transaction_id) AND pa_transaction_id !~ '[^\x01-\xff]'),
+    pa_match_status           VARCHAR(1)  COLLATE "C"  NOT NULL
+        CHECK (pa_match_status = rtrim(pa_match_status) AND pa_match_status !~ '[^\x01-\xff]'),
+    pa_auth_fraud             VARCHAR(1)  COLLATE "C"  NOT NULL
+        CHECK (pa_auth_fraud = rtrim(pa_auth_fraud) AND pa_auth_fraud !~ '[^\x01-\xff]'),
+    pa_fraud_rpt_date         VARCHAR(8)  COLLATE "C"  NOT NULL
+        CHECK (pa_fraud_rpt_date = rtrim(pa_fraud_rpt_date) AND pa_fraud_rpt_date !~ '[^\x01-\xff]'),
     CONSTRAINT pautdtl1_key UNIQUE (pa_acct_id, pa_auth_date_9c, pa_auth_time_9c),
     CONSTRAINT pending_auth_details_pa_acct_id_fkey
         FOREIGN KEY (pa_acct_id) REFERENCES pending_auth_summaries (pa_acct_id)
@@ -277,32 +316,51 @@ CREATE TABLE pending_auth_details (
 -- pending authorizations or the master files: Db2 declares none, and a purged detail
 -- leaves its fraud row in place.
 CREATE TABLE auth_fraud (
-    card_num               VARCHAR(16) COLLATE "C" NOT NULL,
+    card_num               VARCHAR(16) COLLATE "C" NOT NULL
+        CHECK (card_num = rtrim(card_num) AND card_num !~ '[^\x01-\xff]'),
     auth_ts                TIMESTAMP(6)            NOT NULL
         CHECK (isfinite(auth_ts)),
-    auth_type              VARCHAR(4)  COLLATE "C",
-    card_expiry_date       VARCHAR(4)  COLLATE "C",
-    message_type           VARCHAR(6)  COLLATE "C",
-    message_source         VARCHAR(6)  COLLATE "C",
-    auth_id_code           VARCHAR(6)  COLLATE "C",
-    auth_resp_code         VARCHAR(2)  COLLATE "C",
-    auth_resp_reason       VARCHAR(4)  COLLATE "C",
-    processing_code        VARCHAR(6)  COLLATE "C",
+    auth_type              VARCHAR(4)  COLLATE "C"
+        CHECK (auth_type = rtrim(auth_type) AND auth_type !~ '[^\x01-\xff]'),
+    card_expiry_date       VARCHAR(4)  COLLATE "C"
+        CHECK (card_expiry_date = rtrim(card_expiry_date) AND card_expiry_date !~ '[^\x01-\xff]'),
+    message_type           VARCHAR(6)  COLLATE "C"
+        CHECK (message_type = rtrim(message_type) AND message_type !~ '[^\x01-\xff]'),
+    message_source         VARCHAR(6)  COLLATE "C"
+        CHECK (message_source = rtrim(message_source) AND message_source !~ '[^\x01-\xff]'),
+    auth_id_code           VARCHAR(6)  COLLATE "C"
+        CHECK (auth_id_code = rtrim(auth_id_code) AND auth_id_code !~ '[^\x01-\xff]'),
+    auth_resp_code         VARCHAR(2)  COLLATE "C"
+        CHECK (auth_resp_code = rtrim(auth_resp_code) AND auth_resp_code !~ '[^\x01-\xff]'),
+    auth_resp_reason       VARCHAR(4)  COLLATE "C"
+        CHECK (auth_resp_reason = rtrim(auth_resp_reason) AND auth_resp_reason !~ '[^\x01-\xff]'),
+    processing_code        VARCHAR(6)  COLLATE "C"
+        CHECK (processing_code = rtrim(processing_code) AND processing_code !~ '[^\x01-\xff]'),
     transaction_amt        NUMERIC(12,2)
         CHECK (transaction_amt <> 'NaN'),
     approved_amt           NUMERIC(12,2)
         CHECK (approved_amt <> 'NaN'),
-    merchant_catagory_code VARCHAR(4)  COLLATE "C",
-    acqr_country_code      VARCHAR(3)  COLLATE "C",
+    merchant_catagory_code VARCHAR(4)  COLLATE "C"
+        CHECK (merchant_catagory_code = rtrim(merchant_catagory_code) AND merchant_catagory_code !~ '[^\x01-\xff]'),
+    acqr_country_code      VARCHAR(3)  COLLATE "C"
+        CHECK (acqr_country_code = rtrim(acqr_country_code) AND acqr_country_code !~ '[^\x01-\xff]'),
     pos_entry_mode         SMALLINT,
-    merchant_id            VARCHAR(15) COLLATE "C",
-    merchant_name          VARCHAR(22) COLLATE "C",
-    merchant_city          VARCHAR(13) COLLATE "C",
-    merchant_state         VARCHAR(2)  COLLATE "C",
-    merchant_zip           VARCHAR(9)  COLLATE "C",
-    transaction_id         VARCHAR(15) COLLATE "C",
-    match_status           VARCHAR(1)  COLLATE "C",
-    auth_fraud             VARCHAR(1)  COLLATE "C",
+    merchant_id            VARCHAR(15) COLLATE "C"
+        CHECK (merchant_id = rtrim(merchant_id) AND merchant_id !~ '[^\x01-\xff]'),
+    merchant_name          VARCHAR(22) COLLATE "C"
+        CHECK (merchant_name = rtrim(merchant_name) AND merchant_name !~ '[^\x01-\xff]'),
+    merchant_city          VARCHAR(13) COLLATE "C"
+        CHECK (merchant_city = rtrim(merchant_city) AND merchant_city !~ '[^\x01-\xff]'),
+    merchant_state         VARCHAR(2)  COLLATE "C"
+        CHECK (merchant_state = rtrim(merchant_state) AND merchant_state !~ '[^\x01-\xff]'),
+    merchant_zip           VARCHAR(9)  COLLATE "C"
+        CHECK (merchant_zip = rtrim(merchant_zip) AND merchant_zip !~ '[^\x01-\xff]'),
+    transaction_id         VARCHAR(15) COLLATE "C"
+        CHECK (transaction_id = rtrim(transaction_id) AND transaction_id !~ '[^\x01-\xff]'),
+    match_status           VARCHAR(1)  COLLATE "C"
+        CHECK (match_status = rtrim(match_status) AND match_status !~ '[^\x01-\xff]'),
+    auth_fraud             VARCHAR(1)  COLLATE "C"
+        CHECK (auth_fraud = rtrim(auth_fraud) AND auth_fraud !~ '[^\x01-\xff]'),
     fraud_rpt_date         DATE
         CHECK (isfinite(fraud_rpt_date)),
     acct_id                BIGINT

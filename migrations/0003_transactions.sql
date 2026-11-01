@@ -20,6 +20,14 @@
 --   produced (dailytran.txt holds 2022-06-10 19:27:53.000000; CBTRN02C and CBACT04C stamp
 --   the Db2 form 2022-07-01-12.00.00.000000 [app/cbl/CBTRN02C.cbl:L692-705]), so they
 --   compare and sort as text, as the alternate index on TRAN-PROC-TS does.
+--   Every VARCHAR column carries CHECK (v = rtrim(v) AND v !~ '[^\x01-\xff]'), which
+--   admits only that stored form. A value must equal its rtrim, so a trailing-space
+--   variant is rejected and one COBOL key is one row: PostgreSQL VARCHAR equality counts
+--   trailing spaces, where COBOL comparisons pad the shorter operand with spaces, so
+--   '1' and '1 ' would otherwise be two trancat_type_cd keys for the one COBOL key.
+--   Each character must lie in U+0001..U+00FF, the ISO 8859-1 range that
+--   Alnum::from_trimmed (crates/domain/src/numeric/alnum.rs) reads back one byte per
+--   character; NUL cannot be stored in PostgreSQL text at all.
 --   Unsigned 9(n) maps to INTEGER for n <= 9 and BIGINT for n >= 10, with
 --   CHECK (0 <= v < 10^n).
 --   S9(09)V99 maps to NUMERIC(11,2): the precision bounds the value to the 9 integer digits
@@ -27,7 +35,10 @@
 --   no PIC clause and no rust_decimal newtype (Money in crates/domain/src/numeric/money.rs)
 --   can hold, so each money column carries CHECK (v <> 'NaN') and no sign check.
 --   Every copybook column is NOT NULL, as every field of a VSAM record holds a value.
---   Text columns carry no value-domain check.
+--   That storage-form check is the only check on a VARCHAR column. No text column checks
+--   a value domain: CBTRN02C copies the daily record's text fields unchanged
+--   [app/cbl/CBTRN02C.cbl:L425-436], so the codes, source and timestamps hold whatever
+--   their writer supplied.
 --   FILLER is not stored; the codec layouts keep its bytes.
 --   No foreign keys link these tables to the master files of 0002. VSAM enforces no
 --   relationship between the files: CBTRN02C writes the transaction and creates the
@@ -116,22 +127,32 @@
 -- row by updating it, never by inserting its old identity.
 CREATE TABLE transactions (
     transaction_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    tran_id            VARCHAR(16)  COLLATE "C" NOT NULL,
-    tran_type_cd       VARCHAR(2)   COLLATE "C" NOT NULL,
+    tran_id            VARCHAR(16)  COLLATE "C" NOT NULL
+        CHECK (tran_id = rtrim(tran_id) AND tran_id !~ '[^\x01-\xff]'),
+    tran_type_cd       VARCHAR(2)   COLLATE "C" NOT NULL
+        CHECK (tran_type_cd = rtrim(tran_type_cd) AND tran_type_cd !~ '[^\x01-\xff]'),
     tran_cat_cd        INTEGER                  NOT NULL
         CHECK (tran_cat_cd >= 0 AND tran_cat_cd < 10000),
-    tran_source        VARCHAR(10)  COLLATE "C" NOT NULL,
-    tran_desc          VARCHAR(100) COLLATE "C" NOT NULL,
+    tran_source        VARCHAR(10)  COLLATE "C" NOT NULL
+        CHECK (tran_source = rtrim(tran_source) AND tran_source !~ '[^\x01-\xff]'),
+    tran_desc          VARCHAR(100) COLLATE "C" NOT NULL
+        CHECK (tran_desc = rtrim(tran_desc) AND tran_desc !~ '[^\x01-\xff]'),
     tran_amt           NUMERIC(11,2)            NOT NULL
         CHECK (tran_amt <> 'NaN'),
     tran_merchant_id   INTEGER                  NOT NULL
         CHECK (tran_merchant_id >= 0 AND tran_merchant_id < 1000000000),
-    tran_merchant_name VARCHAR(50)  COLLATE "C" NOT NULL,
-    tran_merchant_city VARCHAR(50)  COLLATE "C" NOT NULL,
-    tran_merchant_zip  VARCHAR(10)  COLLATE "C" NOT NULL,
-    tran_card_num      VARCHAR(16)  COLLATE "C" NOT NULL,
-    tran_orig_ts       VARCHAR(26)  COLLATE "C" NOT NULL,
-    tran_proc_ts       VARCHAR(26)  COLLATE "C" NOT NULL,
+    tran_merchant_name VARCHAR(50)  COLLATE "C" NOT NULL
+        CHECK (tran_merchant_name = rtrim(tran_merchant_name) AND tran_merchant_name !~ '[^\x01-\xff]'),
+    tran_merchant_city VARCHAR(50)  COLLATE "C" NOT NULL
+        CHECK (tran_merchant_city = rtrim(tran_merchant_city) AND tran_merchant_city !~ '[^\x01-\xff]'),
+    tran_merchant_zip  VARCHAR(10)  COLLATE "C" NOT NULL
+        CHECK (tran_merchant_zip = rtrim(tran_merchant_zip) AND tran_merchant_zip !~ '[^\x01-\xff]'),
+    tran_card_num      VARCHAR(16)  COLLATE "C" NOT NULL
+        CHECK (tran_card_num = rtrim(tran_card_num) AND tran_card_num !~ '[^\x01-\xff]'),
+    tran_orig_ts       VARCHAR(26)  COLLATE "C" NOT NULL
+        CHECK (tran_orig_ts = rtrim(tran_orig_ts) AND tran_orig_ts !~ '[^\x01-\xff]'),
+    tran_proc_ts       VARCHAR(26)  COLLATE "C" NOT NULL
+        CHECK (tran_proc_ts = rtrim(tran_proc_ts) AND tran_proc_ts !~ '[^\x01-\xff]'),
     in_master          BOOLEAN                  NOT NULL DEFAULT TRUE
 );
 
@@ -179,7 +200,8 @@ WITH LOCAL CHECK OPTION;
 CREATE TABLE transaction_category_balances (
     trancat_acct_id BIGINT                 NOT NULL
         CHECK (trancat_acct_id >= 0 AND trancat_acct_id < 100000000000),
-    trancat_type_cd VARCHAR(2) COLLATE "C" NOT NULL,
+    trancat_type_cd VARCHAR(2) COLLATE "C" NOT NULL
+        CHECK (trancat_type_cd = rtrim(trancat_type_cd) AND trancat_type_cd !~ '[^\x01-\xff]'),
     trancat_cd      INTEGER                NOT NULL
         CHECK (trancat_cd >= 0 AND trancat_cd < 10000),
     tran_cat_bal    NUMERIC(11,2)          NOT NULL

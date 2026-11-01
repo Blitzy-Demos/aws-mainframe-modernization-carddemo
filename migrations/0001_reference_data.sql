@@ -16,6 +16,14 @@
 --   gives the byte order of the COBOL keys and of COBOL string comparisons.
 --   Text is stored right-trimmed of trailing spaces; the codec and persistence layers pad
 --   it back to the PIC width.
+--   Every VARCHAR column carries CHECK (v = rtrim(v) AND v !~ '[^\x01-\xff]'), which
+--   admits only that stored form. A value must equal its rtrim, so a trailing-space
+--   variant is rejected and one COBOL key is one row: PostgreSQL VARCHAR equality counts
+--   trailing spaces, where COBOL and Db2 comparisons pad the shorter operand with spaces,
+--   so '1' and '1 ' would otherwise be two tr_type keys for the one COBOL key. Each
+--   character must lie in U+0001..U+00FF, the ISO 8859-1 range that Alnum::from_trimmed
+--   (crates/domain/src/numeric/alnum.rs) reads back one byte per character; NUL cannot
+--   be stored in PostgreSQL text at all.
 --   Unsigned 9(n) with n <= 9 maps to INTEGER with CHECK (0 <= v < 10^n).
 --   S9(04)V99 maps to NUMERIC(6,2) with CHECK (v <> 'NaN'): PostgreSQL NUMERIC also stores
 --   NaN, which no PIC clause and no rust_decimal newtype (InterestRate in
@@ -68,8 +76,10 @@
 
 -- The primary key index replaces the Db2 unique index XTRAN_TYPE (TR_TYPE ASC).
 CREATE TABLE transaction_types (
-    tr_type        VARCHAR(2)  COLLATE "C" NOT NULL,
-    tr_description VARCHAR(50) COLLATE "C" NOT NULL,
+    tr_type        VARCHAR(2)  COLLATE "C" NOT NULL
+        CHECK (tr_type = rtrim(tr_type) AND tr_type !~ '[^\x01-\xff]'),
+    tr_description VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (tr_description = rtrim(tr_description) AND tr_description !~ '[^\x01-\xff]'),
     CONSTRAINT xtran_type PRIMARY KEY (tr_type)
 );
 
@@ -79,9 +89,12 @@ CREATE TABLE transaction_types (
 -- -532); PostgreSQL reports both as SQLSTATE 23503, which persistence maps to the audited
 -- COTRTLIC and COBTUPDT messages.
 CREATE TABLE transaction_categories (
-    trc_type_code     VARCHAR(2)  COLLATE "C" NOT NULL,
-    trc_type_category VARCHAR(4)  COLLATE "C" NOT NULL,
-    trc_cat_data      VARCHAR(50) COLLATE "C" NOT NULL,
+    trc_type_code     VARCHAR(2)  COLLATE "C" NOT NULL
+        CHECK (trc_type_code = rtrim(trc_type_code) AND trc_type_code !~ '[^\x01-\xff]'),
+    trc_type_category VARCHAR(4)  COLLATE "C" NOT NULL
+        CHECK (trc_type_category = rtrim(trc_type_category) AND trc_type_category !~ '[^\x01-\xff]'),
+    trc_cat_data      VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (trc_cat_data = rtrim(trc_cat_data) AND trc_cat_data !~ '[^\x01-\xff]'),
     CONSTRAINT x_tran_type_catg PRIMARY KEY (trc_type_code, trc_type_category),
     CONSTRAINT transaction_categories_trc_type_code_fkey
         FOREIGN KEY (trc_type_code) REFERENCES transaction_types (tr_type) ON DELETE RESTRICT
@@ -92,17 +105,21 @@ CREATE TABLE transaction_categories (
 -- trancatg_file has no foreign key to trantype_file.
 
 CREATE TABLE trantype_file (
-    tran_type      VARCHAR(2)  COLLATE "C" NOT NULL PRIMARY KEY,
+    tran_type      VARCHAR(2)  COLLATE "C" NOT NULL PRIMARY KEY
+        CHECK (tran_type = rtrim(tran_type) AND tran_type !~ '[^\x01-\xff]'),
     tran_type_desc VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (tran_type_desc = rtrim(tran_type_desc) AND tran_type_desc !~ '[^\x01-\xff]')
 );
 
 -- The 6-byte KSDS key is TRAN-TYPE-CD X(02) followed by TRAN-CAT-CD 9(04). Four zoned
 -- digits sort by byte exactly as their integer values sort, so this key orders rows as the
 -- KSDS does.
 CREATE TABLE trancatg_file (
-    tran_type_cd       VARCHAR(2)  COLLATE "C" NOT NULL,
+    tran_type_cd       VARCHAR(2)  COLLATE "C" NOT NULL
+        CHECK (tran_type_cd = rtrim(tran_type_cd) AND tran_type_cd !~ '[^\x01-\xff]'),
     tran_cat_cd        INTEGER                 NOT NULL CHECK (tran_cat_cd >= 0 AND tran_cat_cd < 10000),
-    tran_cat_type_desc VARCHAR(50) COLLATE "C" NOT NULL,
+    tran_cat_type_desc VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (tran_cat_type_desc = rtrim(tran_cat_type_desc) AND tran_cat_type_desc !~ '[^\x01-\xff]'),
     PRIMARY KEY (tran_type_cd, tran_cat_cd)
 );
 
@@ -112,8 +129,10 @@ CREATE TABLE trancatg_file (
 -- to the S9(04)V99 range, and its CHECK rejects NaN, which InterestRate cannot hold. No
 -- sign check applies.
 CREATE TABLE disclosure_groups (
-    dis_acct_group_id VARCHAR(10) COLLATE "C" NOT NULL,
-    dis_tran_type_cd  VARCHAR(2)  COLLATE "C" NOT NULL,
+    dis_acct_group_id VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (dis_acct_group_id = rtrim(dis_acct_group_id) AND dis_acct_group_id !~ '[^\x01-\xff]'),
+    dis_tran_type_cd  VARCHAR(2)  COLLATE "C" NOT NULL
+        CHECK (dis_tran_type_cd = rtrim(dis_tran_type_cd) AND dis_tran_type_cd !~ '[^\x01-\xff]'),
     dis_tran_cat_cd   INTEGER                 NOT NULL CHECK (dis_tran_cat_cd >= 0 AND dis_tran_cat_cd < 10000),
     dis_int_rate      NUMERIC(6,2)            NOT NULL CHECK (dis_int_rate <> 'NaN'),
     PRIMARY KEY (dis_acct_group_id, dis_tran_type_cd, dis_tran_cat_cd)

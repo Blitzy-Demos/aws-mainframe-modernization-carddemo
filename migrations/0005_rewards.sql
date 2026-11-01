@@ -18,6 +18,12 @@
 --   match is a plain equality: the type code is VARCHAR(2) COLLATE "C" like
 --   transactions.tran_type_cd, and the category code is INTEGER 0 to 9999 like
 --   transactions.tran_cat_cd (the fixture category 0001 is stored as 1).
+--   Like tran_type_cd, the type code carries CHECK (v = rtrim(v) AND v !~ '[^\x01-\xff]'),
+--   which admits only the stored form: right-trimmed, so a rule stored as '1 ' cannot miss
+--   the transaction code '1' it is meant to match, and every character in U+0001..U+00FF,
+--   the ISO 8859-1 range that Alnum::from_trimmed (crates/domain/src/numeric/alnum.rs)
+--   reads back one byte per character. That storage-form check is the only check on the
+--   VARCHAR column; no text column checks a value domain.
 --   Amounts are NUMERIC(11,2): the 9 integer digits and 2 decimals of S9(09)V99, signed.
 --   PostgreSQL NUMERIC also stores NaN, which no rust_decimal newtype (Money and RewardRate
 --   in crates/domain/src/numeric/) can hold, so every NUMERIC column carries
@@ -92,7 +98,8 @@
 -- type must not fail on a reward rule the COBOL delete paths know nothing of.
 CREATE TABLE reward_rules (
     rule_id                 BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    transaction_type_cd     VARCHAR(2) COLLATE "C" NOT NULL,
+    transaction_type_cd     VARCHAR(2) COLLATE "C" NOT NULL
+        CHECK (transaction_type_cd = rtrim(transaction_type_cd) AND transaction_type_cd !~ '[^\x01-\xff]'),
     transaction_category_cd INTEGER                NOT NULL
         CHECK (transaction_category_cd >= 0 AND transaction_category_cd < 10000),
     reward_rate             NUMERIC(9,4)           NOT NULL

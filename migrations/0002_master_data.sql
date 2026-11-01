@@ -18,6 +18,14 @@
 --   comparisons (the CBTRN02C expiration date test [app/cbl/CBTRN02C.cbl:L414]).
 --   Text is stored right-trimmed of trailing spaces; the codec and persistence layers pad
 --   it back to the PIC width. COBOL dates X(10) stay text.
+--   Every VARCHAR column carries CHECK (v = rtrim(v) AND v !~ '[^\x01-\xff]'), which
+--   admits only that stored form. A value must equal its rtrim, so a trailing-space
+--   variant is rejected and one COBOL key is one row: PostgreSQL VARCHAR equality counts
+--   trailing spaces, where COBOL comparisons pad the shorter operand with spaces, so
+--   'ADMIN1' and 'ADMIN1 ' would otherwise be two user_id keys for the one COBOL key.
+--   Each character must lie in U+0001..U+00FF, the ISO 8859-1 range that
+--   Alnum::from_trimmed (crates/domain/src/numeric/alnum.rs) reads back one byte per
+--   character; NUL cannot be stored in PostgreSQL text at all.
 --   Unsigned 9(n) maps to INTEGER for n <= 9 and BIGINT for n >= 10, with
 --   CHECK (0 <= v < 10^n).
 --   S9(10)V99 maps to NUMERIC(12,2): the precision bounds the value to the 10 integer
@@ -26,8 +34,9 @@
 --   crates/domain/src/numeric/money.rs) can hold, so each money column carries
 --   CHECK (v <> 'NaN') and no sign check.
 --   Every column is NOT NULL, as every field of a VSAM record holds a value.
---   Text columns carry no value-domain check: COUSR01C stores any non-blank user type
---   [app/cbl/COUSR01C.cbl:L142-158], and the status flags hold whatever the files hold.
+--   That storage-form check is the only check on a VARCHAR column. No text column checks
+--   a value domain: COUSR01C stores any non-blank user type [app/cbl/COUSR01C.cbl:L142-158],
+--   and the status flags hold whatever the files hold.
 --   FILLER is not stored; the codec layouts keep its bytes.
 --   No foreign keys link these tables. VSAM enforces no relationship between the files,
 --   and the COBOL relies on the gaps being possible: CBTRN02C rejects reason 100 (card not
@@ -75,7 +84,7 @@
 --   acct_group_id          | ACCT-GROUP-ID          | X(10)      | VARCHAR(10) COLLATE "C" NOT NULL   | P-CVACT01Y-012
 --   (not stored)           | FILLER                 | X(178)     | not stored                         | P-CVACT01Y-013
 --   The fixture's group IDs are all blank and A000000000 sits in the ZIP field (E-06). The
---   seed reads both by their PIC offsets, so neither column carries a check.
+--   seed reads both by their PIC offsets, so neither column carries a value-domain check.
 --
 -- cards: VSAM CARDDAT, CVACT02Y CARD-RECORD, RECLN 150, KEYS(16 0) [app/jcl/CARDFILE.jcl:L54-55]
 --   column              | copybook field      | PIC   | SQL type                          | audit row
@@ -118,23 +127,38 @@
 CREATE TABLE customers (
     customer_id              INTEGER                 NOT NULL PRIMARY KEY
         CHECK (customer_id >= 0 AND customer_id < 1000000000),
-    cust_first_name          VARCHAR(25) COLLATE "C" NOT NULL,
-    cust_middle_name         VARCHAR(25) COLLATE "C" NOT NULL,
-    cust_last_name           VARCHAR(25) COLLATE "C" NOT NULL,
-    cust_addr_line_1         VARCHAR(50) COLLATE "C" NOT NULL,
-    cust_addr_line_2         VARCHAR(50) COLLATE "C" NOT NULL,
-    cust_addr_line_3         VARCHAR(50) COLLATE "C" NOT NULL,
-    cust_addr_state_cd       VARCHAR(2)  COLLATE "C" NOT NULL,
-    cust_addr_country_cd     VARCHAR(3)  COLLATE "C" NOT NULL,
-    cust_addr_zip            VARCHAR(10) COLLATE "C" NOT NULL,
-    cust_phone_num_1         VARCHAR(15) COLLATE "C" NOT NULL,
-    cust_phone_num_2         VARCHAR(15) COLLATE "C" NOT NULL,
+    cust_first_name          VARCHAR(25) COLLATE "C" NOT NULL
+        CHECK (cust_first_name = rtrim(cust_first_name) AND cust_first_name !~ '[^\x01-\xff]'),
+    cust_middle_name         VARCHAR(25) COLLATE "C" NOT NULL
+        CHECK (cust_middle_name = rtrim(cust_middle_name) AND cust_middle_name !~ '[^\x01-\xff]'),
+    cust_last_name           VARCHAR(25) COLLATE "C" NOT NULL
+        CHECK (cust_last_name = rtrim(cust_last_name) AND cust_last_name !~ '[^\x01-\xff]'),
+    cust_addr_line_1         VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (cust_addr_line_1 = rtrim(cust_addr_line_1) AND cust_addr_line_1 !~ '[^\x01-\xff]'),
+    cust_addr_line_2         VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (cust_addr_line_2 = rtrim(cust_addr_line_2) AND cust_addr_line_2 !~ '[^\x01-\xff]'),
+    cust_addr_line_3         VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (cust_addr_line_3 = rtrim(cust_addr_line_3) AND cust_addr_line_3 !~ '[^\x01-\xff]'),
+    cust_addr_state_cd       VARCHAR(2)  COLLATE "C" NOT NULL
+        CHECK (cust_addr_state_cd = rtrim(cust_addr_state_cd) AND cust_addr_state_cd !~ '[^\x01-\xff]'),
+    cust_addr_country_cd     VARCHAR(3)  COLLATE "C" NOT NULL
+        CHECK (cust_addr_country_cd = rtrim(cust_addr_country_cd) AND cust_addr_country_cd !~ '[^\x01-\xff]'),
+    cust_addr_zip            VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (cust_addr_zip = rtrim(cust_addr_zip) AND cust_addr_zip !~ '[^\x01-\xff]'),
+    cust_phone_num_1         VARCHAR(15) COLLATE "C" NOT NULL
+        CHECK (cust_phone_num_1 = rtrim(cust_phone_num_1) AND cust_phone_num_1 !~ '[^\x01-\xff]'),
+    cust_phone_num_2         VARCHAR(15) COLLATE "C" NOT NULL
+        CHECK (cust_phone_num_2 = rtrim(cust_phone_num_2) AND cust_phone_num_2 !~ '[^\x01-\xff]'),
     cust_ssn                 INTEGER                 NOT NULL
         CHECK (cust_ssn >= 0 AND cust_ssn < 1000000000),
-    cust_govt_issued_id      VARCHAR(20) COLLATE "C" NOT NULL,
-    cust_dob_yyyy_mm_dd      VARCHAR(10) COLLATE "C" NOT NULL,
-    cust_eft_account_id      VARCHAR(10) COLLATE "C" NOT NULL,
-    cust_pri_card_holder_ind VARCHAR(1)  COLLATE "C" NOT NULL,
+    cust_govt_issued_id      VARCHAR(20) COLLATE "C" NOT NULL
+        CHECK (cust_govt_issued_id = rtrim(cust_govt_issued_id) AND cust_govt_issued_id !~ '[^\x01-\xff]'),
+    cust_dob_yyyy_mm_dd      VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (cust_dob_yyyy_mm_dd = rtrim(cust_dob_yyyy_mm_dd) AND cust_dob_yyyy_mm_dd !~ '[^\x01-\xff]'),
+    cust_eft_account_id      VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (cust_eft_account_id = rtrim(cust_eft_account_id) AND cust_eft_account_id !~ '[^\x01-\xff]'),
+    cust_pri_card_holder_ind VARCHAR(1)  COLLATE "C" NOT NULL
+        CHECK (cust_pri_card_holder_ind = rtrim(cust_pri_card_holder_ind) AND cust_pri_card_holder_ind !~ '[^\x01-\xff]'),
     cust_fico_credit_score   INTEGER                 NOT NULL
         CHECK (cust_fico_credit_score >= 0 AND cust_fico_credit_score < 1000)
 );
@@ -144,33 +168,43 @@ CREATE TABLE customers (
 CREATE TABLE accounts (
     account_id             BIGINT                  NOT NULL PRIMARY KEY
         CHECK (account_id >= 0 AND account_id < 100000000000),
-    acct_active_status     VARCHAR(1)  COLLATE "C" NOT NULL,
+    acct_active_status     VARCHAR(1)  COLLATE "C" NOT NULL
+        CHECK (acct_active_status = rtrim(acct_active_status) AND acct_active_status !~ '[^\x01-\xff]'),
     acct_curr_bal          NUMERIC(12,2)           NOT NULL
         CHECK (acct_curr_bal <> 'NaN'),
     acct_credit_limit      NUMERIC(12,2)           NOT NULL
         CHECK (acct_credit_limit <> 'NaN'),
     acct_cash_credit_limit NUMERIC(12,2)           NOT NULL
         CHECK (acct_cash_credit_limit <> 'NaN'),
-    acct_open_date         VARCHAR(10) COLLATE "C" NOT NULL,
-    acct_expiraion_date    VARCHAR(10) COLLATE "C" NOT NULL,
-    acct_reissue_date      VARCHAR(10) COLLATE "C" NOT NULL,
+    acct_open_date         VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (acct_open_date = rtrim(acct_open_date) AND acct_open_date !~ '[^\x01-\xff]'),
+    acct_expiraion_date    VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (acct_expiraion_date = rtrim(acct_expiraion_date) AND acct_expiraion_date !~ '[^\x01-\xff]'),
+    acct_reissue_date      VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (acct_reissue_date = rtrim(acct_reissue_date) AND acct_reissue_date !~ '[^\x01-\xff]'),
     acct_curr_cyc_credit   NUMERIC(12,2)           NOT NULL
         CHECK (acct_curr_cyc_credit <> 'NaN'),
     acct_curr_cyc_debit    NUMERIC(12,2)           NOT NULL
         CHECK (acct_curr_cyc_debit <> 'NaN'),
-    acct_addr_zip          VARCHAR(10) COLLATE "C" NOT NULL,
+    acct_addr_zip          VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (acct_addr_zip = rtrim(acct_addr_zip) AND acct_addr_zip !~ '[^\x01-\xff]'),
     acct_group_id          VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (acct_group_id = rtrim(acct_group_id) AND acct_group_id !~ '[^\x01-\xff]')
 );
 
 CREATE TABLE cards (
-    card_number         VARCHAR(16) COLLATE "C" NOT NULL PRIMARY KEY,
+    card_number         VARCHAR(16) COLLATE "C" NOT NULL PRIMARY KEY
+        CHECK (card_number = rtrim(card_number) AND card_number !~ '[^\x01-\xff]'),
     card_acct_id        BIGINT                  NOT NULL
         CHECK (card_acct_id >= 0 AND card_acct_id < 100000000000),
     card_cvv_cd         INTEGER                 NOT NULL
         CHECK (card_cvv_cd >= 0 AND card_cvv_cd < 1000),
-    card_embossed_name  VARCHAR(50) COLLATE "C" NOT NULL,
-    card_expiraion_date VARCHAR(10) COLLATE "C" NOT NULL,
+    card_embossed_name  VARCHAR(50) COLLATE "C" NOT NULL
+        CHECK (card_embossed_name = rtrim(card_embossed_name) AND card_embossed_name !~ '[^\x01-\xff]'),
+    card_expiraion_date VARCHAR(10) COLLATE "C" NOT NULL
+        CHECK (card_expiraion_date = rtrim(card_expiraion_date) AND card_expiraion_date !~ '[^\x01-\xff]'),
     card_active_status  VARCHAR(1)  COLLATE "C" NOT NULL
+        CHECK (card_active_status = rtrim(card_active_status) AND card_active_status !~ '[^\x01-\xff]')
 );
 
 -- Replaces the non-unique alternate index KEYS(11 16) on CARD-ACCT-ID
@@ -179,7 +213,8 @@ CREATE TABLE cards (
 CREATE INDEX cardaix ON cards (card_acct_id);
 
 CREATE TABLE card_xref (
-    xref_card_num VARCHAR(16) COLLATE "C" NOT NULL PRIMARY KEY,
+    xref_card_num VARCHAR(16) COLLATE "C" NOT NULL PRIMARY KEY
+        CHECK (xref_card_num = rtrim(xref_card_num) AND xref_card_num !~ '[^\x01-\xff]'),
     xref_cust_id  INTEGER                 NOT NULL
         CHECK (xref_cust_id >= 0 AND xref_cust_id < 1000000000),
     xref_acct_id  BIGINT                  NOT NULL
@@ -199,10 +234,14 @@ CREATE INDEX cxacaix ON card_xref (xref_acct_id);
 -- hash output as PasswordError::MalformedHash. The prefix alone is 10 bytes and SEC-USR-PWD
 -- is X(08), so no plaintext SEC-USR-PWD value can be stored.
 CREATE TABLE users (
-    user_id       VARCHAR(8)  COLLATE "C" NOT NULL PRIMARY KEY,
-    sec_usr_fname VARCHAR(20) COLLATE "C" NOT NULL,
-    sec_usr_lname VARCHAR(20) COLLATE "C" NOT NULL,
+    user_id       VARCHAR(8)  COLLATE "C" NOT NULL PRIMARY KEY
+        CHECK (user_id = rtrim(user_id) AND user_id !~ '[^\x01-\xff]'),
+    sec_usr_fname VARCHAR(20) COLLATE "C" NOT NULL
+        CHECK (sec_usr_fname = rtrim(sec_usr_fname) AND sec_usr_fname !~ '[^\x01-\xff]'),
+    sec_usr_lname VARCHAR(20) COLLATE "C" NOT NULL
+        CHECK (sec_usr_lname = rtrim(sec_usr_lname) AND sec_usr_lname !~ '[^\x01-\xff]'),
     password_hash TEXT                    NOT NULL
         CHECK (password_hash LIKE '$argon2id$%'),
     sec_usr_type  VARCHAR(1)  COLLATE "C" NOT NULL
+        CHECK (sec_usr_type = rtrim(sec_usr_type) AND sec_usr_type !~ '[^\x01-\xff]')
 );
