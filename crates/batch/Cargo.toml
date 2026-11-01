@@ -1,0 +1,34 @@
+[package]
+name = "carddemo-batch"
+description = "CardDemo batch CLI: the JCL jobs with business logic as subcommands of the batch binary"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "batch"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+carddemo-domain.workspace = true
+carddemo-codec.workspace = true
+carddemo-persistence.workspace = true
+carddemo-runtime.workspace = true
+chrono.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+printpdf.workspace = true
+rust_decimal.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+carddemo-testkit.workspace = true
+carddemo-audit.workspace = true
+insta = { workspace = true, features = ["yaml"] }
+lopdf.workspace = true

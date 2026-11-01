@@ -1,0 +1,26 @@
+[package]
+name = "carddemo-codec"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "ASCII and EBCDIC (CP037) record codecs for the CardDemo copybook layouts"
+
+[lints]
+workspace = true
+
+# The codec is pure byte translation: no database, runtime or other adapter
+# crate may appear here (crates/testkit/tests/hygiene.rs scans this manifest).
+[dependencies]
+carddemo-domain.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+insta = { workspace = true, features = ["yaml"] }
+proptest.workspace = true
+
+[[bench]]
+name = "codec"
+harness = false

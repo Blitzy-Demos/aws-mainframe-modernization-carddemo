@@ -1,0 +1,32 @@
+[package]
+name = "carddemo-domain"
+description = "CardDemo business core: copybook newtypes, ported COBOL rules, reward engine, port traits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# The domain stays pure: no runtime, database, HTTP, AMQP, serialization, PDF
+# or other carddemo crate may appear in any dependency table here, including
+# dev-dependencies. tests/manifest_boundary.rs enforces this. Versions live in
+# the root [workspace.dependencies]; this manifest adds features only.
+[dependencies]
+argon2.workspace = true
+chrono.workspace = true
+password-hash = { workspace = true, features = ["getrandom"] }
+rust_decimal.workspace = true
+rust_decimal_macros.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+trybuild.workspace = true
+
+[[bench]]
+name = "reward_engine"
+harness = false
