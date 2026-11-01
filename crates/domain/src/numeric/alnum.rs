@@ -10,7 +10,8 @@
 //! (P-CVTRA06Y-012), `CUST-FIRST-NAME X(25)` (P-CVCUS01Y-002)
 //! [app/cpy/CVCUS01Y.cpy:L6], `SEC-USR-FNAME X(20)` (P-CSUSR01Y-002) and the
 //! reject record's `REJECT-TRAN-DATA X(350)` (P-CBTRN02C-001). Its SQL column
-//! is `VARCHAR(N)`, right-trimmed.
+//! is `VARCHAR(N)`, right-trimmed: persistence binds [`Alnum::trimmed`] and
+//! rebuilds the item with [`Alnum::from_trimmed`].
 //!
 //! The type holds the stored bytes exactly, trailing spaces and low-values
 //! included, so that a decoded fixture field re-encodes to its original bytes.
@@ -92,6 +93,37 @@ impl<const N: usize> Alnum<N> {
             })
     }
 
+    /// The item rebuilt from the right-trimmed text of its `VARCHAR(N)`
+    /// column: the path persistence reads a stored item back by.
+    ///
+    /// Each character becomes the byte with the same code point (ISO 8859-1,
+    /// Latin-1), the reverse of the mapping [`Alnum::as_text`] applies, so `é`
+    /// becomes byte `0xE9` again. The bytes fill the item left-justified and
+    /// the rest of it is spaces, which restores the trailing spaces
+    /// [`Alnum::trimmed`] removed. The width counts characters, not UTF-8
+    /// bytes: `ééé` fills an `X(3)` item. This is the exact inverse of
+    /// [`Alnum::trimmed`]: `Alnum::from_trimmed(&item.trimmed())` is
+    /// `Ok(item)` for every item.
+    ///
+    /// # Errors
+    ///
+    /// [`NumericError::TooLong`] when `text` has more than `N` characters,
+    /// checked first, and [`NumericError::NotLatin1`] when a character lies
+    /// above `U+00FF`. Nothing is cut or replaced: either would change the
+    /// stored bytes.
+    // No `#[must_use]`, for the reason given at `from_bytes`.
+    pub fn from_trimmed(text: &str) -> Result<Self, NumericError> {
+        let actual = text.chars().count();
+        if actual > N {
+            return Err(NumericError::TooLong { max: N, actual });
+        }
+        let mut bytes = [SPACE; N];
+        for (dst, character) in bytes.iter_mut().zip(text.chars()) {
+            *dst = u8::try_from(character).map_err(|_| NumericError::NotLatin1)?;
+        }
+        Ok(Self(bytes))
+    }
+
     /// The COBOL alphanumeric `MOVE` of `src` into an `X(N)` receiver.
     ///
     /// The first `min(src.len(), N)` bytes are copied left-justified, the rest
@@ -112,8 +144,9 @@ impl<const N: usize> Alnum<N> {
     /// in the COBOL: a multi-byte UTF-8 character that straddles byte `N` is
     /// cut, and a non-ASCII character is stored as its UTF-8 bytes, which
     /// [`Alnum::as_text`] then reads one byte per character. API request DTOs
-    /// restrict their text to ASCII, where text and bytes agree; this is also
-    /// how persistence re-pads a right-trimmed `VARCHAR(N)` value it reads back.
+    /// restrict their text to ASCII, where text and bytes agree. Text read back
+    /// from an SQL column is not moved: [`Alnum::from_trimmed`] rebuilds the
+    /// stored bytes from it.
     #[must_use]
     pub fn move_from(src: &str) -> Self {
         Self::move_from_bytes(src.as_bytes())
@@ -154,7 +187,8 @@ impl<const N: usize> Alnum<N> {
     /// rule as [`Alnum::as_text`].
     ///
     /// This is the right-trimmed `VARCHAR(N)` value persistence binds; reading
-    /// it back, persistence pads it again with [`Alnum::move_from`].
+    /// it back, persistence rebuilds the same item with
+    /// [`Alnum::from_trimmed`].
     #[must_use]
     pub fn trimmed(&self) -> Cow<'_, str> {
         text_of(self.trimmed_bytes())
@@ -470,6 +504,59 @@ mod tests {
         // Valid UTF-8 is still read one byte per character, never as UTF-8.
         let utf8 = Alnum::<2>::move_from("é");
         assert_eq!(utf8.as_text(), "\u{c3}\u{a9}");
+    }
+
+    #[test]
+    fn from_trimmed_restores_every_byte_value() {
+        for byte in u8::MIN..=u8::MAX {
+            let items = [
+                Alnum::<3>::from_array([byte, b'x', byte]),
+                Alnum::<3>::from_array([b'a', byte, b' ']),
+                Alnum::<3>::from_array([byte; 3]),
+            ];
+            for item in items {
+                assert_eq!(Alnum::from_trimmed(&item.trimmed()), Ok(item), "{item:?}");
+            }
+        }
+        // Byte 0xE9 reads as "é" and is rebuilt as 0xE9, not as its UTF-8 lead
+        // byte 0xC3, which only the UTF-8 `MOVE` stores.
+        let acute = Alnum::<1>::from_array([0xE9]);
+        assert_eq!(acute.trimmed(), "é");
+        assert_eq!(Alnum::<1>::from_trimmed(&acute.trimmed()), Ok(acute));
+        assert_eq!(Alnum::<1>::move_from("é").as_bytes(), &[0xC3]);
+    }
+
+    #[test]
+    fn from_trimmed_counts_characters_and_pads_with_spaces() {
+        let cases: [(&str, [u8; 3]); 6] = [
+            ("ééé", [0xE9; 3]),
+            ("\u{ff}", [0xFF, b' ', b' ']),
+            ("AB", *b"AB "),
+            (" x", *b" x "),
+            ("", *b"   "),
+            ("a\0", *b"a\0 "),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(
+                Alnum::<3>::from_trimmed(text),
+                Ok(Alnum::from_array(expected)),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn from_trimmed_rejects_text_the_item_cannot_hold() {
+        let cases: [(&str, NumericError); 5] = [
+            ("\u{100}", NumericError::NotLatin1),
+            ("€", NumericError::NotLatin1),
+            ("a😀", NumericError::NotLatin1),
+            ("ABCD", NumericError::TooLong { max: 3, actual: 4 }),
+            ("éééé", NumericError::TooLong { max: 3, actual: 4 }),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(Alnum::<3>::from_trimmed(text), Err(expected), "{text:?}");
+        }
     }
 
     #[test]

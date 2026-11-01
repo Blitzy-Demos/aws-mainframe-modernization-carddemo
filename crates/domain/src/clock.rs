@@ -73,21 +73,26 @@ pub enum AnyClock {
 impl AnyClock {
     /// Builds the clock from the value of `CARDDEMO_CLOCK_OVERRIDE`.
     ///
-    /// An absent value, or one that is empty after trimming, selects the
-    /// [`SystemClock`]. Any other value is parsed as an RFC 3339 instant,
-    /// converted to UTC, and selects a [`FixedClock`].
+    /// An absent value (`None`) selects the [`SystemClock`]. A supplied value
+    /// is trimmed of surrounding whitespace and must then be an RFC 3339
+    /// instant, which is converted to UTC and selects a [`FixedClock`]. A
+    /// supplied value that is empty or only whitespace is an error, never the
+    /// system clock, so a mistyped pin cannot fall back to wall time.
+    ///
+    /// Treating an empty variable as unset is the settings layer's job
+    /// (`Settings` in `crates/runtime`), not this parser's.
     ///
     /// # Errors
     ///
-    /// [`ClockError::InvalidOverride`] when the trimmed value is not an
-    /// RFC 3339 instant.
+    /// [`ClockError::InvalidOverride`] when the supplied value, trimmed, is not
+    /// an RFC 3339 instant, including when it is empty or only whitespace.
     pub fn from_override(value: Option<&str>) -> Result<Self, ClockError> {
-        match value.map(str::trim) {
-            None | Some("") => Ok(Self::System(SystemClock)),
-            Some(text) => DateTime::parse_from_rfc3339(text)
-                .map(|instant| Self::Fixed(FixedClock(instant.with_timezone(&Utc))))
-                .map_err(|_| ClockError::InvalidOverride(text.to_owned())),
-        }
+        let Some(text) = value.map(str::trim) else {
+            return Ok(Self::System(SystemClock));
+        };
+        DateTime::parse_from_rfc3339(text)
+            .map(|instant| Self::Fixed(FixedClock(instant.with_timezone(&Utc))))
+            .map_err(|_| ClockError::InvalidOverride(text.to_owned()))
     }
 }
 
@@ -286,13 +291,10 @@ mod tests {
 
     #[test]
     fn from_override_without_a_value_selects_the_system_clock() {
-        for value in [None, Some(""), Some("   "), Some("\t\n")] {
-            assert_eq!(
-                AnyClock::from_override(value),
-                Ok(AnyClock::System(SystemClock)),
-                "{value:?}"
-            );
-        }
+        assert_eq!(
+            AnyClock::from_override(None),
+            Ok(AnyClock::System(SystemClock))
+        );
     }
 
     #[test]
@@ -315,6 +317,9 @@ mod tests {
             ("not-a-date", "not-a-date"),
             (" 2022-07-01 ", "2022-07-01"),
             ("2022-07-01T12:00:00", "2022-07-01T12:00:00"),
+            ("", ""),
+            ("   ", ""),
+            ("\t\n", ""),
         ] {
             let error = AnyClock::from_override(Some(value)).expect_err("invalid override");
             assert_eq!(error, ClockError::InvalidOverride(kept.to_owned()));

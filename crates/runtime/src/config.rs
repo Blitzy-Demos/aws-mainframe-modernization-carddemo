@@ -147,11 +147,13 @@ pub struct Settings {
     pub fixture_dir: PathBuf,
     /// `CARDDEMO_CORS_ORIGIN`: browser origin admitted through CORS.
     pub cors_origin: String,
-    /// `CARDDEMO_CLOCK_OVERRIDE`: the raw RFC 3339 text, `None` when unset or
-    /// empty.
+    /// `CARDDEMO_CLOCK_OVERRIDE`: the raw text, `None` when unset or set to an
+    /// empty value. Only an empty value counts as unset; any other value,
+    /// whitespace-only included, is kept verbatim.
     ///
     /// This crate never parses it. Consumers turn it into a clock with the
-    /// domain clock, `carddemo_domain::clock::AnyClock::from_override`.
+    /// domain clock, `carddemo_domain::clock::AnyClock::from_override`, which
+    /// rejects any value that is not an RFC 3339 instant.
     pub clock_override: Option<String>,
     /// `RUST_LOG`: log filter directives.
     pub rust_log: String,
@@ -231,8 +233,11 @@ impl Settings {
     /// A value of `None` keeps the field's default. `CARDDEMO_DATABASE_URL`,
     /// `CARDDEMO_AMQP_URL` and `CARDDEMO_JWT_SECRET` reject a blank value
     /// (empty or only whitespace) and take any other value as given. The other
-    /// text and path fields take a value as given; an empty
-    /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset.
+    /// text and path fields take a value as given. Only an empty
+    /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset; any other value of it,
+    /// whitespace-only included, is passed through verbatim, and
+    /// `AnyClock::from_override` in the domain clock rejects what is not an
+    /// RFC 3339 instant.
     ///
     /// ```
     /// use carddemo_runtime::config::{Settings, keys};
@@ -674,9 +679,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_clock_override_counts_as_unset() -> Result<(), ConfigError> {
-        let settings = Settings::from_lookup(lookup_from(&[(keys::CLOCK_OVERRIDE, "")]))?;
-        assert_eq!(settings.clock_override, None);
+    fn empty_clock_override_counts_as_unset_and_whitespace_passes_verbatim()
+    -> Result<(), ConfigError> {
+        for (value, expected) in [("", None), ("   ", Some("   ")), ("\t\n", Some("\t\n"))] {
+            let settings = Settings::from_lookup(lookup_from(&[(keys::CLOCK_OVERRIDE, value)]))?;
+            assert_eq!(settings.clock_override.as_deref(), expected, "{value:?}");
+        }
         Ok(())
     }
 

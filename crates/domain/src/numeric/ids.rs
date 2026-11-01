@@ -15,8 +15,8 @@
 //!   [`UserId`] and [`AccountGroupId`]) hold the `n` stored bytes of an
 //!   [`Alnum<n>`](Alnum). Equality and ordering compare the padded bytes: the
 //!   VSAM key order under ASCII collation, as [`Alnum`] describes. Their SQL
-//!   column is `VARCHAR(n)` holding the `trimmed` text, which persistence pads
-//!   again with `move_from`.
+//!   column is `VARCHAR(n)` holding the `trimmed` text, from which
+//!   persistence rebuilds the key with `from_trimmed`.
 //! - Row identities ([`TransactionRowId`], [`RuleId`], [`AccrualId`] and
 //!   [`AuthId`]) are `BIGINT` identity columns of the replacement tables, which
 //!   no copybook defines.
@@ -375,9 +375,9 @@ macro_rules! text_key {
             /// The COBOL alphanumeric `MOVE` of `text` into the key.
             ///
             /// The text is copied left-justified, padded with spaces and cut on
-            /// the right at the key's width, as [`Alnum::move_from`] does. This
-            /// is also how a right-trimmed `VARCHAR` value read back from the
-            /// database becomes the key again. No case is changed.
+            /// the right at the key's width, as [`Alnum::move_from`] does. No
+            /// case is changed. A key read back from its `VARCHAR` column is
+            /// rebuilt with [`Self::from_trimmed`] instead.
             #[must_use]
             pub fn move_from(text: &str) -> Self {
                 Self(Alnum::move_from(text))
@@ -388,6 +388,25 @@ macro_rules! text_key {
             #[must_use]
             pub const fn from_alnum(value: Alnum<$width>) -> Self {
                 Self(value)
+            }
+
+            /// The key rebuilt from the right-trimmed text of its `VARCHAR`
+            /// column: the path persistence reads a stored key back by, and
+            /// the exact inverse of [`Self::trimmed`].
+            ///
+            /// The text becomes the key's bytes as [`Alnum::from_trimmed`]
+            /// builds them: one ISO 8859-1 byte per character, padded with
+            /// spaces to the key's width.
+            ///
+            /// # Errors
+            ///
+            /// Those of [`Alnum::from_trimmed`]: [`NumericError::TooLong`]
+            /// when the text has more characters than the key's width, and
+            /// [`NumericError::NotLatin1`] when a character lies above
+            /// `U+00FF`.
+            // No `#[must_use]`, for the reason given at `Alnum::from_bytes`.
+            pub fn from_trimmed(text: &str) -> Result<Self, NumericError> {
+                Alnum::from_trimmed(text).map(Self)
             }
 
             /// The key as the `X(n)` item it is stored in.
@@ -403,7 +422,7 @@ macro_rules! text_key {
             }
 
             /// The key without its trailing spaces: the `VARCHAR` value
-            /// persistence binds.
+            /// persistence binds, which [`Self::from_trimmed`] reads back.
             #[must_use]
             pub fn trimmed(&self) -> Cow<'_, str> {
                 self.0.trimmed()
@@ -1066,6 +1085,39 @@ mod tests {
         assert_eq!(group.as_alnum().cobol_cmp(b"DEFAULT"), Ordering::Equal);
         assert_eq!(group.to_string(), "DEFAULT   ");
         Ok(())
+    }
+
+    #[test]
+    fn text_keys_are_rebuilt_from_their_trimmed_text() {
+        // The stored bytes of a rebuilt key, or why it cannot be rebuilt.
+        type Rebuilt = Result<Vec<u8>, NumericError>;
+        let accented = UserId::from_alnum(Alnum::from_array(*b"ADM\xE9N1  "));
+        assert_eq!(accented.trimmed(), "ADMéN1");
+        assert_eq!(UserId::from_trimmed(&accented.trimmed()), Ok(accented));
+
+        // (rebuilt from the text read back, expected)
+        let cases: [(Rebuilt, Rebuilt); 4] = [
+            (
+                UserId::from_trimmed("ADMéN1").map(|key| key.as_bytes().to_vec()),
+                Ok(b"ADM\xE9N1  ".to_vec()),
+            ),
+            // E-06: a blank group ID is rebuilt as ten spaces.
+            (
+                AccountGroupId::from_trimmed("").map(|key| key.as_bytes().to_vec()),
+                Ok(b"          ".to_vec()),
+            ),
+            (
+                UserId::from_trimmed("ADMIN0012").map(|key| key.as_bytes().to_vec()),
+                Err(NumericError::TooLong { max: 8, actual: 9 }),
+            ),
+            (
+                CardNumber::from_trimmed("€").map(|key| key.as_bytes().to_vec()),
+                Err(NumericError::NotLatin1),
+            ),
+        ];
+        for (rebuilt, expected) in cases {
+            assert_eq!(rebuilt, expected);
+        }
     }
 
     #[test]

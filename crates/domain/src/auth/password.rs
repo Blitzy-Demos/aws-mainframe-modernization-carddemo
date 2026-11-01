@@ -43,13 +43,14 @@ pub enum PasswordError {
 
 /// Stores a password the way the admin programs move it into `SEC-USR-PWD`.
 ///
-/// `COUSR01C` `PROCESS-ENTER-KEY` moves `PASSWDI` to `SEC-USR-PWD` as entered
-/// [app/cbl/COUSR01C.cbl:L154-158]; `COUSR02C` `UPDATE-USER-INFO` does the same
-/// for a changed password [app/cbl/COUSR02C.cbl:L227-229]; the `DUSRSECJ` seed
-/// rows hold the value as stored [app/jcl/DUSRSECJ.jcl:L35-44]. The password
-/// is therefore padded and truncated to `PIC X(08)` with its case unchanged,
-/// then hashed with `Argon2::default()` (argon2id, v=19, m=19456, t=2, p=1) and
-/// a fresh `OsRng` salt. E-20.
+/// `COUSR01C` `PROCESS-ENTER-KEY` — P-COUSR01C-003 — moves `PASSWDI` to
+/// `SEC-USR-PWD` as entered [app/cbl/COUSR01C.cbl:L154-158]; `COUSR02C`
+/// `UPDATE-USER-INFO` — P-COUSR02C-005 — does the same for a changed password
+/// [app/cbl/COUSR02C.cbl:L227-229]; the `DUSRSECJ` seed rows hold the value as
+/// stored [app/jcl/DUSRSECJ.jcl:L35-44]. The password is therefore padded and
+/// truncated to `PIC X(08)` with its case unchanged, then hashed with
+/// `Argon2::default()` (argon2id, v=19, m=19456, t=2, p=1) and a fresh `OsRng`
+/// salt. E-20.
 ///
 /// Returns the PHC string `$argon2id$v=19$m=19456,t=2,p=1$<salt>$<hash>`.
 ///
@@ -67,9 +68,10 @@ pub fn hash_stored_password(entered: &str) -> Result<String, PasswordError> {
 
 /// Normalises a sign-on user ID into the `USRSEC` key `WS-USER-ID`.
 ///
-/// `COSGN00C` `PROCESS-ENTER-KEY` moves `FUNCTION UPPER-CASE(USERIDI)` to
-/// `WS-USER-ID PIC X(08)` [app/cbl/COSGN00C.cbl:L132-134], which is the key of
-/// the `USRSEC` read [app/cbl/COSGN00C.cbl:L211-219]. E-20.
+/// `COSGN00C` `PROCESS-ENTER-KEY` — P-COSGN00C-007 — moves
+/// `FUNCTION UPPER-CASE(USERIDI)` to `WS-USER-ID PIC X(08)`
+/// [app/cbl/COSGN00C.cbl:L132-134], which is the key of the `USRSEC` read in
+/// `READ-USER-SEC-FILE` — P-COSGN00C-008 [app/cbl/COSGN00C.cbl:L211-219]. E-20.
 ///
 /// The result is exactly [`SEC_USR_ID_LEN`] bytes, space-padded. A caller
 /// whose user-ID column or newtype is right-trimmed must trim the trailing
@@ -82,13 +84,14 @@ pub fn normalize_signon_user_id(entered: &str) -> String {
 
 /// Checks a sign-on password against the stored hash.
 ///
-/// `COSGN00C` `PROCESS-ENTER-KEY` moves `FUNCTION UPPER-CASE(PASSWDI)` to
-/// `WS-USER-PWD PIC X(08)` [app/cbl/COSGN00C.cbl:L135-136], and
-/// `READ-USER-SEC-FILE` compares it with `SEC-USR-PWD`
-/// [app/cbl/COSGN00C.cbl:L223]. The entered password is upper-cased (ASCII
-/// range only), padded to `PIC X(08)` and verified. E-20.
+/// `COSGN00C` `PROCESS-ENTER-KEY` — P-COSGN00C-007 — moves
+/// `FUNCTION UPPER-CASE(PASSWDI)` to `WS-USER-PWD PIC X(08)`
+/// [app/cbl/COSGN00C.cbl:L135-136], and `READ-USER-SEC-FILE` —
+/// P-COSGN00C-009 — compares it with `SEC-USR-PWD` [app/cbl/COSGN00C.cbl:L223].
+/// The entered password is upper-cased (ASCII range only), padded to
+/// `PIC X(08)` and verified. E-20.
 ///
-/// `Ok(false)` is a wrong password.
+/// `Ok(false)` is a wrong password (`READ-USER-SEC-FILE` — P-COSGN00C-010).
 ///
 /// # Errors
 ///
@@ -100,13 +103,13 @@ pub fn verify_signon(entered: &str, phc: &str) -> Result<bool, PasswordError> {
 
 /// Checks whether an edited password equals the stored one, case kept.
 ///
-/// `COUSR02C` `UPDATE-USER-INFO` treats the password as modified when
-/// `PASSWDI NOT = SEC-USR-PWD` [app/cbl/COUSR02C.cbl:L227]. The entered value
-/// is padded to `PIC X(08)` without a case change and verified. `Ok(true)`
-/// means unchanged (keep the stored hash); `Ok(false)` means modified (store
-/// it with [`hash_stored_password`]). The COBOL also reloads `SEC-USR-PWD`
-/// into the edit field [app/cbl/COUSR02C.cbl:L166-170], which a hash cannot
-/// reproduce. E-21.
+/// `COUSR02C` `UPDATE-USER-INFO` — P-COUSR02C-005 — treats the password as
+/// modified when `PASSWDI NOT = SEC-USR-PWD` [app/cbl/COUSR02C.cbl:L227]. The
+/// entered value is padded to `PIC X(08)` without a case change and verified.
+/// `Ok(true)` means unchanged (keep the stored hash); `Ok(false)` means
+/// modified (store it with [`hash_stored_password`]). The COBOL also reloads
+/// `SEC-USR-PWD` into the edit field in `PROCESS-ENTER-KEY` — P-COUSR02C-002
+/// [app/cbl/COUSR02C.cbl:L166-170], which a hash cannot reproduce. E-21.
 ///
 /// # Errors
 ///

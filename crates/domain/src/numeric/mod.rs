@@ -130,6 +130,21 @@ pub enum NumericError {
         /// The length of the slice offered.
         actual: usize,
     },
+    /// Text holding a character above `U+00FF`, which no single byte holds.
+    /// Returned by `Alnum::from_trimmed` and the `from_trimmed` of the `X(n)`
+    /// keys; no character is replaced.
+    #[error("value has a character outside ISO 8859-1")]
+    NotLatin1,
+    /// Text with more characters than the field's width. Returned by
+    /// `Alnum::from_trimmed` and the `from_trimmed` of the `X(n)` keys; nothing
+    /// is cut.
+    #[error("expected at most {max} characters, got {actual}")]
+    TooLong {
+        /// The field length in characters: the `N` of `X(N)`.
+        max: usize,
+        /// The number of characters offered.
+        actual: usize,
+    },
 }
 
 #[cfg(test)]
@@ -163,6 +178,14 @@ mod tests {
                     actual: 3,
                 },
                 "expected 16 bytes, got 3",
+            ),
+            (
+                NumericError::NotLatin1,
+                "value has a character outside ISO 8859-1",
+            ),
+            (
+                NumericError::TooLong { max: 8, actual: 9 },
+                "expected at most 8 characters, got 9",
             ),
         ];
         for (error, text) in cases {
