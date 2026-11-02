@@ -9,10 +9,19 @@
 //! holding the whole record, trailing spaces included, so every record extracts as exactly one
 //! line with nothing trimmed.
 //!
+//! lopdf decodes a string with the encoding of the font its `Tf` selects, which it looks up only
+//! in a `/Font` resource held directly in the page's resource dictionary. printpdf 0.7 writes that
+//! resource as a reference to a separate dictionary, so lopdf finds no font and falls back to
+//! `StandardEncoding`, which turns `'` (0x27) into U+2019 and `` ` `` (0x60) into U+2018 instead of
+//! the characters the declared `WinAnsiEncoding` gives. Fixture merchant names hold apostrophes,
+//! so the rendered document is rewritten with each `/Font` resource inlined, an equally valid
+//! form, before it is returned.
+//!
 //! This module receives formatted text lines only, never a money or points value. That is why it
 //! is the one place the workspace float ban admits `f32`: printpdf takes page geometry in
 //! millimetres and the font size in points as `f32`.
 
+use printpdf::lopdf;
 use printpdf::{BuiltinFont, Mm, PdfDocument};
 
 /// Document title written into the PDF information dictionary.
@@ -49,6 +58,10 @@ pub(crate) enum RenderError {
     /// printpdf could not register the builtin font or serialize the document.
     #[error("statement PDF rendering failed: {0}")]
     Pdf(#[from] printpdf::Error),
+    /// The rendered document could not be read back, have its font resources inlined, or be
+    /// serialized again.
+    #[error("statement PDF font resources could not be inlined: {0}")]
+    FontResources(#[from] lopdf::Error),
 }
 
 /// Renders STMTFILE records as a PDF in builtin Courier, one text object per record,
@@ -63,7 +76,8 @@ pub(crate) enum RenderError {
 /// # Errors
 ///
 /// Returns [`RenderError::Pdf`] when printpdf cannot register the builtin font or serialize the
-/// document.
+/// document, and [`RenderError::FontResources`] when the serialized document cannot be rewritten
+/// with its font resources inlined.
 pub(crate) fn render_statement(lines: &[String]) -> Result<Vec<u8>, RenderError> {
     let (doc, first_page, first_layer) = PdfDocument::new(
         DOCUMENT_TITLE,
@@ -87,7 +101,32 @@ pub(crate) fn render_statement(lines: &[String]) -> Result<Vec<u8>, RenderError>
         }
     }
 
-    Ok(doc.save_to_bytes()?)
+    Ok(inline_font_resources(&doc.save_to_bytes()?)?)
+}
+
+/// Rewrites the serialized document `pdf` with every `/Font` resource that refers to a font
+/// dictionary replaced by that dictionary, so lopdf decodes each record with the font's
+/// `WinAnsiEncoding` (see the module documentation). Nothing else changes: the content streams,
+/// and with them the text objects, are written back as they were.
+fn inline_font_resources(pdf: &[u8]) -> Result<Vec<u8>, lopdf::Error> {
+    let mut doc = lopdf::Document::load_mem(pdf)?;
+    let mut inlined = Vec::new();
+    for (&id, object) in &doc.objects {
+        if let Ok(&lopdf::Object::Reference(fonts_id)) = object
+            .as_dict()
+            .and_then(|resources| resources.get(b"Font"))
+        {
+            inlined.push((id, doc.get_dictionary(fonts_id)?.clone()));
+        }
+    }
+    for (id, fonts) in inlined {
+        doc.get_object_mut(id)?
+            .as_dict_mut()?
+            .set("Font", lopdf::Object::Dictionary(fonts));
+    }
+    let mut out = Vec::new();
+    doc.save_to(&mut out)?;
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -122,6 +161,24 @@ mod tests {
         ];
         assert!(lines.iter().all(|line| line.len() == 80));
         assert_eq!(lines[2].len() - lines[2].trim_end().len(), 10);
+
+        let (pages, extracted) = extract(&render_statement(&lines).expect("renders"));
+
+        assert_eq!(pages, 1);
+        assert_eq!(extracted, lines);
+    }
+
+    #[test]
+    fn quote_characters_extract_as_written() {
+        let lines = vec![
+            // CBSTM03A ST-LINE14 of a fixture transaction whose merchant name holds `'`.
+            format!(
+                "{:<16} {:<49}${:>13}",
+                "0000000802663079", "Purchase at Zulauf-O'Keefe", "975.11 "
+            ),
+            format!("{:<80}", "`grave` and 'single' quotes"),
+        ];
+        assert!(lines.iter().all(|line| line.len() == 80));
 
         let (pages, extracted) = extract(&render_statement(&lines).expect("renders"));
 

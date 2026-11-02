@@ -38,12 +38,13 @@ use crate::entities::{
     Account, CardXref, DailyTran, NewTransaction, TranCatBalance, TranCatBalanceKey, Transaction,
 };
 use crate::messages::{
-    ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_OPENING_DALY_REJECTS_FILE,
-    ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE, ERROR_READING_DALYTRAN_FILE,
-    ERROR_READING_TRANSACTION_BALANCE_FILE, ERROR_REWRITING_TRANSACTION_BALANCE_FILE,
-    ERROR_WRITING_TO_REJECTS_FILE, ERROR_WRITING_TO_TRANSACTION_FILE,
-    ERROR_WRITING_TRANSACTION_BALANCE_FILE, INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION,
-    TRANSACTION_RECEIVED_AFTER_ACCT_EXPIRATION, UNEXPECTED_ERROR, file_status_message,
+    ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_CLOSING_DAILY_REJECTS_FILE,
+    ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE,
+    ERROR_READING_DALYTRAN_FILE, ERROR_READING_TRANSACTION_BALANCE_FILE,
+    ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ERROR_WRITING_TO_REJECTS_FILE,
+    ERROR_WRITING_TO_TRANSACTION_FILE, ERROR_WRITING_TRANSACTION_BALANCE_FILE,
+    INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION, TRANSACTION_RECEIVED_AFTER_ACCT_EXPIRATION,
+    UNEXPECTED_ERROR, file_status_message,
 };
 use crate::numeric::{Alnum, Money};
 use crate::ports::{
@@ -117,6 +118,7 @@ const CREATE_TCATBAL_REC: &str = "2700-A-CREATE-TCATBAL-REC";
 const UPDATE_TCATBAL_REC: &str = "2700-B-UPDATE-TCATBAL-REC";
 const UPDATE_ACCOUNT_REC: &str = "2800-UPDATE-ACCOUNT-REC";
 const WRITE_TRANSACTION_FILE: &str = "2900-WRITE-TRANSACTION-FILE";
+const DALYREJS_CLOSE: &str = "9300-DALYREJS-CLOSE";
 
 /// CBTRN02C 1500-VALIDATE-TRAN — P-CBTRN02C-006: the outcome for one daily
 /// record.
@@ -247,6 +249,18 @@ impl PostingAbend {
     #[must_use]
     pub fn reject_write() -> Self {
         Self::job_level(WRITE_REJECT_REC, ERROR_WRITING_TO_REJECTS_FILE, "")
+    }
+
+    /// CBTRN02C 9300-DALYREJS-CLOSE — P-CBTRN02C-020: the `DALYREJS`
+    /// generation cannot be closed at the end of the run
+    /// [app/cbl/CBTRN02C.cbl:L637-653].
+    ///
+    /// The paragraph moves `XREFFILE-STATUS`, not `DALYREJS-STATUS`, to
+    /// `IO-STATUS` before `9910-DISPLAY-IO-STATUS` [app/cbl/CBTRN02C.cbl:L649].
+    /// The audit row records no status for the path, so none is shown.
+    #[must_use]
+    pub fn dalyrejs_close() -> Self {
+        Self::job_level(DALYREJS_CLOSE, ERROR_CLOSING_DAILY_REJECTS_FILE, "")
     }
 
     /// The `FILE STATUS IS: NNNN…` line of [`PostingAbend::file_status`], or
@@ -586,11 +600,12 @@ mod tests {
         Transaction,
     };
     use crate::messages::{
-        ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_OPENING_DALY_REJECTS_FILE,
-        ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE, ERROR_READING_DALYTRAN_FILE,
-        ERROR_READING_TRANSACTION_BALANCE_FILE, ERROR_REWRITING_TRANSACTION_BALANCE_FILE,
-        ERROR_WRITING_TO_REJECTS_FILE, ERROR_WRITING_TO_TRANSACTION_FILE,
-        ERROR_WRITING_TRANSACTION_BALANCE_FILE, INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION,
+        ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_CLOSING_DAILY_REJECTS_FILE,
+        ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE,
+        ERROR_READING_DALYTRAN_FILE, ERROR_READING_TRANSACTION_BALANCE_FILE,
+        ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ERROR_WRITING_TO_REJECTS_FILE,
+        ERROR_WRITING_TO_TRANSACTION_FILE, ERROR_WRITING_TRANSACTION_BALANCE_FILE,
+        INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION,
         TRANSACTION_RECEIVED_AFTER_ACCT_EXPIRATION, UNEXPECTED_ERROR,
     };
     use crate::numeric::{
@@ -1308,9 +1323,9 @@ mod tests {
         assert_eq!(PostingCounts::default().return_code(), 0);
     }
 
-    /// P-CBTRN02C-005, P-CBTRN02C-007, P-CBTRN02C-012, P-CBTRN02C-021,
-    /// P-CBTRN02C-221, P-CBTRN02C-223: the job-level abends display their
-    /// text, the status line when the status is known, then
+    /// P-CBTRN02C-005, P-CBTRN02C-007, P-CBTRN02C-012, P-CBTRN02C-020,
+    /// P-CBTRN02C-021, P-CBTRN02C-221, P-CBTRN02C-223: the job-level abends
+    /// display their text, the status line when the status is known, then
     /// `ABENDING PROGRAM`.
     #[test]
     fn job_level_abends_display_their_lines_in_the_cobol_order() {
@@ -1343,6 +1358,11 @@ mod tests {
                 PostingAbend::reject_write(),
                 "2500-WRITE-REJECT-REC",
                 vec![ERROR_WRITING_TO_REJECTS_FILE, ABENDING_PROGRAM],
+            ),
+            (
+                PostingAbend::dalyrejs_close(),
+                "9300-DALYREJS-CLOSE",
+                vec![ERROR_CLOSING_DAILY_REJECTS_FILE, ABENDING_PROGRAM],
             ),
         ];
         for (abend, paragraph, lines) in cases {

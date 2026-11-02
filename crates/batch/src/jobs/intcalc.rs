@@ -1,0 +1,453 @@
+//! `batch intcalc`: JCL `INTCALC` step `STEP15`, `EXEC PGM=CBACT04C,PARM='2022071800'`
+//! [app/jcl/INTCALC.jcl:L22-41], the monthly interest on the transaction category balances.
+//!
+//! The program logic is `carddemo_domain::rules::interest`. This job supplies what the JCL and
+//! the file I/O around the rule supply:
+//!
+//! | CBACT04C | Audit rows | Here |
+//! |---|---|---|
+//! | `PROCEDURE DIVISION USING EXTERNAL-PARMS`, `PARM-DATE X(10)` | P-CBACT04C-001 | `parm_date` |
+//! | `0000-TCATBALF-OPEN` to `0300-ACCTFILE-OPEN` | P-CBACT04C-177 to P-CBACT04C-180 | the units of work, below |
+//! | `0400-TRANFILE-OPEN`, `TRANSACT DD DSN=SYSTRAN(+1)` | P-CBACT04C-181 | `open_systran` |
+//! | `1000-TCATBALF-GET-NEXT` | P-CBACT04C-182 | `read_page` |
+//! | the loop body, `1050-UPDATE-ACCOUNT` to `1300-COMPUTE-INTEREST` | P-CBACT04C-002 to P-CBACT04C-010 | `InterestRun::process_record`, called by `IntcalcJob::process` |
+//! | `1300-B-WRITE-TX` `WRITE FD-TRANFILE-REC` | P-CBACT04C-008, P-CBACT04C-009 | `IntcalcJob::write_systran` |
+//! | end of file, the last account never updated (E-14) | P-CBACT04C-003, P-CBACT04C-174 | `InterestRun::finish`, called by `IntcalcJob::end_of_file` |
+//! | `9400-TRANFILE-CLOSE`, `DISP=(NEW,CATLG,DELETE)` | P-CBACT04C-187 | `PendingGeneration::catalog` in `IntcalcJob::end_of_file` |
+//! | `9999-ABEND-PROGRAM`, `9910-DISPLAY-IO-STATUS` | P-CBACT04C-188, P-CBACT04C-189 | `abend_status`, `systran_abend` |
+//!
+//! # Files and units of work
+//!
+//! `TCATBALF`, `XREFFILE`, `DISCGRP` and `ACCTFILE` are tables of one database here. The job
+//! layer opened the pool before this job runs, and a failure to reach it is a setup failure
+//! (exit 16, as an abend). The four KSDS opens therefore have no outcome of their own: there is
+//! no per-table open that can fail while the others succeed, so the texts of P-CBACT04C-177 to
+//! P-CBACT04C-180, `"ERROR OPENING DALY REJECTS FILE"` of E-72 included, have no reachable
+//! counterpart, as the per-request queue opens of E-22 have none in the consumers. A unit of
+//! work that cannot begin is a setup failure too.
+//!
+//! The category balances are browsed in key order a page at a time, each page in a read-only
+//! unit of work. Every balance record is then processed in its own unit of work, committed once
+//! the rule has rewritten the previous account (on an account break) and the record's interest
+//! transaction is written to `SYSTRAN(+1)`. Every file CBACT04C rewrites is `RECOVERY(NONE)`
+//! [app/csd/CARDDEMO.CSD:L1-96], so each `REWRITE` is durable when it completes and survives a
+//! later abend (P-CBACT04C-010). A commit per record gives the account rewrites that durability,
+//! and holds no account row lock beyond its record, so online bill payments and account updates
+//! do not wait for the end of the run.
+//!
+//! On an abend the record's unit of work is still committed, because the rule's account rewrite
+//! ran under its own savepoint and persists, and the pending `SYSTRAN(+1)` is dropped
+//! uncataloged, as `DISP=(NEW,CATLG,DELETE)` deletes it. The stderr lines are the `DISPLAY`
+//! lines of the abending paragraph and `ABEND 999`; the adapter detail goes to the log only.
+//!
+//! No interest transaction enters the live transaction master: `SYSTRAN(0)` reaches it only
+//! through `batch combtran`.
+
+use std::error::Error;
+use std::slice;
+
+use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
+use carddemo_domain::entities::{NewTransaction, TranCatBalance, TranCatBalanceKey};
+use carddemo_domain::messages::{
+    ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBACT04C, ERROR_CLOSING_TRANSACTION_FILE,
+    ERROR_OPENING_TRANSACTION_FILE, file_status_message,
+};
+use carddemo_domain::numeric::Alnum;
+use carddemo_domain::ports::TranCatBalanceStore;
+use carddemo_domain::rules::interest::{InterestAbend, InterestRun};
+use carddemo_persistence::{Db, UnitOfWork};
+use tracing::Span;
+
+use super::{JobContext, setup_failure};
+use crate::cli::IntcalcArgs;
+use crate::exit::ExitStatus;
+use crate::generations::{Dataset, PendingGeneration};
+
+/// The category balances one browse read returns: a bound on the records the job holds at
+/// once, not a COBOL value. `1000-TCATBALF-GET-NEXT` reads one record at a time.
+const PAGE_SIZE: u16 = 500;
+
+/// The file status the job shows for a failed open, write or close of `SYSTRAN(+1)`: 30, the
+/// permanent error with no further information. A file-system error has no QSAM status of its
+/// own, and `rules::interest` shows every database failure without one as 30 too.
+const NO_FURTHER_INFORMATION: [u8; 2] = *b"30";
+
+/// Runs `batch intcalc` with `args` on `db`, and returns how CBACT04C ended: exit 0 at the end
+/// of the category balance file, 16 on an abend or a setup failure.
+///
+/// Once `SYSTRAN(+1)` is open, the counts `read` (`WS-RECORD-COUNT`, the balance records handed
+/// to the rule) and `written` (the interest records written to `SYSTRAN(+1)`) are recorded on the
+/// job span however the reading ends.
+pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitStatus {
+    let parm = match parm_date(args) {
+        Ok(parm) => parm,
+        Err(status) => return status,
+    };
+    let systran = match open_systran(ctx) {
+        Ok(pending) => pending,
+        Err(status) => return status,
+    };
+    let mut job = IntcalcJob {
+        ctx,
+        db,
+        interest: InterestRun::new(parm),
+        systran,
+        read: 0,
+        written: 0,
+    };
+    let outcome = job.read_file().await;
+    job.record_counts();
+    match outcome {
+        Ok(()) => job.end_of_file(),
+        Err(status) => {
+            // The abnormal end of the step: `DISP=(NEW,CATLG,DELETE)` deletes `SYSTRAN(+1)`.
+            drop(job);
+            status
+        }
+    }
+}
+
+/// CBACT04C `PROCEDURE DIVISION USING EXTERNAL-PARMS` [app/cbl/CBACT04C.cbl:L175-180] —
+/// P-CBACT04C-001: the JCL `PARM` as `PARM-DATE X(10)`, the first ten bytes of every interest
+/// TRAN-ID.
+///
+/// # Errors
+///
+/// A setup failure when the text is not exactly ten bytes, which the command line already
+/// rejects.
+fn parm_date(args: &IntcalcArgs) -> Result<Alnum<10>, ExitStatus> {
+    Alnum::from_bytes(args.parm_date.as_bytes())
+        .map_err(|err| setup_failure("PARM-DATE does not fill X(10)", err))
+}
+
+/// CBACT04C 0400-TRANFILE-OPEN [app/cbl/CBACT04C.cbl:L307-323] — P-CBACT04C-181:
+/// `OPEN OUTPUT TRANSACT-FILE`, the new generation `SYSTRAN(+1)`, `RECFM=F,LRECL=350`
+/// [app/jcl/INTCALC.jcl:L37-41]. Nothing has been read or written yet.
+///
+/// # Errors
+///
+/// The 0400-TRANFILE-OPEN abend when the generation cannot be allocated; the allocation error
+/// is logged.
+fn open_systran(ctx: &JobContext) -> Result<PendingGeneration, ExitStatus> {
+    ctx.generations.begin_next(Dataset::SysTran).map_err(|err| {
+        tracing::error!(error = %err, "SYSTRAN(+1) allocation failed");
+        systran_abend(ERROR_OPENING_TRANSACTION_FILE)
+    })
+}
+
+/// CBACT04C 1000-TCATBALF-GET-NEXT [app/cbl/CBACT04C.cbl:L325-348] — P-CBACT04C-182: the next
+/// records of `TCATBALF` in key order after `after`, from the first when `after` is `None`, in
+/// a read-only unit of work. Fewer than [`PAGE_SIZE`] records is the end of the file (status
+/// 10).
+///
+/// # Errors
+///
+/// - The 1000-TCATBALF-GET-NEXT abend when the read fails.
+/// - A setup failure when the unit of work cannot begin or end.
+async fn read_page(
+    db: &Db,
+    after: Option<TranCatBalanceKey>,
+) -> Result<Vec<TranCatBalance>, ExitStatus> {
+    let mut uow = db
+        .begin()
+        .await
+        .map_err(|err| setup_failure("category balance read could not begin", err))?;
+    match uow.store().tcatbals_after(after, PAGE_SIZE).await {
+        Ok(records) => {
+            uow.rollback()
+                .await
+                .map_err(|err| setup_failure("category balance read could not end", err))?;
+            Ok(records)
+        }
+        // The unit of work wrote nothing; dropping it rolls it back.
+        Err(cause) => Err(abend_status(&InterestAbend::TcatbalRead { cause })),
+    }
+}
+
+/// One `batch intcalc` run: the CBACT04C state the rule keeps, the open `SYSTRAN(+1)` and the
+/// counts the job span records.
+struct IntcalcJob<'a> {
+    /// The settings, the processing clock and the generation catalog of the run.
+    ctx: &'a JobContext,
+    /// The pool the units of work begin on.
+    db: &'a Db,
+    /// The CBACT04C working storage across balance records.
+    interest: InterestRun,
+    /// `TRANSACT DD DSN=SYSTRAN(+1)`, open for output.
+    systran: PendingGeneration,
+    /// `WS-RECORD-COUNT`: the balance records read.
+    read: u64,
+    /// The interest records written to `SYSTRAN(+1)`.
+    written: u64,
+}
+
+impl IntcalcJob<'_> {
+    /// CBACT04C `PERFORM UNTIL END-OF-FILE = 'Y'` [app/cbl/CBACT04C.cbl:L188-222] —
+    /// P-CBACT04C-002, P-CBACT04C-182: every balance record of `TCATBALF`, in key order, then
+    /// the end of the file.
+    ///
+    /// # Errors
+    ///
+    /// The status of the first abend or setup failure; the records before it stay committed.
+    async fn read_file(&mut self) -> Result<(), ExitStatus> {
+        let mut after = None;
+        loop {
+            let page = read_page(self.db, after).await?;
+            for record in &page {
+                self.process(record).await?;
+            }
+            match page.last() {
+                Some(last) if page.len() == usize::from(PAGE_SIZE) => {
+                    after = Some(last.key.clone());
+                }
+                _ => return Ok(()),
+            }
+        }
+    }
+
+    /// CBACT04C loop body [app/cbl/CBACT04C.cbl:L191-217] — P-CBACT04C-002, P-CBACT04C-006,
+    /// P-CBACT04C-007, P-CBACT04C-010, P-CBACT04C-182: `ADD 1 TO WS-RECORD-COUNT`,
+    /// `DISPLAY TRAN-CAT-BAL-RECORD`, then the rule on one balance record in its own unit of
+    /// work, and the interest record it returns written to `SYSTRAN(+1)`. A zero rate returns
+    /// none and writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// - The abend of the failing paragraph, after the unit of work is committed: the account
+    ///   rewrite the rule made before the failure persists (P-CBACT04C-010).
+    /// - A setup failure when the unit of work cannot begin or commit.
+    async fn process(&mut self, record: &TranCatBalance) -> Result<(), ExitStatus> {
+        self.read += 1;
+        display_record(record);
+        let mut uow = self
+            .db
+            .begin()
+            .await
+            .map_err(|err| setup_failure("balance record unit of work could not begin", err))?;
+        let processed = self
+            .interest
+            .process_record(&mut uow.store(), record, &self.ctx.clock)
+            .await;
+        let written = match processed {
+            Ok(Some(tran)) => self.write_systran(tran),
+            Ok(None) => Ok(()),
+            Err(abend) => Err(abend),
+        };
+        match written {
+            Ok(()) => uow
+                .commit()
+                .await
+                .map_err(|err| setup_failure("balance record unit of work commit failed", err)),
+            Err(abend) => Err(commit_then_abend(uow, &abend).await),
+        }
+    }
+
+    /// CBACT04C 1300-B-WRITE-TX `WRITE FD-TRANFILE-REC FROM TRAN-RECORD`
+    /// [app/cbl/CBACT04C.cbl:L500-515] — P-CBACT04C-008, P-CBACT04C-009, P-CBACT04C-173: the
+    /// interest record as a 350-byte `CVTRA05Y` record, its FILLER spaces (E-25).
+    ///
+    /// # Errors
+    ///
+    /// The 1300-B-WRITE-TX abend, status 30, when the generation cannot be written; the write
+    /// error is logged.
+    fn write_systran(&mut self, tran: NewTransaction) -> Result<(), InterestAbend> {
+        let record = TransactionRecord::new(tran);
+        match self
+            .systran
+            .append_records::<TransactionLayout>(slice::from_ref(&record))
+        {
+            Ok(()) => {
+                self.written += 1;
+                Ok(())
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    tran_id = %record.transaction.tran_id,
+                    "SYSTRAN(+1) write failed"
+                );
+                Err(InterestAbend::SystranWrite {
+                    status: NO_FURTHER_INFORMATION,
+                })
+            }
+        }
+    }
+
+    /// Records `read` and `written` on the job span.
+    fn record_counts(&self) {
+        let span = Span::current();
+        span.record("read", self.read);
+        span.record("written", self.written);
+    }
+
+    /// CBACT04C end of file and closes [app/cbl/CBACT04C.cbl:L188-230] — P-CBACT04C-003,
+    /// P-CBACT04C-174, P-CBACT04C-187, E-14: the run ends with the last account not updated,
+    /// and `9400-TRANFILE-CLOSE` catalogs `SYSTRAN(+1)`.
+    ///
+    /// The loop leaves before the `ELSE` that would perform `1050-UPDATE-ACCOUNT`, so the last
+    /// account keeps its balance and cycle amounts while its interest records are written; the
+    /// rule reports its total and nothing updates it. The closes of the four KSDS files end
+    /// nothing here: each record's unit of work is already committed.
+    ///
+    /// # Errors
+    ///
+    /// The 9400-TRANFILE-CLOSE abend when the generation cannot be cataloged; the catalog
+    /// error is logged and the account updates stay committed.
+    fn end_of_file(self) -> ExitStatus {
+        let summary = self.interest.finish();
+        if let Some(unposted) = summary.unposted {
+            tracing::info!(
+                acct_id = %unposted.acct_id,
+                total_interest = %unposted.total_interest,
+                "last account of the category balance file not updated (E-14)"
+            );
+        }
+        match self.systran.catalog() {
+            Ok(generation) => {
+                tracing::info!(
+                    generation = %generation,
+                    records_read = summary.records_read,
+                    interest_records = summary.interest_records,
+                    accounts_updated = summary.accounts_updated,
+                    default_group_reads = summary.default_group_reads,
+                    "{END_OF_EXECUTION_OF_PROGRAM_CBACT04C}"
+                );
+                ExitStatus::Success
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "SYSTRAN(+1) catalog failed");
+                systran_abend(ERROR_CLOSING_TRANSACTION_FILE)
+            }
+        }
+    }
+}
+
+/// CBACT04C `DISPLAY TRAN-CAT-BAL-RECORD` [app/cbl/CBACT04C.cbl:L193] — P-CBACT04C-182: the
+/// balance record just read, as an event with its `CVTRA01Y` fields.
+fn display_record(record: &TranCatBalance) {
+    tracing::info!(
+        trancat_acct_id = %record.key.trancat_acct_id,
+        trancat_type_cd = %record.key.trancat_type_cd,
+        trancat_cd = %record.key.trancat_cd,
+        tran_cat_bal = %record.tran_cat_bal,
+        "TRAN-CAT-BAL-RECORD"
+    );
+}
+
+/// CBACT04C 9999-ABEND-PROGRAM after a failed paragraph of the loop — P-CBACT04C-010,
+/// P-CBACT04C-188: commits the record's unit of work, whose account rewrite persists under
+/// `RECOVERY(NONE)`, then reports `abend`.
+async fn commit_then_abend(uow: UnitOfWork, abend: &InterestAbend) -> ExitStatus {
+    if let Err(err) = uow.commit().await {
+        tracing::error!(
+            error = %err,
+            "account rewrite before the abend could not be committed"
+        );
+    }
+    abend_status(abend)
+}
+
+/// CBACT04C 9999-ABEND-PROGRAM [app/cbl/CBACT04C.cbl:L628-632] — P-CBACT04C-188,
+/// P-CBACT04C-189: the `DISPLAY` lines of `abend` and `CEE3ABD` with `ABCODE` 999, exit 16.
+/// The port failure behind it is logged, never written to stderr.
+fn abend_status(abend: &InterestAbend) -> ExitStatus {
+    tracing::error!(
+        display = %abend,
+        cause = ?abend.source(),
+        abcode = InterestAbend::ABCODE,
+        "{ABENDING_PROGRAM}"
+    );
+    ExitStatus::abend_from(abend, Some(InterestAbend::ABCODE))
+}
+
+/// CBACT04C 9999-ABEND-PROGRAM after 0400-TRANFILE-OPEN or 9400-TRANFILE-CLOSE
+/// [app/cbl/CBACT04C.cbl:L307-323] [app/cbl/CBACT04C.cbl:L595-611] — P-CBACT04C-181,
+/// P-CBACT04C-187 to P-CBACT04C-189: `text`, 9910-DISPLAY-IO-STATUS with status 30 and
+/// `ABENDING PROGRAM`, then `CEE3ABD` with `ABCODE` 999, exit 16.
+fn systran_abend(text: &'static str) -> ExitStatus {
+    let lines = vec![
+        text.to_owned(),
+        file_status_message(NO_FURTHER_INFORMATION),
+        ABENDING_PROGRAM.to_owned(),
+    ];
+    tracing::error!(
+        display = %lines.join("\n"),
+        abcode = InterestAbend::ABCODE,
+        "{ABENDING_PROGRAM}"
+    );
+    ExitStatus::Abend {
+        lines,
+        abcode: Some(InterestAbend::ABCODE),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carddemo_domain::messages::{
+        ABENDING_PROGRAM, ERROR_CLOSING_TRANSACTION_FILE, ERROR_OPENING_TRANSACTION_FILE,
+        ERROR_WRITING_TRANSACTION_RECORD,
+    };
+    use carddemo_domain::rules::interest::InterestAbend;
+
+    use super::{NO_FURTHER_INFORMATION, abend_status, parm_date, systran_abend};
+    use crate::cli::IntcalcArgs;
+    use crate::exit::{ABEND, ExitStatus};
+
+    fn args(parm: &str) -> IntcalcArgs {
+        IntcalcArgs {
+            parm_date: parm.to_owned(),
+        }
+    }
+
+    #[test]
+    fn parm_date_is_the_jcl_parm_as_x10() {
+        assert_eq!(
+            parm_date(&args("2022071800")).map(|parm| *parm.as_bytes()),
+            Ok(*b"2022071800")
+        );
+    }
+
+    #[test]
+    fn parm_date_of_another_length_is_a_setup_failure() {
+        for parm in ["202207180", "20220718000"] {
+            let status = parm_date(&args(parm)).err();
+            assert!(
+                matches!(status, Some(ExitStatus::SetupFailure(_))),
+                "{parm}: {status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn systran_failures_abend_999_with_status_30() {
+        let cases = [
+            (
+                systran_abend(ERROR_OPENING_TRANSACTION_FILE),
+                ERROR_OPENING_TRANSACTION_FILE,
+            ),
+            (
+                systran_abend(ERROR_CLOSING_TRANSACTION_FILE),
+                ERROR_CLOSING_TRANSACTION_FILE,
+            ),
+            (
+                abend_status(&InterestAbend::SystranWrite {
+                    status: NO_FURTHER_INFORMATION,
+                }),
+                ERROR_WRITING_TRANSACTION_RECORD,
+            ),
+        ];
+        for (status, text) in cases {
+            assert_eq!(status.code(), ABEND, "{text}");
+            assert_eq!(
+                status.render(),
+                [
+                    text,
+                    "FILE STATUS IS: NNNN0030",
+                    ABENDING_PROGRAM,
+                    "ABEND 999"
+                ],
+                "{text}"
+            );
+        }
+    }
+}

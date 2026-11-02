@@ -8,7 +8,7 @@
 //! | 0 | Success |
 //! | 4 | Records rejected or failed while the run went on (`RETURN-CODE` 4) |
 //! | 8 | Reward-engine halt, `posttran` only |
-//! | 16 | Abend, `creastmt` capacity stop or setup failure |
+//! | 16 | Abend, `creastmt` capacity stop, `combtran` equivalence halt or setup failure |
 //! | REPRO code | The condition code of an IDCAMS REPRO step, such as `combtran` STEP10 |
 //!
 //! Stdout carries only the JSON telemetry lines, so COBOL `DISPLAY` output such as the run
@@ -16,7 +16,7 @@
 //! [`ExitStatus::render`] returns for an abend, a halt or a setup failure. The COBOL texts among
 //! them arrive already rendered by the domain values that own them, whose texts live in
 //! `carddemo_domain::messages`. This module composes only `ABEND {code}`, the reward-halt line,
-//! the capacity-stop line and the setup prefix.
+//! the capacity-stop line, the equivalence-halt line and the setup prefix.
 
 use std::fmt;
 use std::io::Write;
@@ -38,8 +38,8 @@ pub(crate) const REWARD_HALT: i32 = 8;
 /// `ABCODE` 999 [app/cbl/CBTRN02C.cbl:L707-711] [app/cbl/CBACT04C.cbl:L628-632]
 /// [app/cbl/CBTRN03C.cbl:L626-630], and CBSTM03A with no code [app/cbl/CBSTM03A.CBL:L921-923].
 /// Also CBPAUP0C `9999-ABEND`, which moves 16 to `RETURN-CODE`
-/// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L377-383], the `creastmt` capacity stop
-/// and every setup failure.
+/// [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L377-383], the `creastmt` capacity stop,
+/// the `combtran` equivalence halt and every setup failure.
 pub(crate) const ABEND: i32 = 16;
 
 /// How a subcommand ended: its exit code ([`ExitStatus::code`]) and its stderr lines
@@ -95,6 +95,17 @@ pub(crate) enum ExitStatus {
         escalation_id: String,
     },
 
+    /// A job stopped before writing the output of a step because its input belongs to an input
+    /// class whose COBOL result the parity audit cannot pin, a `halt` escalation: `combtran`
+    /// on a SORT input holding two different records with one TRAN-ID, whose order the SORT
+    /// without `EQUALS` leaves undefined (P-COMBTRAN-001, P-COMBTRAN-009, E-38).
+    EquivalenceHalt {
+        /// The text of the job's halt report, one entry per line.
+        lines: Vec<String>,
+        /// The `halt` escalation that records the input class.
+        escalation_id: String,
+    },
+
     /// The condition code of an IDCAMS REPRO step, as the parity audit records it, carrying no
     /// other meaning: 8 here is not a reward halt. `combtran` STEP10 loads the combined file
     /// with no `REPLACE` [app/jcl/COMBTRAN.jcl:L41-48], so it ends with 0 (P-COMBTRAN-002), or
@@ -126,7 +137,10 @@ impl ExitStatus {
                 code
             }
             Self::RewardHalt { .. } => REWARD_HALT,
-            Self::Abend { .. } | Self::CapacityStop { .. } | Self::SetupFailure(_) => ABEND,
+            Self::Abend { .. }
+            | Self::CapacityStop { .. }
+            | Self::EquivalenceHalt { .. }
+            | Self::SetupFailure(_) => ABEND,
             Self::ReproCondition(condition_code) => i32::from(*condition_code),
         }
     }
@@ -157,6 +171,14 @@ impl ExitStatus {
                 .iter()
                 .cloned()
                 .chain([format!("CAPACITY STOP: halt escalation {escalation_id}")])
+                .collect(),
+            Self::EquivalenceHalt {
+                lines,
+                escalation_id,
+            } => lines
+                .iter()
+                .cloned()
+                .chain([format!("EQUIVALENCE HALT: halt escalation {escalation_id}")])
                 .collect(),
             Self::SetupFailure(message) => vec![format!("SETUP FAILURE: {}", one_line(message))],
         }
@@ -189,6 +211,18 @@ impl ExitStatus {
     /// escalation that records the input class.
     pub(crate) fn capacity_stop(err: &impl fmt::Display, escalation_id: impl Into<String>) -> Self {
         Self::CapacityStop {
+            lines: text_lines(err),
+            escalation_id: escalation_id.into(),
+        }
+    }
+
+    /// An equivalence halt reporting the lines of `err`'s text and the `halt` escalation that
+    /// records the input class.
+    pub(crate) fn equivalence_halt(
+        err: &impl fmt::Display,
+        escalation_id: impl Into<String>,
+    ) -> Self {
+        Self::EquivalenceHalt {
             lines: text_lines(err),
             escalation_id: escalation_id.into(),
         }
@@ -260,6 +294,7 @@ mod tests {
             (ExitStatus::abend_from(&ABENDING_PROGRAM, Some(999)), 16),
             (ExitStatus::abend_from(&CBPAUP0C_ABENDING, None), 16),
             (ExitStatus::capacity_stop(&"too many cards", "E-99"), 16),
+            (ExitStatus::equivalence_halt(&"equal keys", "E-99"), 16),
             (ExitStatus::setup("connection refused"), 16),
             (ExitStatus::ReproCondition(0), 0),
             (ExitStatus::ReproCondition(8), 8),
@@ -347,17 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn capacity_stop_ends_with_the_escalation() {
+    fn halt_stops_end_with_the_escalation() {
         let err = DisplayLines(vec!["first line".to_owned(), "second line".to_owned()]);
-        let status = ExitStatus::capacity_stop(&err, "E-99");
-        assert_eq!(
-            status.render(),
-            [
-                "first line",
-                "second line",
-                "CAPACITY STOP: halt escalation E-99"
-            ]
-        );
+        let cases = [
+            (
+                ExitStatus::capacity_stop(&err, "E-99"),
+                "CAPACITY STOP: halt escalation E-99",
+            ),
+            (
+                ExitStatus::equivalence_halt(&err, "E-99"),
+                "EQUIVALENCE HALT: halt escalation E-99",
+            ),
+        ];
+        for (status, last) in cases {
+            assert_eq!(status.render(), ["first line", "second line", last]);
+        }
     }
 
     #[test]

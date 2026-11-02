@@ -31,6 +31,15 @@
 //! Token `iat` and `exp` never read it: `crate::auth::jwt` stamps them from
 //! system time, because a pinned instant in the past would issue tokens that
 //! are already expired.
+//!
+//! # Version tokens
+//!
+//! [`AppState::version_key`] keys the record version tokens that replace the
+//! COMMAREA copy of a fetched record: `GET /accounts/{id}` and
+//! `GET /cards/{id}` issue them, the matching `PUT` checks them (AAP 0.3.7).
+//! The key is built from `CARDDEMO_JWT_SECRET`, the server secret the process
+//! already holds, so every API process started with the same settings checks
+//! the tokens any of them issued.
 
 use std::fmt;
 use std::sync::Arc;
@@ -38,6 +47,7 @@ use std::sync::Arc;
 use axum::http::HeaderValue;
 use axum::http::header::InvalidHeaderValue;
 use carddemo_domain::clock::{AnyClock, ClockError};
+use carddemo_domain::rules::{VersionError, VersionKey};
 use carddemo_persistence::Db;
 use carddemo_runtime::config::Settings;
 
@@ -45,7 +55,7 @@ use crate::auth::jwt::JwtKeys;
 
 /// The shared state of the API process.
 ///
-/// Cloning copies a pool handle, three reference counts and the origin
+/// Cloning copies a pool handle, four reference counts and the origin
 /// header; every clone sees the same connections, settings, clock and keys.
 #[derive(Clone)]
 pub struct AppState {
@@ -53,14 +63,16 @@ pub struct AppState {
     settings: Arc<Settings>,
     clock: Arc<AnyClock>,
     jwt: Arc<JwtKeys>,
+    version_key: Arc<VersionKey>,
     cors_origin: HeaderValue,
 }
 
 impl fmt::Debug for AppState {
     /// Shows every field through its own `Debug`, each of which keeps its
     /// secrets out: [`Settings`] redacts the database and broker URLs and the
-    /// JWT secret, [`JwtKeys`] prints only its algorithm and lifetime, and
-    /// [`Db`] only its pool's size and options.
+    /// JWT secret, [`JwtKeys`] prints only its algorithm and lifetime,
+    /// [`VersionKey`] prints `VersionKey(<redacted>)`, and [`Db`] only its
+    /// pool's size and options.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Exhaustive destructuring: a field added to `AppState` fails to
         // compile here until it is decided whether `Debug` may show it.
@@ -69,6 +81,7 @@ impl fmt::Debug for AppState {
             settings,
             clock,
             jwt,
+            version_key,
             cors_origin,
         } = self;
         f.debug_struct("AppState")
@@ -76,6 +89,7 @@ impl fmt::Debug for AppState {
             .field("settings", settings)
             .field("clock", clock)
             .field("jwt", jwt)
+            .field("version_key", version_key)
             .field("cors_origin", cors_origin)
             .finish()
     }
@@ -94,6 +108,10 @@ pub enum StateError {
     /// control character other than tab, such as a line break, or DEL.
     #[error("invalid CARDDEMO_CORS_ORIGIN: {0}")]
     CorsOrigin(#[from] InvalidHeaderValue),
+    /// `CARDDEMO_JWT_SECRET` cannot key the record version tokens: it is
+    /// empty, which would leave every token computable from the record.
+    #[error("invalid CARDDEMO_JWT_SECRET for the record version key: {0}")]
+    VersionKey(#[from] VersionError),
 }
 
 /// Everything [`AppState::new`] derives from the settings, apart from the
@@ -104,19 +122,22 @@ struct Derived {
     clock: AnyClock,
     cors_origin: HeaderValue,
     jwt: JwtKeys,
+    version_key: VersionKey,
 }
 
 impl Derived {
-    /// Parses the clock override, then the CORS origin, and builds the token
-    /// keys, which cannot fail.
+    /// Parses the clock override, then the CORS origin, builds the token
+    /// keys, which cannot fail, and then the version key.
     fn from_settings(settings: &Settings) -> Result<Self, StateError> {
         let clock = AnyClock::from_override(settings.clock_override.as_deref())?;
         let cors_origin = HeaderValue::from_str(&settings.cors_origin)?;
         let jwt = JwtKeys::new(&settings.jwt_secret, settings.jwt_ttl_secs);
+        let version_key = VersionKey::new(settings.jwt_secret.as_bytes())?;
         Ok(Self {
             clock,
             cors_origin,
             jwt,
+            version_key,
         })
     }
 }
@@ -131,26 +152,32 @@ impl AppState {
     /// - The token keys sign and verify HS256 tokens with
     ///   `CARDDEMO_JWT_SECRET` and issue them for `CARDDEMO_JWT_TTL_SECS`
     ///   seconds.
+    /// - The version key keys the record version tokens with
+    ///   `CARDDEMO_JWT_SECRET`.
     ///
     /// Nothing here connects or reads the environment: `db` is already open
     /// and `settings` already resolved.
     ///
     /// # Errors
     ///
-    /// [`StateError::Clock`] when `CARDDEMO_CLOCK_OVERRIDE` is set and is not
-    /// an RFC 3339 instant; otherwise [`StateError::CorsOrigin`] when
-    /// `CARDDEMO_CORS_ORIGIN` is not a valid header value.
+    /// The first setting that fails, in this order: [`StateError::Clock`]
+    /// when `CARDDEMO_CLOCK_OVERRIDE` is set and is not an RFC 3339 instant,
+    /// [`StateError::CorsOrigin`] when `CARDDEMO_CORS_ORIGIN` is not a valid
+    /// header value, and [`StateError::VersionKey`] when
+    /// `CARDDEMO_JWT_SECRET` is empty.
     pub fn new(db: Db, settings: Settings) -> Result<Self, StateError> {
         let Derived {
             clock,
             cors_origin,
             jwt,
+            version_key,
         } = Derived::from_settings(&settings)?;
         Ok(Self {
             db,
             settings: Arc::new(settings),
             clock: Arc::new(clock),
             jwt: Arc::new(jwt),
+            version_key: Arc::new(version_key),
             cors_origin,
         })
     }
@@ -182,6 +209,13 @@ impl AppState {
         &self.jwt
     }
 
+    /// The key of the record version tokens: a handler passes it to the view
+    /// rule that issues a token and to the update rule that checks one.
+    #[must_use]
+    pub fn version_key(&self) -> &VersionKey {
+        &self.version_key
+    }
+
     /// The one browser origin the CORS layer admits.
     #[must_use]
     pub fn cors_origin(&self) -> &HeaderValue {
@@ -192,6 +226,7 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use carddemo_domain::clock::{AnyClock, Clock, ClockError, FixedClock, SystemClock};
+    use carddemo_domain::rules::{VersionError, VersionKey, version_token};
     use carddemo_runtime::config::{Settings, defaults};
     use chrono::{DateTime, Utc};
 
@@ -260,7 +295,9 @@ mod tests {
                 StateError::Clock(ClockError::InvalidOverride(value)) => {
                     assert_eq!(value, text.trim(), "{text:?}");
                 }
-                StateError::CorsOrigin(_) => panic!("{text:?} gave {err:?}"),
+                StateError::CorsOrigin(_) | StateError::VersionKey(_) => {
+                    panic!("{text:?} gave {err:?}")
+                }
             }
             assert!(
                 err.to_string()
@@ -318,6 +355,47 @@ mod tests {
                 .verify(&issued.token)
                 .is_err(),
             "another secret must not verify the token"
+        );
+    }
+
+    #[test]
+    fn version_key_is_the_configured_secret() {
+        let parts: [&[u8]; 2] = [b"747", b"ANIYA VON"];
+        let token_under = |secret: &str| {
+            let settings = Settings {
+                jwt_secret: secret.to_owned(),
+                ..Settings::default()
+            };
+            let derived = derive(&settings).expect("valid settings");
+            version_token(&derived.version_key, &parts).expect("a token")
+        };
+        let configured = VersionKey::new(b"state-test-secret").expect("a secret");
+        assert_eq!(
+            token_under("state-test-secret"),
+            version_token(&configured, &parts).expect("a token")
+        );
+        assert_ne!(
+            token_under("state-test-secret"),
+            token_under(defaults::JWT_SECRET),
+            "another secret must issue another token"
+        );
+    }
+
+    #[test]
+    fn empty_secret_is_a_version_key_error() {
+        let settings = Settings {
+            jwt_secret: String::new(),
+            ..Settings::default()
+        };
+        let err = derive(&settings).expect_err("an empty secret keys nothing");
+        assert!(
+            matches!(err, StateError::VersionKey(VersionError::EmptyKey)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("invalid CARDDEMO_JWT_SECRET for the record version key: "),
+            "{err}"
         );
     }
 }

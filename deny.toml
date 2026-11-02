@@ -16,7 +16,7 @@ unmaintained = "workspace"
 # Supply-chain exceptions forced by the pinned stack (escalation E-11, awaiting
 # the user's acceptance). These are not Rust lint suppressions.
 ignore = [
-    { id = "RUSTSEC-2026-0187", reason = "lopdf 0.31 unbounded recursion on nested objects, fixed in 0.42. lopdf 0.31 is forced by printpdf 0.7, and the statement test parses only PDFs this program writes (E-11)" },
+    { id = "RUSTSEC-2026-0187", reason = "lopdf 0.31 unbounded recursion on nested objects, fixed in 0.42. lopdf 0.31 is forced by printpdf 0.7, and it parses only PDFs this program writes: the statement renderer reads back its own output and the statement test reads the rendered file (E-11)" },
     { id = "RUSTSEC-2025-0111", reason = "tokio-tar PAX header handling, no fixed release. Dev-only, through testcontainers 0.23 (E-11)" },
 ]
 
