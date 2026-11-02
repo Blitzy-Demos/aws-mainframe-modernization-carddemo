@@ -130,8 +130,22 @@ mod tests {
 
     impl Drop for Scratch {
         fn drop(&mut self) {
-            // Cleanup only: a leftover directory fails no assertion.
-            let _ = fs::remove_dir_all(&self.0);
+            // A directory that cannot be removed fails the test with its path and
+            // the I/O error, the only report libtest shows for a passing test.
+            // While the test is already unwinding, a second panic would abort the
+            // process and hide the first failure, so the error goes to standard
+            // error instead.
+            if let Err(err) = fs::remove_dir_all(&self.0) {
+                let message = format!(
+                    "the scratch directory {} cannot be removed: {err}",
+                    self.0.display()
+                );
+                if std::thread::panicking() {
+                    eprintln!("{message}");
+                } else {
+                    panic!("{message}");
+                }
+            }
         }
     }
 

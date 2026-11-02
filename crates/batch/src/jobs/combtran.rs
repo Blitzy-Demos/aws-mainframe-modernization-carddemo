@@ -24,13 +24,19 @@
 //!
 //! # Failures without a COBOL counterpart
 //!
-//! - A `(0)` generation that is not cataloged, a SORTIN or combined file that cannot be read or
-//!   decoded, and a failure to allocate, write or catalog `TRANSACT.COMBINED(+1)` are setup
-//!   failures (exit 16). `TRANSACT.COMBINED(+1)` is then not cataloged and the live master is
+//! - `STEP05R` failures, before `TRANSACT.COMBINED(+1)` is cataloged, are setup failures
+//!   (exit 16): a `(0)` generation that is not cataloged, a SORTIN file that cannot be read or
+//!   decoded, and a failure to allocate, write or catalog `TRANSACT.COMBINED(+1)`. No
+//!   `TRANSACT.COMBINED(+1)` is then cataloged, `STEP10` does not run and the live master is
 //!   untouched.
-//! - A database failure during `STEP10` is a setup failure too. The whole load is rolled back,
-//!   so the live master is as the run found it and a rerun starts from the same state, while the
-//!   cataloged `TRANSACT.COMBINED(+1)` stays.
+//! - `STEP10` failures, after `TRANSACT.COMBINED(+1)` is cataloged, are setup failures (exit 16)
+//!   too: a combined file that cannot be read or decoded, a unit of work that cannot begin, a
+//!   record that cannot be loaded, and a commit that fails. The cataloged
+//!   `TRANSACT.COMBINED(+1)` stays, and the live master is as the run found it, because the load
+//!   never began or is rolled back whole, so a rerun starts from the same live master. The job
+//!   span records `posted` 0 and in `rejected` the duplicate records met before the failure,
+//!   and one `warn` event gives the records the uncommitted load inserted, revived and found
+//!   duplicate.
 //! - Two different records with one TRAN-ID in the SORT input stop the job before
 //!   `TRANSACT.COMBINED(+1)` is allocated: an equivalence halt (exit 16, E-38).
 
@@ -242,43 +248,58 @@ impl fmt::Display for EqualKeyHalt<'_> {
 ///
 /// Reads `TRANSACT.COMBINED(+1)`, the `TRANSACT` DD of the step, from the file `STEP05R`
 /// cataloged, loads its records into the live master in file order by [`load_records`] inside
-/// one unit of work, and commits. Records the loaded records in `posted` and the duplicate
-/// records in `rejected` on the job span, and ends with the `REPRO` condition code:
+/// one unit of work, and commits. Once the load is committed, [`finish`] records the loaded
+/// records in `posted` and the duplicate records in `rejected` on the job span, and the step
+/// ends with the `REPRO` condition code:
 ///
 /// - 0 when every record loaded, an empty file included (P-COMBTRAN-002, P-COMBTRAN-005);
 /// - 8 after one to three duplicate records (P-COMBTRAN-003, P-COMBTRAN-008);
 /// - 12 when the fourth duplicate record stops the load (P-COMBTRAN-003, P-COMBTRAN-006,
 ///   P-COMBTRAN-007).
 ///
-/// A setup failure (exit 16) when the file cannot be read, the unit of work cannot begin or
-/// commit, or a record cannot be loaded; the load is then rolled back.
+/// A setup failure (exit 16) ends the step, through [`not_committed`], when the file cannot be
+/// read or decoded or the unit of work cannot begin, before any record is loaded; when a record
+/// cannot be loaded, after which the load is rolled back; or when the commit fails. Each leaves
+/// the cataloged `TRANSACT.COMBINED(+1)` in place and the live master as the run found it, and
+/// records `posted` 0 and in `rejected` the duplicate records met before the failure.
 async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
+    let mut tally = ReproTally::default();
     let records = match read_records::<TransactionLayout>(&combined.path) {
         Ok(records) => records,
-        Err(err) => return setup_failure("TRANSACT.COMBINED(+1) read failed", err),
+        Err(err) => {
+            return not_committed(
+                tally,
+                setup_failure("TRANSACT.COMBINED(+1) read failed", err),
+            );
+        }
     };
     let mut uow = match db.begin().await {
         Ok(uow) => uow,
-        Err(err) => return setup_failure("live transaction master load failed", err),
-    };
-    let tally = match load_records(&mut uow, &records).await {
-        Ok(tally) => tally,
-        Err(status) => {
-            if let Err(err) = uow.rollback().await {
-                tracing::error!(error = %err, "live transaction master load not rolled back");
-            }
-            return status;
+        Err(err) => {
+            return not_committed(
+                tally,
+                setup_failure("live transaction master load failed", err),
+            );
         }
     };
+    if let Err(status) = load_records(&mut uow, &records, &mut tally).await {
+        if let Err(err) = uow.rollback().await {
+            tracing::error!(error = %err, "live transaction master load not rolled back");
+        }
+        return not_committed(tally, status);
+    }
     if let Err(err) = uow.commit().await {
-        return setup_failure("live transaction master load failed", err);
+        return not_committed(
+            tally,
+            setup_failure("live transaction master load failed", err),
+        );
     }
     finish(tally, records.len())
 }
 
 /// The `REPRO` record loop of STEP10 [app/jcl/COMBTRAN.jcl:L48] — P-COMBTRAN-003: each record,
-/// in file order, through `PgStore::load_combined_record`, until [`ReproTally::count`] stops the
-/// load at the error limit.
+/// in file order, through `PgStore::load_combined_record`, counted in `tally`, until
+/// [`ReproTally::count`] stops the load at the error limit.
 ///
 /// A duplicate record emits one `IDC3308I DUPLICATE RECORD` warning with its record number and
 /// TRAN-ID, and the stop one `IDC31467I MAXIMUM ERROR LIMIT REACHED` warning.
@@ -286,12 +307,13 @@ async fn repro_step(db: &Db, combined: &Generation) -> ExitStatus {
 /// # Errors
 ///
 /// A setup failure (exit 16) naming the record number and TRAN-ID of the first record whose
-/// load fails. The audit records no condition code for it.
+/// load fails. The audit records no condition code for it. `tally` then holds the records
+/// counted before that one.
 async fn load_records(
     uow: &mut UnitOfWork,
     records: &[TransactionRecord],
-) -> Result<ReproTally, ExitStatus> {
-    let mut tally = ReproTally::default();
+    tally: &mut ReproTally,
+) -> Result<(), ExitStatus> {
     for (index, record) in records.iter().enumerate() {
         let record_number = index + 1;
         let tran_id = record.transaction.tran_id;
@@ -319,7 +341,7 @@ async fn load_records(
             break;
         }
     }
-    Ok(tally)
+    Ok(())
 }
 
 /// The end of STEP10 once the load is committed: the counts on the job span, one end event, and
@@ -327,9 +349,7 @@ async fn load_records(
 fn finish(tally: ReproTally, read: usize) -> ExitStatus {
     let condition_code = tally.condition_code();
     let loaded = tally.loaded();
-    let span = Span::current();
-    span.record("posted", loaded);
-    span.record("rejected", tally.duplicates);
+    tally.record_on_span(loaded);
     tracing::info!(
         read,
         inserted = tally.inserted,
@@ -340,6 +360,25 @@ fn finish(tally: ReproTally, read: usize) -> ExitStatus {
         "IDC0005I NUMBER OF RECORDS PROCESSED WAS {loaded}"
     );
     ExitStatus::ReproCondition(condition_code)
+}
+
+/// The end of STEP10 when the load is not committed, a failure the COBOL has no counterpart
+/// for: the job span records `posted` 0, since the live master keeps none of the load, and in
+/// `rejected` the duplicate records met before the failure. One `warn` event reports the
+/// records the uncommitted load handled (`inserted`, `revived`, `duplicates` and their sum
+/// `attempted`) beside `posted` 0. Returns `status`, the failure that ended the step.
+fn not_committed(tally: ReproTally, status: ExitStatus) -> ExitStatus {
+    const POSTED: usize = 0;
+    tally.record_on_span(POSTED);
+    tracing::warn!(
+        inserted = tally.inserted,
+        revived = tally.revived,
+        duplicates = tally.duplicates,
+        attempted = tally.attempted(),
+        posted = POSTED,
+        "live transaction master load not committed: {POSTED} records posted"
+    );
+    status
 }
 
 /// The record accounting of one `REPRO` run — P-COMBTRAN-003: what each record's load did, and
@@ -368,6 +407,14 @@ impl ReproTally {
         } else {
             ControlFlow::Continue(())
         }
+    }
+
+    /// Records `posted`, the records the live master keeps from the load, and the duplicate
+    /// records in `rejected` on the job span.
+    fn record_on_span(&self, posted: usize) {
+        let span = Span::current();
+        span.record("posted", posted);
+        span.record("rejected", self.duplicates);
     }
 
     /// The records written to the live master: inserted or revived.
@@ -400,6 +447,7 @@ impl ReproTally {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::ErrorKind;
     use std::path::PathBuf;
 
     use carddemo_domain::clock::{AnyClock, SystemClock};
@@ -481,9 +529,21 @@ mod tests {
     }
 
     impl Drop for BatchDir {
+        /// Removes the directory. A directory that is already gone is not a failure. Any
+        /// other removal failure fails the test with the path and the error; while the test
+        /// is already panicking it is only reported, because a second panic aborts the run.
         fn drop(&mut self) {
-            // Best effort: a directory left behind holds only this test's files.
-            let _ = fs::remove_dir_all(&self.0);
+            let Err(error) = fs::remove_dir_all(&self.0) else {
+                return;
+            };
+            if error.kind() == ErrorKind::NotFound {
+                return;
+            }
+            if std::thread::panicking() {
+                eprintln!("remove {}: {error}", self.0.display());
+            } else {
+                panic!("remove {}: {error}", self.0.display());
+            }
         }
     }
 

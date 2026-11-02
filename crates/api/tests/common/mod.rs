@@ -26,8 +26,19 @@
 //! calling test. The harness names only the seed credentials and route
 //! paths, and reaches SQL only through [`TestApp::stack`], whose
 //! `exec_sql` and `fetch_text_rows` run text-typed statements.
+//!
+//! Every request is bounded, so a handler stalled on SQL or a lock fails its
+//! test instead of hanging the suite: connecting may take at most
+//! [`CONNECT_TIMEOUT`], and the whole exchange, from the start of the
+//! connection until the response body has been read, at most
+//! [`REQUEST_TIMEOUT`]. A test that deliberately needs another bound shapes
+//! its request through [`TestApp::client`], sets it with
+//! `RequestBuilder::timeout`, which replaces [`REQUEST_TIMEOUT`] for that
+//! request only, and passes the builder to [`send`]. An expired bound panics
+//! naming the stage, the URL and the bound.
 
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use carddemo_audit::{Document, IdKind, PARITY_AUDIT_PATH, Repo, VALIDATION_AUDIT_PATH};
 use carddemo_runtime::config::Settings;
@@ -51,6 +62,21 @@ const SEED_PASSWORD: &str = "PASSWORD";
 
 /// The sign-on route, the only issuer of bearer tokens.
 const LOGIN_PATH: &str = "/auth/login";
+
+/// The bound on opening the TCP connection to the test server.
+///
+/// The server listens on `127.0.0.1`, so a connection that is not open within
+/// this bound means the server task is not accepting.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The default bound on one whole request, from the start of the connection
+/// until the response body has been read.
+///
+/// It is generous enough for unoptimised builds of the report and posting
+/// handlers on a loaded host, and finite, so a handler stalled on SQL or a
+/// lock fails its test. `RequestBuilder::timeout` replaces it for a single
+/// request.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One HTTP response: the status, the body parsed as JSON (`Value::Null` when
 /// the body is empty or not JSON), and the raw body text.
@@ -94,9 +120,10 @@ impl TestApp {
     ///
     /// # Panics
     ///
-    /// Panics if Docker is unavailable or the container does not start, if the
-    /// seed fails, if the settings are rejected by `AppState::new`, or if no
-    /// local port can be bound.
+    /// Panics if the bounded HTTP client cannot be built, if Docker is
+    /// unavailable or the container does not start, if the seed fails, if the
+    /// settings are rejected by `AppState::new`, or if no local port can be
+    /// bound.
     #[must_use]
     pub fn start() -> Self {
         Self::launch(None)
@@ -118,9 +145,20 @@ impl TestApp {
         Self::launch(Some(rfc3339.to_owned()))
     }
 
-    /// Builds the stack, the state and the server task, all inside one
-    /// `block_on`, so each is bound to the shared test runtime.
+    /// Builds the client bounded by [`CONNECT_TIMEOUT`] and
+    /// [`REQUEST_TIMEOUT`], then the stack, the state and the server task, all
+    /// inside one `block_on`, so each is bound to the shared test runtime.
+    ///
+    /// The client comes first, so a client that cannot be built fails the test
+    /// before a container or a server task exists.
     fn launch(clock_override: Option<String>) -> Self {
+        let client = Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|error| {
+                panic!("building the bounded test HTTP client failed: {error}")
+            });
         let (stack, port, server) = block_on(async move {
             let stack = TestStack::postgres().await;
             stack
@@ -150,7 +188,7 @@ impl TestApp {
             (stack, port, server)
         });
         Self {
-            client: Client::new(),
+            client,
             base_url: format!("http://127.0.0.1:{port}"),
             server,
             stack,
@@ -174,6 +212,12 @@ impl TestApp {
 
     /// The HTTP client, for requests the helpers below do not shape, such as
     /// a malformed `Authorization` header.
+    ///
+    /// It is bounded by [`CONNECT_TIMEOUT`] and [`REQUEST_TIMEOUT`]. A request
+    /// that deliberately needs another total bound sets it with
+    /// `RequestBuilder::timeout`, for example `.timeout(Duration::from_secs(300))`,
+    /// which replaces [`REQUEST_TIMEOUT`] for that request only; passing the
+    /// builder to [`send`] keeps the harness's diagnostics.
     #[must_use]
     pub fn client(&self) -> &Client {
         &self.client
@@ -254,20 +298,60 @@ impl TestApp {
 
 /// Sends `builder`, with `token` as the bearer token when given, and reads the
 /// whole response.
-async fn send(builder: RequestBuilder, token: Option<&str>) -> Resp {
+///
+/// `builder` comes from [`TestApp::client`], so the exchange runs under
+/// [`CONNECT_TIMEOUT`] and, from the start of the connection until the body
+/// has been read, under [`REQUEST_TIMEOUT`], or under the request's own bound
+/// when `builder` sets one with `RequestBuilder::timeout`. The helpers of
+/// [`TestApp`] call it; a test calls it directly for a request it shapes
+/// itself.
+///
+/// # Panics
+///
+/// Panics if the request cannot be built or sent or its body cannot be read.
+/// When a bound expires, the panic names the stage (connecting, waiting for
+/// the response, or reading the body), the URL and the bound that expired.
+pub async fn send(builder: RequestBuilder, token: Option<&str>) -> Resp {
     let builder = match token {
         Some(token) => builder.bearer_auth(token),
         None => builder,
     };
-    let response = builder
-        .send()
-        .await
-        .unwrap_or_else(|error| panic!("the test request failed: {error}"));
+    let (client, request) = builder.build_split();
+    let request = request.unwrap_or_else(|error| panic!("the test request failed: {error}"));
+    let url = request.url().clone();
+    let (bound, origin) = match request.timeout() {
+        Some(own) => (*own, "the request's own timeout"),
+        None => (REQUEST_TIMEOUT, "the harness REQUEST_TIMEOUT"),
+    };
+    let response = client.execute(request).await.unwrap_or_else(|error| {
+        let url = error.url().unwrap_or(&url);
+        if error.is_timeout() && error.is_connect() {
+            panic!(
+                "the test request to {url} timed out connecting: no connection within \
+                 {CONNECT_TIMEOUT:?}, the harness CONNECT_TIMEOUT ({error})"
+            )
+        } else if error.is_timeout() {
+            panic!(
+                "the test request to {url} timed out waiting for the response: no response \
+                 within {bound:?}, {origin} ({error})"
+            )
+        } else {
+            panic!("the test request failed: {error}")
+        }
+    });
     let status = response.status();
-    let text = response
-        .text()
-        .await
-        .unwrap_or_else(|error| panic!("reading the test response body failed: {error}"));
+    let url = response.url().clone();
+    let text = response.text().await.unwrap_or_else(|error| {
+        if error.is_timeout() {
+            panic!(
+                "the test request to {url} timed out reading the response body: the {status} \
+                 response was not complete within {bound:?} of the request start, {origin} \
+                 ({error})"
+            )
+        } else {
+            panic!("reading the test response body failed: {error}")
+        }
+    });
     let json = serde_json::from_str(&text).unwrap_or(Value::Null);
     (status, json, text)
 }

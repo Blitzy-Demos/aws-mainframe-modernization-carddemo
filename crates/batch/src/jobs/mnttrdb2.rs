@@ -22,8 +22,11 @@
 //! in the persistence adapter, so a failed statement changes nothing and leaves the others in
 //! place, as Db2 does for a statement that ends with a negative `SQLCODE`. Each `DISPLAY`
 //! becomes one `tracing` event inside the job span: `info` for the `PROCESSING` line and the
-//! success displays, `warn` for the `9999-ABEND` display. The job span receives the counts
-//! `read`, `written` (inserts and updates), `deleted` and `rejected` (failed records).
+//! success displays, `warn` for the `9999-ABEND` display. The job span receives `read` and
+//! `rejected` (failed records) once every record is treated, before the `STOP RUN` commit, and
+//! then `written` (inserts and updates) and `deleted` as the commit leaves the master: the
+//! statements' counts when it commits, 0 when it fails and every statement is undone, the
+//! undone counts then going to one `warn` event.
 
 use std::fmt;
 use std::fs;
@@ -58,7 +61,10 @@ const INPUT_LAYOUT: &str = "COBTUPDT";
 ///
 /// - the input cannot be read or framed (P-COBTUPDT-011, E-36), before any change;
 /// - the unit of work cannot begin, before any change;
-/// - the commit at `STOP RUN` fails, which leaves every statement of the run undone.
+/// - the commit at `STOP RUN` fails, which leaves every statement of the run undone. The job
+///   span keeps the `read` and `rejected` counts recorded before the commit and records
+///   `written` and `deleted` as 0, and one `warn` event carries the inserts, updates and
+///   deletes undone.
 pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> ExitStatus {
     let records = match load_records(&args.input) {
         Ok(records) => records,
@@ -74,14 +80,24 @@ pub(super) async fn run(_ctx: &JobContext, db: &Db, args: &Mnttrdb2Args) -> Exit
         let outcome = treat_record(&mut uow, &mut run, index + 1, record).await;
         counts.add(&outcome);
     }
-    Span::current().record("read", counts.read);
-    if let Err(err) = uow.commit().await {
-        return setup_failure("MNTTRDB2 STOP RUN commit failed", err);
-    }
     let span = Span::current();
+    span.record("read", counts.read);
+    span.record("rejected", counts.failed);
+    if let Err(err) = uow.commit().await {
+        let status = setup_failure("MNTTRDB2 STOP RUN commit failed", err);
+        span.record("written", 0_usize);
+        span.record("deleted", 0_usize);
+        tracing::warn!(
+            undone_written = counts.written,
+            undone_deleted = counts.deleted,
+            written = 0_usize,
+            deleted = 0_usize,
+            "MNTTRDB2 STOP RUN commit failed: every statement undone, 0 types written or deleted"
+        );
+        return status;
+    }
     span.record("written", counts.written);
     span.record("deleted", counts.deleted);
-    span.record("rejected", counts.failed);
     ExitStatus::ReturnCode(run.return_code())
 }
 
@@ -215,7 +231,7 @@ mod tests {
     use std::path::PathBuf;
 
     use carddemo_codec::CodecErrorKind;
-    use carddemo_domain::messages::NO_RECORDS_FOUND;
+    use carddemo_domain::messages::{NO_RECORDS_FOUND, PROCESSING};
     use carddemo_domain::rules::tran_type_batch::{MaintRecord, RecordOutcome, parse_record};
 
     use super::{Counts, load_records, parse_input};
@@ -247,7 +263,7 @@ mod tests {
         assert_eq!(parsed.len(), 10);
         assert_eq!(
             parsed[1].processing_message().trim_end(),
-            "PROCESSING   A08BALANCE TRANSFER"
+            format!("{PROCESSING}A08BALANCE TRANSFER")
         );
     }
 
