@@ -297,9 +297,9 @@ mod tests {
         assert_eq!(
             status.render(),
             [
-                "ERROR OPENING DALYTRAN",
+                ERROR_OPENING_DALYTRAN,
                 "FILE STATUS IS: NNNN0035",
-                "ABENDING PROGRAM",
+                ABENDING_PROGRAM,
                 "ABEND 999",
             ]
         );
@@ -330,7 +330,7 @@ mod tests {
             }
         );
         assert_eq!(
-            ExitStatus::abend_from(&"ABENDING PROGRAM\n", None),
+            ExitStatus::abend_from(&format!("{ABENDING_PROGRAM}\n"), None),
             ExitStatus::Abend {
                 lines: vec![ABENDING_PROGRAM.to_owned()],
                 abcode: None,

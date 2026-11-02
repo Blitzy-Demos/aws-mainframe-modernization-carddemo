@@ -188,6 +188,7 @@ fn value_error(spec: &FieldSpec, err: &NumericError) -> CodecError {
 mod tests {
     use std::error::Error;
 
+    use carddemo_domain::messages::INVALID_CARD_NUMBER_FOUND;
     use carddemo_domain::numeric::{Alnum, NumericCode};
 
     use super::{RejectRecord, RejectRecordLayout};
@@ -201,7 +202,7 @@ mod tests {
 
     /// The sample description, the `1500-A-LOOKUP-XREF` text of reason 100
     /// (P-CBTRN02C-008).
-    const DESC: &str = "INVALID CARD NUMBER FOUND";
+    const DESC: &str = INVALID_CARD_NUMBER_FOUND;
 
     /// Record 2 of `dailytran.txt`, decoded.
     fn daily_record_2() -> Result<DailyTranRecord, Box<dyn Error>> {

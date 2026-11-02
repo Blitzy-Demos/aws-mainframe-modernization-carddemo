@@ -17,7 +17,8 @@
 //! cross-references in key order and writes the two files from the returned
 //! [`StatementOutput`]. A `CBSTM03B` return code other than `00` becomes a
 //! [`StatementError::ReadFailed`] whose text is the `DISPLAY` lines of the
-//! abending path (P-CBSTM03A-1257 to P-CBSTM03A-1259, P-CBSTM03A-011).
+//! abending path (P-CBSTM03A-1257 to P-CBSTM03A-1259, P-CBSTM03A-011) and
+//! whose source is the port failure behind it, for the job's log.
 //!
 //! The z/OS TIOT walk (P-CBSTM03A-001), the `ALTER` and `GO TO` dispatch of
 //! `0000-START` (P-CBSTM03A-002) and the opens and closes (P-CBSTM03A-1260 to
@@ -66,8 +67,11 @@ const RC_NOT_FOUND: &str = "23";
 /// statements and the exit code do not depend on which one it is.
 const RC_PERMANENT_ERROR: &str = "30";
 
-/// The `CBSTM03B` return code of a failed read: the VSAM file status the
-/// subroutine moves into `WS-M03B-RC` [app/cbl/CBSTM03B.CBL:L151-152].
+/// CBSTM03B 1900-EXIT, 2900-EXIT, 3900-EXIT and 4900-EXIT — P-CBSTM03B-001 to
+/// P-CBSTM03B-005: the `CBSTM03B` return code of a failed read, the VSAM file
+/// status the subroutine moves into `WS-M03B-RC` [app/cbl/CBSTM03B.CBL:L151-152]
+/// [app/cbl/CBSTM03B.CBL:L175-176] [app/cbl/CBSTM03B.CBL:L200-201]
+/// [app/cbl/CBSTM03B.CBL:L225-226].
 fn return_code(error: &PortError) -> &'static str {
     match error {
         PortError::NotFound => RC_NOT_FOUND,
@@ -91,23 +95,31 @@ pub enum StatementError {
     /// COBOL stores past its tables without a bound check, so its result is
     /// undefined and nothing is produced (P-CBSTM03A-004, P-CBSTM03A-1256,
     /// [`CAPACITY_ESCALATION`]).
+    ///
+    /// The load halts at the first record that has no slot, so the counts
+    /// describe the records up to and including that one: lower bounds on
+    /// what the whole file needs.
     #[error(
-        "TRNXFILE needs {cards} card slots and up to {max_per_card} transaction slots for one \
-         card; the CBSTM03A tables hold {card_capacity} cards and {per_card} transactions per card",
+        "TRNXFILE needs at least {cards} card slots and at least {max_per_card} transaction slots \
+         for one card; the CBSTM03A tables hold {card_capacity} cards and {per_card} transactions \
+         per card",
         card_capacity = CARD_CAPACITY,
         per_card = TRANSACTIONS_PER_CARD
     )]
     CapacityExceeded {
-        /// The card slots the file fills: one per run of records with the
-        /// same card number.
+        /// The card slots the records up to the halt fill: one per run of
+        /// records with the same card number, the halting record's run
+        /// included.
         cards: usize,
-        /// The most transactions of one card slot.
+        /// The most transactions of one card slot among the records up to the
+        /// halt, the halting record included.
         max_per_card: usize,
     },
     /// A `CBSTM03B` call returned a code other than `00`: `CBSTM03A` displays
     /// the failure text and `RETURN CODE: ` with the code, then
     /// `9999-ABEND-PROGRAM` displays `ABENDING PROGRAM` and calls `CEE3ABD`
     /// (P-CBSTM03A-003, P-CBSTM03A-1257 to P-CBSTM03A-1259, P-CBSTM03A-011).
+    /// The port failure behind the return code is the error's source only.
     #[error("{file}\n{label}{rc}\n{abend}", label = RETURN_CODE, abend = ABENDING_PROGRAM)]
     ReadFailed {
         /// The failure text that names the file, one of the `crate::messages`
@@ -116,35 +128,48 @@ pub enum StatementError {
         file: &'static str,
         /// The two-character `CBSTM03B` return code, `WS-M03B-RC X(02)`.
         rc: String,
+        /// The port failure behind the abend, for the job's log event; `None`
+        /// for the end of the transaction file at open, which is no port
+        /// failure. Its text is adapter detail and is never part of the
+        /// displayed lines.
+        #[source]
+        cause: Option<PortError>,
     },
 }
 
 impl StatementError {
-    /// The read failure displayed as `file` with the return code of `error`.
-    fn read_failed(file: &'static str, error: &PortError) -> Self {
+    /// CBSTM03A 2000-CUSTFILE-GET and 3000-ACCTFILE-GET — P-CBSTM03A-1258,
+    /// P-CBSTM03A-1259: the read failure displayed as `file` with the return
+    /// code of `error`, which it keeps as its cause
+    /// [app/cbl/CBSTM03A.CBL:L379-386] [app/cbl/CBSTM03A.CBL:L403-410]; also the
+    /// abend of the transaction and cross-reference reads, through
+    /// [`Self::trnxfile_read_failed`] and [`Self::xreffile_read_failed`].
+    fn read_failed(file: &'static str, error: PortError) -> Self {
         Self::ReadFailed {
             file,
-            rc: return_code(error).to_owned(),
+            rc: return_code(&error).to_owned(),
+            cause: Some(error),
         }
     }
 
-    /// A failed read of the transaction file, whose records `batch creastmt`
-    /// reads in statement order before [`load_table`]: the `ERROR READING
-    /// TRNXFILE` branch of `8100-TRNXFILE-OPEN` and `8500-READTRNX-READ`
-    /// [app/cbl/CBSTM03A.CBL:L748-754] [app/cbl/CBSTM03A.CBL:L843-846]
-    /// (P-CBSTM03A-002, P-CBSTM03A-003).
+    /// CBSTM03A 8100-TRNXFILE-OPEN and 8500-READTRNX-READ — P-CBSTM03A-002,
+    /// P-CBSTM03A-003: a failed read of the transaction file, whose records
+    /// `batch creastmt` reads in statement order before [`load_table`]: the
+    /// `ERROR READING TRNXFILE` branch of `8100-TRNXFILE-OPEN` and
+    /// `8500-READTRNX-READ` [app/cbl/CBSTM03A.CBL:L748-754]
+    /// [app/cbl/CBSTM03A.CBL:L843-846].
     #[must_use]
     pub fn trnxfile_read_failed(error: &PortError) -> Self {
-        Self::read_failed(ERROR_READING_TRNXFILE, error)
+        Self::read_failed(ERROR_READING_TRNXFILE, error.clone())
     }
 
-    /// A failed read of the card cross-reference file, which `batch creastmt`
-    /// reads in key order before [`create_statements`]: the `WHEN OTHER`
-    /// branch of `1000-XREFFILE-GET-NEXT` [app/cbl/CBSTM03A.CBL:L353-362]
-    /// (P-CBSTM03A-1257).
+    /// CBSTM03A 1000-XREFFILE-GET-NEXT — P-CBSTM03A-1257: a failed read of the
+    /// card cross-reference file, which `batch creastmt` reads in key order
+    /// before [`create_statements`]: the `WHEN OTHER` branch of
+    /// `1000-XREFFILE-GET-NEXT` [app/cbl/CBSTM03A.CBL:L353-362].
     #[must_use]
     pub fn xreffile_read_failed(error: &PortError) -> Self {
-        Self::read_failed(ERROR_READING_XREFFILE, error)
+        Self::read_failed(ERROR_READING_XREFFILE, error.clone())
     }
 }
 
@@ -168,7 +193,10 @@ pub struct StatementTransaction {
 }
 
 impl StatementTransaction {
-    /// The slot content of the transaction `tran` (P-CREASTMT-002).
+    /// CBSTM03A 8500-READTRNX-READ — P-CBSTM03A-004, P-CREASTMT-002: the slot
+    /// content of the transaction `tran`, as `MOVE TRNX-CARD-NUM`, `MOVE
+    /// TRNX-ID` and `MOVE TRNX-REST` fill `WS-CARD-NUM (CR-CNT)` and the slot
+    /// `(CR-CNT, TR-CNT)` [app/cbl/CBSTM03A.CBL:L827-829].
     fn from_transaction(tran: &Transaction) -> Self {
         Self {
             card_num: tran.tran_card_num,
@@ -194,11 +222,11 @@ pub struct TransactionTable {
 }
 
 impl TransactionTable {
-    /// The transactions `4000-TRNXFILE-GET` writes for the card `card`
-    /// [app/cbl/CBSTM03A.CBL:L417-432] (P-CBSTM03A-008): the slots are scanned
-    /// from the first `UNTIL CR-JMP > CR-CNT OR WS-CARD-NUM (CR-JMP) >
-    /// XREF-CARD-NUM`, and every slot whose card number equals the card gives
-    /// all of its transactions, in slot order.
+    /// CBSTM03A 4000-TRNXFILE-GET — P-CBSTM03A-008: the transactions the
+    /// paragraph writes for the card `card` [app/cbl/CBSTM03A.CBL:L417-432]:
+    /// the slots are scanned from the first `UNTIL CR-JMP > CR-CNT OR
+    /// WS-CARD-NUM (CR-JMP) > XREF-CARD-NUM`, and every slot whose card number
+    /// equals the card gives all of its transactions, in slot order.
     fn transactions_of(&self, card: CardNumber) -> impl Iterator<Item = &StatementTransaction> {
         self.cards
             .iter()
@@ -305,16 +333,18 @@ const HTML_STATEMENT_CLOSE: [HtmlFixedLine; 8] = [
     HtmlFixedLine::L80,
 ];
 
-/// Appends the 100-byte records of the fixed HTML lines `fixed`, each written
-/// after `SET HTML-… TO TRUE` (P-CBSTM03A-009).
+/// CBSTM03A 5100-WRITE-HTML-HEADER — P-CBSTM03A-009: appends the 100-byte
+/// records of the fixed HTML lines `fixed`, each written after `SET HTML-… TO
+/// TRUE` [app/cbl/CBSTM03A.CBL:L506-555] (also for the fixed lines of
+/// `5200-WRITE-HTML-NMADBS`, `4000-TRNXFILE-GET` and `6000-WRITE-TRANS`).
 fn push_fixed(html_lines: &mut Vec<String>, fixed: &[HtmlFixedLine]) {
     html_lines.extend(fixed.iter().copied().map(HtmlFixedLine::record));
 }
 
-/// A `STRING` whose every source is `DELIMITED BY ' '` and followed by
-/// `' ' DELIMITED BY SIZE`, as `5000-CREATE-STATEMENT` builds `ST-NAME` and
-/// `ST-ADD3` [app/cbl/CBSTM03A.CBL:L462-481] (P-CBSTM03A-006): each source up
-/// to its first space, then one space.
+/// CBSTM03A 5000-CREATE-STATEMENT — P-CBSTM03A-006: a `STRING` whose every
+/// source is `DELIMITED BY ' '` and followed by `' ' DELIMITED BY SIZE`, as the
+/// paragraph builds `ST-NAME` and `ST-ADD3` [app/cbl/CBSTM03A.CBL:L462-481]:
+/// each source up to its first space, then one space.
 ///
 /// `INITIALIZE STATEMENT-LINES` cleared the receiver to spaces first, and the
 /// line builders cut the text at the receiver width, where the `STRING` stops
@@ -348,7 +378,8 @@ struct HeaderFields {
 }
 
 impl HeaderFields {
-    /// The fields of the statement of `customer` and `account`.
+    /// CBSTM03A 5000-CREATE-STATEMENT — P-CBSTM03A-006: the fields of the
+    /// statement of `customer` and `account` [app/cbl/CBSTM03A.CBL:L459-485].
     fn new(customer: &Customer, account: &Account) -> Self {
         let name = string_delimited_by_space(&[
             &customer.cust_first_name.as_text(),
@@ -502,36 +533,50 @@ fn totals(output: &mut StatementOutput, total: Money<9>) {
 ///   code `10` when there is no record: the first read at open meets the end
 ///   of the file, which `8100-TRNXFILE-OPEN` treats as an error, so no
 ///   statement is produced (P-CBSTM03A-003).
-/// - [`StatementError::CapacityExceeded`] when the records need more than
-///   [`CARD_CAPACITY`] card slots or more than [`TRANSACTIONS_PER_CARD`]
-///   transactions in one slot. The COBOL result is undefined there, so the
-///   table is not built (escalation [`CAPACITY_ESCALATION`]).
+/// - [`StatementError::CapacityExceeded`] at the first record that needs a
+///   card slot beyond [`CARD_CAPACITY`] or a transaction slot beyond
+///   [`TRANSACTIONS_PER_CARD`] in its card slot. The COBOL result is undefined
+///   there, so the table is not built and no further record is taken from
+///   `transactions`: the counts describe the records up to that one
+///   (escalation [`CAPACITY_ESCALATION`]).
 pub fn load_table(
     transactions: impl IntoIterator<Item = Transaction>,
 ) -> Result<TransactionTable, StatementError> {
     let mut cards: Vec<(CardNumber, Vec<StatementTransaction>)> = Vec::new();
     for tran in transactions {
         let slot = StatementTransaction::from_transaction(&tran);
+        let filled = cards.len();
         match cards.last_mut() {
-            Some((card, slots)) if *card == slot.card_num => slots.push(slot),
-            _ => cards.push((slot.card_num, vec![slot])),
+            Some((card, slots)) if *card == slot.card_num => {
+                if slots.len() == TRANSACTIONS_PER_CARD {
+                    return Err(StatementError::CapacityExceeded {
+                        cards: filled,
+                        max_per_card: TRANSACTIONS_PER_CARD + 1,
+                    });
+                }
+                slots.push(slot);
+            }
+            _ => {
+                if filled == CARD_CAPACITY {
+                    // The new slot holds this one record.
+                    let max_per_card = cards
+                        .iter()
+                        .map(|(_, slots)| slots.len())
+                        .fold(1, usize::max);
+                    return Err(StatementError::CapacityExceeded {
+                        cards: CARD_CAPACITY + 1,
+                        max_per_card,
+                    });
+                }
+                cards.push((slot.card_num, vec![slot]));
+            }
         }
     }
     if cards.is_empty() {
         return Err(StatementError::ReadFailed {
             file: ERROR_READING_TRNXFILE,
             rc: RC_END_OF_FILE.to_owned(),
-        });
-    }
-    let max_per_card = cards
-        .iter()
-        .map(|(_, slots)| slots.len())
-        .max()
-        .unwrap_or_default();
-    if cards.len() > CARD_CAPACITY || max_per_card > TRANSACTIONS_PER_CARD {
-        return Err(StatementError::CapacityExceeded {
-            cards: cards.len(),
-            max_per_card,
+            cause: None,
         });
     }
     Ok(TransactionTable { cards })
@@ -570,11 +615,11 @@ pub async fn create_statements<S: CustomerReader + AccountReader>(
         let customer = store
             .read_customer(xref.xref_cust_id)
             .await
-            .map_err(|error| StatementError::read_failed(ERROR_READING_CUSTFILE, &error))?;
+            .map_err(|error| StatementError::read_failed(ERROR_READING_CUSTFILE, error))?;
         let account = store
             .read_account(xref.xref_acct_id)
             .await
-            .map_err(|error| StatementError::read_failed(ERROR_READING_ACCTFILE, &error))?;
+            .map_err(|error| StatementError::read_failed(ERROR_READING_ACCTFILE, error))?;
         statement_header(&mut output, &customer, &account);
         let total = card_transactions(&mut output, table, xref.xref_card_num);
         totals(&mut output, total);
@@ -584,6 +629,8 @@ pub async fn create_statements<S: CustomerReader + AccountReader>(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::error::Error as _;
     use std::future::Future;
 
     use super::{
@@ -928,24 +975,33 @@ mod tests {
         assert_record_widths(&output);
     }
 
-    /// `cards` card numbers of `per_card` transactions each, in sort order.
-    fn corpus(cards: usize, per_card: usize) -> Vec<Transaction> {
-        (0..cards)
-            .flat_map(|card_index| {
-                (0..per_card).map(move |tran_index| {
-                    tran(
-                        &format!("{card_index:016}"),
-                        &format!("{tran_index:016}"),
-                        "Purchase",
-                        100,
-                    )
-                })
+    /// `cards` card numbers of `per_card` transactions each, in sort order,
+    /// each record made only when it is pulled, so a corpus may be larger
+    /// than memory.
+    fn corpus(cards: usize, per_card: usize) -> impl Iterator<Item = Transaction> {
+        (0..cards).flat_map(move |card_index| {
+            (0..per_card).map(move |tran_index| {
+                tran(
+                    &format!("{card_index:016}"),
+                    &format!("{tran_index:016}"),
+                    "Purchase",
+                    100,
+                )
             })
-            .collect()
+        })
     }
 
     #[test]
     fn load_table_holds_51_cards_of_10_and_halts_beyond_either_limit() {
+        /// A corpus of `cards` cards of `per_card` records, the counts of its
+        /// `CapacityExceeded` and the records the load pulls before it.
+        struct Case {
+            cards: usize,
+            per_card: usize,
+            halt_cards: usize,
+            halt_per_card: usize,
+            pulled: usize,
+        }
         let full = load_table(corpus(CARD_CAPACITY, TRANSACTIONS_PER_CARD))
             .expect("the tables hold 51 cards of 10 transactions");
         assert_eq!(full.cards.len(), CARD_CAPACITY);
@@ -956,27 +1012,79 @@ mod tests {
         );
 
         let beyond = [
-            (CARD_CAPACITY + 1, 1),
-            (1, TRANSACTIONS_PER_CARD + 1),
-            (CARD_CAPACITY + 1, TRANSACTIONS_PER_CARD + 1),
+            // The 52nd card opens a slot past WS-CARD-TBL.
+            Case {
+                cards: CARD_CAPACITY + 1,
+                per_card: 1,
+                halt_cards: 52,
+                halt_per_card: 1,
+                pulled: 52,
+            },
+            // The 11th transaction of the first card has no slot.
+            Case {
+                cards: 1,
+                per_card: TRANSACTIONS_PER_CARD + 1,
+                halt_cards: 1,
+                halt_per_card: 11,
+                pulled: 11,
+            },
+            // Beyond both limits, the first card's 11th record halts the load
+            // before any later card is read.
+            Case {
+                cards: CARD_CAPACITY + 1,
+                per_card: TRANSACTIONS_PER_CARD + 1,
+                halt_cards: 1,
+                halt_per_card: 11,
+                pulled: 11,
+            },
+            // 51 full cards are held; the first record of the 52nd halts.
+            Case {
+                cards: CARD_CAPACITY + 1,
+                per_card: TRANSACTIONS_PER_CARD,
+                halt_cards: 52,
+                halt_per_card: 10,
+                pulled: 511,
+            },
+            // Endless inputs end at the first record beyond the tables.
+            Case {
+                cards: usize::MAX,
+                per_card: 1,
+                halt_cards: 52,
+                halt_per_card: 1,
+                pulled: 52,
+            },
+            Case {
+                cards: 1,
+                per_card: usize::MAX,
+                halt_cards: 1,
+                halt_per_card: 11,
+                pulled: 11,
+            },
         ];
-        for (cards, per_card) in beyond {
-            let error = load_table(corpus(cards, per_card)).expect_err("beyond the tables");
+        for case in beyond {
+            let pulled = Cell::new(0_usize);
+            let records =
+                corpus(case.cards, case.per_card).inspect(|_| pulled.set(pulled.get() + 1));
+            let error = load_table(records).expect_err("beyond the tables");
+            let label = format!("{} cards of {}", case.cards, case.per_card);
             assert_eq!(
                 error,
                 StatementError::CapacityExceeded {
-                    cards,
-                    max_per_card: per_card,
+                    cards: case.halt_cards,
+                    max_per_card: case.halt_per_card,
                 },
-                "{cards} cards of {per_card}"
+                "{label}"
             );
             assert_eq!(
                 error.to_string(),
                 format!(
-                    "TRNXFILE needs {cards} card slots and up to {per_card} transaction slots for \
-                     one card; the CBSTM03A tables hold 51 cards and 10 transactions per card"
-                )
+                    "TRNXFILE needs at least {} card slots and at least {} transaction slots for \
+                     one card; the CBSTM03A tables hold 51 cards and 10 transactions per card",
+                    case.halt_cards, case.halt_per_card
+                ),
+                "{label}"
             );
+            assert_eq!(pulled.get(), case.pulled, "records pulled from {label}");
         }
         assert_eq!(CAPACITY_ESCALATION, "E-33");
     }
@@ -989,7 +1097,12 @@ mod tests {
             StatementError::ReadFailed {
                 file: ERROR_READING_TRNXFILE,
                 rc: "10".to_owned(),
+                cause: None,
             }
+        );
+        assert!(
+            error.source().is_none(),
+            "the end of file is no port failure"
         );
         let lines: Vec<String> = error.to_string().lines().map(str::to_owned).collect();
         assert_eq!(
@@ -1141,6 +1254,7 @@ mod tests {
                 PortError::NotFound,
                 ERROR_READING_CUSTFILE,
                 "23",
+                "record not found",
                 vec!["read_customer"],
             ),
             (
@@ -1148,6 +1262,7 @@ mod tests {
                 PortError::Unavailable("connection reset".to_owned()),
                 ERROR_READING_CUSTFILE,
                 "30",
+                "store unavailable: connection reset",
                 vec!["read_customer"],
             ),
             (
@@ -1155,6 +1270,7 @@ mod tests {
                 PortError::NotFound,
                 ERROR_READING_ACCTFILE,
                 "23",
+                "record not found",
                 vec!["read_customer", "read_account"],
             ),
             (
@@ -1162,12 +1278,13 @@ mod tests {
                 PortError::Unavailable("connection reset".to_owned()),
                 ERROR_READING_ACCTFILE,
                 "30",
+                "store unavailable: connection reset",
                 vec!["read_customer", "read_account"],
             ),
         ];
-        for (method, port_error, file, rc, calls) in cases {
+        for (method, port_error, file, rc, source, calls) in cases {
             let mut store = store_50();
-            store.fail_next(method, port_error);
+            store.fail_next(method, port_error.clone());
             let table = table(card_a_transactions());
             let error = run(&mut store, vec![xref(CARD_A, 50)], &table).expect_err("an abend");
             assert_eq!(
@@ -1175,13 +1292,20 @@ mod tests {
                 StatementError::ReadFailed {
                     file,
                     rc: rc.to_owned(),
+                    cause: Some(port_error),
                 },
+                "{method}"
+            );
+            assert_eq!(
+                error.source().map(ToString::to_string).as_deref(),
+                Some(source),
                 "{method}"
             );
             assert_eq!(
                 error.to_string(),
                 format!("{file}\nRETURN CODE: {rc}\n{ABENDING_PROGRAM}")
             );
+            assert!(!error.to_string().contains(source), "{method}");
             assert_eq!(store.calls, calls, "{method}");
         }
     }
@@ -1197,6 +1321,7 @@ mod tests {
             StatementError::ReadFailed {
                 file: ERROR_READING_CUSTFILE,
                 rc: "23".to_owned(),
+                cause: Some(PortError::NotFound),
             }
         );
     }
@@ -1209,30 +1334,43 @@ mod tests {
                 StatementError::trnxfile_read_failed(&unavailable),
                 ERROR_READING_TRNXFILE,
                 "30",
+                unavailable.clone(),
+                "store unavailable: timeout",
             ),
             (
                 StatementError::xreffile_read_failed(&unavailable),
                 ERROR_READING_XREFFILE,
                 "30",
+                unavailable.clone(),
+                "store unavailable: timeout",
             ),
             (
                 StatementError::xreffile_read_failed(&PortError::NotFound),
                 ERROR_READING_XREFFILE,
                 "23",
+                PortError::NotFound,
+                "record not found",
             ),
         ];
-        for (error, file, rc) in cases {
+        for (error, file, rc, cause, source) in cases {
             assert_eq!(
                 error,
                 StatementError::ReadFailed {
                     file,
                     rc: rc.to_owned(),
+                    cause: Some(cause),
                 }
+            );
+            assert_eq!(
+                error.source().map(ToString::to_string).as_deref(),
+                Some(source),
+                "{file}"
             );
             assert_eq!(
                 error.to_string(),
                 format!("{file}\nRETURN CODE: {rc}\n{ABENDING_PROGRAM}")
             );
+            assert!(!error.to_string().contains(source), "{file}");
         }
     }
 }

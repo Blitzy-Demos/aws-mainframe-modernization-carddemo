@@ -592,10 +592,6 @@ mod tests {
                 }
             );
         }
-        assert_eq!(
-            messages::ERROR_WHILE_READING_ACCTFILE,
-            "ERROR WHILE READING ACCTFILE"
-        );
     }
 
     #[test]

@@ -2882,6 +2882,29 @@ mod tests {
     }
 
     #[test]
+    fn program_literals_keep_their_cobol_bytes() {
+        // No V-row of validation-audit.md holds these texts, so
+        // `every_audited_message_has_exactly_one_catalog_entry` never checks
+        // them; this table pins their COBOL bytes. P-CODATE01-015 and
+        // P-COACCT01-017: the MQPUT error. P-COACCT01-015: the 28-byte literal
+        // as declared, before its X(25) cut. P-CBACT04C-002 and P-CBACT04C-188:
+        // the account and cross-reference read abends. P-CBTRN02C-221: the
+        // DALYTRAN open abend; it and P-CBACT04C-188 end in the abend display.
+        // P-CBTRN02C-008: reject reason 100.
+        for (text, expected) in [
+            (MQPUT_ERR, "MQPUT ERR"),
+            (ERROR_WHILE_READING_ACCTFILE, "ERROR WHILE READING ACCTFILE"),
+            (ERROR_READING_ACCOUNT_FILE, "ERROR READING ACCOUNT FILE"),
+            (ERROR_READING_XREF_FILE, "ERROR READING XREF FILE"),
+            (ABENDING_PROGRAM, "ABENDING PROGRAM"),
+            (ERROR_OPENING_DALYTRAN, "ERROR OPENING DALYTRAN"),
+            (INVALID_CARD_NUMBER_FOUND, "INVALID CARD NUMBER FOUND"),
+        ] {
+            assert_eq!(text, expected);
+        }
+    }
+
+    #[test]
     fn batch_displays_edit_their_fields() {
         for (status, expected) in [
             (*b"23", "FILE STATUS IS: NNNN0023"),

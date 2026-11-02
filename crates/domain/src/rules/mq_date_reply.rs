@@ -186,7 +186,7 @@ mod tests {
         // P-CODATE01-003, P-CODATE01-009: 'MQPUT ERR' fits X(25) and the reply
         // queue name fits X(48), so the record keeps both whole.
         let spec = put_reply_failure(2, 2085, "CARD.DEMO.REPLY.DATE");
-        assert_eq!(spec.return_message, "MQPUT ERR");
+        assert_eq!(spec.return_message, messages::MQPUT_ERR);
         assert!(spec.return_message.len() <= 25);
         assert!(spec.queue_name.len() <= 48);
     }

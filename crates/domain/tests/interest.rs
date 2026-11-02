@@ -30,6 +30,9 @@ use carddemo_domain::entities::{
     Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
     TranCatBalanceKey,
 };
+use carddemo_domain::messages::{
+    ABENDING_PROGRAM, ERROR_READING_ACCOUNT_FILE, ERROR_READING_XREF_FILE,
+};
 use carddemo_domain::numeric::{
     AccountGroupId, AccountId, Alnum, CardNumber, CustomerId, InterestRate, MerchantId, Money,
     TranCategoryCode, TranId, TranTypeCode,
@@ -573,7 +576,7 @@ fn a_missing_account_or_cross_reference_abends() {
                 acct_id: account_id(1),
                 cause: PortError::NotFound,
             },
-            "ERROR READING ACCOUNT FILE",
+            ERROR_READING_ACCOUNT_FILE,
         ),
         (
             MemoryStore::default().with_account(account(1, 0, 0, 0)),
@@ -581,7 +584,7 @@ fn a_missing_account_or_cross_reference_abends() {
                 acct_id: account_id(1),
                 cause: PortError::NotFound,
             },
-            "ERROR READING XREF FILE",
+            ERROR_READING_XREF_FILE,
         ),
     ];
     for (store, expected, text) in cases {
@@ -596,7 +599,7 @@ fn a_missing_account_or_cross_reference_abends() {
                 "ACCOUNT NOT FOUND: 00000000001",
                 text,
                 "FILE STATUS IS: NNNN0023",
-                "ABENDING PROGRAM",
+                ABENDING_PROGRAM,
             ]
         );
         assert!(store.group_reads.is_empty(), "{text}: no rate read");
