@@ -79,8 +79,11 @@ impl JobContext {
 /// Runs `command` inside its job span and returns how it ended.
 ///
 /// The span `job` is opened first and carries the subcommand name in `job` and the job's
-/// inputs (`input`, `parm_date`, `start_date`, `end_date`, `sysin`). Inside it the database
-/// pool is opened and the job runs. Jobs record their counts on it with
+/// inputs (`input`, `parm_date`, `start_date`, `end_date`). The `cbpaup0j` card is not
+/// recorded whole: `sysin` holds the 17-byte `PRM-INFO` receiver it fills, `sysin_len` the
+/// card's length in bytes and `sysin_truncated` whether the receiver left any of the card out
+/// (`cbpaup0j::BoundedSysin`). Inside the span the database pool is opened and the job runs.
+/// Jobs record their counts on it with
 /// `tracing::Span::current().record("<field>", value)` for the fields `read`, `posted`,
 /// `rejected`, `written` and `deleted`. When the job returns, `exit_code` is recorded and one
 /// job-end event is emitted inside the span: `info` for exit 0, `warn` for 4, `error` for every
@@ -128,6 +131,8 @@ fn job_span(job: &'static str, command: &Command) -> Span {
         start_date = Empty,
         end_date = Empty,
         sysin = Empty,
+        sysin_len = Empty,
+        sysin_truncated = Empty,
         read = Empty,
         posted = Empty,
         rejected = Empty,
@@ -150,7 +155,10 @@ fn job_span(job: &'static str, command: &Command) -> Span {
             span.record("end_date", args.end_date.as_str());
         }
         Command::Cbpaup0j(args) => {
-            span.record("sysin", args.sysin.as_str());
+            let sysin = cbpaup0j::BoundedSysin::of(&args.sysin);
+            span.record("sysin", display(sysin.prm_info));
+            span.record("sysin_len", sysin.len);
+            span.record("sysin_truncated", sysin.truncated);
         }
         Command::Migrate
         | Command::Seed(_)

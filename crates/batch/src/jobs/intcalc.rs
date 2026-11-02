@@ -401,10 +401,17 @@ mod tests {
 
     #[test]
     fn parm_date_is_the_jcl_parm_as_x10() {
-        assert_eq!(
-            parm_date(&args("2022071800")).map(|parm| *parm.as_bytes()),
-            Ok(*b"2022071800")
-        );
+        // `PARM-DATE X(10)` copies the bytes it is given, a record delimiter included.
+        for (parm, expected) in [
+            ("2022071800", *b"2022071800"),
+            ("2022\n71800", *b"2022\n71800"),
+        ] {
+            assert_eq!(
+                parm_date(&args(parm)).map(|parm| *parm.as_bytes()),
+                Ok(expected),
+                "{parm:?}"
+            );
+        }
     }
 
     #[test]

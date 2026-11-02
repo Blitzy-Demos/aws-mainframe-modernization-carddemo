@@ -449,7 +449,10 @@ mod tests {
     use std::fs;
     use std::io::ErrorKind;
     use std::path::PathBuf;
+    use std::slice;
 
+    use carddemo_codec::layouts::TransactionLayout;
+    use carddemo_codec::{Charset, Layout};
     use carddemo_domain::clock::{AnyClock, SystemClock};
     use carddemo_domain::numeric::TransactionRowId;
     use carddemo_persistence::repos::LoadOutcome;
@@ -457,7 +460,7 @@ mod tests {
 
     use super::{ReproTally, finish, sort_step};
     use crate::exit::ExitStatus;
-    use crate::generations::{Dataset, Generation};
+    use crate::generations::{Dataset, Generation, read_records};
     use crate::jobs::JobContext;
 
     /// A 350-byte `CVTRA05Y` record with `tran_id` and `desc`, the other fields fixed and
@@ -472,6 +475,22 @@ mod tests {
             zip = "12345",
             ts = "2022-07-18 00:00:00.000000",
             filler = "",
+        );
+        assert_eq!(record.len(), 350, "{record:?}");
+        record
+    }
+
+    /// The 350-byte `CVTRA05Y` interest record INTCALC writes for account 1 under `tran_id`, the
+    /// PARM-DATE and its six-digit suffix: type 01, category 0005, source `System`, +1.50, no
+    /// merchant, the account's card and both timestamps of the processing clock.
+    fn interest_record(tran_id: &str) -> String {
+        let record = format!(
+            "{tran_id:<16}010005{source:<10}{desc:<100}0000000015{{000000000{blank:<110}\
+             9680294154603697{ts}{ts}{blank:<20}",
+            source = "System",
+            desc = "Int. for a/c 00000000001",
+            ts = "2022-07-01-12.00.00.000000",
+            blank = "",
         );
         assert_eq!(record.len(), 350, "{record:?}");
         record
@@ -587,6 +606,48 @@ mod tests {
             &backup[2],
         ];
         assert_eq!(read(&combined), file_of(&expected));
+    }
+
+    #[test]
+    fn an_interest_tran_id_holding_lf_sorts_and_reads_back_unchanged() {
+        let dir = BatchDir::new("lf-tran-id");
+        let backup = [
+            record("0000000000000005", "BACKUP 5"),
+            record("2022071800000001", "BACKUP 2022071800000001"),
+        ];
+        dir.write("TRANSACT.BKUP.G0001V00", &backup.iter().collect::<Vec<_>>());
+        // `batch intcalc --parm-date $'2022\n71800'`: `PARM-DATE X(10)` copies the LF into the
+        // TRAN-ID, and SYSTRAN(+1) is written through the shared record writer.
+        let interest = interest_record("2022\n71800000001");
+        let decode = |text: &str| {
+            TransactionLayout::decode(text.as_bytes(), Charset::Ascii)
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"))
+        };
+        let interest_tran = decode(&interest);
+        let mut systran = dir
+            .context()
+            .generations
+            .begin_next(Dataset::SysTran)
+            .unwrap_or_else(|e| panic!("SYSTRAN(+1) allocation: {e}"));
+        systran
+            .append_records::<TransactionLayout>(slice::from_ref(&interest_tran))
+            .unwrap_or_else(|e| panic!("SYSTRAN(+1) write: {e}"));
+        let systran = systran
+            .catalog()
+            .unwrap_or_else(|e| panic!("SYSTRAN(+1) catalog: {e}"));
+        assert_eq!(read(&systran), file_of(&[&interest]));
+
+        let combined = sorted(&dir);
+        // `CH` byte order: LF (0x0A) sorts before the digit 0 (0x30).
+        assert_eq!(
+            read(&combined),
+            file_of(&[&backup[0], &interest, &backup[1]])
+        );
+        assert_eq!(
+            read_records::<TransactionLayout>(&combined.path)
+                .unwrap_or_else(|e| panic!("{}: {e}", combined.path.display())),
+            [decode(&backup[0]), interest_tran, decode(&backup[1])]
+        );
     }
 
     #[test]

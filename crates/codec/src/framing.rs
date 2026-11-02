@@ -17,8 +17,13 @@
 //! re-applied as stored and never normalised: no `CR LF` becomes `LF` and no
 //! short record is padded on output.
 //!
-//! Files written by batch use [`encode_ascii_lf`]: every record at full width,
-//! each followed by `LF`.
+//! Record files written by batch use [`encode_ascii_lf`]: every record at full
+//! width, each followed by `LF`. [`decode_ascii_lf`] reads them back frame by
+//! frame, taking each record's [`Layout::LEN`] bytes whole and only then
+//! requiring the `LF` after them. Alphanumeric fields copy bytes, so a record
+//! may itself hold `LF` or `CR`; [`split_ascii`] would cut it at that `LF`, or
+//! take a final `CR` for a `CR LF` line end, so it reads the fixture corpus
+//! only.
 //!
 //! # EBCDIC
 //!
@@ -211,7 +216,10 @@ fn stored_part<L: Layout>(encoded: &[u8], stored_len: usize) -> Result<&[u8], Co
 }
 
 /// Encodes records as an ASCII file of full-width records, each followed by
-/// `LF`: the format of every record file batch writes.
+/// `LF`: the format of every record file batch writes, which
+/// [`decode_ascii_lf`] reads back. Each record is written as [`Layout::encode`]
+/// returns it, so an `LF` or `CR` inside an alphanumeric field is record data,
+/// not a line end.
 #[must_use]
 pub fn encode_ascii_lf<L: Layout>(records: &[L::Record]) -> Vec<u8> {
     let terminator = Terminator::Lf.as_bytes();
@@ -225,6 +233,47 @@ pub fn encode_ascii_lf<L: Layout>(records: &[L::Record]) -> Vec<u8> {
         out.extend_from_slice(terminator);
     }
     out
+}
+
+/// Decodes a record file of full-width records, each followed by `LF`, with
+/// the layout `L`: the inverse of [`encode_ascii_lf`].
+///
+/// The file is a sequence of frames, each exactly [`Layout::LEN`] record bytes
+/// and then one `LF`. The record bytes are taken whole and decoded as they
+/// are, `LF` and `CR` included: nothing is padded and no `CR LF` line end is
+/// recognised. Empty input has no records.
+///
+/// # Errors
+///
+/// The first failing record's error, located at its 1-based record number:
+///
+/// - [`CodecErrorKind::PartialFrame`] carrying the number of bytes left when
+///   fewer than `LEN + 1` remain for the final record and its `LF`.
+/// - [`CodecErrorKind::Separator`] carrying the byte after the record bytes
+///   when it is not `LF`.
+/// - Any error of [`Layout::decode`].
+pub fn decode_ascii_lf<L: Layout>(bytes: &[u8]) -> Result<Vec<L::Record>, CodecError> {
+    let mut records = Vec::with_capacity(bytes.len() / L::LEN.saturating_add(1));
+    let mut rest = bytes;
+    for n in 1.. {
+        if rest.is_empty() {
+            break;
+        }
+        let error = |kind| CodecError::new(L::NAME, kind).at_record(n);
+        let partial = || {
+            error(CodecErrorKind::PartialFrame {
+                frame_len: rest.len(),
+            })
+        };
+        let (body, after) = rest.split_at_checked(L::LEN).ok_or_else(partial)?;
+        let (&separator, next) = after.split_first().ok_or_else(partial)?;
+        if separator != b'\n' {
+            return Err(error(CodecErrorKind::Separator { byte: separator }));
+        }
+        records.push(L::decode(body, Charset::Ascii).map_err(|e| e.at_record(n))?);
+        rest = next;
+    }
+    Ok(records)
 }
 
 /// Decodes every fixed-length block of the EBCDIC file `bytes` with the layout
@@ -268,8 +317,8 @@ mod tests {
     use carddemo_domain::numeric::Alnum;
 
     use super::{
-        AsciiFrame, Framed, Terminator, decode_ascii_file, decode_ebcdic_file, encode_ascii_file,
-        encode_ascii_lf, encode_ebcdic_file, pad, split_ascii,
+        AsciiFrame, Framed, Terminator, decode_ascii_file, decode_ascii_lf, decode_ebcdic_file,
+        encode_ascii_file, encode_ascii_lf, encode_ebcdic_file, pad, split_ascii,
     };
     use crate::Layout;
     use crate::charset::Charset;
@@ -471,6 +520,7 @@ mod tests {
         assert_eq!(decode_ebcdic_file::<Pair>(b""), Ok(Vec::new()));
         assert!(encode_ebcdic_file::<Pair>(&[]).is_empty());
         assert!(encode_ascii_lf::<Pair>(&[]).is_empty());
+        assert_eq!(decode_ascii_lf::<Pair>(b""), Ok(Vec::new()));
     }
 
     #[test]
@@ -537,6 +587,70 @@ mod tests {
     fn encode_ascii_lf_writes_full_width_records_each_followed_by_lf() {
         let records = [pair(*b"ab", *b"cd"), pair(*b"ef", *b"  ")];
         assert_eq!(encode_ascii_lf::<Pair>(&records), b"abcd\nef  \n");
+    }
+
+    #[test]
+    fn lf_record_files_round_trip_records_holding_lf_and_cr() {
+        // Alphanumeric fields copy bytes, so LF, CR, CR LF and a final CR are
+        // record data. The last case is stored as `c\r` and then the LF, the
+        // bytes of a CR LF line end.
+        let cases = [
+            vec![pair(*b"a\n", *b"bc")],
+            vec![pair(*b"\r\n", *b"\n\n"), pair(*b"ab", *b"cd")],
+            vec![pair(*b"ab", *b"cd"), pair(*b"\n\r", *b"\r\r")],
+            vec![pair(*b"ab", *b"c\r")],
+        ];
+        for records in cases {
+            let file = encode_ascii_lf::<Pair>(&records);
+            assert_eq!(file.len(), records.len() * 5, "{records:?}");
+            assert_eq!(decode_ascii_lf::<Pair>(&file), Ok(records));
+        }
+    }
+
+    #[test]
+    fn lf_record_files_of_a_zero_length_layout_are_one_lf_per_record() {
+        assert_eq!(encode_ascii_lf::<Zero>(&[(), ()]), b"\n\n");
+        assert_eq!(decode_ascii_lf::<Zero>(b"\n\n"), Ok(vec![(), ()]));
+        assert_eq!(decode_ascii_lf::<Zero>(b""), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn lf_record_file_errors_carry_their_one_based_record_number() {
+        let partial =
+            |frame_len, n| at_record("TEST", CodecErrorKind::PartialFrame { frame_len }, n);
+        let separator = |layout, byte, n| at_record(layout, CodecErrorKind::Separator { byte }, n);
+        let cases = [
+            (decode_ascii_lf::<Pair>(b"abcd").map(|_| ()), partial(4, 1)),
+            (
+                decode_ascii_lf::<Pair>(b"abcd\nab").map(|_| ()),
+                partial(2, 2),
+            ),
+            (
+                decode_ascii_lf::<Pair>(b"abcd\nabcd").map(|_| ()),
+                partial(4, 2),
+            ),
+            (
+                decode_ascii_lf::<Pair>(b"abcd\r\n").map(|_| ()),
+                separator("TEST", b'\r', 1),
+            ),
+            (
+                decode_ascii_lf::<Pair>(b"abcd\nabcde\n").map(|_| ()),
+                separator("TEST", b'e', 2),
+            ),
+            (
+                decode_ascii_lf::<Zero>(b"\n\nx").map(|_| ()),
+                separator("ZERO", b'x', 3),
+            ),
+            (
+                decode_ascii_lf::<Count>(b"12\n1x\n").map(|_| ()),
+                CodecError::new("COUNT", CodecErrorKind::NotNumeric { byte: b'x' })
+                    .at_field("COUNT", 0)
+                    .at_record(2),
+            ),
+        ];
+        for (result, expected) in cases {
+            assert_eq!(result, Err(expected));
+        }
     }
 
     #[test]

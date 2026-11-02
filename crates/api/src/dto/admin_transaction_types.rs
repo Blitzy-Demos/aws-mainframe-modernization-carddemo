@@ -29,9 +29,15 @@
 //! field exists for an error to name, and their errors carry none.
 //!
 //! The delete is `COTRTLIC`'s `9300-DELETE-RECORD` (V-COTRTLIC-021 to
-//! V-COTRTLIC-023), whose rows name no field either. The `COTRTUP` F4 delete
-//! and F6 add stay outside these resources while E-23 is open, so no type
-//! here serves the `COTRTUPC` delete.
+//! V-COTRTLIC-023), whose rows name no field either; the same `DELETE`
+//! serves the `COTRTUP` F4 delete, with these `COTRTLIC` texts
+//! (P-COTRTUPC-028). [`TranTypeCreateRequest`], the `POST` body, is the
+//! `COTRTUPC` add: F5 on a key not found. The map's `F6=Add` legend has no
+//! executable path, as it stays dark and F6 is never accepted
+//! (P-COTRTUPC-001, P-COTRTUPC-026). Only the alternate `COTRTUPC` delete
+//! message set, `Delete successful.` (P-COTRTUPC-004) and its failure texts
+//! (P-COTRTUPC-005), stays unexposed: E-23 leaves its selection open, so no
+//! type here carries it and no second delete endpoint exists.
 //!
 //! # Lengths
 //!

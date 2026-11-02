@@ -61,6 +61,20 @@ pub enum CodecErrorKind {
         /// The stored length of the frame being re-applied.
         stored_len: usize,
     },
+    /// A record file of full-width records, each followed by `LF`, ends in a
+    /// partial frame: fewer bytes remain than the record length plus its `LF`.
+    #[error("final frame of {frame_len} bytes is shorter than the record length plus LF")]
+    PartialFrame {
+        /// The number of bytes left for the final record and its `LF`.
+        frame_len: usize,
+    },
+    /// The byte after a full-width record of a record file is not the `LF`
+    /// that must separate it from the next record.
+    #[error("byte 0x{byte:02X} instead of LF after a full-width record")]
+    Separator {
+        /// The byte found where the `LF` belongs.
+        byte: u8,
+    },
     /// An EBCDIC file length is not a whole multiple of the layout `LEN`.
     #[error("file length {file_len} is not a multiple of the record length")]
     Blocking {
@@ -273,6 +287,14 @@ mod tests {
             (
                 CodecErrorKind::TruncationLoss { stored_len: 36 },
                 "re-applying stored length 36 would drop non-space bytes",
+            ),
+            (
+                CodecErrorKind::PartialFrame { frame_len: 350 },
+                "final frame of 350 bytes is shorter than the record length plus LF",
+            ),
+            (
+                CodecErrorKind::Separator { byte: b'\r' },
+                "byte 0x0D instead of LF after a full-width record",
             ),
             (
                 CodecErrorKind::Blocking { file_len: 15_001 },

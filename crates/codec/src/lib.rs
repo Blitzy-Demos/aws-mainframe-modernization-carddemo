@@ -15,9 +15,11 @@
 //! - [`field`]: the display-format field codecs, which see internal bytes
 //!   only: `X(n)` copied verbatim, `9(n)` as digits, and `S9(n)V9(s)` with its
 //!   sign as a trailing overpunch on the last digit.
-//! - [`framing`]: ASCII files are split into lines, each record keeping its
-//!   stored length and terminator; EBCDIC files are fixed-length blocks of the
-//!   record length, with no terminators.
+//! - [`framing`]: ASCII fixture files are split into lines, each record keeping
+//!   its stored length and terminator; the record files batch writes are
+//!   full-width records each followed by `LF`, read back frame by frame;
+//!   EBCDIC files are fixed-length blocks of the record length, with no
+//!   terminators.
 //! - [`layouts`]: one [`Layout`] per copybook record, listing every field as a
 //!   [`FieldSpec`] in copybook order. FILLER is kept as raw bytes, because the
 //!   `DISCGRP` and `TCATBAL` fillers hold `0` characters, not spaces.
@@ -64,8 +66,8 @@ pub use charset::Charset;
 pub use error::{CodecError, CodecErrorKind};
 pub use field::{FieldKind, FieldSpec, PreservedFields, RawField, Signed};
 pub use framing::{
-    AsciiFrame, Framed, Terminator, decode_ascii_file, decode_ebcdic_file, encode_ascii_file,
-    encode_ascii_lf, encode_ebcdic_file, pad, split_ascii,
+    AsciiFrame, Framed, Terminator, decode_ascii_file, decode_ascii_lf, decode_ebcdic_file,
+    encode_ascii_file, encode_ascii_lf, encode_ebcdic_file, pad, split_ascii,
 };
 pub use layouts::{
     AccountLayout, AccountRecord, CardLayout, CardRecord, CardXrefLayout, CardXrefRecord,

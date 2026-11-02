@@ -2,12 +2,14 @@
 //! [app/cpy/CVTRA05Y.cpy:L2-18], the record of the VSAM KSDS `TRANSACT`, keyed
 //! on `TRAN-ID` `KEYS(16 0)` [app/jcl/TRANFILE.jcl:L53].
 //!
-//! Batch writes its `TRANSACT` generation files with this layout, one record
-//! per LF-terminated line (`framing::encode_ascii_lf`): `TRANSACT.BKUP(+1)`
-//! (`tranbkp`, `tranrept`), `TRANSACT.COMBINED(+1)` (`combtran`),
-//! `TRANSACT.DALY(+1)` (`tranrept`) and the interest transactions of
-//! `SYSTRAN(+1)` (`intcalc`); `combtran` reads `TRANSACT.BKUP(0)` and
-//! `SYSTRAN(0)` back through it. The live master starts empty (E-07), so no
+//! Batch writes its `TRANSACT` generation files with this layout, each record
+//! at full width followed by `LF` (`framing::encode_ascii_lf`):
+//! `TRANSACT.BKUP(+1)` (`tranbkp`, `tranrept`), `TRANSACT.COMBINED(+1)`
+//! (`combtran`), `TRANSACT.DALY(+1)` (`tranrept`) and the interest
+//! transactions of `SYSTRAN(+1)` (`intcalc`). `combtran` reads
+//! `TRANSACT.BKUP(0)`, `SYSTRAN(0)` and `TRANSACT.COMBINED(+1)`, and
+//! `tranrept` its `TRANSACT.BKUP(+1)` and `TRANSACT.DALY(+1)`, back through it
+//! with `framing::decode_ascii_lf`. The live master starts empty (E-07), so no
 //! fixture file of this layout exists. The fields have the widths and offsets
 //! of `CVTRA06Y` `DALYTRAN-RECORD`, from which `CBTRN02C` moves them one by
 //! one, so a daily transaction record also decodes here.

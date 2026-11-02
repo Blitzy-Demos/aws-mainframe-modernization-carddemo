@@ -30,8 +30,9 @@
 //!   fall, and the adapter commits them once, after the rule returns or
 //!   abends. The store has no checkpoint verb that could fail.
 //! - Of the `DISPLAY` lines, only the two texts the audit records are
-//!   rendered, by [`AbendCause`]'s `Display`. The counts the end of job
-//!   displays are [`PurgeCounts`], which the adapter logs.
+//!   rendered, by [`AbendCause`]'s `Display`. The `PARM RECEIVED` line shows
+//!   [`prm_info`], and the counts the end of job displays are
+//!   [`PurgeCounts`]; the adapter logs both.
 
 use std::error::Error;
 use std::fmt;
@@ -44,7 +45,7 @@ use crate::ports::{AuthorizationStore, Browse, Direction, PortError};
 
 /// `PRM-INFO` [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L98-108]: the
 /// 17 bytes `ACCEPT PRM-INFO FROM SYSIN` fills.
-const PRM_INFO_LEN: usize = 17;
+pub const PRM_INFO_LEN: usize = 17;
 
 /// `P-EXPIRY-DAYS PIC 9(02)`, positions 1-2.
 const P_EXPIRY_DAYS: Range<usize> = 0..2;
@@ -149,9 +150,17 @@ pub fn parse_sysin(text: &str) -> PurgeParams {
     }
 }
 
-/// The `PRM-INFO` bytes `ACCEPT` fills from the first line of `text`: cut at
-/// 17 bytes, padded with spaces.
-fn prm_info(text: &str) -> [u8; PRM_INFO_LEN] {
+/// CBPAUP0C 1000-INITIALIZE — P-CBPAUP0C-001.
+///
+/// The `PRM-INFO` bytes `ACCEPT PRM-INFO FROM SYSIN` fills from the first
+/// line of `text` [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L189]:
+/// cut at 17 bytes, padded with spaces. The line ends at the first `LF`, and
+/// a `CR` just before it is not part of it. These are the bytes
+/// [`parse_sysin`] reads and `DISPLAY 'CBPAUP0C PARM RECEIVED :' PRM-INFO`
+/// shows [app/app-authorization-ims-db2-mq/cbl/CBPAUP0C.cbl:L192]. The cut is
+/// a byte cut, so it may split a multi-byte UTF-8 character.
+#[must_use]
+pub fn prm_info(text: &str) -> [u8; PRM_INFO_LEN] {
     let mut record = [b' '; PRM_INFO_LEN];
     let line = text.lines().next().unwrap_or_default();
     for (slot, byte) in record.iter_mut().zip(line.bytes()) {

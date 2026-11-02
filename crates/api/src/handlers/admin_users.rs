@@ -56,8 +56,9 @@ use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
+use crate::dto::BmsField;
 use crate::dto::admin_users::{
-    UserAddRequest, UserDeleteField, UserListField, UserMessageResponse, UserSummary,
+    UserAddField, UserAddRequest, UserDeleteField, UserListField, UserMessageResponse, UserSummary,
     UserUpdateField, UserUpdateRequest, check_user_id_key,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
@@ -76,17 +77,87 @@ const CU02: &str = "CU02";
 /// The transaction ID of the user delete, `COUSR03C`.
 const CU03: &str = "CU03";
 
-/// The handler span of a request for one user: the transaction, the acting
-/// admin and the user the request names. `outcome` is recorded by
-/// [`traced`] once the unit of work is committed or rolled back.
-fn user_span(transaction: &'static str, admin: &AdminUser, target_user_id: Option<&str>) -> Span {
+/// The span field of the user ID a request for one user names.
+const TARGET_USER_ID: &str = "target_user_id";
+
+/// The span field of the user ID a CU00 page starts from.
+const START_KEY: &str = "start_key";
+
+/// The handler span of a request for one user: the transaction and the
+/// acting admin. `target_user_id`, the user the request names, is recorded
+/// by [`record_key`] once [`check_user_id_key`] has passed it; a key the
+/// check rejects leaves it empty and fills `key_rejected` and `key_len`
+/// instead. `outcome` is recorded by [`traced`] once the unit of work is
+/// committed or rolled back.
+fn user_span(transaction: &'static str, admin: &AdminUser) -> Span {
     tracing::info_span!(
         "admin_users",
         transaction,
         user_id = %admin.user_id,
-        target_user_id,
+        target_user_id = Empty,
+        key_rejected = Empty,
+        key_len = Empty,
         outcome = Empty,
     )
+}
+
+/// The CU00 handler span: as [`user_span`], with the `start_key` the page
+/// starts from in place of `target_user_id`.
+fn list_span(admin: &AdminUser) -> Span {
+    tracing::info_span!(
+        "admin_users",
+        transaction = CU00,
+        user_id = %admin.user_id,
+        start_key = Empty,
+        key_rejected = Empty,
+        key_len = Empty,
+        outcome = Empty,
+    )
+}
+
+/// Records on `span` the user ID key `key`, which [`check_user_id_key`]
+/// answered `checked` for. A key that passed is recorded under `field` as
+/// entered, at most `PIC X(8)`. Of a rejected key only the error's `code`
+/// (`key_rejected`) and the key's length in characters (`key_len`) are
+/// recorded, never its text: a rejected key can be as long as the request
+/// allows and hold anything.
+fn record_key(span: &Span, field: &'static str, key: &str, checked: &Result<(), ApiError>) {
+    match checked {
+        Ok(()) => span.record(field, key),
+        Err(error) => span
+            .record("key_rejected", error.body().code.as_str())
+            .record("key_len", key.chars().count()),
+    };
+}
+
+/// [`check_user_id_key`] of `key` on the BMS field `bms_field`, the check
+/// that decides the request, with its result recorded on `span` under
+/// `field` by [`record_key`].
+///
+/// # Errors
+///
+/// The check's 400 `INVALID`, unchanged.
+fn checked_key(
+    span: &Span,
+    field: &'static str,
+    key: &str,
+    bms_field: impl BmsField,
+) -> Result<(), ApiError> {
+    let checked = check_user_id_key(key, bms_field);
+    record_key(span, field, key, &checked);
+    checked
+}
+
+/// Records the new user's ID of a CU01 body on `span` as `target_user_id`,
+/// through [`check_user_id_key`] on `USERID` alone. That check only bounds
+/// the telemetry: `UserAddRequest::check` edits every member and answers
+/// the request, so the error recorded here is dropped. An absent ID records
+/// nothing.
+fn record_new_user_id(span: &Span, user_id: Option<&str>) {
+    if let Some(user_id) = user_id {
+        let checked = check_user_id_key(user_id, UserAddField::UserId);
+        record_key(span, TARGET_USER_ID, user_id, &checked);
+    }
 }
 
 /// Runs `work` inside `span` and records its `outcome`: the success label the
@@ -143,6 +214,8 @@ async fn roll_back(uow: UnitOfWork) {
 /// COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,
 /// PROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to
 /// P-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).
+/// COUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its
+/// `message` included, replaces the `COUSR0A` map.
 ///
 /// `start_key` is the `USRIDIN` search field and the page keys a previous
 /// page returned; `direction=forward` is ENTER and PF8, `direction=backward`
@@ -180,24 +253,20 @@ pub async fn list_users(
     admin: AdminUser,
     ApiQuery(page): ApiQuery<PageQuery>,
 ) -> Result<Json<Page<UserSummary>>, ApiError> {
-    let span = tracing::info_span!(
-        "admin_users",
-        transaction = CU00,
-        user_id = %admin.user_id,
-        start_key = page.start_key.as_deref(),
-        outcome = Empty,
-    );
-    traced(&span, list(&state, page)).await
+    let span = list_span(&admin);
+    traced(&span, list(&state, &span, page)).await
 }
 
-/// The CU00 browse: the start-key width check, then `user_list::list` in a
-/// unit of work that is rolled back, since the list writes nothing.
+/// The CU00 browse: the start-key width check, recorded on `span`, then
+/// `user_list::list` in a unit of work that is rolled back, since the list
+/// writes nothing.
 async fn list(
     state: &AppState,
+    span: &Span,
     page: PageQuery,
 ) -> Result<(Json<Page<UserSummary>>, &'static str), ApiError> {
     if let Some(key) = page.start_key.as_deref() {
-        check_user_id_key(key, UserListField::UsrIdIn)?;
+        checked_key(span, START_KEY, key, UserListField::UsrIdIn)?;
     }
     let (start_key, direction, page_size) = page.resolve(user_list::SCREEN_ROWS);
     let input = UserListInput {
@@ -215,6 +284,8 @@ async fn list(
 ///
 /// COUSR01C PROCESS-ENTER-KEY, WRITE-USER-SEC-FILE — P-COUSR01C-002 to
 /// P-COUSR01C-005; V-COUSR01C-001 to V-COUSR01C-007 (E-20).
+/// COUSR01C SEND-USRADD-SCREEN — P-COUSR01C-007: the response body and the
+/// form's field errors replace the `COUSR1A` map.
 ///
 /// The five fields are edited for emptiness in screen order (first name, last
 /// name, user ID, password, user type) and stored exactly as entered: no
@@ -253,16 +324,18 @@ pub async fn create_user(
     admin: AdminUser,
     ApiJson(body): ApiJson<UserAddRequest>,
 ) -> Result<(StatusCode, Json<UserMessageResponse>), ApiError> {
-    let span = user_span(CU01, &admin, body.user_id.as_deref());
-    traced(&span, add(&state, body)).await
+    let span = user_span(CU01, &admin);
+    traced(&span, add(&state, &span, body)).await
 }
 
 /// The CU01 add: the width check, `user_add::prepare` on the blocking pool,
 /// then the single `WRITE` of `user_add::add`, committed when it succeeds.
 async fn add(
     state: &AppState,
+    span: &Span,
     body: UserAddRequest,
 ) -> Result<((StatusCode, Json<UserMessageResponse>), &'static str), ApiError> {
+    record_new_user_id(span, body.user_id.as_deref());
     body.check()?;
     let input = body.into_input();
     let prepared = off_executor(move || user_add::prepare(input)).await?;
@@ -288,6 +361,10 @@ async fn add(
 /// P-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the
 /// identical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,
 /// E-58).
+/// COUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces
+/// the `COUSR2A` map.
+/// COUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled
+/// from the response body, replaces the `COUSR3A` map.
 ///
 /// The body is the user's ID, names and type. `COUSR02C` also moves the
 /// stored password into its edit field; a stored argon2id hash cannot be
@@ -322,17 +399,19 @@ pub async fn get_user(
     admin: AdminUser,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<UserSummary>, ApiError> {
-    let span = user_span(CU02, &admin, Some(&id));
-    traced(&span, fetch(&state, id)).await
+    let span = user_span(CU02, &admin);
+    traced(&span, fetch(&state, &span, id)).await
 }
 
-/// The ENTER fetch: the ID width check, then `user_update::lookup` in a unit
-/// of work that is rolled back, releasing the row its `READ … UPDATE` locked.
+/// The ENTER fetch: the ID width check, recorded on `span`, then
+/// `user_update::lookup` in a unit of work that is rolled back, releasing the
+/// row its `READ … UPDATE` locked.
 async fn fetch(
     state: &AppState,
+    span: &Span,
     id: String,
 ) -> Result<(Json<UserSummary>, &'static str), ApiError> {
-    check_user_id_key(&id, UserUpdateField::UsrIdIn)?;
+    checked_key(span, TARGET_USER_ID, &id, UserUpdateField::UsrIdIn)?;
     let mut uow = state.db().begin().await?;
     let found = user_update::lookup(&mut uow.store(), Some(id)).await;
     roll_back(uow).await;
@@ -344,6 +423,8 @@ async fn fetch(
 /// COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —
 /// P-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,
 /// E-46).
+/// COUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces
+/// the `COUSR2A` map.
 ///
 /// The fields are edited for emptiness in screen order (user ID, first name,
 /// last name, password, user type); the user is then read for update and
@@ -391,20 +472,22 @@ pub async fn update_user(
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<UserUpdateRequest>,
 ) -> Result<Json<UserMessageResponse>, ApiError> {
-    let span = user_span(CU02, &admin, Some(&id));
-    traced(&span, update(&state, id, body)).await
+    let span = user_span(CU02, &admin);
+    traced(&span, update(&state, &span, id, body)).await
 }
 
 /// The PF5 update in three steps, inside one unit of work: `user_update::update`
 /// (the empty checks and the `READ … UPDATE`), `UserUpdateCheck::compare` on
 /// the blocking pool with the row still locked, then `user_update::rewrite`,
-/// committed when it rewrote the record.
+/// committed when it rewrote the record. The ID width check before them is
+/// recorded on `span`.
 async fn update(
     state: &AppState,
+    span: &Span,
     id: String,
     body: UserUpdateRequest,
 ) -> Result<(Json<UserMessageResponse>, &'static str), ApiError> {
-    check_user_id_key(&id, UserUpdateField::UsrIdIn)?;
+    checked_key(span, TARGET_USER_ID, &id, UserUpdateField::UsrIdIn)?;
     body.check()?;
     let input = body.into_input(id.clone());
     let mut uow = state.db().begin().await?;
@@ -455,6 +538,8 @@ async fn update(
 /// COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —
 /// P-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to
 /// V-COUSR03C-007 (E-46, E-58).
+/// COUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the
+/// `DELETE` response replace the `COUSR3A` map.
 ///
 /// The user is read for update and deleted. The body carries the user as
 /// read before the delete and `User <id> has been deleted ...`.
@@ -491,17 +576,19 @@ pub async fn delete_user(
     admin: AdminUser,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<UserMessageResponse>, ApiError> {
-    let span = user_span(CU03, &admin, Some(&id));
-    traced(&span, delete(&state, id)).await
+    let span = user_span(CU03, &admin);
+    traced(&span, delete(&state, &span, id)).await
 }
 
-/// The PF5 delete: the ID width check, the record the response shows, then
-/// `user_delete::delete`, committed when it deleted the user.
+/// The PF5 delete: the ID width check, recorded on `span`, the record the
+/// response shows, then `user_delete::delete`, committed when it deleted the
+/// user.
 async fn delete(
     state: &AppState,
+    span: &Span,
     id: String,
 ) -> Result<(Json<UserMessageResponse>, &'static str), ApiError> {
-    check_user_id_key(&id, UserDeleteField::UsrIdIn)?;
+    checked_key(span, TARGET_USER_ID, &id, UserDeleteField::UsrIdIn)?;
     let mut uow = state.db().begin().await?;
     // `user_delete::delete` answers only the deleted ID, while the response
     // shows the user as read before the delete, so the record is read for
@@ -527,5 +614,232 @@ async fn delete(
             roll_back(uow).await;
             Err(error.into())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fmt;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use axum::http::StatusCode;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Span, Subscriber};
+
+    use super::{
+        CU00, CU01, CU02, CU03, START_KEY, TARGET_USER_ID, checked_key, list_span,
+        record_new_user_id, user_span,
+    };
+    use crate::auth::{AdminUser, AuthUser, UserType};
+    use crate::dto::admin_users::{UserDeleteField, UserListField, UserUpdateField};
+    use crate::error::ApiError;
+
+    /// Text no valid key holds, so finding it in telemetry means a rejected
+    /// key leaked.
+    const MARKER: &str = "SPAN-LEAK-MARKER";
+
+    /// A subscriber that keeps every value recorded on its spans and events,
+    /// as text, in the order it was recorded.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(&'static str, String)>>>);
+
+    impl Capture {
+        fn lock(&self) -> MutexGuard<'_, Vec<(&'static str, String)>> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Every value recorded so far.
+        fn values(&self) -> Vec<(&'static str, String)> {
+            self.lock().clone()
+        }
+
+        /// The last value recorded under `field`, if any.
+        fn value(&self, field: &str) -> Option<String> {
+            self.lock()
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == field)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// Writes each value a span or event carries into the capture.
+    struct Collect<'a>(&'a mut Vec<(&'static str, String)>);
+
+    impl Visit for Collect<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push((field.name(), value.to_owned()));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.push((field.name(), value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.push((field.name(), format!("{value:?}")));
+        }
+    }
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &Attributes<'_>) -> Id {
+            span.record(&mut Collect(&mut self.lock()));
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, values: &Record<'_>) {
+            values.record(&mut Collect(&mut self.lock()));
+        }
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut Collect(&mut self.lock()));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    /// One handler's key: the span it opens, the field the key is recorded
+    /// under, and the key step it runs on that span first. `gates` is whether
+    /// the step's result answers the request.
+    struct Site {
+        route: &'static str,
+        transaction: &'static str,
+        span: fn(&AdminUser) -> Span,
+        field: &'static str,
+        step: fn(&Span, &str) -> Result<(), ApiError>,
+        gates: bool,
+    }
+
+    fn sites() -> [Site; 5] {
+        [
+            Site {
+                route: "GET /admin/users?start_key",
+                transaction: CU00,
+                span: list_span,
+                field: START_KEY,
+                step: |span, key| checked_key(span, START_KEY, key, UserListField::UsrIdIn),
+                gates: true,
+            },
+            Site {
+                route: "POST /admin/users",
+                transaction: CU01,
+                span: |admin| user_span(CU01, admin),
+                field: TARGET_USER_ID,
+                step: |span, key| {
+                    record_new_user_id(span, Some(key));
+                    Ok(())
+                },
+                gates: false,
+            },
+            Site {
+                route: "GET /admin/users/{id}",
+                transaction: CU02,
+                span: |admin| user_span(CU02, admin),
+                field: TARGET_USER_ID,
+                step: |span, key| checked_key(span, TARGET_USER_ID, key, UserUpdateField::UsrIdIn),
+                gates: true,
+            },
+            Site {
+                route: "PUT /admin/users/{id}",
+                transaction: CU02,
+                span: |admin| user_span(CU02, admin),
+                field: TARGET_USER_ID,
+                step: |span, key| checked_key(span, TARGET_USER_ID, key, UserUpdateField::UsrIdIn),
+                gates: true,
+            },
+            Site {
+                route: "DELETE /admin/users/{id}",
+                transaction: CU03,
+                span: |admin| user_span(CU03, admin),
+                field: TARGET_USER_ID,
+                step: |span, key| checked_key(span, TARGET_USER_ID, key, UserDeleteField::UsrIdIn),
+                gates: true,
+            },
+        ]
+    }
+
+    fn admin() -> AdminUser {
+        AdminUser(AuthUser {
+            user_id: "ADMIN001".to_owned(),
+            usr_type: UserType::Admin,
+        })
+    }
+
+    #[test]
+    fn a_user_key_is_recorded_once_checked_and_a_rejected_one_only_by_code_and_length() {
+        let overlong = format!("USER0001{MARKER}");
+        let overlong_len = overlong.chars().count().to_string();
+        // (key, recorded as the key, rejected with this length): a key of
+        // `PIC X(8)` or less, blank included, is kept as entered; a longer
+        // one, counted in characters, is not.
+        let cases = [
+            ("USER0001", Some("USER0001"), None),
+            ("", Some(""), None),
+            (overlong.as_str(), None, Some(overlong_len.as_str())),
+            ("ÜSER0001X", None, Some("9")),
+        ];
+        for site in sites() {
+            for (key, recorded, rejected_len) in cases {
+                let capture = Capture::default();
+                let result = tracing::subscriber::with_default(capture.clone(), || {
+                    let span = (site.span)(&admin());
+                    (site.step)(&span, key)
+                });
+                let case = format!("{} with {key:?}", site.route);
+                assert_eq!(
+                    capture.value("transaction").as_deref(),
+                    Some(site.transaction),
+                    "{case}"
+                );
+                assert_eq!(
+                    capture.value("user_id").as_deref(),
+                    Some("ADMIN001"),
+                    "{case}"
+                );
+                assert_eq!(capture.value(site.field).as_deref(), recorded, "{case}");
+                assert_eq!(
+                    capture.value("key_rejected").as_deref(),
+                    rejected_len.map(|_| "INVALID"),
+                    "{case}"
+                );
+                assert_eq!(capture.value("key_len").as_deref(), rejected_len, "{case}");
+                assert!(
+                    capture
+                        .values()
+                        .iter()
+                        .all(|(_, value)| !value.contains(MARKER)),
+                    "{case}: {:?}",
+                    capture.values()
+                );
+                match result {
+                    Err(error) if site.gates && rejected_len.is_some() => {
+                        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{case}");
+                        assert_eq!(error.body().code, "INVALID", "{case}");
+                    }
+                    Ok(()) if !site.gates || rejected_len.is_none() => {}
+                    other => panic!("{case}: the key step answered {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_new_user_id_records_no_key() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            record_new_user_id(&user_span(CU01, &admin()), None);
+        });
+        for field in [TARGET_USER_ID, "key_rejected", "key_len"] {
+            assert_eq!(capture.value(field), None, "{field}");
+        }
+        assert_eq!(capture.value("transaction").as_deref(), Some(CU01));
     }
 }

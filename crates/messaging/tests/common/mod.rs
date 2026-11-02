@@ -19,11 +19,16 @@
 //! [`audit_row`] and [`audit_texts`] read `docs/parity/parity-oracle-audit.md`,
 //! where every expected value of these tests comes from.
 //!
-//! The polling helpers sleep on a blocking thread, because the crate enables no
-//! tokio timer.
+//! Every broker operation the harness awaits is bounded: by the caller's
+//! deadline where there is one, by `READY_TIMEOUT` while the consumers
+//! subscribe, and by `BROKER_TIMEOUT` otherwise. One that does not complete in
+//! time panics, naming the operation, its queue and the bound. The crate enables
+//! no tokio timer, so the polling helpers sleep on a blocking thread, and each
+//! bound is a blocking thread that waits out the remaining time unless the
+//! operation completes first and wakes it.
 
 use std::io;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use carddemo_messaging::Running;
@@ -48,6 +53,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How long [`Harness::start`] waits for each request queue to report its
 /// consumer.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long one broker operation of a helper without a caller deadline may
+/// take; a publish and its confirm count as one.
+const BROKER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Service name of the captured span lines.
 const SERVICE_NAME: &str = "mq-test";
@@ -90,6 +99,75 @@ async fn pause(period: Duration) {
         .expect("sleep task");
 }
 
+/// The instant by which broker operations must complete, with the bound it was
+/// set from, which expiry messages name.
+#[derive(Clone, Copy)]
+struct Deadline {
+    /// When the time runs out.
+    until: Instant,
+    /// The span from the deadline's start to `until`.
+    bound: Duration,
+}
+
+impl Deadline {
+    /// The deadline `bound` from now.
+    fn after(bound: Duration) -> Self {
+        Self {
+            until: Instant::now() + bound,
+            bound,
+        }
+    }
+
+    /// Whether the time has run out.
+    fn passed(self) -> bool {
+        Instant::now() >= self.until
+    }
+
+    /// Starts the broker operation that `start` returns and awaits it until
+    /// the deadline. `operation` names it and `subject` what it concerns,
+    /// usually a queue, for the expiry message.
+    ///
+    /// The bound is a blocking thread that waits out the remaining time. When
+    /// the operation completes first, dropping `cancel` wakes that thread at
+    /// once and it is joined, so no thread outlives the operation.
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the operation, its subject and the bound, without
+    /// starting the operation if the time has run out already, or once it runs
+    /// out before the operation completes.
+    async fn run<F: Future>(
+        self,
+        operation: &str,
+        subject: &str,
+        start: impl FnOnce() -> F,
+    ) -> F::Output {
+        let bound = self.bound;
+        let remaining = self.until.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{operation} for {subject} not started: its bound of {bound:?} had passed"
+        );
+        let (cancel, cancelled) = mpsc::channel::<()>();
+        let mut timer = tokio::task::spawn_blocking(move || {
+            // Ends on the timeout, or at once when `cancel` is dropped.
+            let _ = cancelled.recv_timeout(remaining);
+        });
+        tokio::select! {
+            biased;
+            output = start() => {
+                drop(cancel);
+                timer.await.expect("deadline timer task");
+                output
+            }
+            ended = &mut timer => {
+                ended.expect("deadline timer task");
+                panic!("{operation} for {subject} did not complete within {bound:?}");
+            }
+        }
+    }
+}
+
 /// A running consumer stack and a client of its broker, owned by one test.
 ///
 /// Build it with [`Harness::start`] and end it with [`Harness::shutdown`],
@@ -128,8 +206,11 @@ impl Harness {
     ///
     /// Panics if the containers do not start, the seed fails, the settings or
     /// the telemetry cannot be built, the consumers do not start, the client
-    /// connection or channel cannot be opened, or a request queue reports no
-    /// consumer within 30 seconds.
+    /// connection or channel cannot be opened, opening the test channel or
+    /// putting it in confirm mode takes more than 30 seconds each, or a request
+    /// queue reports no consumer within 30 seconds, which also bound the broker
+    /// operations of its probes. An expiry names the operation and its queue
+    /// or channel.
     pub async fn start(clock_override: Option<&str>) -> Self {
         let stack = TestStack::with_rabbitmq().await;
         stack.seed().await.expect("seed the test database");
@@ -159,12 +240,16 @@ impl Harness {
             .expect("start the consumers");
 
         let connection = stack.amqp_connection().await;
-        let channel = connection
-            .create_channel()
+        let channel = Deadline::after(BROKER_TIMEOUT)
+            .run("channel.open", "the test channel", || {
+                connection.create_channel()
+            })
             .await
             .expect("open the test channel");
-        channel
-            .confirm_select(ConfirmSelectOptions::default())
+        Deadline::after(BROKER_TIMEOUT)
+            .run("confirm.select", "the test channel", || {
+                channel.confirm_select(ConfirmSelectOptions::default())
+            })
             .await
             .expect("put the test channel in confirm mode");
 
@@ -185,6 +270,9 @@ impl Harness {
     /// Waits until each request queue reports a consumer. The consumers
     /// subscribe inside their spawned tasks, after `start` returns, so a
     /// request or an injected failure could otherwise precede them.
+    ///
+    /// Each queue has `READY_TIMEOUT`, checked before every probe, and bounds
+    /// each probe's broker operations.
     async fn wait_for_consumers(&self) {
         let queues = [
             &self.settings.queue_date_request,
@@ -192,12 +280,15 @@ impl Harness {
             &self.settings.queue_pauth_request,
         ];
         for queue in queues {
-            let until = Instant::now() + READY_TIMEOUT;
-            while self.passive_declare(queue).await.consumer_count() == 0 {
+            let deadline = Deadline::after(READY_TIMEOUT);
+            loop {
                 assert!(
-                    Instant::now() < until,
+                    !deadline.passed(),
                     "no consumer on {queue} within {READY_TIMEOUT:?}"
                 );
+                if self.passive_declare(queue, deadline).await.consumer_count() > 0 {
+                    break;
+                }
                 pause(POLL_INTERVAL).await;
             }
         }
@@ -206,25 +297,31 @@ impl Harness {
     /// The broker's current state of `queue`, from a passive declare on a
     /// channel of its own: the broker closes the channel of a passive declare
     /// of a missing queue (404), and that must never be the test's `channel`.
-    async fn passive_declare(&self, queue: &str) -> Queue {
-        let probe = self
-            .connection
-            .create_channel()
+    /// Opening, declaring and closing must all complete within `deadline`.
+    async fn passive_declare(&self, queue: &str, deadline: Deadline) -> Queue {
+        let probe = deadline
+            .run("channel.open (probe)", queue, || {
+                self.connection.create_channel()
+            })
             .await
             .unwrap_or_else(|error| panic!("cannot open a channel to inspect {queue}: {error}"));
-        let state = probe
-            .queue_declare(
-                queue,
-                QueueDeclareOptions {
-                    passive: true,
-                    ..QueueDeclareOptions::default()
-                },
-                FieldTable::default(),
-            )
+        let state = deadline
+            .run("queue.declare (passive)", queue, || {
+                probe.queue_declare(
+                    queue,
+                    QueueDeclareOptions {
+                        passive: true,
+                        ..QueueDeclareOptions::default()
+                    },
+                    FieldTable::default(),
+                )
+            })
             .await
             .unwrap_or_else(|error| panic!("cannot inspect queue {queue}: {error}"));
-        probe
-            .close(REPLY_SUCCESS, "inspected")
+        deadline
+            .run("channel.close (probe)", queue, || {
+                probe.close(REPLY_SUCCESS, "inspected")
+            })
             .await
             .unwrap_or_else(|error| {
                 panic!("cannot close the channel that inspected {queue}: {error}")
@@ -240,7 +337,8 @@ impl Harness {
     ///
     /// Panics if the publish fails or the broker does not confirm it with a
     /// plain `Ack`. The publish is mandatory, so one to a missing queue comes
-    /// back returned and panics too.
+    /// back returned and panics too. It also panics, naming the queue and the
+    /// operation, if the publish and its confirm take more than 30 seconds.
     pub async fn publish(
         &self,
         queue: &str,
@@ -255,20 +353,24 @@ impl Harness {
         if let Some(reply_to) = reply_to {
             properties = properties.with_reply_to(reply_to.into());
         }
-        let confirmation = self
-            .channel
-            .basic_publish(
-                "",
-                queue,
-                BasicPublishOptions {
-                    mandatory: true,
-                    ..BasicPublishOptions::default()
-                },
-                body,
-                properties,
-            )
+        let deadline = Deadline::after(BROKER_TIMEOUT);
+        let confirm = deadline
+            .run("basic.publish", queue, || {
+                self.channel.basic_publish(
+                    "",
+                    queue,
+                    BasicPublishOptions {
+                        mandatory: true,
+                        ..BasicPublishOptions::default()
+                    },
+                    body,
+                    properties,
+                )
+            })
             .await
-            .unwrap_or_else(|error| panic!("cannot publish to {queue}: {error}"))
+            .unwrap_or_else(|error| panic!("cannot publish to {queue}: {error}"));
+        let confirmation = deadline
+            .run("publisher confirm", queue, || confirm)
             .await
             .unwrap_or_else(|error| panic!("no confirmation of the publish to {queue}: {error}"));
         assert!(
@@ -288,19 +390,21 @@ impl Harness {
     ///
     /// # Panics
     ///
-    /// Panics if the broker refuses the declaration.
+    /// Panics if the broker refuses the declaration, or does not answer it
+    /// within 30 seconds.
     pub async fn temp_reply_queue(&self) -> String {
-        let queue = self
-            .channel
-            .queue_declare(
-                "",
-                QueueDeclareOptions {
-                    exclusive: true,
-                    auto_delete: true,
-                    ..QueueDeclareOptions::default()
-                },
-                FieldTable::default(),
-            )
+        let queue = Deadline::after(BROKER_TIMEOUT)
+            .run("queue.declare", "a temporary reply queue", || {
+                self.channel.queue_declare(
+                    "",
+                    QueueDeclareOptions {
+                        exclusive: true,
+                        auto_delete: true,
+                        ..QueueDeclareOptions::default()
+                    },
+                    FieldTable::default(),
+                )
+            })
             .await
             .expect("declare a temporary reply queue");
         queue.name().as_str().to_owned()
@@ -313,38 +417,41 @@ impl Harness {
     ///
     /// Panics if no message arrives within `deadline`, or if the get or the
     /// acknowledgement fails. A get from a missing queue closes the test's
-    /// channel and fails.
+    /// channel and fails. Every get and the acknowledgement must also complete
+    /// within `deadline`, or it panics, naming the queue and the operation.
     pub async fn next_message(&self, queue: &str, deadline: Duration) -> Delivery {
-        let until = Instant::now() + deadline;
+        let until = Deadline::after(deadline);
         loop {
-            if let Some(delivery) = self.try_get(queue).await {
-                delivery
-                    .acker
-                    .ack(BasicAckOptions::default())
+            assert!(!until.passed(), "no message on {queue} within {deadline:?}");
+            if let Some(delivery) = self.try_get(queue, until).await {
+                until
+                    .run("basic.ack", queue, || {
+                        delivery.acker.ack(BasicAckOptions::default())
+                    })
                     .await
                     .unwrap_or_else(|error| {
                         panic!("cannot acknowledge a message of {queue}: {error}")
                     });
                 return delivery;
             }
-            assert!(
-                Instant::now() < until,
-                "no message on {queue} within {deadline:?}"
-            );
             pause(POLL_INTERVAL).await;
         }
     }
 
     /// Checks `queue` for the whole of `wait` and returns when it stayed empty.
     ///
+    /// `wait` is the least time the queue is watched, not a budget: each get
+    /// has 30 seconds from its own start, so a slow broker lengthens the watch
+    /// rather than cutting it short.
+    ///
     /// # Panics
     ///
     /// Panics with the queue and the message body as soon as a message
-    /// appears, or if a get fails.
+    /// appears, or if a get fails or does not complete within 30 seconds.
     pub async fn assert_no_message(&self, queue: &str, wait: Duration) {
         let until = Instant::now() + wait;
         loop {
-            if let Some(delivery) = self.try_get(queue).await {
+            if let Some(delivery) = self.try_get(queue, Deadline::after(BROKER_TIMEOUT)).await {
                 let body = String::from_utf8_lossy(&delivery.data);
                 panic!("unexpected message on {queue}: {body:?}");
             }
@@ -355,10 +462,14 @@ impl Harness {
         }
     }
 
-    /// One unacknowledged `basic.get` from `queue` on the test's channel.
-    async fn try_get(&self, queue: &str) -> Option<Delivery> {
-        self.channel
-            .basic_get(queue, BasicGetOptions { no_ack: false })
+    /// One unacknowledged `basic.get` from `queue` on the test's channel,
+    /// which must complete within `deadline`.
+    async fn try_get(&self, queue: &str, deadline: Deadline) -> Option<Delivery> {
+        deadline
+            .run("basic.get", queue, || {
+                self.channel
+                    .basic_get(queue, BasicGetOptions { no_ack: false })
+            })
             .await
             .unwrap_or_else(|error| panic!("cannot get from {queue}: {error}"))
             .map(|message| message.delivery)
@@ -368,9 +479,12 @@ impl Harness {
     ///
     /// # Panics
     ///
-    /// Panics if the queue does not exist or cannot be inspected.
+    /// Panics if the queue does not exist or cannot be inspected, or if
+    /// inspecting it takes more than 30 seconds.
     pub async fn queue_depth(&self, queue: &str) -> u32 {
-        self.passive_declare(queue).await.message_count()
+        self.passive_declare(queue, Deadline::after(BROKER_TIMEOUT))
+            .await
+            .message_count()
     }
 
     /// Every non-blank line the consumers' telemetry has written so far, in
@@ -423,8 +537,9 @@ impl Harness {
     ///
     /// Panics if the consumers' connection or the test's connection cannot be
     /// closed, if the test's channel fails to close for a reason other than
-    /// the broker having closed it already, or if the capture's tracer provider
-    /// fails to shut down.
+    /// the broker having closed it already, if closing the test's channel or
+    /// connection takes more than 30 seconds each, or if the capture's tracer
+    /// provider fails to shut down.
     pub async fn shutdown(self) {
         let Self {
             stack,
@@ -437,14 +552,21 @@ impl Harness {
             guard,
         } = self;
         running.shutdown().await.expect("stop the consumers");
-        match channel.close(REPLY_SUCCESS, "done").await {
+        let closed = Deadline::after(BROKER_TIMEOUT)
+            .run("channel.close", "the test channel", || {
+                channel.close(REPLY_SUCCESS, "done")
+            })
+            .await;
+        match closed {
             // A test that provoked a channel error left the channel closed by
             // the broker, so there is nothing left to close.
             Ok(()) | Err(lapin::Error::InvalidChannelState(_)) => {}
             Err(error) => panic!("cannot close the test channel: {error}"),
         }
-        connection
-            .close(REPLY_SUCCESS, "done")
+        Deadline::after(BROKER_TIMEOUT)
+            .run("connection.close", "the test connection", || {
+                connection.close(REPLY_SUCCESS, "done")
+            })
             .await
             .expect("close the test connection");
         guard.shutdown().expect("shut the capture telemetry down");
@@ -488,7 +610,9 @@ pub fn audit_row(id: &str) -> String {
 /// Panics, naming the row, if the audit cannot be read, holds no row `id`, its
 /// table has no "Expected result" column, the cell holds no code span, a code
 /// span is not a well-formed double-quoted string, or a padded value would be
-/// longer than its width or holds a `{FIELD}` placeholder of unknown length.
+/// longer than its width, holds a `{FIELD}` placeholder of unknown length, or
+/// holds a `{UNDEF:` that starts no well-formed `{UNDEF:n}`: unterminated, or
+/// with an n that is empty, not all digits or too large for a length.
 #[must_use]
 pub fn audit_texts(id: &str) -> Vec<String> {
     let lines: Vec<&str> = audit_text().lines().collect();
@@ -742,19 +866,22 @@ fn pad(mut text: String, width: usize, id: &str) -> String {
 }
 
 /// The byte length of the value `text` stands for: `{UNDEF:n}` counts n bytes,
-/// and any other `{` is a literal character, such as an overpunched `+0`.
+/// and a `{` that starts neither `{UNDEF:` nor a `{FIELD}` placeholder is a
+/// literal character, such as an overpunched `+0`.
 ///
 /// # Panics
 ///
-/// Panics on a `{FIELD}` placeholder, a COBOL data name in braces, because the
-/// length of the field's content is not part of the text.
+/// Panics, naming the row, on a `{FIELD}` placeholder, a COBOL data name in
+/// braces, because the length of the field's content is not part of the text,
+/// and on a `{UNDEF:` that starts no well-formed `{UNDEF:n}`: unterminated, or
+/// with an n that is empty, not all digits or too large for a length.
 fn value_length(text: &str, id: &str) -> usize {
     let mut length = 0;
     let mut rest = text;
     while let Some(at) = rest.find('{') {
         length += at;
         let tail = &rest[at..];
-        if let Some((bytes, written)) = undefined_bytes(tail) {
+        if let Some((bytes, written)) = undefined_bytes(tail, text, id) {
             length += bytes;
             rest = &tail[written..];
         } else if starts_with_field(tail) {
@@ -767,14 +894,28 @@ fn value_length(text: &str, id: &str) -> usize {
     length + rest.len()
 }
 
-/// For a `tail` starting with `{UNDEF:n}`: n, and the placeholder's own length.
-fn undefined_bytes(tail: &str) -> Option<(usize, usize)> {
+/// For a `tail` of `text` starting with `{UNDEF:n}`: n, and the placeholder's
+/// own length. `None` when `tail` does not start with `{UNDEF:`.
+///
+/// # Panics
+///
+/// Panics, naming the row, when a `tail` starting with `{UNDEF:` holds no
+/// well-formed `{UNDEF:n}`: the placeholder is unterminated, or its n is empty,
+/// not all digits or too large for a length.
+fn undefined_bytes(tail: &str, text: &str, id: &str) -> Option<(usize, usize)> {
     let rest = tail.strip_prefix("{UNDEF:")?;
-    let (digits, _) = rest.split_once('}')?;
-    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let bytes = digits.parse().ok()?;
+    let (digits, _) = rest.split_once('}').unwrap_or_else(|| {
+        panic!("audit row {id}: {text:?} holds an unterminated {{UNDEF:n}} placeholder")
+    });
+    assert!(
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()),
+        "audit row {id}: {text:?} holds {{UNDEF:{digits}}}, whose n is not a run of digits"
+    );
+    let bytes = digits.parse().unwrap_or_else(|error| {
+        panic!(
+            "audit row {id}: {text:?} holds {{UNDEF:{digits}}}, whose n is not a length: {error}"
+        )
+    });
     Some((bytes, "{UNDEF:}".len() + digits.len()))
 }
 

@@ -22,11 +22,15 @@
 //!
 //! # What these resources leave out
 //!
-//! `COTRTUP` also offers F4 delete and F6 add (E-23, open). The add is
-//! `POST`, which `COTRTUPC` reaches with F5 on a key not found. The delete is
-//! served only as the `COTRTLIC` row delete, with its texts: which message
-//! set the one `DELETE` answers with is the user's decision under E-23, so no
-//! second delete and no other endpoint exists here.
+//! They leave out only the alternate `COTRTUPC` delete message set:
+//! `Delete successful.` (P-COTRTUPC-004) and its failure texts
+//! (P-COTRTUPC-005). The `COTRTUP` F4 delete is served by the one `DELETE`,
+//! with the `COTRTLIC` `9300-DELETE-RECORD` texts (P-COTRTUPC-028); which set
+//! that `DELETE` answers with is the user's decision under E-23 (open), so no
+//! second delete endpoint exists here. The add is `POST`, which `COTRTUPC`
+//! reaches with F5 on a key not found. The map's `F6=Add` legend has no
+//! executable path: it stays dark and `0001-CHECK-PFKEYS` never accepts F6
+//! (P-COTRTUPC-001, P-COTRTUPC-026).
 //!
 //! # Units of work
 //!
@@ -50,7 +54,11 @@
 //! token is used for telemetry only. Each request runs in a `handler` span
 //! with `transaction` (`CTLI` or `CTTU`), `user_id`, `type_code`, `origin`
 //! and, once the unit of work has ended, `outcome`: `ok`, or the error code
-//! of the response.
+//! of the response. `type_code` is the path code, the code of an add's body
+//! or the type code filter of a list, recorded only once
+//! [`check_type_code_key`] has passed it, so it is at most `X(2)`. A code
+//! that check rejects is never recorded: `key_rejected` holds the error's
+//! code and `key_len` its length in characters instead.
 
 use axum::Json;
 use axum::extract::State;
@@ -87,7 +95,8 @@ const OUTCOME_OK: &str = "ok";
 /// P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,
 /// V-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,
 /// V-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,
-/// V-COTRTLIC-028
+/// V-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response
+/// replaces the 3270 send of the `CTRTLIA` map, a mandated deviation.
 ///
 /// A page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,
 /// in ascending type code order. An empty result and a page boundary are 200
@@ -125,7 +134,8 @@ pub async fn list_tran_types(
     ApiQuery(filters): ApiQuery<TranTypeListQuery>,
     ApiQuery(page): ApiQuery<PageQuery>,
 ) -> Result<Json<Page<TranTypeResponse>>, ApiError> {
-    let span = handler_span(CTLI, &admin, filters.type_code.as_deref(), None);
+    let span = handler_span(CTLI, &admin, None);
+    record_entered_type_code(&span, filters.type_code.as_deref());
     traced(span, async move {
         filters.check()?;
         let (start_key, direction, page_size) = page.resolve(tran_type_list::SCREEN_ROWS);
@@ -181,7 +191,8 @@ pub async fn create_tran_type(
     admin: AdminUser,
     ApiJson(body): ApiJson<TranTypeCreateRequest>,
 ) -> Result<(StatusCode, Json<TranTypeMessageResponse>), ApiError> {
-    let span = handler_span(CTTU, &admin, body.type_code.as_deref(), None);
+    let span = handler_span(CTTU, &admin, None);
+    record_entered_type_code(&span, body.type_code.as_deref());
     traced(span, async move {
         body.check()?;
         let input = body.into_input();
@@ -258,11 +269,11 @@ pub async fn update_tran_type(
         None => CTTU,
         Some(TranTypeOrigin::List) => CTLI,
     };
-    let span = handler_span(transaction, &admin, Some(&id), query.origin);
-    traced(span, async move {
+    let span = handler_span(transaction, &admin, query.origin);
+    traced(span.clone(), async move {
         let response = match query.origin {
-            None => update_via_cttu(&state, id, body).await?,
-            Some(TranTypeOrigin::List) => update_via_ctli(&state, &id, body).await?,
+            None => update_via_cttu(&state, &span, id, body).await?,
+            Some(TranTypeOrigin::List) => update_via_ctli(&state, &span, &id, body).await?,
         };
         Ok(Json(response))
     })
@@ -277,10 +288,11 @@ pub async fn update_tran_type(
 /// V-COTRTUPC-011
 async fn update_via_cttu(
     state: &AppState,
+    span: &Span,
     id: String,
     body: TranTypeUpdateRequest,
 ) -> Result<TranTypeMessageResponse, ApiError> {
-    check_type_code_key(&id, None)?;
+    checked_type_code(span, &id, None)?;
     body.check(None)?;
     let input = body.into_upsert_input(id);
     let mut uow = state.db().begin().await?;
@@ -298,11 +310,12 @@ async fn update_via_cttu(
 /// P-COTRTLIC-010, V-COTRTLIC-012 to V-COTRTLIC-018
 async fn update_via_ctli(
     state: &AppState,
+    span: &Span,
     id: &str,
     body: TranTypeUpdateRequest,
 ) -> Result<TranTypeMessageResponse, ApiError> {
     let origin = Some(TranTypeOrigin::List);
-    check_type_code_key(id, origin)?;
+    checked_type_code(span, id, origin)?;
     body.check(origin)?;
     let row = body.into_list_update(id);
     let mut uow = state.db().begin().await?;
@@ -354,9 +367,9 @@ pub async fn delete_tran_type(
     admin: AdminUser,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<TranTypeMessageResponse>, ApiError> {
-    let span = handler_span(CTLI, &admin, Some(&id), None);
-    traced(span, async move {
-        check_type_code_key(&id, Some(TranTypeOrigin::List))?;
+    let span = handler_span(CTLI, &admin, None);
+    traced(span.clone(), async move {
+        checked_type_code(&span, &id, Some(TranTypeOrigin::List))?;
         // The `COTRTLIC` delete, not the `COTRTUPC` F4 delete with its own
         // texts: which of the two message sets this endpoint answers with is
         // open for the user (E-23), and the list's delete is the one the
@@ -370,23 +383,68 @@ pub async fn delete_tran_type(
     .await
 }
 
-/// The span of one request: its CICS `transaction`, the admin's ID, the type
-/// code as entered (the filter of a list) and the `origin` of an update.
-/// `outcome` is recorded by [`traced`].
+/// The span of one request: its CICS `transaction`, the admin's ID and the
+/// `origin` of an update. `type_code`, or `key_rejected` and `key_len` in
+/// its place, is recorded by [`record_type_code`], and `outcome` by
+/// [`traced`].
 fn handler_span(
     transaction: &'static str,
     admin: &AdminUser,
-    type_code: Option<&str>,
     origin: Option<TranTypeOrigin>,
 ) -> Span {
     tracing::info_span!(
         "handler",
         transaction,
         user_id = admin.user_id.as_str(),
-        type_code,
+        type_code = tracing::field::Empty,
+        key_rejected = tracing::field::Empty,
+        key_len = tracing::field::Empty,
         origin = origin.map(origin_name),
         outcome = tracing::field::Empty,
     )
+}
+
+/// Records on `span` the type code `code`, which [`check_type_code_key`]
+/// answered `checked` for. A code that passed is recorded as `type_code` as
+/// entered, at most `X(2)`. Of a rejected code only the error's `code`
+/// (`key_rejected`) and the code's length in characters (`key_len`) are
+/// recorded, never its text: a rejected code can be as long as the request
+/// allows and hold anything.
+fn record_type_code(span: &Span, code: &str, checked: &Result<(), ApiError>) {
+    match checked {
+        Ok(()) => span.record("type_code", code),
+        Err(error) => span
+            .record("key_rejected", error.body().code.as_str())
+            .record("key_len", code.chars().count()),
+    };
+}
+
+/// [`check_type_code_key`] of the `{id}` path code `code` for `origin`, the
+/// check that decides the request, with its result recorded on `span` by
+/// [`record_type_code`].
+///
+/// # Errors
+///
+/// The check's 400, unchanged.
+fn checked_type_code(
+    span: &Span,
+    code: &str,
+    origin: Option<TranTypeOrigin>,
+) -> Result<(), ApiError> {
+    let checked = check_type_code_key(code, origin);
+    record_type_code(span, code, &checked);
+    checked
+}
+
+/// Records the type code of a list filter or of an add's body on `span`,
+/// through [`check_type_code_key`] on that member alone, which holds it to
+/// the same `X(2)` as the filter and body checks. That check only bounds the
+/// telemetry: the request's own check edits every member and answers, so
+/// the error recorded here is dropped. An absent code records nothing.
+fn record_entered_type_code(span: &Span, code: Option<&str>) {
+    if let Some(code) = code {
+        record_type_code(span, code, &check_type_code_key(code, None));
+    }
 }
 
 /// The `origin` query value, as the span records it.
@@ -456,10 +514,21 @@ async fn discard(uow: UnitOfWork) {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt;
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use axum::http::StatusCode;
     use serde_json::Value;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Span, Subscriber};
     use utoipa_axum::router::OpenApiRouter;
     use utoipa_axum::routes;
 
+    use super::{CTLI, CTTU, checked_type_code, handler_span, record_entered_type_code};
+    use crate::auth::{AdminUser, AuthUser, UserType};
+    use crate::dto::admin_transaction_types::TranTypeOrigin;
+    use crate::error::ApiError;
     use crate::state::AppState;
 
     /// The `OpenAPI` document of the four operations, registered as the route
@@ -626,5 +695,217 @@ mod tests {
             delete["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/TranTypeMessageResponse"
         );
+    }
+
+    /// Text no valid code holds, so finding it in telemetry means a rejected
+    /// code leaked.
+    const MARKER: &str = "SPAN-LEAK-MARKER";
+
+    /// A subscriber that keeps every value recorded on its spans and events,
+    /// as text, in the order it was recorded.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<(&'static str, String)>>>);
+
+    impl Capture {
+        fn lock(&self) -> MutexGuard<'_, Vec<(&'static str, String)>> {
+            self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        }
+
+        /// Every value recorded so far.
+        fn values(&self) -> Vec<(&'static str, String)> {
+            self.lock().clone()
+        }
+
+        /// The last value recorded under `field`, if any.
+        fn value(&self, field: &str) -> Option<String> {
+            self.lock()
+                .iter()
+                .rev()
+                .find(|(name, _)| *name == field)
+                .map(|(_, value)| value.clone())
+        }
+    }
+
+    /// Writes each value a span or event carries into the capture.
+    struct Collect<'a>(&'a mut Vec<(&'static str, String)>);
+
+    impl Visit for Collect<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.push((field.name(), value.to_owned()));
+        }
+
+        fn record_u64(&mut self, field: &Field, value: u64) {
+            self.0.push((field.name(), value.to_string()));
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.push((field.name(), format!("{value:?}")));
+        }
+    }
+
+    impl Subscriber for Capture {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, span: &Attributes<'_>) -> Id {
+            span.record(&mut Collect(&mut self.lock()));
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, values: &Record<'_>) {
+            values.record(&mut Collect(&mut self.lock()));
+        }
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            event.record(&mut Collect(&mut self.lock()));
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    /// One handler's type code: the span it opens and the code step it runs
+    /// on that span first. `gates` is whether the step's result answers the
+    /// request.
+    struct Site {
+        route: &'static str,
+        transaction: &'static str,
+        origin: Option<&'static str>,
+        span: fn(&AdminUser) -> Span,
+        step: fn(&Span, &str) -> Result<(), ApiError>,
+        gates: bool,
+    }
+
+    fn sites() -> [Site; 5] {
+        [
+            Site {
+                route: "GET /admin/transaction-types?type_code",
+                transaction: CTLI,
+                origin: None,
+                span: |admin| handler_span(CTLI, admin, None),
+                step: |span, code| {
+                    record_entered_type_code(span, Some(code));
+                    Ok(())
+                },
+                gates: false,
+            },
+            Site {
+                route: "POST /admin/transaction-types",
+                transaction: CTTU,
+                origin: None,
+                span: |admin| handler_span(CTTU, admin, None),
+                step: |span, code| {
+                    record_entered_type_code(span, Some(code));
+                    Ok(())
+                },
+                gates: false,
+            },
+            Site {
+                route: "PUT /admin/transaction-types/{id}",
+                transaction: CTTU,
+                origin: None,
+                span: |admin| handler_span(CTTU, admin, None),
+                step: |span, code| checked_type_code(span, code, None),
+                gates: true,
+            },
+            Site {
+                route: "PUT /admin/transaction-types/{id}?origin=list",
+                transaction: CTLI,
+                origin: Some("list"),
+                span: |admin| handler_span(CTLI, admin, Some(TranTypeOrigin::List)),
+                step: |span, code| checked_type_code(span, code, Some(TranTypeOrigin::List)),
+                gates: true,
+            },
+            Site {
+                route: "DELETE /admin/transaction-types/{id}",
+                transaction: CTLI,
+                origin: None,
+                span: |admin| handler_span(CTLI, admin, None),
+                step: |span, code| checked_type_code(span, code, Some(TranTypeOrigin::List)),
+                gates: true,
+            },
+        ]
+    }
+
+    fn admin() -> AdminUser {
+        AdminUser(AuthUser {
+            user_id: "ADMIN001".to_owned(),
+            usr_type: UserType::Admin,
+        })
+    }
+
+    #[test]
+    fn a_type_code_is_recorded_once_checked_and_a_rejected_one_only_by_code_and_length() {
+        let overlong = format!("01{MARKER}");
+        let overlong_len = overlong.chars().count().to_string();
+        // (code, recorded as `type_code`, rejected with this length): a code
+        // of `X(2)` or less, blank included, is kept as entered; a longer one,
+        // counted in characters, is not.
+        let cases = [
+            ("01", Some("01"), None),
+            ("", Some(""), None),
+            (overlong.as_str(), None, Some(overlong_len.as_str())),
+            ("ÄB1", None, Some("3")),
+        ];
+        for site in sites() {
+            for (code, recorded, rejected_len) in cases {
+                let capture = Capture::default();
+                let result = tracing::subscriber::with_default(capture.clone(), || {
+                    let span = (site.span)(&admin());
+                    (site.step)(&span, code)
+                });
+                let case = format!("{} with {code:?}", site.route);
+                assert_eq!(
+                    capture.value("transaction").as_deref(),
+                    Some(site.transaction),
+                    "{case}"
+                );
+                assert_eq!(
+                    capture.value("user_id").as_deref(),
+                    Some("ADMIN001"),
+                    "{case}"
+                );
+                assert_eq!(capture.value("origin").as_deref(), site.origin, "{case}");
+                assert_eq!(capture.value("type_code").as_deref(), recorded, "{case}");
+                assert_eq!(
+                    capture.value("key_rejected").as_deref(),
+                    rejected_len.map(|_| "INVALID"),
+                    "{case}"
+                );
+                assert_eq!(capture.value("key_len").as_deref(), rejected_len, "{case}");
+                assert!(
+                    capture
+                        .values()
+                        .iter()
+                        .all(|(_, value)| !value.contains(MARKER)),
+                    "{case}: {:?}",
+                    capture.values()
+                );
+                match result {
+                    Err(error) if site.gates && rejected_len.is_some() => {
+                        assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{case}");
+                        assert_eq!(error.body().code, "INVALID", "{case}");
+                    }
+                    Ok(()) if !site.gates || rejected_len.is_none() => {}
+                    other => panic!("{case}: the code step answered {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_absent_entered_type_code_records_no_key() {
+        let capture = Capture::default();
+        tracing::subscriber::with_default(capture.clone(), || {
+            record_entered_type_code(&handler_span(CTLI, &admin(), None), None);
+        });
+        for field in ["type_code", "key_rejected", "key_len"] {
+            assert_eq!(capture.value(field), None, "{field}");
+        }
+        assert_eq!(capture.value("transaction").as_deref(), Some(CTLI));
     }
 }

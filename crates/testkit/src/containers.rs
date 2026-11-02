@@ -11,23 +11,38 @@
 //! Every [`TestStack`] owns its containers: each constructor starts new ones,
 //! so tests never share state, and dropping the stack removes them.
 //!
+//! Every [`TestStack`] also owns a Docker bridge network of its own, which its
+//! containers join. The network's default host binding is `127.0.0.1`, so the
+//! random host ports the containers publish listen on loopback only, as the
+//! Compose services' publications do, instead of on every host interface as
+//! they would on Docker's default bridge. Dropping the stack removes the
+//! network after the containers.
+//!
 //! The public API names only `sqlx::PgPool`, `lapin::Connection` and standard
 //! library types. No testcontainers or `carddemo-persistence` type crosses it,
 //! because the persistence suites reach this crate through a dev-dependency
 //! cycle and would otherwise meet a second copy of every persistence type.
 
+use std::collections::HashMap;
 use std::error::Error;
+use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use carddemo_persistence::seed::{SeedMode, SeedSources};
 use carddemo_persistence::{Db, migrate, seed};
 use lapin::{Connection, ConnectionProperties};
 use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row, ValueRef};
+use testcontainers::bollard::Docker;
+use testcontainers::bollard::errors::Error as DockerError;
+use testcontainers::bollard::network::CreateNetworkOptions;
 use testcontainers::core::{AccessMode, IntoContainerPort, Mount, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use testcontainers_modules::postgres::Postgres;
-use tokio::runtime::Handle;
+use tokio::runtime::{Builder, Handle};
 
 use crate::{fixtures, runtime};
 
@@ -98,12 +113,36 @@ const RABBITMQ_ERL_ARGS: &str = "+S 2:2";
 /// handlers it drives, while many stacks run side by side.
 const POOL_MAX_CONNECTIONS: u32 = 5;
 
+/// Docker network driver of a stack's network.
+const NETWORK_DRIVER: &str = "bridge";
+
+/// Bridge driver option that sets the host address a port published without
+/// one binds to. Docker's default bridge sets it to `0.0.0.0`.
+const HOST_BINDING_OPTION: &str = "com.docker.network.bridge.host_binding_ipv4";
+
+/// The host address every published port of a stack binds to: loopback, the
+/// host of the URLs the stack hands out.
+const NETWORK_HOST_BINDING: &str = "127.0.0.1";
+
+/// First part of a stack network's name, which the process id, the creation
+/// time and [`NETWORK_SEQUENCE`] make unique.
+const NETWORK_NAME_PREFIX: &str = "carddemo-testkit";
+
+/// Label key and value that testcontainers puts on the containers it starts,
+/// put on a stack network too so it is found alongside them.
+const NETWORK_LABEL: (&str, &str) = ("org.testcontainers.managed-by", "testcontainers");
+
+/// Stack networks this process has created so far.
+static NETWORK_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 /// A migrated `PostgreSQL` test database and, from [`TestStack::with_rabbitmq`],
-/// a `RabbitMQ` broker, each in its own container.
+/// a `RabbitMQ` broker, each in its own container. The containers join the
+/// stack's own bridge network, so their published ports listen on `127.0.0.1`
+/// only.
 ///
-/// Dropping the stack removes its containers. That works in a plain `#[test]`
-/// after [`crate::block_on`], inside `block_on`, and in a `#[tokio::test]` of
-/// either runtime flavour.
+/// Dropping the stack removes its containers and then its network. That works
+/// in a plain `#[test]` after [`crate::block_on`], inside `block_on`, and in a
+/// `#[tokio::test]` of either runtime flavour.
 pub struct TestStack {
     pool: PgPool,
     database_url: String,
@@ -111,6 +150,10 @@ pub struct TestStack {
     rabbitmq: Option<ContainerAsync<GenericImage>>,
     /// `Some` from construction until [`Drop::drop`] takes it.
     postgres: Option<ContainerAsync<Postgres>>,
+    /// `Some` from construction until [`Drop::drop`] takes it, after the
+    /// containers, which Docker must have detached before it removes the
+    /// network.
+    network: Option<StackNetwork>,
 }
 
 impl Drop for TestStack {
@@ -123,6 +166,7 @@ impl Drop for TestStack {
         let _entered = Handle::try_current().is_err().then(|| runtime().enter());
         drop(self.rabbitmq.take());
         drop(self.postgres.take());
+        drop(self.network.take());
     }
 }
 
@@ -133,19 +177,29 @@ impl TestStack {
     /// to `0005_rewards.sql`). The database holds the schema and no rows; call
     /// [`TestStack::seed`] for the fixture state.
     ///
+    /// The container joins a bridge network the stack creates first, whose
+    /// default host binding is `127.0.0.1`, so its random published port
+    /// listens on loopback only.
+    ///
     /// # Panics
     ///
-    /// Panics, naming the image, the URL or the error, if Docker is unavailable,
-    /// the container does not start or become ready, its port cannot be looked
-    /// up, the pool cannot connect, or a migration fails.
+    /// Panics, naming the network, the image, the URL or the error, if Docker is
+    /// unavailable, the stack network cannot be created, the container does not
+    /// start or become ready, its port cannot be looked up, the pool cannot
+    /// connect, or a migration fails. As the panic unwinds, a container already
+    /// started is removed, then the stack network.
     pub async fn postgres() -> Self {
-        let (postgres, database_url, pool) = start_postgres().await;
+        // Created before any container, so that on a panic the containers,
+        // dropped first, are gone when the network is removed.
+        let network = StackNetwork::create().await;
+        let (postgres, database_url, pool) = start_postgres(network.name()).await;
         Self {
             pool,
             database_url,
             amqp_url: None,
             rabbitmq: None,
             postgres: Some(postgres),
+            network: Some(network),
         }
     }
 
@@ -169,23 +223,33 @@ impl TestStack {
     ///   `CARD.DEMO.ERROR` [app/app-vsam-mq/cbl/CODATE01.cbl:243]
     ///   [app/app-vsam-mq/cbl/COACCT01.cbl:294].
     ///
+    /// Both containers join the one bridge network the stack creates, whose
+    /// default host binding is `127.0.0.1`, so every port the broker and the
+    /// database publish listens on loopback only.
+    ///
     /// # Panics
     ///
     /// Panics in every case [`TestStack::postgres`] does, if either mounted
-    /// file is missing (checked before any container starts) or its path is not
-    /// UTF-8, or if the broker does not start or become ready or its AMQP port
-    /// cannot be looked up.
+    /// file is missing (checked before any Docker network or container is
+    /// created) or its path is not UTF-8, or if the broker does not start or
+    /// become ready or its AMQP port cannot be looked up.
     pub async fn with_rabbitmq() -> Self {
         let definitions = mount_source(RABBITMQ_DEFINITIONS_SOURCE);
         let conf = mount_source(RABBITMQ_CONF_SOURCE);
-        let ((postgres, database_url, pool), (rabbitmq, amqp_url)) =
-            tokio::join!(start_postgres(), start_rabbitmq(definitions, conf));
+        // Created before any container, so that on a panic the containers,
+        // dropped first, are gone when the network is removed.
+        let network = StackNetwork::create().await;
+        let ((postgres, database_url, pool), (rabbitmq, amqp_url)) = tokio::join!(
+            start_postgres(network.name()),
+            start_rabbitmq(network.name(), definitions, conf)
+        );
         Self {
             pool,
             database_url,
             amqp_url: Some(amqp_url),
             rabbitmq: Some(rabbitmq),
             postgres: Some(postgres),
+            network: Some(network),
         }
     }
 
@@ -287,14 +351,122 @@ impl TestStack {
     }
 }
 
-/// Starts the `PostgreSQL` container, connects a pool and migrates it, returning
-/// the container, the database URL and the pool.
-async fn start_postgres() -> (ContainerAsync<Postgres>, String, PgPool) {
+/// A Docker bridge network that one [`TestStack`] creates and its containers
+/// join. Its default host binding is [`NETWORK_HOST_BINDING`], so the ports its
+/// containers publish without a host address listen on loopback only, where
+/// Docker's default bridge would bind them to every host interface.
+///
+/// The network exists before testcontainers sees its name, so testcontainers
+/// treats it as created elsewhere and never removes it; this guard's `Drop`
+/// does.
+struct StackNetwork {
+    name: String,
+}
+
+impl StackNetwork {
+    /// Creates a uniquely named bridge network whose default host binding is
+    /// [`NETWORK_HOST_BINDING`].
+    ///
+    /// # Panics
+    ///
+    /// Panics, naming the network and the error, if the Docker daemon cannot be
+    /// reached or refuses to create the network.
+    async fn create() -> Self {
+        let sequence = NETWORK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let name = format!("{NETWORK_NAME_PREFIX}-{}-{nanos}-{sequence}", process::id());
+        if let Err(error) = create_network(&name).await {
+            panic!(
+                "cannot create the test network {name} with host binding \
+                 {NETWORK_HOST_BINDING} (is the Docker daemon running?): {error}"
+            );
+        }
+        Self { name }
+    }
+
+    /// The network's name, which containers join through
+    /// [`ImageExt::with_network`].
+    fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for StackNetwork {
+    fn drop(&mut self) {
+        // Removal is a Docker API call, which needs a tokio runtime. Inside a
+        // runtime, as in `block_on` or a `#[tokio::test]` of either flavour, a
+        // nested `block_on` panics, so a thread of its own, with its own
+        // current-thread runtime and client, runs it alike in every context,
+        // outside any runtime included. A failure is reported instead of
+        // raised, because a panic in `Drop` during unwinding aborts.
+        let name = &self.name;
+        let removed = name.clone();
+        let removal = thread::Builder::new()
+            .name(String::from("testkit-network"))
+            .spawn(move || remove_network(&removed));
+        let outcome = match removal {
+            Ok(handle) => match handle.join() {
+                Ok(result) => result.map_err(|error| error.to_string()),
+                Err(_) => Err(String::from("its removal thread panicked")),
+            },
+            Err(error) => Err(format!("its removal thread did not start: {error}")),
+        };
+        if let Err(error) = outcome {
+            eprintln!(
+                "warning: carddemo-testkit left the Docker network {name} behind \
+                 (remove it with `docker network rm {name}`): {error}"
+            );
+        }
+    }
+}
+
+/// Creates the bridge network `name`, labelled [`NETWORK_LABEL`], with
+/// [`HOST_BINDING_OPTION`] set to [`NETWORK_HOST_BINDING`], for
+/// [`StackNetwork::create`].
+///
+/// # Errors
+///
+/// Returns the error if the Docker daemon cannot be reached or refuses the
+/// network, for example because one of that name exists.
+async fn create_network(name: &str) -> Result<(), DockerError> {
+    Docker::connect_with_defaults()?
+        .create_network(CreateNetworkOptions {
+            name,
+            check_duplicate: true,
+            driver: NETWORK_DRIVER,
+            options: HashMap::from([(HOST_BINDING_OPTION, NETWORK_HOST_BINDING)]),
+            labels: HashMap::from([NETWORK_LABEL]),
+            ..CreateNetworkOptions::default()
+        })
+        .await?;
+    Ok(())
+}
+
+/// Removes the Docker network `name` through a client and a current-thread
+/// runtime of its own, for [`StackNetwork`]'s `Drop`.
+///
+/// # Errors
+///
+/// Returns the error if the runtime cannot be built, the Docker daemon cannot
+/// be reached, or it refuses the removal, for example because a container kept
+/// by `TESTCONTAINERS_COMMAND=keep` is still attached.
+fn remove_network(name: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let runtime = Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async { Docker::connect_with_defaults()?.remove_network(name).await })?;
+    Ok(())
+}
+
+/// Starts the `PostgreSQL` container on `network`, connects a pool and migrates
+/// it, returning the container, the database URL and the pool.
+async fn start_postgres(network: &str) -> (ContainerAsync<Postgres>, String, PgPool) {
     let container = Postgres::default()
         .with_db_name(POSTGRES_DB)
         .with_user(POSTGRES_USER)
         .with_password(POSTGRES_PASSWORD)
         .with_tag(POSTGRES_TAG)
+        .with_network(network)
         .start()
         .await
         .unwrap_or_else(|error| {
@@ -322,9 +494,10 @@ async fn start_postgres() -> (ContainerAsync<Postgres>, String, PgPool) {
     (container, url, pool)
 }
 
-/// Starts the `RabbitMQ` container with the two repository files mounted
-/// read-only, returning the container and its AMQP URL.
+/// Starts the `RabbitMQ` container on `network` with the two repository files
+/// mounted read-only, returning the container and its AMQP URL.
 async fn start_rabbitmq(
+    network: &str,
     definitions: String,
     conf: String,
 ) -> (ContainerAsync<GenericImage>, String) {
@@ -339,6 +512,7 @@ async fn start_rabbitmq(
             Mount::bind_mount(conf, RABBITMQ_CONF_TARGET).with_access_mode(AccessMode::ReadOnly),
         )
         .with_env_var("RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS", RABBITMQ_ERL_ARGS)
+        .with_network(network)
         .start()
         .await
         .unwrap_or_else(|error| {
@@ -394,4 +568,113 @@ fn text_value(row: &PgRow, index: usize, sql: &str) -> Option<String> {
         .as_str()
         .unwrap_or_else(|error| panic!("column {index} is not UTF-8 text: {error}\n{sql}"));
     Some(text.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use testcontainers::bollard::Docker;
+    use testcontainers::bollard::container::InspectContainerOptions;
+    use testcontainers::bollard::errors::Error as DockerError;
+    use testcontainers::bollard::network::InspectNetworkOptions;
+
+    use super::{AMQP_PORT, POSTGRES_PORT, TestStack};
+    use crate::block_on;
+
+    /// The only host address a stack's containers may publish on. Written out
+    /// rather than taken from the module, so that a changed binding fails here.
+    const LOOPBACK: &str = "127.0.0.1";
+
+    /// The Docker bridge driver option that sets the default host binding.
+    const HOST_BINDING_OPTION: &str = "com.docker.network.bridge.host_binding_ipv4";
+
+    /// Asserts that container `id` runs on `network`, publishes `port`, and binds
+    /// every published port to [`LOOPBACK`] only.
+    fn assert_loopback_only(docker: &Docker, id: &str, network: &str, port: u16) {
+        let inspected = block_on(docker.inspect_container(id, None::<InspectContainerOptions>))
+            .unwrap_or_else(|error| panic!("cannot inspect the test container {id}: {error}"));
+        let network_mode = inspected.host_config.and_then(|config| config.network_mode);
+        assert_eq!(
+            network_mode.as_deref(),
+            Some(network),
+            "container {id} is not on the stack network"
+        );
+        let ports = inspected
+            .network_settings
+            .and_then(|settings| settings.ports)
+            .unwrap_or_default();
+        let published = format!("{port}/tcp");
+        assert!(
+            ports
+                .get(&published)
+                .and_then(Option::as_ref)
+                .is_some_and(|bindings| !bindings.is_empty()),
+            "container {id} does not publish {published}: {ports:?}"
+        );
+        for (container_port, bindings) in &ports {
+            for binding in bindings.iter().flatten() {
+                assert_eq!(
+                    binding.host_ip.as_deref(),
+                    Some(LOOPBACK),
+                    "container {id} publishes {container_port} beyond loopback: {binding:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stack_publishes_on_loopback_only_and_removes_its_network() {
+        let docker = Docker::connect_with_defaults()
+            .unwrap_or_else(|error| panic!("cannot reach the Docker daemon: {error}"));
+        let stack = block_on(TestStack::with_rabbitmq());
+        let network = stack
+            .network
+            .as_ref()
+            .expect("a new stack owns its network")
+            .name()
+            .to_owned();
+        let postgres = stack
+            .postgres
+            .as_ref()
+            .expect("a new stack holds its PostgreSQL container")
+            .id()
+            .to_owned();
+        let rabbitmq = stack
+            .rabbitmq
+            .as_ref()
+            .expect("a stack from with_rabbitmq holds its broker container")
+            .id()
+            .to_owned();
+
+        assert_loopback_only(&docker, &postgres, &network, POSTGRES_PORT);
+        assert_loopback_only(&docker, &rabbitmq, &network, AMQP_PORT);
+        let created =
+            block_on(docker.inspect_network(&network, None::<InspectNetworkOptions<&str>>))
+                .unwrap_or_else(|error| {
+                    panic!("cannot inspect the stack network {network}: {error}")
+                });
+        assert_eq!(created.driver.as_deref(), Some("bridge"));
+        assert_eq!(
+            created
+                .options
+                .as_ref()
+                .and_then(|options| options.get(HOST_BINDING_OPTION))
+                .map(String::as_str),
+            Some(LOOPBACK),
+            "the stack network {network} lacks the loopback host binding"
+        );
+
+        drop(stack);
+        let removed =
+            block_on(docker.inspect_network(&network, None::<InspectNetworkOptions<&str>>));
+        assert!(
+            matches!(
+                removed,
+                Err(DockerError::DockerResponseServerError {
+                    status_code: 404,
+                    ..
+                })
+            ),
+            "the stack network {network} outlived the stack: {removed:?}"
+        );
+    }
 }

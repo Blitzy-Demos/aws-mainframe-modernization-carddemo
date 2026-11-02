@@ -43,8 +43,11 @@
 //!
 //! # Record files
 //!
-//! Record files use the ASCII codec layouts at full copybook width with `LF` terminators
-//! ([`PendingGeneration::append_records`], [`read_records`]). Print and statement files are
+//! Record files use the ASCII codec layouts at full copybook width, each record followed by `LF`
+//! ([`PendingGeneration::append_records`]). [`read_records`] reads them back frame by frame, each
+//! frame the copybook width of record bytes and then that `LF`. Alphanumeric fields copy bytes,
+//! so an `LF` or `CR` inside a record is record data and never a record boundary, and a file that
+//! is not a whole number of such frames does not decode. Print and statement files are
 //! fixed-width text lines with `LF` terminators, checked by [`encode_fixed_lines`]: `TRANREPT`
 //! 133 bytes (`LRECL=133` [app/jcl/TRANREPT.jcl:L78]), STMTFILE 80 and HTMLFILE 100
 //! [app/cbl/CBSTM03A.CBL:L44-47]. A line must have exactly that width and hold no `LF` or `CR`,
@@ -61,7 +64,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use carddemo_codec::framing::{decode_ascii_file, encode_ascii_lf};
+use carddemo_codec::framing::{decode_ascii_lf, encode_ascii_lf};
 use carddemo_codec::{CodecError, Layout};
 
 /// `LIMIT(5) SCRATCH`: the number of generations each GDG keeps [app/jcl/DEFGDGB.jcl:STEP05]
@@ -508,16 +511,19 @@ impl Drop for PendingGeneration {
 /// Reads every record of the ASCII record file `path` with the layout `L`, in file order: a
 /// generation such as `TRANSACT.BKUP(0)`, `SYSTRAN(0)` or `TRANSACT.DALY(+1)`.
 ///
+/// The file is read as [`PendingGeneration::append_records`] writes it: consecutive frames of
+/// `L::LEN` record bytes, each followed by `LF`. Each record's bytes are decoded whole, whatever
+/// they hold, so a record whose alphanumeric field holds `LF` or `CR` reads back unchanged.
+///
 /// # Errors
 ///
 /// [`GenerationError::Io`] when the file cannot be read, and [`GenerationError::Codec`] for the
-/// first record that does not decode, located at its 1-based record number.
+/// first record that does not decode, located at its 1-based record number: a final frame
+/// shorter than `L::LEN` bytes and its `LF`, a byte other than `LF` after a record, or a field
+/// error of the layout.
 pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, GenerationError> {
     let bytes = fs::read(path).map_err(|source| io_error(path, source))?;
-    Ok(decode_ascii_file::<L>(&bytes)?
-        .into_iter()
-        .map(|framed| framed.record)
-        .collect())
+    Ok(decode_ascii_lf::<L>(&bytes)?)
 }
 
 /// Encodes fixed-width text lines as a record file: each line, which must be exactly `width`
@@ -1210,17 +1216,19 @@ mod tests {
         pending
             .append_records::<SixBytes>(&[*b"ABCDEF"])
             .expect("record appends");
+        // An `X(n)` field copies bytes, so `LF`, `CR LF` and a final `CR` are record data that
+        // reads back unchanged.
         pending
-            .append_records::<SixBytes>(&[*b"GHIJKL", *b"MNOPQR"])
+            .append_records::<SixBytes>(&[*b"GH\nJKL", *b"MN\r\nQR", *b"STUVW\r"])
             .expect("records append");
         let records = pending.catalog().expect("generation catalogs");
         assert_eq!(
             fs::read(&records.path).expect("generation is readable"),
-            b"ABCDEF\nGHIJKL\nMNOPQR\n"
+            b"ABCDEF\nGH\nJKL\nMN\r\nQR\nSTUVW\r\n"
         );
         assert_eq!(
             read_records::<SixBytes>(&records.path).expect("records decode"),
-            [*b"ABCDEF", *b"GHIJKL", *b"MNOPQR"]
+            [*b"ABCDEF", *b"GH\nJKL", *b"MN\r\nQR", *b"STUVW\r"]
         );
 
         let mut report = generations
@@ -1263,21 +1271,38 @@ mod tests {
         );
 
         fs::create_dir_all(dir.path()).expect("directory creates");
-        let long = dir.path().join("TRANSACT.BKUP.G0001V00");
-        fs::write(&long, b"ABCDEF\nGHIJKLM\n").expect("file writes");
-        let error = read_records::<SixBytes>(&long).expect_err("record 2 is too long");
-        assert!(matches!(
-            &error,
-            GenerationError::Codec(CodecError {
-                record: Some(2),
-                kind: CodecErrorKind::RecordTooLong { stored_len: 7 },
-                ..
-            })
-        ));
-        assert_eq!(
-            error.to_string(),
-            "record file decode failed: TEST-REC record 2: stored length 7 exceeds the record length"
-        );
+        let file = dir.path().join("TRANSACT.BKUP.G0001V00");
+        let cases: [(&[u8], CodecErrorKind, &str); 2] = [
+            (
+                b"ABCDEF\nGHIJKLM\n",
+                CodecErrorKind::Separator { byte: b'M' },
+                "byte 0x4D instead of LF after a full-width record",
+            ),
+            (
+                b"ABCDEF\nGHI",
+                CodecErrorKind::PartialFrame { frame_len: 3 },
+                "final frame of 3 bytes is shorter than the record length plus LF",
+            ),
+        ];
+        for (bytes, kind, text) in cases {
+            fs::write(&file, bytes).expect("file writes");
+            let error = read_records::<SixBytes>(&file).expect_err("record 2 is not framed");
+            assert!(
+                matches!(
+                    &error,
+                    GenerationError::Codec(CodecError {
+                        record: Some(2),
+                        kind: found,
+                        ..
+                    }) if *found == kind
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!("record file decode failed: TEST-REC record 2: {text}")
+            );
+        }
     }
 
     #[test]

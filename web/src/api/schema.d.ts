@@ -197,7 +197,8 @@ export interface paths {
          *     P-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,
          *     V-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,
          *     V-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,
-         *     V-COTRTLIC-028
+         *     V-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response
+         *     replaces the 3270 send of the `CTRTLIA` map, a mandated deviation.
          *
          *     A page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,
          *     in ascending type code order. An empty result and a page boundary are 200
@@ -329,6 +330,8 @@ export interface paths {
          * @description COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,
          *     PROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to
          *     P-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).
+         *     COUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its
+         *     `message` included, replaces the `COUSR0A` map.
          *
          *     `start_key` is the `USRIDIN` search field and the page keys a previous
          *     page returned; `direction=forward` is ENTER and PF8, `direction=backward`
@@ -354,6 +357,8 @@ export interface paths {
          * CU01: adds a user to `USRSEC`.
          * @description COUSR01C PROCESS-ENTER-KEY, WRITE-USER-SEC-FILE — P-COUSR01C-002 to
          *     P-COUSR01C-005; V-COUSR01C-001 to V-COUSR01C-007 (E-20).
+         *     COUSR01C SEND-USRADD-SCREEN — P-COUSR01C-007: the response body and the
+         *     form's field errors replace the `COUSR1A` map.
          *
          *     The five fields are edited for emptiness in screen order (first name, last
          *     name, user ID, password, user type) and stored exactly as entered: no
@@ -394,6 +399,10 @@ export interface paths {
          *     P-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the
          *     identical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,
          *     E-58).
+         *     COUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces
+         *     the `COUSR2A` map.
+         *     COUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled
+         *     from the response body, replaces the `COUSR3A` map.
          *
          *     The body is the user's ID, names and type. `COUSR02C` also moves the
          *     stored password into its edit field; a stored argon2id hash cannot be
@@ -415,6 +424,8 @@ export interface paths {
          * @description COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —
          *     P-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,
          *     E-46).
+         *     COUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces
+         *     the `COUSR2A` map.
          *
          *     The fields are edited for emptiness in screen order (user ID, first name,
          *     last name, password, user type); the user is then read for update and
@@ -448,6 +459,8 @@ export interface paths {
          * @description COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —
          *     P-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to
          *     V-COUSR03C-007 (E-46, E-58).
+         *     COUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the
+         *     `DELETE` response replace the `COUSR3A` map.
          *
          *     The user is read for update and deleted. The body carries the user as
          *     read before the delete and `User <id> has been deleted ...`.
