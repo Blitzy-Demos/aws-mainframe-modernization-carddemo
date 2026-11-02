@@ -237,11 +237,16 @@ proptest! {
         check_store(temp, amount(credit) - amount(debit) + amount(tran_amt))?;
     }
 
-    /// The store of an interest quotient, the one value the public algebra
-    /// yields whose exact amount has more than two fraction digits: CBACT04C
-    /// `COMPUTE WS-MONTHLY-INT = (TRAN-CAT-BAL * DIS-INT-RATE) / 1200` into
-    /// `S9(09)V99` truncates the fraction toward zero and drops the high-order
-    /// digits (P-CBACT04C-012, P-CBACT04C-019).
+    /// CBACT04C `COMPUTE WS-MONTHLY-INT = (TRAN-CAT-BAL * DIS-INT-RATE) / 1200`
+    /// into `S9(09)V99` truncates the fraction toward zero and drops the
+    /// high-order digits (P-CBACT04C-012, P-CBACT04C-019). The port takes two
+    /// steps: `RatedBalance::monthly()` truncates the quotient toward zero to
+    /// whole cents with the sign kept, and `MoneyExpr::store::<9>()` then drops
+    /// the high-order digits and stores a zero as positive zero. The property
+    /// checks the two together against [`reference_store`] of the exact
+    /// quotient, the only input to [`reference_store`] in this file that can
+    /// carry more than two fraction digits, so it alone exercises the
+    /// reference's fraction truncation.
     #[test]
     fn an_interest_quotient_store_truncates_both_ends(
         balance in cents_up_to(MAX_CENTS_9),

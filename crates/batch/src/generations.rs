@@ -751,6 +751,7 @@ fn io_error(path: &Path, source: io::Error) -> GenerationError {
 #[cfg(test)]
 mod tests {
     use std::env;
+    use std::ffi::OsStr;
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
@@ -760,8 +761,8 @@ mod tests {
     use carddemo_codec::{Charset, CodecError, CodecErrorKind, FieldKind, FieldSpec, Layout};
 
     use super::{
-        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, encode_fixed_lines,
-        read_records, write_replacing,
+        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, create_temp,
+        encode_fixed_lines, read_records, remove_temp, write_replacing, write_synced,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
@@ -1325,6 +1326,51 @@ mod tests {
             write_replacing(Path::new("/"), b""),
             Err(GenerationError::Io { .. })
         ));
+    }
+
+    /// Holds the first temporary allocation of a target while the second is made, so the two
+    /// lifetimes overlap on every run rather than only when the scheduler interleaves writers.
+    #[test]
+    fn outstanding_temporary_files_of_one_target_are_distinct() {
+        let dir = TestDir::new("outstanding-temps");
+        fs::create_dir_all(dir.path()).expect("directory creates");
+        let target = dir.path().join("STATEMNT.PS");
+        let file_name = OsStr::new("STATEMNT.PS");
+
+        let (first, first_file) = create_temp(&target, file_name).expect("first temporary creates");
+        let (second, second_file) =
+            create_temp(&target, file_name).expect("second temporary creates beside the first");
+        assert_ne!(first, second);
+
+        let prefix = format!(".STATEMNT.PS.tmp-{}-", process::id());
+        let mut temp_names = Vec::new();
+        for temp in [&first, &second] {
+            assert_eq!(temp.parent(), Some(dir.path()), "{}", temp.display());
+            let name = temp
+                .file_name()
+                .and_then(OsStr::to_str)
+                .expect("temporary file name is UTF-8");
+            let sequence = name.strip_prefix(&prefix);
+            assert!(
+                sequence.is_some_and(|digits| {
+                    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+                }),
+                "{name}"
+            );
+            temp_names.push(name.to_owned());
+        }
+        temp_names.sort();
+
+        write_synced(first_file, &first, b"first\n").expect("first temporary writes");
+        write_synced(second_file, &second, b"second\n").expect("second temporary writes");
+        assert_eq!(fs::read(&first).expect("first is readable"), b"first\n");
+        assert_eq!(fs::read(&second).expect("second is readable"), b"second\n");
+        assert_eq!(dir.names(), temp_names, "the target is never created");
+
+        assert!(remove_temp(&first), "first temporary is deleted");
+        assert!(remove_temp(&second), "second temporary is deleted");
+        let left = dir.names();
+        assert!(left.is_empty(), "no temporary file is left: {left:?}");
     }
 
     #[test]
