@@ -7,11 +7,16 @@
  * This schema blocks only input the server rejects, in the order it rejects
  * it:
  *
- * 1. Each field holds at most the 8 characters of its `PIC X(8)` map field.
- *    The server applies this length check before the sign-on rule and answers
- *    it with an empty message, so the issue keeps zod's own text.
- * 2. V-COSGN00C-001, then V-COSGN00C-002: a user ID, then a password, of
- *    `SPACES OR LOW-VALUES` [app/cbl/COSGN00C.cbl:L117-127].
+ * 1. The lengths of both fields, the user ID's then the password's: each
+ *    holds at most the 8 characters of its `PIC X(8)` map field. The server's
+ *    `LoginRequest::check` tests both before the sign-on rule runs, names
+ *    `USERID` then `PASSWD` for each field that is too long, and answers with
+ *    an empty message, so each issue keeps zod's own text.
+ * 2. Only when both lengths pass, V-COSGN00C-001, then V-COSGN00C-002: a user
+ *    ID, then a password, of `SPACES OR LOW-VALUES`
+ *    [app/cbl/COSGN00C.cbl:L117-127]. The server's sign-on rule answers the
+ *    first of them alone; when both fields are blank the schema reports both,
+ *    the user ID's first, so its first issue is still the server's answer.
  *
  * Values are never trimmed or upper-cased. COSGN00C upper-cases both after
  * the blank edits [app/cbl/COSGN00C.cbl:L132-136], and a password stored in
@@ -38,29 +43,43 @@ export const LOGIN_MESSAGES = {
 } as const;
 
 /**
- * One map field: the length check, then the field's COSGN00C blank edit,
- * `SPACES OR LOW-VALUES` as the server's sign-on rule tests it. The value is
- * not trimmed: a tab or other whitespace is not blank to the COBOL, and the
- * server reads it and answers 'User not found. Try again ...'.
- */
-function mapField(emptyMessage: string) {
-  return z
-    .string()
-    .max(MAP_FIELD_LENGTH)
-    .refine((value) => !isSpacesOrLowValues(value), {
-      message: emptyMessage,
-    });
-}
-
-/**
  * The sign-on form. Keys follow the audit `Order` (USERID 1, PASSWD 2), so
- * zod reports the user ID's issues before the password's, as COSGN00C tests
- * them.
+ * zod reports the user ID's length before the password's, as the server's
+ * `LoginRequest::check` lists them. The blank edits are object-level and wait
+ * on both lengths, because the server answers an over-long field alone,
+ * before its sign-on rule tests either field: an over-long password stops the
+ * user ID's blank edit, and an over-long user ID the password's. Blank is
+ * `SPACES OR LOW-VALUES` as that rule tests it. The values are not trimmed: a
+ * tab or other whitespace is not blank to the COBOL, and the server reads it
+ * and answers 'User not found. Try again ...'.
  */
-export const loginSchema = z.object({
-  user_id: mapField(LOGIN_MESSAGES.userIdEmpty),
-  password: mapField(LOGIN_MESSAGES.passwordEmpty),
-}) satisfies z.ZodType<LoginRequest>;
+export const loginSchema = z
+  .object({
+    user_id: z.string().max(MAP_FIELD_LENGTH),
+    password: z.string().max(MAP_FIELD_LENGTH),
+  })
+  .superRefine((values, ctx) => {
+    if (
+      values.user_id.length > MAP_FIELD_LENGTH ||
+      values.password.length > MAP_FIELD_LENGTH
+    ) {
+      return;
+    }
+    if (isSpacesOrLowValues(values.user_id)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["user_id"],
+        message: LOGIN_MESSAGES.userIdEmpty,
+      });
+    }
+    if (isSpacesOrLowValues(values.password)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["password"],
+        message: LOGIN_MESSAGES.passwordEmpty,
+      });
+    }
+  }) satisfies z.ZodType<LoginRequest>;
 
 export type LoginFormValues = z.infer<typeof loginSchema>;
 

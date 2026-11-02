@@ -9,7 +9,10 @@
 // - The acting user is the bearer token of the signed-on session
 //   (lib/session.ts), the client-side counterpart of the COMMAREA's
 //   CDEMO-USER-ID and CDEMO-USER-TYPE [app/cpy/COCOM01Y.cpy:L25-28]. No other
-//   header, query parameter or body field names a user or a role.
+//   header, query parameter or body field names a user or a role. The token
+//   goes only to the page's own origin under the /api path segment, the API
+//   behind the proxy: a call whose `baseUrl` option points anywhere else is
+//   sent without it.
 // - Every non-2xx answer surfaces as an ApiError carrying the server's
 //   `{code, message, fields}` body, the 3270 message line (COSGN00 ERRMSG
 //   [app/cpy-bms/COSGN00.CPY:L84]) turned into data, which lib/api-errors.ts
@@ -129,11 +132,49 @@ const LOGIN_PATH = "/auth/login" satisfies keyof paths;
 // so the object itself identifies the sign-on. openapi-fetch hands onResponse
 // the Request object onRequest returned, so the answer is matched to its own
 // request, and an entry goes away with its request. A request sent with no
-// session has no entry.
+// session, or to anywhere but the API, has no entry.
 const sentBySession = new WeakMap<Request, Session>();
 
+// The path segment the Vite proxy forwards to the API, under which every
+// request of the default base URL lies.
+const API_PREFIX = "/api";
+
+// Whether `url` addresses the API: the page's own origin, with a path that is
+// API_PREFIX or lies under it. A segment that merely begins with the prefix
+// (/apiary) is another path, and path matching is case-sensitive. An opaque
+// origin ("null", as for a file: or sandboxed document) matches nothing, and
+// neither does a URL that does not parse. The page's origin is read on every
+// request rather than once at load, so a test that stubs `location` after
+// this module loads is honoured.
+function isApiRequest(url: string): boolean {
+  const pageOrigin = globalThis.location.origin;
+  if (pageOrigin === "null") {
+    return false;
+  }
+  let target: URL;
+  try {
+    target = new URL(url);
+  } catch {
+    return false;
+  }
+  return (
+    target.origin === pageOrigin &&
+    (target.pathname === API_PREFIX ||
+      target.pathname.startsWith(`${API_PREFIX}/`))
+  );
+}
+
+// The session's token is attached only to a request for the API
+// (isApiRequest). openapi-fetch accepts a `baseUrl` option on every call and
+// builds the Request from it before this middleware runs, so the client's own
+// base URL does not bound where a request goes. A request elsewhere is sent
+// untouched, with no Authorization header and no sentBySession entry, so a 401
+// it receives ends no session.
 const authMiddleware: Middleware = {
   onRequest({ request }) {
+    if (!isApiRequest(request.url)) {
+      return request;
+    }
     const session = getSession();
     if (session !== null) {
       request.headers.set("Authorization", `Bearer ${session.token}`);
@@ -248,7 +289,7 @@ function fetchWithDeadline(request: Request): Promise<Response> {
  * first rejects with that signal's reason, an AbortError by default.
  */
 export const api = createClient<paths>({
-  baseUrl: `${globalThis.location.origin}/api`,
+  baseUrl: `${globalThis.location.origin}${API_PREFIX}`,
   fetch: fetchWithDeadline,
 });
 

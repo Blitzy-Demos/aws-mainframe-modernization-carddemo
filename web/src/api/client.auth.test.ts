@@ -1,7 +1,9 @@
 // Tests of the API client's 401 handling (api/client.ts authMiddleware): which
 // session a 401 ends, that the caller still receives the server's error, and
 // that the way back to the sign-on page is RequireAuth's router redirect, which
-// keeps the requested location as `from`, never a document navigation.
+// keeps the requested location as `from`, never a document navigation. Also
+// which requests carry the session's token at all: only those for the page's
+// own origin under /api, whatever base URL a call gives.
 //
 // The network is the stubbed global the client looks up on every request. The
 // test releases each answer itself, so a sign-on can happen while a request is
@@ -339,5 +341,136 @@ describe("the sign-on redirect after a 401", () => {
       401,
       "Authentication required",
     );
+  });
+});
+
+describe("the session token", () => {
+  type Target = {
+    target: string;
+    outcome: string;
+    // The call's `baseUrl` option, from the page's origin; null sends the call
+    // with the client's own base URL.
+    override: (origin: string) => string | null;
+    carried: boolean;
+  };
+
+  const ACCOUNT = { acct_id: "00000000001" };
+
+  // The page's host on another port, which is another origin.
+  function otherPort(origin: string): string {
+    const url = new URL(origin);
+    url.port = url.port === "1" ? "2" : "1";
+    return url.origin;
+  }
+
+  // GET /accounts/{id} with the per-call `baseUrl` option openapi-fetch
+  // accepts, or with the client's own base URL when `baseUrl` is null.
+  function viewAccountAt(baseUrl: string | null): Promise<unknown> {
+    if (baseUrl === null) {
+      return viewAccount();
+    }
+    return api
+      .GET("/accounts/{id}", {
+        baseUrl,
+        params: { path: { id: "00000000001" } },
+      })
+      .then(unwrap);
+  }
+
+  // `recording` as a document of opaque origin (a file: or sandboxed page)
+  // reports itself: its navigation is still recorded, and its origin is
+  // "null".
+  function withOpaqueOrigin(recording: object): object {
+    const opaque: object = Object.create(recording, {
+      origin: { get: () => "null" },
+    });
+    return opaque;
+  }
+
+  it.each<Target>([
+    {
+      target: "the client's own base URL",
+      outcome: "is sent",
+      override: () => null,
+      carried: true,
+    },
+    {
+      target: "the page's origin under /api",
+      outcome: "is sent",
+      override: (origin) => `${origin}/api`,
+      carried: true,
+    },
+    {
+      target: "another origin",
+      outcome: "is withheld",
+      override: () => "https://other.example",
+      carried: false,
+    },
+    {
+      target: "the page's host on another port",
+      outcome: "is withheld",
+      override: otherPort,
+      carried: false,
+    },
+    {
+      target: "the page's origin under /apiary",
+      outcome: "is withheld",
+      override: (origin) => `${origin}/apiary`,
+      carried: false,
+    },
+    {
+      target: "the page's origin under /API",
+      outcome: "is withheld",
+      override: (origin) => `${origin}/API`,
+      carried: false,
+    },
+    {
+      target: "the page's origin outside /api",
+      outcome: "is withheld",
+      override: (origin) => `${origin}/other`,
+      carried: false,
+    },
+  ])("$outcome with a call to $target", async ({ override, carried }) => {
+    setSession(EARLIER);
+    const origin = globalThis.location.origin;
+    const baseUrl = override(origin);
+    const call = viewAccountAt(baseUrl);
+    const { request, answer } = await nextRequest();
+    const base = baseUrl ?? `${origin}/api`;
+    expect(request.url).toBe(`${base}/accounts/00000000001`);
+    expect(request.headers.get("Authorization")).toBe(
+      carried ? `Bearer ${EARLIER.token}` : null,
+    );
+
+    answer(Response.json(ACCOUNT));
+
+    await expect(call).resolves.toEqual(ACCOUNT);
+    expect(getSession()).toEqual(EARLIER);
+  });
+
+  it("is withheld from another origin, whose 401 keeps the current session", async () => {
+    setSession(EARLIER);
+    const call = viewAccountAt("https://other.example");
+    const { request, answer } = await nextRequest();
+    expect(request.headers.get("Authorization")).toBeNull();
+
+    answer(authenticationRequired());
+
+    expectApiError(await rejectionOf(call), 401, "Authentication required");
+    expect(getSession()).toEqual(EARLIER);
+  });
+
+  it("is withheld on a page of opaque origin", async () => {
+    documentLocation = withOpaqueOrigin(documentLocation);
+    vi.stubGlobal("location", documentLocation);
+    setSession(EARLIER);
+    const call = viewAccount();
+    const { request, answer } = await nextRequest();
+    expect(request.headers.get("Authorization")).toBeNull();
+
+    answer(Response.json(ACCOUNT));
+
+    await expect(call).resolves.toEqual(ACCOUNT);
+    expect(getSession()).toEqual(EARLIER);
   });
 });
