@@ -25,6 +25,15 @@
 //! has no async runtime, not even as a dev-dependency (R3, AAP 0.10.4), and
 //! the in-memory futures are always ready, so `block_on` polls them with a
 //! no-op waker.
+//!
+//! The rule sets the reward benchmark times, its synthetic 50.47 purchase and
+//! its `points_for` grid are shared source, `support/reward_rule_sets.rs`,
+//! which `benches/reward_engine.rs` includes too. The benchmark checks no
+//! result, so the last two tests check those exact rule sets and that grid
+//! against hand-derived expectations.
+
+#[path = "support/reward_rule_sets.rs"]
+mod reward_rule_sets;
 
 use std::collections::HashMap;
 use std::future::{self, Future};
@@ -42,6 +51,11 @@ use carddemo_domain::numeric::{
 use carddemo_domain::ports::{PortError, PortResult};
 use carddemo_domain::rewards::engine::{credit, points_for, select_rule};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine, RewardError, RewardStore};
+
+use reward_rule_sets::{
+    POINTS_FOR_AMOUNT_CENTS, POINTS_FOR_RATE_UNITS, money, processing_instant, purchase_input,
+    reward_rate, rule_sets,
+};
 
 /// How often `block_on` polls a future before it gives up.
 const POLL_LIMIT: usize = 8;
@@ -406,8 +420,7 @@ fn a_rule_accrues_only_inside_its_active_window() {
 
 #[test]
 fn the_highest_matching_rate_wins() {
-    // 50.47, the amount of the first `app/data/ASCII/dailytran.txt` record, at
-    // 2.0000 earns ceil(100.94) = 101 points.
+    // A synthetic 50.47 purchase at 2.0000 earns ceil(100.94) = 101 points.
     let rules = vec![rule(1, RETAIL, 10_000), rule(2, RETAIL, 20_000)];
     assert_eq!(
         outcome(rules, input(1, account(1), RETAIL, 5_047)),
@@ -640,4 +653,101 @@ fn the_accrual_future_is_send_for_a_store_outside_the_crate() {
     );
     assert_send(&future);
     assert!(matches!(block_on(future), Ok(Some(_))));
+}
+
+#[test]
+fn every_benchmarked_rule_set_accrues_on_the_matching_path() {
+    // (label, rules in the set, winning rule_id, points), derived by hand from
+    // `seed_rules` and `generated_rule` for the 50.47 purchase at *t*:
+    // - seed: rule 1 is the one retail rule; ceil(50.47 × 1.0000) = 51.
+    // - 10, 100, 1000: generated rule `index + 3` matches when index % 4 != 3
+    //   (retail pair), index % 5 is 0, 1 or 4 (its bounds hold 50.47) and
+    //   index % 3 == 0 (active), at 0.5000 + (index % 8) × 0.1250. As
+    //   index % 8 == 7 implies index % 4 == 3, the highest matching rate is
+    //   1.2500, first at index 6 (minimum 10.00): rule 9, which beats the
+    //   seed's 1.0000 and every later 1.2500 tie, and earns
+    //   ceil(50.47 × 1.2500 = 63.0875) = 64.
+    let expected = [
+        ("seed", 2, 1, 51),
+        ("10", 10, 9, 64),
+        ("100", 100, 9, 64),
+        ("1000", 1_000, 9, 64),
+    ];
+    let sets = rule_sets();
+    assert_eq!(
+        sets.iter()
+            .map(|set| set.label.as_str())
+            .collect::<Vec<_>>(),
+        expected.map(|(label, ..)| label),
+        "the benchmarked rule sets"
+    );
+
+    let input = purchase_input();
+    let at = processing_instant();
+    for (set, (label, size, rule_id, earned)) in sets.into_iter().zip(expected) {
+        assert_eq!(set.rules.len(), size, "{label}: rules in the set");
+        let mut store = MemoryRewardStore::with_rules(set.rules);
+        let accrual = block_on(RewardEngine::accrue(&mut store, input, at));
+        assert_eq!(
+            accrual,
+            Ok(Some(RewardAccrual {
+                accrual_id: AccrualId::from(1),
+                account_id: account(1),
+                transaction_id: TransactionRowId::from(1),
+                rule_id: RuleId::from(rule_id),
+                points_earned: points(earned),
+                created_at: processing_clock(),
+            })),
+            "{label}: the accrual"
+        );
+
+        let balance = &store.balances[&account(1)];
+        assert_eq!(
+            (
+                balance.total_points_earned,
+                balance.total_points_redeemed,
+                balance.available_points
+            ),
+            (points(earned), RewardPoints::ZERO, points(earned)),
+            "{label}: the balance credited with the accrual"
+        );
+
+        let candidates = block_on(store.candidate_rules(input.type_cd, input.category_cd))
+            .expect("the candidate read succeeds");
+        assert_eq!(
+            select_rule(&candidates, &input, at).map(|rule| rule.rule_id),
+            Some(RuleId::from(rule_id)),
+            "{label}: select_rule over the store's candidates"
+        );
+    }
+}
+
+#[test]
+fn the_benchmarked_points_for_grid_earns_the_rounded_up_products() {
+    // (rate in units of 0.0001, amount cents, points): 0.01, 50.47 and
+    // 999,999,999.99 at 1.0000, 1.5000 and 3.0000, each product rounded up:
+    // 0.015 → 1, 75.705 → 76, 1,499,999,999.985 → 1,500,000,000,
+    // 151.41 → 152 and 2,999,999,999.97 → 3,000,000,000.
+    let expected = [
+        (10_000, 1, 1),
+        (10_000, 5_047, 51),
+        (10_000, 99_999_999_999, 1_000_000_000),
+        (15_000, 1, 1),
+        (15_000, 5_047, 76),
+        (15_000, 99_999_999_999, 1_500_000_000),
+        (30_000, 1, 1),
+        (30_000, 5_047, 152),
+        (30_000, 99_999_999_999, 3_000_000_000),
+    ];
+    let mut grid = Vec::new();
+    for rate_units in POINTS_FOR_RATE_UNITS {
+        for cents in POINTS_FOR_AMOUNT_CENTS {
+            let earned = points_for(money(cents), reward_rate(rate_units));
+            grid.push((rate_units, cents, earned));
+        }
+    }
+    assert_eq!(
+        grid,
+        expected.map(|(rate_units, cents, earned)| (rate_units, cents, Ok(points(earned))))
+    );
 }

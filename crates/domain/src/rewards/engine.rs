@@ -343,7 +343,10 @@ mod tests {
 
     #[test]
     fn for_transaction_maps_the_row_identity_codes_and_amount() {
-        // The first `app/data/ASCII/dailytran.txt` record as a stored row.
+        // The first `app/data/ASCII/dailytran.txt` record as a stored row: its
+        // `TRAN-AMT` `0000005047G` is +504.77. The record's `DALYTRAN-PROC-TS`
+        // is blank, and this row repeats the origination timestamp there;
+        // `for_transaction` reads neither timestamp.
         let transaction = Transaction {
             transaction_id: TransactionRowId::from(41),
             tran_id: TranId::move_from("0000000000683580"),
@@ -351,7 +354,7 @@ mod tests {
             tran_cat_cd: category(1),
             tran_source: Alnum::move_from("POS TERM"),
             tran_desc: Alnum::move_from("Purchase at Abshire-Lowe"),
-            tran_amt: amount(5047),
+            tran_amt: amount(50_477),
             tran_merchant_id: MerchantId::new(800_000_000).expect("a 9(09) merchant ID"),
             tran_merchant_name: Alnum::move_from("Abshire-Lowe"),
             tran_merchant_city: Alnum::move_from("North Enoshaven"),
@@ -362,7 +365,7 @@ mod tests {
         };
         assert_eq!(
             AccrualInput::for_transaction(&transaction, account()),
-            purchase(41, 5047)
+            purchase(41, 50_477)
         );
     }
 
