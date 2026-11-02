@@ -33,8 +33,9 @@
 //! # Shared helpers
 //!
 //! The behaviours several programs share live here, once:
-//! [`version_token`] and [`VersionToken`] (the change check of `COACTUPC` and
-//! `COCRDUPC`), [`Confirm`] (the `X(1)` confirmation fields) and [`ReturnMsg`]
+//! [`version_token`], [`VersionToken`] and the [`VersionKey`] that keys it
+//! (the change check of `COACTUPC` and `COCRDUPC`), [`Confirm`] (the `X(1)`
+//! confirmation fields) and [`ReturnMsg`]
 //! (the first-message-wins `WS-RETURN-MSG` accumulator). Every other item is
 //! imported from its own module, as `rules::<module>::<item>`.
 
@@ -71,14 +72,33 @@ pub mod user_update;
 
 use std::fmt;
 
-/// The FNV-1a 64-bit offset basis.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+use argon2::{Algorithm, Argon2, Params, Version};
 
-/// The FNV-1a 64-bit prime.
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-/// The length of a rendered [`VersionToken`]: a 64-bit hash in hex.
+/// The length of a rendered [`VersionToken`]: a 64-bit digest in hex.
 const VERSION_TOKEN_LEN: usize = 16;
+
+/// The Argon2id memory cost of a version digest, in KiB: 8, the least argon2
+/// accepts for one lane (`Params::MIN_M_COST`). The digest's strength is the
+/// secret of the [`VersionKey`], not its cost, so every cost is the minimum
+/// and a token costs microseconds per `GET` and `PUT`.
+const VERSION_DIGEST_M_COST: u32 = 8;
+
+/// The Argon2id time cost of a version digest: one pass
+/// (`Params::MIN_T_COST`).
+const VERSION_DIGEST_T_COST: u32 = 1;
+
+/// The Argon2id parallelism of a version digest: one lane
+/// (`Params::MIN_P_COST`).
+const VERSION_DIGEST_P_COST: u32 = 1;
+
+/// The length of a version digest in bytes: the 64 bits a [`VersionToken`]
+/// renders as [`VERSION_TOKEN_LEN`] hex digits.
+const VERSION_DIGEST_LEN: usize = 8;
+
+/// The Argon2 salt of every version digest: a fixed label that separates these
+/// digests from any other use of the same secret. It is not secret, and it is
+/// longer than the 8 bytes argon2 requires (`argon2::MIN_SALT_LEN`).
+const VERSION_DIGEST_SALT: &[u8] = b"carddemo record version token";
 
 /// The version of a record as `GET /accounts/{id}` and `GET /cards/{id}` show
 /// it: 16 lower-case hex digits that the matching `PUT` echoes back.
@@ -99,8 +119,11 @@ const VERSION_TOKEN_LEN: usize = 16;
 /// with 400 and no COBOL text (E-24), as it does a token [`VersionToken::parse`]
 /// rejects.
 ///
-/// The token detects concurrent change; it is not a security feature. Anyone
-/// can compute it from the record, and it authenticates nothing.
+/// The digest is keyed with the server's [`VersionKey`]: only the holder of
+/// the key can compute a token, so a token discloses nothing about the fields
+/// it digests, the card's verification code included, which no response
+/// shows. The token detects concurrent change and authenticates nothing: a
+/// client echoes the token it was given and cannot forge another.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct VersionToken(String);
 
@@ -130,29 +153,122 @@ impl fmt::Display for VersionToken {
     }
 }
 
-/// Folds `bytes` into the FNV-1a 64-bit `hash`.
-fn fnv1a(hash: u64, bytes: &[u8]) -> u64 {
-    bytes.iter().fold(hash, |hash, &byte| {
-        (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
-    })
+/// The server secret that keys every [`VersionToken`].
+///
+/// Adapters build one once, from their server secret, and pass it to every
+/// rule that issues or checks a token: the API builds it from
+/// `CARDDEMO_JWT_SECRET`, the secret it already holds. Every process that
+/// serves the same records must use the same secret; a token issued under
+/// another one never matches, and its `PUT` answers as a changed record.
+///
+/// The secret is never logged: `Debug` prints `VersionKey(<redacted>)`.
+#[derive(Clone)]
+pub struct VersionKey {
+    /// The secret bytes: the Argon2 secret value `K`.
+    secret: Box<[u8]>,
+    /// The Argon2id costs of every digest, checked once by [`VersionKey::new`].
+    params: Params,
 }
 
-/// The [`VersionToken`] of a record whose compared fields are `parts`, in the
-/// order the change check compares them.
+impl VersionKey {
+    /// The key whose secret is `secret`.
+    ///
+    /// # Errors
+    ///
+    /// - [`VersionError::EmptyKey`] when `secret` is empty: an empty key would
+    ///   leave the digest unkeyed, computable by anyone from the record.
+    /// - [`VersionError::Digest`] when argon2 rejects the secret: one longer
+    ///   than its 4 GiB secret limit (`argon2::MAX_SECRET_LEN`).
+    pub fn new(secret: &[u8]) -> Result<Self, VersionError> {
+        if secret.is_empty() {
+            return Err(VersionError::EmptyKey);
+        }
+        let params = Params::new(
+            VERSION_DIGEST_M_COST,
+            VERSION_DIGEST_T_COST,
+            VERSION_DIGEST_P_COST,
+            Some(VERSION_DIGEST_LEN),
+        )
+        .map_err(digest_error)?;
+        Argon2::new_with_secret(secret, Algorithm::Argon2id, Version::V0x13, params.clone())
+            .map_err(digest_error)?;
+        Ok(Self {
+            secret: secret.into(),
+            params,
+        })
+    }
+
+    /// The Argon2id (version `0x13`) context keyed with this secret.
+    fn argon2(&self) -> Result<Argon2<'_>, VersionError> {
+        Argon2::new_with_secret(
+            &self.secret,
+            Algorithm::Argon2id,
+            Version::V0x13,
+            self.params.clone(),
+        )
+        .map_err(digest_error)
+    }
+}
+
+/// `VersionKey(<redacted>)`, whatever the secret.
+impl fmt::Debug for VersionKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("VersionKey(<redacted>)")
+    }
+}
+
+/// A failure to build a [`VersionKey`] or to compute a [`VersionToken`].
 ///
-/// The digest is FNV-1a 64-bit. Each part is preceded by its length as eight
-/// little-endian bytes, so moving bytes from one part to the next changes the
-/// token: `["ab", "c"]` and `["a", "bc"]` differ. Equal parts always give the
-/// same token, whatever process computes it.
-#[must_use]
-pub fn version_token(parts: &[&[u8]]) -> VersionToken {
-    let hash = parts.iter().fold(FNV_OFFSET_BASIS, |hash, part| {
+/// No variant carries the secret or a digested field: the payload is argon2's
+/// error text, which holds neither.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum VersionError {
+    /// [`VersionKey::new`] was given an empty secret, which would leave every
+    /// token unkeyed.
+    #[error("the version key secret is empty")]
+    EmptyKey,
+    /// argon2 rejected the key, its costs or the digest input.
+    #[error("version digest failed: {0}")]
+    Digest(String),
+}
+
+/// The [`VersionError::Digest`] of an argon2 `error`.
+fn digest_error(error: argon2::Error) -> VersionError {
+    VersionError::Digest(error.to_string())
+}
+
+/// The [`VersionToken`] under `key` of a record whose compared fields are
+/// `parts`, in the order the change check compares them.
+///
+/// Each part is encoded as its length, eight little-endian bytes, followed by
+/// its bytes, so moving bytes from one part to the next changes the token:
+/// `["ab", "c"]` and `["a", "bc"]` differ. The encoding is the Argon2id
+/// (version `0x13`) password input, keyed with the secret of `key` and salted
+/// with a fixed, non-secret domain-separation label, at 8 KiB, one pass and
+/// one lane; the 8 output bytes, read big-endian, are the 16 hex digits.
+/// Equal keys and parts always give the same token, whatever process computes
+/// it. Without the key nobody can compute or check a token, so it discloses
+/// nothing about `parts`.
+///
+/// # Errors
+///
+/// [`VersionError::Digest`] when argon2 rejects the input: only an encoding
+/// longer than its 4 GiB input limit (`argon2::MAX_PWD_LEN`), which no
+/// record's compared fields reach.
+pub fn version_token(key: &VersionKey, parts: &[&[u8]]) -> Result<VersionToken, VersionError> {
+    let mut encoded = Vec::new();
+    for part in parts {
         // A slice longer than u64::MAX bytes cannot exist on any supported
         // target; the fallback only keeps the conversion free of a panic.
         let len = u64::try_from(part.len()).unwrap_or(u64::MAX);
-        fnv1a(fnv1a(hash, &len.to_le_bytes()), part)
-    });
-    VersionToken(format!("{hash:016x}"))
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(part);
+    }
+    let mut tag = [0u8; VERSION_DIGEST_LEN];
+    key.argon2()?
+        .hash_password_into(&encoded, VERSION_DIGEST_SALT, &mut tag)
+        .map_err(digest_error)?;
+    Ok(VersionToken(format!("{:016x}", u64::from_be_bytes(tag))))
 }
 
 /// The class of a value entered in an `X(1)` confirmation field.
@@ -302,6 +418,17 @@ pub(crate) mod test_support {
         PortResult, TranCatBalanceStore, TranTypeFileReader, TranTypeFilter, TranTypeMasterStore,
         TransactionReader, TransactionWriter, UserStore, XrefReader,
     };
+
+    use super::VersionKey;
+
+    /// The secret [`version_key`] uses in place of a server secret.
+    const TEST_VERSION_SECRET: &[u8] = b"carddemo rule tests version secret";
+
+    /// The [`VersionKey`] the rules' tests issue and check their tokens with,
+    /// as an adapter's server secret keys them.
+    pub(crate) fn version_key() -> VersionKey {
+        VersionKey::new(TEST_VERSION_SECRET).expect("a non-empty test secret")
+    }
 
     /// Wakes the thread [`block_on`] parks.
     struct ThreadWaker(Thread);
@@ -1225,8 +1352,13 @@ mod tests {
 
     use chrono::{NaiveDate, NaiveDateTime};
 
-    use super::test_support::{FakeStore, PORT_METHODS, block_on};
-    use super::{Confirm, FNV_OFFSET_BASIS, ReturnMsg, VersionToken, fnv1a, version_token};
+    use argon2::{Algorithm, Argon2, Params, Version};
+
+    use super::test_support::{FakeStore, PORT_METHODS, block_on, version_key};
+    use super::{
+        Confirm, ReturnMsg, VERSION_DIGEST_SALT, VersionError, VersionKey, VersionToken,
+        version_token,
+    };
     use crate::entities::{
         Account, AuthFraud, Card, CardXref, Customer, DisclosureGroup, DisclosureGroupKey,
         FraudFlag, MatchStatus, NewPendingAuthDetail, NewTransaction, PA_ACCOUNT_STATUS_OCCURS,
@@ -1534,34 +1666,44 @@ mod tests {
         details.iter().map(|detail| detail.auth_id.get()).collect()
     }
 
-    #[test]
-    fn fnv1a_matches_the_published_test_vectors() {
-        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b"a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(fnv1a(FNV_OFFSET_BASIS, b"foobar"), 0x8594_4171_f739_67e8);
+    /// The token of `parts` under the tests' [`version_key`].
+    fn token_of(parts: &[&[u8]]) -> VersionToken {
+        version_token(&version_key(), parts).expect("a digest of a few bytes")
     }
 
     #[test]
     fn version_token_is_sixteen_lower_hex_digits_and_deterministic() {
-        let parts: [&[u8]; 3] = [b"Y", b"0000000194.00", b"2025-05-20"];
-        let token = version_token(&parts);
-        assert_eq!(token, version_token(&parts), "equal inputs, equal tokens");
-        assert_eq!(token.as_str().len(), 16);
-        assert!(
-            token
-                .as_str()
-                .bytes()
-                .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
-            "{token}"
+        let record: [&[u8]; 3] = [b"Y", b"0000000194.00", b"2025-05-20"];
+        for parts in [&record[..], &[]] {
+            let token = token_of(parts);
+            assert_eq!(token, token_of(parts), "equal inputs, equal tokens");
+            assert_eq!(token.as_str().len(), 16);
+            assert!(
+                token
+                    .as_str()
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+                "{token}"
+            );
+            assert_eq!(token.to_string(), token.as_str());
+            assert_eq!(VersionToken::parse(token.as_str()), Some(token));
+        }
+        let key = version_key();
+        assert_eq!(
+            version_token(&key.clone(), &record),
+            version_token(&key, &record),
+            "a cloned key, the same token"
         );
-        assert_eq!(token.to_string(), token.as_str());
-        assert_eq!(VersionToken::parse(token.as_str()), Some(token));
-        assert_eq!(version_token(&[]).as_str(), "cbf29ce484222325");
+        assert_eq!(
+            version_token(&key, &record),
+            Ok(token_of(&record)),
+            "a key built again from the same secret, the same token"
+        );
     }
 
     #[test]
     fn version_token_changes_with_part_boundaries_bytes_and_order() {
-        let base = version_token(&[b"ab", b"c"]);
+        let base = token_of(&[b"ab", b"c"]);
         let others: [&[&[u8]]; 5] = [
             &[b"a", b"bc"],
             &[b"abc"],
@@ -1570,8 +1712,65 @@ mod tests {
             &[b"c", b"ab"],
         ];
         for parts in others {
-            assert_ne!(version_token(parts), base, "{parts:?}");
+            assert_ne!(token_of(parts), base, "{parts:?}");
         }
+    }
+
+    #[test]
+    fn version_token_differs_between_keys() {
+        // Without the server's secret no token can be computed again.
+        let other = VersionKey::new(b"another server secret").expect("a secret");
+        let record: [&[u8]; 3] = [b"747", b"ANIYA VON", b"Y"];
+        for parts in [&record[..], &[b"ab", b"c"], &[]] {
+            assert_ne!(
+                version_token(&other, parts),
+                Ok(token_of(parts)),
+                "{parts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn version_key_rejects_an_empty_secret() {
+        assert_eq!(VersionKey::new(b"").err(), Some(VersionError::EmptyKey));
+        assert!(VersionKey::new(b"k").is_ok(), "any non-empty secret keys");
+    }
+
+    #[test]
+    fn version_key_debug_never_shows_the_secret() {
+        let secret = "a server secret nobody may log";
+        let key = VersionKey::new(secret.as_bytes()).expect("a secret");
+        for shown in [format!("{key:?}"), format!("{key:#?}")] {
+            assert_eq!(shown, "VersionKey(<redacted>)");
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
+
+    #[test]
+    fn version_token_is_keyed_argon2id_of_the_length_prefixed_parts() {
+        // The documented construction, computed with argon2 directly.
+        let secret = b"an independent check secret";
+        let parts: [&[u8]; 3] = [b"747", b"ANIYA", b""];
+        let mut encoded = Vec::new();
+        for (len, part) in [(3u64, parts[0]), (5, parts[1]), (0, parts[2])] {
+            encoded.extend_from_slice(&len.to_le_bytes());
+            encoded.extend_from_slice(part);
+        }
+        let salt = b"carddemo record version token";
+        assert_eq!(VERSION_DIGEST_SALT, salt);
+        assert!(salt.len() >= argon2::MIN_SALT_LEN);
+        let params = Params::new(8, 1, 1, Some(8)).expect("the minimum costs");
+        let argon2 = Argon2::new_with_secret(secret, Algorithm::Argon2id, Version::V0x13, params)
+            .expect("a short secret");
+        let mut tag = [0u8; 8];
+        argon2
+            .hash_password_into(&encoded, salt, &mut tag)
+            .expect("a short input");
+        let expected = format!("{:016x}", u64::from_be_bytes(tag));
+
+        let key = VersionKey::new(secret).expect("a secret");
+        let token = version_token(&key, &parts).expect("a digest of a few bytes");
+        assert_eq!(token.as_str(), expected);
     }
 
     #[test]

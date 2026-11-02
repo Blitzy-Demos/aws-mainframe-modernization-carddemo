@@ -42,7 +42,7 @@
 use std::fmt;
 
 use super::card_update::{CardKeys, record_version};
-use super::{ReturnMsg, VersionToken};
+use super::{ReturnMsg, VersionKey, VersionToken};
 use crate::entities::Card;
 use crate::error::{DomainError, ErrorKind};
 use crate::messages;
@@ -116,7 +116,9 @@ pub struct CardView {
     pub card: Card,
     /// The token `PUT /cards/{id}` echoes back:
     /// [`card_update::record_version`](super::card_update::record_version) of
-    /// [`CardView::card`].
+    /// [`CardView::card`] under the server's [`VersionKey`]. The digest is
+    /// keyed, so the token discloses nothing about the verification code the
+    /// response leaves out.
     pub version: VersionToken,
     /// The information line of a found card,
     /// [`DISPLAYING_REQUESTED_DETAILS`](messages::DISPLAYING_REQUESTED_DETAILS)
@@ -353,7 +355,7 @@ pub async fn read_data<S: CardReader>(
 ///
 /// The whole `GET /cards/{id}`: [`edit_map_inputs`], then, when both keys
 /// pass, [`read_data`] by the card number. The card found is shown with its
-/// [`VersionToken`] and the information line
+/// [`VersionToken`], computed under `key`, and the information line
 /// [`DISPLAYING_REQUESTED_DETAILS`](messages::DISPLAYING_REQUESTED_DETAILS).
 /// Nothing is written; the caller owns the read-only unit of work.
 ///
@@ -361,9 +363,11 @@ pub async fn read_data<S: CardReader>(
 ///
 /// The error of the first step that fails, as that step documents it: the key
 /// edits (V-COCRDSLC-001 to V-COCRDSLC-005, no read), then the read
-/// (V-COCRDSLC-006, V-COCRDSLC-007).
+/// (V-COCRDSLC-006, V-COCRDSLC-007), then the token, as
+/// [`record_version`] documents it.
 pub async fn view<S: CardReader>(
     store: &mut S,
+    key: &VersionKey,
     input: CardViewInput,
 ) -> Result<CardView, DomainError> {
     let CardViewInput {
@@ -372,7 +376,7 @@ pub async fn view<S: CardReader>(
     } = input;
     let keys = edit_map_inputs(account_id.as_deref(), card_number.as_deref())?;
     let card = read_data(store, keys.card_number).await?;
-    let version = record_version(&card);
+    let version = record_version(key, &card)?;
     Ok(CardView {
         card,
         version,
@@ -392,7 +396,7 @@ mod tests {
     use crate::numeric::{AccountId, Alnum, CardNumber, Cvv};
     use crate::ports::PortError;
     use crate::rules::card_update::{CardKeys, record_version};
-    use crate::rules::test_support::{FakeStore, block_on};
+    use crate::rules::test_support::{FakeStore, block_on, version_key};
     use crate::rules::{ReturnMsg, VersionToken};
 
     /// The first fixture card, of account 00000000050 (P-CVACT02Y-009)
@@ -443,6 +447,12 @@ mod tests {
         FakeStore::default()
             .with_card(first_card())
             .with_card(second_card())
+    }
+
+    /// The token `PUT /cards/{id}` recomputes for `card` under the tests'
+    /// server key.
+    fn version_of(card: &Card) -> VersionToken {
+        record_version(&version_key(), card).expect("the token of a card")
     }
 
     fn input(account_id: Option<&str>, card_number: Option<&str>) -> CardViewInput {
@@ -569,7 +579,11 @@ mod tests {
             assert_rejected(result, expected, &case);
 
             let mut store = store();
-            let viewed = block_on(view(&mut store, input(account_id, card_number)));
+            let viewed = block_on(view(
+                &mut store,
+                &version_key(),
+                input(account_id, card_number),
+            ));
             assert_rejected(viewed, expected, &case);
             assert!(store.calls.is_empty(), "{case}: a key error skips the read");
         }
@@ -609,15 +623,18 @@ mod tests {
     fn a_fixture_card_is_shown_with_its_token_and_information_line() {
         // P-COCRDSLC-004, P-COCRDSLC-006, P-COCRDSLC-010, P-COCRDSLC-016
         let mut store = store();
-        let shown = block_on(view(&mut store, input(Some(ACCOUNT), Some(CARD))))
-            .expect("the fixture card is on file");
+        let shown = block_on(view(
+            &mut store,
+            &version_key(),
+            input(Some(ACCOUNT), Some(CARD)),
+        ))
+        .expect("the fixture card is on file");
         let expected = CardView {
             card: first_card(),
-            version: record_version(&first_card()),
+            version: version_of(&first_card()),
             message: messages::DISPLAYING_REQUESTED_DETAILS,
         };
         assert_eq!(shown, expected);
-        assert_eq!(shown.message, "   Displaying requested details");
         assert_eq!(store.calls, ["read_card"]);
     }
 
@@ -627,11 +644,12 @@ mod tests {
         let mut store = store();
         let shown = block_on(view(
             &mut store,
+            &version_key(),
             input(Some("00000000027"), Some(OTHER_CARD)),
         ))
         .expect("the fixture card is on file");
-        assert_eq!(shown.version, record_version(&second_card()));
-        assert_ne!(shown.version, record_version(&first_card()));
+        assert_eq!(shown.version, version_of(&second_card()));
+        assert_ne!(shown.version, version_of(&first_card()));
         assert_eq!(
             VersionToken::parse(shown.version.as_str()),
             Some(shown.version.clone()),
@@ -644,8 +662,12 @@ mod tests {
         // E-55, P-COCRDSLC-016: the read is by card number alone.
         for entered in ["00000000001", "99999999999", "00000000027"] {
             let mut store = store();
-            let shown = block_on(view(&mut store, input(Some(entered), Some(CARD))))
-                .expect("the card is read by its number");
+            let shown = block_on(view(
+                &mut store,
+                &version_key(),
+                input(Some(entered), Some(CARD)),
+            ))
+            .expect("the card is read by its number");
             assert_eq!(shown.card, first_card(), "{entered}");
             assert_eq!(shown.card.card_acct_id, account(50), "{entered}");
         }
@@ -655,7 +677,11 @@ mod tests {
     fn an_unknown_card_is_not_found() {
         // V-COCRDSLC-006, P-COCRDSLC-004
         let mut store = store();
-        let result = block_on(view(&mut store, input(Some(ACCOUNT), Some(MISSING_CARD))));
+        let result = block_on(view(
+            &mut store,
+            &version_key(),
+            input(Some(ACCOUNT), Some(MISSING_CARD)),
+        ));
         let expected = (
             ErrorKind::NotFound,
             messages::DID_NOT_FIND_CARDS_FOR_THIS_SEARCH_CONDITION,
@@ -669,7 +695,6 @@ mod tests {
     fn any_other_read_failure_is_the_file_error_text() {
         // V-COCRDSLC-007, P-COCRDSLC-005, E-44
         let text = messages::file_error_message("READ", "CARDDAT ", 17, 0);
-        assert!(text.starts_with("File Error: READ     on CARDDAT   returned RESP "));
         let failures = [
             PortError::Unavailable("connection reset".to_owned()),
             PortError::Contention,
@@ -680,7 +705,11 @@ mod tests {
             let case = format!("{failure:?}");
             let mut store = store();
             store.fail_next("read_card", failure);
-            let result = block_on(view(&mut store, input(Some(ACCOUNT), Some(CARD))));
+            let result = block_on(view(
+                &mut store,
+                &version_key(),
+                input(Some(ACCOUNT), Some(CARD)),
+            ));
             assert_rejected(result, (ErrorKind::Unexpected, &text, ACCTSID), &case);
             assert_eq!(store.calls, ["read_card"], "{case}");
         }
@@ -693,7 +722,8 @@ mod tests {
             future
         }
         let mut store = store();
-        let future = assert_send(view(&mut store, input(Some(ACCOUNT), Some(CARD))));
+        let key = version_key();
+        let future = assert_send(view(&mut store, &key, input(Some(ACCOUNT), Some(CARD))));
         assert!(block_on(future).is_ok());
     }
 

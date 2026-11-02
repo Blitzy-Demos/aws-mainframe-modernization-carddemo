@@ -6,15 +6,19 @@
 //! turn that writes them (`9200-WRITE-PROCESSING`). One request performs all
 //! three (E-56), in the order the validation audit ranks their messages
 //! (V-COCRDUPC-002 to V-COCRDUPC-020): [`update`] runs [`edit_keys`],
-//! [`read_data`], [`validate`] and [`apply`] in that order, and each step is
-//! public for an adapter that sequences them itself.
+//! [`read_data`], the card-field edits of [`validate`] and [`apply`] in that
+//! order, editing the keys once, and each step is public for an adapter that
+//! sequences them itself.
 //!
 //! Between turns the program keeps the fetched values, `CCUP-OLD-DETAILS`, in
 //! its COMMAREA (P-COCRDUPC-008). The stateless API keeps a
 //! [`VersionToken`] instead (E-24): [`record_version`] digests the fields
-//! `9300-CHECK-CHANGE-IN-REC` compares, the `GET /cards/{id}` response carries
-//! it, and [`apply`] recomputes it from the record it locks. A request without
-//! a token is the API's 400 (V-COCRDUPC-001) and never reaches this module.
+//! `9300-CHECK-CHANGE-IN-REC` compares, keyed with the server's
+//! [`VersionKey`], the `GET /cards/{id}` response carries it, and [`apply`]
+//! recomputes it under the same key from the record it locks. The key keeps
+//! the token from disclosing the verification code it digests. A request
+//! without a token is the API's 400 (V-COCRDUPC-001) and never reaches this
+//! module.
 //!
 //! # Outcomes
 //!
@@ -41,7 +45,7 @@
 use std::fmt;
 use std::ops::RangeInclusive;
 
-use super::{VersionToken, version_token};
+use super::{VersionKey, VersionToken, version_token};
 use crate::entities::Card;
 use crate::error::{DomainError, ErrorKind};
 use crate::messages;
@@ -284,27 +288,41 @@ fn upper_cased<const N: usize>(field: &Alnum<N>) -> [u8; N] {
 
 /// COCRDUPC 9300-CHECK-CHANGE-IN-REC — P-COCRDUPC-005, P-COCRDUPC-022
 ///
-/// The [`VersionToken`] of `card`: the digest of exactly the fields
-/// `9300-CHECK-CHANGE-IN-REC` compares, in its order
+/// The [`VersionToken`] of `card` under `key`: the keyed digest of exactly
+/// the fields `9300-CHECK-CHANGE-IN-REC` compares, in its order
 /// [app/cbl/COCRDUPC.cbl:L1503-1508]: `CARD-CVV-CD` as its three digits, the
 /// embossed name upper-cased as `INSPECT … CONVERTING LIT-LOWER TO LIT-UPPER`
 /// upper-cases it (only `a` to `z`), the expiry year `(1:4)`, month `(6:2)`
 /// and day `(9:2)`, and `CARD-ACTIVE-STATUS`. `9000-READ-DATA` stores the
-/// fetched name upper-cased the same way, so two cards get equal tokens
-/// exactly when the change check finds no change between them.
-#[must_use]
-pub fn record_version(card: &Card) -> VersionToken {
+/// fetched name upper-cased the same way, so under one key two cards get
+/// equal tokens exactly when the change check finds no change between them.
+///
+/// Every compared field but the verification code is in the card response,
+/// so only the key keeps the token from revealing that code: without it, no
+/// client can test the 1,000 candidates against the token it was given.
+///
+/// # Errors
+///
+/// [`ErrorKind::Unexpected`] with
+/// [`UNEXPECTED_ERROR`](messages::UNEXPECTED_ERROR) at `ACCTSID` when the
+/// digest fails; as [`version_token`] documents, no card's fields reach the
+/// input size that makes it fail.
+pub fn record_version(key: &VersionKey, card: &Card) -> Result<VersionToken, DomainError> {
     let cvv = card.card_cvv_cd.to_string();
     let name = upper_cased(&card.card_embossed_name);
     let (year, month, day) = expiry_parts(&card.card_expiraion_date);
-    version_token(&[
-        cvv.as_bytes(),
-        &name,
-        &year,
-        &month,
-        &day,
-        card.card_active_status.as_bytes(),
-    ])
+    version_token(
+        key,
+        &[
+            cvv.as_bytes(),
+            &name,
+            &year,
+            &month,
+            &day,
+            card.card_active_status.as_bytes(),
+        ],
+    )
+    .map_err(|_| DomainError::unexpected(messages::UNEXPECTED_ERROR).with_field(FIELD_ACCTSID))
 }
 
 /// COCRDUPC 1210-EDIT-ACCOUNT — P-COCRDUPC-011, V-COCRDUPC-002,
@@ -576,6 +594,30 @@ fn update_record(keys: CardKeys, new: &NewCardData, current: &Card) -> Card {
 /// one its edit rejects, at `CRDNAME`, `CRDSTCD`, `EXPMON` or `EXPYEAR`.
 pub fn validate(current: &Card, input: &CardUpdateInput) -> Result<CardEdit, DomainError> {
     let keys = edit_keys(&input.account_id, &input.card_number)?;
+    edit_card_fields(keys, current, input)
+}
+
+/// COCRDUPC 1200-EDIT-MAP-INPUTS, 1230-EDIT-NAME to 1260-EDIT-EXPIRY-YEAR —
+/// P-COCRDUPC-002, P-COCRDUPC-013 to P-COCRDUPC-016, V-COCRDUPC-009 to
+/// V-COCRDUPC-017
+///
+/// The ENTER turn after the key edits, against `current`, the card
+/// [`read_data`] fetched, with `keys`, the keys of `input` [`edit_keys`]
+/// passed: the received card fields are compared with `current`, and when
+/// they differ the name, status, expiry month and expiry year edits all run
+/// [app/cbl/COCRDUPC.cbl:L696-714], the first failure supplying the error;
+/// when all pass, the update record carries `keys`.
+///
+/// # Errors
+///
+/// The first failing card-field edit in the order name, status, month, year:
+/// [`ErrorKind::Empty`] for a field not provided, [`ErrorKind::Invalid`] for
+/// one its edit rejects, at `CRDNAME`, `CRDSTCD`, `EXPMON` or `EXPYEAR`.
+fn edit_card_fields(
+    keys: CardKeys,
+    current: &Card,
+    input: &CardUpdateInput,
+) -> Result<CardEdit, DomainError> {
     let new = NewCardData::from_input(input, current);
     if no_changes_detected(&new, current) {
         return Ok(CardEdit::NoChange);
@@ -594,15 +636,20 @@ pub fn validate(current: &Card, input: &CardUpdateInput) -> Result<CardEdit, Dom
 /// COCRDUPC 9300-CHECK-CHANGE-IN-REC — P-COCRDUPC-005, V-COCRDUPC-019
 ///
 /// The locked record against the fetched values the token stands for
-/// [app/cbl/COCRDUPC.cbl:L1498-1521].
+/// [app/cbl/COCRDUPC.cbl:L1498-1521], the locked record's token computed
+/// under `key`, the key the fetched token was issued under.
 ///
 /// The COBOL then refreshes `CCUP-OLD-DETAILS` from the locked record
 /// [app/cbl/COCRDUPC.cbl:L1512-1517] and redisplays it. The error carries no
 /// card: the API error body is exactly `{code, message, fields}`, so the
 /// client reads the current card, with its new token, through
 /// `GET /cards/{id}`.
-fn check_change_in_rec(locked: &Card, expected: &VersionToken) -> Result<(), DomainError> {
-    if record_version(locked) == *expected {
+fn check_change_in_rec(
+    key: &VersionKey,
+    locked: &Card,
+    expected: &VersionToken,
+) -> Result<(), DomainError> {
+    if record_version(key, locked)? == *expected {
         Ok(())
     } else {
         Err(
@@ -617,8 +664,9 @@ fn check_change_in_rec(locked: &Card, expected: &VersionToken) -> Result<(), Dom
 /// V-COCRDUPC-020
 ///
 /// The PF5 write [app/cbl/COCRDUPC.cbl:L1420-1496]: `READ … UPDATE` of
-/// `card_number`, the change check of the locked record against `expected`,
-/// then one `REWRITE` of `updated`, the record [`validate`] built. The record
+/// `card_number`, the change check of the locked record against `expected`
+/// with its token computed under `key`, then one `REWRITE` of `updated`, the
+/// record [`validate`] built. The record
 /// is written under `card_number`, the key it was locked by, and with the
 /// locked record's verification code (E-75). With a single write,
 /// `RECOVERY(NONE)` of `CARDDAT` [app/csd/CARDDEMO.CSD:L25-33] changes
@@ -630,6 +678,10 @@ fn check_change_in_rec(locked: &Card, expected: &VersionToken) -> Result<(), Dom
 ///   [`COULD_NOT_LOCK_RECORD_FOR_UPDATE`](messages::COULD_NOT_LOCK_RECORD_FOR_UPDATE)
 ///   at `ACCTSID` when the locked read fails for any reason; nothing is
 ///   written.
+/// - [`ErrorKind::Unexpected`] with
+///   [`UNEXPECTED_ERROR`](messages::UNEXPECTED_ERROR) at `ACCTSID` when the
+///   locked record's token cannot be computed ([`record_version`]); nothing is
+///   written.
 /// - [`ErrorKind::Conflict`] with
 ///   [`RECORD_CHANGED_BY_SOME_ONE_ELSE`](messages::RECORD_CHANGED_BY_SOME_ONE_ELSE)
 ///   at `CRDNAME` when the locked record's token differs from `expected`;
@@ -639,6 +691,7 @@ fn check_change_in_rec(locked: &Card, expected: &VersionToken) -> Result<(), Dom
 ///   `ACCTSID` when the rewrite fails.
 pub async fn apply<S: CardReader + CardWriter>(
     store: &mut S,
+    key: &VersionKey,
     card_number: CardNumber,
     expected: &VersionToken,
     updated: Card,
@@ -647,7 +700,7 @@ pub async fn apply<S: CardReader + CardWriter>(
         DomainError::unexpected(messages::COULD_NOT_LOCK_RECORD_FOR_UPDATE)
             .with_field(FIELD_ACCTSID)
     })?;
-    check_change_in_rec(&locked, expected)?;
+    check_change_in_rec(key, &locked, expected)?;
     let record = Card {
         card_num: card_number,
         card_cvv_cd: locked.card_cvv_cd,
@@ -667,8 +720,10 @@ pub async fn apply<S: CardReader + CardWriter>(
 /// P-COCRDUPC-009 to P-COCRDUPC-016, P-COCRDUPC-022, P-COCRDUPC-023,
 /// V-COCRDUPC-002 to V-COCRDUPC-020
 ///
-/// The whole `PUT /cards/{id}`: [`edit_keys`], [`read_data`], [`validate`]
-/// and, when the input changes the card, [`apply`]. When nothing changed the
+/// The whole `PUT /cards/{id}`: [`edit_keys`], [`read_data`], the card-field
+/// edits of [`validate`] for the keys already edited and, when the input
+/// changes the card, [`apply`] with `key`, the key the token of `input` was
+/// issued under. When nothing changed the
 /// request succeeds with the fetched card and
 /// [`NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED`](messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED)
 /// and nothing is locked or written. The caller owns the database
@@ -681,16 +736,19 @@ pub async fn apply<S: CardReader + CardWriter>(
 /// edits, the lock, the change check, the rewrite.
 pub async fn update<S: CardReader + CardWriter>(
     store: &mut S,
+    key: &VersionKey,
     input: &CardUpdateInput,
 ) -> Result<CardUpdated, DomainError> {
     let keys = edit_keys(&input.account_id, &input.card_number)?;
     let current = read_data(store, keys.card_number).await?;
-    match validate(&current, input)? {
+    match edit_card_fields(keys, &current, input)? {
         CardEdit::NoChange => Ok(CardUpdated {
             card: current,
             message: messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED,
         }),
-        CardEdit::Changed(record) => apply(store, keys.card_number, &input.version, record).await,
+        CardEdit::Changed(record) => {
+            apply(store, key, keys.card_number, &input.version, record).await
+        }
     }
 }
 
@@ -707,7 +765,8 @@ mod tests {
     use crate::messages;
     use crate::numeric::{AccountId, Alnum, CardNumber, Cvv};
     use crate::ports::PortError;
-    use crate::rules::test_support::{FakeStore, block_on};
+    use crate::rules::test_support::{FakeStore, block_on, version_key};
+    use crate::rules::{VersionKey, VersionToken};
 
     /// The first fixture card, of account 00000000050 (P-CVACT02Y-009)
     /// [app/data/ASCII/carddata.txt:L1].
@@ -748,6 +807,12 @@ mod tests {
         FakeStore::default().with_card(fixture_card())
     }
 
+    /// The token of `card` under the tests' server key, as `GET /cards/{id}`
+    /// issues it.
+    fn version_of(card: &Card) -> VersionToken {
+        record_version(&version_key(), card).expect("the token of a card")
+    }
+
     /// The input that repeats [`fixture_card`] as `GET /cards/{id}` shows it.
     fn unchanged_input() -> CardUpdateInput {
         CardUpdateInput {
@@ -757,7 +822,7 @@ mod tests {
             active_status: "Y".to_owned(),
             expiry_month: "03".to_owned(),
             expiry_year: "2023".to_owned(),
-            version: record_version(&fixture_card()),
+            version: version_of(&fixture_card()),
         }
     }
 
@@ -807,18 +872,18 @@ mod tests {
     fn record_version_digests_the_compared_fields_with_the_name_upper_cased() {
         // P-COCRDUPC-005, P-COCRDUPC-022
         let card = fixture_card();
-        let token = record_version(&card);
+        let token = version_of(&card);
         let recased = Card {
             card_embossed_name: Alnum::move_from("ANIYA VON"),
             ..card.clone()
         };
-        assert_eq!(record_version(&recased), token);
+        assert_eq!(version_of(&recased), token);
         let other_account = Card {
             card_acct_id: account(1),
             ..card.clone()
         };
         assert_eq!(
-            record_version(&other_account),
+            version_of(&other_account),
             token,
             "the account is not compared"
         );
@@ -850,8 +915,60 @@ mod tests {
             },
         ];
         for other in changed {
-            assert_ne!(record_version(&other), token, "{other:?}");
+            assert_ne!(version_of(&other), token, "{other:?}");
         }
+    }
+
+    #[test]
+    fn the_token_does_not_disclose_the_verification_code() {
+        // P-COCRDUPC-005: the card response shows every compared field but the
+        // CVV, so a client can rebuild all 1,000 candidate records. Without
+        // the server key none of their tokens matches the one it was given.
+        let card = fixture_card();
+        let server_key = version_key();
+        let shown = record_version(&server_key, &card).expect("the server's token");
+        let matching_codes = |key: &VersionKey| -> Vec<u16> {
+            (0..=999)
+                .filter(|&code| {
+                    let candidate = Card {
+                        card_cvv_cd: cvv(code),
+                        ..card.clone()
+                    };
+                    record_version(key, &candidate).expect("a candidate's token") == shown
+                })
+                .collect()
+        };
+        let guessed_key =
+            VersionKey::new(b"a client's guess at the server secret").expect("a non-empty secret");
+        assert_eq!(matching_codes(&guessed_key), Vec::<u16>::new());
+        assert_eq!(matching_codes(&server_key), [747]);
+    }
+
+    #[test]
+    fn a_token_issued_under_another_key_is_a_changed_record() {
+        // V-COCRDUPC-019: the locked card's token is computed under the
+        // server key, so a token computed under any other key never matches.
+        let other_key = VersionKey::new(b"another server secret").expect("a non-empty secret");
+        let foreign = record_version(&other_key, &fixture_card()).expect("a token");
+        let mut store = store();
+        let record = update_record(&fixture_card(), &changed_input());
+        assert_rejected(
+            block_on(apply(
+                &mut store,
+                &version_key(),
+                card_number(),
+                &foreign,
+                record,
+            )),
+            (
+                ErrorKind::Conflict,
+                messages::RECORD_CHANGED_BY_SOME_ONE_ELSE,
+                "CRDNAME",
+            ),
+            "a token of another key",
+        );
+        assert_eq!(store.cards.get(&card_number()), Some(&fixture_card()));
+        assert_eq!(store.calls, ["read_card_for_update"]);
     }
 
     #[test]
@@ -938,10 +1055,6 @@ mod tests {
             PortError::Unavailable("connection reset".to_owned()),
         );
         let file_error = messages::file_error_message("READ", "CARDDAT ", 17, 0);
-        assert!(
-            file_error.starts_with("File Error: READ     on CARDDAT   returned RESP "),
-            "{file_error}"
-        );
         assert_rejected(
             block_on(read_data(&mut store, card_number())),
             (ErrorKind::Unexpected, &file_error, "ACCTSID"),
@@ -1178,9 +1291,15 @@ mod tests {
         // P-COCRDUPC-006, P-COCRDUPC-007.
         let mut store = store();
         let record = update_record(&fixture_card(), &changed_input());
-        let token = record_version(&fixture_card());
+        let token = version_of(&fixture_card());
         assert_eq!(
-            block_on(apply(&mut store, card_number(), &token, record.clone())),
+            block_on(apply(
+                &mut store,
+                &version_key(),
+                card_number(),
+                &token,
+                record.clone()
+            )),
             Ok(CardUpdated {
                 card: record.clone(),
                 message: messages::CHANGES_COMMITTED_TO_DATABASE,
@@ -1200,10 +1319,16 @@ mod tests {
             card_cvv_cd: cvv(1),
             ..update_record(&fixture_card(), &changed_input())
         };
-        let token = record_version(&fixture_card());
-        let written = block_on(apply(&mut store, card_number(), &token, record))
-            .expect("the update is applied")
-            .card;
+        let token = version_of(&fixture_card());
+        let written = block_on(apply(
+            &mut store,
+            &version_key(),
+            card_number(),
+            &token,
+            record,
+        ))
+        .expect("the update is applied")
+        .card;
         assert_eq!(written.card_cvv_cd, cvv(747));
         assert_eq!(written.card_num, card_number());
         assert_eq!(store.cards.len(), 1);
@@ -1219,15 +1344,24 @@ mod tests {
         };
         let mut store = FakeStore::default().with_card(recased);
         let record = update_record(&fixture_card(), &changed_input());
-        let token = record_version(&fixture_card());
-        assert!(block_on(apply(&mut store, card_number(), &token, record)).is_ok());
+        let token = version_of(&fixture_card());
+        assert!(
+            block_on(apply(
+                &mut store,
+                &version_key(),
+                card_number(),
+                &token,
+                record
+            ))
+            .is_ok()
+        );
     }
 
     #[test]
     fn apply_rejects_a_card_changed_since_the_fetch_and_writes_nothing() {
         // V-COCRDUPC-019.
         let fetched = fixture_card();
-        let token = record_version(&fetched);
+        let token = version_of(&fetched);
         let changes = [
             Card {
                 card_active_status: Alnum::move_from("N"),
@@ -1246,7 +1380,13 @@ mod tests {
             let mut store = FakeStore::default().with_card(since.clone());
             let record = update_record(&fetched, &changed_input());
             assert_rejected(
-                block_on(apply(&mut store, card_number(), &token, record)),
+                block_on(apply(
+                    &mut store,
+                    &version_key(),
+                    card_number(),
+                    &token,
+                    record,
+                )),
                 (
                     ErrorKind::Conflict,
                     messages::RECORD_CHANGED_BY_SOME_ONE_ELSE,
@@ -1272,9 +1412,15 @@ mod tests {
             let case = format!("{failure:?}");
             store.fail_next("read_card_for_update", failure);
             let record = update_record(&fixture_card(), &changed_input());
-            let token = record_version(&fixture_card());
+            let token = version_of(&fixture_card());
             assert_rejected(
-                block_on(apply(&mut store, card_number(), &token, record)),
+                block_on(apply(
+                    &mut store,
+                    &version_key(),
+                    card_number(),
+                    &token,
+                    record,
+                )),
                 (
                     ErrorKind::Unexpected,
                     messages::COULD_NOT_LOCK_RECORD_FOR_UPDATE,
@@ -1296,9 +1442,15 @@ mod tests {
             PortError::Unavailable("disk full".to_owned()),
         );
         let record = update_record(&fixture_card(), &changed_input());
-        let token = record_version(&fixture_card());
+        let token = version_of(&fixture_card());
         assert_rejected(
-            block_on(apply(&mut store, card_number(), &token, record)),
+            block_on(apply(
+                &mut store,
+                &version_key(),
+                card_number(),
+                &token,
+                record,
+            )),
             (
                 ErrorKind::Unexpected,
                 messages::UPDATE_OF_RECORD_FAILED,
@@ -1318,7 +1470,7 @@ mod tests {
             ..fixture_card()
         };
         assert_eq!(
-            block_on(update(&mut store, &changed_input())),
+            block_on(update(&mut store, &version_key(), &changed_input())),
             Ok(CardUpdated {
                 card: expected.clone(),
                 message: messages::CHANGES_COMMITTED_TO_DATABASE,
@@ -1336,7 +1488,7 @@ mod tests {
         // V-COCRDUPC-009: 200 with the fetched card.
         let mut store = store();
         assert_eq!(
-            block_on(update(&mut store, &unchanged_input())),
+            block_on(update(&mut store, &version_key(), &unchanged_input())),
             Ok(CardUpdated {
                 card: fixture_card(),
                 message: messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED,
@@ -1347,7 +1499,7 @@ mod tests {
 
     #[test]
     fn update_stops_at_the_first_failing_step_in_audit_order() {
-        let stale_token = record_version(&Card {
+        let stale_token = version_of(&Card {
             card_active_status: Alnum::move_from("N"),
             ..fixture_card()
         });
@@ -1402,7 +1554,11 @@ mod tests {
         for (input, expected, calls) in cases {
             let mut store = store();
             let case = format!("{input:?}");
-            assert_rejected(block_on(update(&mut store, &input)), expected, &case);
+            assert_rejected(
+                block_on(update(&mut store, &version_key(), &input)),
+                expected,
+                &case,
+            );
             assert_eq!(store.calls, calls, "{case}");
             assert_eq!(
                 store.cards.get(&card_number()),
@@ -1416,8 +1572,9 @@ mod tests {
     fn the_update_future_is_send() {
         fn assert_send<T: Send>(_: &T) {}
         let mut store = store();
+        let key = version_key();
         let input = changed_input();
-        let future = update(&mut store, &input);
+        let future = update(&mut store, &key, &input);
         assert_send(&future);
         assert!(block_on(future).is_ok());
     }

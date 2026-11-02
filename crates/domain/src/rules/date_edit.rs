@@ -676,11 +676,13 @@ mod tests {
         CANNOT_BE_IN_THE_FUTURE, CANNOT_HAVE_30_DAYS_IN_THIS_MONTH as DAYS_30,
         CANNOT_HAVE_31_DAYS_IN_THIS_MONTH as DAYS_31, CENTURY_NOT_VALID as CENTURY,
         DAY_MUST_BE_A_NUMBER_BETWEEN_1_AND_31 as DAY_RANGE, DAY_MUST_BE_SUPPLIED as DAY_SUPPLIED,
-        FIELD_DATE_OF_BIRTH, FIELD_EXPIRY_DATE, FIELD_OPEN_DATE, FIELD_REISSUE_DATE,
+        FIELD_ACCOUNT_STATUS, FIELD_DATE_OF_BIRTH, FIELD_EXPIRY_DATE, FIELD_OPEN_DATE,
+        FIELD_REISSUE_DATE, FIELD_SSN_FIRST_3_CHARS,
         MONTH_MUST_BE_A_NUMBER_BETWEEN_1_AND_12 as MONTH_RANGE,
         MONTH_MUST_BE_SUPPLIED as MONTH_SUPPLIED, MUST_BE_4_DIGIT_NUMBER as FOUR_DIGITS,
-        NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS as LEAP, YEAR_MUST_BE_SUPPLIED as YEAR_SUPPLIED,
-        date_edit_message, date_validation_error_message,
+        MUST_BE_SUPPLIED, MUST_BE_Y_OR_N, NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS as LEAP,
+        YEAR_MUST_BE_SUPPLIED as YEAR_SUPPLIED, date_edit_message, date_validation_error_message,
+        field_edit_message,
     };
     use crate::rules::ReturnMsg;
     use crate::rules::date_validation::{DatePicture, DateValidationError, validate};
@@ -838,7 +840,8 @@ mod tests {
             }
         }
         let (_, msg) = edit_open("", "04", "15");
-        assert_eq!(msg.message(), Some("Open Date : Year must be supplied."));
+        let year_supplied = date_edit_message(FIELD_OPEN_DATE, YEAR_SUPPLIED);
+        assert_eq!(msg.message(), Some(year_supplied.as_str()));
     }
 
     #[test]
@@ -862,15 +865,13 @@ mod tests {
     #[test]
     fn an_earlier_message_stands() {
         let mut msg = ReturnMsg::default();
-        msg.set_if_off("Account Status must be Y or N.", "ACSTTUS");
+        let status = field_edit_message(FIELD_ACCOUNT_STATUS, MUST_BE_Y_OR_N);
+        msg.set_if_off(status.as_str(), "ACSTTUS");
         let parts = DateParts::from_entered("2024", "13", "15");
         let result =
             edit_date_ccyymmdd(FIELD_OPEN_DATE, &parts, &mut msg, DateBmsFields::OPEN_DATE);
         assert_eq!(result, Ok(flags(Valid, NotOk, Valid)));
-        assert_eq!(
-            msg.into_parts(),
-            Some(("Account Status must be Y or N.".to_owned(), "ACSTTUS"))
-        );
+        assert_eq!(msg.into_parts(), Some((status, "ACSTTUS")));
     }
 
     // P-CSUTLDPY-012, P-CSUTLDPY-014, E-26: a date that passes every edit
@@ -981,10 +982,6 @@ mod tests {
         edit.check_severity(&rejected);
         assert_eq!(edit.flags, DateEditFlags::VALID);
         let expected = date_validation_error_message(FIELD_OPEN_DATE, "0003", "2508");
-        assert_eq!(
-            expected,
-            "Open Date validation error Sev code: 0003 Message code: 2508"
-        );
         assert_eq!(msg.into_parts(), Some((expected, "ACCTSID")));
 
         let Ok(accepted) = validate(b"2024-02-29", DatePicture::YyyyMmDdDashed) else {
@@ -1005,7 +1002,6 @@ mod tests {
             panic!("2024-06-15 is a date");
         };
         let future = date_edit_message(FIELD_DATE_OF_BIRTH, CANNOT_BE_IN_THE_FUTURE);
-        assert_eq!(future, "Date of Birth:cannot be in the future ");
         let cases = [
             (("2024", "06", "14"), DateEditFlags::VALID, None),
             (("1980", "06", "5 "), DateEditFlags::VALID, None),
@@ -1040,7 +1036,10 @@ mod tests {
         }
 
         let mut msg = ReturnMsg::default();
-        msg.set_if_off("SSN: First 3 chars must be supplied.", "ACTSSN1");
+        msg.set_if_off(
+            field_edit_message(FIELD_SSN_FIRST_3_CHARS, MUST_BE_SUPPLIED),
+            "ACTSSN1",
+        );
         let parts = DateParts::from_entered("2025", "01", "01");
         let result = edit_date_of_birth(FIELD_DATE_OF_BIRTH, &parts, today, &mut msg, "DOBYEAR");
         assert_eq!(result, DateEditFlags::INVALID);

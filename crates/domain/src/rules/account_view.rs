@@ -38,8 +38,8 @@
 //! branches no path reaches are not carried (P-COACTVWC-001, P-COACTVWC-002,
 //! P-COACTVWC-022 to P-COACTVWC-024, P-COACTVWC-026 to P-COACTVWC-029).
 
-use super::VersionToken;
 use super::account_update::record_version;
+use super::{VersionKey, VersionToken};
 use crate::entities::{Account, CardXref, Customer};
 use crate::error::DomainError;
 use crate::messages::{
@@ -105,7 +105,7 @@ pub struct AccountView {
     pub card_xref: CardXref,
     /// The token `PUT /accounts/{id}` echoes back:
     /// [`record_version`] of [`AccountView::account`] and
-    /// [`AccountView::customer`].
+    /// [`AccountView::customer`] under the server's [`VersionKey`].
     pub version: VersionToken,
 }
 
@@ -179,6 +179,7 @@ fn read_failure(file: &str) -> DomainError {
 /// `READ` without a lock: the cross-reference by `account_id` through the
 /// `CXACAIX` path, then `ACCTDAT` by the same key (`WS-CARD-RID-ACCT-ID-X`,
 /// L778), then `CUSTDAT` by the cross-reference's `XREF-CUST-ID` (L739, L708).
+/// The records found are shown with their token computed under `key`.
 ///
 /// # Errors
 ///
@@ -191,9 +192,12 @@ fn read_failure(file: &str) -> DomainError {
 /// - else an account failure: [`account_master_not_found_message`] on
 ///   `NOTFND`, the `ACCTDAT` file-error text otherwise. A found customer does
 ///   not make the account shown (P-COACTVWC-014);
-/// - else the customer's [`customer_master_not_found_message`].
+/// - else the customer's [`customer_master_not_found_message`];
+/// - with both records found, the token's error, as [`record_version`]
+///   documents it.
 async fn read_acct<S: XrefReader + AccountReader + CustomerReader>(
     store: &mut S,
+    key: &VersionKey,
     account_id: AccountId,
 ) -> Result<AccountView, DomainError> {
     let account_text = account_id.to_string();
@@ -215,7 +219,7 @@ async fn read_acct<S: XrefReader + AccountReader + CustomerReader>(
     let customer = store.read_customer(customer_id).await;
     match (account, customer) {
         (Ok(account), Ok(customer)) => {
-            let version = record_version(&account, &customer);
+            let version = record_version(key, &account, &customer)?;
             Ok(AccountView {
                 account,
                 customer,
@@ -246,22 +250,24 @@ async fn read_acct<S: XrefReader + AccountReader + CustomerReader>(
 ///
 /// The whole `GET /accounts/{id}`: [`edit_account_id`], then, when the key
 /// passes, the cross-reference, account and customer reads. The records found
-/// are shown with their [`VersionToken`]. Nothing is written; the caller owns
-/// the read-only unit of work.
+/// are shown with their [`VersionToken`], computed under `key`. Nothing is
+/// written; the caller owns the read-only unit of work.
 ///
 /// # Errors
 ///
 /// The error of the first step that fails: the key edit (V-COACTVWC-001,
 /// V-COACTVWC-002, no read), then the reads (V-COACTVWC-003 to
 /// V-COACTVWC-008), each a [`DomainError`] at `ACCTSID` as
-/// [`edit_account_id`] and the module's outcome table describe.
+/// [`edit_account_id`] and the module's outcome table describe, then the
+/// token, as [`record_version`] documents it.
 pub async fn view<S: XrefReader + AccountReader + CustomerReader>(
     store: &mut S,
+    key: &VersionKey,
     input: AccountViewInput,
 ) -> Result<AccountView, DomainError> {
     let AccountViewInput { account_id } = input;
     let account_id = edit_account_id(account_id.as_deref())?;
-    read_acct(store, account_id).await
+    read_acct(store, key, account_id).await
 }
 
 #[cfg(test)]
@@ -279,7 +285,7 @@ mod tests {
     use crate::ports::PortError;
     use crate::rules::VersionToken;
     use crate::rules::account_update::record_version;
-    use crate::rules::test_support::{FakeStore, block_on};
+    use crate::rules::test_support::{FakeStore, block_on, version_key};
 
     /// `ACCTSID`, as the validation audit names it.
     const ACCTSID: &str = "ACCTSID";
@@ -372,6 +378,12 @@ mod tests {
         }
     }
 
+    /// The token `PUT /accounts/{id}` recomputes for `account` and `customer`
+    /// under the tests' server key.
+    fn version_of(account: &Account, customer: &Customer) -> VersionToken {
+        record_version(&version_key(), account, customer).expect("the records' token")
+    }
+
     /// Asserts that `result` is the rejection `kind`, `message` at `ACCTSID`.
     fn assert_rejected<T: Debug>(
         result: Result<T, DomainError>,
@@ -399,13 +411,13 @@ mod tests {
         // P-COACTVWC-006, P-COACTVWC-007, P-COACTVWC-011, P-COACTVWC-014,
         // P-COACTVWC-015.
         let mut store = fixture_store();
-        let shown = block_on(view(&mut store, input(Some(ACCOUNT))))
+        let shown = block_on(view(&mut store, &version_key(), input(Some(ACCOUNT))))
             .expect("account 00000000001 is on file");
         let expected = AccountView {
             account: fixture_account(),
             customer: fixture_customer(),
             card_xref: fixture_xref(),
-            version: record_version(&fixture_account(), &fixture_customer()),
+            version: version_of(&fixture_account(), &fixture_customer()),
         };
         assert_eq!(shown, expected);
         assert_eq!(store.calls, ALL_READS);
@@ -420,11 +432,12 @@ mod tests {
             ..fixture_account()
         };
         let mut store = fixture_store().with_account(changed.clone());
-        let shown = block_on(view(&mut store, input(Some(ACCOUNT)))).expect("the account");
-        assert_eq!(shown.version, record_version(&changed, &fixture_customer()));
+        let shown =
+            block_on(view(&mut store, &version_key(), input(Some(ACCOUNT)))).expect("the account");
+        assert_eq!(shown.version, version_of(&changed, &fixture_customer()));
         assert_ne!(
             shown.version,
-            record_version(&fixture_account(), &fixture_customer())
+            version_of(&fixture_account(), &fixture_customer())
         );
         assert_eq!(
             VersionToken::parse(shown.version.as_str()),
@@ -445,7 +458,7 @@ mod tests {
         let low_values = "\0".repeat(11);
         let cases = [
             // V-COACTVWC-001: absent, empty, spaces, '*' and LOW-VALUES; the
-            // cross edit replaces "Account number not provided".
+            // cross edit replaces messages::ACCOUNT_NUMBER_NOT_PROVIDED.
             (None, empty),
             (Some(""), empty),
             (Some(" "), empty),
@@ -475,7 +488,11 @@ mod tests {
             assert_rejected(edit_account_id(raw), expected, &case);
 
             let mut store = fixture_store();
-            assert_rejected(block_on(view(&mut store, input(raw))), expected, &case);
+            assert_rejected(
+                block_on(view(&mut store, &version_key(), input(raw))),
+                expected,
+                &case,
+            );
             assert!(
                 store.calls.is_empty(),
                 "{case}: a key error skips the reads"
@@ -499,24 +516,20 @@ mod tests {
     fn an_account_without_a_cross_reference_is_not_found() {
         // V-COACTVWC-003, P-COACTVWC-007, E-44: the other reads are skipped.
         let mut store = fixture_store();
-        let result = block_on(view(&mut store, input(Some(MISSING_ACCOUNT))));
-        let text = "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000";
-        assert_eq!(
-            text,
-            messages::xref_not_found_message(MISSING_ACCOUNT, 13, 80)
-        );
-        assert_rejected(result, (ErrorKind::NotFound, text), MISSING_ACCOUNT);
+        let result = block_on(view(
+            &mut store,
+            &version_key(),
+            input(Some(MISSING_ACCOUNT)),
+        ));
+        let text = messages::xref_not_found_message(MISSING_ACCOUNT, 13, 80);
+        assert_rejected(result, (ErrorKind::NotFound, &text), MISSING_ACCOUNT);
         assert_eq!(store.calls, ["read_xref_by_account"]);
     }
 
     #[test]
     fn a_failed_cross_reference_read_ends_the_reads() {
         // V-COACTVWC-004, P-COACTVWC-008, E-44.
-        let text = "File Error: READ     on CXACAIX   returned RESP 000000017 ,RESP2 000000000 ";
-        assert_eq!(
-            text,
-            messages::file_error_message("READ", "CXACAIX ", 17, 0)
-        );
+        let text = messages::file_error_message("READ", "CXACAIX ", 17, 0);
         let failures = [
             PortError::Unavailable("connection reset".to_owned()),
             PortError::Contention,
@@ -527,8 +540,8 @@ mod tests {
             let case = format!("{failure:?}");
             let mut store = fixture_store();
             store.fail_next("read_xref_by_account", failure);
-            let result = block_on(view(&mut store, input(Some(ACCOUNT))));
-            assert_rejected(result, (ErrorKind::Unexpected, text), &case);
+            let result = block_on(view(&mut store, &version_key(), input(Some(ACCOUNT))));
+            assert_rejected(result, (ErrorKind::Unexpected, &text), &case);
             assert_eq!(store.calls, ["read_xref_by_account"], "{case}");
         }
     }
@@ -537,18 +550,8 @@ mod tests {
     fn the_customer_is_read_after_any_account_outcome_and_its_failure_wins() {
         // V-COACTVWC-005 to V-COACTVWC-008, P-COACTVWC-006, P-COACTVWC-009,
         // P-COACTVWC-010, P-COACTVWC-014, P-COACTVWC-030, E-45.
-        let account_text =
-            "Account:00000000001 not found in Acct Master file.Resp:000000013  Reas:0000";
-        let customer_text =
-            "CustId:000000001 not found in customer master.Resp: 000000013  REAS:0000000";
-        assert_eq!(
-            account_text,
-            messages::account_master_not_found_message(ACCOUNT, 13, 80)
-        );
-        assert_eq!(
-            customer_text,
-            messages::customer_master_not_found_message("000000001", 13, 80)
-        );
+        let account_text = messages::account_master_not_found_message(ACCOUNT, 13, 80);
+        let customer_text = messages::customer_master_not_found_message("000000001", 13, 80);
         let account_error = messages::file_error_message("READ", "ACCTDAT ", 17, 0);
         let customer_error = messages::file_error_message("READ", "CUSTDAT ", 17, 0);
         let unavailable = || PortError::Unavailable("database".to_owned());
@@ -558,14 +561,14 @@ mod tests {
                 Some(PortError::NotFound),
                 None,
                 ErrorKind::NotFound,
-                account_text,
+                account_text.as_str(),
             ),
             // V-COACTVWC-005: the guarded customer text keeps the account's.
             (
                 Some(PortError::NotFound),
                 Some(PortError::NotFound),
                 ErrorKind::NotFound,
-                account_text,
+                account_text.as_str(),
             ),
             // V-COACTVWC-006.
             (
@@ -585,7 +588,7 @@ mod tests {
                 None,
                 Some(PortError::NotFound),
                 ErrorKind::NotFound,
-                customer_text,
+                customer_text.as_str(),
             ),
             // V-COACTVWC-008: the unguarded move replaces any account text.
             (
@@ -616,7 +619,7 @@ mod tests {
             if let Some(error) = customer {
                 store.fail_next("read_customer", error);
             }
-            let result = block_on(view(&mut store, input(Some(ACCOUNT))));
+            let result = block_on(view(&mut store, &version_key(), input(Some(ACCOUNT))));
             assert_rejected(result, (kind, message), &case);
             assert_eq!(store.calls, ALL_READS, "{case}");
         }
@@ -628,7 +631,7 @@ mod tests {
         let mut store = FakeStore::default()
             .with_xref(fixture_xref())
             .with_customer(fixture_customer());
-        let result = block_on(view(&mut store, input(Some(ACCOUNT))));
+        let result = block_on(view(&mut store, &version_key(), input(Some(ACCOUNT))));
         let text = messages::account_master_not_found_message(ACCOUNT, 13, 80);
         assert_rejected(result, (ErrorKind::NotFound, &text), "no account");
         assert_eq!(store.calls, ALL_READS);
@@ -650,7 +653,8 @@ mod tests {
             .with_account(fixture_account())
             .with_customer(fixture_customer())
             .with_customer(customer.clone());
-        let shown = block_on(view(&mut store, input(Some(ACCOUNT)))).expect("the account");
+        let shown =
+            block_on(view(&mut store, &version_key(), input(Some(ACCOUNT)))).expect("the account");
         assert_eq!(shown.customer, customer);
         assert_eq!(shown.card_xref, xref);
 
@@ -658,9 +662,8 @@ mod tests {
             .with_xref(xref)
             .with_account(fixture_account())
             .with_customer(fixture_customer());
-        let result = block_on(view(&mut store, input(Some(ACCOUNT))));
+        let result = block_on(view(&mut store, &version_key(), input(Some(ACCOUNT))));
         let text = messages::customer_master_not_found_message("000000007", 13, 80);
-        assert!(text.starts_with("CustId:000000007 not found"), "{text}");
         assert_rejected(result, (ErrorKind::NotFound, &text), "customer 7 missing");
     }
 
@@ -671,7 +674,8 @@ mod tests {
             future
         }
         let mut store = fixture_store();
-        let future = assert_send(view(&mut store, input(Some(ACCOUNT))));
+        let key = version_key();
+        let future = assert_send(view(&mut store, &key, input(Some(ACCOUNT))));
         assert!(block_on(future).is_ok());
     }
 }

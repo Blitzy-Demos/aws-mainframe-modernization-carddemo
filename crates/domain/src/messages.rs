@@ -2330,6 +2330,9 @@ mod tests {
     /// This file, read to list the `pub const` texts it declares.
     const SOURCE: &str = include_str!("messages.rs");
 
+    /// COACTUPC, read for the field labels it moves to `WS-EDIT-VARIABLE-NAME`.
+    const COACTUPC: &str = include_str!("../../../app/cbl/COACTUPC.cbl");
+
     /// Every text [`field_edit_message`] appends to a field label.
     const FIELD_EDIT_SUFFIXES: [&str; 32] = [
         MUST_BE_SUPPLIED,
@@ -2607,6 +2610,35 @@ mod tests {
         templates
     }
 
+    /// The literal of every `MOVE '<label>' TO WS-EDIT-VARIABLE-NAME` statement
+    /// of the fixed-format COBOL `program`, in source order. Comment lines (`*`
+    /// or `/` in column 7) are skipped and the code areas (columns 8 to 72) of
+    /// the other lines are read as one stream, so a statement split over lines
+    /// is found whole.
+    fn edit_variable_name_literals(program: &str) -> Vec<String> {
+        assert!(program.is_ascii(), "fixed-format columns are bytes");
+        let code = program
+            .lines()
+            .filter(|line| !matches!(line.as_bytes().get(6), Some(b'*' | b'/')))
+            .map(|line| line.get(7..line.len().clamp(7, 72)).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(" ");
+        code.split("MOVE ")
+            .skip(1)
+            .filter_map(|statement| {
+                let (literal, rest) = statement
+                    .trim_start()
+                    .strip_prefix('\'')?
+                    .split_once('\'')?;
+                let mut words = rest.split_whitespace();
+                (words.next() == Some("TO")
+                    && words.next().map(|name| name.trim_end_matches('.'))
+                        == Some("WS-EDIT-VARIABLE-NAME"))
+                .then(|| literal.to_owned())
+            })
+            .collect()
+    }
+
     #[test]
     fn every_audited_message_has_exactly_one_catalog_entry() {
         let constants = catalog_constants();
@@ -2705,6 +2737,56 @@ mod tests {
         }
         let long = field_edit_message(FIELD_DATE_OF_BIRTH, &"x".repeat(80));
         assert_eq!(long.len(), 75, "WS-RETURN-MSG X(75)");
+    }
+
+    /// Each COACTUPC field label is, byte for byte and before the `X(25)` cut
+    /// (E-45), the literal of one `MOVE … TO WS-EDIT-VARIABLE-NAME` in
+    /// 1200-EDIT-MAP-INPUTS (P-COACTUPC-006) [app/cbl/COACTUPC.cbl:L1429-1680]
+    /// or 1265-EDIT-US-SSN (P-COACTUPC-031) [app/cbl/COACTUPC.cbl:L2431-2488].
+    /// The one literal without a label is 'SSN' [app/cbl/COACTUPC.cbl:L1529],
+    /// which 1265-EDIT-US-SSN overwrites before any message reads it; the
+    /// 'Address Line 2' move [app/cbl/COACTUPC.cbl:L1614] is a comment.
+    #[test]
+    fn coactupc_field_labels_are_the_literals_moved_to_ws_edit_variable_name() {
+        let labels = [
+            FIELD_ACCOUNT_STATUS,
+            FIELD_OPEN_DATE,
+            FIELD_CREDIT_LIMIT,
+            FIELD_EXPIRY_DATE,
+            FIELD_CASH_CREDIT_LIMIT,
+            FIELD_REISSUE_DATE,
+            FIELD_CURRENT_BALANCE,
+            FIELD_CURRENT_CYCLE_CREDIT_LIMIT,
+            FIELD_CURRENT_CYCLE_DEBIT_LIMIT,
+            FIELD_SSN_FIRST_3_CHARS,
+            FIELD_SSN_4TH_AND_5TH_CHARS,
+            FIELD_SSN_LAST_4_CHARS,
+            FIELD_DATE_OF_BIRTH,
+            FIELD_FICO_SCORE,
+            FIELD_FIRST_NAME,
+            FIELD_MIDDLE_NAME,
+            FIELD_LAST_NAME,
+            FIELD_ADDRESS_LINE_1,
+            FIELD_STATE,
+            FIELD_ZIP,
+            FIELD_CITY,
+            FIELD_COUNTRY,
+            FIELD_PHONE_NUMBER_1,
+            FIELD_PHONE_NUMBER_2,
+            FIELD_EFT_ACCOUNT_ID,
+            FIELD_PRIMARY_CARD_HOLDER,
+        ];
+        let literals = edit_variable_name_literals(COACTUPC);
+        for label in labels {
+            let moves = literals.iter().filter(|literal| *literal == label).count();
+            assert_eq!(moves, 1, "MOVEs of {label:?} to WS-EDIT-VARIABLE-NAME");
+        }
+        let unlabelled: Vec<&str> = literals
+            .iter()
+            .map(String::as_str)
+            .filter(|literal| !labels.contains(literal))
+            .collect();
+        assert_eq!(unlabelled, ["SSN"], "{literals:?}");
     }
 
     #[test]

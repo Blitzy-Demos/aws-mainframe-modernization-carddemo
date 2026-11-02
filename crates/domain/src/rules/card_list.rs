@@ -31,6 +31,8 @@
 //! `2250-EDIT-ARRAY` (V-COCRDLIC-003, V-COCRDLIC-004) are therefore not
 //! carried, nor are the paragraphs no path reaches (E-67).
 
+use std::fmt;
+
 use crate::entities::Card;
 use crate::error::DomainError;
 use crate::messages::{
@@ -90,7 +92,9 @@ const KEY_AND_NEXT: u16 = 2;
 const MAX_PAGE_ROWS: u16 = u16::MAX - KEY_AND_NEXT;
 
 /// One `GET /cards` request: the filters as entered and the page asked for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` shows the card filter masked as [`CardNumber`] masks it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct CardListInput {
     /// The account filter as entered (`ACCTSIDI`, moved to `CC-ACCT-ID`).
     /// `None`, empty or blank text is no filter.
@@ -106,6 +110,20 @@ pub struct CardListInput {
     /// The most cards on the page, [`SCREEN_ROWS`] on the 3270 screen. Zero is
     /// read as one, and anything above `u16::MAX - 2` as that limit.
     pub page_size: u16,
+}
+
+impl fmt::Debug for CardListInput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let masked = self.card_filter.as_deref().map(CardNumber::move_from);
+        formatter
+            .debug_struct("CardListInput")
+            .field("account_filter", &self.account_filter)
+            .field("card_filter", &masked)
+            .field("start_key", &self.start_key)
+            .field("direction", &self.direction)
+            .field("page_size", &self.page_size)
+            .finish()
+    }
 }
 
 /// One page of the card list, as `1000-SEND-MAP` shows it.
@@ -1110,5 +1128,33 @@ mod tests {
             assert_eq!(page.message, message, "{page_size}");
         }
         Ok(())
+    }
+
+    /// `Debug` masks the card filter as entered, whatever its length, and the
+    /// start key to their last four characters, and shows the account filter
+    /// as entered.
+    #[test]
+    fn debug_masks_the_card_filter_and_the_start_key() {
+        let cases = [
+            // The fixture card number, the receiver's full width.
+            (ACCOUNT_50_CARD, "************5740"),
+            // Longer than the receiver: masked as the `MOVE` cuts it.
+            ("05000244537657401", "************5740"),
+            // Shorter than the receiver.
+            ("12345678", "****5678"),
+        ];
+        for (card_filter, masked) in cases {
+            let input = CardListInput {
+                start_key: Some(key(FIRST_PAGE[1])),
+                ..filtered(Some(ACCOUNT_50), Some(card_filter))
+            };
+            let shown = format!("{input:?}");
+            assert!(shown.contains(masked), "{shown}");
+            assert!(shown.contains("************1516"), "{shown}");
+            assert!(shown.contains(ACCOUNT_50), "{shown}");
+            for full in [card_filter, ACCOUNT_50_CARD, FIRST_PAGE[1]] {
+                assert!(!shown.contains(full), "{shown}");
+            }
+        }
     }
 }

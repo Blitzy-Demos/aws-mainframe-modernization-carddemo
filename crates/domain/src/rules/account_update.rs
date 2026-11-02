@@ -6,17 +6,19 @@
 //! PF5 turn that writes them (`9600-WRITE-PROCESSING`). One request performs
 //! all three (E-56), in the order the validation audit ranks their messages
 //! (V-COACTUPC-002 to V-COACTUPC-128): [`update`] runs [`edit_account_id`],
-//! [`read_snapshot`], [`validate`] and [`apply`] in that order, and each step
-//! is public for an adapter that sequences them itself. The copybook
-//! procedures `CSUTLDPY` (the date edits, through [`super::date_edit`]) and
-//! `CSLKPCDY` (the lookup tables below) are part of the program.
+//! [`read_snapshot`], the receiving and edits of [`validate`] and [`apply`] in
+//! that order, editing the key once, and each step is public for an adapter
+//! that sequences them itself. The copybook procedures `CSUTLDPY` (the date
+//! edits, through [`super::date_edit`]) and `CSLKPCDY` (the lookup tables
+//! below) are part of the program.
 //!
 //! Between turns the program keeps the fetched values, `ACUP-OLD-DETAILS`, in
 //! its COMMAREA. The stateless API keeps a [`VersionToken`] instead (E-24):
 //! [`record_version`] digests the fields `9700-CHECK-CHANGE-IN-REC` compares,
-//! `GET /accounts/{id}` returns it, and [`apply`] recomputes it from the rows it
-//! locks. A request without a token is the API's 400 (V-COACTUPC-001) and never
-//! reaches this module.
+//! keyed with the server's [`VersionKey`], `GET /accounts/{id}` returns it, and
+//! [`apply`] recomputes it under the same key from the rows it locks. A request
+//! without a token is the API's 400 (V-COACTUPC-001) and never reaches this
+//! module.
 //!
 //! # Outcomes
 //!
@@ -94,7 +96,7 @@ use super::date_edit::{
     DateBmsFields, DateEditFlags, DateParts, FlagState, edit_date_ccyymmdd, edit_date_of_birth,
 };
 use super::date_validation::DateValidationError;
-use super::{ReturnMsg, VersionToken, version_token};
+use super::{ReturnMsg, VersionKey, VersionToken, version_token};
 use crate::entities::{Account, Customer};
 use crate::error::{DomainError, ErrorKind, FieldError};
 use crate::messages::{
@@ -1725,7 +1727,7 @@ impl Edits {
         let mut own = ReturnMsg::default();
         match edit_date_ccyymmdd(label, &parts, &mut own, fields) {
             Ok(flags) => {
-                self.date_flags(flags, fields, own);
+                self.date_flags(parts, flags, fields, own);
                 Ok(flags.is_valid())
             }
             Err(DateValidationError::Unproven { escalation_id })
@@ -1745,26 +1747,52 @@ impl Edits {
         let fields = DateBmsFields::DATE_OF_BIRTH;
         let mut own = ReturnMsg::default();
         let flags = edit_date_of_birth(FIELD_DATE_OF_BIRTH, &parts, today, &mut own, fields.year);
-        self.date_flags(flags, fields, own);
+        self.date_flags(parts, flags, fields, own);
     }
 
-    /// The flags one date edit left and the text it wrote into `own`: the
-    /// text stands if no earlier text is set, with the kind of the part it
-    /// names (`Empty` for a part not supplied), and every flagged part is
-    /// listed with it. A text that names no part, the `CSUTLDTC` rejection
-    /// at `ACCTSID`, is listed at its own field.
-    fn date_flags(&mut self, flags: DateEditFlags, fields: DateBmsFields, own: ReturnMsg) {
+    /// The `entered` parts of one date, the flags its edit left and the text
+    /// it wrote into `own`: the text stands if no earlier text is set, and
+    /// every part the flags leave not valid is listed with it. A text that
+    /// names no part, the `CSUTLDTC` rejection at `ACCTSID`, is listed at its
+    /// own field.
+    ///
+    /// The text's kind is that of the rejection that wrote it: `Empty` when
+    /// the part whose field it names is blank as entered (`= SPACES OR =
+    /// LOW-VALUES`, the test of `EDIT-YEAR-CCYY`, `EDIT-MONTH` and
+    /// `EDIT-DAY`), else `Invalid`. A part's "must be supplied" text is
+    /// written before any later step can name that part's field, so this is
+    /// exact; the text naming no part, and the birth date's `cannot be in the
+    /// future` on parts every edit passed, stay `Invalid`.
+    ///
+    /// The final flags cannot decide the kind, because a later step
+    /// overwrites a `'B'` flag without writing a text: a blank month is set
+    /// `FLG-MONTH-BLANK` with its text by `EDIT-MONTH` (P-CSUTLDPY-005)
+    /// [app/cpy/CSUTLDPY.cpy:L94-105], then with day 31 it is not a
+    /// `WS-31-DAY-MONTH`, so `EDIT-DAY-MONTH-YEAR` sets `FLG-MONTH-NOT-OK`
+    /// and `FLG-DAY-NOT-OK` (P-CSUTLDPY-009) [app/cpy/CSUTLDPY.cpy:L213-225];
+    /// the month's text still stands with kind `Empty` (V-COACTUPC-016).
+    fn date_flags(
+        &mut self,
+        entered: DateParts,
+        flags: DateEditFlags,
+        fields: DateBmsFields,
+        own: ReturnMsg,
+    ) {
         let Some((text, field)) = own.into_parts() else {
             return;
         };
+        let blank = [
+            (entered.ccyy.as_slice(), fields.year),
+            (entered.mm.as_slice(), fields.month),
+            (entered.dd.as_slice(), fields.day),
+        ]
+        .iter()
+        .any(|&(bytes, name)| name == field && is_blank_bytes(bytes));
         let parts = [
             (flags.year, fields.year),
             (flags.month, fields.month),
             (flags.day, fields.day),
         ];
-        let blank = parts
-            .iter()
-            .any(|&(state, name)| name == field && state == FlagState::Blank);
         let kind = if blank {
             ErrorKind::Empty
         } else {
@@ -2070,19 +2098,30 @@ fn phone_number(phone: &PhoneParts) -> Alnum<15> {
 /// COACTUPC 9700-CHECK-CHANGE-IN-REC, 9500-STORE-FETCHED-DATA —
 /// P-COACTUPC-012, P-COACTUPC-048
 ///
-/// The [`VersionToken`] of `account` and `customer`: the digest of exactly
-/// the fields the paragraph compares, in its order and with its
-/// normalization [app/cbl/COACTUPC.cbl:L4115-4190], so two snapshots give the
-/// same token exactly when the paragraph finds no change between them. The
+/// The [`VersionToken`] of `account` and `customer` under `key`: the keyed
+/// digest of exactly the fields the paragraph compares, in its order and with
+/// its normalization [app/cbl/COACTUPC.cbl:L4115-4190], so under one key two
+/// snapshots give the same token exactly when the paragraph finds no change
+/// between them. The
 /// account status, the five amounts, each date's `(1:4)`, `(6:2)` and
 /// `(9:2)`, the group ID lower-cased; the names, address lines, state and
 /// country upper-cased; the zip, both phone numbers and the SSN exactly; the
 /// government ID upper-cased; the date of birth's three parts; the EFT
 /// account ID, the primary holder indicator and the FICO score exactly. The
 /// account and customer IDs are the keys the records were read by and are
-/// not compared. `account_view` returns this token with `GET /accounts/{id}`.
-#[must_use]
-pub fn record_version(account: &Account, customer: &Customer) -> VersionToken {
+/// not compared. `account_view` returns this token with `GET /accounts/{id}`;
+/// the key keeps it from disclosing the digested fields.
+///
+/// # Errors
+///
+/// [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] at `ACCTSID` when the
+/// digest fails; as [`version_token`] documents, no record's fields reach the
+/// input size that makes it fail.
+pub fn record_version(
+    key: &VersionKey,
+    account: &Account,
+    customer: &Customer,
+) -> Result<VersionToken, DomainError> {
     let mut parts: Vec<Vec<u8>> = vec![account.acct_active_status.as_bytes().to_vec()];
     parts.extend(
         [
@@ -2129,7 +2168,8 @@ pub fn record_version(account: &Account, customer: &Customer) -> VersionToken {
     parts.push(customer.cust_pri_card_holder_ind.as_bytes().to_vec());
     parts.push(customer.cust_fico_credit_score.to_string().into_bytes());
     let slices: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
-    version_token(&slices)
+    version_token(key, &slices)
+        .map_err(|_| DomainError::unexpected(UNEXPECTED_ERROR).with_field(FIELD_ACCTSID))
 }
 
 /// The `(1:4)`, `(6:2)` and `(9:2)` of a stored `X(10)` date, the three
@@ -2170,6 +2210,35 @@ pub fn validate(
     today: NaiveDate,
 ) -> Result<AccountEdit, DomainError> {
     let account_id = edit_account_id(&input.account_id)?;
+    edit_changes(account_id, snapshot, input, today)
+}
+
+/// COACTUPC 1100-RECEIVE-MAP, 1205-COMPARE-OLD-NEW, 1200-EDIT-MAP-INPUTS,
+/// 9600-WRITE-PROCESSING — P-COACTUPC-005 to P-COACTUPC-008, P-COACTUPC-018
+/// to P-COACTUPC-033, P-COACTUPC-047, P-COACTUPC-049, V-COACTUPC-010 to
+/// V-COACTUPC-123
+///
+/// The ENTER turn after the key edit, against `snapshot`, the records
+/// [`read_snapshot`] fetched, with `account_id`, the key of `input`
+/// [`edit_account_id`] passed: every field is received; when the received
+/// values equal the fetched ones nothing more happens; otherwise every edit
+/// runs, and when all pass the result holds the records
+/// `9600-WRITE-PROCESSING` builds for `account_id`. `today` is the processing
+/// date the birth-date check compares with (`FUNCTION CURRENT-DATE`).
+///
+/// # Errors
+///
+/// - The first failing field edit in `1200-EDIT-MAP-INPUTS` order, with its
+///   kind ([`ErrorKind::Empty`] for a field not supplied,
+///   [`ErrorKind::Invalid`] otherwise) and every flagged field.
+/// - [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] for an input class
+///   held at `halt` (see the module notes).
+fn edit_changes(
+    account_id: AccountId,
+    snapshot: &AccountSnapshot,
+    input: &AccountUpdateInput,
+    today: NaiveDate,
+) -> Result<AccountEdit, DomainError> {
     let new = NewDetails::receive(input)?;
     if no_changes_found(&new, snapshot) {
         return Ok(AccountEdit::NoChange);
@@ -2186,7 +2255,8 @@ pub fn validate(
 /// The PF5 write [app/cbl/COACTUPC.cbl:L3888-4104]: `READ … UPDATE` of the
 /// account `account_id` and of the customer `customer_id`, the
 /// cross-reference's; the change check of the locked records against
-/// `expected`; then the account `REWRITE` and the customer `REWRITE` of
+/// `expected`, their token computed under `key`, the key `expected` was issued
+/// under; then the account `REWRITE` and the customer `REWRITE` of
 /// `changes`, in that order. Each write is one legacy write: the account
 /// rewrite stands when the customer rewrite fails, because every `CardDemo`
 /// file is `RECOVERY(NONE)` [app/csd/CARDDEMO.CSD:L1-96] and `SYNCPOINT
@@ -2205,6 +2275,9 @@ pub fn validate(
 /// - [`ErrorKind::Unexpected`] with [`COULD_NOT_LOCK_ACCOUNT_RECORD_FOR_UPDATE`]
 ///   or [`COULD_NOT_LOCK_CUSTOMER_RECORD_FOR_UPDATE`] when a locked read
 ///   fails for any reason; nothing is written.
+/// - [`ErrorKind::Unexpected`] with [`UNEXPECTED_ERROR`] when the locked
+///   records' token cannot be computed ([`record_version`]); nothing is
+///   written.
 /// - [`ErrorKind::Conflict`] with [`RECORD_CHANGED_BY_SOME_ONE_ELSE`] when the
 ///   locked records' token differs from `expected`; nothing is written.
 /// - [`ErrorKind::Unexpected`] with [`UPDATE_OF_RECORD_FAILED`] when the
@@ -2213,6 +2286,7 @@ pub fn validate(
 ///   holding a non-digit (nothing is written).
 pub async fn apply<S>(
     store: &mut S,
+    key: &VersionKey,
     account_id: AccountId,
     customer_id: CustomerId,
     expected: &VersionToken,
@@ -2229,7 +2303,7 @@ where
         .read_customer_for_update(customer_id)
         .await
         .map_err(|_| write_failure(COULD_NOT_LOCK_CUSTOMER_RECORD_FOR_UPDATE))?;
-    if record_version(&locked_account, &locked_customer) != *expected {
+    if record_version(key, &locked_account, &locked_customer)? != *expected {
         return Err(
             DomainError::conflict(RECORD_CHANGED_BY_SOME_ONE_ELSE).with_field(FIELD_ACCTSID)
         );
@@ -2270,9 +2344,10 @@ fn write_failure(message: &'static str) -> DomainError {
 /// P-COACTUPC-015, V-COACTUPC-002 to V-COACTUPC-128
 ///
 /// One `PUT /accounts/{id}` from key to write (E-56): [`edit_account_id`],
-/// [`read_snapshot`], [`validate`] and, for a change, [`apply`] with the
-/// cross-reference's customer and the token of `input`. No change succeeds
-/// with the fetched records and
+/// [`read_snapshot`], the receiving, comparison and field edits of
+/// [`validate`] for the key already edited and, for a change, [`apply`] with
+/// `key`, the cross-reference's customer and the token of `input`. No change
+/// succeeds with the fetched records and
 /// [`NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED`] (V-COACTUPC-010).
 ///
 /// # Errors
@@ -2280,6 +2355,7 @@ fn write_failure(message: &'static str) -> DomainError {
 /// The first error of those steps, as each documents it.
 pub async fn update<S>(
     store: &mut S,
+    key: &VersionKey,
     input: &AccountUpdateInput,
     today: NaiveDate,
 ) -> Result<AccountUpdated, DomainError>
@@ -2288,7 +2364,7 @@ where
 {
     let account_id = edit_account_id(&input.account_id)?;
     let snapshot = read_snapshot(store, account_id).await?;
-    match validate(&snapshot, input, today)? {
+    match edit_changes(account_id, &snapshot, input, today)? {
         AccountEdit::NoChange => Ok(AccountUpdated {
             account: snapshot.account,
             customer: snapshot.customer,
@@ -2296,7 +2372,15 @@ where
         }),
         AccountEdit::Changed(changes) => {
             let customer_id = snapshot.customer.cust_id;
-            apply(store, account_id, customer_id, &input.version, *changes).await
+            apply(
+                store,
+                key,
+                account_id,
+                customer_id,
+                &input.version,
+                *changes,
+            )
+            .await
         }
     }
 }
@@ -2317,11 +2401,33 @@ mod tests {
     use crate::entities::{Account, CardXref, Customer};
     use crate::error::{DomainError, ErrorKind, FieldError};
     use crate::messages;
+    use crate::messages::{
+        AREA_CODE_CANNOT_BE_ZERO, AREA_CODE_MUST_BE_A_3_DIGIT_NUMBER, AREA_CODE_MUST_BE_SUPPLIED,
+        CAN_HAVE_ALPHABETS_ONLY, CANNOT_BE_IN_THE_FUTURE, CANNOT_HAVE_30_DAYS_IN_THIS_MONTH,
+        CANNOT_HAVE_31_DAYS_IN_THIS_MONTH, CENTURY_NOT_VALID,
+        DAY_MUST_BE_A_NUMBER_BETWEEN_1_AND_31, DAY_MUST_BE_SUPPLIED, FIELD_ACCOUNT_STATUS,
+        FIELD_ADDRESS_LINE_1, FIELD_CASH_CREDIT_LIMIT, FIELD_CITY, FIELD_COUNTRY,
+        FIELD_CREDIT_LIMIT, FIELD_CURRENT_BALANCE, FIELD_CURRENT_CYCLE_CREDIT_LIMIT,
+        FIELD_CURRENT_CYCLE_DEBIT_LIMIT, FIELD_DATE_OF_BIRTH, FIELD_EFT_ACCOUNT_ID,
+        FIELD_EXPIRY_DATE, FIELD_FICO_SCORE, FIELD_FIRST_NAME, FIELD_LAST_NAME, FIELD_MIDDLE_NAME,
+        FIELD_OPEN_DATE, FIELD_PHONE_NUMBER_1, FIELD_PHONE_NUMBER_2, FIELD_PRIMARY_CARD_HOLDER,
+        FIELD_REISSUE_DATE, FIELD_SSN_4TH_AND_5TH_CHARS, FIELD_SSN_FIRST_3_CHARS,
+        FIELD_SSN_LAST_4_CHARS, FIELD_STATE, FIELD_ZIP, INVALID_ZIP_CODE_FOR_STATE,
+        IS_NOT_A_VALID_STATE_CODE, IS_NOT_VALID, LINE_NUMBER_CODE_CANNOT_BE_ZERO,
+        LINE_NUMBER_CODE_MUST_BE_A_4_DIGIT_NUMBER, LINE_NUMBER_CODE_MUST_BE_SUPPLIED,
+        MONTH_MUST_BE_A_NUMBER_BETWEEN_1_AND_12, MONTH_MUST_BE_SUPPLIED, MUST_BE_4_DIGIT_NUMBER,
+        MUST_BE_ALL_NUMERIC, MUST_BE_SUPPLIED, MUST_BE_Y_OR_N, MUST_NOT_BE_ZERO,
+        NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS, NOT_VALID_NORTH_AMERICA_AREA_CODE,
+        PREFIX_CODE_CANNOT_BE_ZERO, PREFIX_CODE_MUST_BE_A_3_DIGIT_NUMBER,
+        PREFIX_CODE_MUST_BE_SUPPLIED, SHOULD_BE_BETWEEN_300_AND_850,
+        SHOULD_NOT_BE_000_666_OR_BETWEEN_900_AND_999, YEAR_MUST_BE_SUPPLIED, date_edit_message,
+        field_edit_message, xref_not_found_message,
+    };
     use crate::numeric::{
         AccountGroupId, AccountId, Alnum, CardNumber, CustSsn, CustomerId, FicoScore, Money,
     };
     use crate::ports::PortError;
-    use crate::rules::test_support::{FakeStore, block_on};
+    use crate::rules::test_support::{FakeStore, block_on, version_key};
 
     /// The copybook the five lookup tables are transcribed from.
     const CSLKPCDY: &str = include_str!("../../../../app/cpy/CSLKPCDY.cpy");
@@ -2458,13 +2564,13 @@ mod tests {
             phone_2_line: text("8684"),
             eft_account_id: text("0053581756"),
             primary_card_holder: text("Y"),
-            version: record_version(&fixture_account(), &fixture_customer()),
+            version: token(),
         }
     }
 
     /// The fetched values with the three that fail their edits on the
     /// fixture corrected (FICO 274, phone 2 area 373, NC with zip 12) and
-    /// the status rejected, so `Account Status must be Y or N.` is the
+    /// the status rejected, so the status's [`MUST_BE_Y_OR_N`] text is the
     /// message and every later edit's text shows only in `fields`.
     fn clean_input() -> AccountUpdateInput {
         AccountUpdateInput {
@@ -2686,7 +2792,7 @@ mod tests {
             block_on(read_snapshot(&mut store, missing)),
             (
                 ErrorKind::NotFound,
-                "Account:99999999999 not found in Cross ref file.  Resp:000000013  Reas:0000",
+                &xref_not_found_message("99999999999", 13, 80),
                 Some("ACCTSID"),
             ),
             "V-COACTUPC-004",
@@ -2833,9 +2939,9 @@ mod tests {
     #[test]
     fn the_status_edit_supplies_the_first_message() {
         // V-COACTUPC-011, V-COACTUPC-012: the status is edited first.
-        let supplied = (ErrorKind::Empty, "Account Status must be supplied.");
-        let y_or_n = (ErrorKind::Invalid, "Account Status must be Y or N.");
-        for (status, (kind, message)) in [
+        let supplied = (ErrorKind::Empty, MUST_BE_SUPPLIED);
+        let y_or_n = (ErrorKind::Invalid, MUST_BE_Y_OR_N);
+        for (status, (kind, suffix)) in [
             ("", supplied),
             (" ", supplied),
             ("0", supplied),
@@ -2849,18 +2955,23 @@ mod tests {
             };
             assert_rejected(
                 validate(&snapshot(), &input, today()),
-                (kind, message, Some("ACSTTUS")),
+                (
+                    kind,
+                    &field_edit_message(FIELD_ACCOUNT_STATUS, suffix),
+                    Some("ACSTTUS"),
+                ),
                 status,
             );
         }
     }
 
     /// Asserts the rejection the open date `year`-`month`-`day` gives with a
-    /// valid status: the date is the first edit after the status.
+    /// valid status: the date is the first edit after the status, and its
+    /// text is the open date's `suffix` at `field`.
     fn assert_open_date(
         (year, month, day): (&str, &str, &str),
         kind: ErrorKind,
-        (message, field): (&str, &str),
+        (suffix, field): (&str, &str),
     ) {
         let input = AccountUpdateInput {
             active_status: "Y".to_owned(),
@@ -2869,73 +2980,53 @@ mod tests {
             open_day: day.to_owned(),
             ..clean_input()
         };
+        let message = date_edit_message(FIELD_OPEN_DATE, suffix);
         assert_rejected(
             validate(&snapshot(), &input, today()),
-            (kind, message, Some(field)),
-            message,
+            (kind, &message, Some(field)),
+            &message,
         );
     }
 
     #[test]
     fn the_open_date_edits_supply_the_first_message() {
         // V-COACTUPC-013 to V-COACTUPC-022.
-        for (date, message) in [
-            (
-                ("", "11", "20"),
-                ("Open Date : Year must be supplied.", "OPNYEAR"),
-            ),
-            (
-                ("2014", "", "20"),
-                ("Open Date : Month must be supplied.", "OPNMON"),
-            ),
-            (
-                ("2014", "11", ""),
-                ("Open Date : Day must be supplied.", "OPNDAY"),
-            ),
+        for (date, text) in [
+            (("", "11", "20"), (YEAR_MUST_BE_SUPPLIED, "OPNYEAR")),
+            (("2014", "", "20"), (MONTH_MUST_BE_SUPPLIED, "OPNMON")),
+            (("2014", "11", ""), (DAY_MUST_BE_SUPPLIED, "OPNDAY")),
         ] {
-            assert_open_date(date, ErrorKind::Empty, message);
+            assert_open_date(date, ErrorKind::Empty, text);
         }
-        for (date, message) in [
-            (
-                ("20A2", "11", "20"),
-                ("Open Date must be 4 digit number.", "OPNYEAR"),
-            ),
-            (
-                ("1899", "11", "20"),
-                ("Open Date : Century is not valid.", "OPNYEAR"),
-            ),
+        for (date, text) in [
+            (("20A2", "11", "20"), (MUST_BE_4_DIGIT_NUMBER, "OPNYEAR")),
+            (("1899", "11", "20"), (CENTURY_NOT_VALID, "OPNYEAR")),
             (
                 ("2014", "13", "20"),
-                (
-                    "Open Date: Month must be a number between 1 and 12.",
-                    "OPNMON",
-                ),
+                (MONTH_MUST_BE_A_NUMBER_BETWEEN_1_AND_12, "OPNMON"),
             ),
             (
                 ("2014", "11", "32"),
-                ("Open Date:day must be a number between 1 and 31.", "OPNDAY"),
+                (DAY_MUST_BE_A_NUMBER_BETWEEN_1_AND_31, "OPNDAY"),
             ),
             (
                 ("2014", "11", "ab"),
-                ("Open Date:day must be a number between 1 and 31.", "OPNDAY"),
+                (DAY_MUST_BE_A_NUMBER_BETWEEN_1_AND_31, "OPNDAY"),
             ),
             (
                 ("2024", "04", "31"),
-                ("Open Date:Cannot have 31 days in this month.", "OPNMON"),
+                (CANNOT_HAVE_31_DAYS_IN_THIS_MONTH, "OPNMON"),
             ),
             (
                 ("2024", "02", "30"),
-                ("Open Date:Cannot have 30 days in this month.", "OPNMON"),
+                (CANNOT_HAVE_30_DAYS_IN_THIS_MONTH, "OPNMON"),
             ),
             (
                 ("2023", "02", "29"),
-                (
-                    "Open Date:Not a leap year.Cannot have 29 days in this month.",
-                    "OPNYEAR",
-                ),
+                (NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS, "OPNYEAR"),
             ),
         ] {
-            assert_open_date(date, ErrorKind::Invalid, message);
+            assert_open_date(date, ErrorKind::Invalid, text);
         }
     }
 
@@ -2950,10 +3041,64 @@ mod tests {
             open_day: "29".to_owned(),
             ..clean_input()
         };
-        let leap = "Open Date:Not a leap year.Cannot have 29 days in this month.";
+        let leap = date_edit_message(FIELD_OPEN_DATE, NOT_A_LEAP_YEAR_CANNOT_HAVE_29_DAYS);
         assert_eq!(
             rejection(&input).fields,
-            entries(&[("OPNYEAR", leap), ("OPNMON", leap), ("OPNDAY", leap)])
+            entries(&[("OPNYEAR", &leap), ("OPNMON", &leap), ("OPNDAY", &leap)])
+        );
+    }
+
+    #[test]
+    fn a_blank_month_later_flagged_by_the_31_day_check_stays_empty() {
+        // V-COACTUPC-016, V-COACTUPC-029, V-COACTUPC-042, V-COACTUPC-069: the
+        // blank month's text keeps its kind Empty after the 31-day edit
+        // (P-CSUTLDPY-009) flags the month and the day not OK.
+        use super::{DateBmsFields, DateParts, Edits};
+
+        type Change = fn(&mut AccountUpdateInput);
+        let open: Change = |i| (i.open_month, i.open_day) = (String::new(), "31".to_owned());
+        let expiry: Change = |i| (i.expiry_month, i.expiry_day) = (String::new(), "31".to_owned());
+        let reissue: Change =
+            |i| (i.reissue_month, i.reissue_day) = (String::new(), "31".to_owned());
+        let birth: Change = |i| (i.dob_month, i.dob_day) = (String::new(), "31".to_owned());
+        for (label, fields, change) in [
+            (FIELD_OPEN_DATE, DateBmsFields::OPEN_DATE, open),
+            (FIELD_EXPIRY_DATE, DateBmsFields::EXPIRY_DATE, expiry),
+            (FIELD_REISSUE_DATE, DateBmsFields::REISSUE_DATE, reissue),
+            (FIELD_DATE_OF_BIRTH, DateBmsFields::DATE_OF_BIRTH, birth),
+        ] {
+            let text = messages::date_edit_message(label, messages::MONTH_MUST_BE_SUPPLIED);
+            let flagged = [(fields.month, text.as_str()), (fields.day, text.as_str())];
+            // The date's edit supplies the first message.
+            let mut edits = Edits::default();
+            let entered = DateParts::from_entered("2024", "", "31");
+            assert_eq!(edits.date(label, entered, fields), Ok(false), "{label}");
+            let error = edits.finish().expect_err(label);
+            assert_eq!(error.fields, entries(&flagged), "{label}");
+            assert_rejected::<()>(
+                Err(error),
+                (ErrorKind::Empty, text.as_str(), Some(fields.month)),
+                label,
+            );
+            // After the rejected status, the date's parts are listed in order.
+            assert_flagged(change, &flagged);
+        }
+        // The open date is the first edit after a valid status.
+        let input = AccountUpdateInput {
+            active_status: "Y".to_owned(),
+            open_month: String::new(),
+            open_day: "31".to_owned(),
+            ..clean_input()
+        };
+        let text = messages::date_edit_message(FIELD_OPEN_DATE, messages::MONTH_MUST_BE_SUPPLIED);
+        assert_rejected(
+            validate(&snapshot(), &input, today()),
+            (ErrorKind::Empty, text.as_str(), Some("OPNMON")),
+            "open date",
+        );
+        assert_eq!(
+            rejection(&input).fields,
+            entries(&[("OPNMON", text.as_str()), ("OPNDAY", text.as_str())])
         );
     }
 
@@ -2985,9 +3130,10 @@ mod tests {
         let mut input = clean_input();
         change(&mut input);
         let error = rejection(&input);
-        assert_eq!(error.message, "Account Status must be Y or N.");
+        let status = field_edit_message(FIELD_ACCOUNT_STATUS, MUST_BE_Y_OR_N);
+        assert_eq!(error.message, status);
         assert_eq!(error.kind, ErrorKind::Invalid);
-        let mut all = vec![("ACSTTUS", "Account Status must be Y or N.")];
+        let mut all = vec![("ACSTTUS", status.as_str())];
         all.extend_from_slice(expected);
         assert_eq!(error.fields, entries(&all), "{expected:?}");
     }
@@ -3002,51 +3148,73 @@ mod tests {
         // V-COACTUPC-024 to V-COACTUPC-055 (E-45: the 26-byte name is cut).
         assert_flagged(
             |i| i.credit_limit = String::new(),
-            &[("ACRDLIM", "Credit Limit must be supplied.")],
+            &[(
+                "ACRDLIM",
+                &field_edit_message(FIELD_CREDIT_LIMIT, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.credit_limit = "12A4".to_owned(),
-            &[("ACRDLIM", "Credit Limit is not valid")],
+            &[(
+                "ACRDLIM",
+                &field_edit_message(FIELD_CREDIT_LIMIT, IS_NOT_VALID),
+            )],
         );
         assert_flagged(
             |i| i.expiry_year = String::new(),
-            &[("EXPYEAR", "Expiry Date : Year must be supplied.")],
+            &[(
+                "EXPYEAR",
+                &date_edit_message(FIELD_EXPIRY_DATE, YEAR_MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.cash_credit_limit = "1.2.3".to_owned(),
-            &[("ACSHLIM", "Cash Credit Limit is not valid")],
+            &[(
+                "ACSHLIM",
+                &field_edit_message(FIELD_CASH_CREDIT_LIMIT, IS_NOT_VALID),
+            )],
         );
         assert_flagged(
             |i| i.reissue_day = "32".to_owned(),
             &[(
                 "RISDAY",
-                "Reissue Date:day must be a number between 1 and 31.",
+                &date_edit_message(FIELD_REISSUE_DATE, DAY_MUST_BE_A_NUMBER_BETWEEN_1_AND_31),
             )],
         );
+        let days_31 = date_edit_message(FIELD_REISSUE_DATE, CANNOT_HAVE_31_DAYS_IN_THIS_MONTH);
         assert_flagged(
             |i| (i.reissue_month, i.reissue_day) = ("04".to_owned(), "31".to_owned()),
-            &[
-                ("RISMON", "Reissue Date:Cannot have 31 days in this month."),
-                ("RISDAY", "Reissue Date:Cannot have 31 days in this month."),
-            ],
+            &[("RISMON", &days_31), ("RISDAY", &days_31)],
         );
         assert_flagged(
             |i| i.current_balance = String::new(),
-            &[("ACURBAL", "Current Balance must be supplied.")],
+            &[(
+                "ACURBAL",
+                &field_edit_message(FIELD_CURRENT_BALANCE, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.current_cycle_credit = "--1".to_owned(),
-            &[("ACRCYCR", "Current Cycle Credit Limi is not valid")],
+            &[(
+                "ACRCYCR",
+                &field_edit_message(FIELD_CURRENT_CYCLE_CREDIT_LIMIT, IS_NOT_VALID),
+            )],
         );
         assert_flagged(
             |i| i.current_cycle_debit = "*".to_owned(),
-            &[("ACRCYDB", "Current Cycle Debit Limit must be supplied.")],
+            &[(
+                "ACRCYDB",
+                &field_edit_message(FIELD_CURRENT_CYCLE_DEBIT_LIMIT, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| (i.credit_limit, i.city) = (String::new(), String::new()),
             &[
-                ("ACRDLIM", "Credit Limit must be supplied."),
-                ("ACSCITY", "City must be supplied."),
+                (
+                    "ACRDLIM",
+                    &field_edit_message(FIELD_CREDIT_LIMIT, MUST_BE_SUPPLIED),
+                ),
+                ("ACSCITY", &field_edit_message(FIELD_CITY, MUST_BE_SUPPLIED)),
             ],
         );
     }
@@ -3056,40 +3224,53 @@ mod tests {
         // V-COACTUPC-056 to V-COACTUPC-065, E-45.
         assert_flagged(
             |i| (i.ssn_part_1, i.ssn_part_2) = (String::new(), String::new()),
-            &[("ACTSSN1", "SSN: First 3 chars must be supplied.")],
+            &[(
+                "ACTSSN1",
+                &field_edit_message(FIELD_SSN_FIRST_3_CHARS, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.ssn_part_1 = "12A".to_owned(),
-            &[("ACTSSN1", "SSN: First 3 chars must be all numeric.")],
+            &[(
+                "ACTSSN1",
+                &field_edit_message(FIELD_SSN_FIRST_3_CHARS, MUST_BE_ALL_NUMERIC),
+            )],
         );
         assert_flagged(
             |i| i.ssn_part_1 = "000".to_owned(),
-            &[("ACTSSN1", "SSN: First 3 chars must not be zero.")],
+            &[(
+                "ACTSSN1",
+                &field_edit_message(FIELD_SSN_FIRST_3_CHARS, MUST_NOT_BE_ZERO),
+            )],
+        );
+        let area = field_edit_message(
+            FIELD_SSN_FIRST_3_CHARS,
+            SHOULD_NOT_BE_000_666_OR_BETWEEN_900_AND_999,
         );
         assert_flagged(
             |i| (i.ssn_part_1, i.ssn_part_2) = ("666".to_owned(), "AB".to_owned()),
             &[
+                ("ACTSSN1", &area),
                 (
-                    "ACTSSN1",
-                    "SSN: First 3 chars: should not be 000, 666, or between 900 and 999",
+                    "ACTSSN2",
+                    &field_edit_message(FIELD_SSN_4TH_AND_5TH_CHARS, MUST_BE_ALL_NUMERIC),
                 ),
-                ("ACTSSN2", "SSN 4th & 5th chars must be all numeric."),
             ],
         );
+        assert_flagged(|i| i.ssn_part_1 = "901".to_owned(), &[("ACTSSN1", &area)]);
         assert_flagged(
-            |i| i.ssn_part_1 = "901".to_owned(),
+            |i| i.ssn_part_2 = "00".to_owned(),
             &[(
-                "ACTSSN1",
-                "SSN: First 3 chars: should not be 000, 666, or between 900 and 999",
+                "ACTSSN2",
+                &field_edit_message(FIELD_SSN_4TH_AND_5TH_CHARS, MUST_NOT_BE_ZERO),
             )],
         );
         assert_flagged(
-            |i| i.ssn_part_2 = "00".to_owned(),
-            &[("ACTSSN2", "SSN 4th & 5th chars must not be zero.")],
-        );
-        assert_flagged(
             |i| i.ssn_part_3 = String::new(),
-            &[("ACTSSN3", "SSN Last 4 chars must be supplied.")],
+            &[(
+                "ACTSSN3",
+                &field_edit_message(FIELD_SSN_LAST_4_CHARS, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(|i| i.ssn_part_1 = "899".to_owned(), &[]);
     }
@@ -3097,31 +3278,47 @@ mod tests {
     #[test]
     fn the_birth_date_and_fico_score_edits_flag_their_fields() {
         // V-COACTUPC-066 to V-COACTUPC-081.
-        let future = "Date of Birth:cannot be in the future ";
-        let leap = "Date of Birth:Cannot have 31 days in this month.";
+        let future = date_edit_message(FIELD_DATE_OF_BIRTH, CANNOT_BE_IN_THE_FUTURE);
+        let leap = date_edit_message(FIELD_DATE_OF_BIRTH, CANNOT_HAVE_31_DAYS_IN_THIS_MONTH);
         assert_flagged(
             |i| i.dob_year = String::new(),
-            &[("DOBYEAR", "Date of Birth : Year must be supplied.")],
+            &[(
+                "DOBYEAR",
+                &date_edit_message(FIELD_DATE_OF_BIRTH, YEAR_MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| (i.dob_month, i.dob_day) = ("04".to_owned(), "31".to_owned()),
-            &[("DOBMON", leap), ("DOBDAY", leap)],
+            &[("DOBMON", &leap), ("DOBDAY", &leap)],
         );
         assert_flagged(
             |i| i.dob_year = "2099".to_owned(),
-            &[("DOBYEAR", future), ("DOBMON", future), ("DOBDAY", future)],
+            &[
+                ("DOBYEAR", &future),
+                ("DOBMON", &future),
+                ("DOBDAY", &future),
+            ],
         );
         assert_flagged(
             |i| i.fico_score = String::new(),
-            &[("ACSTFCO", "FICO Score must be supplied.")],
+            &[(
+                "ACSTFCO",
+                &field_edit_message(FIELD_FICO_SCORE, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.fico_score = "7O0".to_owned(),
-            &[("ACSTFCO", "FICO Score must be all numeric.")],
+            &[(
+                "ACSTFCO",
+                &field_edit_message(FIELD_FICO_SCORE, MUST_BE_ALL_NUMERIC),
+            )],
         );
         assert_flagged(
             |i| i.fico_score = "000".to_owned(),
-            &[("ACSTFCO", "FICO Score must not be zero.")],
+            &[(
+                "ACSTFCO",
+                &field_edit_message(FIELD_FICO_SCORE, MUST_NOT_BE_ZERO),
+            )],
         );
         for score in ["274", "299", "851"] {
             let mut input = clean_input();
@@ -3131,7 +3328,7 @@ mod tests {
                 error.fields.get(1),
                 Some(&FieldError {
                     field: "ACSTFCO",
-                    message: "FICO Score: should be between 300 and 850".to_owned(),
+                    message: field_edit_message(FIELD_FICO_SCORE, SHOULD_BE_BETWEEN_300_AND_850),
                 }),
                 "{score}"
             );
@@ -3145,75 +3342,106 @@ mod tests {
         // V-COACTUPC-082 to V-COACTUPC-097.
         assert_flagged(
             |i| i.first_name = String::new(),
-            &[("ACSFNAM", "First Name must be supplied.")],
+            &[(
+                "ACSFNAM",
+                &field_edit_message(FIELD_FIRST_NAME, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.first_name = "J0hn".to_owned(),
-            &[("ACSFNAM", "First Name can have alphabets only.")],
+            &[(
+                "ACSFNAM",
+                &field_edit_message(FIELD_FIRST_NAME, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
         assert_flagged(|i| i.middle_name = String::new(), &[]);
         assert_flagged(
             |i| i.middle_name = "M.".to_owned(),
-            &[("ACSMNAM", "Middle Name can have alphabets only.")],
+            &[(
+                "ACSMNAM",
+                &field_edit_message(FIELD_MIDDLE_NAME, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
         assert_flagged(
             |i| i.last_name = "  ".to_owned(),
-            &[("ACSLNAM", "Last Name must be supplied.")],
+            &[(
+                "ACSLNAM",
+                &field_edit_message(FIELD_LAST_NAME, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.last_name = "O'Neil".to_owned(),
-            &[("ACSLNAM", "Last Name can have alphabets only.")],
+            &[(
+                "ACSLNAM",
+                &field_edit_message(FIELD_LAST_NAME, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
         assert_flagged(
             |i| i.address_line_1 = String::new(),
-            &[("ACSADL1", "Address Line 1 must be supplied.")],
+            &[(
+                "ACSADL1",
+                &field_edit_message(FIELD_ADDRESS_LINE_1, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(|i| i.address_line_1 = "#12, Lane 4!".to_owned(), &[]);
         assert_flagged(
             |i| i.state = String::new(),
-            &[("ACSSTTE", "State must be supplied.")],
+            &[(
+                "ACSSTTE",
+                &field_edit_message(FIELD_STATE, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.state = "N1".to_owned(),
-            &[("ACSSTTE", "State can have alphabets only.")],
+            &[(
+                "ACSSTTE",
+                &field_edit_message(FIELD_STATE, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
-        assert_flagged(
-            |i| i.state = "nc".to_owned(),
-            &[("ACSSTTE", "State: is not a valid state code")],
-        );
-        assert_flagged(
-            |i| i.state = "XX".to_owned(),
-            &[("ACSSTTE", "State: is not a valid state code")],
-        );
+        let not_listed = field_edit_message(FIELD_STATE, IS_NOT_A_VALID_STATE_CODE);
+        assert_flagged(|i| i.state = "nc".to_owned(), &[("ACSSTTE", &not_listed)]);
+        assert_flagged(|i| i.state = "XX".to_owned(), &[("ACSSTTE", &not_listed)]);
         assert_flagged(
             |i| i.city = "Area 51".to_owned(),
-            &[("ACSCITY", "City can have alphabets only.")],
+            &[(
+                "ACSCITY",
+                &field_edit_message(FIELD_CITY, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
         assert_flagged(
             |i| i.country = String::new(),
-            &[("ACSCTRY", "Country must be supplied.")],
+            &[(
+                "ACSCTRY",
+                &field_edit_message(FIELD_COUNTRY, MUST_BE_SUPPLIED),
+            )],
         );
         assert_flagged(
             |i| i.country = "U5A".to_owned(),
-            &[("ACSCTRY", "Country can have alphabets only.")],
+            &[(
+                "ACSCTRY",
+                &field_edit_message(FIELD_COUNTRY, CAN_HAVE_ALPHABETS_ONLY),
+            )],
         );
     }
 
     #[test]
     fn the_zip_code_is_edited_alone_then_with_the_state() {
         // V-COACTUPC-091 to V-COACTUPC-093, V-COACTUPC-123, P-CSLKPCDY-005.
-        let combo = "Invalid zip code for state";
+        let combo = INVALID_ZIP_CODE_FOR_STATE;
         assert_flagged(
             |i| i.zip = String::new(),
-            &[("ACSZIPC", "Zip must be supplied.")],
+            &[("ACSZIPC", &field_edit_message(FIELD_ZIP, MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.zip = "12A45".to_owned(),
-            &[("ACSZIPC", "Zip must be all numeric.")],
+            &[(
+                "ACSZIPC",
+                &field_edit_message(FIELD_ZIP, MUST_BE_ALL_NUMERIC),
+            )],
         );
         assert_flagged(
             |i| i.zip = "00000".to_owned(),
-            &[("ACSZIPC", "Zip must not be zero.")],
+            &[("ACSZIPC", &field_edit_message(FIELD_ZIP, MUST_NOT_BE_ZERO))],
         );
         assert_flagged(
             |i| i.zip = "12546".to_owned(),
@@ -3222,7 +3450,7 @@ mod tests {
         assert_flagged(
             |i| (i.zip, i.city) = ("12546".to_owned(), String::new()),
             &[
-                ("ACSCITY", "City must be supplied."),
+                ("ACSCITY", &field_edit_message(FIELD_CITY, MUST_BE_SUPPLIED)),
                 ("ACSSTTE", combo),
                 ("ACSZIPC", combo),
             ],
@@ -3233,7 +3461,10 @@ mod tests {
         );
         assert_flagged(
             |i| (i.state, i.zip) = ("XX".to_owned(), "12546".to_owned()),
-            &[("ACSSTTE", "State: is not a valid state code")],
+            &[(
+                "ACSSTTE",
+                &field_edit_message(FIELD_STATE, IS_NOT_A_VALID_STATE_CODE),
+            )],
         );
     }
 
@@ -3245,103 +3476,92 @@ mod tests {
                 (String::new(), String::new(), String::new());
         };
         assert_flagged(blank, &[]);
+        let phone_1 = |suffix: &str| field_edit_message(FIELD_PHONE_NUMBER_1, suffix);
+        let phone_2 = |suffix: &str| field_edit_message(FIELD_PHONE_NUMBER_2, suffix);
         assert_flagged(
             |i| i.phone_1_area = String::new(),
-            &[("ACSPH1A", "Phone Number 1: Area code must be supplied.")],
+            &[("ACSPH1A", &phone_1(AREA_CODE_MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.phone_1_area = "9A8".to_owned(),
-            &[(
-                "ACSPH1A",
-                "Phone Number 1: Area code must be A 3 digit number.",
-            )],
+            &[("ACSPH1A", &phone_1(AREA_CODE_MUST_BE_A_3_DIGIT_NUMBER))],
         );
         assert_flagged(
             |i| i.phone_1_area = "000".to_owned(),
-            &[("ACSPH1A", "Phone Number 1: Area code cannot be zero")],
+            &[("ACSPH1A", &phone_1(AREA_CODE_CANNOT_BE_ZERO))],
         );
         assert_flagged(
             |i| i.phone_1_area = "373".to_owned(),
-            &[(
-                "ACSPH1A",
-                "Phone Number 1: Not valid North America general purpose area code",
-            )],
+            &[("ACSPH1A", &phone_1(NOT_VALID_NORTH_AMERICA_AREA_CODE))],
         );
         assert_flagged(
             |i| i.phone_1_prefix = String::new(),
-            &[("ACSPH1B", "Phone Number 1: Prefix code must be supplied.")],
+            &[("ACSPH1B", &phone_1(PREFIX_CODE_MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.phone_1_prefix = "1A9".to_owned(),
-            &[(
-                "ACSPH1B",
-                "Phone Number 1: Prefix code must be A 3 digit number.",
-            )],
+            &[("ACSPH1B", &phone_1(PREFIX_CODE_MUST_BE_A_3_DIGIT_NUMBER))],
         );
         assert_flagged(
             |i| i.phone_1_prefix = "000".to_owned(),
-            &[("ACSPH1B", "Phone Number 1: Prefix code cannot be zero")],
+            &[("ACSPH1B", &phone_1(PREFIX_CODE_CANNOT_BE_ZERO))],
         );
         assert_flagged(
             |i| i.phone_1_line = String::new(),
-            &[(
-                "ACSPH1C",
-                "Phone Number 1: Line number code must be supplied.",
-            )],
+            &[("ACSPH1C", &phone_1(LINE_NUMBER_CODE_MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.phone_1_line = "83A0".to_owned(),
             &[(
                 "ACSPH1C",
-                "Phone Number 1: Line number code must be A 4 digit number.",
+                &phone_1(LINE_NUMBER_CODE_MUST_BE_A_4_DIGIT_NUMBER),
             )],
         );
         assert_flagged(
             |i| i.phone_1_line = "0000".to_owned(),
-            &[("ACSPH1C", "Phone Number 1: Line number code cannot be zero")],
+            &[("ACSPH1C", &phone_1(LINE_NUMBER_CODE_CANNOT_BE_ZERO))],
         );
         assert_flagged(
             |i| (i.phone_2_area, i.phone_2_prefix) = (String::new(), String::new()),
             &[
-                ("ACSPH2A", "Phone Number 2: Area code must be supplied."),
-                ("ACSPH2B", "Phone Number 2: Prefix code must be supplied."),
+                ("ACSPH2A", &phone_2(AREA_CODE_MUST_BE_SUPPLIED)),
+                ("ACSPH2B", &phone_2(PREFIX_CODE_MUST_BE_SUPPLIED)),
             ],
         );
         assert_flagged(
             |i| i.phone_2_area = "373".to_owned(),
-            &[(
-                "ACSPH2A",
-                "Phone Number 2: Not valid North America general purpose area code",
-            )],
+            &[("ACSPH2A", &phone_2(NOT_VALID_NORTH_AMERICA_AREA_CODE))],
         );
     }
 
     #[test]
     fn the_eft_account_and_primary_holder_edits_flag_their_fields() {
         // V-COACTUPC-118 to V-COACTUPC-122.
+        let eft = |suffix: &str| field_edit_message(FIELD_EFT_ACCOUNT_ID, suffix);
+        let holder = |suffix: &str| field_edit_message(FIELD_PRIMARY_CARD_HOLDER, suffix);
         assert_flagged(
             |i| i.eft_account_id = String::new(),
-            &[("ACSEFTC", "EFT Account Id must be supplied.")],
+            &[("ACSEFTC", &eft(MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.eft_account_id = "12345678AB".to_owned(),
-            &[("ACSEFTC", "EFT Account Id must be all numeric.")],
+            &[("ACSEFTC", &eft(MUST_BE_ALL_NUMERIC))],
         );
         assert_flagged(
             |i| i.eft_account_id = "0000000000".to_owned(),
-            &[("ACSEFTC", "EFT Account Id must not be zero.")],
+            &[("ACSEFTC", &eft(MUST_NOT_BE_ZERO))],
         );
         assert_flagged(
             |i| i.primary_card_holder = String::new(),
-            &[("ACSPFLG", "Primary Card Holder must be supplied.")],
+            &[("ACSPFLG", &holder(MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.primary_card_holder = "0".to_owned(),
-            &[("ACSPFLG", "Primary Card Holder must be supplied.")],
+            &[("ACSPFLG", &holder(MUST_BE_SUPPLIED))],
         );
         assert_flagged(
             |i| i.primary_card_holder = "y".to_owned(),
-            &[("ACSPFLG", "Primary Card Holder must be Y or N.")],
+            &[("ACSPFLG", &holder(MUST_BE_Y_OR_N))],
         );
     }
 
@@ -3423,7 +3643,7 @@ mod tests {
         let token = |change: fn(&mut Account, &mut Customer)| {
             let (mut account, mut customer) = (fixture_account(), fixture_customer());
             change(&mut account, &mut customer);
-            record_version(&account, &customer)
+            record_version(&version_key(), &account, &customer).expect("a snapshot's token")
         };
         let base = token(|_, _| {});
         let same: [fn(&mut Account, &mut Customer); 7] = [
@@ -3462,7 +3682,8 @@ mod tests {
                 acct_group_id: AccountGroupId::move_from(text),
                 ..fixture_account()
             };
-            record_version(&account, &fixture_customer())
+            record_version(&version_key(), &account, &fixture_customer())
+                .expect("a snapshot's token")
         };
         assert_eq!(group("Gold"), group("GOLD"));
     }
@@ -3477,8 +3698,11 @@ mod tests {
         })
     }
 
+    /// The token of the fixture records under the tests' server key, as
+    /// `GET /accounts/{id}` issues it.
     fn token() -> super::VersionToken {
-        record_version(&fixture_account(), &fixture_customer())
+        record_version(&version_key(), &fixture_account(), &fixture_customer())
+            .expect("the fixture records' token")
     }
 
     #[test]
@@ -3488,6 +3712,7 @@ mod tests {
         let mut store = fixture_store();
         let updated = block_on(apply(
             &mut store,
+            &version_key(),
             account_id(),
             customer_id(),
             &token(),
@@ -3523,6 +3748,7 @@ mod tests {
         assert_rejected(
             block_on(apply(
                 &mut store,
+                &version_key(),
                 account_id(),
                 customer_id(),
                 &token(),
@@ -3682,7 +3908,13 @@ mod tests {
     fn an_update_without_a_change_reads_and_writes_nothing_more() {
         // V-COACTUPC-010.
         let mut store = fixture_store();
-        let updated = block_on(update(&mut store, &fetched_input(), today())).expect("no change");
+        let updated = block_on(update(
+            &mut store,
+            &version_key(),
+            &fetched_input(),
+            today(),
+        ))
+        .expect("no change");
         assert_eq!(
             updated.message,
             messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED
@@ -3698,6 +3930,7 @@ mod tests {
     #[test]
     fn an_update_stops_at_its_first_failing_step() {
         // V-COACTUPC-002, V-COACTUPC-012, E-26.
+        let status = field_edit_message(FIELD_ACCOUNT_STATUS, MUST_BE_Y_OR_N);
         let cases = [
             (
                 AccountUpdateInput {
@@ -3713,11 +3946,7 @@ mod tests {
             ),
             (
                 clean_input(),
-                (
-                    ErrorKind::Invalid,
-                    "Account Status must be Y or N.",
-                    Some("ACSTTUS"),
-                ),
+                (ErrorKind::Invalid, status.as_str(), Some("ACSTTUS")),
                 3,
             ),
             (
@@ -3732,7 +3961,7 @@ mod tests {
         for (index, (input, expected, reads)) in cases.into_iter().enumerate() {
             let mut store = fixture_store();
             assert_rejected(
-                block_on(update(&mut store, &input, today())),
+                block_on(update(&mut store, &version_key(), &input, today())),
                 expected,
                 &format!("case {index}"),
             );
