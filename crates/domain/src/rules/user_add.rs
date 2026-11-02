@@ -4,8 +4,25 @@
 //! `WRITE-USER-SEC-FILE` [app/cbl/COUSR01C.cbl:L238-274]: one `EVALUATE` of
 //! five empty-field edits in screen order, the `MOVE`s of the entered values
 //! into `SEC-USER-DATA` (`CSUSR01Y` [app/cpy/CSUSR01Y.cpy:L17-23]) and the
-//! `WRITE` with its three outcomes. [`edit`] is the `EVALUATE`; [`add`] runs it
-//! and then stores the user.
+//! `WRITE` with its three outcomes. [`edit`] is the `EVALUATE`.
+//!
+//! # Two steps
+//!
+//! The rule runs in two steps, because argon2id hashing is memory-hard and
+//! CPU-bound and never yields:
+//!
+//! 1. [`prepare`], synchronous and pure: [`edit`], the `MOVE`s and the hash of
+//!    the password. It reads no store and answers with a [`PreparedUser`].
+//! 2. [`add`], asynchronous: the `WRITE` of that record and the message its
+//!    outcome selects. It does no argon2 work.
+//!
+//! An asynchronous adapter runs [`prepare`] on a blocking thread pool, such as
+//! tokio's `spawn_blocking`, never inline on the executor, where one hash
+//! would hold a worker thread and delay every other task on it. The step
+//! needs no store, so the adapter runs it before it opens its unit of work,
+//! then awaits [`add`] inside that unit. [`add`] takes only a
+//! [`PreparedUser`], which only [`prepare`] yields, so no user is written
+//! without the edits.
 //!
 //! # Values as entered (E-20)
 //!
@@ -168,47 +185,98 @@ pub fn edit(input: &UserAddInput) -> Result<(), DomainError> {
     }
 }
 
-/// COUSR01C PROCESS-ENTER-KEY, WRITE-USER-SEC-FILE — P-COUSR01C-002,
-/// P-COUSR01C-003, P-COUSR01C-004, P-COUSR01C-005, V-COUSR01C-001 to
-/// V-COUSR01C-007
+/// A user that passed the edits, moved into `SEC-USER-DATA` with its password
+/// hashed, and not yet written: what [`prepare`] answers and [`add`] writes.
 ///
-/// Runs [`edit`]; when every field is entered, moves the fields into
-/// `SEC-USER-DATA` as entered [app/cbl/COUSR01C.cbl:L153-158] and `WRITE`s the
-/// record [app/cbl/COUSR01C.cbl:L238-274]. Each `MOVE` left-justifies its value
-/// in the `CSUSR01Y` field, pads it with spaces and cuts it on the right; no
-/// case is changed (E-20). The password is hashed by [`hash_stored_password`],
-/// which performs its `PIC X(08)` move.
+/// Its one field is owned, so the prepared user is `Send + 'static` and an
+/// asynchronous adapter can move it out of the blocking thread pool that
+/// prepared it. `Debug` shows the user ID only: neither the hash nor the other
+/// fields reach a log line or a tracing span.
+#[must_use = "the user is written only by `add`"]
+pub struct PreparedUser {
+    /// The record to write: every field as entered, moved to its `CSUSR01Y`
+    /// width, and the argon2id hash of the password.
+    user: UserSecurity,
+}
+
+impl fmt::Debug for PreparedUser {
+    /// The user ID only, ended with `..` to show that the rest of the record
+    /// is left out.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedUser")
+            .field("user_id", &self.user.sec_usr_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// COUSR01C PROCESS-ENTER-KEY — P-COUSR01C-002, P-COUSR01C-003,
+/// V-COUSR01C-001 to V-COUSR01C-005, V-COUSR01C-007
 ///
-/// On `NORMAL` the result carries the stored record and
-/// `User <id> has been added ...`, the ID cut at its first space
-/// (`DELIMITED BY SPACE`).
+/// The first step of an add by the ENTER key [app/cbl/COUSR01C.cbl:L115-160]:
+/// runs [`edit`]; when every field is entered, moves the fields into
+/// `SEC-USER-DATA` as entered [app/cbl/COUSR01C.cbl:L153-158]. Each `MOVE`
+/// left-justifies its value in the `CSUSR01Y` field, pads it with spaces and
+/// cuts it on the right; no case is changed (E-20). The password is hashed by
+/// [`hash_stored_password`], which performs its `PIC X(08)` move. [`add`]
+/// writes the [`PreparedUser`] this answers.
+///
+/// Synchronous: argon2id hashing is memory-hard and CPU-bound and never
+/// yields. The step reads no store, so an asynchronous adapter calls it on a
+/// blocking thread pool, such as tokio's `spawn_blocking`, before it opens its
+/// unit of work, never inline on the executor.
 ///
 /// # Errors
 ///
-/// - The [`edit`] error of the first blank field; nothing is hashed or
-///   written.
+/// - The [`edit`] error of the first blank field; nothing is hashed.
+/// - `Unable to Add User...` with field `FNAME`, an
+///   [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) error,
+///   when the password cannot be hashed.
+pub fn prepare(input: UserAddInput) -> Result<PreparedUser, DomainError> {
+    edit(&input)?;
+    let UserAddInput {
+        first_name,
+        last_name,
+        user_id,
+        password,
+        usr_type,
+    } = input;
+    // Hashing stands in for `MOVE PASSWDI TO SEC-USR-PWD`, which cannot fail
+    // in the COBOL. Its failure leaves the user unwritten, so it answers with
+    // the program's own message for a user that could not be added.
+    let password_hash = hash_stored_password(&password).map_err(|_| unable_to_add())?;
+    Ok(PreparedUser {
+        user: UserSecurity {
+            sec_usr_id: UserId::move_from(&user_id),
+            sec_usr_fname: Alnum::move_from(&first_name),
+            sec_usr_lname: Alnum::move_from(&last_name),
+            password_hash,
+            sec_usr_type: Alnum::move_from(&usr_type),
+        },
+    })
+}
+
+/// COUSR01C WRITE-USER-SEC-FILE — P-COUSR01C-004, P-COUSR01C-005,
+/// V-COUSR01C-006, V-COUSR01C-007
+///
+/// The second step of an add: `WRITE`s the record [`prepare`] built
+/// [app/cbl/COUSR01C.cbl:L238-274]. It does no argon2 work. On `NORMAL` the
+/// result carries the stored record and `User <id> has been added ...`, the
+/// ID cut at its first space (`DELIMITED BY SPACE`).
+///
+/// # Errors
+///
 /// - `User ID already exist...` with field `USERID`, an
 ///   [`ErrorKind::Duplicate`](crate::error::ErrorKind::Duplicate) error, when
 ///   the write answers `DUPKEY` or `DUPREC` ([`PortError::Duplicate`]).
 /// - `Unable to Add User...` with field `FNAME`, an
 ///   [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) error, for
-///   any other write outcome, and when the password cannot be hashed.
+///   any other write outcome.
 pub async fn add<S: UserStore>(
     store: &mut S,
-    input: UserAddInput,
+    user: PreparedUser,
 ) -> Result<UserAdded, DomainError> {
-    edit(&input)?;
-    // Hashing stands in for `MOVE PASSWDI TO SEC-USR-PWD`, which cannot fail
-    // in the COBOL. Its failure leaves the user unwritten, so it answers with
-    // the program's own message for a user that could not be added.
-    let password_hash = hash_stored_password(&input.password).map_err(|_| unable_to_add())?;
-    let user = UserSecurity {
-        sec_usr_id: UserId::move_from(&input.user_id),
-        sec_usr_fname: Alnum::move_from(&input.first_name),
-        sec_usr_lname: Alnum::move_from(&input.last_name),
-        password_hash,
-        sec_usr_type: Alnum::move_from(&input.usr_type),
-    };
+    let PreparedUser { user } = user;
     match store.insert_user(user.clone()).await {
         Ok(()) => {
             let message = user_added_message(&user.sec_usr_id.as_alnum().as_text());
@@ -235,7 +303,9 @@ fn unable_to_add() -> DomainError {
 
 #[cfg(test)]
 mod tests {
-    use super::{UserAddInput, UserAdded, add, edit};
+    use std::thread;
+
+    use super::{PreparedUser, UserAddInput, UserAdded, add, edit, prepare};
     use crate::auth::{verify_as_entered, verify_signon};
     use crate::entities::UserSecurity;
     use crate::error::{DomainError, ErrorKind};
@@ -289,8 +359,29 @@ mod tests {
         input
     }
 
+    /// Adds `input`: both steps, the preparation and then the write.
+    fn run(store: &mut FakeStore, input: UserAddInput) -> Result<UserAdded, DomainError> {
+        let user = prepare(input)?;
+        block_on(add(store, user))
+    }
+
     fn added(store: &mut FakeStore, input: UserAddInput) -> UserAdded {
-        block_on(add(store, input)).expect("the user is added")
+        run(store, input).expect("the user is added")
+    }
+
+    /// What a preparation answers, once its hash is checked to verify
+    /// `password` as entered and then cleared: two hashes of one password
+    /// never match byte for byte, because each draws its own salt.
+    fn prepared_outcome(
+        result: Result<PreparedUser, DomainError>,
+        password: &str,
+    ) -> Result<UserSecurity, DomainError> {
+        result.map(|PreparedUser { mut user }| {
+            let verified = verify_as_entered(password, &user.password_hash);
+            assert_eq!(verified, Ok(true), "the hash of {password:?} as entered");
+            user.password_hash.clear();
+            user
+        })
     }
 
     #[test]
@@ -311,7 +402,7 @@ mod tests {
                     .fold(new_user(), |input, later| with_field(input, later, &blank));
                 let mut store = FakeStore::default();
 
-                let error = block_on(add(&mut store, input.clone())).expect_err("a blank field");
+                let error = run(&mut store, input.clone()).expect_err("a blank field");
 
                 assert_eq!(error, DomainError::empty(message).with_field(field));
                 assert_eq!(error.kind, ErrorKind::Empty);
@@ -414,7 +505,7 @@ mod tests {
             ..new_user()
         };
 
-        let error = block_on(add(&mut store, input)).expect_err("a duplicate key");
+        let error = run(&mut store, input).expect_err("a duplicate key");
 
         assert_eq!(
             error,
@@ -441,7 +532,7 @@ mod tests {
             let mut store = FakeStore::default();
             store.fail_next("insert_user", failure.clone());
 
-            let error = block_on(add(&mut store, new_user())).expect_err("a failed write");
+            let error = run(&mut store, new_user()).expect_err("a failed write");
 
             assert_eq!(
                 error,
@@ -455,16 +546,72 @@ mod tests {
     }
 
     #[test]
+    fn the_write_step_stores_the_prepared_record_as_is() {
+        // P-COUSR01C-004: the WRITE is the step's only store call, and it
+        // stores the hash the preparation computed, so it does no argon2 work.
+        let prepared = prepare(new_user()).expect("every field is entered");
+        let expected = prepared.user.clone();
+        let mut store = FakeStore::default();
+
+        let result = block_on(add(&mut store, prepared)).expect("the user is added");
+
+        assert_eq!(store.calls, ["insert_user"]);
+        assert_eq!(result.user, expected, "the prepared hash is stored as is");
+        assert_eq!(store.users.get(&expected.sec_usr_id), Some(&expected));
+    }
+
+    #[test]
+    fn a_preparation_on_another_thread_answers_as_inline() {
+        // An asynchronous adapter prepares on a blocking thread pool. The
+        // bounds of `thread::spawn` check that the input and the prepared user
+        // are Send + 'static, and the answer there is the one given inline.
+        let cases = [
+            new_user(),
+            UserAddInput {
+                user_id: "test0002".to_owned(),
+                password: "pass1234".to_owned(),
+                ..new_user()
+            },
+            with_field(new_user(), 3, ""),
+        ];
+        for input in cases {
+            let case = format!("{input:?}");
+            let password = input.password.clone();
+            let inline = prepared_outcome(prepare(input.clone()), &password);
+            let elsewhere = thread::spawn(move || prepare(input))
+                .join()
+                .unwrap_or_else(|_| panic!("{case}: the preparing thread panicked"));
+            assert_eq!(prepared_outcome(elsewhere, &password), inline, "{case}");
+        }
+    }
+
+    #[test]
     fn add_is_send_for_a_send_store() {
-        // The API awaits the rule on the multi-threaded runtime.
+        // The API awaits the write on the multi-threaded runtime.
         fn assert_send<T: Send>(value: T) -> T {
             value
         }
 
         let mut store = FakeStore::default();
-        let result = block_on(assert_send(add(&mut store, new_user())));
+        let user = prepare(new_user()).expect("every field is entered");
+        let result = block_on(assert_send(add(&mut store, user)));
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn debug_of_the_prepared_user_omits_the_password_and_the_hash() {
+        let prepared = prepare(new_user()).expect("every field is entered");
+        let rendered = format!("{prepared:?}");
+        let user_id = UserId::move_from("TEST0001");
+
+        assert_eq!(
+            rendered,
+            format!("PreparedUser {{ user_id: {user_id:?}, .. }}")
+        );
+        for hidden in ["Pass1234", "argon2", prepared.user.password_hash.as_str()] {
+            assert!(!rendered.contains(hidden), "{hidden} in {rendered}");
+        }
     }
 
     #[test]

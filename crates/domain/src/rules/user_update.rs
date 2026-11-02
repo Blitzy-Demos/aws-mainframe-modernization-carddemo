@@ -1,9 +1,10 @@
 //! `COUSR02C` (CU02): show a user for update and rewrite it, served as
 //! `GET /admin/users/{id}` ([`lookup`], the ENTER fetch) and
-//! `PUT /admin/users/{id}` ([`update`], PF5) to administrators only.
+//! `PUT /admin/users/{id}` ([`update`], [`UserUpdateCheck::compare`] and
+//! [`rewrite`], PF5) to administrators only.
 //!
 //! [`lookup`] ports `PROCESS-ENTER-KEY` [app/cbl/COUSR02C.cbl:L143-172] with
-//! `READ-USER-SEC-FILE` [app/cbl/COUSR02C.cbl:L320-353]; [`update`] ports
+//! `READ-USER-SEC-FILE` [app/cbl/COUSR02C.cbl:L320-353]; the update steps port
 //! `UPDATE-USER-INFO` [app/cbl/COUSR02C.cbl:L177-245] with the same read and
 //! `UPDATE-USER-SEC-FILE` [app/cbl/COUSR02C.cbl:L358-390]. The record is
 //! `CSUSR01Y` `SEC-USER-DATA` [app/cpy/CSUSR01Y.cpy:L17-23]; the edited
@@ -11,16 +12,42 @@
 //! `LNAMEI X(20)`, `PASSWDI X(8)` and `USRTYPEI X(1)` [app/cpy-bms/COUSR02.CPY],
 //! whose BMS names the errors carry.
 //!
+//! # Three update steps
+//!
+//! An update runs in three steps, because argon2id verification and hashing
+//! are memory-hard and CPU-bound and never yield:
+//!
+//! 1. [`update`], asynchronous: the empty checks and the `READ … UPDATE`. It
+//!    does no argon2 work and answers with a [`UserUpdateCheck`] holding the
+//!    record read and the fields entered.
+//! 2. [`UserUpdateCheck::compare`], synchronous and pure: the field compare,
+//!    the password verification and, for a changed password, its hash. It
+//!    answers with a [`UserRewrite`].
+//! 3. [`rewrite`], asynchronous: the `REWRITE` when a field changed, or
+//!    [`PLEASE_MODIFY_TO_UPDATE`] when none did. It does no argon2 work.
+//!
+//! The adapter awaits [`update`] inside its unit of work and keeps that unit
+//! open through the compare, so the row the `READ … UPDATE` locked stays
+//! locked, as the COBOL holds it until its `REWRITE`. An asynchronous adapter
+//! runs [`UserUpdateCheck::compare`] on a blocking thread pool, such as tokio's
+//! `spawn_blocking`, never inline on the executor, where one argon2 run would
+//! hold a worker thread and delay every other task on it. When the compare
+//! fails, nothing has been written: the adapter rolls its unit of work back
+//! and answers the error. Otherwise it awaits [`rewrite`] in the same unit.
+//! [`rewrite`] takes only a [`UserRewrite`], which only the compare yields, so
+//! no record is rewritten without it.
+//!
 //! # The password (E-21, E-20)
 //!
 //! The COBOL moves the stored `SEC-USR-PWD` into the edit field when it shows a
 //! user [app/cbl/COUSR02C.cbl:L166-170] and counts the password as changed only
 //! when the field then differs from it [app/cbl/COUSR02C.cbl:L227-230]. A
 //! stored argon2id hash cannot be shown, so [`lookup`]'s record goes out
-//! without its password, and in [`update`] an absent password stands for that
-//! reloaded value: unchanged, never re-hashed. A password that is present goes
-//! through the empty edit, then is compared with the stored value by
-//! [`verify_as_entered`], case kept; a different one is stored with
+//! without its password, and in an update an absent password stands for that
+//! reloaded value: unchanged, never verified or re-hashed. A password that is
+//! present goes through the empty edit of [`update`], then
+//! [`UserUpdateCheck::compare`] compares it with the stored value by
+//! [`verify_as_entered`], case kept, and stores a different one with
 //! [`hash_stored_password`]. The one remaining difference, the current password
 //! never displayed, is the known difference P-COUSR02C-007 records.
 //!
@@ -123,6 +150,88 @@ pub enum UserUpdateOutcome {
         /// [`PLEASE_MODIFY_TO_UPDATE`].
         message: &'static str,
     },
+}
+
+/// An update whose fields passed the empty checks and whose user was read for
+/// update, still to be compared: what [`update`] answers and
+/// [`UserUpdateCheck::compare`] completes.
+///
+/// Every field is owned, so the check is `Send + 'static` and an asynchronous
+/// adapter can move it into a blocking thread pool to compare it. `Debug`
+/// shows the user ID only: neither the password entered nor the stored hash
+/// reaches a log line or a tracing span.
+#[must_use = "the fields are compared only by `UserUpdateCheck::compare`"]
+pub struct UserUpdateCheck {
+    /// The `USRSEC` record read for update by the entered `USRIDINI`.
+    record: UserSecurity,
+    /// The `COUSR2AI` fields PF5 sent, the password included.
+    input: UserUpdateInput,
+}
+
+impl fmt::Debug for UserUpdateCheck {
+    /// The user ID read only, ended with `..` to show that the fields entered
+    /// and the rest of the record are left out.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserUpdateCheck")
+            .field("user_id", &self.record.sec_usr_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl UserUpdateCheck {
+    /// COUSR02C UPDATE-USER-INFO — P-COUSR02C-005, P-COUSR02C-007,
+    /// V-COUSR02C-010, V-COUSR02C-012.
+    ///
+    /// The second step of an update: compares each entered field with the
+    /// record read and moves every one that differs into it
+    /// [app/cbl/COUSR02C.cbl:L219-234], setting `USR-MODIFIED-YES`. A present
+    /// password is verified against the stored hash, case kept, and hashed
+    /// when it differs; an absent one is neither verified nor re-hashed
+    /// (E-21). [`rewrite`] writes the [`UserRewrite`] this answers.
+    ///
+    /// Synchronous: argon2id verification and hashing are memory-hard and
+    /// CPU-bound and never yield. An asynchronous adapter calls this on a
+    /// blocking thread pool, such as tokio's `spawn_blocking`, never inline on
+    /// the executor, while it keeps the unit of work of [`update`] open with
+    /// the row read for update still locked. On an error it rolls that unit
+    /// back; nothing has been written.
+    ///
+    /// # Errors
+    ///
+    /// [`UNABLE_TO_UPDATE_USER`], kind `Unexpected`, field `FNAME`, when the
+    /// stored hash cannot be verified or the new password cannot be hashed
+    /// (V-COUSR02C-012).
+    pub fn compare(self) -> Result<UserRewrite, DomainError> {
+        let Self { mut record, input } = self;
+        let modified = apply_changes(&mut record, &input)?;
+        Ok(UserRewrite { record, modified })
+    }
+}
+
+/// A compared update, still to be written: what
+/// [`UserUpdateCheck::compare`] answers and [`rewrite`] completes.
+///
+/// `Debug` shows the user ID and whether a field changed: the stored hash
+/// never reaches a log line or a tracing span.
+#[must_use = "the record is rewritten only by `rewrite`"]
+pub struct UserRewrite {
+    /// The record read for update, every changed field moved into it.
+    record: UserSecurity,
+    /// `USR-MODIFIED-YES`: whether any entered field differed.
+    modified: bool,
+}
+
+impl fmt::Debug for UserRewrite {
+    /// The user ID and the modified flag, ended with `..` to show that the
+    /// rest of the record is left out.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("UserRewrite")
+            .field("user_id", &self.record.sec_usr_id)
+            .field("modified", &self.modified)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The COBOL condition `= SPACES OR LOW-VALUES` on the `X(width)` field that
@@ -272,42 +381,70 @@ fn apply_changes(record: &mut UserSecurity, input: &UserUpdateInput) -> Result<b
     Ok(modified)
 }
 
-/// COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —
-/// P-COUSR02C-004, P-COUSR02C-005, P-COUSR02C-006, P-COUSR02C-007,
+/// COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE — P-COUSR02C-004,
 /// V-COUSR02C-004, V-COUSR02C-005, V-COUSR02C-006, V-COUSR02C-007,
-/// V-COUSR02C-008, V-COUSR02C-009, V-COUSR02C-010, V-COUSR02C-011,
-/// V-COUSR02C-012.
+/// V-COUSR02C-008, V-COUSR02C-009.
 ///
-/// Runs the empty checks, reads the user for update, compares and moves the
-/// changed fields, and rewrites the record when one changed
-/// [app/cbl/COUSR02C.cbl:L177-245] [app/cbl/COUSR02C.cbl:L358-390]. The rule
-/// commits nothing: the adapter's caller owns the transaction.
+/// The first step of an update by PF5 [app/cbl/COUSR02C.cbl:L177-213]: runs
+/// the empty checks, then reads the user for update with `READ … UPDATE`
+/// [app/cbl/COUSR02C.cbl:L320-353]. The record read and the fields entered
+/// come back as a [`UserUpdateCheck`], uncompared: this function does no
+/// argon2 work. The adapter awaits it inside its unit of work, keeps that unit
+/// open, and runs [`UserUpdateCheck::compare`] where blocking work belongs —
+/// for an asynchronous adapter a blocking thread pool, such as tokio's
+/// `spawn_blocking`, never inline on the executor. The rule commits nothing:
+/// the adapter's caller owns the transaction.
 ///
 /// # Errors
 ///
 /// - The empty-field message of the first blank field, kind `Empty`, on its
-///   BMS field (V-COUSR02C-004 to V-COUSR02C-008).
+///   BMS field (V-COUSR02C-004 to V-COUSR02C-008); nothing is read.
 /// - [`UNABLE_TO_UPDATE_USER`], kind `Unexpected`, field `FNAME`, when the
-///   read for update fails, unknown user included (V-COUSR02C-009, E-46),
-///   when the password cannot be verified or hashed, or when the `REWRITE`
-///   fails other than `NOTFND` (V-COUSR02C-012).
-/// - [`USER_ID_NOT_FOUND`], kind `NotFound`, field `USRIDIN`, when the
-///   `REWRITE` finds no user (V-COUSR02C-011).
+///   read for update fails, unknown user included (V-COUSR02C-009, E-46).
+///
+/// A password that cannot be verified or hashed is answered by
+/// [`UserUpdateCheck::compare`], and a failed `REWRITE` by [`rewrite`].
 pub async fn update<S: UserStore>(
     store: &mut S,
     input: UserUpdateInput,
-) -> Result<UserUpdateOutcome, DomainError> {
+) -> Result<UserUpdateCheck, DomainError> {
     edit(&input)?;
     // A failed READ UPDATE is not answered with the read's own text, as the
     // fetch answers it: COUSR02C sets that text, still compares against the
     // unread record, finds the entered fields different and issues a REWRITE
     // with no READ UPDATE before it, whose INVREQ replaces the text with
     // 'Unable to Update User...' (E-46, V-COUSR02C-009). Nothing is written.
-    let mut record = store
+    let record = store
         .read_user_for_update(UserId::move_from(&input.user_id))
         .await
         .map_err(|_| unable_to_update())?;
-    if !apply_changes(&mut record, &input)? {
+    Ok(UserUpdateCheck { record, input })
+}
+
+/// COUSR02C UPDATE-USER-INFO, UPDATE-USER-SEC-FILE — P-COUSR02C-005,
+/// P-COUSR02C-006, V-COUSR02C-010, V-COUSR02C-011, V-COUSR02C-012.
+///
+/// The third step of an update: when no field differed, nothing is written
+/// and the program shows [`PLEASE_MODIFY_TO_UPDATE`]
+/// [app/cbl/COUSR02C.cbl:L236-243]; otherwise the record
+/// [`UserUpdateCheck::compare`] changed is rewritten
+/// [app/cbl/COUSR02C.cbl:L358-390], and `NORMAL` answers
+/// `User <id> has been updated ...`, the ID cut at its first space. It does no
+/// argon2 work, and it commits nothing: the adapter's caller owns the
+/// transaction.
+///
+/// # Errors
+///
+/// - [`USER_ID_NOT_FOUND`], kind `NotFound`, field `USRIDIN`, when the
+///   `REWRITE` finds no user (V-COUSR02C-011).
+/// - [`UNABLE_TO_UPDATE_USER`], kind `Unexpected`, field `FNAME`, when the
+///   `REWRITE` fails otherwise (V-COUSR02C-012).
+pub async fn rewrite<S: UserStore>(
+    store: &mut S,
+    rewrite: UserRewrite,
+) -> Result<UserUpdateOutcome, DomainError> {
+    let UserRewrite { record, modified } = rewrite;
+    if !modified {
         return Ok(UserUpdateOutcome::NotModified {
             message: PLEASE_MODIFY_TO_UPDATE,
         });
@@ -335,8 +472,11 @@ pub async fn update<S: UserStore>(
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
+    use std::thread;
 
-    use super::{UserUpdateInput, UserUpdateOutcome, lookup, update};
+    use super::{
+        UserRewrite, UserUpdateCheck, UserUpdateInput, UserUpdateOutcome, lookup, rewrite, update,
+    };
     use crate::auth::{hash_stored_password, verify_as_entered};
     use crate::entities::UserSecurity;
     use crate::error::{DomainError, ErrorKind};
@@ -419,6 +559,49 @@ mod tests {
 
     fn stored(store: &FakeStore, id: &str) -> Option<UserSecurity> {
         store.users.get(&user_id(id)).cloned()
+    }
+
+    /// The update's first step only: the empty checks and the read for
+    /// update.
+    fn check(
+        store: &mut FakeStore,
+        input: UserUpdateInput,
+    ) -> Result<UserUpdateCheck, DomainError> {
+        block_on(update(store, input))
+    }
+
+    /// Updates with `input`: all three steps, the read, the compare and the
+    /// rewrite.
+    fn run(
+        store: &mut FakeStore,
+        input: UserUpdateInput,
+    ) -> Result<UserUpdateOutcome, DomainError> {
+        let rewritten = check(store, input)?.compare()?;
+        block_on(rewrite(store, rewritten))
+    }
+
+    /// What a compare answers, a re-hashed password replaced by a marker once
+    /// it is checked to verify `entered`: each hash draws its own salt, so two
+    /// runs never store the same bytes. A hash kept from `stored` is kept as
+    /// it is.
+    fn compared(
+        result: Result<UserRewrite, DomainError>,
+        stored: &UserSecurity,
+        entered: Option<&str>,
+    ) -> Result<(UserSecurity, bool), DomainError> {
+        result.map(|rewritten| {
+            let UserRewrite {
+                mut record,
+                modified,
+            } = rewritten;
+            if record.password_hash != stored.password_hash {
+                let entered = entered.expect("only an entered password is re-hashed");
+                let verified = verify_as_entered(entered, &record.password_hash);
+                assert_eq!(verified, Ok(true), "the new hash of {entered:?}");
+                "re-hashed".clone_into(&mut record.password_hash);
+            }
+            (record, modified)
+        })
     }
 
     /// The updated record and message, or a panic naming the outcome.
@@ -565,7 +748,7 @@ mod tests {
         for (change, message, field) in cases {
             let mut store = seeded();
             let input = input_with(change);
-            let result = block_on(update(&mut store, input.clone()));
+            let result = run(&mut store, input.clone());
             assert_eq!(
                 result,
                 Err(error(ErrorKind::Empty, message, field)),
@@ -589,7 +772,7 @@ mod tests {
         ];
         for input in inputs {
             let mut store = seeded();
-            let result = block_on(update(&mut store, input.clone()));
+            let result = run(&mut store, input.clone());
             assert_eq!(result, Ok(not_modified()), "{input:?}");
             assert_eq!(store.calls, ["read_user_for_update"], "no write");
             assert_eq!(stored(&store, "USER0001"), Some(user0001()));
@@ -601,7 +784,7 @@ mod tests {
         // P-COUSR02C-005, P-COUSR02C-006, E-21: not re-hashed.
         let mut store = seeded();
         let input = input_with(|input| input.first_name = "LARRY".to_owned());
-        let (user, message) = updated(block_on(update(&mut store, input)));
+        let (user, message) = updated(run(&mut store, input));
 
         assert_eq!(message, user_updated_message("USER0001"));
         assert_eq!(user.sec_usr_fname, Alnum::move_from("LARRY"));
@@ -615,14 +798,14 @@ mod tests {
         // P-COUSR02C-005, E-21: equal by argon2 verification, hash kept.
         let mut store = seeded();
         let input = input_with(|input| input.password = Some(SEED_PASSWORD.to_owned()));
-        assert_eq!(block_on(update(&mut store, input)), Ok(not_modified()));
+        assert_eq!(run(&mut store, input), Ok(not_modified()));
         assert_eq!(stored(&store, "USER0001"), Some(user0001()));
 
         let input = input_with(|input| {
             input.password = Some(SEED_PASSWORD.to_owned());
             input.last_name = "THOMSON".to_owned();
         });
-        let (user, _) = updated(block_on(update(&mut store, input)));
+        let (user, _) = updated(run(&mut store, input));
         assert_eq!(user.sec_usr_lname, Alnum::move_from("THOMSON"));
         assert_eq!(user.password_hash, seed_hash(), "hash not replaced");
     }
@@ -632,7 +815,7 @@ mod tests {
         // P-COUSR02C-005, E-21, E-20: stored as entered, case unchanged.
         let mut store = seeded();
         let input = input_with(|input| input.password = Some("pass1234".to_owned()));
-        let (user, message) = updated(block_on(update(&mut store, input)));
+        let (user, message) = updated(run(&mut store, input));
 
         assert_eq!(message, user_updated_message("USER0001"));
         assert_ne!(user.password_hash, seed_hash());
@@ -663,7 +846,7 @@ mod tests {
         for (change, expect) in cases {
             let mut store = seeded();
             let input = input_with(change);
-            let (user, _) = updated(block_on(update(&mut store, input.clone())));
+            let (user, _) = updated(run(&mut store, input.clone()));
             let mut expected = user0001();
             expect(&mut expected);
             assert_eq!(user, expected, "{input:?}");
@@ -683,7 +866,7 @@ mod tests {
             input.user_id = "ADMIN1".to_owned();
             input.usr_type = "A".to_owned();
         });
-        let (_, message) = updated(block_on(update(&mut store, input)));
+        let (_, message) = updated(run(&mut store, input));
         assert_eq!(message, user_updated_message("ADMIN1"));
     }
 
@@ -709,7 +892,7 @@ mod tests {
                 first_name: "NEW".to_owned(),
                 ..unchanged_input()
             };
-            let result = block_on(update(&mut store, input));
+            let result = run(&mut store, input);
             assert_eq!(result, Err(unexpected.clone()), "{id} {failure:?}");
             assert_eq!(store.calls, ["read_user_for_update"], "{id} {failure:?}");
             assert_eq!(stored(&store, "USER0001"), Some(user0001()));
@@ -735,7 +918,7 @@ mod tests {
             let mut store = seeded();
             store.fail_next("update_user", failure.clone());
             let input = input_with(|input| input.first_name = "LARRY".to_owned());
-            let result = block_on(update(&mut store, input));
+            let result = run(&mut store, input);
             assert_eq!(result, Err(expected), "{failure:?}");
             assert_eq!(store.calls, ["read_user_for_update", "update_user"]);
             assert_eq!(stored(&store, "USER0001"), Some(user0001()));
@@ -752,7 +935,7 @@ mod tests {
         let mut store = FakeStore::default().with_user(broken.clone());
         let input = input_with(|input| input.password = Some(SEED_PASSWORD.to_owned()));
         assert_eq!(
-            block_on(update(&mut store, input)),
+            run(&mut store, input),
             Err(error(ErrorKind::Unexpected, UNABLE_TO_UPDATE_USER, "FNAME"))
         );
         assert_eq!(store.calls, ["read_user_for_update"]);
@@ -760,7 +943,7 @@ mod tests {
         // E-21: an absent password is never verified, so the name change goes
         // through with the stored value untouched.
         let input = input_with(|input| input.first_name = "LARRY".to_owned());
-        let (user, _) = updated(block_on(update(&mut store, input)));
+        let (user, _) = updated(run(&mut store, input));
         assert_eq!(user.password_hash, UNUSABLE_HASH);
     }
 
@@ -775,6 +958,108 @@ mod tests {
     }
 
     #[test]
+    fn the_read_step_leaves_the_password_uncompared() {
+        // V-COUSR02C-012 before the REWRITE: the read step answers with a
+        // check even though the stored hash is unusable, so it verified
+        // nothing; only the compare rejects, and nothing is rewritten.
+        let broken = UserSecurity {
+            password_hash: UNUSABLE_HASH.to_owned(),
+            ..user0001()
+        };
+        let mut store = FakeStore::default().with_user(broken.clone());
+        let input = input_with(|input| input.password = Some(SEED_PASSWORD.to_owned()));
+
+        let pending = check(&mut store, input)
+            .unwrap_or_else(|error| panic!("USER0001 is read for update: {error:?}"));
+
+        assert_eq!(store.calls, ["read_user_for_update"]);
+        assert_eq!(
+            pending.compare().err(),
+            Some(error(ErrorKind::Unexpected, UNABLE_TO_UPDATE_USER, "FNAME"))
+        );
+        assert_eq!(store.calls, ["read_user_for_update"], "no write");
+        assert_eq!(stored(&store, "USER0001"), Some(broken));
+    }
+
+    #[test]
+    fn a_compare_on_another_thread_answers_as_inline() {
+        // An asynchronous adapter compares on a blocking thread pool. The
+        // bounds of `thread::spawn` check that the check and the rewrite are
+        // Send + 'static, and the answer there is the one given inline.
+        let broken = UserSecurity {
+            password_hash: UNUSABLE_HASH.to_owned(),
+            ..user0001()
+        };
+        let cases: [(UserSecurity, InputChange); 4] = [
+            (user0001(), |input| input.first_name = "LARRY".to_owned()),
+            (user0001(), |input| {
+                input.password = Some(SEED_PASSWORD.to_owned());
+            }),
+            (user0001(), |input| {
+                input.password = Some("pass1234".to_owned());
+            }),
+            (broken, |input| {
+                input.password = Some(SEED_PASSWORD.to_owned());
+            }),
+        ];
+        for (record, change) in cases {
+            let input = input_with(change);
+            let case = format!("{record:?} {input:?}");
+            let entered = input.password.clone();
+            let mut store = FakeStore::default().with_user(record.clone());
+            let inline = compared(
+                check(&mut store, input.clone()).and_then(UserUpdateCheck::compare),
+                &record,
+                entered.as_deref(),
+            );
+            let pending = check(&mut store, input)
+                .unwrap_or_else(|error| panic!("{case}: read for update: {error:?}"));
+            let elsewhere = thread::spawn(move || pending.compare())
+                .join()
+                .unwrap_or_else(|_| panic!("{case}: the comparing thread panicked"));
+            assert_eq!(
+                compared(elsewhere, &record, entered.as_deref()),
+                inline,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_of_the_check_and_the_rewrite_omits_the_password_and_the_hash() {
+        let mut store = seeded();
+        let input = input_with(|input| input.password = Some("FAKEPW99".to_owned()));
+        let pending = check(&mut store, input)
+            .unwrap_or_else(|error| panic!("USER0001 is read for update: {error:?}"));
+        let rendered_check = format!("{pending:?}");
+        let rewritten = pending
+            .compare()
+            .unwrap_or_else(|error| panic!("FAKEPW99 is compared: {error:?}"));
+        let rendered_rewrite = format!("{rewritten:?}");
+        let key = user_id("USER0001");
+
+        assert_eq!(
+            rendered_check,
+            format!("UserUpdateCheck {{ user_id: {key:?}, .. }}")
+        );
+        assert_eq!(
+            rendered_rewrite,
+            format!("UserRewrite {{ user_id: {key:?}, modified: true, .. }}")
+        );
+        let hidden = [
+            "FAKEPW99",
+            "argon2",
+            seed_hash(),
+            rewritten.record.password_hash.as_str(),
+        ];
+        for rendered in [&rendered_check, &rendered_rewrite] {
+            for text in hidden {
+                assert!(!rendered.contains(text), "{text} in {rendered}");
+            }
+        }
+    }
+
+    #[test]
     fn rule_futures_are_send_with_a_send_store() {
         // The adapters run the rules on the multi-threaded tokio runtime.
         fn assert_send<T: Send>(_: &T) {}
@@ -783,7 +1068,14 @@ mod tests {
             let fetch = lookup(&mut store, Some("USER0001".to_owned()));
             assert_send(&fetch);
         }
-        let write = update(&mut store, unchanged_input());
+        {
+            let read = update(&mut store, unchanged_input());
+            assert_send(&read);
+        }
+        let rewritten = check(&mut store, unchanged_input())
+            .and_then(UserUpdateCheck::compare)
+            .unwrap_or_else(|error| panic!("USER0001 is read and compared: {error:?}"));
+        let write = rewrite(&mut store, rewritten);
         assert_send(&write);
     }
 }

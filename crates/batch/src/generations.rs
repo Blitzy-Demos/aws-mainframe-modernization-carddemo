@@ -12,7 +12,7 @@
 //!   `(+1)` DD is `DISP=(NEW,CATLG,DELETE)` [app/jcl/POSTTRAN.jcl:L34-38]
 //!   [app/jcl/INTCALC.jcl:L37-41] [app/jcl/TRANBKP.jcl:L29-33] [app/jcl/COMBTRAN.jcl:L33-37]
 //!   [app/jcl/TRANREPT.jcl:L29-33, L51-55, L76-80]. The generation is written to a hidden
-//!   temporary sibling; [`PendingGeneration::catalog`] renames it into place when the step ends
+//!   temporary sibling; [`PendingGeneration::catalog`] links it into place when the step ends
 //!   normally, and a [`PendingGeneration`] dropped uncataloged deletes it. An abend, a reward halt
 //!   or an early `?` return therefore leaves the previous generation current, while generations
 //!   cataloged by earlier steps stay.
@@ -24,8 +24,22 @@
 //!   [app/jcl/DALYREJS.jcl:STEP05]: cataloging deletes the oldest generations until the newest
 //!   [`LIMIT`] remain.
 //!
-//! The catalog takes no lock. JES serializes jobs that allocate the same GDG through the dataset
-//! enqueue; here one operator runs the jobs one at a time, as the README cycle does.
+//! # Allocation lock
+//!
+//! JES serializes jobs that allocate the same GDG `DISP=(NEW,CATLG,DELETE)` through the dataset
+//! enqueue [app/jcl/POSTTRAN.jcl:L34-38]. Here [`Generations::begin_next`] takes that enqueue as
+//! the lock file `.<DATASET>.lock` in the catalog directory, created exclusively and holding the
+//! process id, before it reads the current generation. The [`PendingGeneration`] holds the lock
+//! until it is cataloged, roll-off included, or dropped, so two `(+1)` allocations of one GDG can
+//! never pick the same number. An allocation that finds the lock fails with
+//! [`GenerationError::InUse`]: it neither waits nor takes the lock over. A job killed before it
+//! could release the lock (`SIGKILL`, a power loss) leaves the file behind, and every later
+//! allocation of that GDG is refused until an operator removes it, which is safe only while no
+//! batch job is running. Allocations of different GDGs take different locks and run side by side.
+//!
+//! Every temporary file is created exclusively under a name unique to its process and allocation,
+//! and [`PendingGeneration::catalog`] publishes a generation as a hard link to its final name,
+//! which fails when that name exists, so a cataloged generation is never replaced.
 //!
 //! # Record files
 //!
@@ -33,15 +47,19 @@
 //! ([`PendingGeneration::append_records`], [`read_records`]). Print and statement files are
 //! fixed-width text lines with `LF` terminators, checked by [`encode_fixed_lines`]: `TRANREPT`
 //! 133 bytes (`LRECL=133` [app/jcl/TRANREPT.jcl:L78]), STMTFILE 80 and HTMLFILE 100
-//! [app/cbl/CBSTM03A.CBL:L44-47]. The statement files are cataloged datasets, not GDGs, and are
+//! [app/cbl/CBSTM03A.CBL:L44-47]. A line must have exactly that width and hold no `LF` or `CR`,
+//! because either byte would split one fixed-width record into several physical records or
+//! merge it into its terminator; such a line is rejected, never trimmed, escaped or replaced,
+//! and nothing is written. The statement files are cataloged datasets, not GDGs, and are
 //! replaced whole by [`write_replacing`].
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use carddemo_codec::framing::{decode_ascii_file, encode_ascii_lf};
 use carddemo_codec::{CodecError, Layout};
@@ -55,6 +73,14 @@ const FIRST_NUMBER: u16 = 1;
 
 /// The highest absolute generation number, `G9999V00`.
 const MAX_NUMBER: u16 = 9999;
+
+/// How many temporary names one write tries before it gives up. A name is taken only by a file
+/// left behind by an earlier process that had the same process id, so one retry nearly always
+/// suffices.
+const TEMP_ATTEMPTS: u32 = 64;
+
+/// The sequence number that makes each temporary name of this process unique.
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// A GDG base that an in-scope job writes. `TCATBALF.BKUP`, also defined by DEFGDGB, has no
 /// variant because no in-scope job writes it.
@@ -120,6 +146,38 @@ pub(crate) struct Generations {
     root: PathBuf,
 }
 
+/// A record delimiter byte that a fixed-width line must not contain, as
+/// [`GenerationError::LineDelimiter`] reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Delimiter {
+    /// `LF`, `0x0A`: the terminator of every record.
+    Lf,
+    /// `CR`, `0x0D`: as the last byte of a line it would join the `LF` after it into a `CRLF`
+    /// terminator.
+    Cr,
+}
+
+impl Delimiter {
+    /// The delimiter that `byte` is, or `None` for every other byte.
+    const fn of(byte: u8) -> Option<Self> {
+        match byte {
+            b'\n' => Some(Self::Lf),
+            b'\r' => Some(Self::Cr),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for Delimiter {
+    /// The delimiter's name and byte value, for example `LF (0x0A)`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Lf => "LF (0x0A)",
+            Self::Cr => "CR (0x0D)",
+        })
+    }
+}
+
 /// A failure to read, write or catalog a generation or a record file.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GenerationError {
@@ -139,6 +197,20 @@ pub(crate) enum GenerationError {
         /// The dataset name, as [`Dataset::name`] gives it.
         dataset: &'static str,
     },
+    /// `(+1)` was requested while the allocation lock of the GDG exists: another batch job is
+    /// allocating it, or a job killed before it could release the lock left the file behind.
+    #[error(
+        "{dataset}(+1): another batch job holds the allocation lock {}; remove that file only \
+         when no batch job is running, because a job killed before releasing the lock leaves it \
+         behind",
+        path.display()
+    )]
+    InUse {
+        /// The dataset name, as [`Dataset::name`] gives it.
+        dataset: &'static str,
+        /// The lock file, `<root>/.<DATASET>.lock`.
+        path: PathBuf,
+    },
     /// `(0)` was requested while no generation is cataloged.
     #[error("{dataset}(0): no generation is cataloged")]
     NotCataloged {
@@ -154,6 +226,20 @@ pub(crate) enum GenerationError {
         expected: usize,
         /// The line length in bytes.
         actual: usize,
+    },
+    /// A fixed-width line holds a record delimiter, which would split it into more records or
+    /// merge it into the terminator that follows it.
+    #[error(
+        "line {line} holds {delimiter} at byte {position}; a fixed-width line cannot contain a \
+         record delimiter"
+    )]
+    LineDelimiter {
+        /// The 1-based position of the line among the lines passed.
+        line: usize,
+        /// The 1-based position of the delimiter byte within the line.
+        position: usize,
+        /// The delimiter found.
+        delimiter: Delimiter,
     },
     /// A record file did not decode with its layout.
     #[error("record file decode failed: {0}")]
@@ -201,18 +287,24 @@ impl Generations {
     }
 
     /// Allocates the `(+1)` generation of `dataset`: the newest number + 1, or `G0001V00` for an
-    /// empty GDG. It creates the catalog directory and opens the hidden temporary file
-    /// `.<DATASET>.G<nnnn>V00.tmp-<pid>` that the generation is written to until it is cataloged.
+    /// empty GDG. It creates the catalog directory, takes the allocation lock `.<DATASET>.lock`
+    /// before it reads the current generation, and creates the hidden temporary file
+    /// `.<DATASET>.G<nnnn>V00.tmp-<pid>-<seq>` that the generation is written to until it is
+    /// cataloged. The returned [`PendingGeneration`] holds the lock; every error releases it.
     ///
     /// # Errors
     ///
+    /// - [`GenerationError::InUse`] when the allocation lock of `dataset` exists. Nothing is
+    ///   created or changed.
     /// - [`GenerationError::Exhausted`] when `G9999V00` is the newest generation.
-    /// - [`GenerationError::Io`] when the directory cannot be read or created, or the temporary
-    ///   file cannot be created.
+    /// - [`GenerationError::Io`] when the directory cannot be read or created, or the lock file or
+    ///   the temporary file cannot be created.
     pub(crate) fn begin_next(
         &self,
         dataset: Dataset,
     ) -> Result<PendingGeneration, GenerationError> {
+        fs::create_dir_all(&self.root).map_err(|source| io_error(&self.root, source))?;
+        let lock = AllocationLock::acquire(&self.root, dataset)?;
         let number = match self.current(dataset)? {
             None => FIRST_NUMBER,
             Some(newest) => newest
@@ -223,11 +315,9 @@ impl Generations {
                     dataset: dataset.name(),
                 })?,
         };
-        fs::create_dir_all(&self.root).map_err(|source| io_error(&self.root, source))?;
         let name = generation_name(dataset, number);
         let final_path = self.root.join(&name);
-        let temp_path = self.root.join(temp_name(OsStr::new(&name)));
-        let file = File::create(&temp_path).map_err(|source| io_error(&temp_path, source))?;
+        let (temp_path, file) = create_temp(&final_path, OsStr::new(&name))?;
         Ok(PendingGeneration {
             dataset,
             number,
@@ -236,7 +326,57 @@ impl Generations {
             writer: Some(BufWriter::new(file)),
             root: self.root.clone(),
             cataloged: false,
+            _lock: lock,
         })
+    }
+}
+
+/// The allocation lock of one GDG, `<root>/.<DATASET>.lock`: the dataset enqueue JES takes for a
+/// job that allocates the GDG `DISP=(NEW,CATLG,DELETE)` [app/jcl/POSTTRAN.jcl:L34-38]. Dropping
+/// the value deletes the file and so releases the lock.
+#[derive(Debug)]
+struct AllocationLock {
+    path: PathBuf,
+}
+
+impl AllocationLock {
+    /// Creates the lock file of `dataset` under `root` exclusively and writes the process id to
+    /// it, so an operator can tell which process holds it.
+    ///
+    /// # Errors
+    ///
+    /// [`GenerationError::InUse`] when the lock file exists, and [`GenerationError::Io`] when it
+    /// cannot be created or written; a file created but not written is deleted again.
+    fn acquire(root: &Path, dataset: Dataset) -> Result<Self, GenerationError> {
+        let path = root.join(format!(".{}.lock", dataset.name()));
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                return Err(GenerationError::InUse {
+                    dataset: dataset.name(),
+                    path,
+                });
+            }
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        let lock = Self { path };
+        writeln!(file, "{}", process::id()).map_err(|source| io_error(&lock.path, source))?;
+        Ok(lock)
+    }
+}
+
+impl Drop for AllocationLock {
+    /// Releases the lock. Best effort, because a destructor has no caller to report to: a lock
+    /// file that cannot be deleted is logged, and the next allocation reports it as
+    /// [`GenerationError::InUse`].
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_file(&self.path) {
+            tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "generation allocation lock not released"
+            );
+        }
     }
 }
 
@@ -244,6 +384,7 @@ impl Generations {
 ///
 /// [`PendingGeneration::catalog`] is the normal end of the step. Dropping the value without
 /// cataloging it is the abnormal end: the temporary file is deleted and no generation is added.
+/// Either way the allocation lock of the GDG is released last.
 #[must_use = "a pending generation is deleted unless it is cataloged"]
 #[derive(Debug)]
 pub(crate) struct PendingGeneration {
@@ -255,6 +396,10 @@ pub(crate) struct PendingGeneration {
     writer: Option<BufWriter<File>>,
     root: PathBuf,
     cataloged: bool,
+    /// Held, never read: fields drop after `Drop::drop` and after the body of `catalog`, so the
+    /// lock is released only once the temporary file is deleted or the generation is cataloged
+    /// and rolled off.
+    _lock: AllocationLock,
 }
 
 impl PendingGeneration {
@@ -273,12 +418,14 @@ impl PendingGeneration {
     }
 
     /// Appends fixed-width text lines of `width` bytes, each followed by `LF`, as
-    /// [`encode_fixed_lines`] encodes them. Nothing is written when a line has the wrong width.
+    /// [`encode_fixed_lines`] encodes them. Nothing is written when a line has the wrong width or
+    /// holds `LF` or `CR`.
     ///
     /// # Errors
     ///
-    /// [`GenerationError::LineWidth`] as [`encode_fixed_lines`] reports it, and
-    /// [`GenerationError::Io`] when the temporary file cannot be written.
+    /// [`GenerationError::LineWidth`] and [`GenerationError::LineDelimiter`] as
+    /// [`encode_fixed_lines`] reports them, and [`GenerationError::Io`] when the temporary file
+    /// cannot be written.
     pub(crate) fn append_lines(
         &mut self,
         lines: &[String],
@@ -289,14 +436,20 @@ impl PendingGeneration {
     }
 
     /// Catalogs the generation at the normal end of its step: flushes and syncs the temporary
-    /// file, renames it to `<DATASET>.G<nnnn>V00`, then scratches the oldest generations until the
-    /// newest [`LIMIT`] remain. A generation with nothing appended catalogs as an empty file, as
-    /// `DALYREJS(+1)` does after a run without rejects.
+    /// file, hard-links it to `<DATASET>.G<nnnn>V00`, deletes the temporary name, then scratches
+    /// the oldest generations until the newest [`LIMIT`] remain, and finally releases the
+    /// allocation lock. The link never replaces an existing file. A generation with nothing
+    /// appended catalogs as an empty file, as `DALYREJS(+1)` does after a run without rejects.
+    ///
+    /// Once linked, the generation is cataloged: a temporary name or an old generation that
+    /// cannot be deleted afterwards is logged, not returned.
     ///
     /// # Errors
     ///
-    /// [`GenerationError::Io`] when the flush, the sync or the rename fails. The temporary file is
-    /// then deleted and no generation is added.
+    /// [`GenerationError::Io`] when the flush, the sync or the link fails, including when
+    /// `<DATASET>.G<nnnn>V00` already exists (`AlreadyExists`, reported on that path). The
+    /// temporary file is then deleted, an existing file of that name is left as it was, and no
+    /// generation is added.
     pub(crate) fn catalog(mut self) -> Result<Generation, GenerationError> {
         if let Some(writer) = self.writer.take() {
             let file = writer
@@ -306,9 +459,10 @@ impl PendingGeneration {
                 .map_err(|source| io_error(&self.temp_path, source))?;
             drop(file);
         }
-        fs::rename(&self.temp_path, &self.final_path)
+        fs::hard_link(&self.temp_path, &self.final_path)
             .map_err(|source| io_error(&self.final_path, source))?;
         self.cataloged = true;
+        remove_temp(&self.temp_path);
         let generation = Generation {
             dataset: self.dataset,
             number: self.number,
@@ -334,8 +488,9 @@ impl PendingGeneration {
 }
 
 impl Drop for PendingGeneration {
-    /// `DISP=(…,DELETE)` on abnormal end: an uncataloged generation's temporary file is deleted.
-    /// Best effort, because a destructor has no caller to report to: a failure is logged.
+    /// `DISP=(…,DELETE)` on abnormal end: an uncataloged generation's temporary file is deleted,
+    /// and then the allocation lock is released. Best effort, because a destructor has no caller
+    /// to report to: a failure is logged.
     fn drop(&mut self) {
         if self.cataloged {
             return;
@@ -366,12 +521,16 @@ pub(crate) fn read_records<L: Layout>(path: &Path) -> Result<Vec<L::Record>, Gen
 }
 
 /// Encodes fixed-width text lines as a record file: each line, which must be exactly `width`
-/// bytes, followed by `LF`. Lines are never padded or truncated, so a width error in the code
-/// that formats them surfaces here instead of shifting the records of the file.
+/// bytes and hold no `LF` or `CR`, followed by `LF`. Lines are never padded, truncated, trimmed,
+/// escaped or otherwise altered, so a width or content error in the code that formats them
+/// surfaces here instead of shifting, splitting or merging the records of the file. Each line is
+/// checked in order, width first; the first error is returned and nothing is encoded.
 ///
 /// # Errors
 ///
-/// [`GenerationError::LineWidth`] for the first line whose byte length is not `width`.
+/// - [`GenerationError::LineWidth`] for a line whose byte length is not `width`.
+/// - [`GenerationError::LineDelimiter`] for a line of the right width that holds `LF` or `CR`,
+///   located at the first such byte.
 pub(crate) fn encode_fixed_lines(
     lines: &[String],
     width: usize,
@@ -385,22 +544,35 @@ pub(crate) fn encode_fixed_lines(
                 actual: text.len(),
             });
         }
+        if let Some((delimiter, position)) = text
+            .bytes()
+            .zip(1..)
+            .find_map(|(byte, position)| Delimiter::of(byte).map(|delimiter| (delimiter, position)))
+        {
+            return Err(GenerationError::LineDelimiter {
+                line,
+                position,
+                delimiter,
+            });
+        }
         out.extend_from_slice(text.as_bytes());
         out.push(b'\n');
     }
     Ok(out)
 }
 
-/// Replaces the file `path` with `bytes` as a whole: writes and syncs a hidden temporary sibling,
-/// then renames it over `path`, so a reader never sees a partly written file. The parent
-/// directory is created first. `creastmt` writes `STATEMNT.PS`, `STATEMNT.HTML` and
-/// `STATEMNT.PS.PDF` this way, because they are cataloged datasets, not GDGs.
+/// Replaces the file `path` with `bytes` as a whole: writes and syncs a hidden temporary sibling
+/// created exclusively under a name of its own, then renames it over `path`, so a reader never
+/// sees a partly written file and concurrent writers of the same path never share a temporary
+/// file; the last rename wins. The parent directory is created first. `creastmt` writes
+/// `STATEMNT.PS`, `STATEMNT.HTML` and `STATEMNT.PS.PDF` this way, because they are cataloged
+/// datasets, not GDGs: each run replaces them.
 ///
 /// # Errors
 ///
-/// [`GenerationError::Io`] when `path` names no file, or when the directory cannot be created or
-/// the file cannot be written, synced or renamed. The temporary file is then deleted and `path`
-/// keeps its previous content.
+/// [`GenerationError::Io`] when `path` names no file, or when the directory or the temporary
+/// file cannot be created, or the file cannot be written, synced or renamed. The temporary file
+/// is then deleted and `path` keeps its previous content.
 pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     let Some(file_name) = path.file_name() else {
         return Err(io_error(
@@ -411,8 +583,8 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Generatio
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     }
-    let temp_path = path.with_file_name(temp_name(file_name));
-    let replaced = write_synced(&temp_path, bytes)
+    let (temp_path, file) = create_temp(path, file_name)?;
+    let replaced = write_synced(file, &temp_path, bytes)
         .and_then(|()| fs::rename(&temp_path, path).map_err(|source| io_error(path, source)));
     if replaced.is_err() {
         remove_temp(&temp_path);
@@ -420,12 +592,41 @@ pub(crate) fn write_replacing(path: &Path, bytes: &[u8]) -> Result<(), Generatio
     replaced
 }
 
-/// Creates `path`, writes `bytes` to it and syncs it to disk.
-fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
-    let mut file = File::create(path).map_err(|source| io_error(path, source))?;
+/// Writes `bytes` to `file`, the newly created file at `path`, syncs it to disk and closes it.
+fn write_synced(mut file: File, path: &Path, bytes: &[u8]) -> Result<(), GenerationError> {
     file.write_all(bytes)
         .and_then(|()| file.sync_all())
         .map_err(|source| io_error(path, source))
+}
+
+/// Creates the hidden temporary sibling of `path`, whose file name is `file_name`, exclusively:
+/// a name that already exists is never opened, truncated or deleted, and the next sequence
+/// number is tried instead.
+///
+/// # Errors
+///
+/// [`GenerationError::Io`] when the file cannot be created, or when [`TEMP_ATTEMPTS`] names in a
+/// row are taken (`AlreadyExists`, reported on the last name tried).
+fn create_temp(path: &Path, file_name: &OsStr) -> Result<(PathBuf, File), GenerationError> {
+    let mut attempt = 1;
+    loop {
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path = path.with_file_name(temp_name(file_name, sequence));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+        {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
+                if attempt == TEMP_ATTEMPTS {
+                    return Err(io_error(&temp_path, source));
+                }
+                attempt += 1;
+            }
+            Err(source) => return Err(io_error(&temp_path, source)),
+        }
+    }
 }
 
 /// The generations of `dataset` under `root`, oldest first; see [`Generations::list`].
@@ -510,17 +711,20 @@ fn generation_name(dataset: Dataset, number: u16) -> String {
     format!("{}.G{number:04}V00", dataset.name())
 }
 
-/// The hidden temporary name `.<file name>.tmp-<pid>` a file is written under before it is
-/// renamed into place. The leading dot keeps it out of [`Generations::list`].
-fn temp_name(file_name: &OsStr) -> OsString {
+/// The hidden temporary name `.<file name>.tmp-<pid>-<seq>` a file is written under before it is
+/// linked or renamed into place. The process id separates concurrent jobs and the sequence
+/// number separates the writes of one process. The leading dot keeps it out of
+/// [`Generations::list`].
+fn temp_name(file_name: &OsStr, sequence: u64) -> OsString {
     let mut name = OsString::from(".");
     name.push(file_name);
-    name.push(format!(".tmp-{}", process::id()));
+    name.push(format!(".tmp-{}-{sequence}", process::id()));
     name
 }
 
 /// Deletes the temporary file `path`, reporting whether it was there. Best effort: a failure
-/// other than an absent file is logged, because the callers are already failing or dropping.
+/// other than an absent file is logged, because the callers are already failing or dropping, or,
+/// in [`PendingGeneration::catalog`], have already cataloged the generation.
 fn remove_temp(path: &Path) -> bool {
     match fs::remove_file(path) {
         Ok(()) => true,
@@ -548,14 +752,16 @@ fn io_error(path: &Path, source: io::Error) -> GenerationError {
 mod tests {
     use std::env;
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     use std::process;
+    use std::thread;
 
     use carddemo_codec::{Charset, CodecError, CodecErrorKind, FieldKind, FieldSpec, Layout};
 
     use super::{
-        Dataset, Generation, GenerationError, Generations, LIMIT, encode_fixed_lines, read_records,
-        write_replacing,
+        Dataset, Delimiter, Generation, GenerationError, Generations, LIMIT, encode_fixed_lines,
+        read_records, write_replacing,
     };
 
     /// A test directory under the system temporary directory, removed when the test ends.
@@ -705,12 +911,168 @@ mod tests {
             .expect("record appends");
         drop(pending);
 
-        assert_eq!(dir.names(), ["DALYREJS.G0001V00"]);
+        assert_eq!(dir.names(), ["DALYREJS.G0001V00"], "the lock is released");
         assert_eq!(
             generations
                 .current(Dataset::DalyRejs)
                 .expect("catalog lists"),
             Some(first)
+        );
+        assert_eq!(
+            catalog_empty(&generations, Dataset::DalyRejs).to_string(),
+            "DALYREJS.G0002V00",
+            "the dropped number is allocated again"
+        );
+    }
+
+    #[test]
+    fn pending_generation_holds_the_allocation_lock_until_cataloged() {
+        let dir = TestDir::new("in-use");
+        let generations = Generations::new(dir.path());
+        let lock = dir.path().join(".DALYREJS.lock");
+
+        let mut first = generations
+            .begin_next(Dataset::DalyRejs)
+            .expect("generation allocates");
+        first
+            .append_records::<SixBytes>(&[*b"FIRST1"])
+            .expect("record appends");
+        assert_eq!(
+            fs::read_to_string(&lock).expect("lock is readable"),
+            format!("{}\n", process::id())
+        );
+        let names = dir.names();
+        assert_eq!(names.len(), 2, "{names:?}");
+        let sequence = names[0]
+            .strip_prefix(&format!(".DALYREJS.G0001V00.tmp-{}-", process::id()))
+            .expect("temporary name holds the process id");
+        assert!(sequence.parse::<u64>().is_ok(), "{names:?}");
+        assert_eq!(names[1], ".DALYREJS.lock");
+
+        let error = generations
+            .begin_next(Dataset::DalyRejs)
+            .expect_err("the allocation is held");
+        assert!(
+            matches!(&error, GenerationError::InUse { dataset: "DALYREJS", path } if *path == lock),
+            "{error:?}"
+        );
+        assert_eq!(dir.names(), names, "a refused allocation creates nothing");
+
+        let first = first.catalog().expect("generation catalogs");
+        assert_eq!(first.to_string(), "DALYREJS.G0001V00");
+        assert_eq!(
+            fs::read(&first.path).expect("generation is readable"),
+            b"FIRST1\n"
+        );
+        assert_eq!(
+            dir.names(),
+            ["DALYREJS.G0001V00"],
+            "no lock or temporary file is left"
+        );
+
+        assert_eq!(
+            catalog_empty(&generations, Dataset::DalyRejs).to_string(),
+            "DALYREJS.G0002V00"
+        );
+        assert_eq!(dir.names(), ["DALYREJS.G0001V00", "DALYREJS.G0002V00"]);
+    }
+
+    #[test]
+    fn stale_allocation_lock_refuses_allocation() {
+        let dir = TestDir::new("stale-lock");
+        fs::create_dir_all(dir.path()).expect("directory creates");
+        let lock = dir.path().join(".DALYREJS.lock");
+        fs::write(&lock, b"4242\n").expect("file writes");
+        let generations = Generations::new(dir.path());
+
+        let error = generations
+            .begin_next(Dataset::DalyRejs)
+            .expect_err("the lock exists");
+        assert!(
+            matches!(&error, GenerationError::InUse { dataset: "DALYREJS", path } if *path == lock),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "DALYREJS(+1): another batch job holds the allocation lock {}; remove that file \
+                 only when no batch job is running, because a job killed before releasing the \
+                 lock leaves it behind",
+                lock.display()
+            )
+        );
+        assert_eq!(dir.names(), [".DALYREJS.lock"], "nothing else is created");
+        assert_eq!(
+            fs::read(&lock).expect("lock is readable"),
+            b"4242\n",
+            "the lock is never taken over"
+        );
+    }
+
+    #[test]
+    fn pending_generations_of_different_datasets_coexist() {
+        let dir = TestDir::new("coexist");
+        let generations = Generations::new(dir.path());
+
+        let backup = generations
+            .begin_next(Dataset::TransactBkup)
+            .expect("backup allocates");
+        let daily = generations
+            .begin_next(Dataset::TransactDaly)
+            .expect("daily allocates");
+        let report = generations
+            .begin_next(Dataset::TranRept)
+            .expect("report allocates");
+
+        assert_eq!(
+            report.catalog().expect("report catalogs").to_string(),
+            "TRANREPT.G0001V00"
+        );
+        assert_eq!(
+            daily.catalog().expect("daily catalogs").to_string(),
+            "TRANSACT.DALY.G0001V00"
+        );
+        assert_eq!(
+            backup.catalog().expect("backup catalogs").to_string(),
+            "TRANSACT.BKUP.G0001V00"
+        );
+        assert_eq!(
+            dir.names(),
+            [
+                "TRANREPT.G0001V00",
+                "TRANSACT.BKUP.G0001V00",
+                "TRANSACT.DALY.G0001V00"
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_never_replaces_an_existing_generation() {
+        let dir = TestDir::new("no-clobber");
+        let generations = Generations::new(dir.path());
+        let mut pending = generations
+            .begin_next(Dataset::DalyRejs)
+            .expect("generation allocates");
+        pending
+            .append_records::<SixBytes>(&[*b"NEWREC"])
+            .expect("record appends");
+        let existing = dir.path().join("DALYREJS.G0001V00");
+        fs::write(&existing, b"KEPT\n").expect("file writes");
+
+        let error = pending.catalog().expect_err("the generation name is taken");
+        assert!(
+            matches!(
+                &error,
+                GenerationError::Io { path, source }
+                    if *path == existing && source.kind() == io::ErrorKind::AlreadyExists
+            ),
+            "{error:?}"
+        );
+        assert_eq!(fs::read(&existing).expect("file is readable"), b"KEPT\n");
+        assert_eq!(
+            dir.names(),
+            ["DALYREJS.G0001V00"],
+            "the temporary file and the lock are removed"
         );
     }
 
@@ -761,6 +1123,53 @@ mod tests {
         assert!(matches!(
             encode_fixed_lines(&[wide], 2),
             Err(GenerationError::LineWidth { actual: 4, .. })
+        ));
+    }
+
+    #[test]
+    fn encode_fixed_lines_rejects_record_delimiters() {
+        let report_line = format!("A\n{}", "B".repeat(131));
+        let cases: [(&[&str], usize, usize, usize, Delimiter); 5] = [
+            (&["A\nBC"], 4, 1, 2, Delimiter::Lf),
+            (&["ABC\r"], 4, 1, 4, Delimiter::Cr),
+            (&["\r\nAB"], 4, 1, 1, Delimiter::Cr),
+            (&[report_line.as_str()], 133, 1, 2, Delimiter::Lf),
+            (&["ABCD", "AB\nC"], 4, 2, 3, Delimiter::Lf),
+        ];
+        for (texts, width, line, position, delimiter) in cases {
+            let lines: Vec<String> = texts.iter().map(|text| (*text).to_owned()).collect();
+            let result = encode_fixed_lines(&lines, width);
+            assert!(
+                matches!(
+                    result,
+                    Err(GenerationError::LineDelimiter { line: l, position: p, delimiter: d })
+                        if l == line && p == position && d == delimiter
+                ),
+                "{texts:?}: {result:?}"
+            );
+        }
+
+        let error = encode_fixed_lines(&["A\nBC".to_owned()], 4).expect_err("line 1 holds LF");
+        assert_eq!(
+            error.to_string(),
+            "line 1 holds LF (0x0A) at byte 2; a fixed-width line cannot contain a record \
+             delimiter"
+        );
+        assert_eq!(
+            encode_fixed_lines(&["AB\r\n".to_owned()], 4)
+                .expect_err("line 1 holds CR")
+                .to_string(),
+            "line 1 holds CR (0x0D) at byte 3; a fixed-width line cannot contain a record \
+             delimiter"
+        );
+        // Width is checked first: a short line holding LF is a width error.
+        assert!(matches!(
+            encode_fixed_lines(&["A\n".to_owned()], 4),
+            Err(GenerationError::LineWidth {
+                line: 1,
+                expected: 4,
+                actual: 2,
+            })
         ));
     }
 
@@ -822,6 +1231,14 @@ mod tests {
         assert!(matches!(
             report.append_lines(&["BAD".to_owned()], 4),
             Err(GenerationError::LineWidth { line: 1, .. })
+        ));
+        assert!(matches!(
+            report.append_lines(&["GOOD".to_owned(), "BA\nD".to_owned()], 4),
+            Err(GenerationError::LineDelimiter {
+                line: 2,
+                position: 3,
+                delimiter: Delimiter::Lf,
+            })
         ));
         let report = report.catalog().expect("generation catalogs");
         assert_eq!(report.path, dir.path().join("TRANREPT.G0001V00"));
@@ -908,5 +1325,29 @@ mod tests {
             write_replacing(Path::new("/"), b""),
             Err(GenerationError::Io { .. })
         ));
+    }
+
+    #[test]
+    fn concurrent_write_replacing_never_shares_a_temporary_file() {
+        let dir = TestDir::new("replacing-race");
+        let path = dir.path().join("STATEMNT.PS");
+        let target = path.as_path();
+        let payloads: [&[u8]; 2] = [b"first\n", b"second\n"];
+
+        for _ in 0..50 {
+            thread::scope(|scope| {
+                let writers =
+                    payloads.map(|bytes| scope.spawn(move || write_replacing(target, bytes)));
+                for writer in writers {
+                    writer
+                        .join()
+                        .expect("writer does not panic")
+                        .expect("file is replaced");
+                }
+            });
+            let content = fs::read(&path).expect("file is readable");
+            assert!(payloads.contains(&content.as_slice()), "{content:?}");
+        }
+        assert_eq!(dir.names(), ["STATEMNT.PS"], "no temporary file is left");
     }
 }
