@@ -23,9 +23,15 @@
 //! # Units of work
 //!
 //! Each request runs in one unit of work. The list reads and rolls back. A
-//! write commits only once it has succeeded; a missing rule rolls back
-//! explicitly, and any other failure drops the unit, which rolls it back.
-//! Unlike the legacy writes, no rule write has to survive a later failure.
+//! write commits only once it has succeeded. Every failure after the unit
+//! begins, a failed store call or a missing rule, rolls it back explicitly
+//! and awaits the `ROLLBACK` before the outcome is recorded, rather than
+//! leaving the rollback to the unit being dropped. A `ROLLBACK` that fails
+//! after a failed store call is logged and that call's 500 stands; any other
+//! failed `ROLLBACK` answers 500. A failed `COMMIT` consumes the unit, whose
+//! transaction `PostgreSQL` has already ended. On every failure path nothing
+//! of the request is committed. Unlike the legacy writes, no rule write has
+//! to survive a later failure.
 //!
 //! # Telemetry
 //!
@@ -41,19 +47,20 @@ use std::future::Future;
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::StatusCode;
 use carddemo_domain::clock::Clock;
 use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::RuleId;
+use carddemo_domain::ports::PortError;
 use carddemo_domain::rewards::validate_rule;
+use carddemo_persistence::UnitOfWork;
 use carddemo_persistence::repos::SoftDeleteOutcome;
 use tracing::field::Empty;
 use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
 use crate::dto::admin_reward_rules::{RewardRuleRequest, RewardRuleResponse};
-use crate::error::{ApiError, ApiJson, ApiPath, ErrorBody};
+use crate::error::{ApiError, ApiJson, ApiPath, Created, ErrorBody};
 use crate::state::AppState;
 
 /// The `transaction` field of every span this module opens. Rewards have no
@@ -118,8 +125,9 @@ fn record_rule_id(rule_id: RuleId) {
 /// Runs `work` inside `span`, then records its outcome there: the outcome
 /// `work` names on success, the error body's code on failure.
 ///
-/// `work` finishes its unit of work before it returns, so the outcome is
-/// recorded after the commit or the rollback.
+/// `work` commits its unit of work, or rolls it back and awaits the
+/// `ROLLBACK`, before it returns, on success and failure alike, so the
+/// outcome is recorded after the commit or the rollback.
 async fn traced<T>(
     span: Span,
     work: impl Future<Output = Result<(T, &'static str), ApiError>>,
@@ -131,6 +139,21 @@ async fn traced<T>(
     };
     span.record("outcome", outcome);
     result.map(|(value, _)| value)
+}
+
+/// Rolls `uow` back after the store call that failed with `error`, then
+/// answers with that failure: 500 `Unexpected error`, its detail logged.
+///
+/// The `ROLLBACK` is awaited, so it has run before [`traced`] records the
+/// outcome. A failed `ROLLBACK` is only logged and changes no answer: nothing
+/// was committed, and the server discards the transaction when its
+/// connection closes.
+async fn roll_back<T>(uow: UnitOfWork, error: PortError) -> Result<T, ApiError> {
+    let answer = ApiError::from(error);
+    if let Err(failure) = uow.rollback().await {
+        tracing::warn!(error = %failure, "rollback of the unit of work failed");
+    }
+    Err(answer)
 }
 
 /// `GET /admin/reward-rules`: every reward rule, active, future and
@@ -167,7 +190,10 @@ pub async fn list_reward_rules(
 ) -> Result<Json<Vec<RewardRuleResponse>>, ApiError> {
     traced(request_span("list", &admin), async move {
         let mut uow = state.db().begin().await?;
-        let rules = uow.store().list_reward_rules().await?;
+        let rules = match uow.store().list_reward_rules().await {
+            Ok(rules) => rules,
+            Err(error) => return roll_back(uow, error).await,
+        };
         uow.rollback().await?;
         let body = rules.iter().map(RewardRuleResponse::from).collect();
         Ok((Json(body), LISTED))
@@ -213,15 +239,17 @@ pub async fn create_reward_rule(
     State(state): State<AppState>,
     admin: AdminUser,
     ApiJson(body): ApiJson<RewardRuleRequest>,
-) -> Result<(StatusCode, Json<RewardRuleResponse>), ApiError> {
+) -> Result<Created<RewardRuleResponse>, ApiError> {
     traced(request_span("create", &admin), async move {
         let rule = validate_rule(body.into_draft()?)?;
         let mut uow = state.db().begin().await?;
-        let saved = uow.store().insert_reward_rule(rule).await?;
+        let saved = match uow.store().insert_reward_rule(rule).await {
+            Ok(saved) => saved,
+            Err(error) => return roll_back(uow, error).await,
+        };
         uow.commit().await?;
         record_rule_id(saved.rule_id);
-        let created = (StatusCode::CREATED, Json(RewardRuleResponse::from(&saved)));
-        Ok((created, CREATED))
+        Ok((Created(RewardRuleResponse::from(&saved)), CREATED))
     })
     .await
 }
@@ -272,7 +300,10 @@ pub async fn update_reward_rule(
         record_rule_id(rule_id);
         let rule = validate_rule(body.into_draft()?)?;
         let mut uow = state.db().begin().await?;
-        let updated = uow.store().update_reward_rule(rule_id, rule).await?;
+        let updated = match uow.store().update_reward_rule(rule_id, rule).await {
+            Ok(updated) => updated,
+            Err(error) => return roll_back(uow, error).await,
+        };
         let Some(saved) = updated else {
             uow.rollback().await?;
             return Err(rule_not_found());
@@ -324,7 +355,10 @@ pub async fn delete_reward_rule(
         record_rule_id(rule_id);
         let now = state.clock().now();
         let mut uow = state.db().begin().await?;
-        let deleted = uow.store().soft_delete_reward_rule(rule_id, now).await?;
+        let deleted = match uow.store().soft_delete_reward_rule(rule_id, now).await {
+            Ok(deleted) => deleted,
+            Err(error) => return roll_back(uow, error).await,
+        };
         let (rule, outcome) = match deleted {
             SoftDeleteOutcome::Deleted(rule) => (rule, DELETED),
             SoftDeleteOutcome::Unchanged(rule) => (rule, UNCHANGED),

@@ -45,6 +45,13 @@
 //! holds no server detail. Handlers declare their request body and parameters
 //! explicitly in `#[utoipa::path(request_body = .., params(..))]`, so the
 //! wrappers leave the `OpenAPI` document unchanged.
+//!
+//! # Success statuses
+//!
+//! [`Created`] answers a stored new resource with 201 and the resource as its
+//! JSON body, so a handler that returns it names the kind of success and
+//! chooses no status itself. Handlers still declare the 201 in
+//! `#[utoipa::path(responses(..))]`.
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -282,6 +289,19 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The answer to a request that stored a new resource: 201 Created with the
+/// resource as its JSON body, serialized as `axum::Json` serializes it.
+///
+/// A handler returns `Created(resource)`, so it chooses no status itself.
+#[derive(Debug, Clone, Copy)]
+pub struct Created<T>(pub T);
+
+impl<T: Serialize> IntoResponse for Created<T> {
+    fn into_response(self) -> Response {
+        (StatusCode::CREATED, Json(self.0)).into_response()
+    }
+}
+
 /// A JSON request body, extracted as `axum::Json` does, whose rejection is the
 /// 400 error body.
 #[derive(Debug, Clone, Copy, Default)]
@@ -355,7 +375,7 @@ mod tests {
     use tower::ServiceExt;
     use utoipa::PartialSchema;
 
-    use super::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody, ErrorFieldBody};
+    use super::{ApiError, ApiJson, ApiPath, ApiQuery, Created, ErrorBody, ErrorFieldBody};
 
     /// The status table, written out independently of `status_for`.
     const KIND_STATUSES: [(ErrorKind, StatusCode); 7] = [
@@ -564,6 +584,23 @@ mod tests {
                     "message": messages::RECORD_CHANGED_BY_SOME_ONE_ELSE,
                 }],
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn created_writes_201_and_the_resource_as_the_json_body() {
+        let resource = json!({
+            "rule_id": "9007199254740993",
+            "reward_rate": "0.0150",
+            "active_to": null,
+        });
+        let (status, content_type, bytes) =
+            read_body(Created(resource.clone()).into_response()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&resource).expect("the resource serializes")
         );
     }
 

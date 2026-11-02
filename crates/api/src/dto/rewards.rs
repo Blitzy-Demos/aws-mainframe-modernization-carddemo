@@ -119,8 +119,11 @@ impl From<&RewardAccrual> for RewardAccrualResponse {
 /// The query of `GET /rewards/history/{account_id}`: `start_key` and
 /// `page_size` (request Rewards system; AAP 0.3.5).
 ///
-/// The history lists accruals newest first by `accrual_id` and pages one way
-/// only, so it takes no `direction`. Its fields are declared here rather than
+/// The history lists accruals newest first by `created_at`, ties broken by
+/// the higher `accrual_id`. `start_key` is an inclusive accrual-ID cursor,
+/// the `next_key` of the previous page: the page starts at that accrual and
+/// continues with the older ones. The history pages one way only, so it
+/// takes no `direction`. Its fields are declared here rather than
 /// through a flattened [`PageQuery`](crate::pagination::PageQuery), which
 /// would accept and publish a `direction` the history does not have. An
 /// out-of-range `page_size` fails

@@ -22,6 +22,12 @@
 //! Each request reads inside one unit of work that is rolled back, since it
 //! changes nothing, and records one handler span with `transaction`
 //! (`REWARDS`), `user_id`, `account_id` and `outcome` (AAP 0.6.2).
+//! `account_id` is the parsed 11-digit key, recorded once the path text
+//! parses. Path text that does not parse is never recorded, as it may hold
+//! anything a caller typed: the span records only `account_id_rejected`, the
+//! parse error's fixed text, and `account_id_len`, the text's length in
+//! bytes. A history request with a malformed `start_key` is answered before
+//! the account key is parsed, so its span records neither.
 
 use axum::Json;
 use axum::extract::State;
@@ -30,7 +36,7 @@ use carddemo_domain::error::DomainError;
 use carddemo_domain::messages;
 use carddemo_domain::numeric::{AccountId, AccrualId};
 use carddemo_domain::ports::{AccountReader, PortError};
-use tracing::Instrument;
+use tracing::{Instrument, Span};
 
 use crate::auth::AuthUser;
 use crate::dto::rewards::{RewardAccrualResponse, RewardBalanceResponse, RewardHistoryQuery};
@@ -51,6 +57,11 @@ const OUTCOME_OK: &str = "ok";
 /// The account `raw` names, read through [`AccountReader`] as the CAVW rule
 /// reads it.
 ///
+/// The key is recorded on the current span, the handler span: `account_id` as
+/// the parsed 11 digits, before the read, so a missing account still names
+/// its key. Text that does not parse records only `account_id_rejected` and
+/// `account_id_len`, never the text.
+///
 /// # Errors
 ///
 /// - 404 with [`messages::ACCOUNT_NOT_FOUND`] when `raw` is not 1 to 11 ASCII
@@ -64,7 +75,19 @@ async fn resolve_account<A: AccountReader>(
     raw: &str,
 ) -> Result<AccountId, ApiError> {
     let not_found = || ApiError::from(DomainError::not_found(messages::ACCOUNT_NOT_FOUND));
-    let account_id: AccountId = raw.parse().map_err(|_| not_found())?;
+    let span = Span::current();
+    let account_id: AccountId = match raw.parse() {
+        Ok(account_id) => account_id,
+        Err(rejection) => {
+            span.record("account_id_rejected", tracing::field::display(rejection));
+            span.record(
+                "account_id_len",
+                i64::try_from(raw.len()).unwrap_or(i64::MAX),
+            );
+            return Err(not_found());
+        }
+    };
+    span.record("account_id", tracing::field::display(account_id));
     match store.read_account(account_id).await {
         Ok(_) => Ok(account_id),
         Err(PortError::NotFound) => Err(not_found()),
@@ -186,7 +209,9 @@ pub async fn get_reward_balance(
         "get_reward_balance",
         transaction = TRANSACTION,
         user_id = user.user_id.as_str(),
-        account_id = account_id.as_str(),
+        account_id = tracing::field::Empty,
+        account_id_rejected = tracing::field::Empty,
+        account_id_len = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
     let result = read_balance(&state, &account_id)
@@ -244,7 +269,9 @@ pub async fn get_reward_history(
         "get_reward_history",
         transaction = TRANSACTION,
         user_id = user.user_id.as_str(),
-        account_id = account_id.as_str(),
+        account_id = tracing::field::Empty,
+        account_id_rejected = tracing::field::Empty,
+        account_id_len = tracing::field::Empty,
         outcome = tracing::field::Empty,
     );
     let rows = query.page_size.map_or(HISTORY_PAGE_ROWS, PageSize::get);
@@ -260,6 +287,9 @@ pub async fn get_reward_history(
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
     use axum::http::StatusCode;
     use carddemo_domain::entities::{Account, RewardAccrual};
     use carddemo_domain::messages;
@@ -268,10 +298,11 @@ mod tests {
     };
     use carddemo_domain::ports::{AccountReader, PortError, PortResult};
     use chrono::{TimeDelta, TimeZone, Utc};
-    use serde_json::{Value, json};
+    use serde_json::{Map, Value, json};
+    use tracing::Instrument;
     use utoipa::OpenApi;
 
-    use super::{OUTCOME_OK, history_page, outcome_of, resolve_account};
+    use super::{OUTCOME_OK, TRANSACTION, history_page, outcome_of, resolve_account};
     use crate::error::ApiError;
 
     /// An account master that answers every read with one outcome and records
@@ -426,6 +457,126 @@ mod tests {
                 messages::UNEXPECTED_ERROR,
                 "{failure}"
             );
+        }
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("capture buffer").clone();
+            String::from_utf8(bytes).expect("JSON lines are UTF-8")
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Runs `resolve_account` on `raw`, against a store answering `outcome`,
+    /// inside a span declared as the handler spans are, under the binaries'
+    /// telemetry subscriber. Returns its result, the `account_id*` attributes
+    /// the span exporter wrote for that span, and every JSON line written.
+    async fn resolved_in_handler_span(
+        raw: &str,
+        outcome: PortResult<()>,
+    ) -> (Result<AccountId, ApiError>, Map<String, Value>, String) {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, telemetry) =
+            carddemo_runtime::telemetry::subscriber_with_writer("api", "info", move || {
+                sink.clone()
+            })
+            .expect("valid directives");
+        let default = tracing::subscriber::set_default(subscriber);
+        let span = tracing::info_span!(
+            "get_reward_balance",
+            transaction = TRANSACTION,
+            user_id = "USER0001",
+            account_id = tracing::field::Empty,
+            account_id_rejected = tracing::field::Empty,
+            account_id_len = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+        let mut store = FakeAccounts::answering(outcome);
+        let result = resolve_account(&mut store, raw).instrument(span).await;
+        drop(default);
+        telemetry
+            .shutdown()
+            .expect("the tracer provider shuts down");
+
+        let text = capture.text();
+        let spans: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("a JSON line"))
+            .filter(|line| line["type"] == "span" && line["name"] == "get_reward_balance")
+            .collect();
+        assert_eq!(spans.len(), 1, "{text}");
+        let fields = spans[0]["attributes"]
+            .as_object()
+            .expect("an attribute object")
+            .iter()
+            .filter(|(key, _)| key.starts_with("account_id"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        (result, fields, text)
+    }
+
+    #[tokio::test]
+    async fn the_span_records_the_parsed_account_key_or_only_why_the_text_was_rejected() {
+        // (path text, store outcome, resolves, exported account attributes)
+        let cases = [
+            ("1", Ok(()), true, json!({"account_id": "00000000001"})),
+            (
+                "99999999999",
+                Err(PortError::NotFound),
+                false,
+                json!({"account_id": "99999999999"}),
+            ),
+            (
+                "zzSECRETzz9",
+                Ok(()),
+                false,
+                json!({"account_id_rejected": "value is not numeric", "account_id_len": 11}),
+            ),
+            (
+                "123456789012345",
+                Ok(()),
+                false,
+                json!({
+                    "account_id_rejected": "value is outside the range of the field",
+                    "account_id_len": 15,
+                }),
+            ),
+            (
+                "\u{0661}",
+                Ok(()),
+                false,
+                json!({"account_id_rejected": "value is not numeric", "account_id_len": 2}),
+            ),
+        ];
+        for (raw, outcome, resolves, expected) in cases {
+            let (result, fields, text) = resolved_in_handler_span(raw, outcome).await;
+            assert_eq!(result.is_ok(), resolves, "{raw:?}");
+            assert_eq!(Value::Object(fields), expected, "{raw:?}");
+            if expected.get("account_id").is_none() {
+                assert!(
+                    !text.contains(raw),
+                    "{raw:?} must reach no span or log line: {text}"
+                );
+            }
         }
     }
 
