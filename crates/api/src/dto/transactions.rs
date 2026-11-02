@@ -28,14 +28,31 @@
 //!
 //! [`TransactionAddRequest`] carries the 14 input fields of map `COTRN2A`
 //! [app/cpy-bms/COTRN02.CPY:L60-138] as entered. [`TransactionAddRequest::check`]
-//! applies the BMS field lengths; every other edit, with its audited message,
-//! is `transaction_add::validate`'s (V-COTRN02C-001 to V-COTRN02C-028).
+//! applies the BMS field lengths and keeps the free-text fields ASCII; every
+//! other edit, with its audited message, is `transaction_add::validate`'s
+//! (V-COTRN02C-001 to V-COTRN02C-028).
 //!
 //! The 3270 field cannot hold more characters than its width, so an
 //! over-length entry has no COBOL path, and the validation audit records no
 //! over-length row for `COTRN02C`: the length check answers 400 `INVALID` with
 //! no message and names each over-length BMS field, the no-message answer of a
 //! REST input without a COBOL counterpart (E-49).
+//!
+//! The source, the description and the merchant name, city and zip (`TRNSRC`,
+//! `TDESC`, `MNAME`, `MCITY`, `MZIP`) have no class edit: `ADD-TRANSACTION`
+//! moves them byte for byte into their `X(n)` record fields
+//! [app/cbl/COTRN02C.cbl:L450-465], through `Alnum::move_from`, which would
+//! store a non-ASCII character as its two to four UTF-8 bytes, each read back
+//! as one Latin-1 character, and cut it at the field width. A 3270 map field
+//! holds one byte per character, so such an entry has no COBOL counterpart
+//! either, and the check answers it as it answers an over-length one: 400
+//! `INVALID`, no message, its BMS field named (E-49). No other member reaches
+//! the record unless its class or format edit passes it, and only ASCII
+//! digits, signs, points and dashes pass those edits (V-COTRN02C-001,
+//! V-COTRN02C-002, V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026); the
+//! confirmation is never stored, and any value but `Y`, `y`, `N`, `n` or blank
+//! is V-COTRN02C-028. The rule therefore answers a non-ASCII entry there with
+//! its audited message, in its audited order.
 //!
 //! Every `COTRN02C` outcome other than the add sets `WS-ERR-FLG`, the `N` and
 //! blank confirmations included (V-COTRN02C-027, V-COTRN02C-028), so the
@@ -320,20 +337,24 @@ impl TransactionListQuery {
     /// parameters of [`PageQuery::resolve`](crate::pagination::PageQuery::resolve)
     /// and the typed account filter.
     ///
-    /// An absent filter, or one that is empty or holds only spaces or only
-    /// NUL characters, lists every transaction. The start key is passed on as
-    /// entered, for the rule's own edit.
+    /// An absent filter, or one of at most 11 characters that is empty or
+    /// holds only spaces or only NUL characters, lists every transaction. The
+    /// start key is passed on as entered, for the rule's own edit.
     ///
     /// # Errors
     ///
-    /// A filter that is not exactly 11 ASCII digits (V-COTRN00C-001,
-    /// `no-message (E-49)`): 400 `INVALID` with an empty message and no field.
+    /// A filter longer than 11 characters, blank ones included, fails
+    /// [`check`](Self::check) before the blank test; any other non-blank
+    /// filter that is not exactly 11 ASCII digits fails the digit test
+    /// (V-COTRN00C-001, `no-message (E-49)`). Both answer 400 `INVALID` with an
+    /// empty message and no field.
     pub fn into_input(
         self,
         start_key: Option<String>,
         direction: Direction,
         page_size: u16,
     ) -> Result<TransactionListInput, ApiError> {
+        self.check()?;
         let account_id = match self.account_id.as_deref() {
             Some(entered) if !is_blank(entered) => Some(account_filter(entered)?),
             Some(_) | None => None,
@@ -453,8 +474,13 @@ impl fmt::Debug for TransactionResponse {
 /// A missing, `null` or empty member is the blank field the COBOL answers
 /// with its `can NOT be empty` message (V-COTRN02C-003, V-COTRN02C-008 to
 /// V-COTRN02C-018). The account ID is used when entered, otherwise the card
-/// number. Every member is limited to its map field's width; the formats are
-/// the rule's edits, so that a malformed entry gets its audited message.
+/// number. Every member is limited to its map field's width, and the source,
+/// description and merchant name, city and zip to ASCII characters; the
+/// formats are the rule's edits, so that a malformed entry gets its audited
+/// message. The published `pattern` of a code, amount, date or merchant ID is
+/// the form its edit accepts (V-COTRN02C-019 to V-COTRN02C-023,
+/// V-COTRN02C-026); the dates' is their shape only, the calendar check being
+/// `CSUTLDTC`'s (V-COTRN02C-024, V-COTRN02C-025).
 ///
 /// It also serializes, so a client builds the bodies it sends from it.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema, Validate)]
@@ -472,60 +498,67 @@ pub struct TransactionAddRequest {
     pub card_number: Option<String>,
     /// `TTYPCD` (`TTYPCDI X(2)`): the transaction type code, 2 digits.
     #[serde(default)]
-    #[schema(max_length = 2)]
+    // V-COTRN02C-019: `TTYPCDI IS NUMERIC`.
+    #[schema(max_length = 2, pattern = "^[0-9]{2}$")]
     #[validate(length(max = 2))]
     pub tran_type_cd: Option<String>,
     /// `TCATCD` (`TCATCDI X(4)`): the transaction category code, 4 digits.
     #[serde(default)]
-    #[schema(max_length = 4)]
+    // V-COTRN02C-020: `TCATCDI IS NUMERIC`.
+    #[schema(max_length = 4, pattern = "^[0-9]{4}$")]
     #[validate(length(max = 4))]
     pub tran_cat_cd: Option<String>,
-    /// `TRNSRC` (`TRNSRCI X(10)`): the source.
+    /// `TRNSRC` (`TRNSRCI X(10)`): the source, ASCII characters only.
     #[serde(default)]
-    #[schema(max_length = 10)]
-    #[validate(length(max = 10))]
+    #[schema(max_length = 10, pattern = r"^[\x00-\x7F]*$")]
+    #[validate(length(max = 10), custom(function = "crate::dto::ascii_text"))]
     pub tran_source: Option<String>,
-    /// `TDESC` (`TDESCI X(60)`): the description.
+    /// `TDESC` (`TDESCI X(60)`): the description, ASCII characters only.
     #[serde(default)]
-    #[schema(max_length = 60)]
-    #[validate(length(max = 60))]
+    #[schema(max_length = 60, pattern = r"^[\x00-\x7F]*$")]
+    #[validate(length(max = 60), custom(function = "crate::dto::ascii_text"))]
     pub tran_desc: Option<String>,
     /// `TRNAMT` (`TRNAMTI X(12)`): the amount as text in the form
     /// `-99999999.99`, a sign, eight digits, a point and two digits, such as
     /// `-00000012.34`.
     #[serde(default)]
-    #[schema(max_length = 12)]
+    // V-COTRN02C-021: `(1:1)` sign, `(2:8)` digits, `(10:1)` point, `(11:2)`
+    // digits.
+    #[schema(max_length = 12, pattern = r"^[+-][0-9]{8}\.[0-9]{2}$")]
     #[validate(length(max = 12))]
     pub tran_amt: Option<String>,
     /// `TORIGDT` (`TORIGDTI X(10)`): the origination date, `YYYY-MM-DD`.
     #[serde(default)]
-    #[schema(max_length = 10)]
+    // V-COTRN02C-022: digits and dashes in the `YYYY-MM-DD` positions only.
+    #[schema(max_length = 10, pattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$")]
     #[validate(length(max = 10))]
     pub tran_orig_date: Option<String>,
     /// `TPROCDT` (`TPROCDTI X(10)`): the processing date, `YYYY-MM-DD`.
     #[serde(default)]
-    #[schema(max_length = 10)]
+    // V-COTRN02C-023: digits and dashes in the `YYYY-MM-DD` positions only.
+    #[schema(max_length = 10, pattern = "^[0-9]{4}-[0-9]{2}-[0-9]{2}$")]
     #[validate(length(max = 10))]
     pub tran_proc_date: Option<String>,
     /// `MID` (`MIDI X(9)`): the merchant ID, 9 digits.
     #[serde(default)]
-    #[schema(max_length = 9)]
+    // V-COTRN02C-026: `MIDI IS NUMERIC`.
+    #[schema(max_length = 9, pattern = "^[0-9]{9}$")]
     #[validate(length(max = 9))]
     pub tran_merchant_id: Option<String>,
-    /// `MNAME` (`MNAMEI X(30)`): the merchant name.
+    /// `MNAME` (`MNAMEI X(30)`): the merchant name, ASCII characters only.
     #[serde(default)]
-    #[schema(max_length = 30)]
-    #[validate(length(max = 30))]
+    #[schema(max_length = 30, pattern = r"^[\x00-\x7F]*$")]
+    #[validate(length(max = 30), custom(function = "crate::dto::ascii_text"))]
     pub tran_merchant_name: Option<String>,
-    /// `MCITY` (`MCITYI X(25)`): the merchant city.
+    /// `MCITY` (`MCITYI X(25)`): the merchant city, ASCII characters only.
     #[serde(default)]
-    #[schema(max_length = 25)]
-    #[validate(length(max = 25))]
+    #[schema(max_length = 25, pattern = r"^[\x00-\x7F]*$")]
+    #[validate(length(max = 25), custom(function = "crate::dto::ascii_text"))]
     pub tran_merchant_city: Option<String>,
-    /// `MZIP` (`MZIPI X(10)`): the merchant zip.
+    /// `MZIP` (`MZIPI X(10)`): the merchant zip, ASCII characters only.
     #[serde(default)]
-    #[schema(max_length = 10)]
-    #[validate(length(max = 10))]
+    #[schema(max_length = 10, pattern = r"^[\x00-\x7F]*$")]
+    #[validate(length(max = 10), custom(function = "crate::dto::ascii_text"))]
     pub tran_merchant_zip: Option<String>,
     /// `CONFIRM` (`CONFIRMI X(1)`): `Y` adds the transaction; `N` or blank asks
     /// for confirmation (V-COTRN02C-027) and any other value is rejected
@@ -537,13 +570,21 @@ pub struct TransactionAddRequest {
 }
 
 impl TransactionAddRequest {
-    /// The length check of every member against its map field's width.
+    /// The checks of the entry as a 3270 map could hold it: every member
+    /// within its map field's width, and the five free-text members the rule
+    /// moves byte for byte into `X(n)` fields (`TRNSRC`, `TDESC`, `MNAME`,
+    /// `MCITY`, `MZIP`) ASCII, through [`ascii_text`](crate::dto::ascii_text).
+    ///
+    /// Blank members, `SPACES` or `LOW-VALUES` included, pass: the rule answers
+    /// them with their `can NOT be empty` messages (V-COTRN02C-008 to
+    /// V-COTRN02C-018).
     ///
     /// # Errors
     ///
-    /// 400 `INVALID` with an empty message, the audit having no over-length
-    /// row for `COTRN02C`, and one [`TransactionAddField`] entry per member
-    /// longer than its width, in screen order.
+    /// 400 `INVALID` with an empty message, the audit having no over-length or
+    /// non-ASCII row for `COTRN02C` (E-49), and one [`TransactionAddField`]
+    /// entry per member that is longer than its width or, among the five, holds
+    /// a non-ASCII character, in screen order.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate()
             .map_err(|errors| reject_invalid(&errors, TransactionAddField::of_member, NO_MESSAGE))
@@ -633,13 +674,14 @@ mod tests {
 
     use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
-    use carddemo_domain::entities::Transaction;
+    use carddemo_domain::entities::{CardXref, Transaction};
+    use carddemo_domain::error::DomainError;
     use carddemo_domain::messages;
     use carddemo_domain::numeric::{
-        AccountId, Alnum, CardNumber, MerchantId, Money, TranCategoryCode, TranId, TranTypeCode,
-        TransactionRowId,
+        AccountId, Alnum, CardNumber, CustomerId, MerchantId, Money, TranCategoryCode, TranId,
+        TranTypeCode, TransactionRowId,
     };
-    use carddemo_domain::ports::Direction;
+    use carddemo_domain::ports::{Direction, PortError, PortResult, XrefReader};
     use carddemo_domain::rules::transaction_add::{self, TransactionAddInput};
     use carddemo_domain::rules::transaction_list::{self, TransactionListInput};
     use carddemo_domain::rules::{Confirm, transaction_view};
@@ -673,6 +715,39 @@ mod tests {
         ("tran_merchant_city", "MCITY", 25),
         ("tran_merchant_zip", "MZIP", 10),
         ("confirm", "CONFIRM", 1),
+    ];
+
+    /// The `pattern` the API document publishes for each of the
+    /// [`ADD_MEMBERS`], in the same order: the form the class or format edit
+    /// accepts (V-COTRN02C-019 to V-COTRN02C-023, V-COTRN02C-026), ASCII for
+    /// the free-text members, and none for the key fields and the
+    /// confirmation, whose edits depend on another member or answer a blank
+    /// or `N` with a message.
+    const ADD_PATTERNS: [(&str, Option<&str>); 14] = [
+        ("account_id", None),
+        ("card_number", None),
+        ("tran_type_cd", Some("^[0-9]{2}$")),
+        ("tran_cat_cd", Some("^[0-9]{4}$")),
+        ("tran_source", Some(r"^[\x00-\x7F]*$")),
+        ("tran_desc", Some(r"^[\x00-\x7F]*$")),
+        ("tran_amt", Some(r"^[+-][0-9]{8}\.[0-9]{2}$")),
+        ("tran_orig_date", Some("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
+        ("tran_proc_date", Some("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")),
+        ("tran_merchant_id", Some("^[0-9]{9}$")),
+        ("tran_merchant_name", Some(r"^[\x00-\x7F]*$")),
+        ("tran_merchant_city", Some(r"^[\x00-\x7F]*$")),
+        ("tran_merchant_zip", Some(r"^[\x00-\x7F]*$")),
+        ("confirm", None),
+    ];
+
+    /// The [`ADD_MEMBERS`] the rule moves byte for byte into `X(n)` record
+    /// fields without a class edit, which the check keeps ASCII.
+    const ASCII_MEMBERS: [(&str, &str, usize); 5] = [
+        ("tran_source", "TRNSRC", 10),
+        ("tran_desc", "TDESC", 60),
+        ("tran_merchant_name", "MNAME", 30),
+        ("tran_merchant_city", "MCITY", 25),
+        ("tran_merchant_zip", "MZIP", 10),
     ];
 
     /// Every add field with the domain constant naming its BMS field, in
@@ -825,12 +900,238 @@ mod tests {
                 "{member}"
             );
         }
-        // The width counts characters, as the map field holds them.
+        Ok(())
+    }
+
+    #[test]
+    fn add_check_keeps_the_free_text_members_ascii_up_to_their_width() -> TestResult {
+        for (member, _, width) in ASCII_MEMBERS {
+            let printable: String = (b' '..=b'~').map(char::from).cycle().take(width).collect();
+            for accepted in [printable, "\u{7f}".to_owned(), "Cafe".to_owned()] {
+                assert!(
+                    request_with(&[member], &accepted)?.check().is_ok(),
+                    "{member} {accepted:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn add_check_names_each_free_text_member_holding_a_non_ascii_character() -> TestResult {
+        for (member, field, width) in ASCII_MEMBERS {
+            // Accented Latin-1, the first non-ASCII code point, non-Latin-1,
+            // outside the BMP, inside ASCII text, and a width of `é` that fits
+            // the length check but not the field's bytes.
+            let rejected = [
+                "\u{e9}".to_owned(),
+                "\u{80}".to_owned(),
+                "\u{20ac}".to_owned(),
+                "\u{1f600}".to_owned(),
+                "Caf\u{e9}".to_owned(),
+                "\u{e9}".repeat(width),
+            ];
+            for entered in rejected {
+                let error = request_with(&[member], &entered)?
+                    .check()
+                    .expect_err(member);
+                assert_eq!(
+                    answer(&error)?,
+                    (
+                        StatusCode::BAD_REQUEST,
+                        json!({
+                            "code": "INVALID",
+                            "message": "",
+                            "fields": [{ "field": field, "message": "" }],
+                        })
+                    ),
+                    "{member} {entered:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn add_check_lists_non_ascii_and_over_length_fields_together_in_screen_order() -> TestResult {
+        let request = TransactionAddRequest {
+            account_id: Some("9".repeat(12)),
+            tran_type_cd: Some("\u{e9}".to_owned()),
+            tran_merchant_zip: Some("\u{e9}".to_owned()),
+            tran_merchant_city: Some("\u{20ac}".to_owned()),
+            tran_merchant_name: Some("\u{e9}".repeat(31)),
+            tran_desc: Some("9".repeat(61)),
+            tran_source: Some("\u{1f600}".to_owned()),
+            ..TransactionAddRequest::default()
+        };
+        let error = request.check().expect_err("six members fail");
+        let (status, body) = answer(&error)?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["message"], json!(""));
+        // `TTYPCD` is not listed: its class edit answers "é" (V-COTRN02C-019).
+        let expected: Vec<Value> = ["ACTIDIN", "TRNSRC", "TDESC", "MNAME", "MCITY", "MZIP"]
+            .iter()
+            .map(|field| json!({ "field": field, "message": "" }))
+            .collect();
+        assert_eq!(body["fields"], Value::Array(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn add_check_passes_blank_free_text_members_to_the_rule() -> TestResult {
+        for (member, _, width) in ASCII_MEMBERS {
+            for blank in [String::new(), " ".repeat(width), "\0".repeat(width)] {
+                assert!(
+                    request_with(&[member], &blank)?.check().is_ok(),
+                    "{member} {blank:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The body of an add of account 1 that every `COTRN02C` edit accepts.
+    fn valid_add_body() -> Value {
+        json!({
+            "account_id": "00000000001",
+            "tran_type_cd": "01",
+            "tran_cat_cd": "0001",
+            "tran_source": "POS TERM",
+            "tran_desc": "Purchase at Abshire-Lowe",
+            "tran_amt": "-00000012.34",
+            "tran_orig_date": "2022-07-01",
+            "tran_proc_date": "2022-07-02",
+            "tran_merchant_id": "800000000",
+            "tran_merchant_name": "Abshire-Lowe",
+            "tran_merchant_city": "North Enoshaven",
+            "tran_merchant_zip": "72112",
+            "confirm": "Y",
+        })
+    }
+
+    /// A cross-reference file of one record, the rule test's: account 1 and
+    /// card [`CARD`].
+    struct OneXref(CardXref);
+
+    impl XrefReader for OneXref {
+        async fn read_xref_by_card(&mut self, card: CardNumber) -> PortResult<CardXref> {
+            if card == self.0.xref_card_num {
+                Ok(self.0.clone())
+            } else {
+                Err(PortError::NotFound)
+            }
+        }
+
+        async fn read_xref_by_account(&mut self, id: AccountId) -> PortResult<CardXref> {
+            if id == self.0.xref_acct_id {
+                Ok(self.0.clone())
+            } else {
+                Err(PortError::NotFound)
+            }
+        }
+
+        async fn xrefs_after(
+            &mut self,
+            _after: Option<CardNumber>,
+            _limit: u16,
+        ) -> PortResult<Vec<CardXref>> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    // V-COTRN02C-001, V-COTRN02C-002, V-COTRN02C-019 to V-COTRN02C-023,
+    // V-COTRN02C-026, V-COTRN02C-028: the members with a class or format edit
+    // need no ASCII check, because that edit rejects a non-ASCII entry.
+    #[tokio::test]
+    async fn add_rule_answers_non_ascii_format_members_with_their_audited_message() -> TestResult {
+        let mut store = OneXref(CardXref {
+            xref_card_num: CardNumber::move_from(CARD),
+            xref_cust_id: CustomerId::new(1)?,
+            xref_acct_id: AccountId::new(1)?,
+        });
+        let valid = valid_add_body();
+        let request: TransactionAddRequest = serde_json::from_value(valid.clone())?;
+        request.check()?;
         assert!(
-            request_with(&["tran_desc"], &"é".repeat(60))?
-                .check()
+            transaction_add::validate(&mut store, request.into_input())
+                .await
                 .is_ok()
         );
+        // (member, value, message, BMS field)
+        let cases = [
+            (
+                "account_id",
+                Value::from("\u{e9}"),
+                messages::ACCOUNT_ID_MUST_BE_NUMERIC,
+                transaction_add::FIELD_ACTIDIN,
+            ),
+            (
+                "card_number",
+                Value::from("\u{20ac}"),
+                messages::CARD_NUMBER_MUST_BE_NUMERIC,
+                transaction_add::FIELD_CARDNIN,
+            ),
+            (
+                "tran_type_cd",
+                Value::from("\u{e9}"),
+                messages::TYPE_CD_MUST_BE_NUMERIC,
+                transaction_add::FIELD_TTYPCD,
+            ),
+            (
+                "tran_cat_cd",
+                Value::from("00\u{e9}"),
+                messages::CATEGORY_CD_MUST_BE_NUMERIC,
+                transaction_add::FIELD_TCATCD,
+            ),
+            (
+                "tran_amt",
+                Value::from("-0000001\u{e9}.34"),
+                messages::AMOUNT_SHOULD_BE_IN_FORMAT,
+                transaction_add::FIELD_TRNAMT,
+            ),
+            (
+                "tran_orig_date",
+                Value::from("2022-07-\u{e9}"),
+                messages::ORIG_DATE_SHOULD_BE_IN_FORMAT,
+                transaction_add::FIELD_TORIGDT,
+            ),
+            (
+                "tran_proc_date",
+                Value::from("\u{1f600}"),
+                messages::PROC_DATE_SHOULD_BE_IN_FORMAT,
+                transaction_add::FIELD_TPROCDT,
+            ),
+            (
+                "tran_merchant_id",
+                Value::from("80000000\u{e9}"),
+                messages::MERCHANT_ID_MUST_BE_NUMERIC,
+                transaction_add::FIELD_MID,
+            ),
+            (
+                "confirm",
+                Value::from("\u{e9}"),
+                messages::INVALID_VALUE_VALID_VALUES_ARE_Y_N,
+                transaction_add::FIELD_CONFIRM,
+            ),
+        ];
+        for (member, value, message, field) in cases {
+            let mut body = valid.clone();
+            body[member] = value;
+            if member == "card_number" {
+                // The card number is edited only without an account ID.
+                body["account_id"] = Value::from("");
+            }
+            let request: TransactionAddRequest = serde_json::from_value(body)?;
+            request.check()?;
+            let error = transaction_add::validate(&mut store, request.into_input())
+                .await
+                .expect_err(member);
+            assert_eq!(
+                error,
+                DomainError::invalid(message).with_field(field),
+                "{member}"
+            );
+        }
         Ok(())
     }
 
@@ -854,10 +1155,14 @@ mod tests {
     #[test]
     fn add_schema_publishes_each_map_width_and_requires_nothing() -> TestResult {
         let schema = serde_json::to_value(TransactionAddRequest::schema())?;
-        for (member, _, width) in ADD_MEMBERS {
+        for ((member, _, width), (patterned, pattern)) in ADD_MEMBERS.into_iter().zip(ADD_PATTERNS)
+        {
+            assert_eq!(patterned, member);
+            let property = &schema["properties"][member];
+            assert_eq!(property["maxLength"], json!(width), "{member}");
             assert_eq!(
-                schema["properties"][member]["maxLength"],
-                json!(width),
+                property.get("pattern"),
+                pattern.map(Value::from).as_ref(),
                 "{member}"
             );
         }
@@ -937,7 +1242,14 @@ mod tests {
 
     #[test]
     fn list_filter_absent_or_blank_lists_every_transaction() -> TestResult {
-        for entered in [None, Some(""), Some("   "), Some("\0\0")] {
+        for entered in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("\0\0"),
+            Some("           "),
+            Some("\0\0\0\0\0\0\0\0\0\0\0"),
+        ] {
             let query = TransactionListQuery {
                 account_id: entered.map(str::to_owned),
             };
@@ -979,6 +1291,8 @@ mod tests {
             "0000000001 ",
             "+0000000001",
             "0000000000١",
+            "            ",
+            "\0\0\0\0\0\0\0\0\0\0\0\0",
         ] {
             let query = TransactionListQuery {
                 account_id: Some(entered.to_owned()),

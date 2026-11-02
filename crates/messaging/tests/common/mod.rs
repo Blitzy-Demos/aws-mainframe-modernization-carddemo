@@ -31,6 +31,7 @@ use std::io;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
+use carddemo_domain::clock::AnyClock;
 use carddemo_messaging::Running;
 use carddemo_persistence::Db;
 use carddemo_runtime::config::{Settings, keys};
@@ -204,13 +205,13 @@ impl Harness {
     ///
     /// # Panics
     ///
-    /// Panics if the containers do not start, the seed fails, the settings or
-    /// the telemetry cannot be built, the consumers do not start, the client
-    /// connection or channel cannot be opened, opening the test channel or
-    /// putting it in confirm mode takes more than 30 seconds each, or a request
-    /// queue reports no consumer within 30 seconds, which also bound the broker
-    /// operations of its probes. An expiry names the operation and its queue
-    /// or channel.
+    /// Panics if the containers do not start, the seed fails, the settings,
+    /// the clock or the telemetry cannot be built, the consumers do not start,
+    /// the client connection or channel cannot be opened, opening the test
+    /// channel or putting it in confirm mode takes more than 30 seconds each,
+    /// or a request queue reports no consumer within 30 seconds, which also
+    /// bound the broker operations of its probes. An expiry names the
+    /// operation and its queue or channel.
     pub async fn start(clock_override: Option<&str>) -> Self {
         let stack = TestStack::with_rabbitmq().await;
         stack.seed().await.expect("seed the test database");
@@ -221,6 +222,10 @@ impl Harness {
             _ => None,
         })
         .expect("resolve the test settings");
+        // Parsed once from the settings, as the `mq` binary does before it
+        // connects.
+        let clock = AnyClock::from_override(settings.clock_override.as_deref())
+            .expect("parse the test clock override");
         let db = Db::from_pool(stack.pool().clone());
 
         let buffer = Arc::new(Mutex::new(Vec::new()));
@@ -234,7 +239,7 @@ impl Harness {
         // spawns every consumer task with the dispatcher current at the spawn,
         // so the tasks keep writing here, and no process-wide subscriber mixes
         // the lines of tests that run in parallel.
-        let running = carddemo_messaging::start(&settings, db.clone())
+        let running = carddemo_messaging::start(&settings, clock, db.clone())
             .with_subscriber(subscriber)
             .await
             .expect("start the consumers");

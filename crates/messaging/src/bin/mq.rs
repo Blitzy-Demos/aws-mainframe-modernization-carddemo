@@ -9,7 +9,8 @@
 //! [app/app-vsam-mq/cbl/CODATE01.cbl:L146] [app/app-vsam-mq/cbl/COACCT01.cbl:L197].
 //! Here the three are `RabbitMQ` consumers that `carddemo_messaging::run`
 //! starts on the request queues the settings name. This binary only wires them
-//! up: settings, telemetry, the database pool, then `run`.
+//! up: settings, telemetry, the processing clock, the database pool, then
+//! `run`.
 //!
 //! # Starting
 //!
@@ -24,19 +25,26 @@
 //!
 //! # Output and exit status
 //!
-//! Standard output carries JSON lines only, written by
-//! `carddemo_runtime::telemetry`. A failure before telemetry is installed
-//! (invalid settings, telemetry setup) is one line on standard error. After
-//! that, the end of the run is the JSON event `mq stopped`, and telemetry is
-//! shut down and flushed before the process exits. The exit status is non-zero
-//! whenever the consumers stop on an error. No database or broker URL is ever
-//! written, because both carry credentials.
+//! Every diagnostic, a start-up failure included, is a JSON line on standard
+//! output from the shared telemetry formatter of `carddemo_runtime::telemetry`,
+//! and nothing is written to standard error. A failure before telemetry is
+//! installed (invalid settings, telemetry setup) is one JSON line, the ERROR
+//! event `mq start-up failed` with the failed `stage` (`configuration` or
+//! `telemetry`) and the `error`. Once telemetry is installed, the end of the
+//! run is the JSON event `mq stopped`, then telemetry is shut down and flushed
+//! before the process exits, and a failed shutdown is one more ERROR event,
+//! `telemetry shutdown failed`. The exit status is non-zero whenever start-up
+//! fails or the consumers stop on an error; a failed telemetry shutdown leaves
+//! it unchanged. No database or broker URL is ever written, because both carry
+//! credentials.
 //!
 //! A signal ends the process without settling the delivery in flight; the
 //! broker redelivers it once the connection drops.
 
+use std::fmt::Display;
 use std::process::ExitCode;
 
+use carddemo_domain::clock::AnyClock;
 use carddemo_messaging::{MessagingError, run};
 use carddemo_persistence::connect;
 use carddemo_runtime::config::Settings;
@@ -51,16 +59,14 @@ async fn main() -> ExitCode {
     let settings = match Settings::from_env() {
         Ok(settings) => settings,
         Err(error) => {
-            // No subscriber is installed yet, so standard error is the only
-            // channel that keeps standard output JSON-only.
-            eprintln!("mq: invalid configuration: {error}");
+            report_startup_failure("configuration", &error);
             return ExitCode::FAILURE;
         }
     };
     let guard = match telemetry::init(SERVICE_NAME) {
         Ok(guard) => guard,
         Err(error) => {
-            eprintln!("mq: telemetry initialisation failed: {error}");
+            report_startup_failure("telemetry", &error);
             return ExitCode::FAILURE;
         }
     };
@@ -76,19 +82,54 @@ async fn main() -> ExitCode {
         }
     };
     // Shut down after the last event, so it and every pending span are
-    // flushed. A failed shutdown goes to standard error and leaves the exit
-    // status to the consumers' outcome, which is what the status reports.
+    // flushed. The global subscriber's JSON log layer outlives the provider,
+    // so a failed shutdown is still a JSON line on standard output; it leaves
+    // the exit status to the consumers' outcome, which is what the status
+    // reports.
     if let Err(error) = guard.shutdown() {
-        eprintln!("mq: telemetry shutdown failed: {error}");
+        tracing::error!(error = %error, "telemetry shutdown failed");
     }
     code
 }
 
-/// Opens the database pool on `CARDDEMO_DATABASE_URL`, then runs the CDRD,
-/// CDRA and CP00 consumers until the first one stops.
+/// Reports a start-up failure that happens before [`telemetry::init`] has
+/// installed the process telemetry: one ERROR event, `mq start-up failed`,
+/// with the failed `stage` and the `error`, written as a JSON line on standard
+/// output by the shared telemetry formatter, like every other diagnostic of the
+/// process. Nothing is written to standard error.
 ///
-/// The startup event names the request queues only; the URLs carry
+/// The subscriber is scoped to this one event, and dropping its guard shuts
+/// its tracer provider down. `error` is a settings or telemetry error, neither
+/// of which ever holds a database or broker URL.
+fn report_startup_failure(stage: &'static str, error: &dyn Display) {
+    // The fixed directive `info` always parses, so this subscriber is always
+    // built. Were it not, no channel would be left to report on, and the exit
+    // status alone tells of the failure.
+    let Ok((subscriber, guard)) =
+        telemetry::subscriber_with_writer(SERVICE_NAME, "info", std::io::stdout)
+    else {
+        return;
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::error!(stage, error = %error, "mq start-up failed");
+    });
+    drop(guard);
+}
+
+/// Parses the processing clock from `CARDDEMO_CLOCK_OVERRIDE`, opens the
+/// database pool on `CARDDEMO_DATABASE_URL`, then runs the CDRD, CDRA and
+/// CP00 consumers on that clock until the first one stops.
+///
+/// The clock is parsed first, and only here, so an invalid override is
+/// reported before any connection attempt and an unreachable database cannot
+/// mask it. The startup event names the request queues only; the URLs carry
 /// credentials and are never logged.
+///
+/// # Errors
+///
+/// [`MessagingError::Clock`] when the override is not an RFC 3339 instant,
+/// [`MessagingError::Persistence`] when the pool cannot be opened, and any
+/// error of `run`.
 async fn serve(settings: &Settings) -> Result<(), MessagingError> {
     tracing::info!(
         service = SERVICE_NAME,
@@ -97,8 +138,9 @@ async fn serve(settings: &Settings) -> Result<(), MessagingError> {
         queue_pauth_request = %settings.queue_pauth_request,
         "mq starting"
     );
+    let clock = AnyClock::from_override(settings.clock_override.as_deref())?;
     let db = connect(&settings.database_url)
         .await
         .map_err(MessagingError::Persistence)?;
-    run(settings, db).await
+    run(settings, clock, db).await
 }

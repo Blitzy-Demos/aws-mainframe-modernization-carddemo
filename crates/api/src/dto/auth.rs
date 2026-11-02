@@ -2,8 +2,12 @@
 //! `POST /auth/logout`, replacing the `COSGN00` map (`COSGN0AI`/`COSGN0AO`
 //! [app/cpy-bms/COSGN00.CPY]) that `COSGN00C` sends and receives.
 //!
-//! [`LoginRequest`] is the only request type of the API that carries
-//! credentials (AAP 0.6.1). It holds the two map fields as typed; the
+//! [`LoginRequest`] is the only request type of the API that carries the
+//! acting user's sign-on credentials (AAP 0.6.1). The password of
+//! [`UserAddRequest`](crate::dto::admin_users::UserAddRequest) and
+//! [`UserUpdateRequest`](crate::dto::admin_users::UserUpdateRequest) is an
+//! admin-managed field of a target user on `POST`/`PUT /admin/users`, not a
+//! sign-on credential. [`LoginRequest`] holds the two map fields as typed; the
 //! upper-casing and padding of `COSGN00C` (E-20) belong to
 //! `carddemo_domain::rules::signon` and `carddemo_domain::auth`, never to the
 //! wire type. [`LoginResponse`] carries the token and what the SPA needs to
@@ -17,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use validator::Validate;
 
+use crate::auth::UserType;
 use crate::dto::{BmsField, id_string, reject_invalid, text};
 use crate::error::ApiError;
 
@@ -149,14 +154,18 @@ impl LoginResponse {
     /// sign-on whose password matched, carrying `token` and its expiry.
     ///
     /// The landing is the `XCTL` target of `IF CDEMO-USRTYP-ADMIN`
-    /// [app/cbl/COSGN00C.cbl:L230-240].
+    /// [app/cbl/COSGN00C.cbl:L230-240]. The `usr_type` is the type the token's
+    /// claim carries, by the same [`UserType::from_code`]: `A` for a stored
+    /// `A`, and `U` for every other stored code, a legacy `X` or `a` included.
     #[must_use]
     pub fn new(token: String, expires_at: DateTime<Utc>, outcome: &SignonOutcome) -> Self {
         Self {
             token,
             expires_at,
             user_id: id_string(&outcome.user_id),
-            usr_type: text(&outcome.usr_type),
+            usr_type: UserType::from_code(&text(&outcome.usr_type))
+                .as_code()
+                .to_owned(),
             landing: landing_route(outcome.landing).to_owned(),
         }
     }
@@ -348,16 +357,21 @@ mod tests {
 
     #[test]
     fn login_response_lands_by_user_type() {
-        // (user ID stored, user type, landing, expected route)
+        // (user ID stored, user type stored, landing, expected usr_type,
+        // expected route). A legacy code other than `A` is the user type `U`,
+        // the value the token's claim carries.
         let cases = [
-            ("ADMIN001", "A", Landing::AdminHome, "/admin"),
-            ("USER1", "U", Landing::UserHome, "/"),
+            ("ADMIN001", "A", Landing::AdminHome, "A", "/admin"),
+            ("USER1", "U", Landing::UserHome, "U", "/"),
+            ("USER2", "X", Landing::UserHome, "U", "/"),
+            ("USER3", "a", Landing::UserHome, "U", "/"),
+            ("USER4", "", Landing::UserHome, "U", "/"),
         ];
-        for (user_id, usr_type, landing, route) in cases {
+        for (user_id, stored_type, landing, usr_type, route) in cases {
             let response = LoginResponse::new(
                 TOKEN.to_owned(),
                 expiry(),
-                &outcome(user_id, usr_type, landing),
+                &outcome(user_id, stored_type, landing),
             );
             assert_eq!(
                 json_of(&response),
@@ -367,7 +381,8 @@ mod tests {
                     "user_id": user_id,
                     "usr_type": usr_type,
                     "landing": route,
-                })
+                }),
+                "{stored_type:?}"
             );
         }
     }

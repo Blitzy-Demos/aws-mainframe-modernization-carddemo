@@ -1,7 +1,8 @@
 // Client edits of user administration, CU00 to CU03: the COUSR00C list start key, the
 // COUSR01C add form, the COUSR02C edit form and the COUSR03C delete key. They mirror the
-// width of each BMS field and the empty-field edits of the validation audit so a form
-// never submits what the API rejects first; the API stays authoritative. Its record-state
+// width of each BMS field, the ASCII text the API requires of every member and key, and
+// the empty-field edits of the validation audit so a form never submits what the API
+// rejects first; the API stays authoritative. Its record-state
 // and I/O texts ('User ID already exist...', 'User ID NOT found...', 'Unable to ...') and
 // 'Please modify to update ...', which needs the stored user and argon2 verification
 // (E-21), come from the server only.
@@ -50,6 +51,14 @@ const WIDTH = {
   userType: 1,
 } as const;
 
+// ASCII text, the OpenAPI `pattern` of every user member, the {id} path segment and the
+// start_key parameter. The COUSR0nC programs move each value byte for byte into its
+// PIC X(n) field of SEC-USER-DATA, and a 3270 field holds one byte per character, so the
+// API refuses a character above U+007F with no message, as it refuses an over-length
+// value: the issue keeps zod's default regex text. Spaces and NUL characters are ASCII,
+// so a blank field still gets its empty-field text.
+const ASCII_TEXT = /^[\x00-\x7F]*$/;
+
 // `= SPACES OR LOW-VALUES` as a browser field meets it: a field left unentered arrives as
 // the empty string, and one holding only spaces is blank. Any other character, a tab
 // included, is entered text. A field of NUL characters cannot be typed, and the API's own
@@ -58,8 +67,9 @@ const BLANK = /^ *$/;
 
 // Adds the audited empty-field issue of `field` when its value is blank. A value longer
 // than its field already carries zod's too_big issue and gets no second one, because the
-// API answers its width check before any COBOL edit runs. Callers invoke it in the
-// program's EVALUATE order, so the issues follow the audit Order.
+// API answers its width check before any COBOL edit runs; a non-ASCII value is never
+// blank. Callers invoke it in the program's EVALUATE order, so the issues follow the
+// audit Order.
 function rejectBlank<K extends string>(
   ctx: z.RefinementCtx,
   values: Partial<Record<NoInfer<K>, string>>,
@@ -85,6 +95,7 @@ export const userListFilterSchema = z.object({
   start_key: z
     .string()
     .max(WIDTH.userId)
+    .regex(ASCII_TEXT)
     .optional()
     .transform((key) => (key === "" ? undefined : key)),
 }) satisfies z.ZodType<
@@ -110,13 +121,26 @@ export const userAddSchema = z
   .object({
     first_name: z
       .string({ required_error: USER_ADD_MESSAGES.firstNameEmpty })
-      .max(WIDTH.firstName),
-    last_name: z.string({ required_error: USER_ADD_MESSAGES.lastNameEmpty }).max(WIDTH.lastName),
-    user_id: z.string({ required_error: USER_ADD_MESSAGES.userIdEmpty }).max(WIDTH.userId),
-    password: z.string({ required_error: USER_ADD_MESSAGES.passwordEmpty }).max(WIDTH.password),
+      .max(WIDTH.firstName)
+      .regex(ASCII_TEXT),
+    last_name: z
+      .string({ required_error: USER_ADD_MESSAGES.lastNameEmpty })
+      .max(WIDTH.lastName)
+      .regex(ASCII_TEXT),
+    user_id: z
+      .string({ required_error: USER_ADD_MESSAGES.userIdEmpty })
+      .max(WIDTH.userId)
+      .regex(ASCII_TEXT),
+    password: z
+      .string({ required_error: USER_ADD_MESSAGES.passwordEmpty })
+      .max(WIDTH.password)
+      .regex(ASCII_TEXT),
     // Not limited to A and U: COUSR01C edits only for blank and stores any other value as
-    // entered, and the OpenAPI member declares no enum or pattern.
-    usr_type: z.string({ required_error: USER_ADD_MESSAGES.userTypeEmpty }).max(WIDTH.userType),
+    // entered, and the OpenAPI member declares no enum, only the ASCII pattern.
+    usr_type: z
+      .string({ required_error: USER_ADD_MESSAGES.userTypeEmpty })
+      .max(WIDTH.userType)
+      .regex(ASCII_TEXT),
   })
   .superRefine((values, ctx) => {
     rejectBlank(ctx, values, "first_name", WIDTH.firstName, USER_ADD_MESSAGES.firstNameEmpty);
@@ -150,19 +174,25 @@ export const userAddBmsFieldMap: Record<
 // unchanged; switched on, it is required, as the COBOL empty edit requires the field.
 export const userUpdateSchema = z
   .object({
-    user_id: z.string({ required_error: USER_UPDATE_MESSAGES.userIdEmpty }).max(WIDTH.userId),
+    user_id: z
+      .string({ required_error: USER_UPDATE_MESSAGES.userIdEmpty })
+      .max(WIDTH.userId)
+      .regex(ASCII_TEXT),
     first_name: z
       .string({ required_error: USER_UPDATE_MESSAGES.firstNameEmpty })
-      .max(WIDTH.firstName),
+      .max(WIDTH.firstName)
+      .regex(ASCII_TEXT),
     last_name: z
       .string({ required_error: USER_UPDATE_MESSAGES.lastNameEmpty })
-      .max(WIDTH.lastName),
+      .max(WIDTH.lastName)
+      .regex(ASCII_TEXT),
     change_password: z.boolean().default(false),
-    password: z.string().max(WIDTH.password).optional(),
-    // Any non-blank value, as for the add form: COUSR02C edits only for blank.
+    password: z.string().max(WIDTH.password).regex(ASCII_TEXT).optional(),
+    // Any non-blank ASCII value, as for the add form: COUSR02C edits only for blank.
     usr_type: z
       .string({ required_error: USER_UPDATE_MESSAGES.userTypeEmpty })
-      .max(WIDTH.userType),
+      .max(WIDTH.userType)
+      .regex(ASCII_TEXT),
   })
   .superRefine((values, ctx) => {
     rejectBlank(ctx, values, "user_id", WIDTH.userId, USER_UPDATE_MESSAGES.userIdEmpty);
@@ -209,7 +239,10 @@ export const userUpdateBmsFieldMap: Record<
 
 export const userDeleteKeySchema = z
   .object({
-    user_id: z.string({ required_error: USER_DELETE_MESSAGES.userIdEmpty }).max(WIDTH.userId),
+    user_id: z
+      .string({ required_error: USER_DELETE_MESSAGES.userIdEmpty })
+      .max(WIDTH.userId)
+      .regex(ASCII_TEXT),
   })
   .superRefine((values, ctx) => {
     rejectBlank(ctx, values, "user_id", WIDTH.userId, USER_DELETE_MESSAGES.userIdEmpty);

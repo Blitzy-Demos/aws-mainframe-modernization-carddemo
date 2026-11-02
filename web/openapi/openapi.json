@@ -15,8 +15,8 @@
         "tags": [
           "accounts"
         ],
-        "summary": "COACTVWC 2000-PROCESS-INPUTS, 9000-READ-ACCT, 1200-SETUP-SCREEN-VARS —\nP-COACTVWC-004 to P-COACTVWC-011, P-COACTVWC-014, P-COACTVWC-015,\nP-COACTVWC-019 to P-COACTVWC-021, P-COACTVWC-025, P-COACTVWC-030,\nV-COACTVWC-001 to V-COACTVWC-008",
-        "description": "`GET /accounts/{id}` (CAVW): the account number `{id}` as entered, edited\nand read by `account_view::view` (the card cross-reference through\n`CXACAIX`, then the account, then the customer) in a unit of work that is\nrolled back once the reads are done. The answer carries the account and\ncustomer records, the account's first card number and the version token\n`PUT /accounts/{id}` echoes back. A successful view shows no message\n(P-COACTVWC-025).\n\n# Errors\n\n- 400 at `ACCTSID` when the number is blank, spaces or `*`\n  (V-COACTVWC-001), or is not 11 digits or is zero (V-COACTVWC-002).\n- 404 at `ACCTSID` when the cross-reference, the account or the customer\n  is not on file (V-COACTVWC-003, V-COACTVWC-005, V-COACTVWC-007).\n- 500 at `ACCTSID` with the file-error text when a read fails otherwise\n  (V-COACTVWC-004, V-COACTVWC-006, V-COACTVWC-008), and 500 with\n  [`messages::UNEXPECTED_ERROR`] when the database is unavailable.\n- 401 from [`AuthUser`] for a request without a valid bearer token.",
+        "summary": "COACTVWC 2000-PROCESS-INPUTS, 9000-READ-ACCT, 1200-SETUP-SCREEN-VARS,\n1400-SEND-SCREEN, COMMON-RETURN — P-COACTVWC-004 to P-COACTVWC-012,\nP-COACTVWC-014, P-COACTVWC-015, P-COACTVWC-018 to P-COACTVWC-021,\nP-COACTVWC-025, P-COACTVWC-030, V-COACTVWC-001 to V-COACTVWC-008",
+        "description": "`GET /accounts/{id}` (CAVW): the account number `{id}` as entered, edited\nand read by `account_view::view` (the card cross-reference through\n`CXACAIX`, then the account, then the customer) in a unit of work that is\nrolled back once the reads are done. The answer carries the account and\ncustomer records, the account's first card number and the version token\n`PUT /accounts/{id}` echoes back. A successful view shows no message\n(P-COACTVWC-025).\n\n# Errors\n\n- 400 at `ACCTSID` when the number is blank, spaces or `*`\n  (V-COACTVWC-001), or is not 11 digits or is zero (V-COACTVWC-002), a\n  segment longer than its published 11-character `maxLength` included.\n- 404 at `ACCTSID` when the cross-reference, the account or the customer\n  is not on file (V-COACTVWC-003, V-COACTVWC-005, V-COACTVWC-007).\n- 500 at `ACCTSID` with the file-error text when a read fails otherwise\n  (V-COACTVWC-004, V-COACTVWC-006, V-COACTVWC-008), and 500 with\n  [`messages::UNEXPECTED_ERROR`] when the database is unavailable.\n- 401 from [`AuthUser`] for a request without a valid bearer token.",
         "operationId": "get_account",
         "parameters": [
           {
@@ -25,7 +25,8 @@
             "description": "ACCT-ID 9(11) as entered",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 11
             }
           }
         ],
@@ -92,7 +93,7 @@
           "accounts"
         ],
         "summary": "COACTUPC 0000-MAIN, 2000-DECIDE-ACTION, 1200-EDIT-MAP-INPUTS /\n9600-WRITE-PROCESSING — P-COACTUPC-003 to P-COACTUPC-015, P-COACTUPC-018\nto P-COACTUPC-033, P-COACTUPC-043 to P-COACTUPC-045, P-COACTUPC-047 to\nP-COACTUPC-050, V-COACTUPC-001 to V-COACTUPC-128",
-        "description": "`PUT /accounts/{id}` (CAUP): the fetch, the edits and the write of the\nthree `COACTUPC` turns in one request, in the order the validation audit\nranks their messages:\n\n1. the BMS field lengths of the body, then its `version` token\n   (V-COACTUPC-001), before any COBOL edit;\n2. the account number `{id}` and the fetch, `load_snapshot`;\n3. `account_update::validate` against the fetched records, with the\n   processing clock's date as `FUNCTION CURRENT-DATE`: the comparison\n   with the fetched values, then every `1200-EDIT-MAP-INPUTS` edit in\n   COBOL order, the first failing edit supplying the message;\n4. for a change that passed every edit, the locked reads, the change\n   check and the two rewrites (`persist`).\n\nSteps 1 to 3 write nothing, and their unit of work is rolled back. The\nanswer is 200 with the records as they now stand, their version token and\nthe text `COACTUPC` shows: [`messages::CHANGES_COMMITTED_TO_DATABASE`]\nafter both rewrites (P-COACTUPC-015), or\n[`messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED`] when the\nbody repeats the fetched values (V-COACTUPC-010).\n\n# Errors\n\n- 400 with [`MISSING_VERSION_MESSAGE`] and no fields when `version` is\n  missing or malformed (V-COACTUPC-001), and 400 with no message naming\n  each body field longer than its BMS field.\n- 400 at `ACCTSID` for a blank, non-numeric or zero account number\n  (V-COACTUPC-002, V-COACTUPC-003), and 400 at the flagged fields for the\n  first failing field edit (V-COACTUPC-011 to V-COACTUPC-123).\n- 404 or 500 at `ACCTSID` when the fetch finds no record or a read fails\n  (V-COACTUPC-004 to V-COACTUPC-009).\n- 409 at `ACCTSID` with [`messages::RECORD_CHANGED_BY_SOME_ONE_ELSE`]\n  when the locked records differ from the token's (V-COACTUPC-126).\n- 500 at `ACCTSID` when a lock or a rewrite fails (V-COACTUPC-124,\n  V-COACTUPC-125, V-COACTUPC-127, V-COACTUPC-128); after a failed customer\n  rewrite the account rewrite stays committed (P-COACTUPC-014).\n- 500 with [`messages::UNEXPECTED_ERROR`] for an input class held at\n  `halt` (E-26, E-40, E-47, E-74), and when the database or the commit\n  fails.\n- 401 from [`AuthUser`] for a request without a valid bearer token.",
+        "description": "`PUT /accounts/{id}` (CAUP): the fetch, the edits and the write of the\nthree `COACTUPC` turns in one request, in the order the validation audit\nranks their messages:\n\n1. the BMS field lengths of the body and of the `{id}` segment\n   (`ACCTSIDI X(11)`), then the body's `version` token (V-COACTUPC-001),\n   before any COBOL edit and before the unit of work opens;\n2. the account number `{id}` and the fetch, `load_snapshot`;\n3. `account_update::validate` against the fetched records, with the\n   processing clock's date as `FUNCTION CURRENT-DATE`: the comparison\n   with the fetched values, then every `1200-EDIT-MAP-INPUTS` edit in\n   COBOL order, the first failing edit supplying the message;\n4. for a change that passed every edit, the locked reads, the change\n   check and the two rewrites (`persist`).\n\nSteps 1 to 3 write nothing, and their unit of work is rolled back. The\nanswer is 200 with the records as they now stand, their version token and\nthe text `COACTUPC` shows: [`messages::CHANGES_COMMITTED_TO_DATABASE`]\nafter both rewrites (P-COACTUPC-015), or\n[`messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED`] when the\nbody repeats the fetched values (V-COACTUPC-010).\n\n# Errors\n\n- 400 with [`MISSING_VERSION_MESSAGE`] and no fields when `version` is\n  missing or malformed (V-COACTUPC-001), and 400 with no message naming\n  each body field longer than its BMS field and `ACCTSID` for an `{id}`\n  segment longer than 11 characters, which `1210-EDIT-ACCOUNT` would\n  otherwise see cut to the account its first 11 characters name.\n- 400 at `ACCTSID` for a blank, non-numeric or zero account number\n  (V-COACTUPC-002, V-COACTUPC-003), and 400 at the flagged fields for the\n  first failing field edit (V-COACTUPC-011 to V-COACTUPC-123).\n- 404 or 500 at `ACCTSID` when the fetch finds no record or a read fails\n  (V-COACTUPC-004 to V-COACTUPC-009).\n- 409 at `ACCTSID` with [`messages::RECORD_CHANGED_BY_SOME_ONE_ELSE`]\n  when the locked records differ from the token's (V-COACTUPC-126).\n- 500 at `ACCTSID` when a lock or a rewrite fails (V-COACTUPC-124,\n  V-COACTUPC-125, V-COACTUPC-127, V-COACTUPC-128); after a failed customer\n  rewrite the account rewrite stays committed (P-COACTUPC-014).\n- 500 with [`messages::UNEXPECTED_ERROR`] for an input class held at\n  `halt` (E-26, E-40, E-47, E-74), and when the database or the commit\n  fails.\n- 401 from [`AuthUser`] for a request without a valid bearer token.",
         "operationId": "update_account",
         "parameters": [
           {
@@ -101,7 +102,8 @@
             "description": "ACCT-ID 9(11) as entered",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 11
             }
           }
         ],
@@ -127,7 +129,7 @@
             }
           },
           "400": {
-            "description": "A body field longer than its BMS field, a missing or malformed version token (V-COACTUPC-001), or a failed key or field edit (V-COACTUPC-002, V-COACTUPC-003, V-COACTUPC-011 to V-COACTUPC-123)",
+            "description": "A body field longer than its BMS field or an id longer than 11 characters (no message, fields name each), a missing or malformed version token (V-COACTUPC-001), or a failed key or field edit (1210-EDIT-ACCOUNT: V-COACTUPC-002, V-COACTUPC-003; V-COACTUPC-011 to V-COACTUPC-123)",
             "content": {
               "application/json": {
                 "schema": {
@@ -499,7 +501,7 @@
           "admin-transaction-types"
         ],
         "summary": "Lists the transaction types that pass the filters: one page from\n`start_key` in `direction` (CTLI ENTER, F8 and F7).",
-        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,\nV-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,\nV-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. An empty result and a page boundary are 200\nwith the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 for a filter longer than its BMS field or a malformed query, and\n  for a type code filter that is not two digits, on `TRTYPE`\n  (V-COTRTLIC-001).\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002).\n- 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,\n  V-COTRTLIC-026), with the no-records text when the filter count fails\n  (V-COTRTLIC-028), and with `Unexpected error` when the database cannot\n  be reached.",
+        "description": "COTRTLIC 1200-EDIT-INPUTS, 1290-CROSS-EDITS, 8000-READ-FORWARD,\n8100-READ-BACKWARDS, 2500-SETUP-MESSAGE — P-COTRTLIC-003, P-COTRTLIC-004,\nP-COTRTLIC-022, P-COTRTLIC-030 to P-COTRTLIC-034, P-COTRTLIC-036,\nV-COTRTLIC-001, V-COTRTLIC-002, V-COTRTLIC-004, V-COTRTLIC-005,\nV-COTRTLIC-008, V-COTRTLIC-009, V-COTRTLIC-024, V-COTRTLIC-026,\nV-COTRTLIC-028; 2600-SEND-SCREEN — P-COTRTLIC-029: the HTTP response\nreplaces the 3270 send of the `CTRTLIA` map, a mandated deviation.\n\nA page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,\nin ascending type code order. Without `start_key` both directions read\nthe first page from the start of the table: backward is F7 on the first\npage, which re-reads that page with `No previous pages to display`\n(P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are\n200 with the COBOL text in `message` (E-54).\n\n# Errors\n\n- 400 with an empty message for a filter longer than its BMS field or a\n  description filter not in ASCII, on `TRTYPE` or `TRDESC`, and for a\n  `start_key` longer than two characters or not in ASCII, on no field;\n  400 for a malformed query; and 400 for a type code filter that is not\n  two digits, on `TRTYPE` (V-COTRTLIC-001). The filters are checked\n  first, then the start key, before the master is read.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type passes the filters (V-COTRTLIC-002).\n- 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,\n  V-COTRTLIC-026), with the no-records text when the filter count fails\n  (V-COTRTLIC-028), and with `Unexpected error` when the database cannot\n  be reached.",
         "operationId": "list_tran_types",
         "parameters": [
           {
@@ -509,32 +511,36 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 2
+              "maxLength": 2,
+              "pattern": "^(?: {0,2}|\\x00{2}|[0-9]{2})$"
             }
           },
           {
             "name": "description",
             "in": "query",
-            "description": "The description filter, `TRDESC` `X(50)`: the types whose description\ncontains this text, its leading and trailing spaces dropped.",
+            "description": "The description filter, `TRDESC` `X(50)` in ASCII: the types whose\ndescription contains this text, its leading and trailing spaces\ndropped.",
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 50
+              "maxLength": 50,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           },
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward and the last page backward.",
+            "description": "The type code the page starts from, `X(2)` in ASCII: a previous\npage's `next_key` or `prev_key`. Forward (F8), the page starts at that\ncode, inclusive; backward (F7), it holds the types before it. Absent,\nempty, all spaces or all low-values is no key: both directions read\nthe first page, backward with `No previous pages to display`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 2,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           },
           {
             "name": "direction",
             "in": "query",
-            "description": "`forward` (next page, the default) or `backward` (previous page).",
+            "description": "`forward` (ENTER and F8, the default) or `backward` (F7).",
             "required": false,
             "schema": {
               "type": "string",
@@ -548,7 +554,7 @@
           {
             "name": "page_size",
             "in": "query",
-            "description": "Rows on the page, from 1 to 100. Defaults to the rows of the list's\nscreen.",
+            "description": "Rows on the page, from 1 to 100. Defaults to 7, the rows of the\n`COTRTLI` screen.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -570,7 +576,7 @@
             }
           },
           "400": {
-            "description": "A filter or the query is invalid",
+            "description": "A filter or the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed",
             "content": {
               "application/json": {
                 "schema": {
@@ -718,17 +724,18 @@
           "admin-transaction-types"
         ],
         "summary": "Updates the description of the type `{id}`: without `origin` the\n`COTRTUP` maintenance screen (CTTU), with `origin=list` the inline update\nof a listed row (CTLI).",
-        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73).\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, and the key and description edits: on `TRTYPCD` or\n  `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,\n  V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014).\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
+        "description": "Without `origin`: COTRTUPC 9000-READ-TRANTYPE, 1200-EDIT-MAP-INPUTS,\n1205-COMPARE-OLD-NEW, 9600-WRITE-PROCESSING — P-COTRTUPC-007,\nP-COTRTUPC-008, P-COTRTUPC-015 to P-COTRTUPC-021, V-COTRTUPC-001 to\nV-COTRTUPC-011. A request that repeats the stored values writes nothing\nand is 200 with `No change detected with respect to values fetched.`\n(V-COTRTUPC-006); a change is committed with `Changes committed to\ndatabase`.\n\nWith `origin=list`: COTRTLIC 1211-EDIT-ARRAY-DESC, 1240-EDIT-ALPHANUM-REQD,\n9200-UPDATE-RECORD — P-COTRTLIC-009, P-COTRTLIC-010, P-COTRTLIC-013,\nP-COTRTLIC-017, P-COTRTLIC-021, V-COTRTLIC-012 to V-COTRTLIC-014,\nV-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with\n`HIGHLIGHTED row was updated`, or with `No change detected with respect to\ndatabase values.` when only the case changed, which `COTRTLIC` still\nwrites (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info\nline `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the\nupdate is stored (P-COTRTLIC-009); without `origin` there is no `info`.\n\n# Errors\n\n- 400 for a key or description longer than its BMS field, a malformed\n  query or body, and the key and description edits: on `TRTYPCD` or\n  `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,\n  V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`\n  (V-COTRTLIC-013, V-COTRTLIC-014), where a key or description holding a\n  character outside ASCII is also refused with an empty message.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).\n- 500 with the Db2 or lock text when the read or the update fails\n  (V-COTRTUPC-005, V-COTRTUPC-009 to V-COTRTUPC-011, V-COTRTLIC-017,\n  V-COTRTLIC-018); nothing is written.",
         "operationId": "update_tran_type",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The type code, `TR_TYPE`: two characters",
+            "description": "The type code, `TR_TYPE`: two ASCII characters",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 2
+              "maxLength": 2,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           },
           {
@@ -757,7 +764,7 @@
         },
         "responses": {
           "200": {
-            "description": "The description was stored, or nothing changed; `message` is the COBOL text",
+            "description": "The description was stored, or nothing changed; `message` is the COBOL text, and with `origin=list` `info` is the COTRTLIC info line",
             "content": {
               "application/json": {
                 "schema": {
@@ -828,17 +835,18 @@
           "admin-transaction-types"
         ],
         "summary": "Deletes the listed type `{id}`: the `D` selector of the `COTRTLI` list,\nconfirmed with F10 (CTLI).",
-        "description": "COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,\nV-COTRTLIC-021 to V-COTRTLIC-023\n\nThe confirmation is the dialog of the SPA. A deleted type is committed\nand answered with `HIGHLIGHTED row deleted.Hit Enter to continue` and no\ntype.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)` or a malformed path.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 with the delete-failed Db2 text when no type has the code\n  (V-COTRTLIC-022).\n- 409 with the child-records Db2 text when categories still reference the\n  type (SQLCODE -532, V-COTRTLIC-021); the type stays.\n- 500 with the delete-failed Db2 text on any other failure\n  (V-COTRTLIC-023).",
+        "description": "COTRTLIC 9300-DELETE-RECORD — P-COTRTLIC-007, P-COTRTLIC-008,\nV-COTRTLIC-021 to V-COTRTLIC-023\n\nThe confirmation is the dialog of the SPA. A deleted type is committed\nand answered with `HIGHLIGHTED row deleted.Hit Enter to continue` and no\ntype.\n\n# Errors\n\n- 400 for a key longer than the type code `X(2)` or holding a character\n  outside ASCII, or a malformed path.\n- 401 without a valid token; 403 for a token that is not an admin's.\n- 404 with the delete-failed Db2 text when no type has the code\n  (V-COTRTLIC-022).\n- 409 with the child-records Db2 text when categories still reference the\n  type (SQLCODE -532, V-COTRTLIC-021); the type stays.\n- 500 with the delete-failed Db2 text on any other failure\n  (V-COTRTLIC-023).",
         "operationId": "delete_tran_type",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The type code, `TR_TYPE`: two characters",
+            "description": "The type code, `TR_TYPE`: two ASCII characters",
             "required": true,
             "schema": {
               "type": "string",
-              "maxLength": 2
+              "maxLength": 2,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           }
         ],
@@ -854,7 +862,7 @@
             }
           },
           "400": {
-            "description": "The type code is longer than two characters",
+            "description": "The type code is longer than two characters or not ASCII",
             "content": {
               "application/json": {
                 "schema": {
@@ -927,22 +935,24 @@
           "admin-users"
         ],
         "summary": "CU00: one page of the user list, in user-ID order.",
-        "description": "COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to\nP-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).\nCOUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its\n`message` included, replaces the `COUSR0A` map.\n\n`start_key` is the `USRIDIN` search field and the page keys a previous\npage returned; `direction=forward` is ENTER and PF8, `direction=backward`\nPF7; `page_size` defaults to the 10 rows of the `COUSR0A` screen. A\npage-boundary text, which `COUSR00C` shows without its error flag, comes\nback in `message` of the 200 page, and a start key with no user at or\nafter it is an empty page with `You are at the top of the page...`. Each\nrow is the user's ID, names and type; `SEC-USR-PWD` is never listed.\n\n# Errors\n\n- 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`,\n  and for a query that does not deserialize (a `page_size` outside 1 to\n  100, an unknown `direction`).\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 500 `Unable to lookup User...`, field `USRIDIN`, when the user browse\n  fails (V-COUSR00C-004, V-COUSR00C-006, V-COUSR00C-009).",
+        "description": "COUSR00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD, PROCESS-PAGE-BACKWARD — P-COUSR00C-003 to\nP-COUSR00C-011; V-COUSR00C-002 to V-COUSR00C-009 (E-54, E-71).\nCOUSR00C SEND-USRLST-SCREEN — P-COUSR00C-013: the 200 page, its\n`message` included, replaces the `COUSR0A` map.\n\n`start_key` is the `USRIDIN` search field and the page keys a previous\npage returned; `direction=forward` is ENTER and PF8, `direction=backward`\nPF7; `page_size` defaults to the 10 rows of the `COUSR0A` screen. A\npage-boundary text, which `COUSR00C` shows without its error flag, comes\nback in `message` of the 200 page, and a start key with no user at or\nafter it is an empty page with `You are at the top of the page...`. Each\nrow is the user's ID, names and type; `SEC-USR-PWD` is never listed.\n\n# Errors\n\n- 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`\n  or holding a character outside ASCII, and for a query that does not\n  deserialize (a `page_size` outside 1 to 100, an unknown `direction`).\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 500 `Unable to lookup User...`, field `USRIDIN`, when the user browse\n  fails (V-COUSR00C-004, V-COUSR00C-006, V-COUSR00C-009).",
         "operationId": "list_users",
         "parameters": [
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward and the last page backward.",
+            "description": "The user ID the page starts from, `USRIDINI` `X(8)` in ASCII, case\nkept: the search field, or a key a page returned. Forward, the page\nstarts at the first user ID at or after it; backward, it holds the\nusers before that one. Absent, empty, all spaces or all low-values is\nthe top of the file: the first page forward, and backward an empty\npage with `You are already at the top of the page...`.",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 8,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           },
           {
             "name": "direction",
             "in": "query",
-            "description": "`forward` (next page, the default) or `backward` (previous page).",
+            "description": "`forward` (ENTER and PF8, the default) or `backward` (PF7).",
             "required": false,
             "schema": {
               "type": "string",
@@ -956,7 +966,7 @@
           {
             "name": "page_size",
             "in": "query",
-            "description": "Rows on the page, from 1 to 100. Defaults to the rows of the list's\nscreen.",
+            "description": "Rows on the page, from 1 to 100. Defaults to 10, the rows of the\n`COUSR0A` screen.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -978,7 +988,7 @@
             }
           },
           "400": {
-            "description": "A start key longer than 8 characters, or a malformed query",
+            "description": "A start key longer than 8 characters or not ASCII, or a malformed query",
             "content": {
               "application/json": {
                 "schema": {
@@ -1029,7 +1039,7 @@
           "admin-users"
         ],
         "summary": "CU01: adds a user to `USRSEC`.",
-        "description": "COUSR01C PROCESS-ENTER-KEY, WRITE-USER-SEC-FILE — P-COUSR01C-002 to\nP-COUSR01C-005; V-COUSR01C-001 to V-COUSR01C-007 (E-20).\nCOUSR01C SEND-USRADD-SCREEN — P-COUSR01C-007: the response body and the\nform's field errors replace the `COUSR1A` map.\n\nThe five fields are edited for emptiness in screen order (first name, last\nname, user ID, password, user type) and stored exactly as entered: no\nupper-casing, no user-type check. The password is stored as the argon2id\nhash of its 8 space-padded bytes, so a user ID or password added in lower\nor mixed case never signs on, as in the COBOL (E-20). The 201 body carries\nthe user as written and `User <id> has been added ...`.\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`FNAME`, `LNAME`, `USERID`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for a\n  field longer than its BMS field or a body that does not deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 409 `User ID already exist...`, field `USERID` (V-COUSR01C-006).\n- 500 `Unable to Add User...`, field `FNAME`, when the write fails or the\n  password cannot be hashed (V-COUSR01C-007).",
+        "description": "COUSR01C PROCESS-ENTER-KEY, WRITE-USER-SEC-FILE — P-COUSR01C-002 to\nP-COUSR01C-005; V-COUSR01C-001 to V-COUSR01C-007 (E-20).\nCOUSR01C SEND-USRADD-SCREEN — P-COUSR01C-007: the response body and the\nform's field errors replace the `COUSR1A` map.\n\nThe five fields are edited for emptiness in screen order (first name, last\nname, user ID, password, user type) and stored exactly as entered: no\nupper-casing, no user-type check. The password is stored as the argon2id\nhash of its 8 space-padded bytes, so a user ID or password added in lower\nor mixed case never signs on, as in the COBOL (E-20). The 201 body carries\nthe user as written and `User <id> has been added ...`.\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`FNAME`, `LNAME`, `USERID`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for a\n  field longer than its BMS field or holding a character outside ASCII,\n  or a body that does not deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 409 `User ID already exist...`, field `USERID` (V-COUSR01C-006).\n- 500 `Unable to Add User...`, field `FNAME`, when the write fails or the\n  password cannot be hashed (V-COUSR01C-007).",
         "operationId": "create_user",
         "requestBody": {
           "content": {
@@ -1053,7 +1063,7 @@
             }
           },
           "400": {
-            "description": "A blank or over-length field, or a malformed body",
+            "description": "A blank, over-length or non-ASCII field, or a malformed body",
             "content": {
               "application/json": {
                 "schema": {
@@ -1116,16 +1126,18 @@
           "admin-users"
         ],
         "summary": "CU02 and CU03 ENTER: fetches one user for the edit form or the delete\ndialog.",
-        "description": "COUSR02C PROCESS-ENTER-KEY, READ-USER-SEC-FILE — P-COUSR02C-002,\nP-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the\nidentical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,\nE-58).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled\nfrom the response body, replaces the `COUSR3A` map.\n\nThe body is the user's ID, names and type. `COUSR02C` also moves the\nstored password into its edit field; a stored argon2id hash cannot be\nshown, so no password is ever returned (E-21, a known difference).\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)`.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).\n- 500 `Unable to lookup User...`, field `FNAME`, when the read fails\n  (V-COUSR02C-003).",
+        "description": "COUSR02C PROCESS-ENTER-KEY, READ-USER-SEC-FILE — P-COUSR02C-002,\nP-COUSR02C-003, P-COUSR02C-007; V-COUSR02C-001 to V-COUSR02C-003, and the\nidentical `COUSR03C` fetch rows V-COUSR03C-001 to V-COUSR03C-003 (E-21,\nE-58).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog, filled\nfrom the response body, replaces the `COUSR3A` map.\n\nThe body is the user's ID, names and type. `COUSR02C` also moves the\nstored password into its edit field; a stored argon2id hash cannot be\nshown, so no password is ever returned (E-21, a known difference).\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).\n- 500 `Unable to lookup User...`, field `FNAME`, when the read fails\n  (V-COUSR02C-003).",
         "operationId": "get_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID`, as stored (case kept)",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 8,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           }
         ],
@@ -1141,7 +1153,7 @@
             }
           },
           "400": {
-            "description": "A blank or over-length user ID",
+            "description": "A blank, over-length or non-ASCII user ID",
             "content": {
               "application/json": {
                 "schema": {
@@ -1202,16 +1214,18 @@
           "admin-users"
         ],
         "summary": "CU02 PF5: updates a user's names, password and type.",
-        "description": "COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —\nP-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,\nE-46).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\n\nThe fields are edited for emptiness in screen order (user ID, first name,\nlast name, password, user type); the user is then read for update and\neach entered field compared with the stored value. An absent `password`\nstands for the current one: unchanged and never re-hashed. A present one\nis compared by argon2 verification, case kept, and re-hashed when it\ndiffers (E-21). When a field differs the record is rewritten and the body\ncarries `User <id> has been updated ...`. When none does, nothing is\nwritten and the answer is still 200, with `Please modify to update ...`:\n`COUSR02C` sets that text without its error flag (V-COUSR02C-010).\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for\n  a field or ID longer than its BMS field or a body that does not\n  deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no\n  user (V-COUSR02C-011).\n- 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose\n  failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,\n  E-46), for a failed rewrite (V-COUSR02C-012), and when the password\n  cannot be verified or hashed. Nothing is written on any error.",
+        "description": "COUSR02C UPDATE-USER-INFO, READ-USER-SEC-FILE, UPDATE-USER-SEC-FILE —\nP-COUSR02C-004 to P-COUSR02C-007; V-COUSR02C-004 to V-COUSR02C-012 (E-21,\nE-46).\nCOUSR02C SEND-USRUPD-SCREEN — P-COUSR02C-009: the response body replaces\nthe `COUSR2A` map.\n\nThe fields are edited for emptiness in screen order (user ID, first name,\nlast name, password, user type); the user is then read for update and\neach entered field compared with the stored value. An absent `password`\nstands for the current one: unchanged and never re-hashed. A present one\nis compared by argon2 verification, case kept, and re-hashed when it\ndiffers (E-21). When a field differs the record is rewritten and the body\ncarries `User <id> has been updated ...`. When none does, nothing is\nwritten and the answer is still 200, with `Please modify to update ...`:\n`COUSR02C` sets that text without its error flag (V-COUSR02C-010).\n\n# Errors\n\n- 400 `EMPTY` with the empty-field message of the first blank field\n  (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for\n  a field or ID longer than its BMS field or holding a character outside\n  ASCII, or a body that does not deserialize.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no\n  user (V-COUSR02C-011).\n- 500 `Unable to Update User...`, field `FNAME`, for an unknown user, whose\n  failed read the COBOL follows with a failing rewrite (V-COUSR02C-009,\n  E-46), for a failed rewrite (V-COUSR02C-012), and when the password\n  cannot be verified or hashed. Nothing is written on any error.",
         "operationId": "update_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID`, as stored (case kept)",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 8,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           }
         ],
@@ -1237,7 +1251,7 @@
             }
           },
           "400": {
-            "description": "A blank or over-length field, or a malformed body",
+            "description": "A blank, over-length or non-ASCII field or user ID, or a malformed body",
             "content": {
               "application/json": {
                 "schema": {
@@ -1298,16 +1312,18 @@
           "admin-users"
         ],
         "summary": "CU03 PF5: deletes a user, the Confirm of the delete dialog.",
-        "description": "COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —\nP-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to\nV-COUSR03C-007 (E-46, E-58).\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the\n`DELETE` response replace the `COUSR3A` map.\n\nThe user is read for update and deleted. The body carries the user as\nread before the delete and `User <id> has been deleted ...`.\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)`.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no\n  user after the read found it (V-COUSR03C-006).\n- 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,\n  reproduced): for an unknown user, whose failed read the COBOL follows\n  with a failing delete (V-COUSR03C-005, E-46), and for a failed delete\n  (V-COUSR03C-007). Nothing is deleted on any error.",
+        "description": "COUSR03C DELETE-USER-INFO, READ-USER-SEC-FILE, DELETE-USER-SEC-FILE —\nP-COUSR03C-004, P-COUSR03C-005, P-COUSR03C-011; V-COUSR03C-004 to\nV-COUSR03C-007 (E-46, E-58).\nCOUSR03C SEND-USRDEL-SCREEN — P-COUSR03C-007: the delete dialog and the\n`DELETE` response replace the `COUSR3A` map.\n\nThe user is read for update and deleted. The body carries the user as\nread before the delete and `User <id> has been deleted ...`.\n\n# Errors\n\n- 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank\n  ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a\n  character outside ASCII.\n- 401 without a valid bearer token; 403 for a token that is not an\n  administrator's.\n- 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no\n  user after the read found it (V-COUSR03C-006).\n- 500 `Unable to Update User...`, field `FNAME` (the COBOL's own text,\n  reproduced): for an unknown user, whose failed read the COBOL follows\n  with a failing delete (V-COUSR03C-005, E-46), and for a failed delete\n  (V-COUSR03C-007). Nothing is deleted on any error.",
         "operationId": "delete_user",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The user ID, `SEC-USR-ID`, as stored (case kept)",
+            "description": "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "maxLength": 8,
+              "pattern": "^[\\x00-\\x7F]*$"
             }
           }
         ],
@@ -1323,7 +1339,7 @@
             }
           },
           "400": {
-            "description": "A blank or over-length user ID",
+            "description": "A blank, over-length or non-ASCII user ID",
             "content": {
               "application/json": {
                 "schema": {
@@ -1470,7 +1486,7 @@
           "authorizations"
         ],
         "summary": "COPAUS0C GATHER-DETAILS, PROCESS-ENTER-KEY, PROCESS-PF7-KEY,\nPROCESS-PF8-KEY — P-COPAUS0C-001, P-COPAUS0C-003, P-COPAUS0C-006 to\nP-COPAUS0C-015, P-COPAUS0C-020, V-COPAUS0C-001, V-COPAUS0C-002,\nV-COPAUS0C-004 to V-COPAUS0C-015: the pending authorizations of an account.",
-        "description": "The account ID is edited as entered, then the card cross-reference, the\naccount, the customer and the authorization summary of the account are\nread, and, when the summary exists, one page of its authorizations, newest\nfirst. Without `start_key` the page is the first one (ENTER); `next_key`\nwith `direction=forward` is PF8 and `prev_key` with `direction=backward` is\nPF7. A request past either end lists nothing and carries the top- or\nbottom-of-page text.\n\n# Errors\n\n- 400 with `Please enter Acct Id...` or `Acct Id must be Numeric ...` on\n  `ACCTID` for a blank or non-numeric account ID, and 400 with code\n  `INVALID` for a `start_key` that is not an authorization identity or a\n  `page_size` outside 1 to 100.\n- 401 without a valid bearer token.\n- 404 with the `COPAUS0C` text when the account has no cross-reference,\n  or the cross-reference names no account or customer.\n- 500 with the `COPAUS0C` system-error text when a read fails or the\n  authorization store cannot be opened.",
+        "description": "The account ID is edited as entered, then the card cross-reference, the\naccount, the customer and the authorization summary of the account are\nread, and, when the summary exists, one page of its authorizations, newest\nfirst. Without `start_key` the page is the first one forward (ENTER) and\nthe last one, the oldest authorizations, backward; `next_key` with\n`direction=forward` is PF8 and `prev_key` with `direction=backward` is\nPF7. A request past either end lists nothing and carries the top- or\nbottom-of-page text.\n\n# Errors\n\n- 400 with `Please enter Acct Id...` or `Acct Id must be Numeric ...` on\n  `ACCTID` for a blank or non-numeric account ID, and 400 with code\n  `INVALID` for a `start_key` that is not an authorization identity or a\n  `page_size` outside 1 to 100.\n- 401 without a valid bearer token.\n- 404 with the `COPAUS0C` text when the account has no cross-reference,\n  or the cross-reference names no account or customer.\n- 500 with the `COPAUS0C` system-error text when a read fails or the\n  authorization store cannot be opened.",
         "operationId": "list_authorizations",
         "parameters": [
           {
@@ -1480,16 +1496,18 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 11
+              "maxLength": 11,
+              "pattern": "^[0-9]{11}$"
             }
           },
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward and the last page backward.",
+            "description": "The `auth_id` the page continues from, a previous page's `next_key` or\n`prev_key`: forward (PF8) the last authorization shown, which the page\nskips; backward (PF7) the first one shown, before which the page ends.\nAbsent, the page is the first one, the newest authorizations, forward\n(ENTER), and the last one, the oldest, backward. A decimal integer\nfrom -9223372036854775808 to 9223372036854775807, with an optional\nsign and leading zeros.",
             "required": false,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^(?:[+-]?0*(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7])|-0*9223372036854775808)$"
             }
           },
           {
@@ -1509,7 +1527,7 @@
           {
             "name": "page_size",
             "in": "query",
-            "description": "Rows on the page, from 1 to 100. Defaults to the rows of the list's\nscreen.",
+            "description": "Rows on the page, from 1 to 100. Defaults to the 5 rows of the\n`COPAU00` list.",
             "required": false,
             "schema": {
               "type": "integer",
@@ -1584,16 +1602,17 @@
           "authorizations"
         ],
         "summary": "COPAUS1C PROCESS-ENTER-KEY, READ-AUTH-RECORD, POPULATE-AUTH-DETAILS,\nPROCESS-PF8-KEY, READ-NEXT-AUTH-RECORD — P-COPAUS1C-003 to P-COPAUS1C-005,\nP-COPAUS1C-009, P-COPAUS1C-014 to P-COPAUS1C-016, V-COPAUS1C-001 to\nV-COPAUS1C-006, V-COPAUS1C-012, V-COPAUS1C-013: one pending authorization.",
-        "description": "The detail is read by its `auth_id` (ENTER), then the PF8 read under the\nsame summary gives `next_id`, the next older authorization. At the last\nauthorization `next_id` is `null` and `message` carries\n`Already at the last Authorization...`.\n\n# Errors\n\nEach on `CARDNUM`:\n\n- 400 with no message when `{id}` is not a positive integer, the COBOL\n  path with no selected key (V-COPAUS1C-001, E-49).\n- 401 without a valid bearer token.\n- 404 with no message when no authorization has the identity\n  (V-COPAUS1C-004, V-COPAUS1C-005).\n- 500 with the `COPAUS1C` system-error text when the detail or the next\n  read fails, or when the authorization store cannot be opened.",
+        "description": "The authorization summary of the detail's account is read, then the\ndetail by its `auth_id` (ENTER), then the PF8 read under the same summary\ngives `next_id`, the next older authorization. At the last authorization\n`next_id` is `null` and `message` carries\n`Already at the last Authorization...`.\n\n# Errors\n\nEach on `CARDNUM`:\n\n- 400 with no message when `{id}` is not a positive integer, the COBOL\n  path with no selected key (V-COPAUS1C-001, E-49).\n- 401 without a valid bearer token.\n- 404 with no message when no authorization has the identity or no\n  summary is found over it (V-COPAUS1C-004, V-COPAUS1C-005).\n- 500 with ` System error while reading Auth Details: Code:` and the IMS\n  status when the detail read fails, whatever the summary read answered\n  (V-COPAUS1C-006); with ` System error while reading Auth Summary: Code:`\n  and the IMS status when only the summary read fails (V-COPAUS1C-003);\n  with ` System error while reading next Auth: Code:` when the next read\n  fails (V-COPAUS1C-013); with the scheduling text when the authorization\n  store cannot be opened (V-COPAUS1C-002).",
         "operationId": "get_authorization",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The authorization's `auth_id`, as a summary page lists it",
+            "description": "The authorization's `auth_id`, as a summary page lists it: a positive\ninteger up to 9223372036854775807, with an optional `+` and leading\nzeros.",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[+]?0*(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7])$"
             }
           }
         ],
@@ -1659,17 +1678,18 @@
         "tags": [
           "authorizations"
         ],
-        "summary": "COPAUS1C MARK-AUTH-FRAUD, UPDATE-AUTH-DETAILS, TAKE-SYNCPOINT, ROLL-BACK\nwith COPAUS2C — P-COPAUS1C-006 to P-COPAUS1C-008, P-COPAUS1C-015,\nP-COPAUS1C-016, P-COPAUS2C-001 to P-COPAUS2C-006, V-COPAUS1C-002,\nV-COPAUS1C-007, V-COPAUS1C-009 to V-COPAUS1C-011: PF5, the fraud mark of\none pending authorization.",
-        "description": "The request has no body: PF5 acts on the record shown. A detail holding\n`F` becomes `R` and its fraud report is removed; any other detail becomes\n`F` and fraud is reported. `COPAUS2C` stamps the report date of the\nprocessing clock and inserts the `AUTHFRDS` row, or updates it when the\nauthorization was reported before; then the detail is replaced. Both\nwrites commit together, and the response carries the replaced detail with\n`AUTH MARKED FRAUD...` or `AUTH FRAUD REMOVED...`.\n\n# Errors\n\nEach on `CARDNUM`, and nothing is written:\n\n- 400 with no message when `{id}` is not a positive integer.\n- 401 without a valid bearer token.\n- 404 with no message when no authorization has the identity, the outcome\n  E-53 proposes for a fraud mark whose read finds nothing, or when the\n  authorization's account has no card cross-reference to name its\n  customer.\n- 500 with the `COPAUS1C` or `COPAUS2C` text when the detail read, the\n  fraud-table write or the detail replace fails, or when the authorization\n  store cannot be opened; 500 `Unexpected error` when the cross-reference\n  read or the commit fails.",
+        "summary": "COPAUS1C MARK-AUTH-FRAUD, READ-AUTH-RECORD, UPDATE-AUTH-DETAILS,\nTAKE-SYNCPOINT, ROLL-BACK with COPAUS2C — P-COPAUS1C-003, P-COPAUS1C-004,\nP-COPAUS1C-006 to P-COPAUS1C-008, P-COPAUS1C-015, P-COPAUS1C-016,\nP-COPAUS2C-001 to P-COPAUS2C-006, V-COPAUS1C-002 to V-COPAUS1C-007,\nV-COPAUS1C-009 to V-COPAUS1C-011: PF5, the fraud mark of one pending\nauthorization.",
+        "description": "The request has no body: PF5 acts on the record shown. The authorization\nsummary of the detail's account is read, then the detail, under a row\nlock held until the request commits or rolls back, so overlapping marks\nof one authorization take turns and each toggles the flag the one before\nit left. A detail holding `F` becomes `R` and its fraud report is removed;\nany other detail becomes `F` and fraud is reported. `COPAUS2C` stamps the\nreport date of the processing clock and inserts the `AUTHFRDS` row, or\nupdates it when the authorization was reported before; then the detail is\nreplaced. Both writes commit together, and the response carries the\nreplaced detail with `AUTH MARKED FRAUD...` or `AUTH FRAUD REMOVED...`.\n\n# Errors\n\nEach on `CARDNUM`, and nothing is written:\n\n- 400 with no message when `{id}` is not a positive integer.\n- 401 without a valid bearer token.\n- 404 with no message when no authorization has the identity or no\n  summary is found over it, the outcome E-53 proposes for a fraud mark\n  whose read finds nothing, or when the authorization's account has no\n  card cross-reference to name its customer.\n- 500 with ` System error while reading Auth Details: Code:` and the IMS\n  status when the detail read fails or its lock cannot be taken, whatever\n  the summary read answered (V-COPAUS1C-006); with\n  ` System error while reading Auth Summary: Code:` and the IMS status\n  when only the summary read fails (V-COPAUS1C-003); with the `COPAUS1C`\n  or `COPAUS2C` text when the fraud-table write or the detail replace\n  fails, or the scheduling text when the authorization store cannot be\n  opened; 500 `Unexpected error` when the cross-reference read or the\n  commit fails.",
         "operationId": "toggle_fraud",
         "parameters": [
           {
             "name": "id",
             "in": "path",
-            "description": "The authorization's `auth_id`, as a summary page lists it",
+            "description": "The authorization's `auth_id`, as a summary page lists it: a positive\ninteger up to 9223372036854775807, with an optional `+` and leading\nzeros.",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "pattern": "^[+]?0*(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|922337203685477580[0-7])$"
             }
           }
         ],
@@ -1737,8 +1757,8 @@
         "tags": [
           "cards"
         ],
-        "summary": "COCRDLIC 0000-MAIN, 2200-EDIT-INPUTS, 9000-READ-FORWARD,\n9100-READ-BACKWARDS, 9500-FILTER-RECORDS, 1400-SETUP-MESSAGE —\nP-COCRDLIC-003 to P-COCRDLIC-006, P-COCRDLIC-011 to P-COCRDLIC-014,\nP-COCRDLIC-017, P-COCRDLIC-021, P-COCRDLIC-023, V-COCRDLIC-001,\nV-COCRDLIC-002, V-COCRDLIC-005 to V-COCRDLIC-010",
-        "description": "One page of the card list in `CARDDAT` key order: forward (ENTER, PF8)\nfrom `start_key` inclusively, or backward (PF7) from the first card of the\npage shown, `WS-MAX-SCREEN-LINES` (7) rows unless `page_size` says\notherwise. The `account_id` and `card_number` filters reach the rule as\nentered, so a filter that is neither blank nor a number of its width is\nanswered with the `2210-EDIT-ACCOUNT` or `2220-EDIT-CARD` text. An empty\npage is a page: 200 with `items: []` and the text the COBOL shows with it.\n\n# Errors\n\n- 400 with an empty `message` when a filter is longer than its map field.\n- 400 with 'ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER' at\n  `ACCTSID` or 'CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER' at\n  `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).\n- 400 with code `INVALID` when the page parameters do not deserialize.\n- 401 without a valid bearer token.\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read\n  fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the\n  database cannot be reached.",
+        "summary": "COCRDLIC 0000-MAIN, 2200-EDIT-INPUTS, 9000-READ-FORWARD,\n9100-READ-BACKWARDS, 9500-FILTER-RECORDS, 1000-SEND-MAP,\n1400-SETUP-MESSAGE, 1500-SEND-SCREEN — P-COCRDLIC-003 to P-COCRDLIC-006,\nP-COCRDLIC-011 to P-COCRDLIC-015, P-COCRDLIC-017, P-COCRDLIC-020,\nP-COCRDLIC-021, P-COCRDLIC-023, V-COCRDLIC-001, V-COCRDLIC-002,\nV-COCRDLIC-005 to V-COCRDLIC-010",
+        "description": "One page of the card list in `CARDDAT` key order: forward (ENTER, PF8)\nfrom `start_key` inclusively, or backward (PF7) from the first card of the\npage shown, `WS-MAX-SCREEN-LINES` (7) rows unless `page_size` says\notherwise. Without `start_key` both directions read the first page from\nthe lowest card number: backward is PF7 on the first entry, which re-reads\nthat page with 'NO PREVIOUS PAGES TO DISPLAY'\n[app/cbl/COCRDLIC.cbl:L439-454]. The `account_id` and `card_number`\nfilters reach the rule as entered, so a filter that is neither blank nor a\nnumber of its width is answered with the `2210-EDIT-ACCOUNT` or\n`2220-EDIT-CARD` text. An empty page is a page: 200 with `items: []` and\nthe text the COBOL shows with it.\n\n# Errors\n\n- 400 with an empty `message` when a filter is longer than its map field.\n- 400 with 'ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER' at\n  `ACCTSID` or 'CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER' at\n  `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).\n- 400 with code `INVALID` when the page parameters do not deserialize,\n  and with code `INVALID`, an empty `message` and no field when\n  `start_key` holds a NUL character, which no card number holds; no card\n  is read.\n- 401 without a valid bearer token.\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read\n  fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the\n  database cannot be reached.",
         "operationId": "list_cards",
         "parameters": [
           {
@@ -1764,7 +1784,7 @@
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward and the last page backward.",
+            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward; what an absent key reads backward is the list's own, as\nits operation states.",
             "required": false,
             "schema": {
               "type": "string"
@@ -1809,7 +1829,7 @@
             }
           },
           "400": {
-            "description": "A filter or page parameter the COBOL edits reject",
+            "description": "A filter or page parameter the COBOL edits reject, or a start key holding a NUL character",
             "content": {
               "application/json": {
                 "schema": {
@@ -1851,7 +1871,7 @@
         "tags": [
           "cards"
         ],
-        "summary": "COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS —\nP-COCRDSLC-002 to P-COCRDSLC-006, P-COCRDSLC-010, P-COCRDSLC-013 to\nP-COCRDSLC-016, V-COCRDSLC-001 to V-COCRDSLC-007",
+        "summary": "COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS,\n1400-SEND-SCREEN, COMMON-RETURN — P-COCRDSLC-002 to P-COCRDSLC-007,\nP-COCRDSLC-010, P-COCRDSLC-012 to P-COCRDSLC-016, V-COCRDSLC-001 to\nV-COCRDSLC-007",
         "description": "The card whose number is the `{id}` path segment, with the account number\nof the `account_id` query parameter: both keys are edited as\n`2210-EDIT-ACCOUNT` and `2220-EDIT-CARD` edit them, an absent account\nbeing a blank one, and the card is then read by its number alone (E-55).\nThe response carries the card's version token, which a following\n`PUT /cards/{id}` sends back, and never the verification code.\n\n# Errors\n\n- 400 with an empty `message` when `account_id` is longer than 11\n  characters.\n- 400 with 'Account number not provided', 'Card number not provided',\n  'No input received', or the account or card not-numeric text, at\n  `ACCTSID` or `CARDSID` (V-COCRDSLC-001 to V-COCRDSLC-005).\n- 401 without a valid bearer token.\n- 404 with 'Did not find cards for this search condition' at `ACCTSID`\n  when no card has the number (V-COCRDSLC-006).\n- 500 with the `CARDDAT` file-error text at `ACCTSID` when the read fails\n  (V-COCRDSLC-007), or 'Unexpected error' when the database cannot be\n  reached.",
         "operationId": "get_card",
         "parameters": [
@@ -1937,8 +1957,8 @@
         "tags": [
           "cards"
         ],
-        "summary": "COCRDUPC 1200-EDIT-MAP-INPUTS, 2000-DECIDE-ACTION, 9000-READ-DATA,\n9200-WRITE-PROCESSING, 9300-CHECK-CHANGE-IN-REC, 3250-SETUP-INFOMSG —\nP-COCRDUPC-002 to P-COCRDUPC-007, P-COCRDUPC-010 to P-COCRDUPC-016,\nP-COCRDUPC-019, P-COCRDUPC-022, P-COCRDUPC-023, P-COCRDUPC-028,\nV-COCRDUPC-001 to V-COCRDUPC-020",
-        "description": "Updates the card whose number is the `{id}` path segment from the body's\nmap fields, in one request: the key edits, the fetch, the comparison with\nthe fetched card and the name, status, expiry month and year edits, then\nthe locked read, the change check against the body's `version` and the\nrewrite. 200 on success, with 'Changes committed to database' after a\nrewrite or 'No change detected with respect to values fetched.' when the\nbody changes nothing, and the card as it now stands with its new token.\n\n# Errors\n\n- 400 with an empty `message` and no field when `version` is absent or is\n  not 16 lower-case hex digits (V-COCRDUPC-001, E-24), or with an empty\n  `message` and the BMS fields of the values longer than their map\n  fields.\n- 400 with the key edit texts at `ACCTSID` or `CARDSID`\n  (V-COCRDUPC-002 to V-COCRDUPC-006) or the card-field edit texts at\n  `CRDNAME`, `CRDSTCD`, `EXPMON` or `EXPYEAR` (V-COCRDUPC-010 to\n  V-COCRDUPC-017), the first in COBOL order.\n- 400 with code `INVALID` when the body is not a JSON object of strings.\n- 401 without a valid bearer token.\n- 404 with 'Did not find cards for this search condition' at `ACCTSID`\n  (V-COCRDUPC-007).\n- 409 with 'Record changed by some one else. Please review' at `CRDNAME`\n  when the card changed since `version` was issued (V-COCRDUPC-019).\n- 500 with the `CARDDAT` file-error text (V-COCRDUPC-008), 'Could not lock\n  record for update' (V-COCRDUPC-018) or 'Update of record failed'\n  (V-COCRDUPC-020) at `ACCTSID`, or 'Unexpected error' when the database\n  cannot be reached or the commit fails.",
+        "summary": "COCRDUPC 1200-EDIT-MAP-INPUTS, 2000-DECIDE-ACTION, 9000-READ-DATA,\n9200-WRITE-PROCESSING, 9300-CHECK-CHANGE-IN-REC, 3000-SEND-MAP,\n3250-SETUP-INFOMSG, 3400-SEND-SCREEN, COMMON-RETURN — P-COCRDUPC-002 to\nP-COCRDUPC-008, P-COCRDUPC-010 to P-COCRDUPC-017, P-COCRDUPC-019,\nP-COCRDUPC-021 to P-COCRDUPC-023, P-COCRDUPC-028, V-COCRDUPC-001 to\nV-COCRDUPC-020",
+        "description": "Updates the card whose number is the `{id}` path segment from the body's\nmap fields, in one request: the key edits, the fetch, the comparison with\nthe fetched card and the name, status, expiry month and year edits, then\nthe locked read, the change check against the body's `version` and the\nrewrite. 200 on success, with 'Changes committed to database' after a\nrewrite or 'No change detected with respect to values fetched.' when the\nbody changes nothing, and the card as it now stands with its new token.\n`version` stands for the `CCUP-OLD-DETAILS` copy that `COMMON-RETURN`\nkeeps in the COMMAREA (E-24).\n\n# Errors\n\n- 400 with an empty `message` and no field when `version` is absent or is\n  not 16 lower-case hex digits (V-COCRDUPC-001, E-24), or with an empty\n  `message` and the BMS fields of the values longer than their map\n  fields.\n- 400 with the key edit texts at `ACCTSID` or `CARDSID`\n  (V-COCRDUPC-002 to V-COCRDUPC-006) or the card-field edit texts at\n  `CRDNAME`, `CRDSTCD`, `EXPMON` or `EXPYEAR` (V-COCRDUPC-010 to\n  V-COCRDUPC-017), the first in COBOL order.\n- 400 with code `INVALID` when the body is not a JSON object of strings.\n- 401 without a valid bearer token.\n- 404 with 'Did not find cards for this search condition' at `ACCTSID`\n  (V-COCRDUPC-007).\n- 409 with 'Record changed by some one else. Please review' at `CRDNAME`\n  when the card changed since `version` was issued (V-COCRDUPC-019).\n- 500 with the `CARDDAT` file-error text (V-COCRDUPC-008), 'Could not lock\n  record for update' (V-COCRDUPC-018) or 'Update of record failed'\n  (V-COCRDUPC-020) at `ACCTSID`, or 'Unexpected error' when the database\n  cannot be reached or the commit fails.",
         "operationId": "update_card",
         "parameters": [
           {
@@ -2404,7 +2424,7 @@
         "tags": [
           "transactions"
         ],
-        "summary": "COTRN00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD/BACKWARD — P-COTRN00C-005 to P-COTRN00C-016;\nV-COTRN00C-001 to V-COTRN00C-013.",
+        "summary": "COTRN00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,\nPROCESS-PAGE-FORWARD/BACKWARD, SEND-TRNLST-SCREEN — P-COTRN00C-005 to\nP-COTRN00C-016, P-COTRN00C-018; V-COTRN00C-001 to V-COTRN00C-013.",
         "description": "One page of the live transaction master in TRAN-ID order: `direction`\n`forward` is ENTER (and PF8 from the `next_key` of the previous page),\n`backward` is PF7 from the first key shown, or the end of the file when no\n`start_key` is given. `page_size` defaults to the 10 rows of the screen.\nThe page-boundary texts the COBOL sends without its error flag come back in\n`message` of the 200 page; an empty master is a page without items.\n\n# Errors\n\n- 400 for an `account_id` filter that is not 11 digits (V-COTRN00C-001)\n  or a `start_key` that is not 16 digits (V-COTRN00C-004), and for a query\n  that does not deserialize, such as a `page_size` outside 1 to 100.\n- 401 without a valid bearer token.\n- 500 when the browse fails (V-COTRN00C-006, V-COTRN00C-008,\n  V-COTRN00C-011, V-COTRN00C-013) or no unit of work can be opened.",
         "operationId": "list_transactions",
         "parameters": [
@@ -2421,7 +2441,7 @@
           {
             "name": "start_key",
             "in": "query",
-            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward and the last page backward.",
+            "description": "The key the page starts at, as the list shows it. Absent for the first\npage forward; what an absent key reads backward is the list's own, as\nits operation states.",
             "required": false,
             "schema": {
               "type": "string"
@@ -2593,7 +2613,7 @@
         "tags": [
           "transactions"
         ],
-        "summary": "COTRN01C PROCESS-ENTER-KEY, READ-TRANSACT-FILE — P-COTRN01C-003 to\nP-COTRN01C-005; V-COTRN01C-001 to V-COTRN01C-003.",
+        "summary": "COTRN01C PROCESS-ENTER-KEY, READ-TRANSACT-FILE, SEND-TRNVIEW-SCREEN —\nP-COTRN01C-003 to P-COTRN01C-005, P-COTRN01C-007; V-COTRN01C-001 to\nV-COTRN01C-003.",
         "description": "The live transaction whose TRAN-ID is the path segment, moved into the\n16-byte key as entered, with every `CVTRA05Y` field.\n\n# Errors\n\n- 400 for a blank Tran ID (V-COTRN01C-001).\n- 401 without a valid bearer token.\n- 404 when no live transaction has the Tran ID, every Tran ID after\n  `batch tranbkp` included (V-COTRN01C-002).\n- 500 when the read fails (V-COTRN01C-003) or no unit of work can be\n  opened.",
         "operationId": "get_transaction",
         "parameters": [
@@ -2884,7 +2904,7 @@
       },
       "AccountUpdateRequest": {
         "type": "object",
-        "description": "The body of `PUT /accounts/{id}` (CAUP): the `COACTUP` input fields\n`1100-RECEIVE-MAP` receives into `ACUP-NEW-DETAILS`\n[app/cbl/COACTUPC.cbl:L757-860], in map order, each as entered.\n\nThe account number is the `{id}` path segment (`ACCTSID`, 11 characters),\nnot a body field. A missing or blank field is passed on as empty text,\nwhich the rule receives as `LOW-VALUES` and answers with its audited\nmessage, so no field is required here. Each field is bounded by its BMS\nlength [app/bms/COACTUP.bms], checked by [`AccountUpdateRequest::check`].",
+        "description": "The body of `PUT /accounts/{id}` (CAUP): the `COACTUP` input fields\n`1100-RECEIVE-MAP` receives into `ACUP-NEW-DETAILS`\n[app/cbl/COACTUPC.cbl:L757-860], in map order, each as entered.\n\nThe account number is the `{id}` path segment (`ACCTSID`, 11 characters),\nnot a body field; [`AccountUpdateRequest::check`] bounds it with the body\nfields. A missing or blank field is passed on as empty text,\nwhich the rule receives as `LOW-VALUES` and answers with its audited\nmessage, so no field is required here. Each field is bounded by its BMS\nlength [app/bms/COACTUP.bms], checked by [`AccountUpdateRequest::check`].",
         "properties": {
           "acct_active_status": {
             "type": [
@@ -3825,7 +3845,7 @@
         "properties": {
           "code": {
             "type": "string",
-            "description": "The failure class: an error kind code (`INVALID`, `EMPTY`,\n`NOT_FOUND`, `DUPLICATE`, `CONFLICT`, `SIGNON_FAILED`, `UNEXPECTED`),\n`UNAUTHENTICATED` or `FORBIDDEN`."
+            "description": "The failure class: an error kind code (`INVALID`, `EMPTY`,\n`NOT_FOUND`, `DUPLICATE`, `CONFLICT`, `SIGNON_FAILED`, `UNEXPECTED`),\n`UNAUTHENTICATED`, `FORBIDDEN` or `METHOD_NOT_ALLOWED`. A path no route\nserves is `NOT_FOUND`."
           },
           "fields": {
             "type": "array",
@@ -4579,9 +4599,10 @@
           },
           "transaction_type_cd": {
             "type": "string",
-            "description": "The transaction type code the rule matches (`TRAN-TYPE-CD PIC X(02)`),\na fixture type code such as `01` Purchase.",
+            "description": "The transaction type code the rule matches (`TRAN-TYPE-CD PIC X(02)`),\na fixture type code such as `01` Purchase: at most 2 characters from\n`U+0001` to `U+00FF`, the ISO 8859-1 characters its column stores.",
             "example": "01",
-            "maxLength": 2
+            "maxLength": 2,
+            "pattern": "^[\\x01-\\xFF]*$"
           }
         }
       },
@@ -4684,12 +4705,16 @@
       },
       "TranTypeMessageResponse": {
         "type": "object",
-        "description": "The answer of a successful write: the type as stored, and the text the\nprogram shows.\n\nThe texts are the rules': `COTRTUPC` `Changes committed to database` or\n`No change detected with respect to values fetched.` (V-COTRTUPC-006),\n`COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with\nrespect to database values.` (V-COTRTLIC-012), and on a delete\n`HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.",
+        "description": "The answer of a successful write: the type as stored, the text the\nprogram shows, and the `COTRTLIC` info line of an inline update.\n\nThe texts are the rules': `COTRTUPC` `Changes committed to database` or\n`No change detected with respect to values fetched.` (V-COTRTUPC-006),\n`COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with\nrespect to database values.` (V-COTRTLIC-012), and on a delete\n`HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.\n\n`info` is present only on `PUT` with `origin=list`. It is left out of every\nother answer rather than sent as `null`, so the schema declares it an\noptional, non-nullable string.",
         "required": [
           "transaction_type",
           "message"
         ],
         "properties": {
+          "info": {
+            "type": "string",
+            "description": "The `COTRTLI` info line `INFOMSG` `X(45)`\n[app/app-transaction-type-db2/cpy-bms/COTRTLI.cpy:L222], uncentred:\n`HIGHLIGHTED row was updated`, which `COTRTLIC` `9200-UPDATE-RECORD`\nsets once the inline update is stored (P-COTRTLIC-009). It comes with\nevery `origin=list` update, beside the no-change `message` of a change\nof case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on\nthe delete."
+          },
           "message": {
             "type": "string",
             "description": "The program's text, unchanged."
@@ -4734,8 +4759,9 @@
               "string",
               "null"
             ],
-            "description": "The new description, `X(50)`: letters, digits and spaces.",
-            "maxLength": 50
+            "description": "The new description, `X(50)`: letters, digits and spaces, so ASCII\nonly.",
+            "maxLength": 50,
+            "pattern": "^[\\x00-\\x7F]*$"
           }
         }
       },
@@ -4769,7 +4795,7 @@
       },
       "TransactionAddRequest": {
         "type": "object",
-        "description": "The body of `POST /transactions`: the input fields of map `COTRN2A`\n[app/cpy-bms/COTRN02.CPY:L60-138], each as entered.\n\nA missing, `null` or empty member is the blank field the COBOL answers\nwith its `can NOT be empty` message (V-COTRN02C-003, V-COTRN02C-008 to\nV-COTRN02C-018). The account ID is used when entered, otherwise the card\nnumber. Every member is limited to its map field's width; the formats are\nthe rule's edits, so that a malformed entry gets its audited message.\n\nIt also serializes, so a client builds the bodies it sends from it.",
+        "description": "The body of `POST /transactions`: the input fields of map `COTRN2A`\n[app/cpy-bms/COTRN02.CPY:L60-138], each as entered.\n\nA missing, `null` or empty member is the blank field the COBOL answers\nwith its `can NOT be empty` message (V-COTRN02C-003, V-COTRN02C-008 to\nV-COTRN02C-018). The account ID is used when entered, otherwise the card\nnumber. Every member is limited to its map field's width, and the source,\ndescription and merchant name, city and zip to ASCII characters; the\nformats are the rule's edits, so that a malformed entry gets its audited\nmessage. The published `pattern` of a code, amount, date or merchant ID is\nthe form its edit accepts (V-COTRN02C-019 to V-COTRN02C-023,\nV-COTRN02C-026); the dates' is their shape only, the calendar check being\n`CSUTLDTC`'s (V-COTRN02C-024, V-COTRN02C-025).\n\nIt also serializes, so a client builds the bodies it sends from it.",
         "properties": {
           "account_id": {
             "type": [
@@ -4801,7 +4827,8 @@
               "null"
             ],
             "description": "`TRNAMT` (`TRNAMTI X(12)`): the amount as text in the form\n`-99999999.99`, a sign, eight digits, a point and two digits, such as\n`-00000012.34`.",
-            "maxLength": 12
+            "maxLength": 12,
+            "pattern": "^[+-][0-9]{8}\\.[0-9]{2}$"
           },
           "tran_cat_cd": {
             "type": [
@@ -4809,23 +4836,26 @@
               "null"
             ],
             "description": "`TCATCD` (`TCATCDI X(4)`): the transaction category code, 4 digits.",
-            "maxLength": 4
+            "maxLength": 4,
+            "pattern": "^[0-9]{4}$"
           },
           "tran_desc": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`TDESC` (`TDESCI X(60)`): the description.",
-            "maxLength": 60
+            "description": "`TDESC` (`TDESCI X(60)`): the description, ASCII characters only.",
+            "maxLength": 60,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "tran_merchant_city": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`MCITY` (`MCITYI X(25)`): the merchant city.",
-            "maxLength": 25
+            "description": "`MCITY` (`MCITYI X(25)`): the merchant city, ASCII characters only.",
+            "maxLength": 25,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "tran_merchant_id": {
             "type": [
@@ -4833,23 +4863,26 @@
               "null"
             ],
             "description": "`MID` (`MIDI X(9)`): the merchant ID, 9 digits.",
-            "maxLength": 9
+            "maxLength": 9,
+            "pattern": "^[0-9]{9}$"
           },
           "tran_merchant_name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`MNAME` (`MNAMEI X(30)`): the merchant name.",
-            "maxLength": 30
+            "description": "`MNAME` (`MNAMEI X(30)`): the merchant name, ASCII characters only.",
+            "maxLength": 30,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "tran_merchant_zip": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`MZIP` (`MZIPI X(10)`): the merchant zip.",
-            "maxLength": 10
+            "description": "`MZIP` (`MZIPI X(10)`): the merchant zip, ASCII characters only.",
+            "maxLength": 10,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "tran_orig_date": {
             "type": [
@@ -4857,7 +4890,8 @@
               "null"
             ],
             "description": "`TORIGDT` (`TORIGDTI X(10)`): the origination date, `YYYY-MM-DD`.",
-            "maxLength": 10
+            "maxLength": 10,
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
           },
           "tran_proc_date": {
             "type": [
@@ -4865,15 +4899,17 @@
               "null"
             ],
             "description": "`TPROCDT` (`TPROCDTI X(10)`): the processing date, `YYYY-MM-DD`.",
-            "maxLength": 10
+            "maxLength": 10,
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
           },
           "tran_source": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`TRNSRC` (`TRNSRCI X(10)`): the source.",
-            "maxLength": 10
+            "description": "`TRNSRC` (`TRNSRCI X(10)`): the source, ASCII characters only.",
+            "maxLength": 10,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "tran_type_cd": {
             "type": [
@@ -4881,7 +4917,8 @@
               "null"
             ],
             "description": "`TTYPCD` (`TTYPCDI X(2)`): the transaction type code, 2 digits.",
-            "maxLength": 2
+            "maxLength": 2,
+            "pattern": "^[0-9]{2}$"
           }
         }
       },
@@ -5010,40 +5047,45 @@
               "string",
               "null"
             ],
-            "description": "`FNAMEI PIC X(20)`, the first name.",
-            "maxLength": 20
+            "description": "`FNAMEI PIC X(20)`, the first name, in ASCII.",
+            "maxLength": 20,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "last_name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`LNAMEI PIC X(20)`, the last name.",
-            "maxLength": 20
+            "description": "`LNAMEI PIC X(20)`, the last name, in ASCII.",
+            "maxLength": 20,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "password": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`PASSWDI PIC X(8)`, the password, stored as the argon2id hash of the\nvalue as entered, case kept and space-padded to 8 characters.",
-            "maxLength": 8
+            "description": "`PASSWDI PIC X(8)`, the password in ASCII, stored as the argon2id hash\nof the value as entered, case kept and space-padded to 8 characters.",
+            "maxLength": 8,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "user_id": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`USERIDI PIC X(8)`, the new user's ID, stored with its case kept.",
-            "maxLength": 8
+            "description": "`USERIDI PIC X(8)`, the new user's ID in ASCII, stored with its case\nkept.",
+            "maxLength": 8,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "usr_type": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`USRTYPEI PIC X(1)`, the user type: `A` for an administrator, `U` for a\nregular user. Any other non-blank value is stored as entered.",
-            "maxLength": 1
+            "description": "`USRTYPEI PIC X(1)`, the user type: `A` for an administrator, `U` for a\nregular user. Any other non-blank ASCII value is stored as entered.",
+            "maxLength": 1,
+            "pattern": "^[\\x00-\\x7F]*$"
           }
         }
       },
@@ -5132,32 +5174,36 @@
               "string",
               "null"
             ],
-            "description": "`FNAMEI PIC X(20)`, the first name.",
-            "maxLength": 20
+            "description": "`FNAMEI PIC X(20)`, the first name, in ASCII.",
+            "maxLength": 20,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "last_name": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`LNAMEI PIC X(20)`, the last name.",
-            "maxLength": 20
+            "description": "`LNAMEI PIC X(20)`, the last name, in ASCII.",
+            "maxLength": 20,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "password": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`PASSWDI PIC X(8)`, the password, as entered, case kept. Absent or\n`null`: the current password, unchanged and not re-hashed (E-21). An\nempty string is a password left blank, rejected with `Password can NOT\nbe empty...` (V-COUSR02C-007). Any other value is compared with the\nstored password by argon2 verification and re-hashed when it differs.\n\nThe current password is never returned, because `COUSR02C` would show\nit in this field [app/cbl/COUSR02C.cbl:L166-170] and a stored hash\ncannot be shown. An absent or `null` password therefore stands for that\nreloaded value, while an empty string is a field the user emptied; the\ntwo are never merged.",
-            "maxLength": 8
+            "description": "`PASSWDI PIC X(8)`, the password in ASCII, as entered, case kept. Absent or\n`null`: the current password, unchanged and not re-hashed (E-21). An\nempty string is a password left blank, rejected with `Password can NOT\nbe empty...` (V-COUSR02C-007). Any other value is compared with the\nstored password by argon2 verification and re-hashed when it differs.\n\nThe current password is never returned, because `COUSR02C` would show\nit in this field [app/cbl/COUSR02C.cbl:L166-170] and a stored hash\ncannot be shown. An absent or `null` password therefore stands for that\nreloaded value, while an empty string is a field the user emptied; the\ntwo are never merged.",
+            "maxLength": 8,
+            "pattern": "^[\\x00-\\x7F]*$"
           },
           "usr_type": {
             "type": [
               "string",
               "null"
             ],
-            "description": "`USRTYPEI PIC X(1)`, the user type: `A` for an administrator, `U` for a\nregular user. Any other non-blank value is stored as entered.",
-            "maxLength": 1
+            "description": "`USRTYPEI PIC X(1)`, the user type: `A` for an administrator, `U` for a\nregular user. Any other non-blank ASCII value is stored as entered.",
+            "maxLength": 1,
+            "pattern": "^[\\x00-\\x7F]*$"
           }
         }
       }

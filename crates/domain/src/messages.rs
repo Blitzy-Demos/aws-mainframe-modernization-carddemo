@@ -1678,6 +1678,15 @@ pub const AUTHENTICATION_REQUIRED: &str = "Authentication required";
 /// only through menu routing [app/cbl/COMEN01C.cbl:L127-143].
 pub const ADMIN_ACCESS_REQUIRED: &str = "Admin access required";
 
+/// 404 for a path no API route serves. It names no path, so the requested
+/// one is never repeated back.
+pub const ROUTE_NOT_FOUND: &str = "Resource not found";
+
+/// 405 for a method the requested path does not serve; the response's `Allow`
+/// header lists the methods it does. It names no method, so the requested one
+/// is never repeated back.
+pub const METHOD_NOT_ALLOWED: &str = "Method not allowed";
+
 /// 400 for a reward rule whose `reward_rate` is below 0.
 pub const REWARD_RATE_NEGATIVE: &str = "reward_rate must not be negative";
 
@@ -3015,6 +3024,8 @@ mod tests {
         for (text, expected) in [
             (AUTHENTICATION_REQUIRED, "Authentication required"),
             (ADMIN_ACCESS_REQUIRED, "Admin access required"),
+            (ROUTE_NOT_FOUND, "Resource not found"),
+            (METHOD_NOT_ALLOWED, "Method not allowed"),
             (REWARD_RATE_NEGATIVE, "reward_rate must not be negative"),
             (
                 REWARD_MIN_EXCEEDS_MAX,

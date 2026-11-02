@@ -5,8 +5,8 @@
 //! to its program, one `DEFINE TRANSACTION` each [app/csd/CARDDEMO.CSD:L306-487],
 //! and the region served them to 3270 terminals. Here every transaction is a
 //! route of [`carddemo_api::app`]. This binary only wires the shared components
-//! together and serves them: the settings, the telemetry, the database pool,
-//! the application state, then the listener.
+//! together and serves them: the settings, the telemetry, the application
+//! state, the database pool, the listener, then the stop signals.
 //!
 //! # Starting
 //!
@@ -32,21 +32,28 @@
 //!
 //! A failure is one line on standard error, `api: <stage>: <error>`, and exit
 //! status 1. The stages, in start-up order, are `configuration`, `telemetry`,
-//! `database`, `state`, `bind <addr>` and, once serving, `serve`. A failure
-//! after telemetry is installed is also an ERROR event on standard output. No
-//! database URL or secret is ever written: neither the settings errors nor the
-//! database errors carry one.
+//! `state`, `database`, `bind <addr>`, `signals` and, once serving, `serve`.
+//! Every setting is checked by `state` before `database` makes the first
+//! connection attempt, so an unreachable database never hides an invalid
+//! setting. A failure after telemetry is installed is also an ERROR event on
+//! standard output. No database URL or secret is ever written: neither the
+//! settings errors nor the database errors carry one.
 //!
-//! The server runs until the process is stopped. There is no graceful
-//! shutdown: a signal ends the process, and `PostgreSQL` rolls back the unit of
-//! work of any request still in flight when its connection closes. Every span
-//! that finished before then is already on standard output, because the span
-//! exporter writes each one as it ends.
+//! # Stopping
+//!
+//! SIGINT (Ctrl-C) and SIGTERM (`kill`, `docker compose stop`) stop the server
+//! gracefully. It logs `api stopping: draining in-flight requests` with the
+//! signal's name, stops accepting connections, closes the idle ones and lets
+//! every request in flight finish. It then closes the database pool, logs
+//! `api stopped`, shuts telemetry down, which flushes every pending span, and
+//! exits with status 0. A request that never finishes holds the shutdown
+//! open; SIGKILL then ends the process, and `PostgreSQL` rolls back the unit
+//! of work of any request still in flight when its connection closes.
 
 use std::fmt::Display;
 use std::process::ExitCode;
 
-use carddemo_api::{AppState, app};
+use carddemo_api::{PreparedState, app};
 use carddemo_persistence::connect;
 use carddemo_runtime::config::Settings;
 use carddemo_runtime::telemetry;
@@ -68,29 +75,93 @@ async fn main() -> ExitCode {
         Ok(guard) => guard,
         Err(err) => return fail("telemetry", &err),
     };
-    let db = match connect(&settings.database_url).await {
+    // Every setting is checked, and the clock parsed, before the first
+    // connection attempt, so a database failure cannot mask an invalid one.
+    let prepared = match PreparedState::new(settings) {
+        Ok(prepared) => prepared,
+        Err(err) => return fail("state", &err),
+    };
+    let db = match connect(&prepared.settings().database_url).await {
         Ok(db) => db,
         Err(err) => return fail("database", &err),
     };
-    // `AppState::new` takes the settings by value, so the address is copied
-    // out first.
-    let addr = settings.http_addr;
-    let state = match AppState::new(db, settings) {
-        Ok(state) => state,
-        Err(err) => return fail("state", &err),
-    };
+    // `into_state` moves the settings into the state, so the address is
+    // copied out first. A handle is kept to close the pool on shutdown.
+    let addr = prepared.settings().http_addr;
+    let state = prepared.into_state(db.clone());
     let listener = match TcpListener::bind(addr).await {
         Ok(listener) => listener,
         Err(err) => return fail(&format!("bind {addr}"), &err),
     };
+    // Installed before `api listening`, so from then on a stop signal drains
+    // the server instead of killing the process.
+    #[cfg(unix)]
+    let stop = match stop_signal() {
+        Ok(stop) => stop,
+        Err(err) => return fail("signals", &err),
+    };
+    #[cfg(not(unix))]
+    let stop = stop_signal();
     // With port 0 the system picks the port, so the event names the address
     // the listener holds rather than the configured one.
     let bound = listener.local_addr().unwrap_or(addr);
     tracing::info!(addr = %bound, "api listening");
-    match axum::serve(listener, app(state)).await {
-        Ok(()) => ExitCode::SUCCESS,
+    let draining = async move {
+        let signal = stop.await;
+        tracing::info!(signal, "api stopping: draining in-flight requests");
+    };
+    match axum::serve(listener, app(state))
+        .with_graceful_shutdown(draining)
+        .await
+    {
+        Ok(()) => {
+            db.close().await;
+            tracing::info!("api stopped");
+            // Returning drops `_telemetry`, which flushes the span export.
+            ExitCode::SUCCESS
+        }
         Err(err) => fail("serve", &err),
     }
+}
+
+/// Installs the SIGINT (Ctrl-C) and SIGTERM (`kill`, `docker compose stop`)
+/// streams and returns a future that resolves to the name of the first of
+/// them the process receives.
+///
+/// Once installed, neither signal ends the process by itself any more: the
+/// server stops accepting connections, answers the requests in flight and
+/// returns.
+///
+/// # Errors
+///
+/// The I/O error of a stream that cannot be installed.
+#[cfg(unix)]
+fn stop_signal() -> std::io::Result<impl Future<Output = &'static str> + Send + 'static> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        }
+    })
+}
+
+/// Resolves to `ctrl-c` when the process receives Ctrl-C, on a platform
+/// without Unix signals.
+///
+/// A handler that cannot be installed is logged as an ERROR event, and the
+/// future then never resolves: the server keeps serving until the process is
+/// killed.
+#[cfg(not(unix))]
+async fn stop_signal() -> &'static str {
+    if let Err(err) = tokio::signal::ctrl_c().await {
+        tracing::error!(error = %err, "api cannot handle Ctrl-C: it stops only when killed");
+        std::future::pending::<()>().await;
+    }
+    "ctrl-c"
 }
 
 /// Reports a failure at `stage` and returns exit status 1.

@@ -49,7 +49,7 @@ use carddemo_domain::rules::auth_decision::{
 };
 use carddemo_persistence::Db;
 
-use crate::consumer::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
+use crate::consumer::{self, Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
 use crate::ids;
 
 /// COPAUA0C 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-004: the paragraph a
@@ -58,7 +58,8 @@ use crate::ids;
 const EXTRACT_PARAGRAPH: &str = "2100-EXTRACT-REQUEST-MSG";
 
 /// COPAUA0C 8000-WRITE-AUTH-TO-DB — P-COPAUA0C-035: the paragraph a write
-/// plan the audit cannot pin is skipped at, recorded in its log event.
+/// plan the audit cannot pin is skipped at, recorded in its log event and as
+/// the message span's `location`.
 const WRITE_PARAGRAPH: &str = "8000-WRITE-AUTH-TO-DB";
 
 /// The CP00 flow: the `COPAUA0C` rules adapted to [`Flow`].
@@ -161,6 +162,11 @@ impl Flow for Cp00Flow {
     /// audit cannot pin (a declined found card, E-41) is logged with its
     /// escalation and writes nothing. The request is already acknowledged, so
     /// nothing here reaches the broker.
+    ///
+    /// Each failure's location is recorded in the message span as soon as it
+    /// is logged ([`consumer::record_location`]): the `I003` or `I004` of a
+    /// failed write, or `8000-WRITE-AUTH-TO-DB` for a skipped plan. A plan
+    /// written, or none planned, leaves the span's `none`.
     async fn after_ack(&self, req: &Request, work: PendingWrite) {
         let PendingWrite {
             request,
@@ -173,7 +179,10 @@ impl Flow for Cp00Flow {
         match planned {
             Ok(Some(plan)) => self.write(&plan).await,
             Ok(None) => {}
-            Err(unproven) => log_unproven(req, unproven, WRITE_PARAGRAPH),
+            Err(unproven) => {
+                log_unproven(req, unproven, WRITE_PARAGRAPH);
+                consumer::record_location(WRITE_PARAGRAPH);
+            }
         }
     }
 }
@@ -247,27 +256,37 @@ impl Cp00Flow {
     /// audit's "persists on later failure" column records. Each write runs
     /// under its own savepoint in the store. A unit of work that cannot be
     /// opened or committed loses the summary write, so it is logged as `I003`.
+    ///
+    /// Each record's location is recorded in the message span as soon as it
+    /// is logged ([`consumer::record_location`]). A failed commit's `I003`
+    /// replaces an earlier `I004`, because the summary that record left in
+    /// place is lost with the commit.
     async fn write(&self, plan: &AuthWritePlan) {
         let mut uow = match self.db.begin().await {
             Ok(uow) => uow,
             Err(error) => {
-                self.log_entry(&auth_decision::write_failure_entry(
+                let entry = auth_decision::write_failure_entry(
                     WriteStep::Summary,
                     &PortError::from(error),
                     plan,
-                ));
+                );
+                self.log_entry(&entry);
+                consumer::record_location(entry.location);
                 return;
             }
         };
         if let Some(entry) = write_segments(&mut uow.store(), plan).await {
             self.log_entry(&entry);
+            consumer::record_location(entry.location);
         }
         if let Err(error) = uow.commit().await {
-            self.log_entry(&auth_decision::write_failure_entry(
+            let entry = auth_decision::write_failure_entry(
                 WriteStep::Summary,
                 &PortError::from(error),
                 plan,
-            ));
+            );
+            self.log_entry(&entry);
+            consumer::record_location(entry.location);
         }
     }
 
@@ -676,6 +695,10 @@ mod tests {
             self.outside_8000("read_summary")
         }
 
+        async fn read_summary_of_detail(&mut self, _id: AuthId) -> PortResult<PendingAuthSummary> {
+            self.outside_8000("read_summary_of_detail")
+        }
+
         async fn insert_summary(&mut self, _summary: PendingAuthSummary) -> PortResult<()> {
             self.answer("insert_summary", ())
         }
@@ -704,6 +727,10 @@ mod tests {
             self.outside_8000("read_detail")
         }
 
+        async fn read_detail_for_update(&mut self, _id: AuthId) -> PortResult<PendingAuthDetail> {
+            self.outside_8000("read_detail_for_update")
+        }
+
         async fn details_for_account(
             &mut self,
             _id: AccountId,
@@ -714,7 +741,9 @@ mod tests {
 
         async fn adjacent_detail(
             &mut self,
-            _id: AuthId,
+            _account: AccountId,
+            _auth_date_9c: i32,
+            _auth_time_9c: i32,
             _direction: Direction,
         ) -> PortResult<Option<PendingAuthDetail>> {
             self.outside_8000("adjacent_detail")

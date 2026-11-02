@@ -17,7 +17,7 @@
 import createClient, { type Middleware } from "openapi-fetch";
 
 import type { components, paths } from "@/api/schema";
-import { clearSession, getSession } from "@/lib/session";
+import { clearSession, getSession, type Session } from "@/lib/session";
 
 export type ErrorBody = components["schemas"]["ErrorBody"];
 
@@ -124,27 +124,42 @@ export function toErrorBody(raw: unknown): ErrorBody {
 // 401 from this path does not end the session.
 const LOGIN_PATH = "/auth/login" satisfies keyof paths;
 
-// The SPA route of the sign-on page.
-const LOGIN_ROUTE = "/login";
+// The session each request was sent by. Every sign-on stores a new session
+// object, which getSession returns until the session is cleared or replaced,
+// so the object itself identifies the sign-on. openapi-fetch hands onResponse
+// the Request object onRequest returned, so the answer is matched to its own
+// request, and an entry goes away with its request. A request sent with no
+// session has no entry.
+const sentBySession = new WeakMap<Request, Session>();
 
 const authMiddleware: Middleware = {
   onRequest({ request }) {
     const session = getSession();
     if (session !== null) {
       request.headers.set("Authorization", `Bearer ${session.token}`);
+      sentBySession.set(request, session);
     }
     return request;
   },
-  // A 401 elsewhere means the token is missing, expired or rejected: the
-  // session ends and the browser goes to the sign-on page. The answer still
-  // reaches the caller, whose unwrap raises the server's
+  // A 401 elsewhere is the server's verdict on the token the request carried:
+  // missing, expired or rejected. It ends the session only while the session
+  // that sent the request is still the current one. A session signed on while
+  // the request was in flight therefore stays, even when the server issued it
+  // the same token again: the server's tokens are deterministic, derived from
+  // the user and the second of issue, so a user signing on twice within one
+  // second receives the same token. A request sent with no session ends none.
+  //
+  // Ending the session notifies useSession, and RequireAuth then redirects to
+  // the sign-on page with the requested location as `from`; a document
+  // navigation from here would lose that location. The answer reaches the
+  // caller unchanged, whose unwrap raises the server's
   // 'Authentication required'. A 403 ('Admin access required') is left to the
   // caller, which shows it.
-  onResponse({ response, schemaPath }) {
+  onResponse({ request, response, schemaPath }) {
     if (response.status === 401 && schemaPath !== LOGIN_PATH) {
-      clearSession();
-      if (globalThis.location.pathname !== LOGIN_ROUTE) {
-        globalThis.location.assign(LOGIN_ROUTE);
+      const sentBy = sentBySession.get(request);
+      if (sentBy !== undefined && getSession() === sentBy) {
+        clearSession();
       }
     }
     return response;
@@ -152,15 +167,89 @@ const authMiddleware: Middleware = {
 };
 
 /**
+ * The deadline of every request, from sending it to the last byte of its
+ * answer. No API operation streams or runs long, so a live server answers well
+ * within it; it ends a request whose connection has stalled, which would
+ * otherwise leave the call, and the screen waiting on it, pending forever.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000;
+
+/**
+ * The rejection of a request whose answer was still incomplete when
+ * REQUEST_TIMEOUT_MS elapsed: its status line, or the end of its body, had
+ * not arrived. The request is abandoned, never retried, so a write may or may
+ * not have reached the server.
+ */
+export class RequestTimeoutError extends Error {
+  constructor() {
+    super(
+      `No answer from the server within ${REQUEST_TIMEOUT_MS / 1000} seconds`,
+    );
+    this.name = "RequestTimeoutError";
+  }
+}
+
+// Sends one request, bounded by REQUEST_TIMEOUT_MS and by the caller's
+// `signal` option, which openapi-fetch puts on the Request. One controller
+// carries both to the network: the caller's abort rejects with the caller's
+// own reason (an AbortError unless the caller gave one), which query hooks
+// treat as cancellation, and the deadline rejects with a RequestTimeoutError.
+// - The signal goes in fetch's init argument, so the Request the middleware
+//   saw and sees again in onResponse stays the same object. openapi-fetch's
+//   second argument, requestInitExt, is never configured here.
+// - The controller stays armed after the headers arrive, because openapi-fetch
+//   reads the body afterwards and a stalled body is cut off the same way.
+//   Aborting once the body has been read changes nothing, so the deadline is
+//   disarmed early only when the call fails or the answer has no body.
+// - Nothing is retried: a write that timed out may already have been applied,
+//   so the caller sees the rejection and the request is sent exactly once.
+function fetchWithDeadline(request: Request): Promise<Response> {
+  const caller = request.signal;
+  const controller = new AbortController();
+  const onCallerAbort = () => {
+    disarm();
+    controller.abort(caller.reason);
+  };
+  const timer = setTimeout(() => {
+    disarm();
+    controller.abort(new RequestTimeoutError());
+  }, REQUEST_TIMEOUT_MS);
+  function disarm() {
+    clearTimeout(timer);
+    caller.removeEventListener("abort", onCallerAbort);
+  }
+  if (caller.aborted) {
+    onCallerAbort();
+  } else {
+    caller.addEventListener("abort", onCallerAbort, { once: true });
+  }
+  // The global is looked up on every request rather than once at load, so a
+  // test that stubs it after this module loads still intercepts the calls.
+  return globalThis.fetch(request, { signal: controller.signal }).then(
+    (response) => {
+      if (response.body === null) {
+        disarm();
+      }
+      return response;
+    },
+    (error: unknown) => {
+      disarm();
+      throw error;
+    },
+  );
+}
+
+/**
  * The API client. The origin-qualified base URL equals `/api` in the browser
  * and is what Node's Request (Vitest under jsdom) needs, since it rejects
- * relative URLs. The global is looked up on every request rather than once
- * here, so a test that stubs it after this module loads still intercepts the
- * calls.
+ * relative URLs. Each call sends one request through fetchWithDeadline and is
+ * never retried. A call with no complete answer within REQUEST_TIMEOUT_MS
+ * rejects with a RequestTimeoutError; one whose `signal` option is aborted
+ * first rejects with that signal's reason, an AbortError by default.
  */
 export const api = createClient<paths>({
   baseUrl: `${globalThis.location.origin}/api`,
-  fetch: (request) => globalThis.fetch(request),
+  fetch: fetchWithDeadline,
 });
 
 api.use(authMiddleware);
@@ -168,12 +257,14 @@ api.use(authMiddleware);
 /**
  * The success body of an answer and its status, for operations whose 2xx
  * statuses mean different things: `POST /payments` answers 200 with the
- * confirm prompt and 201 once the payment is made, and `POST /transactions`
- * answers 200 for a message-only path and 201 for an add.
+ * confirm prompt, writing nothing, and 201 once the payment is made.
  *
  * @throws ApiError for a non-2xx answer, with the server's error body, and for
- * a 2xx answer without a body, with UNEXPECTED_ERROR_BODY. A request that
- * never got an answer rejects with the original error.
+ * a 2xx answer without a body, with UNEXPECTED_ERROR_BODY. A request without a
+ * complete answer never gets here, because the call itself rejects: with a
+ * RequestTimeoutError once REQUEST_TIMEOUT_MS has elapsed, with the abort
+ * reason of its `signal` option (an AbortError by default) when the caller
+ * cancels it, and otherwise with the network error itself.
  */
 export function unwrapWithStatus<D>(result: ApiResult<D>): {
   data: D;

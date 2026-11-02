@@ -31,17 +31,37 @@
 //! # Telemetry
 //!
 //! Each handler runs in a span carrying `transaction` (`CCLI`, `CCDL` or
-//! `CCUP`), the caller's `user_id`, the keys of the request (`account_id` and
-//! `card_number`) and the `outcome` recorded once the unit of work has ended:
-//! `ok` for an answered read, `committed` for an update, `rejected` for a 4xx
-//! answer and `failed` for a 5xx one. A card number is recorded masked to its
-//! last four characters, as `CardNumber`'s `Debug` shows it, so the JSON
-//! logs hold no full card number.
+//! `CCUP`), the caller's `user_id`, the keys of the request and the `outcome`
+//! recorded once the unit of work has ended: `ok` for an answered read,
+//! `committed` for an update, `rejected` for a 4xx answer and `failed` for a
+//! 5xx one.
+//!
+//! The account and card numbers reach the span only through their key edits,
+//! which the handler applies before anything else and the rule applies again:
+//! `card_list::edit_account_filter` and `card_list::edit_card_filter` for the
+//! filters of the list, `card_view::edit_account` and `card_view::edit_card`
+//! (`2210-EDIT-ACCOUNT`, `2220-EDIT-CARD`) for the keys of the view and the
+//! update. A key the edit accepts is recorded as `account_id`, its 11 digits,
+//! or as `card_number`, masked to its last four digits as `CardNumber`'s
+//! `Debug` shows it, so the JSON logs hold no full card number. A refused key
+//! records no part of its text, only `account_id_length` or
+//! `card_number_length`, its count of characters, and `account_id_rejected`
+//! or `card_number_rejected`:
+//!
+//! | `*_rejected` | The edit refused |
+//! |---|---|
+//! | `blank` | A view or update key not entered: absent, empty, spaces, `*`, zeros or `LOW-VALUES` |
+//! | `too_long` | Any other key longer than its map field, `ACCTSID` X(11) or `CARDSID` X(16) |
+//! | `invalid` | Any other key: not a number of its field's width |
+//!
+//! A list filter left blank or zero filters nothing and records nothing.
 
 use axum::Json;
 use axum::extract::State;
-use carddemo_domain::error::ErrorKind;
-use carddemo_domain::rules::{VersionToken, card_list, card_update, card_view};
+use carddemo_domain::error::{DomainError, ErrorKind};
+use carddemo_domain::messages;
+use carddemo_domain::numeric::{AccountId, CardNumber};
+use carddemo_domain::rules::{ReturnMsg, VersionToken, card_list, card_update, card_view};
 use carddemo_persistence::UnitOfWork;
 use tracing::Span;
 use tracing::field::Empty;
@@ -72,26 +92,99 @@ const OUTCOME_REJECTED: &str = "rejected";
 /// The span `outcome` of a request answered with a 5xx status.
 const OUTCOME_FAILED: &str = "failed";
 
-/// `CARD-NUM PIC X(16)` [app/cpy/CVACT02Y.cpy:L5]: the characters of a card
-/// number a span shows, as the `MOVE` into the key cuts the entry.
+/// `CARDSID PIC X(16)`, the width of `CARD-NUM` [app/cpy/CVACT02Y.cpy:L5]: a
+/// refused card number longer than this is [`KEY_TOO_LONG`].
 const CARD_NUMBER_LEN: usize = 16;
 
 /// The trailing characters of a card number a span shows unmasked.
 const CARD_NUMBER_SHOWN: usize = 4;
 
+/// `*_rejected` of a view or update key the edit reads as not entered.
+const KEY_BLANK: &str = "blank";
+
+/// `*_rejected` of any other refused key longer than its map field.
+const KEY_TOO_LONG: &str = "too_long";
+
+/// `*_rejected` of any other refused key.
+const KEY_INVALID: &str = "invalid";
+
+/// The span fields of one key: its value, and the category and length of a
+/// refused key.
+struct KeyFields {
+    /// The key as the edit accepted it.
+    value: &'static str,
+    /// The category of a refusal.
+    rejected: &'static str,
+    /// The count of characters of a refused key.
+    length: &'static str,
+}
+
+/// The span fields of the account number.
+const ACCOUNT_FIELDS: KeyFields = KeyFields {
+    value: "account_id",
+    rejected: "account_id_rejected",
+    length: "account_id_length",
+};
+
+/// The span fields of the card number.
+const CARD_FIELDS: KeyFields = KeyFields {
+    value: "card_number",
+    rejected: "card_number_rejected",
+    length: "card_number_length",
+};
+
+/// One key of a request as the handler span records it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpanKey {
+    /// A list filter left blank or zero, which filters nothing: nothing is
+    /// recorded.
+    Unfiltered,
+    /// A key the edit accepted, as the span records it: an account number's
+    /// 11 digits, or a card number masked by [`masked_card_number`].
+    Accepted(String),
+    /// A key the edit refused: `category` is recorded as `*_rejected` and
+    /// `length`, the key's count of characters, as `*_length`.
+    Refused {
+        category: &'static str,
+        length: usize,
+    },
+}
+
+impl SpanKey {
+    /// Records this key on `span` under `fields`; the fields it does not set
+    /// stay empty.
+    fn record(self, span: &Span, fields: &KeyFields) {
+        match self {
+            Self::Unfiltered => {}
+            Self::Accepted(value) => {
+                span.record(fields.value, value);
+            }
+            Self::Refused { category, length } => {
+                span.record(fields.rejected, category)
+                    .record(fields.length, length);
+            }
+        }
+    }
+}
+
 /// COCRDLIC 0000-MAIN, 2200-EDIT-INPUTS, 9000-READ-FORWARD,
-/// 9100-READ-BACKWARDS, 9500-FILTER-RECORDS, 1400-SETUP-MESSAGE —
-/// P-COCRDLIC-003 to P-COCRDLIC-006, P-COCRDLIC-011 to P-COCRDLIC-014,
-/// P-COCRDLIC-017, P-COCRDLIC-021, P-COCRDLIC-023, V-COCRDLIC-001,
-/// V-COCRDLIC-002, V-COCRDLIC-005 to V-COCRDLIC-010
+/// 9100-READ-BACKWARDS, 9500-FILTER-RECORDS, 1000-SEND-MAP,
+/// 1400-SETUP-MESSAGE, 1500-SEND-SCREEN — P-COCRDLIC-003 to P-COCRDLIC-006,
+/// P-COCRDLIC-011 to P-COCRDLIC-015, P-COCRDLIC-017, P-COCRDLIC-020,
+/// P-COCRDLIC-021, P-COCRDLIC-023, V-COCRDLIC-001, V-COCRDLIC-002,
+/// V-COCRDLIC-005 to V-COCRDLIC-010
 ///
 /// One page of the card list in `CARDDAT` key order: forward (ENTER, PF8)
 /// from `start_key` inclusively, or backward (PF7) from the first card of the
 /// page shown, `WS-MAX-SCREEN-LINES` (7) rows unless `page_size` says
-/// otherwise. The `account_id` and `card_number` filters reach the rule as
-/// entered, so a filter that is neither blank nor a number of its width is
-/// answered with the `2210-EDIT-ACCOUNT` or `2220-EDIT-CARD` text. An empty
-/// page is a page: 200 with `items: []` and the text the COBOL shows with it.
+/// otherwise. Without `start_key` both directions read the first page from
+/// the lowest card number: backward is PF7 on the first entry, which re-reads
+/// that page with 'NO PREVIOUS PAGES TO DISPLAY'
+/// [app/cbl/COCRDLIC.cbl:L439-454]. The `account_id` and `card_number`
+/// filters reach the rule as entered, so a filter that is neither blank nor a
+/// number of its width is answered with the `2210-EDIT-ACCOUNT` or
+/// `2220-EDIT-CARD` text. An empty page is a page: 200 with `items: []` and
+/// the text the COBOL shows with it.
 ///
 /// # Errors
 ///
@@ -99,7 +192,10 @@ const CARD_NUMBER_SHOWN: usize = 4;
 /// - 400 with 'ACCOUNT FILTER,IF SUPPLIED MUST BE A 11 DIGIT NUMBER' at
 ///   `ACCTSID` or 'CARD ID FILTER,IF SUPPLIED MUST BE A 16 DIGIT NUMBER' at
 ///   `CARDSID` (V-COCRDLIC-001, V-COCRDLIC-002).
-/// - 400 with code `INVALID` when the page parameters do not deserialize.
+/// - 400 with code `INVALID` when the page parameters do not deserialize,
+///   and with code `INVALID`, an empty `message` and no field when
+///   `start_key` holds a NUL character, which no card number holds; no card
+///   is read.
 /// - 401 without a valid bearer token.
 /// - 500 with the `CARDDAT` file-error text at `ACCTSID` when a card read
 ///   fails (V-COCRDLIC-008, V-COCRDLIC-010), or 'Unexpected error' when the
@@ -111,7 +207,7 @@ const CARD_NUMBER_SHOWN: usize = 4;
     params(CardListQuery, PageQuery),
     responses(
         (status = 200, description = "One page of cards in card-number order, with the keys of its neighbours and the COBOL page text", body = Page<CardSummary>),
-        (status = 400, description = "A filter or page parameter the COBOL edits reject", body = ErrorBody),
+        (status = 400, description = "A filter or page parameter the COBOL edits reject, or a start key holding a NUL character", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 500, description = "The card file could not be read", body = ErrorBody),
     ),
@@ -123,7 +219,11 @@ const CARD_NUMBER_SHOWN: usize = 4;
         transaction = "CCLI",
         user_id = %user.user_id,
         account_id = Empty,
+        account_id_rejected = Empty,
+        account_id_length = Empty,
         card_number = Empty,
+        card_number_rejected = Empty,
+        card_number_length = Empty,
         outcome = Empty,
     ),
 )]
@@ -136,9 +236,10 @@ pub async fn list_cards(
     finish(list(&state, filters, page).await, OUTCOME_OK).map(Json)
 }
 
-/// COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS —
-/// P-COCRDSLC-002 to P-COCRDSLC-006, P-COCRDSLC-010, P-COCRDSLC-013 to
-/// P-COCRDSLC-016, V-COCRDSLC-001 to V-COCRDSLC-007
+/// COCRDSLC 2000-PROCESS-INPUTS, 9000-READ-DATA, 1200-SETUP-SCREEN-VARS,
+/// 1400-SEND-SCREEN, COMMON-RETURN — P-COCRDSLC-002 to P-COCRDSLC-007,
+/// P-COCRDSLC-010, P-COCRDSLC-012 to P-COCRDSLC-016, V-COCRDSLC-001 to
+/// V-COCRDSLC-007
 ///
 /// The card whose number is the `{id}` path segment, with the account number
 /// of the `account_id` query parameter: both keys are edited as
@@ -183,7 +284,11 @@ pub async fn list_cards(
         transaction = "CCDL",
         user_id = %user.user_id,
         account_id = Empty,
+        account_id_rejected = Empty,
+        account_id_length = Empty,
         card_number = Empty,
+        card_number_rejected = Empty,
+        card_number_length = Empty,
         outcome = Empty,
     ),
 )]
@@ -197,10 +302,11 @@ pub async fn get_card(
 }
 
 /// COCRDUPC 1200-EDIT-MAP-INPUTS, 2000-DECIDE-ACTION, 9000-READ-DATA,
-/// 9200-WRITE-PROCESSING, 9300-CHECK-CHANGE-IN-REC, 3250-SETUP-INFOMSG —
-/// P-COCRDUPC-002 to P-COCRDUPC-007, P-COCRDUPC-010 to P-COCRDUPC-016,
-/// P-COCRDUPC-019, P-COCRDUPC-022, P-COCRDUPC-023, P-COCRDUPC-028,
-/// V-COCRDUPC-001 to V-COCRDUPC-020
+/// 9200-WRITE-PROCESSING, 9300-CHECK-CHANGE-IN-REC, 3000-SEND-MAP,
+/// 3250-SETUP-INFOMSG, 3400-SEND-SCREEN, COMMON-RETURN — P-COCRDUPC-002 to
+/// P-COCRDUPC-008, P-COCRDUPC-010 to P-COCRDUPC-017, P-COCRDUPC-019,
+/// P-COCRDUPC-021 to P-COCRDUPC-023, P-COCRDUPC-028, V-COCRDUPC-001 to
+/// V-COCRDUPC-020
 ///
 /// Updates the card whose number is the `{id}` path segment from the body's
 /// map fields, in one request: the key edits, the fetch, the comparison with
@@ -209,6 +315,8 @@ pub async fn get_card(
 /// rewrite. 200 on success, with 'Changes committed to database' after a
 /// rewrite or 'No change detected with respect to values fetched.' when the
 /// body changes nothing, and the card as it now stands with its new token.
+/// `version` stands for the `CCUP-OLD-DETAILS` copy that `COMMON-RETURN`
+/// keeps in the COMMAREA (E-24).
 ///
 /// # Errors
 ///
@@ -254,7 +362,11 @@ pub async fn get_card(
         transaction = "CCUP",
         user_id = %user.user_id,
         account_id = Empty,
+        account_id_rejected = Empty,
+        account_id_length = Empty,
         card_number = Empty,
+        card_number_rejected = Empty,
+        card_number_length = Empty,
         outcome = Empty,
     ),
 )]
@@ -274,13 +386,13 @@ async fn list(
     filters: CardListQuery,
     page: PageQuery,
 ) -> Result<Page<CardSummary>, ApiError> {
-    filters.check()?;
-    record_keys(
+    record_keys(list_keys(
         filters.account_id.as_deref(),
         filters.card_number.as_deref(),
-    );
+    ));
+    filters.check()?;
     let (start_key, direction, page_size) = page.resolve(card_list::SCREEN_ROWS);
-    let input = filters.into_input(start_key, direction, page_size);
+    let input = filters.into_input(start_key, direction, page_size)?;
     let mut uow = state.db().begin().await?;
     let listed = card_list::list(&mut uow.store(), input).await;
     release(uow).await;
@@ -300,8 +412,8 @@ async fn view(
     card_number: String,
     query: CardViewQuery,
 ) -> Result<CardResponse, ApiError> {
+    record_keys(entered_keys(query.account_id.as_deref(), &card_number));
     query.check()?;
-    record_keys(query.account_id.as_deref(), Some(&card_number));
     let input = query.into_input(card_number);
     let mut uow = state.db().begin().await?;
     let viewed = card_view::view(&mut uow.store(), state.version_key(), input).await;
@@ -317,8 +429,8 @@ async fn update(
     card_number: String,
     body: CardUpdateRequest,
 ) -> Result<CardUpdateResponse, ApiError> {
+    record_keys(entered_keys(body.account_id.as_deref(), &card_number));
     body.check(&card_number)?;
-    record_keys(body.account_id.as_deref(), Some(&card_number));
     let version = body
         .version
         .as_deref()
@@ -367,25 +479,102 @@ async fn release(uow: UnitOfWork) {
     }
 }
 
-/// Records the request's keys on the handler span: the account number as
-/// entered and the card number masked by [`masked_card_number`].
-fn record_keys(account_id: Option<&str>, card_number: Option<&str>) {
+/// Records `keys`, the account and card numbers of the request as
+/// [`list_keys`] or [`entered_keys`] gives them, on the handler span.
+fn record_keys((account, card): (SpanKey, SpanKey)) {
     let span = Span::current();
-    if let Some(account_id) = account_id {
-        span.record("account_id", account_id);
-    }
-    if let Some(card_number) = card_number {
-        span.record("card_number", masked_card_number(card_number));
+    account.record(&span, &ACCOUNT_FIELDS);
+    card.record(&span, &CARD_FIELDS);
+}
+
+/// COCRDLIC 2210-EDIT-ACCOUNT, 2220-EDIT-CARD — P-COCRDLIC-005,
+/// P-COCRDLIC-006
+///
+/// The filters `account_id` and `card_number` of a `GET /cards` request as
+/// the span records them, through `card_list::edit_account_filter` and
+/// `card_list::edit_card_filter`.
+fn list_keys(account_id: Option<&str>, card_number: Option<&str>) -> (SpanKey, SpanKey) {
+    let account = card_list::edit_account_filter(account_id)
+        .map(|filter| filter.as_ref().map(ToString::to_string));
+    let card = card_list::edit_card_filter(card_number)
+        .map(|filter| filter.as_ref().map(masked_card_number));
+    (
+        filter_key(account_id, AccountId::WIDTH, account),
+        filter_key(card_number, CARD_NUMBER_LEN, card),
+    )
+}
+
+/// The list filter `entered`, of a map field `width` characters wide, as the
+/// span records it, from `edited`: its edit, with an accepted key in the
+/// span's form.
+fn filter_key(
+    entered: Option<&str>,
+    width: usize,
+    edited: Result<Option<String>, DomainError>,
+) -> SpanKey {
+    match edited {
+        Ok(Some(key)) => SpanKey::Accepted(key),
+        Ok(None) => SpanKey::Unfiltered,
+        Err(_) => refused(entered, width, false),
     }
 }
 
-/// `text` as a span shows a card number: its first [`CARD_NUMBER_LEN`]
-/// characters without trailing spaces, each but the last
+/// COCRDSLC 2210-EDIT-ACCOUNT, 2220-EDIT-CARD — P-COCRDSLC-002,
+/// P-COCRDSLC-003
+///
+/// The account number `account_id`, absent being blank, and the card number
+/// `card_number` of a `GET` or `PUT /cards/{id}` request as the span records
+/// them, through `card_view::edit_account` and `card_view::edit_card`.
+///
+/// `COCRDUPC`'s `1210-EDIT-ACCOUNT` and `1220-EDIT-CARD` accept the same keys,
+/// and read the same ones as not entered, for every value within its map
+/// field, and `CardUpdateRequest::check` refuses any longer value before the
+/// rule; these edits therefore describe the update's keys too.
+fn entered_keys(account_id: Option<&str>, card_number: &str) -> (SpanKey, SpanKey) {
+    let mut msg = ReturnMsg::default();
+    let account = match card_view::edit_account(account_id, &mut msg) {
+        Some(account) => SpanKey::Accepted(account.to_string()),
+        None => refused(
+            account_id,
+            AccountId::WIDTH,
+            msg.message() == Some(messages::ACCOUNT_NUMBER_NOT_PROVIDED),
+        ),
+    };
+    let mut msg = ReturnMsg::default();
+    let card = match card_view::edit_card(Some(card_number), &mut msg) {
+        Some(card) => SpanKey::Accepted(masked_card_number(&card)),
+        None => refused(
+            Some(card_number),
+            CARD_NUMBER_LEN,
+            msg.message() == Some(messages::CARD_NUMBER_NOT_PROVIDED),
+        ),
+    };
+    (account, card)
+}
+
+/// The key `entered`, of a map field `width` characters wide, that its edit
+/// refused, as the span records it: [`KEY_BLANK`] when `blank`, the edit
+/// having read it as not entered, else [`KEY_TOO_LONG`] when it holds more
+/// than `width` characters, else [`KEY_INVALID`]; with its count of
+/// characters, an absent key having none. No part of its text is kept.
+fn refused(entered: Option<&str>, width: usize, blank: bool) -> SpanKey {
+    let length = entered.map_or(0, |text| text.chars().count());
+    let category = if blank {
+        KEY_BLANK
+    } else if length > width {
+        KEY_TOO_LONG
+    } else {
+        KEY_INVALID
+    };
+    SpanKey::Refused { category, length }
+}
+
+/// `card`, a card number its edit accepted, as a span shows it: its text
+/// without trailing spaces, each character but the last
 /// [`CARD_NUMBER_SHOWN`] replaced by `*`, or all of them when it has no more
 /// than that many: the mask of `CardNumber`'s `Debug`.
-fn masked_card_number(text: &str) -> String {
-    let kept: String = text.chars().take(CARD_NUMBER_LEN).collect();
-    let trimmed = kept.trim_end_matches(' ');
+fn masked_card_number(card: &CardNumber) -> String {
+    let trimmed = card.trimmed();
     let count = trimmed.chars().count();
     let hidden = if count > CARD_NUMBER_SHOWN {
         count - CARD_NUMBER_SHOWN
@@ -408,4 +597,136 @@ fn finish<T>(result: Result<T, ApiError>, success: &'static str) -> Result<T, Ap
     };
     Span::current().record("outcome", outcome);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{KEY_BLANK, KEY_INVALID, KEY_TOO_LONG, SpanKey, entered_keys, list_keys};
+
+    /// The first fixture card, of account 00000000050 (P-CVACT02Y-009)
+    /// [app/data/ASCII/carddata.txt:L1].
+    const CARD: &str = "0500024453765740";
+
+    /// [`CARD`] as the span shows it.
+    const MASKED_CARD: &str = "************5740";
+
+    /// The account of [`CARD`].
+    const ACCOUNT: &str = "00000000050";
+
+    fn accepted(value: &str) -> SpanKey {
+        SpanKey::Accepted(value.to_owned())
+    }
+
+    const fn refused(category: &'static str, length: usize) -> SpanKey {
+        SpanKey::Refused { category, length }
+    }
+
+    #[test]
+    fn list_filters_record_their_edited_keys_or_only_the_refusal_class_and_length() {
+        // (account filter, card filter) -> (account key, card key)
+        let cases = [
+            (
+                Some(ACCOUNT),
+                Some(CARD),
+                accepted(ACCOUNT),
+                accepted(MASKED_CARD),
+            ),
+            (None, None, SpanKey::Unfiltered, SpanKey::Unfiltered),
+            (
+                Some(""),
+                Some("   "),
+                SpanKey::Unfiltered,
+                SpanKey::Unfiltered,
+            ),
+            (
+                Some("00000000000"),
+                Some("0000000000000000"),
+                SpanKey::Unfiltered,
+                SpanKey::Unfiltered,
+            ),
+            (
+                Some("*"),
+                Some("0500024453765"),
+                refused(KEY_INVALID, 1),
+                refused(KEY_INVALID, 13),
+            ),
+            (
+                Some("0000000005A"),
+                Some("050002445376574A"),
+                refused(KEY_INVALID, 11),
+                refused(KEY_INVALID, 16),
+            ),
+            (
+                Some("000000000501"),
+                Some("05000244537657401"),
+                refused(KEY_TOO_LONG, 12),
+                refused(KEY_TOO_LONG, 17),
+            ),
+        ];
+        for (account, card, account_key, card_key) in cases {
+            assert_eq!(
+                list_keys(account, card),
+                (account_key, card_key),
+                "{account:?}, {card:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_and_update_keys_record_their_edited_keys_or_only_the_refusal_class_and_length() {
+        // (account number, card number) -> (account key, card key)
+        let cases = [
+            (
+                Some(ACCOUNT),
+                CARD,
+                accepted(ACCOUNT),
+                accepted(MASKED_CARD),
+            ),
+            (None, "", refused(KEY_BLANK, 0), refused(KEY_BLANK, 0)),
+            (Some("*"), "*", refused(KEY_BLANK, 1), refused(KEY_BLANK, 1)),
+            (
+                Some("00000000000"),
+                "0000000000000000",
+                refused(KEY_BLANK, 11),
+                refused(KEY_BLANK, 16),
+            ),
+            (
+                Some("           "),
+                "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+                refused(KEY_BLANK, 11),
+                refused(KEY_BLANK, 16),
+            ),
+            (
+                Some("0000000005A"),
+                "050002445376574A",
+                refused(KEY_INVALID, 11),
+                refused(KEY_INVALID, 16),
+            ),
+            (
+                Some("50"),
+                "5740",
+                refused(KEY_INVALID, 2),
+                refused(KEY_INVALID, 4),
+            ),
+            (
+                Some("000000000501"),
+                "05000244537657401",
+                refused(KEY_TOO_LONG, 12),
+                refused(KEY_TOO_LONG, 17),
+            ),
+            (
+                Some("4111111111111111"),
+                CARD,
+                refused(KEY_TOO_LONG, 16),
+                accepted(MASKED_CARD),
+            ),
+        ];
+        for (account, card, account_key, card_key) in cases {
+            assert_eq!(
+                entered_keys(account, card),
+                (account_key, card_key),
+                "{account:?}, {card:?}"
+            );
+        }
+    }
 }

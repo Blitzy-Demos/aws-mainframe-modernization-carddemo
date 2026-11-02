@@ -54,9 +54,36 @@ use carddemo_domain::numeric::{
     TransactionRowId, UserId,
 };
 use rust_decimal::Decimal;
-use validator::ValidationErrors;
+use validator::{ValidationError, ValidationErrors};
 
 use crate::error::{ApiError, ErrorFieldBody};
+
+/// The `validator` check that request text is ASCII, for the members and keys
+/// a rule moves byte for byte into an `X(n)` field.
+///
+/// The rules receive text through [`Alnum::move_from`], the COBOL `MOVE` of
+/// the UTF-8 bytes, which stores a non-ASCII character as two to four bytes
+/// and cuts it at the field width; the stored bytes then read back one
+/// Latin-1 character each, so `é` would come back as `Ã©`. Within ASCII,
+/// characters and bytes agree, so the width the length check counts is the
+/// width the `MOVE` fills. Spaces and low-values are ASCII: blank members
+/// still reach the rule, which answers them with its own message.
+///
+/// The published API document carries this check on each such member as the
+/// pattern `^[\x00-\x7F]*$`. A failure is reported under the `ascii` code,
+/// and the DTO maps it to the member's BMS field as it maps a length failure.
+///
+/// # Errors
+///
+/// A [`ValidationError`] with code `ascii` when `value` holds a character
+/// above `U+007F`.
+pub fn ascii_text(value: &str) -> Result<(), ValidationError> {
+    if value.is_ascii() {
+        Ok(())
+    } else {
+        Err(ValidationError::new("ascii"))
+    }
+}
 
 /// The text of an `X(n)` field as a response carries it: the stored bytes
 /// without their trailing spaces.
@@ -234,7 +261,9 @@ mod tests {
     use serde_json::json;
     use validator::Validate;
 
-    use super::{BmsField, bms_errors, id_string, length_errors, money, reject_invalid, text};
+    use super::{
+        BmsField, ascii_text, bms_errors, id_string, length_errors, money, reject_invalid, text,
+    };
     use crate::error::ErrorFieldBody;
 
     /// A field enum shaped as the `<Dto>Field` enums are, with ranks that
@@ -316,6 +345,19 @@ mod tests {
             start_date: Some(over(10)),
             confirm: Some(over(1)),
             unmapped: Some(over(1)),
+        }
+    }
+
+    #[test]
+    fn ascii_text_accepts_ascii_only() {
+        let accepted = ["", " ", "\0\0", "ABC 123", "\u{7f}", "~`!@#$%^&*()"];
+        for value in accepted {
+            assert!(ascii_text(value).is_ok(), "{value:?}");
+        }
+        let rejected = ["\u{e9}", "A\u{e9}", "\u{80}", "\u{20ac}", "\u{1f600}"];
+        for value in rejected {
+            let error = ascii_text(value).expect_err(value);
+            assert_eq!(error.code, "ascii", "{value:?}");
         }
     }
 

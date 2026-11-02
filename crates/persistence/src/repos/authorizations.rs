@@ -46,9 +46,24 @@
 //! plain `GU`, succeeds is decided by the audit and reproduced by the rules
 //! `auth_detail` and `auth_decision`, not by this adapter.
 //!
-//! Reads run on the transaction itself. No statement writes the current date
-//! or time: the `AUTHFRDS` report date is the value the rule takes from the
-//! processing clock.
+//! # Locks
+//!
+//! One read locks: the CPVD fraud mark's detail read,
+//! [`AuthorizationStore::read_detail_for_update`], a `SELECT … FOR UPDATE`
+//! under its own savepoint whose row lock lasts until the caller's
+//! transaction commits or rolls back. Two overlapping fraud marks of one
+//! authorization therefore serialize: the second reads the flag the first
+//! committed, and no toggle is lost. `COPAUS1C` takes no lock of its own;
+//! this one is the concurrency safeguard of the replacement. Every other read,
+//! the CPVD view and its PF8 step included, takes no lock.
+//!
+//! Two reads run under their own savepoint: that locking read, and the CPVD
+//! summary read [`AuthorizationStore::read_summary_of_detail`], whose failure
+//! `READ-AUTH-RECORD` follows with the detail read (P-COPAUS1C-014), so the
+//! failed statement is rolled back to its savepoint and leaves the
+//! transaction usable for that read. Every other read runs on the transaction
+//! itself. No statement writes the current date or time: the `AUTHFRDS`
+//! report date is the value the rule takes from the processing clock.
 
 use carddemo_domain::entities::{
     AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PA_ACCOUNT_STATUS_OCCURS,
@@ -281,9 +296,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// COPAUA0C 5500-READ-AUTH-SUMMRY — P-COPAUA0C-008
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L616-640]; COPAUS0C
     /// GET-AUTH-SUMMARY — P-COPAUS0C-009
-    /// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L966-997]; COPAUS1C
-    /// READ-AUTH-RECORD — P-COPAUS1C-003
-    /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L431-458]:
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L966-997]:
     /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)`. No row is the `GE` status.
     async fn read_summary(&mut self, id: AccountId) -> PortResult<PendingAuthSummary> {
         let row = sqlx::query_as!(
@@ -304,6 +317,45 @@ impl AuthorizationStore for PgStore<'_, '_> {
         .await
         .map_err(|err| port_error(&err))?
         .ok_or(PortError::NotFound)?;
+        Ok(summary_from_row(row)?)
+    }
+
+    /// COPAUS1C READ-AUTH-RECORD — P-COPAUS1C-003, P-COPAUS1C-004
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L436-462]:
+    /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)` for the account of the
+    /// detail `id`, which stands for the COMMAREA `CDEMO-ACCT-ID` the request
+    /// does not carry (P-COPAUS1C-012).
+    ///
+    /// One statement joins the detail to its parent summary on the primary
+    /// keys of both tables. No detail with the identity, or no summary over
+    /// it, is the `GE` status: [`PortError::NotFound`].
+    ///
+    /// The statement runs under its own savepoint, so a failed summary read
+    /// is rolled back to it and leaves the transaction usable: an `OTHER`
+    /// status of the `GU` leaves `AUTHS-NOT-EOF` as it stood, and
+    /// `READ-AUTH-RECORD` still issues the detail `GNP` after it
+    /// (P-COPAUS1C-014), whose outcome decides between the summary and the
+    /// detail error text (V-COPAUS1C-003, V-COPAUS1C-006).
+    async fn read_summary_of_detail(&mut self, id: AuthId) -> PortResult<PendingAuthSummary> {
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
+            SummaryRow,
+            r#"SELECT s.pa_acct_id AS acct_id, s.pa_cust_id AS cust_id,
+                      s.pa_auth_status AS auth_status, s.pa_account_status AS account_status,
+                      s.pa_credit_limit AS credit_limit, s.pa_cash_limit AS cash_limit,
+                      s.pa_credit_balance AS credit_balance, s.pa_cash_balance AS cash_balance,
+                      s.pa_approved_auth_cnt AS approved_auth_cnt,
+                      s.pa_declined_auth_cnt AS declined_auth_cnt,
+                      s.pa_approved_auth_amt AS approved_auth_amt,
+                      s.pa_declined_auth_amt AS declined_auth_amt
+                 FROM pending_auth_details d
+                 JOIN pending_auth_summaries s ON s.pa_acct_id = d.pa_acct_id
+                WHERE d.auth_id = $1"#,
+            id.get()
+        )
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
         Ok(summary_from_row(row)?)
     }
 
@@ -528,6 +580,42 @@ impl AuthorizationStore for PgStore<'_, '_> {
         Ok(detail_from_row(&row)?)
     }
 
+    /// COPAUS1C MARK-AUTH-FRAUD, READ-AUTH-RECORD — P-COPAUS1C-003,
+    /// P-COPAUS1C-006 [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L230-242]
+    /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L465-470]: the
+    /// detail PF5 toggles, read with `SELECT … FOR UPDATE`.
+    ///
+    /// The row lock is held until the caller's transaction ends, through the
+    /// `AUTHFRDS` write, the detail replace and the commit or rollback, so a
+    /// second fraud mark of the same authorization waits here and then reads
+    /// the flag the first one committed. The statement runs under its own
+    /// savepoint, so a lock timeout ([`PortError::Contention`]) or any other
+    /// failure leaves the transaction usable; a released savepoint keeps the
+    /// lock in the transaction. No row is the `GE` status.
+    async fn read_detail_for_update(&mut self, id: AuthId) -> PortResult<PendingAuthDetail> {
+        let mut sp = savepoint(self.tx).await?;
+        let result = sqlx::query_as!(
+            DetailRow,
+            r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
+                      pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,
+                      pa_card_expiry_date, pa_message_type, pa_message_source,
+                      pa_auth_id_code, pa_auth_resp_code, pa_auth_resp_reason,
+                      pa_processing_code, pa_transaction_amt, pa_approved_amt,
+                      pa_merchant_catagory_code, pa_acqr_country_code, pa_pos_entry_mode,
+                      pa_merchant_id, pa_merchant_name, pa_merchant_city, pa_merchant_state,
+                      pa_merchant_zip, pa_transaction_id, pa_match_status, pa_auth_fraud,
+                      pa_fraud_rpt_date
+                 FROM pending_auth_details
+                WHERE auth_id = $1
+                  FOR UPDATE"#,
+            id.get()
+        )
+        .fetch_optional(&mut *sp)
+        .await;
+        let row = settle(sp, result).await?.ok_or(PortError::NotFound)?;
+        Ok(detail_from_row(&row)?)
+    }
+
     /// COPAUS0C PROCESS-PAGE-FORWARD and REPOSITION-AUTHORIZATIONS —
     /// P-COPAUS0C-010 [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L415-454]
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L488-519]; CBPAUP0C
@@ -553,28 +641,80 @@ impl AuthorizationStore for PgStore<'_, '_> {
 
     /// COPAUS1C READ-NEXT-AUTH-RECORD — P-COPAUS1C-014, P-COPAUS1C-009
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L493-518]: the
-    /// unqualified `GNP PAUTDTL1` after the detail `id`, the next twin under
-    /// the same summary, or for [`Direction::Backward`] the previous one.
+    /// unqualified `GNP PAUTDTL1` from the `PAUT9CTS` key (`auth_date_9c`,
+    /// `auth_time_9c`) under the summary of `account`, the next twin, or for
+    /// [`Direction::Backward`] the previous one.
     ///
-    /// The page from `id` inclusive holds `id` itself first, because the key
-    /// is unique under the summary; its second row is the adjacent twin.
-    /// `None` when there is none (`GE` or `GB`); [`PortError::NotFound`] when
-    /// no detail has the identity.
+    /// One statement on the unique index `pautdtl1_key` (`pa_acct_id`,
+    /// `pa_auth_date_9c`, `pa_auth_time_9c`): the first row past the key in
+    /// the direction's order. The key is excluded, as it is unique under the
+    /// summary and belongs to the detail already read. Both key parts are
+    /// `INTEGER`, so the row comparison orders as the packed `PAUT9CTS` bytes
+    /// do. `None` when no twin follows (`GE` or `GB`).
     async fn adjacent_detail(
         &mut self,
-        id: AuthId,
+        account: AccountId,
+        auth_date_9c: i32,
+        auth_time_9c: i32,
         direction: Direction,
     ) -> PortResult<Option<PendingAuthDetail>> {
-        let parent = sqlx::query_scalar!(
-            "SELECT pa_acct_id FROM pending_auth_details WHERE auth_id = $1",
-            id.get()
-        )
-        .fetch_optional(&mut **self.tx)
-        .await
-        .map_err(|err| port_error(&err))?
-        .ok_or(PortError::NotFound)?;
-        let page = details_page(self.tx, parent, Some(id.get()), direction, 2).await?;
-        Ok(page.into_iter().nth(1))
+        let row = match direction {
+            Direction::Forward => {
+                sqlx::query_as!(
+                    DetailRow,
+                    r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
+                              pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,
+                              pa_card_expiry_date, pa_message_type, pa_message_source,
+                              pa_auth_id_code, pa_auth_resp_code, pa_auth_resp_reason,
+                              pa_processing_code, pa_transaction_amt, pa_approved_amt,
+                              pa_merchant_catagory_code, pa_acqr_country_code,
+                              pa_pos_entry_mode, pa_merchant_id, pa_merchant_name,
+                              pa_merchant_city, pa_merchant_state, pa_merchant_zip,
+                              pa_transaction_id, pa_match_status, pa_auth_fraud,
+                              pa_fraud_rpt_date
+                         FROM pending_auth_details
+                        WHERE pa_acct_id = $1
+                          AND (pa_auth_date_9c, pa_auth_time_9c) > ($2, $3)
+                        ORDER BY pa_auth_date_9c, pa_auth_time_9c
+                        LIMIT 1"#,
+                    account.to_i64(),
+                    auth_date_9c,
+                    auth_time_9c
+                )
+                .fetch_optional(&mut **self.tx)
+                .await
+            }
+            Direction::Backward => {
+                sqlx::query_as!(
+                    DetailRow,
+                    r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
+                              pa_auth_orig_date, pa_auth_orig_time, pa_card_num, pa_auth_type,
+                              pa_card_expiry_date, pa_message_type, pa_message_source,
+                              pa_auth_id_code, pa_auth_resp_code, pa_auth_resp_reason,
+                              pa_processing_code, pa_transaction_amt, pa_approved_amt,
+                              pa_merchant_catagory_code, pa_acqr_country_code,
+                              pa_pos_entry_mode, pa_merchant_id, pa_merchant_name,
+                              pa_merchant_city, pa_merchant_state, pa_merchant_zip,
+                              pa_transaction_id, pa_match_status, pa_auth_fraud,
+                              pa_fraud_rpt_date
+                         FROM pending_auth_details
+                        WHERE pa_acct_id = $1
+                          AND (pa_auth_date_9c, pa_auth_time_9c) < ($2, $3)
+                        ORDER BY pa_auth_date_9c DESC, pa_auth_time_9c DESC
+                        LIMIT 1"#,
+                    account.to_i64(),
+                    auth_date_9c,
+                    auth_time_9c
+                )
+                .fetch_optional(&mut **self.tx)
+                .await
+            }
+        }
+        .map_err(|err| port_error(&err))?;
+        row.as_ref()
+            .map(detail_from_row)
+            .transpose()
+            .map_err(PortError::from)
     }
 
     /// COPAUS1C UPDATE-AUTH-DETAILS — P-COPAUS1C-008
@@ -798,8 +938,7 @@ impl PgStore<'_, '_> {
 }
 
 /// One page of the details of the account `acct_id` in twin order, read on
-/// `conn`: [`AuthorizationStore::details_for_account`] and the step of
-/// [`AuthorizationStore::adjacent_detail`].
+/// `conn`: [`AuthorizationStore::details_for_account`].
 ///
 /// `start`, when given, is the identity of a detail of the account, and the
 /// page begins at its key inclusive; an identity that names no detail of the

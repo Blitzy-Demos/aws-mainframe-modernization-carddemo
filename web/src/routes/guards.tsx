@@ -6,7 +6,8 @@
 // the tab holds, while the server decides access: a missing or expired token
 // is answered 401 'Authentication required' and a regular user's token on
 // /admin/** 403 'Admin access required', and api/client.ts clears the session
-// on a 401, which brings RequireAuth back to the sign-on screen.
+// on a 401 to a request that session sent, which brings RequireAuth back to
+// the sign-on screen.
 //
 // The landing after sign-on is not chosen here: LoginPage navigates to the
 // login response's `landing`, the counterpart of COSGN00C's XCTL split.

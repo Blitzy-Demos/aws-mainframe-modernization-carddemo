@@ -4,7 +4,7 @@
 //!
 //! | Operation | Program and map | Request | Error fields |
 //! |---|---|---|---|
-//! | `GET /admin/transaction-types` | `COTRTLIC`, `COTRTLI` | [`TranTypeListQuery`] and the shared `PageQuery` | [`TranTypeListField`] |
+//! | `GET /admin/transaction-types` | `COTRTLIC`, `COTRTLI` | [`TranTypeListQuery`] and [`TranTypeListPageQuery`] | [`TranTypeListField`] |
 //! | `POST /admin/transaction-types` | `COTRTUPC`, `COTRTUP` | [`TranTypeCreateRequest`] | [`TranTypeUpsertField`] |
 //! | `PUT /admin/transaction-types/{id}` | `COTRTUPC`, `COTRTUP` | [`TranTypeUpdateRequest`] | [`TranTypeUpsertField`] |
 //! | `PUT /admin/transaction-types/{id}?origin=list` | `COTRTLIC`, `COTRTLI` | [`TranTypeUpdateRequest`] | none |
@@ -50,7 +50,45 @@
 //! program's rows name one. Every value within the length reaches the rule
 //! exactly as entered, so blanks, zeros and non-digits get the audited COBOL
 //! messages. [`check_type_code_key`] applies the same length to the `{id}`
-//! path segment.
+//! path segment, and [`TranTypeListPageQuery::check`] to the list's
+//! `start_key`.
+//!
+//! # Encoding
+//!
+//! Both programs `MOVE` the UTF-8 bytes of a value into its `X(n)` field, so
+//! a character above `U+007F` takes two to four bytes there. Where an audited
+//! edit reads every byte that `MOVE` keeps, the edit answers such a value
+//! with its own text, and nothing here precedes it; where none does, the
+//! value is held to ASCII ([`crate::dto::ascii_text`]) and answered as an
+//! over-length one:
+//!
+//! - `COTRTUPC` (`POST`, and `PUT` without `origin`): the type code, from the
+//!   body or the `{id}` segment, goes to `1245-EDIT-NUM-REQD`, and the
+//!   description to `1230-EDIT-ALPHANUM-REQD`. A non-ASCII character leaves
+//!   a byte of `0x80` or more within the two or fifty bytes kept, which is no
+//!   `NUMVAL` argument and no letter, digit or space, so the key is refused
+//!   `must be numeric.` (V-COTRTUPC-002, V-COTRTUPC-013) and the description
+//!   `can have numbers or alphabets only.` (V-COTRTUPC-008, V-COTRTUPC-018)
+//!   before anything is read or written. No ASCII check is added.
+//! - `COTRTLIC` (`PUT` with `origin=list`, and `DELETE`): the `{id}` segment
+//!   is the listed row's `TRTTYPn` and has no edit, so a non-ASCII segment
+//!   would address the type its first two bytes spell. The row description
+//!   is received into `X(50)` cut at a character boundary
+//!   (`1100-RECEIVE-SCREEN`), so a non-ASCII character that straddles byte 50
+//!   would be dropped with the rest of the text and the ASCII text before it
+//!   stored. Both are held to ASCII, on no field, as their rows name none.
+//! - `COTRTLIC` list (`GET`): the type code filter goes to
+//!   `1220-EDIT-TYPECD`, whose `IS NUMERIC` refuses a byte of `0x80` or more
+//!   with its own text (V-COTRTLIC-001), so no ASCII check is added. The
+//!   description filter is moved into `X(50)` by `1230-EDIT-DESC` with no
+//!   content edit (P-COTRTLIC-020), cut at a character boundary, so a
+//!   non-ASCII filter that passes the 50-character length could be cut short
+//!   and a shorter text searched; it is held to ASCII on `TRDESC`. The
+//!   `start_key` is the `X(2)` COMMAREA key `WS-CA-FIRST-TR-CODE` or
+//!   `WS-CA-LAST-TR-CODE` that the program sets from the rows it showed
+//!   (P-COTRTLIC-030, P-COTRTLIC-031, P-COTRTLIC-033) and no edit reads, so a
+//!   non-ASCII key would browse from the code its first two bytes spell; it
+//!   is held to ASCII on no field, as no BMS field holds it.
 
 use carddemo_domain::entities::TranTypeMaster;
 use carddemo_domain::numeric::TranTypeCode;
@@ -67,7 +105,7 @@ use validator::{Validate, ValidationErrors};
 
 use crate::dto::{BmsField, id_string, reject_invalid};
 use crate::error::ApiError;
-use crate::pagination::Page;
+use crate::pagination::{Page, PageDirection, PageQuery, PageSize};
 
 /// The length of the type code fields: `TRTYPEI PIC X(2)` of `COTRTLI`, and
 /// `TRTYPCDI PIC X(2)` of `COTRTUP`
@@ -206,8 +244,8 @@ impl BmsField for TranTypeUpsertField {
 /// The filters of `GET /admin/transaction-types`: the `TRTYPE` and `TRDESC`
 /// fields of the `COTRTLI` map, as entered.
 ///
-/// The browse position travels separately, as the shared `PageQuery`, so the
-/// handler extracts two query structs. The filter edits are the rule's
+/// The browse position travels separately, as [`TranTypeListPageQuery`], so
+/// the handler extracts two query structs. The filter edits are the rule's
 /// (`1230-EDIT-DESC` and `1220-EDIT-TYPECD`, through
 /// [`carddemo_domain::rules::tran_type_list::edit_filters`]): blanks or `00`
 /// set no type condition, anything but two digits is rejected with the
@@ -217,25 +255,47 @@ impl BmsField for TranTypeUpsertField {
 pub struct TranTypeListQuery {
     /// The type code filter, `TRTYPE` `X(2)`: two digits, or blank or `00` for
     /// every type.
+    // COTRTLIC 1220-EDIT-TYPECD — V-COTRTLIC-001: the pattern admits exactly
+    // the text `rules::tran_type_list::edit_filters` passes once it is moved
+    // into `X(2)` and padded with spaces: all spaces (empty included), both
+    // bytes low-values, or two digits (`00` among them). One digit, or a mix
+    // of a space and low-values, is not blank and not numeric.
     #[serde(default)]
-    #[param(max_length = 2)]
+    #[param(max_length = 2, pattern = r"^(?: {0,2}|\x00{2}|[0-9]{2})$")]
     #[validate(length(max = TYPE_CODE_MAX_LEN))]
     pub type_code: Option<String>,
-    /// The description filter, `TRDESC` `X(50)`: the types whose description
-    /// contains this text, its leading and trailing spaces dropped.
+    /// The description filter, `TRDESC` `X(50)` in ASCII: the types whose
+    /// description contains this text, its leading and trailing spaces
+    /// dropped.
+    // COTRTLIC 1230-EDIT-DESC — P-COTRTLIC-020: the filter is moved into
+    // `X(50)` byte for byte with no content edit, so the ASCII check stands
+    // where no audited edit reads the bytes (see the module's notes on the
+    // encoding).
     #[serde(default)]
-    #[param(max_length = 50)]
-    #[validate(length(max = DESCRIPTION_MAX_LEN))]
+    #[param(max_length = 50, pattern = "^[\\x00-\\x7F]*$")]
+    #[validate(
+        length(max = DESCRIPTION_MAX_LEN),
+        custom(function = "crate::dto::ascii_text")
+    )]
     pub description: Option<String>,
 }
 
 impl TranTypeListQuery {
-    /// Rejects a filter longer than its BMS field: 400 with an empty message
-    /// on `TRTYPE` or `TRDESC`.
+    /// Rejects a filter longer than its BMS field, and a description filter
+    /// holding a character above `U+007F`: 400 with an empty message on
+    /// `TRTYPE` or `TRDESC`.
+    ///
+    /// COTRTLIC 1230-EDIT-DESC — P-COTRTLIC-020: the description filter is
+    /// moved into `X(50)` with no edit of its bytes, which would cut a
+    /// non-ASCII filter short of the text entered. A non-ASCII type code
+    /// filter is left to `1220-EDIT-TYPECD`, which refuses it with its own
+    /// text (V-COTRTLIC-001). Blank and low-value filters pass, for the
+    /// rule's no-condition reading.
     ///
     /// # Errors
     ///
-    /// The 400 [`ApiError`] when a filter exceeds its length.
+    /// The 400 [`ApiError`] when a filter exceeds its length, or the
+    /// description filter is not ASCII.
     pub fn check(&self) -> Result<(), ApiError> {
         self.validate().map_err(|errors| {
             reject_invalid(&errors, TranTypeListField::of_filter, OVER_LENGTH_MESSAGE)
@@ -243,12 +303,15 @@ impl TranTypeListQuery {
     }
 
     /// The rule input of one list page: the filters as entered and the
-    /// browse position `PageQuery::resolve` gives.
+    /// browse position [`PageQuery::resolve`] gives for the
+    /// [`TranTypeListPageQuery`].
     ///
     /// The start key is moved into the `X(2)` code as the COMMAREA keys
-    /// `WS-CA-FIRST-TR-CODE` and `WS-CA-LAST-TR-CODE` hold it. A blank key is
-    /// no key: it is the value those fields hold before any page was shown, so
-    /// the request reads the first page.
+    /// `WS-CA-FIRST-TR-CODE` and `WS-CA-LAST-TR-CODE` hold it, so call
+    /// [`TranTypeListPageQuery::check`] first: a longer or non-ASCII key
+    /// would be cut to the bytes of another code. A blank key is no key: it
+    /// is the value those fields hold before any page was shown, so the
+    /// request reads the first page.
     #[must_use]
     pub fn into_input(
         self,
@@ -262,6 +325,84 @@ impl TranTypeListQuery {
         TranTypeListInput {
             type_filter: self.type_code,
             desc_filter: self.description,
+            start_key,
+            direction,
+            page_size,
+        }
+    }
+}
+
+/// The page position of `GET /admin/transaction-types`: `start_key`,
+/// `direction` and `page_size`.
+///
+/// COTRTLIC 8000-READ-FORWARD, 8100-READ-BACKWARDS, 2500-SETUP-MESSAGE —
+/// P-COTRTLIC-004, P-COTRTLIC-030, P-COTRTLIC-031, P-COTRTLIC-033: the
+/// parameters are those of [`PageQuery`], declared here so that the
+/// published `start_key` carries the `X(2)` width of the COMMAREA keys
+/// `WS-CA-FIRST-TR-CODE` and `WS-CA-LAST-TR-CODE` and the ASCII pattern
+/// that [`TranTypeListPageQuery::check`] holds it to. `direction` and
+/// `page_size` are published and read exactly as `PageQuery` declares them,
+/// and the query converts into one, so [`PageQuery::resolve`] gives the
+/// browse its direction and its seven-row default (`WS-MAX-SCREEN-LINES`).
+/// An unknown `direction` or a `page_size` outside 1 to 100 fails to
+/// deserialize, so [`ApiQuery`](crate::error::ApiQuery) answers it 400 with
+/// code `INVALID`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, IntoParams, Validate)]
+#[into_params(parameter_in = Query)]
+pub struct TranTypeListPageQuery {
+    /// The type code the page starts from, `X(2)` in ASCII: a previous
+    /// page's `next_key` or `prev_key`. Forward (F8), the page starts at that
+    /// code, inclusive; backward (F7), it holds the types before it. Absent,
+    /// empty, all spaces or all low-values is no key: both directions read
+    /// the first page, backward with `No previous pages to display`.
+    #[param(max_length = 2, pattern = "^[\\x00-\\x7F]*$")]
+    #[validate(
+        length(max = TYPE_CODE_MAX_LEN),
+        custom(function = "crate::dto::ascii_text")
+    )]
+    pub start_key: Option<String>,
+    /// `forward` (ENTER and F8, the default) or `backward` (F7).
+    // Inlined, as `PageQuery` inlines it: query parameters register no
+    // component schema, so a reference to `PageDirection` would dangle.
+    #[param(inline)]
+    pub direction: Option<PageDirection>,
+    /// Rows on the page, from 1 to 100. Defaults to 7, the rows of the
+    /// `COTRTLI` screen.
+    #[param(value_type = Option<u16>, minimum = 1, maximum = 100)]
+    pub page_size: Option<PageSize>,
+}
+
+impl TranTypeListPageQuery {
+    /// Rejects a `start_key` longer than the type code `X(2)` or holding a
+    /// character above `U+007F`: 400 with an empty message and no field.
+    ///
+    /// COTRTLIC 8000-READ-FORWARD, 8100-READ-BACKWARDS — P-COTRTLIC-030,
+    /// P-COTRTLIC-031, P-COTRTLIC-033: the key is the COMMAREA code the
+    /// program set from the rows it showed, which no operator types and no
+    /// edit reads. Moved into `X(2)`, a longer key, or the UTF-8 bytes of a
+    /// non-ASCII one, would start the browse at another code. No BMS field
+    /// holds the key, so the error names none, as the `COTRTLIC` row keys'
+    /// errors name none ([`check_type_code_key`]). Blank, space and
+    /// low-value keys pass: they read the first page.
+    ///
+    /// # Errors
+    ///
+    /// The 400 [`ApiError`] when `start_key` has more than two characters or
+    /// is not ASCII.
+    pub fn check(&self) -> Result<(), ApiError> {
+        self.validate().map_err(|errors| reject_list_row(&errors))
+    }
+}
+
+/// The shared pagination query of the type list, each parameter unchanged.
+impl From<TranTypeListPageQuery> for PageQuery {
+    fn from(query: TranTypeListPageQuery) -> Self {
+        let TranTypeListPageQuery {
+            start_key,
+            direction,
+            page_size,
+        } = query;
+        Self {
             start_key,
             direction,
             page_size,
@@ -379,9 +520,13 @@ pub struct TranTypeUpdateQuery {
 /// must-be-supplied text (V-COTRTUPC-007, V-COTRTLIC-013).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema, Validate)]
 pub struct TranTypeUpdateRequest {
-    /// The new description, `X(50)`: letters, digits and spaces.
+    /// The new description, `X(50)`: letters, digits and spaces, so ASCII
+    /// only.
+    // The pattern is checked here only for `origin=list`; without `origin`
+    // the COTRTUPC alphanumeric edit refuses every non-ASCII description with
+    // its audited text (see the module's notes on the encoding).
     #[serde(default)]
-    #[schema(max_length = 50)]
+    #[schema(max_length = 50, pattern = "^[\\x00-\\x7F]*$")]
     #[validate(length(max = DESCRIPTION_MAX_LEN))]
     pub description: Option<String>,
 }
@@ -401,14 +546,27 @@ impl TranTypeUpdateRequest {
     /// message, on `TRTYDSC` without `origin` and on no field with
     /// `origin=list`, whose rows name none.
     ///
+    /// With `origin=list` a description holding a character above `U+007F`
+    /// is rejected the same way: `COTRTLIC` `1100-RECEIVE-SCREEN` cuts the
+    /// row description at 50 bytes (P-COTRTLIC-013), which could drop such a
+    /// character and store the text before it. Without `origin`,
+    /// `COTRTUPC` `1230-EDIT-ALPHANUM-REQD` answers it with its own text
+    /// (V-COTRTUPC-008). Blank descriptions pass either way, for the
+    /// must-be-supplied edits (V-COTRTUPC-007, V-COTRTLIC-013).
+    ///
     /// # Errors
     ///
-    /// The 400 [`ApiError`] when the description exceeds its length.
+    /// The 400 [`ApiError`] when the description exceeds its length, or,
+    /// with `origin=list`, is not ASCII.
     pub fn check(&self, origin: Option<TranTypeOrigin>) -> Result<(), ApiError> {
-        self.validate().map_err(|errors| match origin {
-            None => reject_upsert(&errors),
-            Some(TranTypeOrigin::List) => reject_list_row(&errors),
-        })
+        match origin {
+            None => self.validate().map_err(|errors| reject_upsert(&errors)),
+            Some(TranTypeOrigin::List) => ListRowDescription {
+                description: self.description.as_deref().unwrap_or_default(),
+            }
+            .validate()
+            .map_err(|errors| reject_list_row(&errors)),
+        }
     }
 
     /// The `COTRTUPC` input of the update without `origin`: the path's type
@@ -451,18 +609,30 @@ impl TranTypeUpdateRequest {
 /// cut to the code of another type, which the update or the delete would
 /// then change. Within the length, the segment goes to the rule as entered.
 ///
+/// With `origin=list` the segment must also be ASCII: `COTRTLIC`
+/// `9200-UPDATE-RECORD` and `9300-DELETE-RECORD` address the listed row's
+/// `TRTTYPn` with no edit (P-COTRTLIC-007, P-COTRTLIC-009), so the first two
+/// UTF-8 bytes of a non-ASCII segment would spell another code. Without
+/// `origin`, `COTRTUPC` `1245-EDIT-NUM-REQD` refuses such a segment `Tran
+/// Type code must be numeric.` (V-COTRTUPC-002), which is left to answer it.
+/// Blank, space and low-value segments pass, for the rules' own edits.
+///
 /// # Errors
 ///
-/// The 400 [`ApiError`] when the segment has more than two characters.
+/// The 400 [`ApiError`] when the segment has more than two characters, or,
+/// with `origin=list`, holds a character above `U+007F`.
 pub fn check_type_code_key(
     type_code: &str,
     origin: Option<TranTypeOrigin>,
 ) -> Result<(), ApiError> {
-    let key = TypeCodeKey { type_code };
-    key.validate().map_err(|errors| match origin {
-        None => reject_upsert(&errors),
-        Some(TranTypeOrigin::List) => reject_list_row(&errors),
-    })
+    match origin {
+        None => TypeCodeKey { type_code }
+            .validate()
+            .map_err(|errors| reject_upsert(&errors)),
+        Some(TranTypeOrigin::List) => ListedTypeCodeKey { type_code }
+            .validate()
+            .map_err(|errors| reject_list_row(&errors)),
+    }
 }
 
 /// The `{id}` path segment under the length check of the type code members,
@@ -473,13 +643,38 @@ struct TypeCodeKey<'a> {
     type_code: &'a str,
 }
 
+/// The `{id}` path segment of a `COTRTLIC` row action, under the length
+/// check of [`TypeCodeKey`] and the ASCII check of its unedited code.
+#[derive(Validate)]
+struct ListedTypeCodeKey<'a> {
+    #[validate(
+        length(max = TYPE_CODE_MAX_LEN),
+        custom(function = "crate::dto::ascii_text")
+    )]
+    type_code: &'a str,
+}
+
+/// The row description of a `COTRTLIC` inline update, an absent one empty,
+/// under the length check of [`TranTypeUpdateRequest`] and the ASCII check
+/// of its 50-byte receive.
+#[derive(Validate)]
+struct ListRowDescription<'a> {
+    #[validate(
+        length(max = DESCRIPTION_MAX_LEN),
+        custom(function = "crate::dto::ascii_text")
+    )]
+    description: &'a str,
+}
+
 /// The 400 of an over-length `COTRTUP` member, on its field.
 fn reject_upsert(errors: &ValidationErrors) -> ApiError {
     reject_invalid(errors, TranTypeUpsertField::of_member, OVER_LENGTH_MESSAGE)
 }
 
-/// The 400 of an over-length `COTRTLI` row description, on no field: the
-/// rows of the inline update name none (V-COTRTLIC-012 to V-COTRTLIC-018).
+/// The 400 of a `COTRTLI` row key or row description, or of the list's
+/// `start_key`, that fails its length or ASCII check, on no field: the rows
+/// of the row actions name none (V-COTRTLIC-012 to V-COTRTLIC-023), and no
+/// BMS field holds the COMMAREA start key.
 fn reject_list_row(errors: &ValidationErrors) -> ApiError {
     reject_invalid(
         errors,
@@ -488,14 +683,18 @@ fn reject_list_row(errors: &ValidationErrors) -> ApiError {
     )
 }
 
-/// The answer of a successful write: the type as stored, and the text the
-/// program shows.
+/// The answer of a successful write: the type as stored, the text the
+/// program shows, and the `COTRTLIC` info line of an inline update.
 ///
 /// The texts are the rules': `COTRTUPC` `Changes committed to database` or
 /// `No change detected with respect to values fetched.` (V-COTRTUPC-006),
 /// `COTRTLIC` `HIGHLIGHTED row was updated` or `No change detected with
 /// respect to database values.` (V-COTRTLIC-012), and on a delete
 /// `HIGHLIGHTED row deleted.Hit Enter to continue`, with no type.
+///
+/// `info` is present only on `PUT` with `origin=list`. It is left out of every
+/// other answer rather than sent as `null`, so the schema declares it an
+/// optional, non-nullable string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct TranTypeMessageResponse {
     /// The type as stored after the write; `null` after a delete.
@@ -505,6 +704,16 @@ pub struct TranTypeMessageResponse {
     pub transaction_type: Option<TranTypeResponse>,
     /// The program's text, unchanged.
     pub message: String,
+    /// The `COTRTLI` info line `INFOMSG` `X(45)`
+    /// [app/app-transaction-type-db2/cpy-bms/COTRTLI.cpy:L222], uncentred:
+    /// `HIGHLIGHTED row was updated`, which `COTRTLIC` `9200-UPDATE-RECORD`
+    /// sets once the inline update is stored (P-COTRTLIC-009). It comes with
+    /// every `origin=list` update, beside the no-change `message` of a change
+    /// of case alone (V-COTRTLIC-012). Absent on the `COTRTUPC` writes and on
+    /// the delete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(nullable = false)]
+    pub info: Option<String>,
 }
 
 /// The `COTRTUPC` F5 write, on `POST` and on `PUT` without `origin`
@@ -514,6 +723,7 @@ impl From<TranTypeSaved> for TranTypeMessageResponse {
         Self {
             transaction_type: Some(TranTypeResponse::from(&saved.master)),
             message: saved.message,
+            info: None,
         }
     }
 }
@@ -527,18 +737,21 @@ impl From<TranTypeUpsertOutcome> for TranTypeMessageResponse {
             TranTypeUpsertOutcome::Unchanged { master, message } => Self {
                 transaction_type: Some(TranTypeResponse::from(&master)),
                 message,
+                info: None,
             },
         }
     }
 }
 
-/// `PUT` with `origin=list`: the type as stored and the rule's text, the
-/// no-change text included when only the case changed (V-COTRTLIC-012).
+/// `PUT` with `origin=list`: the type as stored, the rule's text, the
+/// no-change text included when only the case changed, and the info line the
+/// stored update sets (P-COTRTLIC-009, V-COTRTLIC-012).
 impl From<TranTypeUpdated> for TranTypeMessageResponse {
     fn from(updated: TranTypeUpdated) -> Self {
         Self {
             transaction_type: Some(TranTypeResponse::from(&updated.transaction_type)),
             message: updated.message.to_owned(),
+            info: Some(updated.info.to_owned()),
         }
     }
 }
@@ -549,6 +762,7 @@ impl From<TranTypeDeleted> for TranTypeMessageResponse {
         Self {
             transaction_type: None,
             message: deleted.message.to_owned(),
+            info: None,
         }
     }
 }
@@ -558,8 +772,11 @@ mod tests {
     use axum::extract::Query;
     use axum::http::{StatusCode, Uri};
     use carddemo_domain::entities::TranTypeMaster;
-    use carddemo_domain::error::ErrorKind;
-    use carddemo_domain::messages;
+    use carddemo_domain::error::{DomainError, ErrorKind};
+    use carddemo_domain::messages::{
+        self, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY, FIELD_TRAN_TYPE_CODE, FIELD_TRANSACTION_DESC,
+        MUST_BE_NUMERIC, field_edit_message,
+    };
     use carddemo_domain::numeric::TranTypeCode;
     use carddemo_domain::ports::Direction;
     use carddemo_domain::rules::ReturnMsg;
@@ -567,7 +784,7 @@ mod tests {
         self, TranTypeDeleted, TranTypeListInput, TranTypePage, TranTypeUpdated,
     };
     use carddemo_domain::rules::tran_type_update::{
-        TranTypeSaved, TranTypeUpsertInput, TranTypeUpsertOutcome,
+        self, TranTypeSaved, TranTypeUpsertInput, TranTypeUpsertOutcome,
     };
     use serde::de::DeserializeOwned;
     use serde_json::{Value, json};
@@ -575,13 +792,13 @@ mod tests {
 
     use super::{
         DESCRIPTION_MAX_LEN, TYPE_CODE_MAX_LEN, TranTypeCreateRequest, TranTypeListField,
-        TranTypeListQuery, TranTypeListUpdate, TranTypeMessageResponse, TranTypeOrigin,
-        TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest, TranTypeUpsertField,
-        check_type_code_key,
+        TranTypeListPageQuery, TranTypeListQuery, TranTypeListUpdate, TranTypeMessageResponse,
+        TranTypeOrigin, TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest,
+        TranTypeUpsertField, check_type_code_key,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
-    use crate::pagination::Page;
+    use crate::pagination::{Page, PageQuery};
 
     /// A value of `count` characters.
     fn chars(text: &str, count: u64) -> String {
@@ -716,7 +933,12 @@ mod tests {
                 type_code: Some(code.clone()),
                 description: Some(description.clone()),
             };
-            assert!(filters.check().is_ok(), "{description:?}");
+            // The description filter is also held to ASCII.
+            assert_eq!(
+                filters.check().is_ok(),
+                description.is_ascii(),
+                "{description:?}"
+            );
             let create = TranTypeCreateRequest {
                 type_code: Some(code.clone()),
                 description: Some(description.clone()),
@@ -725,9 +947,13 @@ mod tests {
             let update = TranTypeUpdateRequest {
                 description: Some(description.clone()),
             };
-            for origin in [None, Some(TranTypeOrigin::List)] {
-                assert!(update.check(origin).is_ok(), "{description:?} {origin:?}");
-            }
+            assert!(update.check(None).is_ok(), "{description:?}");
+            // The inline update also holds the description to ASCII.
+            assert_eq!(
+                update.check(Some(TranTypeOrigin::List)).is_ok(),
+                description.is_ascii(),
+                "{description:?}"
+            );
         }
         assert!(TranTypeListQuery::default().check().is_ok());
         assert!(TranTypeCreateRequest::default().check().is_ok());
@@ -789,7 +1015,7 @@ mod tests {
 
     #[test]
     fn the_path_type_code_is_held_to_two_characters() {
-        for code in ["01", "1", "", "0A", "é9"] {
+        for code in ["01", "1", "", "0A"] {
             for origin in [None, Some(TranTypeOrigin::List)] {
                 assert!(
                     check_type_code_key(code, origin).is_ok(),
@@ -805,6 +1031,161 @@ mod tests {
             body(check_type_code_key("012", Some(TranTypeOrigin::List))),
             over_length(&[])
         );
+    }
+
+    /// The rule error of a `COTRTUPC` edit: kind, text and field.
+    fn edit_error(error: &DomainError) -> (ErrorKind, &str, Vec<&str>) {
+        (
+            error.kind,
+            error.message.as_str(),
+            error.fields.iter().map(|field| field.field).collect(),
+        )
+    }
+
+    #[test]
+    fn non_ascii_text_is_refused_where_no_edit_reads_its_bytes() {
+        let list = Some(TranTypeOrigin::List);
+        // Two-, three- and four-byte characters, alone and beside ASCII.
+        let codes = [
+            "\u{e9}9",
+            "9\u{e9}",
+            "\u{e9}",
+            "\u{80}",
+            "\u{20ac}",
+            "\u{1f600}",
+        ];
+        for code in codes {
+            // COTRTLIC row actions (PUT origin=list, DELETE): no edit, so the
+            // key is refused on no field.
+            assert_eq!(
+                body(check_type_code_key(code, list)),
+                over_length(&[]),
+                "{code:?}"
+            );
+            // COTRTUPC: the key reaches 1245-EDIT-NUM-REQD, which refuses it
+            // with its audited text (V-COTRTUPC-002, V-COTRTUPC-013).
+            assert!(check_type_code_key(code, None).is_ok(), "{code:?}");
+            let create = TranTypeCreateRequest {
+                type_code: Some(code.to_owned()),
+                description: Some("PURCHASE".to_owned()),
+            };
+            assert!(create.check().is_ok(), "{code:?}");
+            let error = tran_type_update::edit(&create.into_input(), None)
+                .expect_err("the key edit refuses it");
+            let numeric = field_edit_message(FIELD_TRAN_TYPE_CODE, MUST_BE_NUMERIC);
+            assert_eq!(
+                edit_error(&error),
+                (ErrorKind::Invalid, numeric.as_str(), vec!["TRTYPCD"]),
+                "{code:?}"
+            );
+        }
+        // Blank, space, low-value and NUMVAL keys still reach the rules.
+        for code in ["", "  ", "\0\0", "01", "+7", ".7", "\u{7f}"] {
+            for origin in [None, list] {
+                assert!(
+                    check_type_code_key(code, origin).is_ok(),
+                    "{code:?} {origin:?}"
+                );
+            }
+        }
+
+        let descriptions = [
+            "Caf\u{e9}".to_owned(),
+            // 50 characters, 51 bytes: the 50-byte receive of COTRTLIC would
+            // drop the last one and store the 49 letters before it.
+            format!("{}\u{e9}", chars("A", DESCRIPTION_MAX_LEN - 1)),
+            chars("\u{e9}", DESCRIPTION_MAX_LEN),
+            "\u{20ac}".to_owned(),
+            "\u{1f600}".to_owned(),
+        ];
+        for description in descriptions {
+            let update = TranTypeUpdateRequest {
+                description: Some(description.clone()),
+            };
+            assert_eq!(
+                body(update.check(list)),
+                over_length(&[]),
+                "{description:?}"
+            );
+            // COTRTUPC: 1230-EDIT-ALPHANUM-REQD refuses it with its audited
+            // text (V-COTRTUPC-008, V-COTRTUPC-018).
+            assert!(update.check(None).is_ok(), "{description:?}");
+            let input = update.into_upsert_input("01".to_owned());
+            let error = tran_type_update::edit(&input, None).expect_err("the edit refuses it");
+            let alphanumeric =
+                field_edit_message(FIELD_TRANSACTION_DESC, CAN_HAVE_NUMBERS_OR_ALPHABETS_ONLY);
+            assert_eq!(
+                edit_error(&error),
+                (ErrorKind::Invalid, alphanumeric.as_str(), vec!["TRTYDSC"]),
+                "{description:?}"
+            );
+        }
+        // Blank descriptions reach the must-be-supplied edits of both origins.
+        for description in ["", "   ", "*", "\0", "PURCHASE", "\u{7f}"] {
+            let update = TranTypeUpdateRequest {
+                description: Some(description.to_owned()),
+            };
+            for origin in [None, list] {
+                assert!(update.check(origin).is_ok(), "{description:?} {origin:?}");
+            }
+        }
+        assert!(TranTypeUpdateRequest::default().check(list).is_ok());
+    }
+
+    #[test]
+    fn the_list_filters_hold_the_description_to_ascii_and_leave_the_code_to_its_edit() {
+        // COTRTLIC 1230-EDIT-DESC moves the description filter into X(50) with
+        // no edit of its bytes (P-COTRTLIC-020), so a non-ASCII filter is
+        // refused on TRDESC as an over-length one is: (filter, refused).
+        let descriptions = [
+            ("\u{e9}".to_owned(), true),
+            ("\u{80}".to_owned(), true),
+            ("\u{20ac}".to_owned(), true),
+            ("\u{1f600}".to_owned(), true),
+            // 50 characters, 51 bytes: the move would search the 49 letters.
+            (
+                format!("{}\u{e9}", chars("A", DESCRIPTION_MAX_LEN - 1)),
+                true,
+            ),
+            (chars("A", DESCRIPTION_MAX_LEN), false),
+            (String::new(), false),
+            ("   ".to_owned(), false),
+            ("\0".to_owned(), false),
+            ("%pur_".to_owned(), false),
+            ("\u{7f}".to_owned(), false),
+        ];
+        for (description, refused) in descriptions {
+            let filters = TranTypeListQuery {
+                type_code: None,
+                description: Some(description.clone()),
+            };
+            if refused {
+                assert_eq!(
+                    body(filters.check()),
+                    over_length(&["TRDESC"]),
+                    "{description:?}"
+                );
+            } else {
+                assert!(filters.check().is_ok(), "{description:?}");
+            }
+        }
+        // 1220-EDIT-TYPECD refuses every non-ASCII type code filter with its
+        // audited text (V-COTRTLIC-001): a byte of 0x80 or more is not NUMERIC.
+        for code in ["\u{e9}", "9\u{e9}", "\u{80}", "\u{20ac}", "\u{1f600}"] {
+            let filters = TranTypeListQuery {
+                type_code: Some(code.to_owned()),
+                description: None,
+            };
+            assert!(filters.check().is_ok(), "{code:?}");
+            let mut msg = ReturnMsg::default();
+            let edited = tran_type_list::edit_filters(Some(code), None, &mut msg);
+            assert_eq!(edited.type_code, None, "{code:?}");
+            assert_eq!(
+                msg.message(),
+                Some(messages::TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT),
+                "{code:?}"
+            );
+        }
     }
 
     #[test]
@@ -831,6 +1212,53 @@ mod tests {
     }
 
     #[test]
+    fn the_type_code_filter_pattern_admits_exactly_what_edit_filters_passes() {
+        // COTRTLIC 1220-EDIT-TYPECD, V-COTRTLIC-001: (filter, admitted by the
+        // published pattern, the type code it selects).
+        let cases = [
+            ("", true, None),
+            (" ", true, None),
+            ("  ", true, None),
+            ("\0\0", true, None),
+            ("00", true, None),
+            ("01", true, Some("01")),
+            ("99", true, Some("99")),
+            ("1", false, None),
+            ("0", false, None),
+            (" 1", false, None),
+            ("1 ", false, None),
+            ("\0", false, None),
+            ("\0 ", false, None),
+            (" \0", false, None),
+            ("0A", false, None),
+            ("é9", false, None),
+        ];
+        for (filter, admitted, selected) in cases {
+            let filters = TranTypeListQuery {
+                type_code: Some(filter.to_owned()),
+                description: None,
+            };
+            assert!(filters.check().is_ok(), "{filter:?}");
+            let mut msg = ReturnMsg::default();
+            let edited = tran_type_list::edit_filters(Some(filter), None, &mut msg);
+            assert_eq!(
+                edited.type_code,
+                selected.map(TranTypeCode::move_from),
+                "{filter:?}"
+            );
+            let expected =
+                (!admitted).then_some(messages::TYPE_CODE_FILTER_IF_SUPPLIED_MUST_BE_2_DIGIT);
+            assert_eq!(msg.message(), expected, "{filter:?}");
+        }
+        let params =
+            serde_json::to_value(TranTypeListQuery::into_params(|| None)).expect("serializes");
+        assert_eq!(
+            params[0]["schema"]["pattern"],
+            json!(r"^(?: {0,2}|\x00{2}|[0-9]{2})$")
+        );
+    }
+
+    #[test]
     fn list_input_reads_a_blank_start_key_as_none() {
         // (start key, code the browse starts at)
         let cases = [
@@ -853,6 +1281,86 @@ mod tests {
                 "{start_key:?}"
             );
             assert_eq!(input.page_size, tran_type_list::SCREEN_ROWS);
+        }
+    }
+
+    #[test]
+    fn the_list_start_key_is_held_to_two_ascii_characters() {
+        // The COMMAREA key WS-CA-FIRST-TR-CODE or WS-CA-LAST-TR-CODE X(2): a
+        // longer or non-ASCII key would start the browse at another code, and
+        // no BMS field holds it, so the 400 names none. Percent-encoded keys
+        // arrive decoded.
+        let refused = [
+            "start_key=%C3%A9",
+            "start_key=%C3%A99",
+            "start_key=012",
+            "start_key=9%E2%82%AC",
+            "start_key=%F0%9F%98%80",
+            "start_key=%C3%A9%C3%A9%C3%A9&direction=backward",
+        ];
+        for text in refused {
+            let page: TranTypeListPageQuery = query(text).expect("deserializes");
+            assert_eq!(body(page.check()), over_length(&[]), "{text}");
+        }
+        // (query text, the resolved start key, direction and rows, the code
+        // the browse starts at): unchanged from the shared query.
+        let rows = tran_type_list::SCREEN_ROWS;
+        let cases = [
+            ("", None, Direction::Forward, rows, None),
+            (
+                "start_key=01",
+                Some("01"),
+                Direction::Forward,
+                rows,
+                Some("01"),
+            ),
+            ("start_key=", Some(""), Direction::Forward, rows, None),
+            (
+                "start_key=%20%20&direction=backward",
+                Some("  "),
+                Direction::Backward,
+                rows,
+                None,
+            ),
+            (
+                "start_key=%00%00&page_size=100",
+                Some("\0\0"),
+                Direction::Forward,
+                100,
+                None,
+            ),
+            (
+                "start_key=7&direction=forward&page_size=1",
+                Some("7"),
+                Direction::Forward,
+                1,
+                Some("7 "),
+            ),
+        ];
+        for (text, start_key, direction, page_size, code) in cases {
+            let page: TranTypeListPageQuery = query(text).expect("deserializes");
+            assert!(page.check().is_ok(), "{text}");
+            let shared: PageQuery = query(text).expect("deserializes");
+            assert_eq!(PageQuery::from(page.clone()), shared, "{text}");
+            let resolved = PageQuery::from(page).resolve(rows);
+            assert_eq!(
+                resolved,
+                (start_key.map(str::to_owned), direction, page_size),
+                "{text}"
+            );
+            let (start_key, direction, page_size) = resolved;
+            let input = TranTypeListQuery::default().into_input(start_key, direction, page_size);
+            assert_eq!(input.start_key, code.map(TranTypeCode::move_from), "{text}");
+        }
+        for text in [
+            "direction=up",
+            "page_size=0",
+            "page_size=101",
+            "page_size=x",
+        ] {
+            let error = query::<TranTypeListPageQuery>(text).expect_err("rejected");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{text}");
+            assert_eq!(error.body().code, ErrorKind::Invalid.code(), "{text}");
         }
     }
 
@@ -958,17 +1466,19 @@ mod tests {
             inserted: false,
             message: messages::CHANGES_COMMITTED_TO_DATABASE.to_owned(),
         };
-        // (response, type, text)
+        // (response, type, text, info line)
         let cases = [
             (
                 TranTypeMessageResponse::from(saved.clone()),
                 typed.clone(),
                 messages::CHANGES_COMMITTED_TO_DATABASE,
+                None,
             ),
             (
                 TranTypeMessageResponse::from(TranTypeUpsertOutcome::Saved(saved)),
                 typed.clone(),
                 messages::CHANGES_COMMITTED_TO_DATABASE,
+                None,
             ),
             (
                 TranTypeMessageResponse::from(TranTypeUpsertOutcome::Unchanged {
@@ -977,7 +1487,21 @@ mod tests {
                 }),
                 typed.clone(),
                 messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_VALUES_FETCHED,
+                None,
             ),
+            // The inline update of a changed description (P-COTRTLIC-009).
+            (
+                TranTypeMessageResponse::from(TranTypeUpdated {
+                    transaction_type: stored.clone(),
+                    message: messages::HIGHLIGHTED_ROW_WAS_UPDATED,
+                    info: messages::HIGHLIGHTED_ROW_WAS_UPDATED,
+                }),
+                typed.clone(),
+                messages::HIGHLIGHTED_ROW_WAS_UPDATED,
+                Some(messages::HIGHLIGHTED_ROW_WAS_UPDATED),
+            ),
+            // A change of case alone: stored, with the no-change text and the
+            // info line (V-COTRTLIC-012).
             (
                 TranTypeMessageResponse::from(TranTypeUpdated {
                     transaction_type: stored.clone(),
@@ -986,6 +1510,7 @@ mod tests {
                 }),
                 typed,
                 messages::NO_CHANGE_DETECTED_WITH_RESPECT_TO_DATABASE_VALUES,
+                Some(messages::HIGHLIGHTED_ROW_WAS_UPDATED),
             ),
             (
                 TranTypeMessageResponse::from(TranTypeDeleted {
@@ -994,23 +1519,26 @@ mod tests {
                 }),
                 None,
                 messages::HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE,
+                None,
             ),
         ];
-        for (response, transaction_type, message) in cases {
+        for (response, transaction_type, message, info) in cases {
             assert_eq!(response.transaction_type, transaction_type, "{message}");
             assert_eq!(response.message, message);
+            assert_eq!(response.info.as_deref(), info, "{message}");
+            // `info` is serialized only when present, never as `null`.
+            let mut expected = json!({
+                "transaction_type": transaction_type,
+                "message": message,
+            });
+            if let Some(info) = info {
+                expected["info"] = json!(info);
+            }
+            let wire = serde_json::to_value(&response).expect("serializes");
+            assert_eq!(wire, expected, "{message}");
+            let back: TranTypeMessageResponse = serde_json::from_value(wire).expect("deserializes");
+            assert_eq!(back, response, "{message}");
         }
-        let deleted = TranTypeMessageResponse {
-            transaction_type: None,
-            message: messages::HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE.to_owned(),
-        };
-        assert_eq!(
-            serde_json::to_value(&deleted).expect("serializes"),
-            json!({
-                "transaction_type": null,
-                "message": messages::HIGHLIGHTED_ROW_DELETED_HIT_ENTER_TO_CONTINUE,
-            })
-        );
     }
 
     #[test]
@@ -1031,6 +1559,25 @@ mod tests {
             filters[1]["schema"]["maxLength"],
             json!(DESCRIPTION_MAX_LEN)
         );
+        assert_eq!(filters[1]["schema"]["pattern"], json!("^[\\x00-\\x7F]*$"));
+
+        // The page position: the two-character ASCII start key, then the
+        // shared query's parameters (their schemas: the handler's tests).
+        let page =
+            serde_json::to_value(TranTypeListPageQuery::into_params(|| None)).expect("serializes");
+        let names: Vec<&str> = page
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|param| param["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(names, ["start_key", "direction", "page_size"]);
+        assert_eq!(page[0]["in"], json!("query"));
+        assert_eq!(page[0]["required"], json!(false));
+        assert_eq!(page[0]["schema"]["type"], json!("string"));
+        assert_eq!(page[0]["schema"]["maxLength"], json!(TYPE_CODE_MAX_LEN));
+        assert_eq!(page[0]["schema"]["pattern"], json!("^[\\x00-\\x7F]*$"));
+        assert!(!page.to_string().contains("$ref"), "{page}");
 
         let origin =
             serde_json::to_value(TranTypeUpdateQuery::into_params(|| None)).expect("serializes");
@@ -1054,10 +1601,20 @@ mod tests {
             update["properties"]["description"]["maxLength"],
             json!(DESCRIPTION_MAX_LEN)
         );
+        assert_eq!(
+            update["properties"]["description"]["pattern"],
+            json!("^[\\x00-\\x7F]*$")
+        );
         assert!(update["properties"].get("type_code").is_none(), "{update}");
 
         let message = serde_json::to_value(TranTypeMessageResponse::schema()).expect("serializes");
         assert_eq!(message["required"], json!(["transaction_type", "message"]));
+        // The `origin=list` info line: an optional, non-nullable string.
+        assert_eq!(message["properties"]["info"]["type"], json!("string"));
+        assert!(
+            message["properties"]["info"].get("oneOf").is_none(),
+            "{message}"
+        );
         let response = serde_json::to_value(TranTypeResponse::schema()).expect("serializes");
         assert_eq!(response["required"], json!(["type_code", "description"]));
     }

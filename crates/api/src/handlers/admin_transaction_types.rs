@@ -71,8 +71,9 @@ use tracing::{Instrument, Span};
 
 use crate::auth::AdminUser;
 use crate::dto::admin_transaction_types::{
-    TranTypeCreateRequest, TranTypeListQuery, TranTypeMessageResponse, TranTypeOrigin,
-    TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest, check_type_code_key,
+    TranTypeCreateRequest, TranTypeListPageQuery, TranTypeListQuery, TranTypeMessageResponse,
+    TranTypeOrigin, TranTypeResponse, TranTypeUpdateQuery, TranTypeUpdateRequest,
+    check_type_code_key,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
 use crate::pagination::{Page, PageQuery};
@@ -99,14 +100,20 @@ const OUTCOME_OK: &str = "ok";
 /// replaces the 3270 send of the `CTRTLIA` map, a mandated deviation.
 ///
 /// A page holds `page_size` rows, seven (`WS-MAX-SCREEN-LINES`) when absent,
-/// in ascending type code order. An empty result and a page boundary are 200
-/// with the COBOL text in `message` (E-54).
+/// in ascending type code order. Without `start_key` both directions read
+/// the first page from the start of the table: backward is F7 on the first
+/// page, which re-reads that page with `No previous pages to display`
+/// (P-COTRTLIC-004, V-COTRTLIC-009). An empty result and a page boundary are
+/// 200 with the COBOL text in `message` (E-54).
 ///
 /// # Errors
 ///
-/// - 400 for a filter longer than its BMS field or a malformed query, and
-///   for a type code filter that is not two digits, on `TRTYPE`
-///   (V-COTRTLIC-001).
+/// - 400 with an empty message for a filter longer than its BMS field or a
+///   description filter not in ASCII, on `TRTYPE` or `TRDESC`, and for a
+///   `start_key` longer than two characters or not in ASCII, on no field;
+///   400 for a malformed query; and 400 for a type code filter that is not
+///   two digits, on `TRTYPE` (V-COTRTLIC-001). The filters are checked
+///   first, then the start key, before the master is read.
 /// - 401 without a valid token; 403 for a token that is not an admin's.
 /// - 404 when no type passes the filters (V-COTRTLIC-002).
 /// - 500 with the cursor's Db2 text when the read fails (V-COTRTLIC-024,
@@ -117,10 +124,10 @@ const OUTCOME_OK: &str = "ok";
     get,
     path = "/admin/transaction-types",
     tag = "admin-transaction-types",
-    params(TranTypeListQuery, PageQuery),
+    params(TranTypeListQuery, TranTypeListPageQuery),
     responses(
         (status = 200, description = "One page of transaction types, with the page-boundary text in `message` where the COBOL shows one", body = Page<TranTypeResponse>),
-        (status = 400, description = "A filter or the query is invalid", body = ErrorBody),
+        (status = 400, description = "A filter or the start key is longer than its field or not ASCII, the type code filter is not two digits, or the query is malformed", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type passes the filters", body = ErrorBody),
@@ -132,13 +139,15 @@ pub async fn list_tran_types(
     State(state): State<AppState>,
     admin: AdminUser,
     ApiQuery(filters): ApiQuery<TranTypeListQuery>,
-    ApiQuery(page): ApiQuery<PageQuery>,
+    ApiQuery(page): ApiQuery<TranTypeListPageQuery>,
 ) -> Result<Json<Page<TranTypeResponse>>, ApiError> {
     let span = handler_span(CTLI, &admin, None);
     record_entered_type_code(&span, filters.type_code.as_deref());
     traced(span, async move {
         filters.check()?;
-        let (start_key, direction, page_size) = page.resolve(tran_type_list::SCREEN_ROWS);
+        page.check()?;
+        let (start_key, direction, page_size) =
+            PageQuery::from(page).resolve(tran_type_list::SCREEN_ROWS);
         let input = filters.into_input(start_key, direction, page_size);
         let mut uow = state.db().begin().await?;
         let result = tran_type_list::list(&mut uow.store(), input).await;
@@ -225,7 +234,9 @@ pub async fn create_tran_type(
 /// V-COTRTLIC-016 to V-COTRTLIC-018. The update is committed with
 /// `HIGHLIGHTED row was updated`, or with `No change detected with respect to
 /// database values.` when only the case changed, which `COTRTLIC` still
-/// writes (V-COTRTLIC-012, E-73).
+/// writes (V-COTRTLIC-012, E-73). Either answer also carries `info`, the info
+/// line `HIGHLIGHTED row was updated` that `9200-UPDATE-RECORD` sets once the
+/// update is stored (P-COTRTLIC-009); without `origin` there is no `info`.
 ///
 /// # Errors
 ///
@@ -233,7 +244,8 @@ pub async fn create_tran_type(
 ///   query or body, and the key and description edits: on `TRTYPCD` or
 ///   `TRTYDSC` without `origin` (V-COTRTUPC-001 to V-COTRTUPC-003,
 ///   V-COTRTUPC-007, V-COTRTUPC-008), on no field with `origin=list`
-///   (V-COTRTLIC-013, V-COTRTLIC-014).
+///   (V-COTRTLIC-013, V-COTRTLIC-014), where a key or description holding a
+///   character outside ASCII is also refused with an empty message.
 /// - 401 without a valid token; 403 for a token that is not an admin's.
 /// - 404 when no type has the code (V-COTRTUPC-004, V-COTRTLIC-016).
 /// - 500 with the Db2 or lock text when the read or the update fails
@@ -244,12 +256,12 @@ pub async fn create_tran_type(
     path = "/admin/transaction-types/{id}",
     tag = "admin-transaction-types",
     params(
-        ("id" = String, Path, description = "The type code, `TR_TYPE`: two characters", max_length = 2),
+        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters", max_length = 2, pattern = "^[\\x00-\\x7F]*$"),
         TranTypeUpdateQuery,
     ),
     request_body = TranTypeUpdateRequest,
     responses(
-        (status = 200, description = "The description was stored, or nothing changed; `message` is the COBOL text", body = TranTypeMessageResponse),
+        (status = 200, description = "The description was stored, or nothing changed; `message` is the COBOL text, and with `origin=list` `info` is the COTRTLIC info line", body = TranTypeMessageResponse),
         (status = 400, description = "The type code or the description fails its edit", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
@@ -336,7 +348,8 @@ async fn update_via_ctli(
 ///
 /// # Errors
 ///
-/// - 400 for a key longer than the type code `X(2)` or a malformed path.
+/// - 400 for a key longer than the type code `X(2)` or holding a character
+///   outside ASCII, or a malformed path.
 /// - 401 without a valid token; 403 for a token that is not an admin's.
 /// - 404 with the delete-failed Db2 text when no type has the code
 ///   (V-COTRTLIC-022).
@@ -349,11 +362,11 @@ async fn update_via_ctli(
     path = "/admin/transaction-types/{id}",
     tag = "admin-transaction-types",
     params(
-        ("id" = String, Path, description = "The type code, `TR_TYPE`: two characters", max_length = 2),
+        ("id" = String, Path, description = "The type code, `TR_TYPE`: two ASCII characters", max_length = 2, pattern = "^[\\x00-\\x7F]*$"),
     ),
     responses(
         (status = 200, description = "The type was deleted; `message` is the COBOL text and `transaction_type` is null", body = TranTypeMessageResponse),
-        (status = 400, description = "The type code is longer than two characters", body = ErrorBody),
+        (status = 400, description = "The type code is longer than two characters or not ASCII", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an admin's", body = ErrorBody),
         (status = 404, description = "No transaction type has the code", body = ErrorBody),
@@ -522,6 +535,7 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Span, Subscriber};
+    use utoipa::IntoParams;
     use utoipa_axum::router::OpenApiRouter;
     use utoipa_axum::routes;
 
@@ -529,6 +543,7 @@ mod tests {
     use crate::auth::{AdminUser, AuthUser, UserType};
     use crate::dto::admin_transaction_types::TranTypeOrigin;
     use crate::error::ApiError;
+    use crate::pagination::PageQuery;
     use crate::state::AppState;
 
     /// The `OpenAPI` document of the four operations, registered as the route
@@ -661,6 +676,25 @@ mod tests {
             ]
             .map(|(name, place)| (name.to_owned(), place.to_owned()))
         );
+        // The description filter and the start key, in ASCII; the key two
+        // characters long.
+        let list_parameters = list["parameters"].as_array().expect("parameters");
+        let description = &list_parameters[1]["schema"];
+        assert_eq!(description["maxLength"], 50);
+        assert_eq!(description["pattern"], "^[\\x00-\\x7F]*$");
+        let start_key = &list_parameters[2];
+        assert_eq!(start_key["required"], false);
+        assert_eq!(start_key["schema"]["type"], "string");
+        assert_eq!(start_key["schema"]["maxLength"], 2);
+        assert_eq!(start_key["schema"]["pattern"], "^[\\x00-\\x7F]*$");
+        // `direction` and `page_size` keep the schemas `PageQuery` gives them.
+        let shared = serde_json::to_value(PageQuery::into_params(|| None)).expect("serializes");
+        let shared = &shared.as_array().expect("an array")[1..];
+        for (published, page_query) in list_parameters[3..].iter().zip(shared) {
+            assert_eq!(published["name"], page_query["name"]);
+            assert_eq!(published["required"], page_query["required"]);
+            assert_eq!(published["schema"], page_query["schema"], "{published}");
+        }
 
         let create = operation(&document, "/admin/transaction-types", "post");
         assert!(parameters(create).is_empty());
@@ -679,17 +713,26 @@ mod tests {
             [("id", "path"), ("origin", "query")]
                 .map(|(name, place)| (name.to_owned(), place.to_owned()))
         );
-        let id = &update["parameters"][0];
-        assert_eq!(id["required"], true);
-        assert_eq!(id["schema"]["type"], "string");
-        assert_eq!(id["schema"]["maxLength"], 2);
         assert_eq!(
             update["requestBody"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/TranTypeUpdateRequest"
         );
+        // The answer of both origins, `info` included with `origin=list`.
+        assert_eq!(
+            update["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/TranTypeMessageResponse"
+        );
 
         let delete = operation(&document, "/admin/transaction-types/{id}", "delete");
         assert_eq!(parameters(delete), [("id".to_owned(), "path".to_owned())]);
+        // The {id} of both operations: two characters, in ASCII.
+        for operation in [update, delete] {
+            let id = &operation["parameters"][0];
+            assert_eq!(id["required"], true);
+            assert_eq!(id["schema"]["type"], "string");
+            assert_eq!(id["schema"]["maxLength"], 2);
+            assert_eq!(id["schema"]["pattern"], "^[\\x00-\\x7F]*$");
+        }
         assert!(delete.get("requestBody").is_none());
         assert_eq!(
             delete["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],

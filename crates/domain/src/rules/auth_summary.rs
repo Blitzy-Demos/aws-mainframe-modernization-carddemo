@@ -156,7 +156,9 @@ impl DetailPage {
 /// `ACCTIDI IS NOT NUMERIC` on the eleven bytes of the field. Absent or empty
 /// text, and text of spaces only or of NUL characters only, is blank; any
 /// other text that is not exactly eleven ASCII digits fails the class test, as
-/// the space-padded field of a shorter entry does.
+/// the space-padded field of a shorter entry does. The edit reads no store, so
+/// an adapter runs it before it opens one, and its errors precede the
+/// scheduling failure of `SCHEDULE-PSB` (V-COPAUS0C-010).
 ///
 /// # Errors
 ///

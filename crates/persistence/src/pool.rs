@@ -3,7 +3,8 @@
 //! A process opens one pool at start-up and shares it: `api` and `mq` clone
 //! the [`Db`] into every request handler and consumer, and each `batch`
 //! subcommand opens one for its run. Adapters hold a [`Db`] and begin their
-//! [`UnitOfWork`] through [`Db::begin`], so none of them names sqlx.
+//! [`UnitOfWork`] through [`Db::begin`], or [`Db::begin_snapshot`] for a
+//! read-only unit on one snapshot, so none of them names sqlx.
 //!
 //! The database URL comes from the caller. `CARDDEMO_DATABASE_URL` is read by
 //! the settings of `carddemo-runtime`; this crate reads no environment. The
@@ -95,6 +96,40 @@ impl Db {
     pub async fn begin(&self) -> Result<UnitOfWork, PersistenceError> {
         let tx = self.pool.begin().await?;
         Ok(UnitOfWork::new(tx))
+    }
+
+    /// Takes a connection from the pool and begins a read-only transaction
+    /// whose statements all read one snapshot: `SET TRANSACTION ISOLATION
+    /// LEVEL REPEATABLE READ, READ ONLY` runs as its first statement.
+    ///
+    /// Every statement of the unit of work sees the database as it was
+    /// committed when the first of them began, so a read spread over several
+    /// statements is one consistent read, as a single `SELECT` is. Nothing can
+    /// be written in it, and it blocks no writer. The TRANREPT backup reads
+    /// the pages of the live transaction master this way.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistenceError::Sqlx`] in every case [`Db::begin`] fails, and when
+    /// the `SET TRANSACTION` fails; the begun transaction is then dropped,
+    /// which rolls it back.
+    pub async fn begin_snapshot(&self) -> Result<UnitOfWork, PersistenceError> {
+        let mut uow = self.begin().await?;
+        sqlx::query!("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut **uow.transaction())
+            .await?;
+        Ok(uow)
+    }
+
+    /// Closes the pool, for a process that is stopping.
+    ///
+    /// Every later [`Db::begin`], on this handle or any clone, fails at once.
+    /// The call waits until each connection in use returns to the pool, that
+    /// is until each open [`UnitOfWork`] commits, rolls back or is dropped,
+    /// and then closes every connection, so `PostgreSQL` sees each session
+    /// end cleanly.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 }
 

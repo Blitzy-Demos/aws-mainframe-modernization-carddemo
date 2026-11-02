@@ -891,7 +891,8 @@ pub trait UserStore {
 pub trait AuthorizationStore {
     /// DL/I `GU PAUTSUM0 WHERE (ACCNTID = :id)`: `COPAUA0C`
     /// `5500-READ-AUTH-SUMMRY` (P-COPAUA0C-008), `COPAUS0C` `GET-AUTH-SUMMARY`
-    /// (P-COPAUS0C-009), `COPAUS1C` `READ-AUTH-RECORD` (P-COPAUS1C-003).
+    /// (P-COPAUS0C-009). `COPAUS1C` reads the same summary through
+    /// [`Self::read_summary_of_detail`].
     ///
     /// # Errors
     ///
@@ -900,6 +901,31 @@ pub trait AuthorizationStore {
     fn read_summary(
         &mut self,
         id: AccountId,
+    ) -> impl Future<Output = PortResult<PendingAuthSummary>> + Send + '_;
+
+    /// DL/I `GU PAUTSUM0 WHERE (ACCNTID = :account)` for the account of the
+    /// detail `id`: `COPAUS1C` `READ-AUTH-RECORD`, the summary read ENTER, PF5
+    /// and PF8 issue before the detail read (P-COPAUS1C-003, P-COPAUS1C-004).
+    ///
+    /// The COBOL qualifies the `GU` by the `CDEMO-ACCT-ID` its COMMAREA
+    /// carries. The REST request carries only the authorization identity
+    /// (P-COPAUS1C-012), so the account is resolved here, server-side, as the
+    /// parent of that detail.
+    ///
+    /// A failure leaves the unit of work usable: `READ-AUTH-RECORD` still
+    /// issues the detail read after a summary `GU` that fails with a status
+    /// other than `GE` or `GB` (P-COPAUS1C-014), and that read's outcome
+    /// decides which error text the caller answers (V-COPAUS1C-003,
+    /// V-COPAUS1C-006).
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::NotFound`] when no detail has the identity or its account
+    /// has no summary (status `GE`); [`PortError::Unavailable`] on any other
+    /// failure.
+    fn read_summary_of_detail(
+        &mut self,
+        id: AuthId,
     ) -> impl Future<Output = PortResult<PendingAuthSummary>> + Send + '_;
 
     /// DL/I `ISRT PAUTSUM0`: `COPAUA0C` `8400-UPDATE-SUMMARY` when no summary
@@ -982,6 +1008,28 @@ pub trait AuthorizationStore {
         id: AuthId,
     ) -> impl Future<Output = PortResult<PendingAuthDetail>> + Send + '_;
 
+    /// [`Self::read_detail`] under a row lock, SQL `SELECT … FOR UPDATE`: the
+    /// detail `COPAUS1C` `MARK-AUTH-FRAUD` reads through `READ-AUTH-RECORD`
+    /// before it toggles the fraud flag and replaces the detail (PF5,
+    /// P-COPAUS1C-006 to P-COPAUS1C-008).
+    ///
+    /// The lock is held until the caller's transaction commits or rolls back,
+    /// so a second fraud mark of the same authorization waits and then reads
+    /// the flag the first one committed. `COPAUS1C` takes no lock of its own;
+    /// this one keeps two overlapping marks from both deriving their action
+    /// from the same flag, which would lose a toggle. The reads of the view
+    /// and of PF8 stay unlocked, through [`Self::read_detail`].
+    ///
+    /// # Errors
+    ///
+    /// [`PortError::NotFound`] when no detail has the identity (status `GE`);
+    /// [`PortError::Contention`] when the lock cannot be taken;
+    /// [`PortError::Unavailable`] on any other failure.
+    fn read_detail_for_update(
+        &mut self,
+        id: AuthId,
+    ) -> impl Future<Output = PortResult<PendingAuthDetail>> + Send + '_;
+
     /// The details of one account in twin order: the `GNP PAUTDTL1` loop of
     /// `COPAUS0C` `PROCESS-PAGE-FORWARD` (P-COPAUS0C-010) and of `CBPAUP0C`
     /// `3000-FIND-NEXT-AUTH-DTL` (P-CBPAUP0C-003).
@@ -1003,22 +1051,30 @@ pub trait AuthorizationStore {
         browse: Browse<AuthId>,
     ) -> impl Future<Output = PortResult<Vec<PendingAuthDetail>>> + Send + '_;
 
-    /// The twin next to the detail `id` under the same summary: `COPAUS1C`
-    /// `READ-NEXT-AUTH-RECORD`, an unqualified `GNP PAUTDTL1` (PF8,
-    /// P-COPAUS1C-014). [`Direction::Forward`] is the next twin, the next older
-    /// authorization; [`Direction::Backward`] the previous twin, the step back
-    /// the web detail page adds (`COPAUS1C` has no PF7).
+    /// The twin next to the `PAUT9CTS` key (`auth_date_9c`, `auth_time_9c`)
+    /// under the summary of `account`: `COPAUS1C` `READ-NEXT-AUTH-RECORD`, the
+    /// unqualified `GNP PAUTDTL1` from the detail `READ-AUTH-RECORD` positioned
+    /// on (PF8, P-COPAUS1C-014).
     ///
-    /// `None` when `id` is the last twin in that direction (status `GE` or
-    /// `GB`, `"Already at the last Authorization..."`, P-COPAUS1C-009).
+    /// The account and the key are those of the detail already read, so the
+    /// step needs no read of that detail or of its parent.
+    /// [`Direction::Forward`] is the first twin with a greater key, the next
+    /// older authorization; [`Direction::Backward`] the last twin with a
+    /// smaller key, the step back the web detail page adds (`COPAUS1C` has no
+    /// PF7).
+    ///
+    /// `None` when no twin follows in that direction (status `GE` or `GB`,
+    /// `"Already at the last Authorization..."`, P-COPAUS1C-009).
     ///
     /// # Errors
     ///
-    /// [`PortError::NotFound`] when no detail has the identity `id`;
-    /// [`PortError::Unavailable`] on any other failure.
+    /// [`PortError::Unavailable`] on any failure; the end of the twins is
+    /// `Ok(None)`.
     fn adjacent_detail(
         &mut self,
-        id: AuthId,
+        account: AccountId,
+        auth_date_9c: i32,
+        auth_time_9c: i32,
         direction: Direction,
     ) -> impl Future<Output = PortResult<Option<PendingAuthDetail>>> + Send + '_;
 

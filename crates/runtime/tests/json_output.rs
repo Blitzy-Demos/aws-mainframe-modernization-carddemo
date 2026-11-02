@@ -78,7 +78,7 @@ impl<'a> MakeWriter<'a> for Capture {
 /// API family: the request span and, inside it, the CAUP handler span whose
 /// `outcome` is recorded once the write has committed, before the span closes.
 fn emit_api_request() {
-    let request = tracing::info_span!(REQUEST_SPAN, method = "PUT", uri = "/accounts/00000000001");
+    let request = tracing::info_span!(REQUEST_SPAN, method = "PUT", route = "/accounts/{id}");
     request.in_scope(|| {
         let handler = tracing::info_span!(
             HANDLER_SPAN,
@@ -258,10 +258,7 @@ fn assert_span_lines(exported: &[&Value]) {
     assert_ne!(message["trace_id"], request["trace_id"], "{message}");
     assert_ne!(message["trace_id"], job["trace_id"], "{message}");
 
-    assert_attributes(
-        request,
-        &[("method", "PUT"), ("uri", "/accounts/00000000001")],
-    );
+    assert_attributes(request, &[("method", "PUT"), ("route", "/accounts/{id}")]);
     assert_attributes(
         handler,
         &[

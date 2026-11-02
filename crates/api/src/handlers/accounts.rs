@@ -40,8 +40,28 @@
 //! # Telemetry
 //!
 //! Each handler runs in one span with `transaction` (`CAVW` or `CAUP`),
-//! `user_id`, `account_id` (the `{id}` segment as entered) and `outcome`,
-//! recorded once the unit of work has ended:
+//! `user_id`, the account key and `outcome`.
+//!
+//! The `{id}` segment reaches the span only through the program's key edit,
+//! `account_view::edit_account_id` for `CAVW` and
+//! `account_update::edit_account_id` for `CAUP`, which the handler applies
+//! before anything else; the rule applies the same edit again. `CAVW`'s edit
+//! refuses a key longer than the 11 characters of `ACCTSID` itself. `CAUP`'s
+//! would `MOVE` one into `CC-ACCT-ID X(11)` and read the account its first 11
+//! characters name, so a longer `CAUP` segment, the one
+//! [`AccountUpdateRequest::check`] refuses, is recorded as `too_long` without
+//! that edit. A key the edit accepts is recorded as `account_id`, the 11
+//! digits of the account the request addresses. A refused key leaves
+//! `account_id` empty and records no part of its text, only
+//! `account_id_length`, its count of characters, and `account_id_rejected`:
+//!
+//! | `account_id_rejected` | Recorded for |
+//! |---|---|
+//! | `too_long` | A key longer than the 11 characters of `ACCTSID`, whatever it holds |
+//! | `blank` | Any other key not entered: empty, spaces, `*` or `LOW-VALUES` |
+//! | `invalid` | Any other key: not 11 digits, or all zeros |
+//!
+//! `outcome` is recorded once the unit of work has ended:
 //!
 //! | `outcome` | Meaning |
 //! |---|---|
@@ -63,6 +83,7 @@ use carddemo_domain::rules::account_view::{self, AccountView, AccountViewInput};
 use carddemo_domain::rules::{VersionKey, VersionToken};
 use carddemo_persistence::UnitOfWork;
 use tracing::Span;
+use tracing::field::display;
 
 use crate::auth::AuthUser;
 use crate::dto::accounts::{AccountResponse, AccountUpdateRequest, AccountUpdateResponse};
@@ -89,10 +110,34 @@ const OUTCOME_COMMITTED: &str = "committed";
 /// `outcome` of an update whose commit failed.
 const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 
-/// COACTVWC 2000-PROCESS-INPUTS, 9000-READ-ACCT, 1200-SETUP-SCREEN-VARS —
-/// P-COACTVWC-004 to P-COACTVWC-011, P-COACTVWC-014, P-COACTVWC-015,
-/// P-COACTVWC-019 to P-COACTVWC-021, P-COACTVWC-025, P-COACTVWC-030,
-/// V-COACTVWC-001 to V-COACTVWC-008
+/// `account_id_rejected` of a key of at most the 11 characters of `ACCTSID`
+/// that the edit reads as not entered.
+const KEY_BLANK: &str = "blank";
+
+/// `account_id_rejected` of a key longer than `ACCTSID`, whatever it holds.
+const KEY_TOO_LONG: &str = "too_long";
+
+/// `account_id_rejected` of any other refused key.
+const KEY_INVALID: &str = "invalid";
+
+/// The `{id}` key as the handler span records it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpanKey {
+    /// The account number the key edit accepted, recorded as `account_id`.
+    Accepted(AccountId),
+    /// A key the edit refused: `category` is recorded as
+    /// `account_id_rejected` and `length`, the key's count of characters, as
+    /// `account_id_length`.
+    Refused {
+        category: &'static str,
+        length: usize,
+    },
+}
+
+/// COACTVWC 2000-PROCESS-INPUTS, 9000-READ-ACCT, 1200-SETUP-SCREEN-VARS,
+/// 1400-SEND-SCREEN, COMMON-RETURN — P-COACTVWC-004 to P-COACTVWC-012,
+/// P-COACTVWC-014, P-COACTVWC-015, P-COACTVWC-018 to P-COACTVWC-021,
+/// P-COACTVWC-025, P-COACTVWC-030, V-COACTVWC-001 to V-COACTVWC-008
 ///
 /// `GET /accounts/{id}` (CAVW): the account number `{id}` as entered, edited
 /// and read by `account_view::view` (the card cross-reference through
@@ -105,7 +150,8 @@ const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 /// # Errors
 ///
 /// - 400 at `ACCTSID` when the number is blank, spaces or `*`
-///   (V-COACTVWC-001), or is not 11 digits or is zero (V-COACTVWC-002).
+///   (V-COACTVWC-001), or is not 11 digits or is zero (V-COACTVWC-002), a
+///   segment longer than its published 11-character `maxLength` included.
 /// - 404 at `ACCTSID` when the cross-reference, the account or the customer
 ///   is not on file (V-COACTVWC-003, V-COACTVWC-005, V-COACTVWC-007).
 /// - 500 at `ACCTSID` with the file-error text when a read fails otherwise
@@ -116,7 +162,7 @@ const OUTCOME_ROLLED_BACK: &str = "rolled_back";
     get,
     path = "/accounts/{id}",
     tag = "accounts",
-    params(("id" = String, Path, description = "ACCT-ID 9(11) as entered")),
+    params(("id" = String, Path, description = "ACCT-ID 9(11) as entered", max_length = 11)),
     responses(
         (status = 200, description = "The account, its customer, the account's first card \
             number and the version token (P-COACTVWC-011)", body = AccountResponse),
@@ -136,7 +182,9 @@ const OUTCOME_ROLLED_BACK: &str = "rolled_back";
     fields(
         transaction = "CAVW",
         user_id = %user.user_id,
-        account_id = %id,
+        account_id = tracing::field::Empty,
+        account_id_rejected = tracing::field::Empty,
+        account_id_length = tracing::field::Empty,
         outcome = tracing::field::Empty,
     )
 )]
@@ -145,6 +193,7 @@ pub async fn get_account(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
 ) -> Result<Json<AccountResponse>, ApiError> {
+    record_key(span_key(&id, &account_view::edit_account_id(Some(&id))));
     let key = state.version_key();
     let mut uow = state.db().begin().await.map_err(rejected)?;
     let input = AccountViewInput {
@@ -166,8 +215,9 @@ pub async fn get_account(
 /// three `COACTUPC` turns in one request, in the order the validation audit
 /// ranks their messages:
 ///
-/// 1. the BMS field lengths of the body, then its `version` token
-///    (V-COACTUPC-001), before any COBOL edit;
+/// 1. the BMS field lengths of the body and of the `{id}` segment
+///    (`ACCTSIDI X(11)`), then the body's `version` token (V-COACTUPC-001),
+///    before any COBOL edit and before the unit of work opens;
 /// 2. the account number `{id}` and the fetch, `load_snapshot`;
 /// 3. `account_update::validate` against the fetched records, with the
 ///    processing clock's date as `FUNCTION CURRENT-DATE`: the comparison
@@ -187,7 +237,9 @@ pub async fn get_account(
 ///
 /// - 400 with [`MISSING_VERSION_MESSAGE`] and no fields when `version` is
 ///   missing or malformed (V-COACTUPC-001), and 400 with no message naming
-///   each body field longer than its BMS field.
+///   each body field longer than its BMS field and `ACCTSID` for an `{id}`
+///   segment longer than 11 characters, which `1210-EDIT-ACCOUNT` would
+///   otherwise see cut to the account its first 11 characters name.
 /// - 400 at `ACCTSID` for a blank, non-numeric or zero account number
 ///   (V-COACTUPC-002, V-COACTUPC-003), and 400 at the flagged fields for the
 ///   first failing field edit (V-COACTUPC-011 to V-COACTUPC-123).
@@ -208,15 +260,17 @@ pub async fn get_account(
     put,
     path = "/accounts/{id}",
     tag = "accounts",
-    params(("id" = String, Path, description = "ACCT-ID 9(11) as entered")),
+    params(("id" = String, Path, description = "ACCT-ID 9(11) as entered", max_length = 11)),
     request_body = AccountUpdateRequest,
     responses(
         (status = 200, description = "Changes committed (P-COACTUPC-015), or no change \
             detected (V-COACTUPC-010): the records as they now stand",
             body = AccountUpdateResponse),
-        (status = 400, description = "A body field longer than its BMS field, a missing or \
-            malformed version token (V-COACTUPC-001), or a failed key or field edit \
-            (V-COACTUPC-002, V-COACTUPC-003, V-COACTUPC-011 to V-COACTUPC-123)",
+        (status = 400, description = "A body field longer than its BMS field or an id longer \
+            than 11 characters (no message, fields name each), a missing or malformed \
+            version token (V-COACTUPC-001), or a failed key or field edit \
+            (1210-EDIT-ACCOUNT: V-COACTUPC-002, V-COACTUPC-003; V-COACTUPC-011 to \
+            V-COACTUPC-123)",
             body = ErrorBody),
         (status = 401, description = "Missing, malformed, badly signed or expired bearer \
             token", body = ErrorBody),
@@ -236,7 +290,9 @@ pub async fn get_account(
     fields(
         transaction = "CAUP",
         user_id = %user.user_id,
-        account_id = %id,
+        account_id = tracing::field::Empty,
+        account_id_rejected = tracing::field::Empty,
+        account_id_length = tracing::field::Empty,
         outcome = tracing::field::Empty,
     )
 )]
@@ -246,7 +302,8 @@ pub async fn update_account(
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<AccountUpdateRequest>,
 ) -> Result<Json<AccountUpdateResponse>, ApiError> {
-    body.check().map_err(rejected)?;
+    record_key(update_span_key(&id));
+    body.check(&id).map_err(rejected)?;
     let version = request_version(body.version.as_deref()).map_err(rejected)?;
     let input = body.into_input(id, version);
     let today = state.clock().now().date_naive();
@@ -309,6 +366,9 @@ pub async fn update_account(
 /// The account number `account_id` as entered, edited by
 /// `account_update::edit_account_id` with the `COACTUPC` texts, and the
 /// fetch of the records `account_update::validate` compares the body with.
+/// [`AccountUpdateRequest::check`] has already refused a segment longer than
+/// 11 characters, so the `MOVE` into `CC-ACCT-ID X(11)` that starts the edit
+/// never cuts one down to another account's number.
 ///
 /// The fetch is `account_view::view` of the edited key: `COACTUPC`
 /// `9000-READ-ACCT` performs the `COACTVWC` reads with the same texts, kinds
@@ -423,15 +483,153 @@ fn record_outcome(outcome: &'static str) {
     Span::current().record("outcome", outcome);
 }
 
+/// The `{id}` key `entered` as the span records it, from `edited`, the
+/// program's key edit of it: the account the edit accepted, or the category
+/// of the refusal with the key's count of characters, keeping nothing of a
+/// refused key's text.
+fn span_key(entered: &str, edited: &Result<AccountId, DomainError>) -> SpanKey {
+    match edited {
+        Ok(account_id) => SpanKey::Accepted(*account_id),
+        Err(error) => {
+            let length = entered.chars().count();
+            let category = if error.kind == ErrorKind::Empty {
+                KEY_BLANK
+            } else if length > AccountId::WIDTH {
+                KEY_TOO_LONG
+            } else {
+                KEY_INVALID
+            };
+            SpanKey::Refused { category, length }
+        }
+    }
+}
+
+/// The `{id}` key `entered` of a `PUT /accounts/{id}` as the span records it.
+///
+/// A segment longer than the 11 characters of `ACCTSIDI X(11)` is the one
+/// [`AccountUpdateRequest::check`] refuses before any key edit, and is
+/// recorded as [`KEY_TOO_LONG`] whatever it holds, spaces included:
+/// `account_update::edit_account_id` would `MOVE` it into `CC-ACCT-ID X(11)`
+/// and read only the account its first 11 characters name, which the request
+/// does not address. Any other segment is recorded by [`span_key`] from that
+/// edit, the edit's own reading deciding a blank key.
+fn update_span_key(entered: &str) -> SpanKey {
+    let length = entered.chars().count();
+    if length > AccountId::WIDTH {
+        SpanKey::Refused {
+            category: KEY_TOO_LONG,
+            length,
+        }
+    } else {
+        span_key(entered, &account_update::edit_account_id(entered))
+    }
+}
+
+/// Records `key` on the handler's span; the fields it does not set stay
+/// empty.
+fn record_key(key: SpanKey) {
+    let span = Span::current();
+    match key {
+        SpanKey::Accepted(account_id) => span.record("account_id", display(account_id)),
+        SpanKey::Refused { category, length } => span
+            .record("account_id_rejected", category)
+            .record("account_id_length", length),
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
     use carddemo_domain::error::ErrorKind;
+    use carddemo_domain::numeric::AccountId;
+    use carddemo_domain::rules::account_view;
+    use serde_json::{Value, json};
+    use utoipa_axum::router::OpenApiRouter;
+    use utoipa_axum::routes;
 
-    use super::{MISSING_VERSION_MESSAGE, request_version};
+    use super::{
+        KEY_BLANK, KEY_INVALID, KEY_TOO_LONG, MISSING_VERSION_MESSAGE, SpanKey, request_version,
+        span_key, update_span_key,
+    };
+    use crate::state::AppState;
 
     /// A well-formed token: 16 lower-case hex digits.
     const TOKEN: &str = "0123456789abcdef";
+
+    /// The `OpenAPI` document of the two operations, registered as the route
+    /// registry registers them: one `routes!` for the path.
+    fn document() -> Value {
+        let (_router, api) = OpenApiRouter::<AppState>::new()
+            .routes(routes!(super::get_account, super::update_account))
+            .split_for_parts();
+        serde_json::to_value(api).expect("the document serializes")
+    }
+
+    #[test]
+    fn the_id_segment_is_published_with_the_acctsid_width() {
+        let document = document();
+        for method in ["get", "put"] {
+            assert_eq!(
+                document["paths"]["/accounts/{id}"][method]["parameters"],
+                json!([{
+                    "name": "id",
+                    "in": "path",
+                    "description": "ACCT-ID 9(11) as entered",
+                    "required": true,
+                    "schema": { "type": "string", "maxLength": 11 },
+                }]),
+                "{method}"
+            );
+        }
+    }
+
+    /// What a handler's span records for the `{id}` segment it was given.
+    type SpanKeyOf = fn(&str) -> SpanKey;
+
+    /// The span key of a key the edit refused.
+    const fn refused(category: &'static str, length: usize) -> SpanKey {
+        SpanKey::Refused { category, length }
+    }
+
+    #[test]
+    fn span_key_is_the_edited_account_or_only_the_refusal_class_and_length() {
+        // `CAVW` and `CAUP` each record what their own key edit decides, as
+        // their handlers derive it; `CAUP` holds the key to `ACCTSID` first.
+        let view: SpanKeyOf = |text| span_key(text, &account_view::edit_account_id(Some(text)));
+        let update: SpanKeyOf = update_span_key;
+        // The fixture account (P-CVACT01Y-015) [app/data/ASCII/acctdata.txt:L1].
+        let account = AccountId::new(1).expect("an account number of 11 digits");
+        // (handler, `{id}` as entered) -> what the span records
+        let cases = [
+            (view, "00000000001", SpanKey::Accepted(account)),
+            (update, "00000000001", SpanKey::Accepted(account)),
+            (view, "", refused(KEY_BLANK, 0)),
+            (view, "   ", refused(KEY_BLANK, 3)),
+            (view, "*", refused(KEY_BLANK, 1)),
+            (view, "\0\0\0\0\0\0\0\0\0\0\0", refused(KEY_BLANK, 11)),
+            (update, "", refused(KEY_BLANK, 0)),
+            (update, "*", refused(KEY_BLANK, 1)),
+            (view, "00000000000", refused(KEY_INVALID, 11)),
+            (view, "0000000001A", refused(KEY_INVALID, 11)),
+            (view, "1", refused(KEY_INVALID, 1)),
+            (view, "\u{e9}", refused(KEY_INVALID, 1)),
+            (update, "00000000000", refused(KEY_INVALID, 11)),
+            (update, "abc", refused(KEY_INVALID, 3)),
+            (view, "000000000012", refused(KEY_TOO_LONG, 12)),
+            (view, "4111111111111111", refused(KEY_TOO_LONG, 16)),
+            (update, "1234567890ab", refused(KEY_TOO_LONG, 12)),
+            // The `CAUP` edit would cut these to the valid account their
+            // first 11 characters name, and to a blank key.
+            (update, "123456789012", refused(KEY_TOO_LONG, 12)),
+            (update, "000000000011", refused(KEY_TOO_LONG, 12)),
+            (update, "            ", refused(KEY_TOO_LONG, 12)),
+            (view, "            ", refused(KEY_TOO_LONG, 12)),
+            (update, "           ", refused(KEY_BLANK, 11)),
+        ];
+        for (key_of, entered, expected) in cases {
+            assert_eq!(key_of(entered), expected, "{entered:?}");
+        }
+    }
 
     #[test]
     fn missing_or_malformed_version_is_the_no_message_400() {

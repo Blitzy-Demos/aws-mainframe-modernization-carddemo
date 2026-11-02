@@ -13,7 +13,8 @@
 //! - [`AuthUser`] answers 401 ([`ApiError::unauthenticated`]) for a request
 //!   without a valid token: no `Authorization` header, more than one, another
 //!   scheme, or a token that is malformed, tampered with, signed with another
-//!   key or algorithm, or expired.
+//!   key or algorithm, expired, or whose `usr_type` claim is not exactly `A`
+//!   or `U`.
 //! - [`AdminUser`] authenticates first and checks the role second. A request
 //!   without a valid token is therefore 401 on `/admin/**` routes too, and
 //!   only a valid token whose `usr_type` is not `A` is 403
@@ -30,8 +31,13 @@
 //! account, so every signed-on user may address every account, as on the
 //! 3270 screens.
 //!
-//! A rejection is logged at `debug` level with the failure kind or the user
-//! ID, never with the token or the header value.
+//! Every rejection is logged at `warn` level, so the default `RUST_LOG=info`
+//! keeps it. A 401 is the event `bearer token rejected` with a fixed `reason`:
+//! `missing_or_malformed_header`, or the token's
+//! [`JwtError::reason`](crate::auth::JwtError::reason). A 403 is the event
+//! `admin access denied` with the verified `user_id`. No event carries the
+//! token, the header value, a claim value the token was rejected for, the
+//! decoder's message or the secret.
 
 use std::ops::Deref;
 
@@ -48,6 +54,10 @@ use crate::state::AppState;
 /// regard to ASCII case.
 const BEARER_SCHEME: &str = "Bearer";
 
+/// The logged `reason` of a request without a single well-formed
+/// `Authorization: Bearer <token>` header, the cases [`bearer_token`] refuses.
+const REASON_MISSING_OR_MALFORMED_HEADER: &str = "missing_or_malformed_header";
+
 /// The signed-on user of a request, from its verified bearer token.
 ///
 /// It stands for the COMMAREA fields `CDEMO-USER-ID` and `CDEMO-USER-TYPE`
@@ -58,8 +68,9 @@ pub struct AuthUser {
     /// The token's `sub` claim verbatim: the upper-cased user ID the sign-on
     /// handler issued the token for.
     pub user_id: String,
-    /// The type the token's `usr_type` claim stands for, read by
-    /// [`UserType::from_code`]: only exactly `A` is [`UserType::Admin`].
+    /// The type of the token's `usr_type` claim, `A` ([`UserType::Admin`]) or
+    /// `U` ([`UserType::User`]); a token with any other claim value is
+    /// rejected before it reaches here.
     pub usr_type: UserType,
 }
 
@@ -75,7 +86,7 @@ impl AuthUser {
         let Claims { sub, usr_type, .. } = claims;
         Self {
             user_id: sub,
-            usr_type: UserType::from_code(&usr_type),
+            usr_type,
         }
     }
 }
@@ -121,17 +132,22 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 ///
 /// [`ApiError::unauthenticated`] (401) when the request has no single bearer
 /// token, or when `keys` reject the token: malformed, signed with another key
-/// or algorithm, expired, or missing a required claim. Only the failure kind
-/// is logged.
+/// or algorithm, expired, missing a required claim, or with a `usr_type`
+/// claim other than `A` or `U`. Each is logged at `warn` level with its fixed
+/// `reason` only: `missing_or_malformed_header`, or
+/// [`JwtError::reason`](crate::auth::JwtError::reason).
 pub(crate) fn authenticate(headers: &HeaderMap, keys: &JwtKeys) -> Result<AuthUser, ApiError> {
     let Some(token) = bearer_token(headers) else {
-        tracing::debug!("bearer token missing or malformed");
+        tracing::warn!(
+            reason = REASON_MISSING_OR_MALFORMED_HEADER,
+            "bearer token rejected"
+        );
         return Err(ApiError::unauthenticated());
     };
     keys.verify(token)
         .map(AuthUser::from_claims)
         .map_err(|err| {
-            tracing::debug!(error = %err, "bearer token rejected");
+            tracing::warn!(reason = err.reason(), "bearer token rejected");
             ApiError::unauthenticated()
         })
 }
@@ -140,13 +156,13 @@ pub(crate) fn authenticate(headers: &HeaderMap, keys: &JwtKeys) -> Result<AuthUs
 ///
 /// # Errors
 ///
-/// [`ApiError::forbidden`] (403) for every other type. The user ID is logged;
-/// it is not a secret.
+/// [`ApiError::forbidden`] (403) for every other type, logged at `warn` level
+/// with the user ID: the verified `sub` claim, not a secret.
 pub(crate) fn require_admin(user: AuthUser) -> Result<AdminUser, ApiError> {
     if user.is_admin() {
         Ok(AdminUser(user))
     } else {
-        tracing::debug!(user_id = %user.user_id, "admin access denied");
+        tracing::warn!(user_id = %user.user_id, "admin access denied");
         Err(ApiError::forbidden())
     }
 }
@@ -178,6 +194,8 @@ impl FromRequestParts<AppState> for AdminUser {
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::body::to_bytes;
@@ -185,8 +203,10 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, StatusCode};
     use axum::response::IntoResponse;
     use carddemo_domain::messages;
+    use carddemo_runtime::telemetry::subscriber_with_writer;
     use jsonwebtoken::{Algorithm, EncodingKey, Header};
-    use serde_json::Value;
+    use serde::Serialize;
+    use serde_json::{Value, json};
 
     use super::{AdminUser, AuthUser, authenticate, bearer_token, require_admin};
     use crate::auth::jwt::{Claims, JwtKeys, UserType};
@@ -199,7 +219,7 @@ mod tests {
         JwtKeys::new(SECRET, TTL_SECS)
     }
 
-    fn token(keys: &JwtKeys, user_id: &str, usr_type: &str) -> String {
+    fn token(keys: &JwtKeys, user_id: &str, usr_type: UserType) -> String {
         keys.issue(user_id, usr_type).expect("issues").token
     }
 
@@ -212,13 +232,21 @@ mod tests {
 
     /// `claims` signed under `algorithm` with the test secret, without
     /// `JwtKeys::issue`, so the claims and the algorithm can be anything.
-    fn sign(algorithm: Algorithm, claims: &Claims) -> String {
+    fn sign(algorithm: Algorithm, claims: &impl Serialize) -> String {
         jsonwebtoken::encode(
             &Header::new(algorithm),
             claims,
             &EncodingKey::from_secret(SECRET.as_bytes()),
         )
         .expect("signs")
+    }
+
+    /// `claims` as JSON with the `usr_type` claim replaced by `role`, which
+    /// [`Claims`] cannot hold when it is not the string `A` or `U`.
+    fn with_role(claims: &Claims, role: Value) -> Value {
+        let mut value = serde_json::to_value(claims).expect("serializes");
+        value["usr_type"] = role;
+        value
     }
 
     /// One `Authorization` header per value, in order.
@@ -264,6 +292,42 @@ mod tests {
         (status, body["message"].clone())
     }
 
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `run` returns, and the JSON log lines it writes through the API's
+    /// telemetry subscriber under the default filter `info`.
+    fn logged<T>(run: impl FnOnce() -> T) -> (T, Vec<Value>) {
+        let capture = Capture::default();
+        let sink = capture.clone();
+        let (subscriber, guard) =
+            subscriber_with_writer("api", "info", move || sink.clone()).expect("valid directives");
+        let result = tracing::subscriber::with_default(subscriber, run);
+        guard.shutdown().expect("the tracer provider shuts down");
+        let bytes = capture.0.lock().expect("capture buffer").clone();
+        let text = String::from_utf8(bytes).expect("JSON lines are UTF-8");
+        let lines = text
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("a JSON line"))
+            .collect();
+        (result, lines)
+    }
+
     #[test]
     fn bearer_token_takes_the_single_bearer_credential() {
         for scheme in ["Bearer", "bearer", "BEARER", "bEaReR"] {
@@ -302,7 +366,7 @@ mod tests {
     #[test]
     fn valid_token_in_a_malformed_header_is_401() {
         let keys = keys();
-        let token = token(&keys, "ADMIN001", "A");
+        let token = token(&keys, "ADMIN001", UserType::Admin);
         let bearer = HeaderValue::from_str(&format!("Bearer {token}")).expect("a header value");
         let mut non_ascii = format!("Bearer {token}").into_bytes();
         non_ascii.push(0xFF);
@@ -332,7 +396,7 @@ mod tests {
         let now = now();
         let expired = Claims {
             sub: "ADMIN001".to_owned(),
-            usr_type: "A".to_owned(),
+            usr_type: UserType::Admin,
             iat: now - TTL_SECS - 10,
             exp: now - 10,
         };
@@ -346,10 +410,26 @@ mod tests {
             ("three garbage segments", "a.b.c".to_owned()),
             (
                 "another secret",
-                token(&JwtKeys::new("other-secret", TTL_SECS), "ADMIN001", "A"),
+                token(
+                    &JwtKeys::new("other-secret", TTL_SECS),
+                    "ADMIN001",
+                    UserType::Admin,
+                ),
             ),
             ("expired 10 s ago", sign(Algorithm::HS256, &expired)),
             ("HS384", sign(Algorithm::HS384, &current)),
+            (
+                "role X",
+                sign(Algorithm::HS256, &with_role(&current, json!("X"))),
+            ),
+            (
+                "role a",
+                sign(Algorithm::HS256, &with_role(&current, json!("a"))),
+            ),
+            (
+                "role A as an enum map",
+                sign(Algorithm::HS256, &with_role(&current, json!({"A": null}))),
+            ),
         ];
         for (case, token) in cases {
             let map = authorization(&format!("Bearer {token}"));
@@ -366,7 +446,7 @@ mod tests {
     #[test]
     fn admin_token_passes_the_admin_check_with_any_scheme_case() {
         let keys = keys();
-        let token = token(&keys, "ADMIN001", "A");
+        let token = token(&keys, "ADMIN001", UserType::Admin);
         for scheme in ["Bearer", "bearer"] {
             let map = authorization(&format!("{scheme} {token}"));
             let user = authenticate(&map, &keys).expect("an admin token authenticates");
@@ -390,6 +470,7 @@ mod tests {
     #[test]
     fn every_type_but_a_is_a_user_and_403_on_the_admin_check() {
         let keys = keys();
+        // (user ID, stored `SEC-USR-TYPE`), issued as sign-on issues it.
         for (user_id, code) in [
             ("USER0001", "U"),
             ("user0001", "X"),
@@ -398,13 +479,120 @@ mod tests {
             ("ADMIN001", "A "),
             ("ADMIN001", "AA"),
         ] {
-            let map = authorization(&format!("Bearer {}", token(&keys, user_id, code)));
+            let issued = token(&keys, user_id, UserType::from_code(code));
+            let map = authorization(&format!("Bearer {issued}"));
             let user = authenticate(&map, &keys).expect("a valid token authenticates");
             assert_eq!(user.user_id, user_id, "the sub claim verbatim for {code:?}");
             assert_eq!(user.usr_type, UserType::User, "{code:?}");
             assert!(!user.is_admin(), "{code:?}");
             assert_forbidden(require_admin(user), code);
         }
+    }
+
+    #[test]
+    fn a_401_is_logged_at_warn_with_its_reason_only() {
+        let keys = keys();
+        let now = now();
+        let current = Claims {
+            sub: "ADMIN001".to_owned(),
+            usr_type: UserType::Admin,
+            iat: now,
+            exp: now + 60,
+        };
+        let expired = Claims {
+            iat: now - TTL_SECS - 10,
+            exp: now - 10,
+            ..current.clone()
+        };
+        let other_secret = JwtKeys::new("other-secret", TTL_SECS);
+        let admin = token(&keys, "ADMIN001", UserType::Admin);
+        let bearer = |token: &str| Some(format!("Bearer {token}"));
+        // (case, the `Authorization` value if any, the logged reason)
+        let cases = [
+            ("no header", None, "missing_or_malformed_header"),
+            (
+                "basic scheme",
+                Some(format!("Basic {admin}")),
+                "missing_or_malformed_header",
+            ),
+            ("garbage", bearer("not-a-jwt"), "malformed"),
+            (
+                "another secret",
+                bearer(&token(&other_secret, "ADMIN001", UserType::Admin)),
+                "bad_signature",
+            ),
+            (
+                "HS384",
+                bearer(&sign(Algorithm::HS384, &current)),
+                "wrong_algorithm",
+            ),
+            (
+                "expired",
+                bearer(&sign(Algorithm::HS256, &expired)),
+                "expired",
+            ),
+            (
+                "role X",
+                bearer(&sign(Algorithm::HS256, &with_role(&current, json!("X")))),
+                "invalid_claims",
+            ),
+        ];
+        for (case, value, reason) in cases {
+            let map = value.as_deref().map_or_else(HeaderMap::new, authorization);
+            let (result, lines) = logged(|| authenticate(&map, &keys));
+            assert_unauthenticated(result, case);
+            let [line] = lines.as_slice() else {
+                panic!("{case}: one event expected, got {lines:?}");
+            };
+            assert_eq!(line["level"], "WARN", "{case}");
+            assert_eq!(line["target"], "carddemo_api::auth::extract", "{case}");
+            assert_eq!(
+                line["fields"],
+                json!({"message": "bearer token rejected", "reason": reason}),
+                "{case}"
+            );
+            let text = line.to_string();
+            for withheld in [
+                SECRET,
+                "other-secret",
+                "JSON error",
+                "unknown variant",
+                "invalid value",
+            ] {
+                assert!(!text.contains(withheld), "{case}: {text}");
+            }
+            if let Some(value) = &value {
+                let presented = value.split_once(' ').map_or(value.as_str(), |(_, t)| t);
+                assert!(!text.contains(presented), "{case}: {text}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_403_is_logged_at_warn_with_the_user_id_and_a_pass_is_not_logged() {
+        let keys = keys();
+        let user_token = token(&keys, "USER0001", UserType::User);
+        let user_map = authorization(&format!("Bearer {user_token}"));
+        let (denied, lines) = logged(|| authenticate(&user_map, &keys).and_then(require_admin));
+        assert_forbidden(denied, "a user token");
+        let [line] = lines.as_slice() else {
+            panic!("one event expected, got {lines:?}");
+        };
+        assert_eq!(line["level"], "WARN");
+        assert_eq!(line["target"], "carddemo_api::auth::extract");
+        assert_eq!(
+            line["fields"],
+            json!({"message": "admin access denied", "user_id": "USER0001"})
+        );
+        assert!(!line.to_string().contains(&user_token), "{line}");
+
+        let admin_map = authorization(&format!(
+            "Bearer {}",
+            token(&keys, "ADMIN001", UserType::Admin)
+        ));
+        let (admitted, lines) = logged(|| authenticate(&admin_map, &keys).and_then(require_admin));
+        assert!(admitted.is_ok(), "an admin token passes");
+        assert!(lines.is_empty(), "{lines:?}");
     }
 
     #[tokio::test]
@@ -419,7 +607,10 @@ mod tests {
             )
         );
 
-        let map = authorization(&format!("Bearer {}", token(&keys, "USER0001", "U")));
+        let map = authorization(&format!(
+            "Bearer {}",
+            token(&keys, "USER0001", UserType::User)
+        ));
         let user = authenticate(&map, &keys).expect("a user token authenticates");
         let denied = require_admin(user).expect_err("a user is not an admin");
         assert_eq!(

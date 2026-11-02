@@ -18,12 +18,17 @@
 //!   settled before the next is read, so a flow handles one request at a time.
 //! - **Persistent, confirmed publishes.** Replies and error records go to the
 //!   default exchange with the queue name as routing key, `mandatory` set,
-//!   `delivery_mode` 2 (persistent) and no expiry. This is a mandated change
+//!   `delivery_mode` 2 (persistent), `content_type` `text/plain`,
+//!   `content_encoding` `utf-8` and no expiry. This is a mandated change
 //!   from CP00's `MQPER-NOT-PERSISTENT` reply with `MQMD-EXPIRY` 50
 //!   [app/app-authorization-ims-db2-mq/cbl/COPAUA0C.cbl:L749-750]. The channel
 //!   is in confirm mode (`crate::connection::open_channel`), so every publish
 //!   resolves to a broker confirmation, and only `Ack(None)` counts as
-//!   delivered ([`classify`]).
+//!   delivered ([`classify`]). A publish whose confirmation has not arrived
+//!   within [`connection::BROKER_TIMEOUT`] counts as not delivered
+//!   ([`PublishFailure::TimedOut`]) and takes the same failure path. The
+//!   channel stays open, because closing it would return the request to its
+//!   queue for redelivery.
 //! - **Ack after confirm.** A request is acknowledged only after its reply's
 //!   `Ack(None)`. Then [`Flow::after_ack`] runs: CP00 writes its pending
 //!   authorization there, after the reply, as `COPAUA0C` writes after
@@ -42,19 +47,39 @@
 //!   requeues. A request left unsettled because the channel failed is
 //!   redelivered by the broker, which single delivery assumes never happens.
 //!
+//!   The acknowledgement and the rejection have no deadline. While the broker
+//!   blocks the connection, lapin holds every outgoing frame, so the
+//!   settlement waits until the broker unblocks it; giving up would stop the
+//!   consumer and return the request to its queue for redelivery.
+//!
 //! # Message span
 //!
 //! Each delivery runs inside one `message` span with the fields `flow`,
 //! `message_id`, `correlation_id`, `outcome` (`replied` or `rejected`),
-//! `error_record` (`published`, `logged` or `none`) and `location` (the
-//! `CCPAUERY` location of a CP00 failure). The last three are recorded after
-//! the confirm and settle decision. The binary's or test's subscriber from
-//! `carddemo_runtime::telemetry` writes the span and the events as JSON lines.
+//! `error_record` (`published`, `logged` or `none`) and `location`.
+//!
+//! - `outcome` and `error_record` are the disposition decided after the
+//!   reply's or error record's confirm, recorded before the request is
+//!   acknowledged or rejected.
+//! - `location` is the `CCPAUERY` location or paragraph of a CP00 failure:
+//!   `M004`, `C001` to `C003`, `I002`, `M003`, `2100-EXTRACT-REQUEST-MSG`
+//!   before a rejection. Every other path records `none`; a replied request
+//!   records it before its acknowledgement, and CP00's [`Flow::after_ack`]
+//!   then replaces it through [`record_location`] as it logs each
+//!   post-acknowledgement failure: `I003`, `I004` or `8000-WRITE-AUTH-TO-DB`.
+//! - An acknowledgement or rejection that fails is an `ERROR` event in the
+//!   span: the request stays unsettled, and the broker redelivers it once the
+//!   channel closes.
+//!
+//! The binary's or test's subscriber from `carddemo_runtime::telemetry` writes
+//! the span and the events as JSON lines.
 
 use std::fmt;
 use std::future::Future;
+use std::time::Duration;
 
 use futures_util::StreamExt;
+use futures_util::stream::{AbortHandle, AbortRegistration, Abortable};
 use lapin::acker::Acker;
 use lapin::message::Delivery;
 use lapin::options::{
@@ -66,6 +91,7 @@ use lapin::{BasicProperties, Channel};
 use tracing::{Instrument, Span};
 
 use crate::MessagingError;
+use crate::connection;
 use crate::error_queue;
 
 /// Deliveries the broker may hand a consumer before it settles the previous
@@ -76,9 +102,24 @@ const PREFETCH: u16 = 1;
 /// durable queue, so a reply or error record survives a broker restart.
 const PERSISTENT: u8 = 2;
 
+/// AMQP `content-type` of every reply and error record: each body is text,
+/// the reply a flow's domain rule builds or the `MQ-ERR-DISPLAY` record of
+/// `error_queue::record_bytes`.
+const CONTENT_TYPE: &str = "text/plain";
+
+/// AMQP `content-encoding` of every reply and error record. Each body is the
+/// bytes of a Rust `String`, so UTF-8, and ASCII for every audited body; the
+/// bytes are published unchanged.
+const CONTENT_ENCODING: &str = "utf-8";
+
 /// The AMQP default exchange, which routes a message to the queue its routing
 /// key names, as an MQ put names its target queue.
 const DEFAULT_EXCHANGE: &str = "";
+
+/// The message span's `location` on a path that has no `CCPAUERY` location:
+/// every CDRD and CDRA request, and a CP00 request whose reply and writes
+/// completed.
+const NO_LOCATION: &str = "none";
 
 /// CODATE01 / COACCT01 3000-GET-REQUEST, COPAUA0C 3100-READ-REQUEST-MQ —
 /// P-CODATE01-012, P-COACCT01-011, P-COPAUA0C-002.
@@ -187,6 +228,14 @@ pub enum PublishFailure {
     /// The channel failed during the publish or while awaiting its
     /// confirmation.
     Channel(lapin::Error),
+    /// The publish and its confirmation did not complete within
+    /// [`connection::BROKER_TIMEOUT`], for example because the broker blocked
+    /// the connection or withheld the confirm, so the message counts as not
+    /// delivered. The broker may still route it later.
+    ///
+    /// The channel is left open: closing it would return the unsettled
+    /// request to its queue, and the broker would redeliver it.
+    TimedOut,
 }
 
 impl PublishFailure {
@@ -201,7 +250,7 @@ impl PublishFailure {
         let reason = match self {
             Self::Returned => error_queue::REASON_RETURNED,
             Self::Nacked => error_queue::REASON_NACKED,
-            Self::NotRequested => error_queue::REASON_NOT_CONFIRMED,
+            Self::NotRequested | Self::TimedOut => error_queue::REASON_NOT_CONFIRMED,
             Self::Channel(_) => error_queue::REASON_CHANNEL_ERROR,
         };
         (error_queue::MQPUT_FAILED_CONDITION_CODE, reason)
@@ -215,6 +264,7 @@ impl fmt::Display for PublishFailure {
             Self::Nacked => f.write_str("nacked"),
             Self::NotRequested => f.write_str("not confirmed"),
             Self::Channel(error) => write!(f, "channel error: {error}"),
+            Self::TimedOut => write!(f, "not confirmed within {:?}", connection::BROKER_TIMEOUT),
         }
     }
 }
@@ -262,11 +312,26 @@ pub trait Flow: Send + Sync + 'static {
 
     /// Runs `work` once the reply is confirmed and the request acknowledged.
     /// Nothing it does reaches the broker: the request is already settled.
+    ///
+    /// It runs inside the request's message span, whose `location` is already
+    /// `none`. A flow reports the location of a failure it logs here with
+    /// [`record_location`], at the moment it logs it.
     fn after_ack<'a>(
         &'a self,
         req: &'a Request,
         work: Self::AfterAck,
     ) -> impl Future<Output = ()> + Send + 'a;
+}
+
+/// For a flow's [`Flow::after_ack`], which runs inside the request's message
+/// span: records `location`, the `CCPAUERY` location or paragraph of a failure,
+/// as the span's `location` as soon as the failure is logged, replacing
+/// `none`.
+///
+/// A later call replaces an earlier one, so the span keeps the last failure
+/// logged, and cancelling the remaining work cannot lose it.
+pub fn record_location(location: &'static str) {
+    Span::current().record("location", location);
 }
 
 /// Maps a publisher confirmation to the publish's outcome.
@@ -295,8 +360,14 @@ pub fn classify(confirmation: Confirmation) -> Result<(), PublishFailure> {
 /// 7100-SEND-RESPONSE — P-CODATE01-014, P-CODATE01-016, P-COACCT01-017,
 /// P-COACCT01-018, P-COPAUA0C-012.
 ///
-/// Publishes `body` to `queue` through the default exchange, persistent and
-/// mandatory, with no expiry, and waits for the broker's confirmation.
+/// Publishes `body` to `queue` through the default exchange, mandatory, with
+/// the [`published_properties`], and waits for the broker's confirmation.
+///
+/// The publish and the confirmation together are held to
+/// [`connection::BROKER_TIMEOUT`], so a broker that stays connected but
+/// blocks the connection or withholds the confirm cannot hold the
+/// prefetch-1 consumer: the message then counts as not delivered,
+/// [`PublishFailure::TimedOut`].
 async fn publish_confirmed(
     channel: &Channel,
     queue: &str,
@@ -304,26 +375,75 @@ async fn publish_confirmed(
     message_id: Option<&str>,
     correlation_id: Option<&str>,
 ) -> Result<(), PublishFailure> {
-    let mut properties = BasicProperties::default().with_delivery_mode(PERSISTENT);
+    let properties = published_properties(message_id, correlation_id);
+    let options = BasicPublishOptions {
+        mandatory: true,
+        ..BasicPublishOptions::default()
+    };
+    confirmed_within(connection::BROKER_TIMEOUT, async {
+        let confirm = channel
+            .basic_publish(DEFAULT_EXCHANGE, queue, options, body, properties)
+            .await
+            .map_err(PublishFailure::Channel)?;
+        let confirmation = confirm.await.map_err(PublishFailure::Channel)?;
+        classify(confirmation)
+    })
+    .await
+}
+
+/// The properties of every reply and error record: persistent, labelled
+/// [`CONTENT_TYPE`] in [`CONTENT_ENCODING`], with no expiry, carrying
+/// `message_id` and `correlation_id` when they are given.
+fn published_properties(message_id: Option<&str>, correlation_id: Option<&str>) -> BasicProperties {
+    let mut properties = BasicProperties::default()
+        .with_delivery_mode(PERSISTENT)
+        .with_content_type(CONTENT_TYPE.into())
+        .with_content_encoding(CONTENT_ENCODING.into());
     if let Some(id) = message_id {
         properties = properties.with_message_id(id.into());
     }
     if let Some(id) = correlation_id {
         properties = properties.with_correlation_id(id.into());
     }
-    let options = BasicPublishOptions {
-        mandatory: true,
-        ..BasicPublishOptions::default()
-    };
-    let confirm = channel
-        .basic_publish(DEFAULT_EXCHANGE, queue, options, body, properties)
-        .await
-        .map_err(PublishFailure::Channel)?;
-    let confirmation = confirm.await.map_err(PublishFailure::Channel)?;
-    classify(confirmation)
+    properties
+}
+
+/// Waits for `delivery`, a publish and its confirmation, for at most `limit`.
+///
+/// The timer is tokio's, as in `crate::connection::bounded`. The abandoned
+/// publish is dropped; lapin keeps its pending confirmation, and the channel
+/// stays open.
+///
+/// # Errors
+///
+/// Returns the failure `delivery` resolves to, and
+/// [`PublishFailure::TimedOut`] when it has not resolved within `limit`.
+async fn confirmed_within(
+    limit: Duration,
+    delivery: impl Future<Output = Result<(), PublishFailure>>,
+) -> Result<(), PublishFailure> {
+    match tokio::time::timeout(limit, delivery).await {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => Err(PublishFailure::TimedOut),
+    }
 }
 
 /// Consumes `queue` on `channel` with `flow` until the stream ends or fails.
+///
+/// This is [`run_until`] with a stop that nothing can signal, so it returns
+/// only an error.
+///
+/// # Errors
+///
+/// Returns the errors of [`run_until`].
+pub async fn run<F: Flow>(channel: Channel, queue: &str, flow: F) -> Result<(), MessagingError> {
+    // The handle is dropped at once, so the stop is never signalled.
+    let (_, never) = AbortHandle::new_pair();
+    run_until(channel, queue, flow, never).await
+}
+
+/// Consumes `queue` on `channel` with `flow` until `stop` is signalled or the
+/// stream ends or fails.
 ///
 /// Sets the channel's prefetch to 1, starts a manually acknowledged consumer
 /// tagged `carddemo-<flow>` (for example `carddemo-cdrd`) and settles each
@@ -332,22 +452,36 @@ async fn publish_confirmed(
 /// leaves it; otherwise every publish fails as
 /// [`PublishFailure::NotRequested`] and every request is rejected.
 ///
+/// `stop` is checked only between deliveries. Once its [`AbortHandle`] is
+/// aborted, the delivery being settled still finishes, its publishes, its
+/// acknowledgement or rejection and [`Flow::after_ack`] included, and no other
+/// delivery is handled: one the broker has already sent stays unsettled, and
+/// the broker redelivers it once the channel closes. Then `run_until` returns
+/// `Ok(())`.
+///
 /// A request whose settlement fails is left unsettled; the broker redelivers it
 /// once the channel closes.
 ///
 /// # Errors
 ///
 /// Returns [`MessagingError::Amqp`] when `basic.qos`, `basic.consume`, an
-/// acknowledgement, a rejection or the delivery stream fails, and
-/// [`MessagingError::ConsumerStopped`] when the broker ends the delivery stream,
-/// for example because the queue was deleted.
-pub async fn run<F: Flow>(channel: Channel, queue: &str, flow: F) -> Result<(), MessagingError> {
+/// acknowledgement, a rejection or the delivery stream fails,
+/// [`MessagingError::BrokerTimeout`] when the broker does not answer
+/// `basic.qos` or `basic.consume` within [`connection::BROKER_TIMEOUT`], and
+/// [`MessagingError::ConsumerStopped`] when the broker ends the delivery stream
+/// before `stop` is signalled, for example because the queue was deleted.
+pub async fn run_until<F: Flow>(
+    channel: Channel,
+    queue: &str,
+    flow: F,
+    stop: AbortRegistration,
+) -> Result<(), MessagingError> {
     let session = Session {
         channel,
         queue: queue.to_owned(),
         flow,
     };
-    session.consume().await
+    session.consume(stop).await
 }
 
 /// The channel, queue and flow of one running consumer.
@@ -359,26 +493,45 @@ struct Session<F> {
 
 impl<F: Flow> Session<F> {
     /// CODATE01 / COACCT01 4000-MAIN-PROCESS, COPAUA0C 2000-MAIN-PROCESS —
-    /// P-CODATE01-024, P-COPAUA0C-003: get and answer requests one at a time.
-    async fn consume(&self) -> Result<(), MessagingError> {
-        self.channel
-            .basic_qos(PREFETCH, BasicQosOptions::default())
-            .await?;
+    /// P-CODATE01-024, P-COPAUA0C-003: get and answer requests one at a time,
+    /// until `stop` is signalled between two of them.
+    async fn consume(&self, stop: AbortRegistration) -> Result<(), MessagingError> {
+        connection::bounded(
+            "basic.qos",
+            connection::BROKER_TIMEOUT,
+            self.channel.basic_qos(PREFETCH, BasicQosOptions::default()),
+        )
+        .await?;
         let consumer_tag = format!("carddemo-{}", F::NAME.to_ascii_lowercase());
-        let mut deliveries = self
-            .channel
-            .basic_consume(
+        let consumer = connection::bounded(
+            "basic.consume",
+            connection::BROKER_TIMEOUT,
+            self.channel.basic_consume(
                 &self.queue,
                 &consumer_tag,
                 BasicConsumeOptions::default(),
                 FieldTable::default(),
-            )
-            .await?;
+            ),
+        )
+        .await?;
+        tracing::info!(
+            flow = F::NAME,
+            queue = %self.queue,
+            consumer_tag = %consumer.tag(),
+            "consumer started"
+        );
+        // The stream is polled only between settlements, so a signalled stop
+        // ends it before the next delivery and never inside the current one.
+        let mut deliveries = Abortable::new(consumer, stop);
         while let Some(item) = deliveries.next().await {
             let delivery = item.map_err(MessagingError::Amqp)?;
             self.settle(delivery).await?;
         }
-        Err(MessagingError::ConsumerStopped { flow: F::NAME })
+        if deliveries.is_aborted() {
+            Ok(())
+        } else {
+            Err(MessagingError::ConsumerStopped { flow: F::NAME })
+        }
     }
 
     /// Handles one delivery inside its message span and settles it with the
@@ -431,15 +584,7 @@ impl<F: Flow> Session<F> {
                 )
                 .await;
                 match published {
-                    Ok(()) => {
-                        // An acknowledgement that fails leaves the request to be
-                        // redelivered, so the post-acknowledgement work must not run.
-                        acker.ack(BasicAckOptions::default()).await?;
-                        span.record("outcome", "replied");
-                        span.record("error_record", "none");
-                        self.flow.after_ack(req, after_ack).await;
-                        Ok(())
-                    }
+                    Ok(()) => self.acknowledge(acker, req, after_ack, span).await,
                     Err(failure) => {
                         tracing::warn!(
                             flow = F::NAME,
@@ -452,7 +597,7 @@ impl<F: Flow> Session<F> {
                                 self.reject_with_record(acker, req, &record, span).await
                             }
                             FailureAction::Logged { location } => {
-                                reject_logged(acker, location, span).await
+                                reject_logged(acker, F::NAME, location, span).await
                             }
                         }
                     }
@@ -461,8 +606,34 @@ impl<F: Flow> Session<F> {
             Disposition::ErrorRecord { record } => {
                 self.reject_with_record(acker, req, &record, span).await
             }
-            Disposition::Reject { location } => reject_logged(acker, location, span).await,
+            Disposition::Reject { location } => reject_logged(acker, F::NAME, location, span).await,
         }
+    }
+
+    /// Acknowledges a request whose reply is confirmed, then runs
+    /// [`Flow::after_ack`].
+    ///
+    /// `outcome`, `error_record` and a `location` of `none` are recorded
+    /// before the acknowledgement, since the reply is already delivered, so a
+    /// span whose remaining work is cancelled still carries all three. The
+    /// flow replaces `location` through [`record_location`] as it logs a
+    /// failure. An acknowledgement that fails leaves the request to be
+    /// redelivered, so the post-acknowledgement work does not run.
+    async fn acknowledge(
+        &self,
+        acker: &Acker,
+        req: &Request,
+        work: F::AfterAck,
+        span: &Span,
+    ) -> Result<(), MessagingError> {
+        span.record("outcome", "replied");
+        span.record("error_record", "none");
+        span.record("location", NO_LOCATION);
+        if let Err(error) = acker.ack(BasicAckOptions::default()).await {
+            return Err(unsettled(F::NAME, "acknowledged", error));
+        }
+        self.flow.after_ack(req, work).await;
+        Ok(())
     }
 
     /// CODATE01 / COACCT01 9000-ERROR — P-CODATE01-015, P-CODATE01-016,
@@ -509,40 +680,71 @@ impl<F: Flow> Session<F> {
                 span.record("error_record", "logged");
             }
         }
-        reject(acker).await?;
         span.record("outcome", "rejected");
-        Ok(())
+        span.record("location", NO_LOCATION);
+        reject(acker, F::NAME).await
     }
 }
 
-/// Rejects a request whose failure the flow has already logged, recording
-/// the flow's `location` in the message span.
+/// Rejects a request of `flow` whose failure the flow has already logged,
+/// recording the flow's `location` in the message span first.
 async fn reject_logged(
     acker: &Acker,
+    flow: &'static str,
     location: &'static str,
     span: &Span,
 ) -> Result<(), MessagingError> {
-    reject(acker).await?;
     span.record("outcome", "rejected");
     span.record("error_record", "none");
     span.record("location", location);
-    Ok(())
+    reject(acker, flow).await
 }
 
-/// Removes a request from its queue without a reply: `basic.reject` with
-/// `requeue = false`, the only way this module settles a failed request.
-async fn reject(acker: &Acker) -> Result<(), lapin::Error> {
-    acker.reject(BasicRejectOptions { requeue: false }).await
+/// Removes a request of `flow` from its queue without a reply: `basic.reject`
+/// with `requeue = false`, the only way this module settles a failed request.
+///
+/// # Errors
+///
+/// Returns [`MessagingError::Amqp`] when the rejection fails, after logging
+/// that the request stays unsettled.
+async fn reject(acker: &Acker, flow: &'static str) -> Result<(), MessagingError> {
+    acker
+        .reject(BasicRejectOptions { requeue: false })
+        .await
+        .map_err(|error| unsettled(flow, "rejected", error))
+}
+
+/// Logs, as an `ERROR` event in the message span, that the request of `flow`
+/// was not `settlement` (`acknowledged` or `rejected`) because `basic.ack` or
+/// `basic.reject` failed with `error`. The request stays unsettled, and the
+/// broker redelivers it once the channel closes. Returns the error the
+/// consumer stops with.
+fn unsettled(flow: &'static str, settlement: &'static str, error: lapin::Error) -> MessagingError {
+    tracing::error!(
+        flow,
+        error = %error,
+        "request not {settlement}: it stays unsettled, and the broker redelivers it once the channel closes"
+    );
+    MessagingError::Amqp(error)
 }
 
 #[cfg(test)]
 mod tests {
     use std::future::{self, Future};
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
+    use futures_util::stream::AbortRegistration;
     use lapin::publisher_confirm::Confirmation;
+    use lapin::types::ShortString;
     use lapin::{BasicProperties, Channel, ChannelState};
 
-    use super::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request, classify, run};
+    use super::{
+        Disposition, FailureAction, Flow, NO_LOCATION, PublishFailure, Reply, Request, classify,
+        confirmed_within, published_properties, record_location, run, run_until, unsettled,
+    };
+    use crate::MessagingError;
     use crate::error_queue;
 
     fn assert_send<T: Send>(_: &T) {}
@@ -652,6 +854,11 @@ mod tests {
                     lapin::Error::InvalidChannelState(ChannelState::Closed)
                 ),
             ),
+            (
+                PublishFailure::TimedOut,
+                error_queue::REASON_NOT_CONFIRMED,
+                "not confirmed within 10s".to_owned(),
+            ),
         ];
         for (failure, reason, text) in cases {
             assert_eq!(
@@ -663,12 +870,173 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_publish_and_its_confirm_are_held_to_the_deadline() {
+        // A confirm the broker withholds past the limit is a publish not
+        // delivered; an outcome within the limit passes through unchanged.
+        let cases = [
+            (None, "Err(TimedOut)"),
+            (Some(Ok(())), "Ok(())"),
+            (Some(Err(PublishFailure::Nacked)), "Err(Nacked)"),
+        ];
+        for (answer, expected) in cases {
+            let delivery = async move {
+                match answer {
+                    Some(outcome) => outcome,
+                    None => future::pending().await,
+                }
+            };
+            let outcome = confirmed_within(Duration::from_millis(10), delivery).await;
+            assert_eq!(format!("{outcome:?}"), expected);
+        }
+    }
+
+    #[test]
+    fn replies_and_error_records_are_persistent_utf8_text() {
+        // P-CODATE01-014, P-COACCT01-017, P-COPAUA0C-012: the IDs a put
+        // carries, labelled as the text the domain rules build.
+        let cases = [
+            (Some("MSG-1"), Some("CORR-1")),
+            (None, Some("CORR-1")),
+            (Some("MSG-1"), None),
+            (None, None),
+        ];
+        for (message_id, correlation_id) in cases {
+            let properties = published_properties(message_id, correlation_id);
+            let text = |value: &Option<ShortString>| value.as_ref().map(ShortString::to_string);
+            assert_eq!(*properties.delivery_mode(), Some(2));
+            assert_eq!(
+                text(properties.content_type()).as_deref(),
+                Some("text/plain")
+            );
+            assert_eq!(
+                text(properties.content_encoding()).as_deref(),
+                Some("utf-8")
+            );
+            assert_eq!(text(properties.expiration()), None);
+            assert_eq!(text(properties.message_id()).as_deref(), message_id);
+            assert_eq!(text(properties.correlation_id()).as_deref(), correlation_id);
+        }
+    }
+
+    /// A shared in-memory sink standing in for standard output.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Capture {
+        fn text(&self) -> String {
+            let bytes = self.0.lock().expect("capture buffer").clone();
+            String::from_utf8(bytes).expect("JSON lines are UTF-8")
+        }
+    }
+
+    impl io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .map_err(|_| io::Error::other("capture buffer poisoned"))?
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_settlement_is_one_error_event_and_the_amqp_error() {
+        // A request whose ack or reject fails is never reported as settled.
+        for settlement in ["acknowledged", "rejected"] {
+            let capture = Capture::default();
+            let sink = capture.clone();
+            let (subscriber, guard) =
+                carddemo_runtime::telemetry::subscriber_with_writer("mq", "info", move || {
+                    sink.clone()
+                })
+                .expect("valid directives");
+            let closed = lapin::Error::InvalidChannelState(ChannelState::Closed);
+            let error = tracing::subscriber::with_default(subscriber, || {
+                unsettled("ECHO", settlement, closed)
+            });
+            guard.shutdown().expect("the tracer provider shuts down");
+            assert!(
+                matches!(
+                    error,
+                    MessagingError::Amqp(lapin::Error::InvalidChannelState(ChannelState::Closed))
+                ),
+                "{error:?}"
+            );
+            let text = capture.text();
+            let mut lines = text.lines();
+            let line = lines.next().expect("one JSON line");
+            assert_eq!(lines.next(), None, "{text}");
+            let message = format!(
+                "\"message\":\"request not {settlement}: it stays unsettled, and the broker \
+                 redelivers it once the channel closes\""
+            );
+            for expected in ["\"level\":\"ERROR\"", "\"flow\":\"ECHO\"", &message] {
+                assert!(line.contains(expected), "{expected} missing from {line}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_replied_span_keeps_none_or_the_last_post_ack_location_recorded() {
+        // P-COPAUA0C-035: a failed commit's I003 replaces the I004 logged
+        // before it; with no failure logged the span keeps `none`.
+        let cases: [(&[&'static str], &str); 2] = [(&[], "none"), (&["I004", "I003"], "I003")];
+        for (logged, expected) in cases {
+            let capture = Capture::default();
+            let sink = capture.clone();
+            let (subscriber, guard) =
+                carddemo_runtime::telemetry::subscriber_with_writer("mq", "info", move || {
+                    sink.clone()
+                })
+                .expect("valid directives");
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("message", location = tracing::field::Empty);
+                span.record("location", NO_LOCATION);
+                let _entered = span.enter();
+                for &location in logged {
+                    record_location(location);
+                }
+                tracing::info!("post-acknowledgement work ended");
+            });
+            guard.shutdown().expect("the tracer provider shuts down");
+            let text = capture.text();
+            let field = format!("\"location\":\"{expected}\"");
+            let event = text
+                .lines()
+                .find(|line| line.contains("post-acknowledgement work ended"))
+                .expect("one event line");
+            assert!(event.contains(&field), "{field} missing from {event}");
+            let span = text
+                .lines()
+                .find(|line| line.contains("\"type\":\"span\""))
+                .expect("one span line");
+            let attributes = span
+                .split_once("\"attributes\":")
+                .expect("span attributes")
+                .1;
+            assert!(attributes.contains(&field), "{field} missing from {span}");
+            assert_eq!(
+                attributes.matches("\"location\"").count(),
+                1,
+                "one location attribute in {span}"
+            );
+        }
+    }
+
     #[test]
     fn flow_values_and_the_consumer_future_are_send() {
-        // Type-checked for every `F: Flow`, so `run` stays spawnable on tokio's
-        // multi-threaded runtime whatever the flow.
+        // Type-checked for every `F: Flow`, so `run` and `run_until` stay
+        // spawnable on tokio's multi-threaded runtime whatever the flow.
         fn run_is_send<F: Flow>(channel: Channel, flow: F) {
             assert_send(&run(channel, "QUEUE", flow));
+        }
+        fn run_until_is_send<F: Flow>(channel: Channel, flow: F, stop: AbortRegistration) {
+            assert_send(&run_until(channel, "QUEUE", flow, stop));
         }
 
         let req = Request::from_parts(b"x".to_vec(), &BasicProperties::default());
@@ -678,6 +1046,8 @@ mod tests {
         assert_send(&EchoFlow.handle(&req));
         let check: fn(Channel, EchoFlow) = run_is_send::<EchoFlow>;
         assert_send(&check);
+        let check_until: fn(Channel, EchoFlow, AbortRegistration) = run_until_is_send::<EchoFlow>;
+        assert_send(&check_until);
     }
 
     #[tokio::test]

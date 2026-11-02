@@ -37,7 +37,8 @@ carddemo-testkit = { path = "crates/testkit" }
 axum = "~0.8.9"
 futures-util = "0.3.34"
 # `net` provides the TcpListener that axum::serve binds.
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
+# `signal` provides the SIGINT/SIGTERM streams the api drains on before it stops.
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 tower = "~0.5.3"
 tower-http = { version = "~0.6.11", features = ["trace", "cors"] }
 

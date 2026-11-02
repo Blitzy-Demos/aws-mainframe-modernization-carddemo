@@ -124,10 +124,10 @@ function isPositiveAuthId(value: string): boolean {
 
 /**
  * COPAUS1C PROCESS-ENTER-KEY — V-COPAUS1C-001: the selected authorization,
- * the `auth_id` a summary row carries. The OpenAPI path parameter declares no
- * pattern, so the edit mirrors the server's parse: a missing, blank or
- * malformed key, or one that is not a positive integer, is the COBOL path
- * with no selected key and no message.
+ * the `auth_id` a summary row carries. The edit mirrors the server's parse,
+ * whose OpenAPI path `pattern` admits the same keys: a missing, blank or
+ * malformed key, or one that is not a positive integer up to `i64::MAX`, is
+ * the COBOL path with no selected key and no message.
  */
 export const authDetailKeySchema = z.object({
   auth_id: z

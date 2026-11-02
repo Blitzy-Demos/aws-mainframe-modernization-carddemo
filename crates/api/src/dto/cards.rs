@@ -28,6 +28,7 @@
 use std::fmt;
 
 use carddemo_domain::entities::Card;
+use carddemo_domain::error::ErrorKind;
 use carddemo_domain::numeric::CardNumber;
 use carddemo_domain::ports::Direction;
 use carddemo_domain::rules::{VersionToken, card_list, card_update, card_view};
@@ -42,6 +43,11 @@ use crate::error::ApiError;
 /// records no over-length row for `COCRDLIC`, `COCRDSLC` or `COCRDUPC` and no
 /// COBOL text exists for an input the map field cannot hold.
 const OVER_LENGTH_MESSAGE: &str = "";
+
+/// The `message` of a `GET /cards` `start_key` holding a NUL character:
+/// empty, because the cursor is a REST input with no COBOL text and the
+/// validation audit records no row for it.
+const MALFORMED_START_KEY_MESSAGE: &str = "";
 
 /// `CARDSIDI PIC X(16)` [app/cpy-bms/COCRDUP.CPY:L66], the bound of the
 /// `{id}` path segment of `PUT /cards/{id}`.
@@ -254,20 +260,34 @@ impl CardListQuery {
     /// first- and last-card keys of the COMMAREA makes it: padded with spaces
     /// and cut after 16 characters. The keys a page returns are card numbers,
     /// so a key passed back unchanged is never cut.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// 400, kind `Invalid`, with an empty `message` and no field when
+    /// `start_key` holds a NUL character, so no browse is attempted. The
+    /// browse binds its key as the text of the `CARDDAT` key column, which
+    /// cannot hold NUL (E-07), so the read could only fail; no card number
+    /// holds one, and the keys a page returns never do.
     pub fn into_input(
         self,
         start_key: Option<String>,
         direction: Direction,
         page_size: u16,
-    ) -> card_list::CardListInput {
-        card_list::CardListInput {
+    ) -> Result<card_list::CardListInput, ApiError> {
+        if start_key.as_deref().is_some_and(|key| key.contains('\0')) {
+            return Err(ApiError::no_message(
+                ErrorKind::Invalid,
+                MALFORMED_START_KEY_MESSAGE,
+                Vec::new(),
+            ));
+        }
+        Ok(card_list::CardListInput {
             account_filter: self.account_id,
             card_filter: self.card_number,
             start_key: start_key.map(|key| CardNumber::move_from(&key)),
             direction,
             page_size,
-        }
+        })
     }
 }
 
@@ -567,7 +587,7 @@ mod tests {
     use carddemo_domain::numeric::{AccountId, Alnum, CardNumber, Cvv, NumericError};
     use carddemo_domain::ports::Direction;
     use carddemo_domain::rules::VersionToken;
-    use carddemo_domain::rules::card_list::CardListInput;
+    use carddemo_domain::rules::card_list::{self, CardListInput};
     use carddemo_domain::rules::card_update::{CardUpdateInput, CardUpdated};
     use carddemo_domain::rules::card_view::{CardView, CardViewInput};
     use serde::Serialize;
@@ -863,7 +883,9 @@ mod tests {
                 account_id: Some(" 50".to_owned()),
                 card_number: None,
             };
-            let input = query.into_input(start.map(str::to_owned), direction, rows);
+            let input = query
+                .into_input(start.map(str::to_owned), direction, rows)
+                .expect("a start key without NUL is a browse key");
             assert_eq!(
                 input,
                 CardListInput {
@@ -915,6 +937,33 @@ mod tests {
                 version: token(),
             }
         );
+    }
+
+    #[test]
+    fn into_input_refuses_a_start_key_holding_nul_so_no_browse_is_attempted() {
+        // No card number and no PostgreSQL text holds a NUL, wherever it sits.
+        let keys = [
+            "\0",
+            "\0\0",
+            "\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0",
+            "05000244\x00537657",
+            "0500024453765740\0",
+        ];
+        for key in keys {
+            for direction in [Direction::Forward, Direction::Backward] {
+                let Err(error) = CardListQuery::default().into_input(
+                    Some(key.to_owned()),
+                    direction,
+                    card_list::SCREEN_ROWS,
+                ) else {
+                    panic!("{key:?} yields no rule input, so it never reaches the browse");
+                };
+                assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{key:?}");
+                assert_eq!(error.body().code, ErrorKind::Invalid.code(), "{key:?}");
+                assert_eq!(error.body().message, "", "{key:?}");
+                assert!(error.body().fields.is_empty(), "{key:?}");
+            }
+        }
     }
 
     fn list_query(text: &str) -> CardListQuery {

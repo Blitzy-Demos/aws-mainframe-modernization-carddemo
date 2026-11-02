@@ -45,6 +45,11 @@
 //!   nothing, and a key that names no row comes back as `RowNotFound` or
 //!   `None` on the client side, not as a server error, so the transaction
 //!   stays usable.
+//! - A plain read whose failure the COBOL follows with another read of the
+//!   same unit runs under its own savepoint too, so a server error it meets
+//!   does not abort the transaction for that read: the `COPAUS1C`
+//!   `READ-AUTH-RECORD` summary read, after which the detail read is still
+//!   issued (P-COPAUS1C-014).
 //!
 //! # Whole-transaction rollback
 //!
@@ -200,7 +205,8 @@ impl<'t, 'c> PgStore<'t, 'c> {
     }
 }
 
-/// Opens a savepoint inside `tx`, for exactly one legacy write or locking read.
+/// Opens a savepoint inside `tx`, for exactly one legacy write, locking read,
+/// or read whose failure the rules follow with another statement.
 ///
 /// sqlx issues `SAVEPOINT` rather than `BEGIN` because the connection is
 /// already in a transaction. The savepoint borrows `tx` until [`settle`]

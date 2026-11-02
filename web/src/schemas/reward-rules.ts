@@ -34,6 +34,11 @@ export const REWARD_RULE_MESSAGES = {
   activeToBeforeFrom: "active_to must not precede active_from",
 } as const;
 
+// `RewardRuleRequest.transaction_type_cd`: the OpenAPI pattern, characters from
+// U+0001 to U+00FF only. The server rejects a NUL, which its text column cannot
+// store, and any character outside ISO 8859-1.
+const TYPE_CODE_PATTERN = /^[\x01-\xFF]*$/;
+
 // `RewardRuleRequest.transaction_category_cd`: TRAN-CAT-CD PIC 9(04), 1 to 4
 // digits as the OpenAPI pattern allows.
 const CATEGORY_CODE_PATTERN = /^[0-9]{1,4}$/;
@@ -82,8 +87,8 @@ const omitBlank = (value: string | undefined): string | undefined =>
   value === undefined || value === "" ? undefined : value;
 
 export const rewardRuleSchema = z.object({
-  // TRAN-TYPE-CD PIC X(02): the OpenAPI maxLength, and not blank.
-  transaction_type_cd: z.string().min(1).max(2),
+  // TRAN-TYPE-CD PIC X(02): the OpenAPI maxLength and pattern, and not blank.
+  transaction_type_cd: z.string().min(1).max(2).regex(TYPE_CODE_PATTERN),
   transaction_category_cd: z.string().regex(CATEGORY_CODE_PATTERN),
   reward_rate: rewardRate,
   min_transaction_amount: blankOr(amount).transform(omitBlank),

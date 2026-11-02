@@ -44,13 +44,18 @@ const AMOUNT_SCALE: u32 = 2;
 /// `-?[0-9]+(.[0-9]+)?`.
 const NOT_A_DECIMAL: &str = "value is not a decimal number";
 
+/// The rejection reason of a type code holding `U+0000`, which the
+/// `reward_rules.transaction_type_cd` text column cannot store.
+const HAS_NUL: &str = "value has a NUL character (U+0000)";
+
 /// The body of `POST /admin/reward-rules` and `PUT /admin/reward-rules/{id}`:
 /// one reward rule as the administrator entered it.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RewardRuleRequest {
     /// The transaction type code the rule matches (`TRAN-TYPE-CD PIC X(02)`),
-    /// a fixture type code such as `01` Purchase.
-    #[schema(max_length = 2, example = "01")]
+    /// a fixture type code such as `01` Purchase: at most 2 characters from
+    /// `U+0001` to `U+00FF`, the ISO 8859-1 characters its column stores.
+    #[schema(max_length = 2, pattern = r"^[\x01-\xFF]*$", example = "01")]
     pub transaction_type_cd: String,
     /// The transaction category code the rule matches
     /// (`TRAN-CAT-CD PIC 9(04)`), 1 to 4 digits, such as `0001` Regular Sales
@@ -101,8 +106,8 @@ impl RewardRuleRequest {
     /// field, in declaration order, whose text does not convert. The message
     /// is the field's JSON name, `": "` and the reason:
     ///
-    /// - `transaction_type_cd`: more than 2 characters, or a character above
-    ///   `U+00FF`.
+    /// - `transaction_type_cd`: a NUL character (`U+0000`), checked first;
+    ///   more than 2 characters; or a character above `U+00FF`.
     /// - `transaction_category_cd`: not 1 to 4 ASCII digits.
     /// - `reward_rate`: not `-?[0-9]+(.[0-9]+)?`, or more digits than a
     ///   `Decimal` holds.
@@ -119,10 +124,7 @@ impl RewardRuleRequest {
             active_from,
             active_to,
         } = self;
-        // `from_trimmed`, not the COBOL `MOVE` of `move_from`: a code longer
-        // than the X(02) field is rejected rather than cut to two characters.
-        let transaction_type_cd = TranTypeCode::from_trimmed(&transaction_type_cd)
-            .map_err(|err| rejected("transaction_type_cd", err))?;
+        let transaction_type_cd = type_code("transaction_type_cd", &transaction_type_cd)?;
         let transaction_category_cd = transaction_category_cd
             .parse::<TranCategoryCode>()
             .map_err(|err| rejected("transaction_category_cd", err))?;
@@ -256,6 +258,21 @@ impl BmsField for RewardRuleField {
 /// The 400 rejection of request field `field`, naming it before `reason`.
 fn rejected(field: &str, reason: impl std::fmt::Display) -> ApiError {
     ApiError::rejection(format!("{field}: {reason}"))
+}
+
+/// The transaction type code written as `text` in request field `field`.
+///
+/// A NUL is rejected before the code is built: the code would hold it as byte
+/// `0x00`, which the type's own conversion admits but no `PostgreSQL` text
+/// value can carry, so the insert or update would fail with a 500. The
+/// published pattern `^[\x01-\xFF]*$` excludes it likewise.
+fn type_code(field: &str, text: &str) -> Result<TranTypeCode, ApiError> {
+    if text.contains('\0') {
+        return Err(rejected(field, HAS_NUL));
+    }
+    // `from_trimmed`, not the COBOL `MOVE` of `move_from`: a code longer than
+    // the X(02) field is rejected rather than cut to two characters.
+    TranTypeCode::from_trimmed(text).map_err(|err| rejected(field, err))
 }
 
 /// Whether `text` is `-?[0-9]+(.[0-9]+)?`.
@@ -508,6 +525,9 @@ mod tests {
         let cases = [
             ("transaction_type_cd", json!("012")),
             ("transaction_type_cd", json!("\u{100}")),
+            ("transaction_type_cd", json!("0\u{0}")),
+            ("transaction_type_cd", json!("\u{0}")),
+            ("transaction_type_cd", json!("\u{0}\u{0}")),
             ("transaction_category_cd", json!("")),
             ("transaction_category_cd", json!("12345")),
             ("transaction_category_cd", json!("-1")),
@@ -564,6 +584,11 @@ mod tests {
                 "expected at most 2 characters, got 3",
             ),
             (
+                "transaction_type_cd",
+                json!("0\u{0}"),
+                "value has a NUL character (U+0000)",
+            ),
+            (
                 "transaction_category_cd",
                 json!("x"),
                 "value is not numeric",
@@ -574,6 +599,21 @@ mod tests {
                 rejection(body_with(field, value)).body().message,
                 format!("{field}: {reason}")
             );
+        }
+    }
+
+    #[test]
+    fn type_codes_of_iso_8859_1_characters_but_nul_convert() {
+        for code in ["01", "0", "\u{e9}", "\u{1}", "\u{ff}\u{ff}"] {
+            let draft = request(body_with("transaction_type_cd", json!(code)))
+                .into_draft()
+                .unwrap_or_else(|error| panic!("{code:?}: {}", error.body().message));
+            assert_eq!(
+                draft.transaction_type_cd,
+                TranTypeCode::from_trimmed(code).expect("an X(02) code"),
+                "{code:?}"
+            );
+            assert_eq!(draft.transaction_type_cd.trimmed(), code, "{code:?}");
         }
     }
 
@@ -670,6 +710,10 @@ mod tests {
         );
         let property = |name: &str| schema["properties"][name].clone();
         assert_eq!(property("transaction_type_cd")["maxLength"], json!(2));
+        assert_eq!(
+            property("transaction_type_cd")["pattern"],
+            json!(r"^[\x01-\xFF]*$")
+        );
         assert_eq!(
             property("transaction_category_cd")["pattern"],
             json!("^[0-9]{1,4}$")

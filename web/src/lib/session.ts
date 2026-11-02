@@ -10,11 +10,11 @@
 // that outlives the browser session.
 //
 // Consumers: api/client.ts reads the token for the Authorization header and
-// clears the session on a 401; routes/guards.tsx and the app shell read it
-// through useSession. usr_type and user_id serve navigation and display only.
-// The server takes the acting user from the verified token, so neither value
-// is ever sent as request data, and a 401 or 403 from the server overrides
-// whatever this copy says.
+// clears the session on a 401 to a request that session sent;
+// routes/guards.tsx and the app shell read it through useSession. usr_type and
+// user_id serve navigation and display only. The server takes the acting user
+// from the verified token, so neither value is ever sent as request data, and
+// a 401 or 403 from the server overrides whatever this copy says.
 import { useSyncExternalStore } from "react";
 
 import type { components } from "@/api/schema";

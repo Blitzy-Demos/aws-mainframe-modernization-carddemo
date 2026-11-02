@@ -58,8 +58,8 @@ use tracing::{Instrument, Span};
 use crate::auth::AdminUser;
 use crate::dto::BmsField;
 use crate::dto::admin_users::{
-    UserAddField, UserAddRequest, UserDeleteField, UserListField, UserMessageResponse, UserSummary,
-    UserUpdateField, UserUpdateRequest, check_user_id_key,
+    UserAddField, UserAddRequest, UserDeleteField, UserListField, UserListQuery,
+    UserMessageResponse, UserSummary, UserUpdateField, UserUpdateRequest, check_user_id_key,
 };
 use crate::error::{ApiError, ApiJson, ApiPath, ApiQuery, ErrorBody};
 use crate::pagination::{Page, PageQuery};
@@ -227,9 +227,9 @@ async fn roll_back(uow: UnitOfWork) {
 ///
 /// # Errors
 ///
-/// - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`,
-///   and for a query that does not deserialize (a `page_size` outside 1 to
-///   100, an unknown `direction`).
+/// - 400 `INVALID`, field `USRIDIN`, for a start key longer than `PIC X(8)`
+///   or holding a character outside ASCII, and for a query that does not
+///   deserialize (a `page_size` outside 1 to 100, an unknown `direction`).
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 500 `Unable to lookup User...`, field `USRIDIN`, when the user browse
@@ -238,11 +238,11 @@ async fn roll_back(uow: UnitOfWork) {
     get,
     path = "/admin/users",
     tag = "admin-users",
-    params(PageQuery),
+    params(UserListQuery),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The page of users, with the page-boundary text COUSR00C shows, if any", body = Page<UserSummary>),
-        (status = 400, description = "A start key longer than 8 characters, or a malformed query", body = ErrorBody),
+        (status = 400, description = "A start key longer than 8 characters or not ASCII, or a malformed query", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 500, description = "The user browse failed", body = ErrorBody),
@@ -251,24 +251,25 @@ async fn roll_back(uow: UnitOfWork) {
 pub async fn list_users(
     State(state): State<AppState>,
     admin: AdminUser,
-    ApiQuery(page): ApiQuery<PageQuery>,
+    ApiQuery(query): ApiQuery<UserListQuery>,
 ) -> Result<Json<Page<UserSummary>>, ApiError> {
     let span = list_span(&admin);
-    traced(&span, list(&state, &span, page)).await
+    traced(&span, list(&state, &span, query)).await
 }
 
-/// The CU00 browse: the start-key width check, recorded on `span`, then
+/// The CU00 browse: the start-key width and ASCII check, recorded on `span`,
+/// then
 /// `user_list::list` in a unit of work that is rolled back, since the list
 /// writes nothing.
 async fn list(
     state: &AppState,
     span: &Span,
-    page: PageQuery,
+    query: UserListQuery,
 ) -> Result<(Json<Page<UserSummary>>, &'static str), ApiError> {
-    if let Some(key) = page.start_key.as_deref() {
+    if let Some(key) = query.start_key.as_deref() {
         checked_key(span, START_KEY, key, UserListField::UsrIdIn)?;
     }
-    let (start_key, direction, page_size) = page.resolve(user_list::SCREEN_ROWS);
+    let (start_key, direction, page_size) = PageQuery::from(query).resolve(user_list::SCREEN_ROWS);
     let input = UserListInput {
         start_key,
         direction,
@@ -298,7 +299,8 @@ async fn list(
 ///
 /// - 400 `EMPTY` with the empty-field message of the first blank field
 ///   (`FNAME`, `LNAME`, `USERID`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for a
-///   field longer than its BMS field or a body that does not deserialize.
+///   field longer than its BMS field or holding a character outside ASCII,
+///   or a body that does not deserialize.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 409 `User ID already exist...`, field `USERID` (V-COUSR01C-006).
@@ -312,7 +314,7 @@ async fn list(
     security(("bearer_auth" = [])),
     responses(
         (status = 201, description = "The user was added", body = UserMessageResponse),
-        (status = 400, description = "A blank or over-length field, or a malformed body", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII field, or a malformed body", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 409, description = "The user ID already exists", body = ErrorBody),
@@ -373,7 +375,8 @@ async fn add(
 /// # Errors
 ///
 /// - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
-///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)`.
+///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
+///   character outside ASCII.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN` (V-COUSR02C-002).
@@ -383,11 +386,11 @@ async fn add(
     get,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID`, as stored (case kept)")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user, without its password", body = UserSummary),
-        (status = 400, description = "A blank or over-length user ID", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII user ID", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "No user has the ID", body = ErrorBody),
@@ -440,8 +443,8 @@ async fn fetch(
 ///
 /// - 400 `EMPTY` with the empty-field message of the first blank field
 ///   (`USRIDIN`, `FNAME`, `LNAME`, `PASSWD`, `USRTYPE`), or 400 `INVALID` for
-///   a field or ID longer than its BMS field or a body that does not
-///   deserialize.
+///   a field or ID longer than its BMS field or holding a character outside
+///   ASCII, or a body that does not deserialize.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN`, when the rewrite finds no
@@ -454,12 +457,12 @@ async fn fetch(
     put,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID`, as stored (case kept)")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
     request_body = UserUpdateRequest,
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user was updated, or no field differed and nothing was written", body = UserMessageResponse),
-        (status = 400, description = "A blank or over-length field, or a malformed body", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII field or user ID, or a malformed body", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "The rewrite found no user", body = ErrorBody),
@@ -547,7 +550,8 @@ async fn update(
 /// # Errors
 ///
 /// - 400 `EMPTY` `User ID can NOT be empty...`, field `USRIDIN`, for a blank
-///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)`.
+///   ID, or 400 `INVALID` for an ID longer than `PIC X(8)` or holding a
+///   character outside ASCII.
 /// - 401 without a valid bearer token; 403 for a token that is not an
 ///   administrator's.
 /// - 404 `User ID NOT found...`, field `USRIDIN`, when the delete finds no
@@ -560,11 +564,11 @@ async fn update(
     delete,
     path = "/admin/users/{id}",
     tag = "admin-users",
-    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID`, as stored (case kept)")),
+    params(("id" = String, Path, description = "The user ID, `SEC-USR-ID` `X(08)`, as stored (case kept): at most 8 ASCII characters", max_length = 8, pattern = "^[\\x00-\\x7F]*$")),
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "The user was deleted", body = UserMessageResponse),
-        (status = 400, description = "A blank or over-length user ID", body = ErrorBody),
+        (status = 400, description = "A blank, over-length or non-ASCII user ID", body = ErrorBody),
         (status = 401, description = "No valid bearer token", body = ErrorBody),
         (status = 403, description = "The token is not an administrator's", body = ErrorBody),
         (status = 404, description = "The delete found no user", body = ErrorBody),
@@ -623,9 +627,13 @@ mod tests {
     use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
     use axum::http::StatusCode;
+    use serde_json::{Value, json};
     use tracing::field::{Field, Visit};
     use tracing::span::{Attributes, Id, Record};
     use tracing::{Event, Metadata, Span, Subscriber};
+    use utoipa::IntoParams;
+    use utoipa_axum::router::OpenApiRouter;
+    use utoipa_axum::routes;
 
     use super::{
         CU00, CU01, CU02, CU03, START_KEY, TARGET_USER_ID, checked_key, list_span,
@@ -634,6 +642,84 @@ mod tests {
     use crate::auth::{AdminUser, AuthUser, UserType};
     use crate::dto::admin_users::{UserDeleteField, UserListField, UserUpdateField};
     use crate::error::ApiError;
+    use crate::pagination::PageQuery;
+    use crate::state::AppState;
+
+    /// The ASCII pattern of every user key.
+    const ASCII: &str = "^[\\x00-\\x7F]*$";
+
+    /// The `OpenAPI` document of the five operations, registered as the route
+    /// registry registers them: one `routes!` per path.
+    fn document() -> Value {
+        let (_router, api) = OpenApiRouter::<AppState>::new()
+            .routes(routes!(super::list_users, super::create_user))
+            .routes(routes!(
+                super::get_user,
+                super::update_user,
+                super::delete_user
+            ))
+            .split_for_parts();
+        serde_json::to_value(api).expect("the document serializes")
+    }
+
+    /// The parameters of the operation `method` of `path`.
+    fn parameters<'a>(document: &'a Value, path: &str, method: &str) -> &'a [Value] {
+        document["paths"][path][method]["parameters"]
+            .as_array()
+            .map_or(&[], Vec::as_slice)
+    }
+
+    /// The `name` and `in` of each parameter.
+    fn names(parameters: &[Value]) -> Vec<(&str, &str)> {
+        parameters
+            .iter()
+            .map(|parameter| {
+                (
+                    parameter["name"].as_str().expect("a name"),
+                    parameter["in"].as_str().expect("a location"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_user_key_publishes_the_eight_character_ascii_limit() {
+        let document = document();
+        for method in ["get", "put", "delete"] {
+            let parameters = parameters(&document, "/admin/users/{id}", method);
+            assert_eq!(names(parameters), [("id", "path")], "{method}");
+            let id = &parameters[0];
+            assert_eq!(id["required"], json!(true), "{method}");
+            assert_eq!(id["schema"]["type"], json!("string"), "{method}");
+            assert_eq!(id["schema"]["maxLength"], json!(8), "{method}");
+            assert_eq!(id["schema"]["pattern"], json!(ASCII), "{method}");
+        }
+
+        let list = parameters(&document, "/admin/users", "get");
+        assert_eq!(
+            names(list),
+            [
+                ("start_key", "query"),
+                ("direction", "query"),
+                ("page_size", "query")
+            ]
+        );
+        assert_eq!(list[0]["required"], json!(false));
+        assert_eq!(list[0]["schema"]["type"], json!("string"));
+        assert_eq!(list[0]["schema"]["maxLength"], json!(8));
+        assert_eq!(list[0]["schema"]["pattern"], json!(ASCII));
+        // The shared paging parameters keep the schemas `PageQuery` gives them.
+        let shared = serde_json::to_value(PageQuery::into_params(|| None)).expect("serializes");
+        let shared = &shared.as_array().expect("an array")[1..];
+        for (published, page_query) in list[1..].iter().zip(shared) {
+            assert_eq!(published["name"], page_query["name"]);
+            assert_eq!(published["required"], page_query["required"]);
+            assert_eq!(published["schema"], page_query["schema"], "{published}");
+        }
+        assert!(!Value::from(list.to_vec()).to_string().contains("$ref"));
+
+        assert!(parameters(&document, "/admin/users", "post").is_empty());
+    }
 
     /// Text no valid key holds, so finding it in telemetry means a rejected
     /// key leaked.
@@ -777,14 +863,16 @@ mod tests {
     fn a_user_key_is_recorded_once_checked_and_a_rejected_one_only_by_code_and_length() {
         let overlong = format!("USER0001{MARKER}");
         let overlong_len = overlong.chars().count().to_string();
-        // (key, recorded as the key, rejected with this length): a key of
-        // `PIC X(8)` or less, blank included, is kept as entered; a longer
-        // one, counted in characters, is not.
+        // (key, recorded as the key, rejected with this length): an ASCII
+        // key of `PIC X(8)` or less, blank included, is kept as entered; a
+        // longer one, counted in characters, or one holding a character
+        // outside ASCII, is not.
         let cases = [
             ("USER0001", Some("USER0001"), None),
             ("", Some(""), None),
             (overlong.as_str(), None, Some(overlong_len.as_str())),
             ("ÜSER0001X", None, Some("9")),
+            ("ÜSER0001", None, Some("8")),
         ];
         for site in sites() {
             for (key, recorded, rejected_len) in cases {

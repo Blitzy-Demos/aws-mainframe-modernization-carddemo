@@ -13,11 +13,15 @@
 //! `sub` and `usr_type`, read back by `crate::auth::AuthUser` and
 //! `crate::auth::AdminUser`. This module is the only issuer of that token:
 //! [`login`] issues it once the `COSGN00C` rules have signed the user on, for
-//! the upper-cased user ID and the stored user type, the values `COSGN00C`
-//! moves to `CDEMO-USER-ID` and `CDEMO-USER-TYPE` [app/cbl/COSGN00C.cbl:L224-228].
-//! The `usr_type` and `landing` of the response serve the SPA's navigation
-//! only. Neither operation takes a token, and [`logout`] is stateless: no
-//! server-side session exists, so the SPA discards its token.
+//! the upper-cased user ID and the type the stored user type stands for, from
+//! the values `COSGN00C` moves to `CDEMO-USER-ID` and `CDEMO-USER-TYPE`
+//! [app/cbl/COSGN00C.cbl:L224-228]. The type is the 88-level value `A` or `U`:
+//! a stored code other than exactly `A`, such as a legacy `X` or `a`, takes
+//! the `ELSE` path of `IF CDEMO-USRTYP-ADMIN` [app/cbl/COSGN00C.cbl:L230-240]
+//! and is issued as `U`. The `usr_type` and `landing` of the response carry
+//! the same type and serve the SPA's navigation only. Neither operation takes
+//! a token, and [`logout`] is stateless: no server-side session exists, so the
+//! SPA discards its token.
 //!
 //! # Sign-on sequence
 //!
@@ -49,6 +53,7 @@ use carddemo_domain::messages;
 use carddemo_domain::rules::signon::{self, SignonCheck, SignonOutcome};
 use tracing::{Span, field};
 
+use crate::auth::UserType;
 use crate::dto::auth::{LoginRequest, LoginResponse, MessageResponse};
 use crate::error::{ApiError, ApiJson, ErrorBody};
 use crate::state::AppState;
@@ -170,8 +175,8 @@ async fn sign_on_user(state: &AppState, body: LoginRequest) -> Result<LoginRespo
 
     let outcome = verify(looked_up?).await?;
     let user_id = outcome.user_id.trimmed();
-    let usr_type = outcome.usr_type.trimmed();
-    let issued = state.jwt().issue(&user_id, &usr_type)?;
+    let usr_type = UserType::from_code(&outcome.usr_type.trimmed());
+    let issued = state.jwt().issue(&user_id, usr_type)?;
     Ok(LoginResponse::new(
         issued.token,
         issued.expires_at,

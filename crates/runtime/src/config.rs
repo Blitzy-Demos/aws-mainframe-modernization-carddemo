@@ -31,7 +31,7 @@
 use std::env::VarError;
 use std::fmt;
 use std::net::{AddrParseError, SocketAddr};
-use std::num::ParseIntError;
+use std::num::{NonZeroU64, ParseIntError};
 use std::path::PathBuf;
 
 /// Names of the environment variables [`Settings`] reads.
@@ -131,7 +131,8 @@ pub struct Settings {
     pub http_addr: SocketAddr,
     /// `CARDDEMO_JWT_SECRET`: token signing secret. `Debug` never prints it.
     pub jwt_secret: String,
-    /// `CARDDEMO_JWT_TTL_SECS`: token lifetime in seconds.
+    /// `CARDDEMO_JWT_TTL_SECS`: token lifetime in seconds, a positive
+    /// integer.
     pub jwt_ttl_secs: u64,
     /// `CARDDEMO_QUEUE_DATE_REQUEST`: CDRD request queue.
     pub queue_date_request: String,
@@ -257,8 +258,8 @@ impl Settings {
     /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
     ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
     ///   whitespace-only value.
-    /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not an
-    ///   unsigned integer.
+    /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not a
+    ///   positive integer that fits a `u64`.
     /// - [`ConfigError::InvalidAddress`] when `CARDDEMO_HTTP_ADDR` is not an IP
     ///   socket address such as `0.0.0.0:8080`.
     pub fn from_lookup<F: Fn(&str) -> Option<String>>(lookup: F) -> Result<Self, ConfigError> {
@@ -280,8 +281,8 @@ impl Settings {
     /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
     ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
     ///   whitespace-only value.
-    /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not an
-    ///   unsigned integer.
+    /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not a
+    ///   positive integer that fits a `u64`.
     /// - [`ConfigError::InvalidAddress`] when `CARDDEMO_HTTP_ADDR` is not an IP
     ///   socket address.
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -317,11 +318,16 @@ impl Settings {
             settings.jwt_secret = value;
         }
         if let Some(value) = lookup(keys::JWT_TTL_SECS)? {
-            settings.jwt_ttl_secs = value.parse().map_err(|source| ConfigError::InvalidNumber {
-                key: keys::JWT_TTL_SECS,
-                value,
-                source,
-            })?;
+            // A zero lifetime would issue tokens that are expired when issued,
+            // so the setting's domain is the positive integers.
+            settings.jwt_ttl_secs = value
+                .parse::<NonZeroU64>()
+                .map_err(|source| ConfigError::InvalidNumber {
+                    key: keys::JWT_TTL_SECS,
+                    value,
+                    source,
+                })?
+                .get();
         }
         if let Some(value) = lookup(keys::QUEUE_DATE_REQUEST)? {
             settings.queue_date_request = value;
@@ -402,7 +408,7 @@ fn lookup_non_blank(
 /// blankness, so no error can carry a credential.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
-    /// A numeric setting is not an unsigned integer.
+    /// A numeric setting is not a positive integer that fits a `u64`.
     #[error("invalid value for {key}: {value:?}")]
     InvalidNumber {
         /// Variable name.
@@ -658,23 +664,37 @@ mod tests {
     }
 
     #[test]
-    fn non_numeric_ttl_is_rejected_with_its_key_and_value() {
-        let Err(err) = Settings::from_lookup(lookup_from(&[(keys::JWT_TTL_SECS, "abc")])) else {
-            panic!("\"abc\" was accepted as a token lifetime");
-        };
-        assert!(
-            matches!(
-                &err,
-                ConfigError::InvalidNumber { key, value, .. }
-                    if *key == keys::JWT_TTL_SECS && value == "abc"
-            ),
-            "{err:?}"
-        );
-        assert_eq!(
-            err.to_string(),
-            "invalid value for CARDDEMO_JWT_TTL_SECS: \"abc\""
-        );
-        assert!(err.source().is_some(), "the parse failure is the source");
+    fn ttl_that_is_not_a_positive_integer_is_rejected_with_its_key_and_value() {
+        for ttl in ["abc", "0", "-1", "", " 60", "1.5", "18446744073709551616"] {
+            let Err(err) = Settings::from_lookup(lookup_from(&[(keys::JWT_TTL_SECS, ttl)])) else {
+                panic!("{ttl:?} was accepted as a token lifetime");
+            };
+            assert!(
+                matches!(
+                    &err,
+                    ConfigError::InvalidNumber { key, value, .. }
+                        if *key == keys::JWT_TTL_SECS && value == ttl
+                ),
+                "{ttl:?}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!("invalid value for CARDDEMO_JWT_TTL_SECS: {ttl:?}")
+            );
+            assert!(
+                err.source().is_some(),
+                "{ttl:?}: the parse failure is the source"
+            );
+        }
+    }
+
+    #[test]
+    fn ttl_accepts_positive_integers_up_to_u64_max() -> Result<(), ConfigError> {
+        for (ttl, expected) in [("1", 1), ("3600", 3600), ("18446744073709551615", u64::MAX)] {
+            let settings = Settings::from_lookup(lookup_from(&[(keys::JWT_TTL_SECS, ttl)]))?;
+            assert_eq!(settings.jwt_ttl_secs, expected, "{ttl:?}");
+        }
+        Ok(())
     }
 
     #[test]

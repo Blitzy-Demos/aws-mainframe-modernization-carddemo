@@ -182,12 +182,16 @@ impl Visitor<'_> for PageSizeVisitor {
 /// Handlers extract it with [`ApiQuery<PageQuery>`](crate::error::ApiQuery)
 /// and declare it with `params(PageQuery)` in `#[utoipa::path]`. A list with
 /// filters of its own extracts them as a second query struct, since unknown
-/// parameters are ignored here.
+/// parameters are ignored here. A list whose `start_key` has a grammar to
+/// publish declares the three parameters in a query struct of its own and
+/// converts it into this one, so [`PageQuery::resolve`] applies the same
+/// defaults.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct PageQuery {
     /// The key the page starts at, as the list shows it. Absent for the first
-    /// page forward and the last page backward.
+    /// page forward; what an absent key reads backward is the list's own, as
+    /// its operation states.
     pub start_key: Option<String>,
     /// `forward` (next page, the default) or `backward` (previous page).
     // Inlined: query parameters register no component schema, so a reference

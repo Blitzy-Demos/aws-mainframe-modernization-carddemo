@@ -5,9 +5,9 @@
 //!
 //! | Operation | Program | Request | Response |
 //! |---|---|---|---|
-//! | `GET /authorizations` | `COPAUS0C` | [`AuthSummaryQuery`] with `crate::pagination::PageQuery` | [`AuthSummaryResponse`] |
-//! | `GET /authorizations/{id}` | `COPAUS1C` | the path `auth_id`, through [`parse_auth_id`] | [`AuthDetailResponse`] |
-//! | `PUT /authorizations/{id}` | `COPAUS1C` PF5, `COPAUS2C` | the path `auth_id`; no body, PF5 acts on the record shown | [`FraudToggleResponse`] |
+//! | `GET /authorizations` | `COPAUS0C` | [`AuthSummaryQuery`] with [`AuthSummaryPageQuery`] | [`AuthSummaryResponse`] |
+//! | `GET /authorizations/{id}` | `COPAUS1C` | the path `auth_id` ([`AuthIdPath`]), through [`parse_auth_id`] | [`AuthDetailResponse`] |
+//! | `PUT /authorizations/{id}` | `COPAUS1C` PF5, `COPAUS2C` | the path `auth_id` ([`AuthIdPath`]); no body, PF5 acts on the record shown | [`FraudToggleResponse`] |
 //!
 //! The REST key of a detail is its row identity `auth_id`; the IMS key
 //! `PA-AUTHORIZATION-KEY` stays in the row. Authorizations the CP00 consumer
@@ -20,10 +20,12 @@
 //! programs compute rather than move are computed here: the approval flag
 //! (`A`/`D`) and the decline-reason text.
 
+use std::fmt;
+
 use carddemo_domain::entities::{PendingAuthDetail, PendingAuthSummary};
 use carddemo_domain::error::ErrorKind;
 use carddemo_domain::messages;
-use carddemo_domain::numeric::{AuthCount, AuthId, Money};
+use carddemo_domain::numeric::{AuthCount, AuthId, CardNumber, Money};
 use carddemo_domain::ports::Direction;
 use carddemo_domain::rules::auth_detail::{self, DetailStep, FraudOutcome};
 use carddemo_domain::rules::auth_summary::{AuthSummaryInput, AuthSummaryView};
@@ -34,6 +36,7 @@ use validator::Validate;
 
 use super::{BmsField, bms_errors, id_string, money, reject_invalid, text};
 use crate::error::ApiError;
+use crate::pagination::{PageDirection, PageQuery, PageSize};
 
 /// `WS-AUTH-APRV-STAT` and `AUTHRSPO` of an authorization whose
 /// `PA-AUTH-RESP-CODE` is `00`
@@ -139,19 +142,48 @@ pub fn parse_auth_id(raw: &str) -> Result<AuthId, ApiError> {
     })
 }
 
+/// The path of `GET` and `PUT /authorizations/{id}`.
+///
+/// COPAUS1C PROCESS-ENTER-KEY — V-COPAUS1C-001 (E-49): the published pattern
+/// admits exactly the text [`parse_auth_id`] reads as an `i64` and
+/// `rules::auth_detail` then accepts as a positive identity. Any other text
+/// is the COBOL path with no selected key: 400 with no message on `CARDNUM`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, IntoParams)]
+#[into_params(parameter_in = Path)]
+pub struct AuthIdPath {
+    /// The authorization's `auth_id`, as a summary page lists it: a positive
+    /// integer up to 9223372036854775807, with an optional `+` and leading
+    /// zeros.
+    // `i64::from_str` text above zero: the 1- to 18-digit values, then each
+    // 19-digit value up to `i64::MAX`, digit by digit.
+    #[param(pattern = "^[+]?0*(?:[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|\
+                       92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|\
+                       92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|\
+                       922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|\
+                       92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|\
+                       9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|\
+                       922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|\
+                       922337203685477580[0-7])$")]
+    pub id: String,
+}
+
 /// The filter of `GET /authorizations`: the account whose authorizations are
 /// listed, the `ACCTID` field of `COPAU0A`.
 ///
-/// The page position is the separate `crate::pagination::PageQuery`, which
-/// the handler extracts beside this struct.
+/// The page position is the separate [`AuthSummaryPageQuery`], which the
+/// handler extracts beside this struct.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, IntoParams, Validate)]
 #[into_params(parameter_in = Query)]
 pub struct AuthSummaryQuery {
     /// The account ID as entered, 11 digits (`ACCTIDI PIC X(11)`). Sent to
     /// the rule unedited, so a blank or non-numeric value is answered with
     /// the `COPAUS0C` message.
+    // The pattern is the class test `ACCTIDI IS NUMERIC` of
+    // `rules::auth_summary::edit_account_id` (V-COPAUS0C-002); a value it
+    // refuses still reaches the rule, which answers a blank one with
+    // `Please enter Acct Id...` (V-COPAUS0C-001).
     #[serde(default)]
-    #[param(max_length = 11)]
+    #[param(max_length = 11, pattern = "^[0-9]{11}$")]
     #[validate(length(max = 11))]
     pub account_id: Option<String>,
 }
@@ -214,6 +246,62 @@ fn parse_start_key(raw: &str) -> Result<AuthId, ApiError> {
             "Failed to deserialize query string: start_key: {error}"
         ))
     })
+}
+
+/// The page position of `GET /authorizations`: `start_key`, `direction` and
+/// `page_size`, the parameters of the shared
+/// [`PageQuery`](crate::pagination::PageQuery), into which the handler
+/// converts it, so [`PageQuery::resolve`] applies the same defaults.
+///
+/// COPAUS0C PROCESS-PF7-KEY, PROCESS-PF8-KEY — P-COPAUS0C-010 to
+/// P-COPAUS0C-012: the list declares its own query so that `start_key`
+/// publishes the grammar of the text [`AuthSummaryQuery::into_input`]
+/// accepts, a decimal `i64`; the other lists' keys have grammars of their
+/// own. `direction` and `page_size` are published as the shared query
+/// publishes them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AuthSummaryPageQuery {
+    /// The `auth_id` the page continues from, a previous page's `next_key` or
+    /// `prev_key`: forward (PF8) the last authorization shown, which the page
+    /// skips; backward (PF7) the first one shown, before which the page ends.
+    /// Absent, the page is the first one, the newest authorizations, forward
+    /// (ENTER), and the last one, the oldest, backward. A decimal integer
+    /// from -9223372036854775808 to 9223372036854775807, with an optional
+    /// sign and leading zeros.
+    // `i64::from_str` text: zero, the 1- to 18-digit values, each 19-digit
+    // value up to `i64::MAX` digit by digit, all signed either way, and
+    // `i64::MIN`.
+    #[param(
+        pattern = "^(?:[+-]?0*(?:0|[1-9][0-9]{0,17}|[1-8][0-9]{18}|9[01][0-9]{17}|\
+                   92[01][0-9]{16}|922[0-2][0-9]{15}|9223[0-2][0-9]{14}|\
+                   92233[0-6][0-9]{13}|922337[01][0-9]{12}|92233720[0-2][0-9]{10}|\
+                   922337203[0-5][0-9]{9}|9223372036[0-7][0-9]{8}|\
+                   92233720368[0-4][0-9]{7}|922337203685[0-3][0-9]{6}|\
+                   9223372036854[0-6][0-9]{5}|92233720368547[0-6][0-9]{4}|\
+                   922337203685477[0-4][0-9]{3}|9223372036854775[0-7][0-9]{2}|\
+                   922337203685477580[0-7])|-0*9223372036854775808)$"
+    )]
+    pub start_key: Option<String>,
+    /// `forward` (next page, the default) or `backward` (previous page).
+    // Inlined: query parameters register no component schema, so a reference
+    // to `PageDirection` would dangle in the OpenAPI document.
+    #[param(inline)]
+    pub direction: Option<PageDirection>,
+    /// Rows on the page, from 1 to 100. Defaults to the 5 rows of the
+    /// `COPAU00` list.
+    #[param(value_type = Option<u16>, minimum = 1, maximum = 100)]
+    pub page_size: Option<PageSize>,
+}
+
+impl From<AuthSummaryPageQuery> for PageQuery {
+    fn from(query: AuthSummaryPageQuery) -> Self {
+        Self {
+            start_key: query.start_key,
+            direction: query.direction,
+            page_size: query.page_size,
+        }
+    }
 }
 
 /// `WS-AUTH-APRV-STAT`: `A` when `PA-AUTH-RESP-CODE = '00'`, else `D`.
@@ -394,7 +482,7 @@ impl AuthSummaryResponse {
 /// `POPULATE-AUTH-DETAILS` shows it
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L290-357]
 /// (P-COPAUS1C-005).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+#[derive(Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct AuthDetailResponse {
     /// The row identity, the `{id}` of this resource.
     pub auth_id: String,
@@ -519,6 +607,43 @@ impl AuthDetailResponse {
     }
 }
 
+/// The card number is shown masked, as `CardNumber`'s `Debug` shows it, so
+/// diagnostics never carry a full card number.
+impl fmt::Debug for AuthDetailResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AuthDetailResponse")
+            .field("auth_id", &self.auth_id)
+            .field("account_id", &self.account_id)
+            .field("card_number", &CardNumber::move_from(&self.card_number))
+            .field("pa_auth_orig_date", &self.pa_auth_orig_date)
+            .field("pa_auth_orig_time", &self.pa_auth_orig_time)
+            .field("approved", &self.approved)
+            .field("pa_auth_resp_code", &self.pa_auth_resp_code)
+            .field("pa_auth_resp_reason", &self.pa_auth_resp_reason)
+            .field("decline_reason", &self.decline_reason)
+            .field("pa_processing_code", &self.pa_processing_code)
+            .field("pa_approved_amt", &self.pa_approved_amt)
+            .field("pa_pos_entry_mode", &self.pa_pos_entry_mode)
+            .field("pa_message_source", &self.pa_message_source)
+            .field("pa_merchant_catagory_code", &self.pa_merchant_catagory_code)
+            .field("pa_card_expiry_date", &self.pa_card_expiry_date)
+            .field("pa_auth_type", &self.pa_auth_type)
+            .field("pa_transaction_id", &self.pa_transaction_id)
+            .field("pa_match_status", &self.pa_match_status)
+            .field("pa_auth_fraud", &self.pa_auth_fraud)
+            .field("pa_fraud_rpt_date", &self.pa_fraud_rpt_date)
+            .field("pa_merchant_name", &self.pa_merchant_name)
+            .field("pa_merchant_id", &self.pa_merchant_id)
+            .field("pa_merchant_city", &self.pa_merchant_city)
+            .field("pa_merchant_state", &self.pa_merchant_state)
+            .field("pa_merchant_zip", &self.pa_merchant_zip)
+            .field("next_id", &self.next_id)
+            .field("message", &self.message)
+            .finish()
+    }
+}
+
 /// The answer to PF5: the detail as `UPDATE-AUTH-DETAILS` replaced it and
 /// the text `MARK-AUTH-FRAUD` shows
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L230-266]
@@ -563,13 +688,56 @@ mod tests {
     use utoipa::{IntoParams, PartialSchema};
 
     use super::{
-        AuthDetailField, AuthDetailResponse, AuthSummaryField, AuthSummaryItem, AuthSummaryQuery,
-        AuthSummaryResponse, FraudToggleResponse, parse_auth_id,
+        AuthDetailField, AuthDetailResponse, AuthIdPath, AuthSummaryField, AuthSummaryItem,
+        AuthSummaryPageQuery, AuthSummaryQuery, AuthSummaryResponse, FraudToggleResponse,
+        parse_auth_id,
     };
     use crate::dto::BmsField;
     use crate::error::ApiError;
+    use crate::pagination::PageQuery;
 
     const CARD: &str = "4111000000000001";
+
+    /// The alternatives that together match the decimal values with as many
+    /// digits as `max`, from the lowest such value to `max`: for each digit of
+    /// `max`, the digits before it, a lower digit in its place (at most that
+    /// digit in the last place), and any digits after it.
+    fn same_width_up_to(max: &str) -> Vec<String> {
+        let digits = max.as_bytes();
+        let last = digits.len() - 1;
+        let mut alternatives = Vec::new();
+        for (place, &digit) in digits.iter().enumerate() {
+            let low = if place == 0 { b'1' } else { b'0' };
+            let high = if place == last { digit } else { digit - 1 };
+            if high < low {
+                continue;
+            }
+            let class = match high - low {
+                0 => char::from(low).to_string(),
+                1 => format!("[{}{}]", char::from(low), char::from(high)),
+                _ => format!("[{}-{}]", char::from(low), char::from(high)),
+            };
+            let rest = last - place;
+            let tail = if rest == 0 {
+                String::new()
+            } else {
+                format!("[0-9]{{{rest}}}")
+            };
+            alternatives.push(format!("{}{class}{tail}", &max[..place]));
+        }
+        alternatives
+    }
+
+    /// The magnitudes from 1 to `i64::MAX` without leading zeros: the values
+    /// of up to 18 digits, then the 19-digit ones up to `i64::MAX`.
+    fn positive_i64_magnitude() -> String {
+        let max = i64::MAX.to_string();
+        let shorter = max.len() - 2;
+        format!(
+            "[1-9][0-9]{{0,{shorter}}}|{}",
+            same_width_up_to(&max).join("|")
+        )
+    }
 
     fn account_id(value: u64) -> AccountId {
         AccountId::new(value).expect("an account number of at most 11 digits")
@@ -951,6 +1119,30 @@ mod tests {
     }
 
     #[test]
+    fn debug_masks_the_card_number_that_json_sends_in_full() {
+        let response = AuthDetailResponse::from_detail(&detail(5, "00"), None, None);
+        let toggle = FraudToggleResponse::from(&FraudOutcome {
+            detail: detail(5, "00"),
+            message: messages::AUTH_MARKED_FRAUD,
+        });
+        let cases = [
+            (
+                format!("{response:?}"),
+                to_json(&response)["card_number"].clone(),
+            ),
+            (
+                format!("{toggle:?}"),
+                to_json(&toggle)["detail"]["card_number"].clone(),
+            ),
+        ];
+        for (shown, sent) in cases {
+            assert!(!shown.contains(CARD), "{shown}");
+            assert!(shown.contains("************0001"), "{shown}");
+            assert_eq!(sent, CARD);
+        }
+    }
+
+    #[test]
     fn an_account_id_over_eleven_characters_fails_on_acctid() {
         // ACCTIDI PIC X(11); V-COPAUS0C-002
         let rejected = AuthSummaryQuery {
@@ -981,12 +1173,60 @@ mod tests {
     }
 
     #[test]
+    fn the_account_id_pattern_admits_exactly_what_edit_account_id_accepts() {
+        // ACCTIDI IS NUMERIC on X(11): V-COPAUS0C-001, V-COPAUS0C-002.
+        for accepted in ["00000000001", "99999999999", "00000000000"] {
+            let query = AuthSummaryQuery {
+                account_id: Some(accepted.to_owned()),
+            };
+            assert!(query.check().is_ok(), "{accepted:?}");
+            assert!(
+                auth_summary::edit_account_id(Some(accepted)).is_ok(),
+                "{accepted:?}"
+            );
+        }
+        // Outside the pattern: the check or the rule answers 400 on ACCTID.
+        let rejected = [
+            ("", messages::PLEASE_ENTER_ACCT_ID),
+            ("           ", messages::PLEASE_ENTER_ACCT_ID),
+            ("\0\0\0", messages::PLEASE_ENTER_ACCT_ID),
+            ("0000000001", messages::ACCT_ID_MUST_BE_NUMERIC),
+            ("0000000000A", messages::ACCT_ID_MUST_BE_NUMERIC),
+            ("+0000000001", messages::ACCT_ID_MUST_BE_NUMERIC),
+            (" 0000000001", messages::ACCT_ID_MUST_BE_NUMERIC),
+            ("000000000012", messages::ACCT_ID_MUST_BE_NUMERIC),
+        ];
+        for (text, message) in rejected {
+            let query = AuthSummaryQuery {
+                account_id: Some(text.to_owned()),
+            };
+            let error = query
+                .check()
+                .and_then(|()| auth_summary::edit_account_id(Some(text)).map_err(ApiError::from))
+                .expect_err("outside the pattern");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{text:?}");
+            let json = body(&error);
+            assert_eq!(json["message"], message, "{text:?}");
+            assert_eq!(json["fields"][0]["field"], "ACCTID", "{text:?}");
+        }
+    }
+
+    #[test]
     fn into_input_passes_the_account_raw_and_parses_the_start_key() {
-        let cases: [(Option<&str>, Option<i64>); 4] = [
+        // Every form the `start_key` pattern admits: a sign, leading zeros,
+        // and both ends of the i64 range.
+        let cases: [(Option<&str>, Option<i64>); 11] = [
             (None, None),
             (Some("42"), Some(42)),
             (Some("9007199254740993"), Some(9_007_199_254_740_993)),
             (Some("-1"), Some(-1)),
+            (Some("0"), Some(0)),
+            (Some("-0"), Some(0)),
+            (Some("+0042"), Some(42)),
+            (Some("9223372036854775807"), Some(i64::MAX)),
+            (Some("+09223372036854775807"), Some(i64::MAX)),
+            (Some("-9223372036854775808"), Some(i64::MIN)),
+            (Some("-0009223372036854775808"), Some(i64::MIN)),
         ];
         for (start_key, expected) in cases {
             for direction in [Direction::Forward, Direction::Backward] {
@@ -1006,7 +1246,21 @@ mod tests {
 
     #[test]
     fn a_start_key_that_is_not_an_identity_is_a_400() {
-        for start_key in ["abc", "", "1.5", " 1", "99999999999999999999"] {
+        // Each lies outside the `start_key` pattern.
+        let rejected = [
+            "abc",
+            "",
+            "1.5",
+            " 1",
+            "1 ",
+            "+",
+            "-",
+            "+-1",
+            "99999999999999999999",
+            "9223372036854775808",
+            "-9223372036854775809",
+        ];
+        for start_key in rejected {
             let error = AuthSummaryQuery::default()
                 .into_input(Some(start_key.to_owned()), Direction::Forward, 5)
                 .expect_err("not an identity");
@@ -1044,6 +1298,95 @@ mod tests {
         assert_eq!(json[0]["in"], "query");
         assert_eq!(json[0]["required"], false);
         assert_eq!(json[0]["schema"]["maxLength"], 11);
+        assert_eq!(json[0]["schema"]["pattern"], "^[0-9]{11}$");
+    }
+
+    #[test]
+    fn the_path_and_page_parameters_publish_the_identity_grammars() {
+        let magnitude = positive_i64_magnitude();
+        // V-COPAUS1C-001 (E-49): a positive i64, as `parse_auth_id` and the
+        // rule's positive edit take it.
+        let path = to_json(&AuthIdPath::into_params(|| None));
+        assert_eq!(path.as_array().map(Vec::len), Some(1), "{path}");
+        assert_eq!(path[0]["name"], "id");
+        assert_eq!(path[0]["in"], "path");
+        assert_eq!(path[0]["required"], true);
+        assert_eq!(path[0]["schema"]["type"], "string");
+        assert_eq!(
+            path[0]["schema"]["pattern"],
+            format!("^[+]?0*(?:{magnitude})$")
+        );
+        // Leading zeros make the text unbounded, so no maximum length holds.
+        assert!(path[0]["schema"].get("maxLength").is_none(), "{path}");
+
+        // Any i64, as `AuthSummaryQuery::into_input` parses the page key.
+        let page = to_json(&AuthSummaryPageQuery::into_params(|| None));
+        let names: Vec<&str> = page
+            .as_array()
+            .expect("an array")
+            .iter()
+            .map(|param| param["name"].as_str().expect("a name"))
+            .collect();
+        assert_eq!(names, ["start_key", "direction", "page_size"]);
+        let min = i64::MIN.unsigned_abs();
+        assert_eq!(
+            page[0]["schema"]["pattern"],
+            format!("^(?:[+-]?0*(?:0|{magnitude})|-0*{min})$")
+        );
+        // `direction` and `page_size` are the shared query's schemas.
+        let shared = to_json(&PageQuery::into_params(|| None));
+        for (index, param) in page.as_array().expect("an array").iter().enumerate() {
+            assert_eq!(param["in"], "query", "{param}");
+            assert_eq!(param["required"], false, "{param}");
+            if index > 0 {
+                assert_eq!(param["schema"], shared[index]["schema"], "{param}");
+            }
+        }
+        assert!(!page.to_string().contains("$ref"), "{page}");
+    }
+
+    #[test]
+    fn the_page_query_converts_to_the_shared_query_unchanged() {
+        // (query text, start key, direction, rows) after `resolve` with the
+        // five COPAU00 rows.
+        let cases = [
+            ("", None, Direction::Forward, auth_summary::SCREEN_ROWS),
+            (
+                "account_id=00000000001&start_key=3&direction=backward&page_size=1",
+                Some("3"),
+                Direction::Backward,
+                1,
+            ),
+            (
+                "start_key=-0042&page_size=100",
+                Some("-0042"),
+                Direction::Forward,
+                100,
+            ),
+        ];
+        for (text, start_key, direction, rows) in cases {
+            let uri: Uri = format!("/authorizations?{text}")
+                .parse()
+                .expect("a valid URI");
+            let Query(page) = Query::<AuthSummaryPageQuery>::try_from_uri(&uri).expect("parses");
+            let Query(shared) = Query::<PageQuery>::try_from_uri(&uri).expect("parses");
+            let converted = PageQuery::from(page);
+            assert_eq!(converted, shared, "{text}");
+            assert_eq!(
+                converted.resolve(auth_summary::SCREEN_ROWS),
+                (start_key.map(str::to_owned), direction, rows),
+                "{text}"
+            );
+        }
+        // Both refuse the same malformed parameters with the same text.
+        for text in ["page_size=0", "page_size=101", "direction=sideways"] {
+            let uri: Uri = format!("/authorizations?{text}")
+                .parse()
+                .expect("a valid URI");
+            let own = Query::<AuthSummaryPageQuery>::try_from_uri(&uri).expect_err("rejected");
+            let shared = Query::<PageQuery>::try_from_uri(&uri).expect_err("rejected");
+            assert_eq!(own.body_text(), shared.body_text(), "{text}");
+        }
     }
 
     #[test]
@@ -1068,11 +1411,46 @@ mod tests {
         // COPAUS1C PROCESS-ENTER-KEY, V-COPAUS1C-001 (E-49)
         assert_eq!(parse_auth_id("12").expect("an integer"), AuthId::from(12));
         assert_eq!(parse_auth_id("0").expect("an integer"), AuthId::from(0));
+        // Every form the path pattern admits reads as a positive identity,
+        // which the rule's positive edit (`auth_id.get() <= 0`) passes.
+        let admitted = [
+            ("1", 1),
+            ("+1", 1),
+            ("0001", 1),
+            ("+0009", 9),
+            ("999999999999999999", 999_999_999_999_999_999),
+            ("1000000000000000000", 1_000_000_000_000_000_000),
+            ("9223372036854775807", i64::MAX),
+            ("+09223372036854775807", i64::MAX),
+        ];
+        for (raw, expected) in admitted {
+            let id = parse_auth_id(raw).expect("a positive identity");
+            assert_eq!(id, AuthId::from(expected), "{raw:?}");
+            assert!(id.get() > 0, "{raw:?}");
+        }
+        // Outside the pattern and still integers: zero and the negatives,
+        // which the rule refuses before any read with the answer below.
+        for raw in ["0", "+0", "000", "-0", "-1"] {
+            let id = parse_auth_id(raw).expect("an integer");
+            assert!(id.get() <= 0, "{raw:?}");
+        }
         // The rule's answer to a non-positive identity, as the API sends it.
         let rule = body(&ApiError::from(
             DomainError::invalid("").with_field(auth_detail::CARD_NUM_FIELD),
         ));
-        for raw in ["abc", "", "1e3", "12 "] {
+        let not_integers = [
+            "abc",
+            "",
+            "1e3",
+            "12 ",
+            " 12",
+            "1.0",
+            "+",
+            "++1",
+            "9223372036854775808",
+            "10000000000000000000",
+        ];
+        for raw in not_integers {
             let error = parse_auth_id(raw).expect_err("not an integer");
             assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{raw:?}");
             assert_eq!(body(&error), rule, "{raw:?}");

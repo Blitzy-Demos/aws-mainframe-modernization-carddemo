@@ -480,7 +480,7 @@ pub(crate) mod test_support {
     /// The name of every port method, in the order `crate::ports` declares
     /// them: the names [`FakeStore::fail_next`] accepts and
     /// [`FakeStore::calls`] records.
-    pub(crate) const PORT_METHODS: [&str; 52] = [
+    pub(crate) const PORT_METHODS: [&str; 54] = [
         "read_account",
         "read_account_for_update",
         "rewrite_account",
@@ -521,12 +521,14 @@ pub(crate) mod test_support {
         "update_user",
         "delete_user",
         "read_summary",
+        "read_summary_of_detail",
         "insert_summary",
         "update_summary",
         "delete_summary",
         "summaries_after",
         "insert_detail",
         "read_detail",
+        "read_detail_for_update",
         "details_for_account",
         "adjacent_detail",
         "update_detail",
@@ -1217,6 +1219,12 @@ pub(crate) mod test_support {
             found(self.summaries.get(&id))
         }
 
+        async fn read_summary_of_detail(&mut self, id: AuthId) -> PortResult<PendingAuthSummary> {
+            self.enter("read_summary_of_detail").await?;
+            let account = self.details.get(&id).ok_or(PortError::NotFound)?.pa_acct_id;
+            found(self.summaries.get(&account))
+        }
+
         async fn insert_summary(&mut self, summary: PendingAuthSummary) -> PortResult<()> {
             self.enter("insert_summary").await?;
             insert_new(&mut self.summaries, summary.pa_acct_id, summary)
@@ -1265,6 +1273,11 @@ pub(crate) mod test_support {
             found(self.details.get(&id))
         }
 
+        async fn read_detail_for_update(&mut self, id: AuthId) -> PortResult<PendingAuthDetail> {
+            self.enter("read_detail_for_update").await?;
+            found(self.details.get(&id))
+        }
+
         async fn details_for_account(
             &mut self,
             id: AccountId,
@@ -1294,21 +1307,21 @@ pub(crate) mod test_support {
 
         async fn adjacent_detail(
             &mut self,
-            id: AuthId,
+            account: AccountId,
+            auth_date_9c: i32,
+            auth_time_9c: i32,
             direction: Direction,
         ) -> PortResult<Option<PendingAuthDetail>> {
             self.enter("adjacent_detail").await?;
-            let account = self.details.get(&id).ok_or(PortError::NotFound)?.pa_acct_id;
+            let key = (auth_date_9c, auth_time_9c);
+            let twin_of =
+                |detail: &&PendingAuthDetail| (detail.pa_auth_date_9c, detail.pa_auth_time_9c);
             let twins = self.twins(account);
-            let index = twins
-                .iter()
-                .position(|detail| detail.auth_id == id)
-                .ok_or(PortError::NotFound)?;
             let adjacent = match direction {
-                Direction::Forward => twins.get(index + 1),
-                Direction::Backward => index.checked_sub(1).and_then(|before| twins.get(before)),
+                Direction::Forward => twins.into_iter().find(|detail| twin_of(detail) > key),
+                Direction::Backward => twins.into_iter().rev().find(|detail| twin_of(detail) < key),
             };
-            Ok(adjacent.copied().cloned())
+            Ok(adjacent.cloned())
         }
 
         async fn update_detail(&mut self, detail: PendingAuthDetail) -> PortResult<()> {
@@ -2068,6 +2081,11 @@ mod tests {
         let stored = PendingAuthDetail::from_new(first, new_detail(1, 79_798, 900_000_000));
         let all_twins = browse(None, Direction::Forward, 10);
         fails_as_injected!(store, "read_summary", store.read_summary(account_id(1)));
+        fails_as_injected!(
+            store,
+            "read_summary_of_detail",
+            store.read_summary_of_detail(first)
+        );
         fails_as_injected!(store, "insert_summary", store.insert_summary(summary(3)));
         fails_as_injected!(store, "update_summary", store.update_summary(summary(1)));
         fails_as_injected!(store, "delete_summary", store.delete_summary(account_id(2)));
@@ -2080,13 +2098,18 @@ mod tests {
         fails_as_injected!(store, "read_detail", store.read_detail(first));
         fails_as_injected!(
             store,
+            "read_detail_for_update",
+            store.read_detail_for_update(first)
+        );
+        fails_as_injected!(
+            store,
             "details_for_account",
             store.details_for_account(account_id(1), all_twins)
         );
         fails_as_injected!(
             store,
             "adjacent_detail",
-            store.adjacent_detail(first, Direction::Forward)
+            store.adjacent_detail(account_id(1), 79_798, 900_000_000, Direction::Forward)
         );
         fails_as_injected!(store, "update_detail", store.update_detail(stored));
         fails_as_injected!(store, "delete_detail", store.delete_detail(first));
@@ -2626,23 +2649,54 @@ mod tests {
             assert_eq!(auth_ids(&rows), expected, "{page:?}");
         }
 
+        // From the keys of details 2, 1, 2, 3 and 4, a key between details 3
+        // and 1 that no detail holds, and an account with no twins.
         let steps = [
-            (2, Direction::Forward, Some(3)),
-            (1, Direction::Forward, None),
-            (2, Direction::Backward, None),
-            (3, Direction::Backward, Some(2)),
-            (4, Direction::Forward, None),
+            (1, 79_797, 100, Direction::Forward, Some(3)),
+            (1, 79_798, 900_000_000, Direction::Forward, None),
+            (1, 79_797, 100, Direction::Backward, None),
+            (1, 79_798, 800_000_000, Direction::Backward, Some(2)),
+            (2, 79_798, 1, Direction::Forward, None),
+            (1, 79_798, 850_000_000, Direction::Forward, Some(1)),
+            (1, 79_798, 850_000_000, Direction::Backward, Some(3)),
+            (9, 0, 0, Direction::Forward, None),
         ];
-        for (from, direction, expected) in steps {
-            let next = block_on(store.adjacent_detail(id(from), direction)).expect("a twin");
+        for (account, date_9c, time_9c, direction, expected) in steps {
+            let next =
+                block_on(store.adjacent_detail(account_id(account), date_9c, time_9c, direction))
+                    .expect("a twin read");
             assert_eq!(
                 next.map(|detail| detail.auth_id.get()),
                 expected,
-                "{from} {direction:?}"
+                "{account} {date_9c} {time_9c} {direction:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_summary_of_a_detail_is_its_parent_and_the_locking_read_is_the_detail() {
+        let mut store = seeded().with_detail(new_detail(9, 79_798, 1));
         assert_eq!(
-            block_on(store.adjacent_detail(id(99), Direction::Forward)),
+            block_on(store.read_summary_of_detail(AuthId::from(4))),
+            Ok(summary(2))
+        );
+        assert_eq!(
+            block_on(store.read_summary_of_detail(AuthId::from(99))),
+            Err(PortError::NotFound),
+            "no detail has the identity"
+        );
+        assert_eq!(
+            block_on(store.read_summary_of_detail(AuthId::from(5))),
+            Err(PortError::NotFound),
+            "the detail's account has no summary"
+        );
+        let first = block_on(store.read_detail(AuthId::from(1))).expect("a seeded detail");
+        assert_eq!(
+            block_on(store.read_detail_for_update(AuthId::from(1))),
+            Ok(first)
+        );
+        assert_eq!(
+            block_on(store.read_detail_for_update(AuthId::from(99))),
             Err(PortError::NotFound)
         );
     }

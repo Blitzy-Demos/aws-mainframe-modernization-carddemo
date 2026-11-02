@@ -21,7 +21,10 @@
 //! Outside the kinds, a missing, malformed, expired or badly signed bearer
 //! token is 401 with code `UNAUTHENTICATED`, a `usr_type` `U` token on
 //! `/admin/**` is 403 with code `FORBIDDEN`, and a request that does not
-//! deserialize is 400 with code `INVALID`.
+//! deserialize is 400 with code `INVALID`. The router's own failures take the
+//! same body: a path no route serves is 404 with the `NotFound` code
+//! `NOT_FOUND`, and a method a routed path does not serve is 405 with code
+//! `METHOD_NOT_ALLOWED`, beside the `Allow` header axum sets.
 //!
 //! The table is the "Status mapping" of `docs/parity/validation-audit.md`, and
 //! every row's `Status` column follows from the row's kind through it. Where a
@@ -42,7 +45,12 @@
 //! plain-text body. [`ApiJson`], [`ApiQuery`] and [`ApiPath`] wrap them and
 //! answer with the error body instead: status 400, code `INVALID`, and the
 //! rejection's text as `message`. That text describes the malformed input and
-//! holds no server detail. Handlers declare their request body and parameters
+//! holds no server detail. A JSON body that parses but does not fit the
+//! request DTO is the one rejection whose text serde words after a Rust type
+//! (`expected struct LoginRequest`): its `message` keeps the JSON path, the
+//! value received and the line and column, and names the JSON that type
+//! accepts in place of the type (`expected a JSON object`, `expected a JSON
+//! array of 7 elements`). Handlers declare their request body and parameters
 //! explicitly in `#[utoipa::path(request_body = .., params(..))]`, so the
 //! wrappers leave the `OpenAPI` document unchanged.
 //!
@@ -74,6 +82,9 @@ const AUTH_REQUIRED_CODE: &str = "UNAUTHENTICATED";
 /// The `code` of a caller whose token is not an admin's, on `/admin/**`.
 const FORBIDDEN_CODE: &str = "FORBIDDEN";
 
+/// The `code` of a method a routed path does not serve.
+const METHOD_NOT_ALLOWED_CODE: &str = "METHOD_NOT_ALLOWED";
+
 /// One field a failure concerns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ErrorFieldBody {
@@ -101,7 +112,8 @@ impl From<FieldError> for ErrorFieldBody {
 pub struct ErrorBody {
     /// The failure class: an error kind code (`INVALID`, `EMPTY`,
     /// `NOT_FOUND`, `DUPLICATE`, `CONFLICT`, `SIGNON_FAILED`, `UNEXPECTED`),
-    /// `UNAUTHENTICATED` or `FORBIDDEN`.
+    /// `UNAUTHENTICATED`, `FORBIDDEN` or `METHOD_NOT_ALLOWED`. A path no route
+    /// serves is `NOT_FOUND`.
     pub code: String,
     /// The message text, byte-identical to the audited COBOL message or the
     /// request-written text. Empty for a path that sets no message and whose
@@ -166,6 +178,33 @@ impl ApiError {
             StatusCode::FORBIDDEN,
             FORBIDDEN_CODE,
             messages::ADMIN_ACCESS_REQUIRED.to_owned(),
+            Vec::new(),
+        )
+    }
+
+    /// 404 for a path no route serves, with the `NotFound` kind's status and
+    /// code and [`messages::ROUTE_NOT_FOUND`]: the router's fallback answer.
+    /// It names neither the path nor the method requested.
+    #[must_use]
+    pub fn route_not_found() -> Self {
+        Self::new(
+            status_for(ErrorKind::NotFound),
+            ErrorKind::NotFound.code(),
+            messages::ROUTE_NOT_FOUND.to_owned(),
+            Vec::new(),
+        )
+    }
+
+    /// 405 for a method a routed path does not serve, with
+    /// [`messages::METHOD_NOT_ALLOWED`]: the method routers' fallback answer,
+    /// to which axum adds the `Allow` header of the path. It names neither the
+    /// path nor the method requested.
+    #[must_use]
+    pub fn method_not_allowed() -> Self {
+        Self::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            METHOD_NOT_ALLOWED_CODE,
+            messages::METHOD_NOT_ALLOWED.to_owned(),
             Vec::new(),
         )
     }
@@ -265,9 +304,146 @@ impl From<RewardError> for ApiError {
     }
 }
 
+/// The words before the expectation in serde's `invalid type`, `invalid
+/// value` and `invalid length` messages.
+const EXPECTED: &str = ", expected ";
+
+/// The expectations serde's derive writes after a Rust type: the form that
+/// precedes the type's name (`Type`, or `Type::Variant` for a variant), and
+/// the JSON that type accepts, which replaces the whole expectation. The
+/// positional form of a struct, tuple or variant (`… with 7 elements`)
+/// becomes `a JSON array of 7 elements` instead.
+///
+/// An externally tagged enum's `enum Type` is absent: `serde_json` answers
+/// such an enum given neither a string nor an object with the syntax error
+/// `expected value`, so that expectation never reaches a rejection.
+const TYPE_EXPECTATIONS: [(&str, &str); 7] = [
+    ("struct ", "a JSON object"),
+    ("struct variant ", "a JSON object"),
+    ("tuple struct ", "a JSON array"),
+    ("tuple variant ", "a JSON array"),
+    ("unit struct ", "null"),
+    (
+        "internally tagged enum ",
+        "a JSON object with a variant tag",
+    ),
+    (
+        "adjacently tagged enum ",
+        "a JSON object with a variant tag and content",
+    ),
+];
+
+/// The whole messages serde writes around a Rust type's name: the text
+/// before and after the name, and the message that replaces them.
+const TYPE_MESSAGES: [(&str, &str, &str); 2] = [
+    (
+        "data did not match any variant of untagged enum ",
+        "",
+        "data did not match any variant",
+    ),
+    (
+        "no variant of enum ",
+        " found in flattened data",
+        "no variant found in flattened data",
+    ),
+];
+
+/// The text of a JSON body that parses but does not fit the request DTO,
+/// with the Rust type name serde put in it replaced by the JSON that type
+/// accepts.
+///
+/// axum writes the text as `<preamble>: [<JSON path>: ]<serde message> at
+/// line L column C`. Everything but a type name at the end of the serde
+/// message is kept: the JSON path of wire names, the value received, wire
+/// field and variant names and the position. A message that names no type,
+/// such as `expected a string` or a rule's own text, is kept whole.
+fn public_data_error(text: &str) -> String {
+    let (message, position) = split_position(text);
+    let public = public_message(message)
+        .or_else(|| {
+            let (head, expected) = message.rsplit_once(EXPECTED)?;
+            public_expectation(expected).map(|json| format!("{head}{EXPECTED}{json}"))
+        })
+        .unwrap_or_else(|| message.to_owned());
+    format!("{public}{position}")
+}
+
+/// `text` split before the ` at line L column C` that ends a located
+/// `serde_json` error, or whole with an empty position.
+fn split_position(text: &str) -> (&str, &str) {
+    text.rsplit_once(" at line ")
+        .filter(|(_, location)| {
+            location
+                .split_once(" column ")
+                .is_some_and(|(line, column)| is_digits(line) && is_digits(column))
+        })
+        .map_or((text, ""), |(message, _)| text.split_at(message.len()))
+}
+
+/// `message` with a [`TYPE_MESSAGES`] form at its end replaced, if it ends
+/// with one around a type name.
+fn public_message(message: &str) -> Option<String> {
+    TYPE_MESSAGES.iter().find_map(|&(before, after, public)| {
+        let (head, rest) = message.rsplit_once(before)?;
+        let name = rest.strip_suffix(after)?;
+        is_type_name(name).then(|| format!("{head}{public}"))
+    })
+}
+
+/// The JSON a [`TYPE_EXPECTATIONS`] expectation stands for, or `None` for an
+/// expectation that names no type.
+fn public_expectation(expected: &str) -> Option<String> {
+    let (named, elements) = expected
+        .rsplit_once(" with ")
+        .filter(|&(_, count)| {
+            count == "1 element" || count.strip_suffix(" elements").is_some_and(is_digits)
+        })
+        .map_or((expected, None), |(named, count)| (named, Some(count)));
+    TYPE_EXPECTATIONS.iter().find_map(|&(form, json)| {
+        let name = named.strip_prefix(form)?;
+        is_type_name(name).then(|| {
+            elements.map_or_else(
+                || json.to_owned(),
+                |count| format!("a JSON array of {count}"),
+            )
+        })
+    })
+}
+
+/// Whether `text` is one or more ASCII digits.
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// Whether `name` is a type name as serde's derive writes it: a Rust
+/// identifier, or `Type::Variant`.
+fn is_type_name(name: &str) -> bool {
+    name.split_once("::").map_or_else(
+        || is_identifier(name),
+        |(type_name, variant)| is_identifier(type_name) && is_identifier(variant),
+    )
+}
+
+/// Whether `text` is a Rust identifier, raw (`r#type`) or not.
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.strip_prefix("r#").unwrap_or(text).chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_alphabetic())
+        && chars.all(|next| next == '_' || next.is_alphanumeric())
+}
+
 impl From<JsonRejection> for ApiError {
     fn from(rejection: JsonRejection) -> Self {
-        Self::rejection(rejection.body_text())
+        let text = rejection.body_text();
+        // Only a body that parses but does not fit the DTO is worded after a
+        // Rust type. A syntax error, a missing JSON content type and a body
+        // that cannot be read are described without one.
+        if matches!(rejection, JsonRejection::JsonDataError(_)) {
+            Self::rejection(public_data_error(&text))
+        } else {
+            Self::rejection(text)
+        }
     }
 }
 
@@ -516,6 +692,18 @@ mod tests {
                 messages::ADMIN_ACCESS_REQUIRED,
             ),
             (
+                ApiError::route_not_found(),
+                StatusCode::NOT_FOUND,
+                "NOT_FOUND",
+                messages::ROUTE_NOT_FOUND,
+            ),
+            (
+                ApiError::method_not_allowed(),
+                StatusCode::METHOD_NOT_ALLOWED,
+                "METHOD_NOT_ALLOWED",
+                messages::METHOD_NOT_ALLOWED,
+            ),
+            (
                 ApiError::unexpected(),
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "UNEXPECTED",
@@ -680,11 +868,15 @@ mod tests {
             assert_eq!(bytes, value.as_bytes(), "{wrapped}");
         }
 
+        // One byte beyond axum's default 2 MiB body limit: a body that cannot
+        // be read.
+        let oversized = " ".repeat(2 * 1024 * 1024 + 1);
         // (method, path after /wrapped or /plain, content type, body)
         let malformed = [
             ("POST", "/json", JSON, r#"{"name":"#),
             ("POST", "/json", JSON, r#"{"name":5}"#),
             ("POST", "/json", None, r#"{"name":"ADMIN001"}"#),
+            ("POST", "/json", JSON, oversized.as_str()),
             ("GET", "/query?other=1", None, ""),
             ("GET", "/path/abc", None, ""),
             ("GET", "/path/99999999999", None, ""),
@@ -709,6 +901,336 @@ mod tests {
                 },
                 "{wrapped}"
             );
+        }
+    }
+
+    /// The text axum puts before the description of a JSON body that does not
+    /// fit its type.
+    const DATA_ERROR: &str = "Failed to deserialize the JSON body into the target type: ";
+
+    /// Answers 204 to a body that deserializes as `T`.
+    async fn accept<T>(ApiJson(_): ApiJson<T>) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    /// One request DTO a handler extracts with [`ApiJson`], behind a probe
+    /// route.
+    struct DtoRoute {
+        /// The probe route's path.
+        path: &'static str,
+        /// `POST`, extracting the DTO through [`ApiJson`].
+        handler: axum::routing::MethodRouter,
+        /// The DTO's Rust type name, which no rejection may show.
+        type_name: &'static str,
+        /// One of the DTO's string fields.
+        field: &'static str,
+    }
+
+    impl DtoRoute {
+        fn new<T>(path: &'static str, field: &'static str) -> Self
+        where
+            T: serde::de::DeserializeOwned + Send + 'static,
+        {
+            let type_name = std::any::type_name::<T>();
+            Self {
+                path,
+                handler: post(accept::<T>),
+                type_name: type_name.rsplit("::").next().unwrap_or(type_name),
+                field,
+            }
+        }
+    }
+
+    /// Every request DTO the handlers extract with [`ApiJson`].
+    fn dto_routes() -> [DtoRoute; 10] {
+        use crate::dto::{
+            accounts, admin_reward_rules, admin_transaction_types, admin_users, auth, cards,
+            payments, transactions,
+        };
+        [
+            DtoRoute::new::<auth::LoginRequest>("/auth/login", "user_id"),
+            DtoRoute::new::<accounts::AccountUpdateRequest>("/accounts", "acct_active_status"),
+            DtoRoute::new::<cards::CardUpdateRequest>("/cards", "embossed_name"),
+            DtoRoute::new::<transactions::TransactionAddRequest>("/transactions", "tran_amt"),
+            DtoRoute::new::<payments::PaymentRequest>("/payments", "account_id"),
+            DtoRoute::new::<admin_users::UserAddRequest>("/admin/users", "user_id"),
+            DtoRoute::new::<admin_users::UserUpdateRequest>("/admin/users/update", "usr_type"),
+            DtoRoute::new::<admin_transaction_types::TranTypeCreateRequest>(
+                "/admin/transaction-types",
+                "type_code",
+            ),
+            DtoRoute::new::<admin_transaction_types::TranTypeUpdateRequest>(
+                "/admin/transaction-types/update",
+                "description",
+            ),
+            DtoRoute::new::<admin_reward_rules::RewardRuleRequest>(
+                "/admin/reward-rules",
+                "reward_rate",
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn bodies_that_do_not_fit_a_request_dto_answer_without_its_type_name() {
+        const JSON: Option<&str> = Some("application/json");
+        let dtos = dto_routes();
+        let type_names: Vec<&str> = dtos.iter().map(|dto| dto.type_name).collect();
+        let router = dtos.iter().fold(Router::new(), |router, dto| {
+            router.route(dto.path, dto.handler.clone())
+        });
+        for dto in &dtos {
+            let (path, field) = (dto.path, dto.field);
+            // `{"<field>":` ends at column field.len() + 4: a map value is
+            // reported there, a number once it is read.
+            let (map_column, number_column) = (field.len() + 4, field.len() + 5);
+            // (body, description after the preamble)
+            let mut cases = vec![
+                (
+                    "1".to_owned(),
+                    "invalid type: integer `1`, expected a JSON object at line 1 column 1"
+                        .to_owned(),
+                ),
+                (
+                    r#""x""#.to_owned(),
+                    r#"invalid type: string "x", expected a JSON object at line 1 column 3"#
+                        .to_owned(),
+                ),
+                (
+                    "true".to_owned(),
+                    "invalid type: boolean `true`, expected a JSON object at line 1 column 4"
+                        .to_owned(),
+                ),
+                (
+                    "null".to_owned(),
+                    "invalid type: null, expected a JSON object at line 1 column 4".to_owned(),
+                ),
+                (
+                    "[1]".to_owned(),
+                    "[0]: invalid type: integer `1`, expected a string at line 1 column 2"
+                        .to_owned(),
+                ),
+                (
+                    format!(r#"{{"{field}":{{}}}}"#),
+                    format!(
+                        "{field}: invalid type: map, expected a string at line 1 column {map_column}"
+                    ),
+                ),
+                (
+                    format!(r#"{{"{field}":5}}"#),
+                    format!(
+                        "{field}: invalid type: integer `5`, expected a string \
+                         at line 1 column {number_column}"
+                    ),
+                ),
+            ];
+            // Only the reward rule has fields without a default, so only it
+            // refuses an empty array or object.
+            if dto.type_name == "RewardRuleRequest" {
+                cases.push((
+                    "[]".to_owned(),
+                    "invalid length 0, expected a JSON array of 7 elements at line 1 column 2"
+                        .to_owned(),
+                ));
+                cases.push((
+                    "{}".to_owned(),
+                    "missing field `transaction_type_cd` at line 1 column 2".to_owned(),
+                ));
+            }
+            for (body, description) in cases {
+                let response = router
+                    .clone()
+                    .oneshot(request("POST", path, JSON, &body))
+                    .await
+                    .expect("the router is infallible");
+                let (status, content_type, bytes) = read_body(response).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}");
+                assert_eq!(content_type.as_deref(), JSON, "{path} {body}");
+                let error = serde_json::from_slice::<ErrorBody>(&bytes).expect("an error body");
+                for type_name in &type_names {
+                    assert!(
+                        !error.message.contains(type_name),
+                        "{path} {body}: {}",
+                        error.message
+                    );
+                }
+                assert_eq!(
+                    error,
+                    ErrorBody {
+                        code: ErrorKind::Invalid.code().to_owned(),
+                        message: format!("{DATA_ERROR}{description}"),
+                        fields: Vec::new(),
+                    },
+                    "{path} {body}"
+                );
+            }
+        }
+    }
+
+    /// A unit struct, which serde words `unit struct Marker`.
+    #[derive(Deserialize)]
+    struct Marker;
+
+    /// A tuple struct, which serde words `tuple struct Pair`.
+    #[derive(Deserialize)]
+    struct Pair((), ());
+
+    /// An externally tagged enum with a tuple and a struct variant.
+    #[derive(Deserialize)]
+    enum Shape {
+        Line((), ()),
+        Square { _side: () },
+    }
+
+    /// An internally tagged enum.
+    #[derive(Deserialize)]
+    #[serde(tag = "kind")]
+    enum Tagged {
+        Dot,
+    }
+
+    /// An adjacently tagged enum.
+    #[derive(Deserialize)]
+    #[serde(tag = "kind", content = "data")]
+    enum Adjacent {
+        Dot,
+    }
+
+    /// An untagged enum.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Untagged {
+        Dot,
+    }
+
+    /// A struct with a flattened enum.
+    #[derive(Deserialize)]
+    struct Flattened {
+        #[serde(flatten)]
+        _shape: Shape,
+    }
+
+    /// The text axum gives `body` as a `T`, and the error [`ApiJson`]
+    /// answers it with.
+    fn reject<T: serde::de::DeserializeOwned>(body: &str) -> (String, ApiError) {
+        let Err(rejection) = Json::<T>::from_bytes(body.as_bytes()) else {
+            panic!("{body} deserializes");
+        };
+        (rejection.body_text(), ApiError::from(rejection))
+    }
+
+    /// [`reject`] for one of the types above.
+    type Reject = fn(&str) -> (String, ApiError);
+
+    /// The Rust names of the types above, which no rejection may show.
+    const TYPE_NAMES: [&str; 7] = [
+        "Marker",
+        "Pair",
+        "Shape",
+        "Tagged",
+        "Adjacent",
+        "Untagged",
+        "Flattened",
+    ];
+
+    #[test]
+    fn data_errors_word_each_derived_type_as_the_json_it_accepts() {
+        // (type, body, serde's wording, the wording answered)
+        let cases: [(Reject, &str, &str, &str); 12] = [
+            (
+                reject::<Marker>,
+                "1",
+                "expected unit struct Marker",
+                "expected null",
+            ),
+            (
+                reject::<Pair>,
+                "1",
+                "expected tuple struct Pair",
+                "expected a JSON array",
+            ),
+            (
+                reject::<Pair>,
+                "[null]",
+                "expected tuple struct Pair with 2 elements",
+                "expected a JSON array of 2 elements",
+            ),
+            (
+                reject::<Shape>,
+                r#"{"Line":1}"#,
+                "Line: invalid type: integer `1`, expected tuple variant Shape::Line",
+                "Line: invalid type: integer `1`, expected a JSON array",
+            ),
+            (
+                reject::<Shape>,
+                r#"{"Line":[]}"#,
+                "expected tuple variant Shape::Line with 2 elements",
+                "expected a JSON array of 2 elements",
+            ),
+            (
+                reject::<Shape>,
+                r#"{"Square":1}"#,
+                "expected struct variant Shape::Square",
+                "expected a JSON object",
+            ),
+            (
+                reject::<Shape>,
+                r#"{"Square":[]}"#,
+                "expected struct variant Shape::Square with 1 element",
+                "expected a JSON array of 1 element",
+            ),
+            // The syntax error that stands for `enum Shape`, kept whole.
+            (
+                reject::<Shape>,
+                "1",
+                "expected value at line 1 column 1",
+                "expected value at line 1 column 1",
+            ),
+            (
+                reject::<Tagged>,
+                "1",
+                "expected internally tagged enum Tagged",
+                "expected a JSON object with a variant tag",
+            ),
+            (
+                reject::<Adjacent>,
+                "1",
+                "expected adjacently tagged enum Adjacent",
+                "expected a JSON object with a variant tag and content",
+            ),
+            // Written once the body is buffered, so without a position.
+            (
+                reject::<Untagged>,
+                "1",
+                "data did not match any variant of untagged enum Untagged",
+                "data did not match any variant",
+            ),
+            (
+                reject::<Flattened>,
+                "{}",
+                "no variant of enum Shape found in flattened data",
+                "no variant found in flattened data",
+            ),
+        ];
+        for (reject, body, serde_wording, answered) in cases {
+            let (text, error) = reject(body);
+            assert!(text.contains(serde_wording), "{body}: {text}");
+            assert_eq!(error.status(), StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(
+                error.body(),
+                &ErrorBody {
+                    code: ErrorKind::Invalid.code().to_owned(),
+                    message: text.replacen(serde_wording, answered, 1),
+                    fields: Vec::new(),
+                },
+                "{body}"
+            );
+            for type_name in TYPE_NAMES {
+                assert!(
+                    !error.body().message.contains(type_name),
+                    "{body}: {}",
+                    error.body().message
+                );
+            }
         }
     }
 }

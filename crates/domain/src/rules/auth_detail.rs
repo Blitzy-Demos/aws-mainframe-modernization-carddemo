@@ -9,16 +9,42 @@
 //!
 //! - ENTER, [`detail`]: `PROCESS-ENTER-KEY` and `READ-AUTH-RECORD`, the
 //!   `GU PAUTSUM0` by account and the `GNP PAUTDTL1` by the selected key
-//!   (P-COPAUS1C-003, P-COPAUS1C-004).
+//!   (P-COPAUS1C-003, P-COPAUS1C-004). The key edit is also [`edit_auth_id`],
+//!   which reads nothing, for an adapter to run before it opens the store.
 //! - PF8, [`next`]: `PROCESS-PF8-KEY` and `READ-NEXT-AUTH-RECORD`, the
 //!   unqualified `GNP` that reaches the next older authorization under the same
-//!   summary (P-COPAUS1C-009, P-COPAUS1C-014).
-//! - PF5, [`toggle_fraud`]: `MARK-AUTH-FRAUD`, the `COPAUS2C` fraud report
+//!   summary, from the detail [`detail`] read (P-COPAUS1C-009, P-COPAUS1C-014).
+//! - PF5, [`detail_for_update`] then [`toggle_fraud`]: `MARK-AUTH-FRAUD`, whose
+//!   `READ-AUTH-RECORD` is the locked read, the `COPAUS2C` fraud report
 //!   ([`fraud_row`], insert or `FRAUD-UPDATE`) and `UPDATE-AUTH-DETAILS`
 //!   (P-COPAUS1C-006 to P-COPAUS1C-008, P-COPAUS2C-001 to P-COPAUS2C-006).
 //! - The reason text `POPULATE-AUTH-DETAILS` shows, [`decline_reason`]
 //!   (P-COPAUS1C-005). Its other moves copy stored fields or cut them by
 //!   reference modification, which the response mapping does.
+//!
+//! # Reads
+//!
+//! `READ-AUTH-RECORD` reads the summary of the account, then the selected
+//! detail under it, for ENTER, PF5 and PF8 alike. The REST key names the
+//! detail, not the account the COMMAREA carried (P-COPAUS1C-012), so the
+//! summary read resolves the detail's account server-side, and a detail of
+//! another account than the summary read is not found under it. The two
+//! reads and their outcomes follow the `EVALUATE` blocks of the paragraph
+//! (P-COPAUS1C-004, P-COPAUS1C-014): see [`detail`].
+//!
+//! PF8 steps from the detail already read, with one lookup of the twin after
+//! its `PAUT9CTS` key; nothing is read twice.
+//!
+//! # The fraud-mark lock
+//!
+//! The PF5 detail read takes a row lock held until the caller commits or rolls
+//! back, and [`toggle_fraud`] accepts only the [`LockedDetail`] that read
+//! returns, so the flag the toggle derives its action from is the one it
+//! replaces. `COPAUS1C` takes no lock of its own, reading and replacing within
+//! one CICS task; the lock is the concurrency safeguard that keeps two
+//! overlapping fraud marks of one authorization from both reading the same
+//! flag and both applying `F`. The marks serialize: the second waits for the
+//! first to end and toggles the flag it committed.
 //!
 //! # Unit of work
 //!
@@ -53,7 +79,8 @@ use crate::error::DomainError;
 use crate::messages::{
     ALREADY_AT_THE_LAST_AUTHORIZATION, AUTH_FRAUD_REMOVED, AUTH_MARKED_FRAUD,
     SYSTEM_ERROR_DB2_CODE, SYSTEM_ERROR_WHILE_FRAUD_TAGGING_ROLLBACK,
-    SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
+    SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C,
+    SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS1C, SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
     UNEXPECTED_ERROR, UPDT_ERROR_DB2_CODE, fraud_db2_error_message, ims_status_message,
 };
 use crate::numeric::{AccountId, Alnum, AuthId, CustomerId};
@@ -154,6 +181,32 @@ pub struct FraudOutcome {
     pub message: &'static str,
 }
 
+/// The detail PF5 toggles, read by [`detail_for_update`] under a row lock
+/// that lasts until the caller's unit of work ends (P-COPAUS1C-006).
+///
+/// Only [`detail_for_update`] builds one, and [`toggle_fraud`] consumes it, so
+/// a detail from the unlocked view read cannot reach the toggle, and one
+/// locked read serves exactly one toggle. It is not `Clone` for that reason.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LockedDetail(PendingAuthDetail);
+
+impl LockedDetail {
+    /// The detail as the locked read returned it.
+    #[must_use]
+    pub const fn detail(&self) -> &PendingAuthDetail {
+        &self.0
+    }
+}
+
+/// The detail read `READ-AUTH-RECORD` issues after the summary `GU`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailRead {
+    /// The view and PF8: a plain read, no lock.
+    Plain,
+    /// PF5: the read that locks the row until the unit of work ends.
+    ForUpdate,
+}
+
 /// The IMS status a port failure stands for in an `IMS-RETURN-CODE` slot
 /// (E-44): `GE` for a missing record, `II` for a duplicate, `AO` otherwise.
 const fn ims_status(error: &PortError) -> &'static str {
@@ -202,30 +255,83 @@ fn fraud_write_failure(head: &str, error: &PortError) -> DomainError {
     DomainError::unexpected(message).with_field(CARD_NUM_FIELD)
 }
 
-/// COPAUS1C READ-AUTH-RECORD — P-COPAUS1C-003, P-COPAUS1C-004,
-/// V-COPAUS1C-001, V-COPAUS1C-004 to V-COPAUS1C-006
-/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L431-491]: the detail
-/// `auth_id` names.
+/// COPAUS1C PROCESS-ENTER-KEY — V-COPAUS1C-001, E-49
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L208-227]: the key edit
+/// before `READ-AUTH-RECORD`.
 ///
 /// `PROCESS-ENTER-KEY` reads only with a numeric account and a selected key;
-/// a REST identity that is not a positive integer is that case (E-49). The
-/// detail row carries its summary's account and cannot exist without the
-/// summary, so the one read stands for the summary `GU` and the detail `GNP`,
-/// and its failure gives the detail-read text.
-async fn read_auth_record<S: AuthorizationStore>(
-    store: &mut S,
-    auth_id: AuthId,
-) -> Result<PendingAuthDetail, DomainError> {
+/// otherwise it sets `WS-ERR-FLG` with no message and reads nothing. A REST
+/// identity that is not a positive integer is that case (E-49). The edit reads
+/// no store, so an adapter runs it before it opens one, and the rejection
+/// precedes the scheduling failure of `SCHEDULE-PSB` (V-COPAUS1C-002).
+///
+/// # Errors
+///
+/// [`ErrorKind::Invalid`](crate::error::ErrorKind::Invalid) with no message on
+/// [`CARD_NUM_FIELD`] when `auth_id` is not positive.
+pub fn edit_auth_id(auth_id: AuthId) -> Result<AuthId, DomainError> {
     if auth_id.get() <= 0 {
         return Err(DomainError::invalid(NO_MESSAGE).with_field(CARD_NUM_FIELD));
     }
-    store
-        .read_detail(auth_id)
-        .await
-        .map_err(|error| match error {
-            PortError::NotFound => not_found(),
-            other => ims_failure(SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, &other),
-        })
+    Ok(auth_id)
+}
+
+/// COPAUS1C READ-AUTH-RECORD — P-COPAUS1C-003, P-COPAUS1C-004,
+/// P-COPAUS1C-014, V-COPAUS1C-001, V-COPAUS1C-003 to V-COPAUS1C-006
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L431-491]: the summary
+/// `GU` by account, then the detail `GNP` by the selected key, for the detail
+/// `auth_id` names.
+///
+/// `PROCESS-ENTER-KEY` reads only with a numeric account and a selected key;
+/// a REST identity that is not a positive integer is that case (E-49), which
+/// [`edit_auth_id`] rejects before anything is read. The account of the `GU`
+/// is the selected detail's own, resolved by
+/// [`AuthorizationStore::read_summary_of_detail`], since the request carries
+/// no COMMAREA account (P-COPAUS1C-012). `read` chooses the plain detail read
+/// or the locking one.
+///
+/// The outcome follows the two `EVALUATE` blocks:
+///
+/// 1. The `GU` answers `GE` or `GB`: `AUTHS-EOF`, so the `GNP` is not issued
+///    and the answer is not found with no message (V-COPAUS1C-004).
+/// 2. Any other `GU` failure moves its text to `WS-MESSAGE` but leaves
+///    `AUTHS-NOT-EOF` as it stood, so the `GNP` still runs (P-COPAUS1C-014).
+///    When the `GNP` fails too, its detail text overwrites the summary text
+///    (V-COPAUS1C-006); otherwise the summary text stands, whatever the `GNP`
+///    found (V-COPAUS1C-003). Both carry the IMS status E-44 proposes.
+/// 3. With the summary read, a `GNP` that answers `GE` or `GB` is not found
+///    with no message (V-COPAUS1C-005), and so is a detail under another
+///    account than the summary's, which the `GNP` qualified under that
+///    summary cannot reach.
+async fn read_auth_record<S: AuthorizationStore>(
+    store: &mut S,
+    auth_id: AuthId,
+    read: DetailRead,
+) -> Result<PendingAuthDetail, DomainError> {
+    let auth_id = edit_auth_id(auth_id)?;
+    let summary = match store.read_summary_of_detail(auth_id).await {
+        Err(PortError::NotFound) => return Err(not_found()),
+        other => other,
+    };
+    let detail = match read {
+        DetailRead::Plain => store.read_detail(auth_id).await,
+        DetailRead::ForUpdate => store.read_detail_for_update(auth_id).await,
+    };
+    let detail = match detail {
+        Ok(detail) => Some(detail),
+        Err(PortError::NotFound) => None,
+        Err(other) => {
+            return Err(ims_failure(
+                SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C,
+                &other,
+            ));
+        }
+    };
+    let summary = summary
+        .map_err(|error| ims_failure(SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS1C, &error))?;
+    detail
+        .filter(|detail| detail.pa_acct_id == summary.pa_acct_id)
+        .ok_or_else(not_found)
 }
 
 /// The answer of a read that finds no detail: `GE` or `GB` sets `AUTHS-EOF`
@@ -234,81 +340,110 @@ fn not_found() -> DomainError {
     DomainError::not_found(NO_MESSAGE).with_field(CARD_NUM_FIELD)
 }
 
-/// COPAUS1C READ-AUTH-RECORD — P-COPAUS1C-003: the detail `auth_id` names,
-/// read under the summary of `account_id`.
-///
-/// The COBOL qualifies the `GNP` by the selected key under the summary its
-/// `GU` reached, so a detail of another account is not found there.
-async fn read_under_account<S: AuthorizationStore>(
-    store: &mut S,
-    account_id: AccountId,
-    auth_id: AuthId,
-) -> Result<PendingAuthDetail, DomainError> {
-    let detail = read_auth_record(store, auth_id).await?;
-    if detail.pa_acct_id == account_id {
-        Ok(detail)
-    } else {
-        Err(not_found())
-    }
-}
-
 /// COPAUS1C PROCESS-ENTER-KEY, READ-AUTH-RECORD — P-COPAUS1C-001,
-/// P-COPAUS1C-003, P-COPAUS1C-004, V-COPAUS1C-001, V-COPAUS1C-004 to
+/// P-COPAUS1C-003, P-COPAUS1C-004, V-COPAUS1C-001, V-COPAUS1C-003 to
 /// V-COPAUS1C-006 [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L208-228]:
-/// the authorization the view shows, as stored.
+/// the authorization the view shows, as stored, read under the summary of its
+/// account and without a lock.
 ///
 /// # Errors
 ///
-/// Each on [`CARD_NUM_FIELD`]:
+/// Each on [`CARD_NUM_FIELD`], in the precedence `READ-AUTH-RECORD` gives
+/// them:
 ///
 /// - [`ErrorKind::Invalid`](crate::error::ErrorKind::Invalid) with no message
-///   when `auth_id` is not a positive integer (V-COPAUS1C-001).
+///   when `auth_id` is not a positive integer (V-COPAUS1C-001); nothing is
+///   read.
 /// - [`ErrorKind::NotFound`](crate::error::ErrorKind::NotFound) with no
-///   message when no detail has the identity (V-COPAUS1C-004,
-///   V-COPAUS1C-005).
+///   message when no summary is found for the detail's account, and then no
+///   detail is read (V-COPAUS1C-004).
 /// - [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
-///   ` System error while reading Auth Details: Code:` and the IMS status on
-///   any other read failure (V-COPAUS1C-006, E-44).
+///   ` System error while reading Auth Details: Code:` and the IMS status when
+///   the detail read fails (V-COPAUS1C-006, E-44), whatever the summary read
+///   answered.
+/// - [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
+///   ` System error while reading Auth Summary: Code:` and the IMS status when
+///   the summary read fails and the detail read does not (V-COPAUS1C-003,
+///   E-44).
+/// - [`ErrorKind::NotFound`](crate::error::ErrorKind::NotFound) with no
+///   message when no detail has the identity, or the detail is not under the
+///   summary read (V-COPAUS1C-005).
 pub async fn detail<S: AuthorizationStore>(
     store: &mut S,
     auth_id: AuthId,
 ) -> Result<PendingAuthDetail, DomainError> {
-    read_auth_record(store, auth_id).await
+    read_auth_record(store, auth_id, DetailRead::Plain).await
 }
 
-/// COPAUS1C PROCESS-PF8-KEY, READ-AUTH-RECORD, READ-NEXT-AUTH-RECORD —
-/// P-COPAUS1C-009, P-COPAUS1C-014, V-COPAUS1C-012, V-COPAUS1C-013
-/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L268-289]
-/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L493-518]: the
-/// authorization after `auth_id` under the summary of `account_id`.
+/// COPAUS1C MARK-AUTH-FRAUD, READ-AUTH-RECORD — P-COPAUS1C-003,
+/// P-COPAUS1C-004, P-COPAUS1C-006, V-COPAUS1C-001, V-COPAUS1C-003 to
+/// V-COPAUS1C-007 [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L230-234]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L431-491]: the detail
+/// PF5 toggles, read as [`detail`] reads it but with the row locked until the
+/// caller's unit of work ends.
 ///
-/// The current detail is read first, as `PROCESS-PF8-KEY` performs
-/// `READ-AUTH-RECORD` to position the unqualified `GNP`. When that read fails
-/// the COBOL still issues the `GNP` from a position the failed read left,
-/// which the audit does not pin, so the read's own outcome is returned and no
-/// next detail is guessed, as E-53 decides for the fraud mark.
+/// The lock is taken by the detail read itself, before the flag is seen, so
+/// a second fraud mark of the same authorization waits for the first to
+/// commit or roll back and then reads the flag it left (see the module's
+/// fraud-mark lock).
 ///
 /// # Errors
 ///
-/// Those of [`detail`] for the current detail, plus
-/// [`ErrorKind::NotFound`](crate::error::ErrorKind::NotFound) with no message
-/// when it is not a detail of `account_id`, and
+/// Those of [`detail`], in the same precedence. A lock that cannot be taken
+/// fails the detail read, so it answers the detail-read text with status `AO`
+/// (V-COPAUS1C-006, E-44). `MARK-AUTH-FRAUD` does not test the read; E-53
+/// decides that its outcome is returned and nothing is written
+/// (V-COPAUS1C-007).
+pub async fn detail_for_update<S: AuthorizationStore>(
+    store: &mut S,
+    auth_id: AuthId,
+) -> Result<LockedDetail, DomainError> {
+    read_auth_record(store, auth_id, DetailRead::ForUpdate)
+        .await
+        .map(LockedDetail)
+}
+
+/// COPAUS1C PROCESS-PF8-KEY, READ-NEXT-AUTH-RECORD — P-COPAUS1C-009,
+/// P-COPAUS1C-014, V-COPAUS1C-012, V-COPAUS1C-013
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L268-289]
+/// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L493-518]: the
+/// authorization after `current` under the same summary.
+///
+/// `current` is the detail [`detail`] returned, the `READ-AUTH-RECORD` that
+/// `PROCESS-PF8-KEY` performs to position the unqualified `GNP`; the step is
+/// one lookup of the twin after its account and `PAUT9CTS` key, with no read
+/// of `current` or its summary again. When that read fails, the caller has
+/// its outcome and does not step: the COBOL still issues the `GNP` from a
+/// position the failed read left, which the audit does not pin, so no next
+/// detail is guessed, as E-53 decides for the fraud mark.
+///
+/// A `GNP` that answers `GE` or `GB`, the port's `None`, is the end of the
+/// twins: `Already at the last Authorization...` and no error
+/// (V-COPAUS1C-012).
+///
+/// # Errors
+///
 /// [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
 /// ` System error while reading next Auth: Code:` and the IMS status when the
-/// next-detail read fails (V-COPAUS1C-013, E-44). All name
-/// [`CARD_NUM_FIELD`].
+/// next-detail read fails (V-COPAUS1C-013, E-44), on [`CARD_NUM_FIELD`].
 pub async fn next<S: AuthorizationStore>(
     store: &mut S,
-    account_id: AccountId,
-    auth_id: AuthId,
+    current: &PendingAuthDetail,
 ) -> Result<DetailStep, DomainError> {
-    read_under_account(store, account_id, auth_id).await?;
-    match store.adjacent_detail(auth_id, Direction::Forward).await {
+    let step = store
+        .adjacent_detail(
+            current.pa_acct_id,
+            current.pa_auth_date_9c,
+            current.pa_auth_time_9c,
+            Direction::Forward,
+        )
+        .await;
+    match step {
         Ok(Some(next)) => Ok(DetailStep::Next(Box::new(next))),
-        Ok(None) => Ok(DetailStep::AtEnd {
+        // GE as well as GB sets AUTHS-EOF in READ-NEXT-AUTH-RECORD.
+        Ok(None) | Err(PortError::NotFound) => Ok(DetailStep::AtEnd {
             message: ALREADY_AT_THE_LAST_AUTHORIZATION,
         }),
-        Err(PortError::NotFound) => Err(not_found()),
         Err(other) => Err(ims_failure(SYSTEM_ERROR_WHILE_READING_NEXT_AUTH, &other)),
     }
 }
@@ -498,50 +633,50 @@ async fn report_fraud<S: AuthorizationStore>(
 /// P-COPAUS2C-006, V-COPAUS1C-007, V-COPAUS1C-009 to V-COPAUS1C-011
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L230-266]
 /// [app/app-authorization-ims-db2-mq/cbl/COPAUS1C.cbl:L520-552]: toggles the
-/// fraud mark of the detail `auth_id` names under the summary of
-/// `account_id`.
+/// fraud mark of the detail `locked` holds.
 ///
-/// In COBOL order: the detail is read; its flag is toggled, `F` to `R` and any
-/// other value to `F`; `COPAUS2C` stamps `PA-FRAUD-RPT-DATE` with the date of
-/// `clock` as `mm/dd/yy` and writes the [`fraud_row`] for the account and
+/// In COBOL order, from the detail [`detail_for_update`] read and locked: its
+/// flag is toggled, `F` to `R` and any other value to `F`; `COPAUS2C` stamps
+/// `PA-FRAUD-RPT-DATE` with the date of `clock` as `mm/dd/yy` and writes the
+/// [`fraud_row`] for the detail's account (`WS-FRD-ACCT-ID`, the
+/// `CDEMO-ACCT-ID` of the summary the read was qualified by) and
 /// `customer_id`, inserting it or, when the authorization was reported
 /// before, updating its flag and report date; then the detail is replaced
-/// with the new flag and date. The instant is read once, so the IMS date and
-/// Db2 `CURRENT DATE` are the same day.
+/// with the new flag and date. The detail is not read again: the lock keeps
+/// the flag the action was derived from in place until the unit of work
+/// ends. The instant is read once, so the IMS date and Db2 `CURRENT DATE` are
+/// the same day.
 ///
 /// The rule commits nothing: the caller commits on `Ok` and rolls the whole
 /// unit of work back on `Err`, which undoes a fraud-table write that a later
-/// failure followed (P-COPAUS1C-015).
+/// failure followed and releases the lock (P-COPAUS1C-015).
 ///
 /// # Errors
 ///
 /// Each on [`CARD_NUM_FIELD`], and nothing is written unless a write is
-/// named:
+/// named. A detail that cannot be read never gets here: [`detail_for_update`]
+/// returns the read's outcome and nothing changes (V-COPAUS1C-007, E-53).
 ///
-/// 1. When the detail cannot be read, the [`detail`] error of that read,
-///    which `MARK-AUTH-FRAUD` does not test: E-53 decides that the outcome of
-///    the read is returned and nothing changes (V-COPAUS1C-007). A detail of
-///    another account is not found.
-/// 2. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with the
+/// 1. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with the
 ///    unexpected-error text when the detail's date and time give no
 ///    `AUTH_TS` (see [`fraud_row`]).
-/// 3. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
+/// 2. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
 ///    ` SYSTEM ERROR DB2: CODE:…, STATE: …` when the insert fails other than
 ///    by a duplicate key, or ` UPDT ERROR DB2: CODE:…, STATE: …` when the
 ///    update after it fails (V-COPAUS1C-009, V-COPAUS1C-010); the
 ///    unexpected-error text where the codes are not pinned (E-30).
-/// 4. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
+/// 3. [`ErrorKind::Unexpected`](crate::error::ErrorKind::Unexpected) with
 ///    ` System error while FRAUD Tagging, ROLLBACK||` and the IMS status when
 ///    the detail replace fails after the fraud-table write
 ///    (V-COPAUS1C-011, E-44).
 pub async fn toggle_fraud<S: AuthorizationStore>(
     store: &mut S,
-    auth_id: AuthId,
-    account_id: AccountId,
+    locked: LockedDetail,
     customer_id: CustomerId,
     clock: &impl Clock,
 ) -> Result<FraudOutcome, DomainError> {
-    let mut detail = read_under_account(store, account_id, auth_id).await?;
+    let LockedDetail(mut detail) = locked;
+    let account_id = detail.pa_acct_id;
     let action = toggled(detail.pa_auth_fraud);
     let today = clock.now().date_naive();
     detail.pa_auth_fraud = action;
@@ -592,28 +727,36 @@ mod tests {
 
     use super::{
         CARD_NUM_FIELD, DetailStep, FraudOutcome, NO_MESSAGE, auth_time, decline_reason, detail,
-        fraud_row, next, timestamp_format, toggle_fraud, toggled, ws_auth_ts,
+        detail_for_update, edit_auth_id, fraud_row, next, timestamp_format, toggle_fraud, toggled,
+        ws_auth_ts,
     };
     use crate::clock::FixedClock;
     use crate::entities::{
-        AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PendingAuthDetail,
+        AuthFraud, FraudFlag, MatchStatus, NewPendingAuthDetail, PA_ACCOUNT_STATUS_OCCURS,
+        PendingAuthDetail, PendingAuthSummary,
     };
     use crate::error::DomainError;
     use crate::messages::{
         ALREADY_AT_THE_LAST_AUTHORIZATION, AUTH_FRAUD_REMOVED, AUTH_MARKED_FRAUD,
         SYSTEM_ERROR_DB2_CODE, SYSTEM_ERROR_WHILE_FRAUD_TAGGING_ROLLBACK,
-        SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
+        SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C,
+        SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS1C, SYSTEM_ERROR_WHILE_READING_NEXT_AUTH,
         UNEXPECTED_ERROR, UPDT_ERROR_DB2_CODE, fraud_db2_error_message, ims_status_message,
     };
-    use crate::numeric::{AccountId, Alnum, AuthId, CardNumber, CustomerId, Money, NumericCode};
+    use crate::numeric::{
+        AccountId, Alnum, AuthCount, AuthId, CardNumber, CustomerId, Money, NumericCode,
+    };
     use crate::ports::PortError;
     use crate::rules::test_support::{FakeStore, block_on};
 
     /// The account whose summary holds details 1 and 2.
     const ACCOUNT: u64 = 50;
 
-    /// The account of detail 3.
+    /// The account whose summary holds detail 3.
     const OTHER_ACCOUNT: u64 = 51;
+
+    /// An account with no summary: [`orphan`] seeds a detail under it.
+    const ORPHAN_ACCOUNT: u64 = 52;
 
     /// The customer `COPAUS0C` passes for [`ACCOUNT`].
     const CUSTOMER: u32 = 50;
@@ -690,12 +833,39 @@ mod tests {
         }
     }
 
-    /// Details 1 (newest) and 2 under [`ACCOUNT`], 3 under [`OTHER_ACCOUNT`].
+    /// The `PAUTSUM0` summary of `account`.
+    fn summary(account: u64) -> PendingAuthSummary {
+        let cents = |value| Money::from_cents(value).expect("an amount within S9(09)V99");
+        PendingAuthSummary {
+            pa_acct_id: account_id(account),
+            pa_cust_id: customer_id(),
+            pa_auth_status: Alnum::move_from("A"),
+            pa_account_status: [Alnum::spaces(); PA_ACCOUNT_STATUS_OCCURS],
+            pa_credit_limit: cents(2_020_000),
+            pa_cash_limit: cents(1_020_000),
+            pa_credit_balance: cents(24_645),
+            pa_cash_balance: Money::ZERO,
+            pa_approved_auth_cnt: AuthCount::new(3).expect("a count of three"),
+            pa_declined_auth_cnt: AuthCount::ZERO,
+            pa_approved_auth_amt: cents(24_645),
+            pa_declined_auth_amt: Money::ZERO,
+        }
+    }
+
+    /// Details 1 (newest) and 2 under the summary of [`ACCOUNT`], 3 under the
+    /// summary of [`OTHER_ACCOUNT`].
     fn store() -> FakeStore {
         FakeStore::default()
+            .with_summary(summary(ACCOUNT))
+            .with_summary(summary(OTHER_ACCOUNT))
             .with_detail(new_detail(ACCOUNT, TIME_9C_NEWER))
             .with_detail(new_detail(ACCOUNT, TIME_9C_OLDER))
             .with_detail(new_detail(OTHER_ACCOUNT, TIME_9C_NEWER))
+    }
+
+    /// [`store`] with detail 4 under [`ORPHAN_ACCOUNT`], which has no summary.
+    fn orphan() -> FakeStore {
+        store().with_detail(new_detail(ORPHAN_ACCOUNT, TIME_9C_NEWER))
     }
 
     fn stored(store: &FakeStore, id: i64) -> PendingAuthDetail {
@@ -719,15 +889,21 @@ mod tests {
         timestamp(date(2022, 7, 18), 12, 34, 56, 789_000)
     }
 
-    /// Toggles detail 1 of [`ACCOUNT`] on `clock`.
+    /// PF5 on the detail `id`: the locked read, then the toggle on `clock`.
+    fn mark(
+        store: &mut FakeStore,
+        id: i64,
+        clock: &FixedClock,
+    ) -> Result<FraudOutcome, DomainError> {
+        block_on(async {
+            let locked = detail_for_update(store, AuthId::from(id)).await?;
+            toggle_fraud(store, locked, customer_id(), clock).await
+        })
+    }
+
+    /// PF5 on detail 1 of [`ACCOUNT`] on `clock`.
     fn toggle(store: &mut FakeStore, clock: &FixedClock) -> Result<FraudOutcome, DomainError> {
-        block_on(toggle_fraud(
-            store,
-            AuthId::from(1),
-            account_id(ACCOUNT),
-            customer_id(),
-            clock,
-        ))
+        mark(store, 1, clock)
     }
 
     #[test]
@@ -738,33 +914,123 @@ mod tests {
         }
         let mut store = store();
 
-        let read = block_on(require_send(detail(&mut store, AuthId::from(1))));
-        let step = block_on(require_send(next(
-            &mut store,
-            account_id(ACCOUNT),
-            AuthId::from(1),
-        )));
+        let read =
+            block_on(require_send(detail(&mut store, AuthId::from(1)))).expect("a readable detail");
+        let step = block_on(require_send(next(&mut store, &read)));
+        let locked = block_on(require_send(detail_for_update(&mut store, AuthId::from(1))))
+            .expect("a lockable detail");
         let clock = clock();
-        let toggle = require_send(toggle_fraud(
-            &mut store,
-            AuthId::from(1),
-            account_id(ACCOUNT),
-            customer_id(),
-            &clock,
-        ));
+        let toggle = require_send(toggle_fraud(&mut store, locked, customer_id(), &clock));
 
-        assert!(read.is_ok() && step.is_ok());
+        assert!(step.is_ok());
         assert!(block_on(toggle).is_ok());
     }
 
     #[test]
-    fn detail_returns_the_stored_authorization() {
-        // P-COPAUS1C-003: the selected detail is read and shown as stored.
+    fn detail_returns_the_stored_authorization_read_under_its_summary() {
+        // P-COPAUS1C-003, P-COPAUS1C-004: the summary GU, then the selected
+        // detail, shown as stored and read without a lock.
         let mut store = store();
         let expected = stored(&store, 2);
 
         assert_eq!(block_on(detail(&mut store, AuthId::from(2))), Ok(expected));
-        assert_eq!(store.calls, ["read_detail"]);
+        assert_eq!(store.calls, ["read_summary_of_detail", "read_detail"]);
+    }
+
+    #[test]
+    fn read_auth_record_answers_in_the_order_of_its_two_evaluates() {
+        // P-COPAUS1C-004, P-COPAUS1C-014, E-44: a GU that finds no summary
+        // skips the GNP (V-COPAUS1C-004); any other GU failure leaves
+        // AUTHS-NOT-EOF, so the GNP still runs and its own failure text
+        // overwrites the summary text (V-COPAUS1C-006), else the summary text
+        // stands (V-COPAUS1C-003); a GNP that finds nothing is not found
+        // (V-COPAUS1C-005). The view read and the PF5 read answer alike, and
+        // PF5 writes nothing on any of them (E-53).
+        let summary_text =
+            ims_status_message(SYSTEM_ERROR_WHILE_READING_AUTH_SUMMARY_COPAUS1C, "AO");
+        let details_text =
+            ims_status_message(SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, "AO");
+        let cases = [
+            (Some(PortError::NotFound), None, not_found(), false),
+            (
+                Some(unavailable()),
+                None,
+                unexpected(summary_text.clone()),
+                true,
+            ),
+            (
+                Some(PortError::Contention),
+                Some(PortError::NotFound),
+                unexpected(summary_text),
+                true,
+            ),
+            (
+                Some(unavailable()),
+                Some(unavailable()),
+                unexpected(details_text.clone()),
+                true,
+            ),
+            (None, Some(unavailable()), unexpected(details_text), true),
+            (None, Some(PortError::NotFound), not_found(), true),
+        ];
+        for (summary_failure, detail_failure, expected, reads_detail) in cases {
+            for (detail_read, pf5) in [("read_detail", false), ("read_detail_for_update", true)] {
+                let mut store = store();
+                let before = store.clone();
+                if let Some(failure) = summary_failure.clone() {
+                    store.fail_next("read_summary_of_detail", failure);
+                }
+                if let Some(failure) = detail_failure.clone() {
+                    store.fail_next(detail_read, failure);
+                }
+
+                let outcome = if pf5 {
+                    toggle(&mut store, &clock()).map(|outcome| outcome.detail)
+                } else {
+                    block_on(detail(&mut store, AuthId::from(1)))
+                };
+
+                let case = format!("{summary_failure:?} {detail_failure:?} {detail_read}");
+                assert_eq!(outcome, Err(expected.clone()), "{case}");
+                let calls: &[&str] = if reads_detail {
+                    &["read_summary_of_detail", detail_read]
+                } else {
+                    &["read_summary_of_detail"]
+                };
+                assert_eq!(store.calls, calls, "{case}");
+                assert_eq!(store.details, before.details, "{case}");
+                assert_eq!(store.frauds, before.frauds, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_detail_outside_the_summary_read_is_not_found_under_it() {
+        // P-COPAUS1C-003, V-COPAUS1C-005: the GNP is qualified under the
+        // summary the GU reached, so a detail of another account than that
+        // summary's is not reached, for the view read as for PF5.
+        for (detail_read, pf5) in [("read_detail", false), ("read_detail_for_update", true)] {
+            let mut store = store();
+            store
+                .summaries
+                .insert(account_id(ACCOUNT), summary(OTHER_ACCOUNT));
+            let before = store.details.clone();
+
+            let outcome = if pf5 {
+                toggle(&mut store, &clock()).map(|outcome| outcome.detail)
+            } else {
+                block_on(detail(&mut store, AuthId::from(1)))
+            };
+
+            assert_eq!(outcome, Err(not_found()), "{detail_read}");
+            assert_eq!(
+                store.calls,
+                ["read_summary_of_detail", detail_read],
+                "{detail_read}"
+            );
+            assert_eq!(store.details, before, "{detail_read}");
+            assert!(store.frauds.is_empty(), "{detail_read}");
+        }
     }
 
     #[test]
@@ -784,14 +1050,42 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_identity_is_not_found_without_a_message() {
-        // V-COPAUS1C-004, V-COPAUS1C-005, E-49: GE sets AUTHS-EOF, 404.
-        let mut store = store();
+    fn the_key_edit_passes_a_positive_identity_unchanged_and_rejects_any_other() {
+        // COPAUS1C PROCESS-ENTER-KEY, V-COPAUS1C-001, E-49: the store-free
+        // edit the adapter runs before it opens the store, and the PF5 read
+        // rejects the same keys before any read.
+        let rejected = DomainError::invalid(NO_MESSAGE).with_field(CARD_NUM_FIELD);
+        let cases = [
+            (1, Ok(AuthId::from(1))),
+            (i64::MAX, Ok(AuthId::from(i64::MAX))),
+            (0, Err(rejected.clone())),
+            (-5, Err(rejected.clone())),
+            (i64::MIN, Err(rejected)),
+        ];
+        for (id, expected) in cases {
+            assert_eq!(edit_auth_id(AuthId::from(id)), expected, "id {id}");
+            if let Err(error) = expected {
+                let mut store = store();
+                let locked = block_on(detail_for_update(&mut store, AuthId::from(id)));
+                assert_eq!(locked, Err(error), "id {id}");
+                assert!(store.calls.is_empty(), "id {id}");
+            }
+        }
+    }
 
-        assert_eq!(
-            block_on(detail(&mut store, AuthId::from(99))),
-            Err(not_found())
-        );
+    #[test]
+    fn no_summary_is_not_found_without_a_message_and_reads_no_detail() {
+        // V-COPAUS1C-004, E-49: the GU answers GE, AUTHS-EOF is set and the
+        // GNP is not issued; 404. No detail has identity 99, and detail 4 has
+        // no summary over it.
+        for (mut store, id) in [(store(), 99), (orphan(), 4)] {
+            assert_eq!(
+                block_on(detail(&mut store, AuthId::from(id))),
+                Err(not_found()),
+                "id {id}"
+            );
+            assert_eq!(store.calls, ["read_summary_of_detail"], "id {id}");
+        }
     }
 
     #[test]
@@ -814,48 +1108,38 @@ mod tests {
     }
 
     #[test]
-    fn pf8_steps_to_the_next_older_authorization_of_the_summary() {
-        // P-COPAUS1C-009, P-COPAUS1C-014: the unqualified GNP in twin order.
+    fn pf8_steps_from_the_detail_read_with_one_twin_lookup() {
+        // P-COPAUS1C-009, P-COPAUS1C-014: the unqualified GNP in twin order
+        // under the detail's own summary, from the detail already read: one
+        // lookup and no read of the detail or its summary again.
         let mut store = store();
         let older = stored(&store, 2);
+        let current = stored(&store, 1);
 
-        let step = block_on(next(&mut store, account_id(ACCOUNT), AuthId::from(1)));
+        let step = block_on(next(&mut store, &current));
 
         assert_eq!(step, Ok(DetailStep::Next(Box::new(older))));
-        assert_eq!(store.calls, ["read_detail", "adjacent_detail"]);
+        assert_eq!(store.calls, ["adjacent_detail"]);
     }
 
     #[test]
     fn pf8_at_the_last_authorization_shows_the_last_authorization_text() {
-        // V-COPAUS1C-012: GE or GB, 200 with the text and no error.
-        let mut store = store();
-
-        let step = block_on(next(&mut store, account_id(ACCOUNT), AuthId::from(2)));
-
+        // V-COPAUS1C-012: GE or GB, 200 with the text and no error. Detail 2
+        // is the last twin of its summary; detail 3 is the only twin of its
+        // own, though detail 2 of another account has a greater key; a GE
+        // from the store ends the twins as well.
         let message = ALREADY_AT_THE_LAST_AUTHORIZATION;
-        assert_eq!(step, Ok(DetailStep::AtEnd { message }));
-    }
-
-    #[test]
-    fn pf8_from_a_detail_that_is_not_read_under_the_account_returns_the_read_outcome() {
-        // P-COPAUS1C-003: the GNP is qualified under the account's summary, so
-        // a detail of another account, or none, is not found; a failed read
-        // keeps its text (V-COPAUS1C-006). No next detail is read.
-        let failed = ims_status_message(SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, "AO");
-        for (id, failure, expected) in [
-            (3, None, not_found()),
-            (99, None, not_found()),
-            (1, Some(unavailable()), unexpected(failed)),
-        ] {
+        for (id, failure) in [(2, None), (3, None), (1, Some(PortError::NotFound))] {
             let mut store = store();
+            let current = stored(&store, id);
             if let Some(failure) = failure {
-                store.fail_next("read_detail", failure);
+                store.fail_next("adjacent_detail", failure);
             }
 
-            let step = block_on(next(&mut store, account_id(ACCOUNT), AuthId::from(id)));
+            let step = block_on(next(&mut store, &current));
 
-            assert_eq!(step, Err(expected), "id {id}");
-            assert_eq!(store.calls, ["read_detail"], "id {id}");
+            assert_eq!(step, Ok(DetailStep::AtEnd { message }), "id {id}");
+            assert_eq!(store.calls, ["adjacent_detail"], "id {id}");
         }
     }
 
@@ -863,63 +1147,59 @@ mod tests {
     fn a_failed_next_read_is_the_next_auth_text() {
         // V-COPAUS1C-013, E-44.
         let mut store = store();
+        let current = stored(&store, 1);
         store.fail_next("adjacent_detail", unavailable());
 
-        let step = block_on(next(&mut store, account_id(ACCOUNT), AuthId::from(1)));
+        let step = block_on(next(&mut store, &current));
 
         let text = ims_status_message(SYSTEM_ERROR_WHILE_READING_NEXT_AUTH, "AO");
         assert_eq!(step, Err(unexpected(text)));
     }
 
     #[test]
-    fn pf5_on_an_unreported_authorization_reports_fraud() {
+    fn pf5_on_an_unreported_authorization_reports_fraud_for_its_own_account() {
         // P-COPAUS1C-006 to P-COPAUS1C-008, P-COPAUS2C-001 to P-COPAUS2C-003,
-        // P-COPAUS2C-006: flag F, report date mm/dd/yy, one AUTHFRDS row.
-        let mut store = store();
-        let mut expected = stored(&store, 1);
-        expected.pa_auth_fraud = FraudFlag::Confirmed;
-        expected.pa_fraud_rpt_date = Alnum::move_from("07/01/22");
-        let mut untouched = store.details.clone();
-        untouched.remove(&AuthId::from(1));
-        assert_eq!(
-            untouched
-                .iter()
-                .map(|(&id, detail)| (id, detail.pa_acct_id))
-                .collect::<Vec<_>>(),
-            [
-                (AuthId::from(2), account_id(ACCOUNT)),
-                (AuthId::from(3), account_id(OTHER_ACCOUNT)),
-            ],
-            "the non-targets: detail 2 of the same account, detail 3 of another"
-        );
+        // P-COPAUS2C-006: flag F, report date mm/dd/yy, one AUTHFRDS row whose
+        // ACCT_ID is the detail's account. The flag comes from the one locked
+        // read: never the unlocked read, and no read again before the writes.
+        for (id, account) in [(1, ACCOUNT), (3, OTHER_ACCOUNT)] {
+            let mut store = store();
+            let mut expected = stored(&store, id);
+            expected.pa_auth_fraud = FraudFlag::Confirmed;
+            expected.pa_fraud_rpt_date = Alnum::move_from("07/01/22");
+            let mut untouched = store.details.clone();
+            untouched.remove(&AuthId::from(id));
 
-        let outcome = toggle(&mut store, &clock());
+            let outcome = mark(&mut store, id, &clock());
 
-        let message = AUTH_MARKED_FRAUD;
-        let detail = expected.clone();
-        assert_eq!(outcome, Ok(FraudOutcome { detail, message }));
-        assert_eq!(stored(&store, 1), expected);
-        assert_eq!(
-            store.calls,
-            ["read_detail", "insert_fraud", "update_detail"]
-        );
-        let report_date = date(2022, 7, 1);
-        let row = fraud_row(
-            &expected,
-            account_id(ACCOUNT),
-            customer_id(),
-            FraudFlag::Confirmed,
-            report_date,
-        );
-        let key = (CardNumber::move_from(CARD), newer_auth_ts());
-        assert_eq!(store.frauds.len(), 1);
-        assert_eq!(store.frauds.get(&key), row.as_ref());
-        let mut others = store.details.clone();
-        others.remove(&AuthId::from(1));
-        assert_eq!(
-            others, untouched,
-            "detail 2 (same account) and detail 3 (other account) untouched"
-        );
+            let message = AUTH_MARKED_FRAUD;
+            let detail = expected.clone();
+            assert_eq!(outcome, Ok(FraudOutcome { detail, message }), "id {id}");
+            assert_eq!(stored(&store, id), expected, "id {id}");
+            assert_eq!(
+                store.calls,
+                [
+                    "read_summary_of_detail",
+                    "read_detail_for_update",
+                    "insert_fraud",
+                    "update_detail"
+                ],
+                "id {id}"
+            );
+            let row = fraud_row(
+                &expected,
+                account_id(account),
+                customer_id(),
+                FraudFlag::Confirmed,
+                date(2022, 7, 1),
+            );
+            let key = (CardNumber::move_from(CARD), newer_auth_ts());
+            assert_eq!(store.frauds.len(), 1, "id {id}");
+            assert_eq!(store.frauds.get(&key), row.as_ref(), "id {id}");
+            let mut others = store.details.clone();
+            others.remove(&AuthId::from(id));
+            assert_eq!(others, untouched, "id {id}: the other details untouched");
+        }
     }
 
     #[test]
@@ -945,9 +1225,10 @@ mod tests {
         assert_eq!(report.auth_fraud, Some(Alnum::move_from("R")));
         assert_eq!(report.fraud_rpt_date, Some(date(2022, 7, 5)));
         assert_eq!(
-            store.calls[3..],
+            store.calls[4..],
             [
-                "read_detail",
+                "read_summary_of_detail",
+                "read_detail_for_update",
                 "insert_fraud",
                 "update_fraud",
                 "update_detail"
@@ -989,7 +1270,14 @@ mod tests {
             store.fail_next("insert_fraud", failure);
 
             assert_eq!(toggle(&mut store, &clock()), Err(unexpected(message)));
-            assert_eq!(store.calls, ["read_detail", "insert_fraud"]);
+            assert_eq!(
+                store.calls,
+                [
+                    "read_summary_of_detail",
+                    "read_detail_for_update",
+                    "insert_fraud"
+                ]
+            );
             assert_eq!(stored(&store, 1), before);
             assert!(store.frauds.is_empty());
         }
@@ -1018,7 +1306,15 @@ mod tests {
             store.fail_next("update_fraud", failure);
 
             assert_eq!(toggle(&mut store, &clock()), Err(unexpected(message)));
-            assert_eq!(store.calls, ["read_detail", "insert_fraud", "update_fraud"]);
+            assert_eq!(
+                store.calls,
+                [
+                    "read_summary_of_detail",
+                    "read_detail_for_update",
+                    "insert_fraud",
+                    "update_fraud"
+                ]
+            );
             assert_eq!(stored(&store, 1), detail);
             assert_eq!(store.frauds.values().collect::<Vec<_>>(), [&row]);
         }
@@ -1038,41 +1334,44 @@ mod tests {
         assert_eq!(outcome, Err(unexpected(text)));
         assert_eq!(
             store.calls,
-            ["read_detail", "insert_fraud", "update_detail"]
+            [
+                "read_summary_of_detail",
+                "read_detail_for_update",
+                "insert_fraud",
+                "update_detail"
+            ]
         );
         assert_eq!(stored(&store, 1), before);
     }
 
     #[test]
     fn pf5_on_an_authorization_that_cannot_be_read_changes_nothing() {
-        // V-COPAUS1C-007, E-53: the read's own outcome, and no write.
+        // V-COPAUS1C-007, E-53: the read's own outcome, and no write. Detail
+        // 4 has no summary; a lock that cannot be taken fails the detail read
+        // with status AO (V-COPAUS1C-006, E-44).
         let failed = ims_status_message(SYSTEM_ERROR_WHILE_READING_AUTH_DETAILS_COPAUS1C, "AO");
         for (id, failure, expected) in [
             (99, None, not_found()),
-            (3, None, not_found()),
+            (4, None, not_found()),
             (
                 0,
                 None,
                 DomainError::invalid(NO_MESSAGE).with_field(CARD_NUM_FIELD),
             ),
-            (1, Some(unavailable()), unexpected(failed)),
+            (1, Some(unavailable()), unexpected(failed.clone())),
+            (1, Some(PortError::Contention), unexpected(failed)),
         ] {
-            let mut store = store();
+            let mut store = orphan();
             let before = store.details.clone();
             if let Some(failure) = failure {
-                store.fail_next("read_detail", failure);
+                store.fail_next("read_detail_for_update", failure);
             }
 
-            let outcome = block_on(toggle_fraud(
-                &mut store,
-                AuthId::from(id),
-                account_id(ACCOUNT),
-                customer_id(),
-                &clock(),
-            ));
+            let outcome = mark(&mut store, id, &clock());
 
             assert_eq!(outcome, Err(expected), "id {id}");
             assert!(!store.calls.contains(&"insert_fraud"), "id {id}");
+            assert!(!store.calls.contains(&"update_detail"), "id {id}");
             assert_eq!(store.details, before, "id {id}");
             assert!(store.frauds.is_empty(), "id {id}");
         }
@@ -1201,17 +1500,22 @@ mod tests {
     fn pf5_on_a_detail_without_a_valid_auth_ts_writes_nothing() {
         // P-COPAUS2C-001: TIMESTAMP_FORMAT rejects the text with a SQLCODE the
         // audit does not record, so the unexpected-error text answers.
-        let mut store = FakeStore::default().with_detail(NewPendingAuthDetail {
-            pa_auth_orig_date: Alnum::spaces(),
-            ..new_detail(ACCOUNT, TIME_9C_NEWER)
-        });
+        let mut store = FakeStore::default()
+            .with_summary(summary(ACCOUNT))
+            .with_detail(NewPendingAuthDetail {
+                pa_auth_orig_date: Alnum::spaces(),
+                ..new_detail(ACCOUNT, TIME_9C_NEWER)
+            });
         let before = stored(&store, 1);
 
         assert_eq!(
             toggle(&mut store, &clock()),
             Err(unexpected(UNEXPECTED_ERROR))
         );
-        assert_eq!(store.calls, ["read_detail"]);
+        assert_eq!(
+            store.calls,
+            ["read_summary_of_detail", "read_detail_for_update"]
+        );
         assert_eq!(stored(&store, 1), before);
     }
 

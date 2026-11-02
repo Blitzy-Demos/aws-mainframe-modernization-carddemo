@@ -18,7 +18,8 @@
 //! database access runs in a `UnitOfWork` of `carddemo_persistence`, generation files go through
 //! [`crate::generations`], the outcome is a [`crate::exit::ExitStatus`], and telemetry goes
 //! through `tracing` inside the job span [`dispatch`] opens. The REPROC backup that TRANBKP and
-//! TRANREPT share lives here, in [`backup_live_master`], and nowhere else.
+//! TRANREPT share lives here, in [`backup_live_master`] and [`backup_live_master_in`], and nowhere
+//! else.
 
 mod cbpaup0j;
 mod combtran;
@@ -35,19 +36,22 @@ use std::fmt;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
 use carddemo_domain::clock::AnyClock;
-use carddemo_domain::entities::Transaction;
-use carddemo_persistence::Db;
+use carddemo_persistence::{Db, UnitOfWork};
 use carddemo_runtime::config::Settings;
 use tracing::field::{Empty, display};
 use tracing::{Instrument, Span};
 
 use crate::cli::Command;
 use crate::exit::{ExitStatus, RECORDS_REJECTED, SUCCESS};
-use crate::generations::{Dataset, Generation, Generations};
+use crate::generations::{Dataset, Generation, Generations, PendingGeneration};
 
 /// The condition code `REPRO` ends with when its input holds no record: `IDC3351I VSAM OPEN
 /// RETURN CODE IS 160` (P-TRANBKP-002, P-TRANREPT-001, E-37).
 const EMPTY_INPUT_CONDITION: u8 = 12;
+
+/// The live records one read of the backup returns: a bound on the records the job holds at
+/// once, not a COBOL value. `REPRO` copies one record at a time.
+const BACKUP_PAGE_SIZE: u16 = 500;
 
 /// What every job of one `batch` run shares: the settings, the processing clock and the
 /// generation catalog.
@@ -231,10 +235,16 @@ impl Backup {
 /// (P-TRANREPT-001).
 ///
 /// Allocates `TRANSACT.BKUP(+1)`, reads every record of the live transaction master in TRAN-ID
-/// order in a read-only unit of work, writes each as a 350-byte `CVTRA05Y` record with FILLER
-/// spaces (P-CVTRA05Y-018) followed by `LF`, and catalogs the generation. An empty live master
-/// gives an empty generation, cataloged all the same, and [`Backup::status`] reports its
-/// condition code 12. The number of records is recorded in `written` on the current span.
+/// order, [`BACKUP_PAGE_SIZE`] records at a time, writes each as a 350-byte `CVTRA05Y` record
+/// with FILLER spaces (P-CVTRA05Y-018) followed by `LF`, and catalogs the generation. An empty
+/// live master gives an empty generation, cataloged all the same, and [`Backup::status`] reports
+/// its condition code 12. The number of records is recorded in `written` on the current span.
+///
+/// The pages are read in one read-only unit of work on a single snapshot (`Db::begin_snapshot`),
+/// so together they are the master as one moment left it, as one read of the whole file was,
+/// while online writers go on. The unit of work writes nothing and is rolled back before the
+/// catalog. TRANREPT backs up this way; TRANBKP, which empties the master after the backup, runs
+/// [`backup_live_master_in`] inside its own unit of work instead.
 ///
 /// # Errors
 ///
@@ -242,24 +252,97 @@ impl Backup {
 /// no condition code for it. The generation is then not cataloged and the previous one stays
 /// `(0)`.
 pub(super) async fn backup_live_master(ctx: &JobContext, db: &Db) -> Result<Backup, ExitStatus> {
+    let mut uow = db
+        .begin_snapshot()
+        .await
+        .map_err(|err| setup_failure("live transaction master read failed", err))?;
+    let (pending, records) = write_backup(ctx, &mut uow).await?;
+    uow.rollback()
+        .await
+        .map_err(|err| setup_failure("live transaction master read failed", err))?;
+    catalog_backup(pending, records)
+}
+
+/// The REPROC step of [`backup_live_master`] inside the caller's unit of work `uow`: TRANBKP
+/// `STEP05R` (P-TRANBKP-001, P-TRANBKP-002). TRANBKP holds the live master still in `uow` first
+/// (`PgStore::exclude_master_writers`) and empties it in the same unit after this returns, so
+/// every record it takes out of the master is in the backup this catalogs.
+///
+/// Writes and catalogs `TRANSACT.BKUP(+1)` as [`backup_live_master`] does, and leaves `uow` open
+/// for the caller to commit or roll back.
+///
+/// # Errors
+///
+/// As [`backup_live_master`]: a failure to allocate, read, write or catalog is a setup failure
+/// (exit 16), the generation is then not cataloged and the previous one stays `(0)`.
+pub(super) async fn backup_live_master_in(
+    ctx: &JobContext,
+    uow: &mut UnitOfWork,
+) -> Result<Backup, ExitStatus> {
+    let (pending, records) = write_backup(ctx, uow).await?;
+    catalog_backup(pending, records)
+}
+
+/// REPROC `PRC001` `REPRO INFILE(FILEIN) OUTFILE(FILEOUT)` [app/proc/REPROC.prc:L21-28] —
+/// P-TRANBKP-001, P-TRANREPT-001: the copy itself, in the caller's unit of work `uow`. Allocates
+/// `TRANSACT.BKUP(+1)` and appends every live record to it in TRAN-ID order, one page of
+/// [`BACKUP_PAGE_SIZE`] records at a time, so the job holds one page however large the master
+/// grows. A page shorter than [`BACKUP_PAGE_SIZE`] is the end of the master. Returns the
+/// generation, still uncataloged, and the number of records written to it.
+///
+/// # Errors
+///
+/// A setup failure (exit 16) when the generation cannot be allocated or written or a page cannot
+/// be read. The pending generation is then dropped, which deletes it.
+async fn write_backup(
+    ctx: &JobContext,
+    uow: &mut UnitOfWork,
+) -> Result<(PendingGeneration, usize), ExitStatus> {
     let mut pending = ctx
         .generations
         .begin_next(Dataset::TransactBkup)
         .map_err(|err| setup_failure("TRANSACT.BKUP(+1) allocation failed", err))?;
-    let records: Vec<TransactionRecord> = read_live_master(db)
-        .await?
-        .iter()
-        .map(|row| TransactionRecord::new(row.to_new()))
-        .collect();
-    pending
-        .append_records::<TransactionLayout>(&records)
-        .map_err(|err| setup_failure("TRANSACT.BKUP(+1) write failed", err))?;
+    let mut records = 0;
+    let mut after = None;
+    loop {
+        let page = uow
+            .store()
+            .live_master_after(after, BACKUP_PAGE_SIZE)
+            .await
+            .map_err(|err| setup_failure("live transaction master read failed", err))?;
+        let page_records: Vec<TransactionRecord> = page
+            .iter()
+            .map(|row| TransactionRecord::new(row.to_new()))
+            .collect();
+        pending
+            .append_records::<TransactionLayout>(&page_records)
+            .map_err(|err| setup_failure("TRANSACT.BKUP(+1) write failed", err))?;
+        records += page_records.len();
+        match page.last() {
+            Some(last) if page.len() == usize::from(BACKUP_PAGE_SIZE) => {
+                after = Some(last.tran_id);
+            }
+            _ => return Ok((pending, records)),
+        }
+    }
+}
+
+/// REPROC `FILEOUT` `DISP=(NEW,CATLG,DELETE)` [app/jcl/TRANBKP.jcl:L23-33] — P-TRANBKP-001,
+/// P-TRANBKP-002, P-TRANREPT-001: catalogs `pending`, the backup [`write_backup`] filled with
+/// `records` records, at the normal end of the step, records `written` on the current span and
+/// reports the step's condition code.
+///
+/// # Errors
+///
+/// A setup failure (exit 16) when the catalog fails: the generation is then not cataloged and the
+/// previous one stays `(0)`.
+fn catalog_backup(pending: PendingGeneration, records: usize) -> Result<Backup, ExitStatus> {
     let generation = pending
         .catalog()
         .map_err(|err| setup_failure("TRANSACT.BKUP(+1) catalog failed", err))?;
     let backup = Backup {
         generation,
-        records: records.len(),
+        records,
     };
     Span::current().record("written", backup.records);
     let condition_code = backup.status().code();
@@ -279,24 +362,6 @@ pub(super) async fn backup_live_master(ctx: &JobContext, db: &Db) -> Result<Back
         );
     }
     Ok(backup)
-}
-
-/// The rows of the live transaction master in TRAN-ID order, read in a unit of work that is
-/// rolled back because it writes nothing.
-async fn read_live_master(db: &Db) -> Result<Vec<Transaction>, ExitStatus> {
-    let mut uow = db
-        .begin()
-        .await
-        .map_err(|err| setup_failure("live transaction master read failed", err))?;
-    let rows = uow
-        .store()
-        .snapshot_live_master()
-        .await
-        .map_err(|err| setup_failure("live transaction master read failed", err))?;
-    uow.rollback()
-        .await
-        .map_err(|err| setup_failure("live transaction master read failed", err))?;
-    Ok(rows)
 }
 
 /// Logs `err` under `what` and turns it into the setup failure that ends the job.

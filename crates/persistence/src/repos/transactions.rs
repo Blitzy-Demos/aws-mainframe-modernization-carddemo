@@ -13,12 +13,13 @@
 //!
 //! - every read of the [`TransactionReader`] port goes through the view, so a
 //!   rule never sees a row outside the live master;
-//! - the base table is named only where a statement changes it: the live
-//!   insert of [`TransactionWriter`], and the batch methods
+//! - the base table is named only where a statement changes it or locks it:
+//!   the live insert of [`TransactionWriter`], the batch methods
 //!   [`PgStore::empty_live_master`] and [`PgStore::load_combined_record`] that
-//!   take rows out of the live master and bring them back. This is the one
-//!   repository module that may name the table
-//!   (`crates/testkit/tests/hygiene.rs`).
+//!   take rows out of the live master and bring them back, and the table lock
+//!   of [`PgStore::exclude_master_writers`] that holds the master still while
+//!   `batch tranbkp` backs it up and empties it. This is the one repository
+//!   module that may name the table (`crates/testkit/tests/hygiene.rs`).
 //!
 //! # Key order
 //!
@@ -64,6 +65,7 @@ use sqlx::PgConnection;
 use super::{
     alnum, card_number, limit_i64, merchant_id, money, tran_category_code, tran_id, tran_type_code,
 };
+use crate::ids::TRAN_ID_LOCK_KEY;
 use crate::tx::{PgStore, savepoint, settle};
 use crate::{PersistenceError, port_error};
 
@@ -600,20 +602,43 @@ impl TransactionWriter for PgStore<'_, '_> {
 impl PgStore<'_, '_> {
     /// TRANBKP STEP05R — P-TRANBKP-001 [app/jcl/TRANBKP.jcl:L23-33]
     /// [app/proc/REPROC.prc:L21-28], and the backup step of TRANREPT —
-    /// P-TRANREPT-001 [app/jcl/TRANREPT.jcl:L23-33]: `REPRO` of every live
-    /// record, in TRAN-ID order, into `TRANSACT.BKUP(+1)`.
+    /// P-TRANREPT-001 [app/jcl/TRANREPT.jcl:L23-33]: `REPRO` of the live
+    /// records, in TRAN-ID order, into `TRANSACT.BKUP(+1)`, one page at a
+    /// time: the live rows after the TRAN-ID `after`, from the first when
+    /// `after` is `None`, up to `limit`.
     ///
-    /// An empty live master gives no rows. The condition code 12 the `REPRO`
-    /// ends with there (P-TRANBKP-002, E-37) is the batch job's to report.
+    /// The bound is exclusive, so the TRAN-ID of the last row of one page
+    /// gives the next page, and a page shorter than `limit` is the end of the
+    /// file. The caller holds one page however large the master grows.
+    ///
+    /// The pages form one consistent read only through the caller's unit of
+    /// work: TRANBKP reads them after [`PgStore::exclude_master_writers`],
+    /// which keeps every writer of the master waiting until it has emptied
+    /// the master and committed, and TRANREPT reads them in the single
+    /// snapshot of `Db::begin_snapshot`.
+    ///
+    /// An empty live master gives an empty first page. The condition code 12
+    /// the `REPRO` ends with there (P-TRANBKP-002, E-37) is the batch job's to
+    /// report.
     ///
     /// # Errors
     ///
     /// [`PortError::Unavailable`] when the read fails or a stored value does
     /// not fit its PIC clause.
-    pub async fn snapshot_live_master(&mut self) -> PortResult<Vec<Transaction>> {
-        let rows = sqlx::query_as!(
-            TransactionRow,
-            r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+    pub async fn live_master_after(
+        &mut self,
+        after: Option<TranId>,
+        limit: u16,
+    ) -> PortResult<Vec<Transaction>> {
+        let limit = limit_i64(limit)?;
+        // Two statements rather than `None` bound as "": an all-space TRAN-ID
+        // is stored as "", which `tran_id > ''` would leave out of the first
+        // page.
+        let rows = match after {
+            None => {
+                sqlx::query_as!(
+                    TransactionRow,
+                    r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
        tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
        tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
        tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
@@ -621,12 +646,88 @@ impl PgStore<'_, '_> {
        tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master
-ORDER BY tran_id"#
-        )
-        .fetch_all(&mut **self.tx)
-        .await
+ORDER BY tran_id
+LIMIT $1"#,
+                    limit
+                )
+                .fetch_all(&mut **self.tx)
+                .await
+            }
+            Some(last) => {
+                let key = last.trimmed();
+                sqlx::query_as!(
+                    TransactionRow,
+                    r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
+       tran_type_cd AS "tran_type_cd!", tran_cat_cd AS "tran_cat_cd!",
+       tran_source AS "tran_source!", tran_desc AS "tran_desc!", tran_amt AS "tran_amt!",
+       tran_merchant_id AS "tran_merchant_id!", tran_merchant_name AS "tran_merchant_name!",
+       tran_merchant_city AS "tran_merchant_city!", tran_merchant_zip AS "tran_merchant_zip!",
+       tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
+       tran_proc_ts AS "tran_proc_ts!"
+FROM transaction_master
+WHERE tran_id > $1
+ORDER BY tran_id
+LIMIT $2"#,
+                    key.as_ref(),
+                    limit
+                )
+                .fetch_all(&mut **self.tx)
+                .await
+            }
+        }
         .map_err(|err| port_error(&err))?;
         into_transactions(rows)
+    }
+
+    /// TRANBKP STEP05R to STEP10 — P-TRANBKP-001, P-TRANBKP-003,
+    /// P-TRANBKP-005 [app/jcl/TRANBKP.jcl:L23-67]: holds the live master
+    /// still for the rest of this unit of work, so the `REPRO` backup and the
+    /// `DELETE` and `DEFINE` after it see the same records, and no record
+    /// leaves the master without being in its backup. On the mainframe the
+    /// batch sequence gives that: `CLOSEFIL` closes the CICS files before it
+    /// and `OPENFIL` reopens them after it [README.md:L213-231], so no online
+    /// transaction writes `TRANSACT` while the job runs.
+    ///
+    /// Two locks, both held until the unit of work commits or rolls back:
+    ///
+    /// 1. The advisory lock [`TRAN_ID_LOCK_KEY`] of the CT02 and CB00 TRAN-ID
+    ///    allocation ([`crate::ids::next_tran_id`]), taken with the same
+    ///    statement. An add that allocated first is waited for; an add that
+    ///    allocates later waits, then reads the master this unit left. CT02
+    ///    and CB00 allocate before they insert, the same order as these two
+    ///    locks, so the two cannot deadlock.
+    /// 2. `LOCK TABLE transactions IN SHARE ROW EXCLUSIVE MODE`. The mode
+    ///    conflicts with itself and with the `ROW EXCLUSIVE` lock every
+    ///    `INSERT`, `UPDATE` and `DELETE` takes, and not with a plain
+    ///    `SELECT`. It waits until the writers in flight (POSTTRAN, COMBTRAN,
+    ///    CT02, CB00) end and keeps every later one waiting, while reads of
+    ///    the master go on.
+    ///
+    /// The unit of work runs at `READ COMMITTED`, the `PostgreSQL` default,
+    /// where each statement takes its own snapshot. Every later statement
+    /// therefore starts after both locks are granted and sees one stable
+    /// committed master, the rows of the last writer included. The locks
+    /// write nothing, so they run on the transaction itself, with no
+    /// savepoint.
+    ///
+    /// # Errors
+    ///
+    /// The [`port_error`] mapping of a failed lock statement:
+    /// [`PortError::Contention`] when the wait ends in a deadlock or a lock
+    /// timeout, [`PortError::Unavailable`] on any other failure.
+    pub async fn exclude_master_writers(&mut self) -> PortResult<()> {
+        sqlx::query_scalar!(
+            r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
+            TRAN_ID_LOCK_KEY
+        )
+        .fetch_one(&mut **self.tx)
+        .await
+        .map_err(|err| port_error(&err))?;
+        sqlx::query!("LOCK TABLE transactions IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut **self.tx)
+            .await
+            .map_err(|err| port_error(&err))?;
+        Ok(())
     }
 
     /// TRANBKP STEP05 and STEP10 — P-TRANBKP-003, P-TRANBKP-004,
@@ -639,6 +740,11 @@ ORDER BY tran_id"#
     /// accruals, so the reward history survives the emptied master. Returns
     /// `(demoted, deleted)`: the rows taken out of the live master and the
     /// rows deleted, which include unreferenced rows an earlier run left.
+    ///
+    /// TRANBKP calls it in the unit of work that took
+    /// [`PgStore::exclude_master_writers`] and read the backup through
+    /// [`PgStore::live_master_after`], so the rows it takes out of the live
+    /// master are exactly the rows backed up.
     ///
     /// # Errors
     ///

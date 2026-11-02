@@ -11,7 +11,8 @@
 //! [`AccountUpdateRequest`] carries the unprotected `COACTUP` input fields
 //! [app/bms/COACTUP.bms] as entered, so a blank or missing field reaches
 //! `carddemo_domain::rules::account_update` and gets its audited COBOL
-//! message. The only edit made here is the BMS field length.
+//! message. The only edit made here is the BMS field length, of the body
+//! fields and of the `{id}` path segment that stands for `ACCTSID`.
 //!
 //! [`AccountViewField`] and [`AccountUpdateField`] list the BMS fields the
 //! error bodies of the two operations can name: the distinct `BMS field`
@@ -27,7 +28,7 @@ use carddemo_domain::rules::account_view::AccountView;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
-use validator::Validate;
+use validator::{Validate, ValidationError};
 
 use super::{BmsField, id_string, money, reject_invalid, text};
 use crate::error::ApiError;
@@ -40,6 +41,17 @@ use crate::error::ApiError;
 /// a REST input with no COBOL counterpart (E-49), and `fields` naming each
 /// over-length field.
 const OVER_LENGTH_MESSAGE: &str = "";
+
+/// `ACCTSIDI PIC X(11)` [app/cpy-bms/COACTUP.CPY:L60], the bound of the
+/// `{id}` path segment of `PUT /accounts/{id}`.
+const ACCOUNT_ID_LEN: usize = 11;
+
+/// The name the `{id}` path segment of `PUT /accounts/{id}` takes among the
+/// length errors of [`AccountUpdateRequest::check`].
+const PATH_ACCOUNT_ID: &str = "account_id";
+
+/// The `validator` code of a failed length check.
+const LENGTH_CODE: &str = "length";
 
 /// A withheld value, which `Debug` shows as `<redacted>`: the social security
 /// number and the card number, which `CustSsn` and `CardNumber` keep out of
@@ -98,7 +110,9 @@ pub enum AccountUpdateField {
     /// the read, lock and rewrite failures, the record-changed check and the
     /// `CSUTLDTC` rejections (V-COACTUPC-002 to V-COACTUPC-009,
     /// V-COACTUPC-023, V-COACTUPC-036, V-COACTUPC-049, V-COACTUPC-076,
-    /// V-COACTUPC-124 to V-COACTUPC-128).
+    /// V-COACTUPC-124 to V-COACTUPC-128), and a segment longer than the
+    /// field's 11 characters, which only [`AccountUpdateRequest::check`]
+    /// reports.
     #[serde(rename = "ACCTSID")]
     Acctsid,
     /// `ACSTTUS`, Account Status (V-COACTUPC-010 to V-COACTUPC-012).
@@ -535,7 +549,8 @@ impl fmt::Debug for AccountResponse {
 /// [app/cbl/COACTUPC.cbl:L757-860], in map order, each as entered.
 ///
 /// The account number is the `{id}` path segment (`ACCTSID`, 11 characters),
-/// not a body field. A missing or blank field is passed on as empty text,
+/// not a body field; [`AccountUpdateRequest::check`] bounds it with the body
+/// fields. A missing or blank field is passed on as empty text,
 /// which the rule receives as `LOW-VALUES` and answers with its audited
 /// message, so no field is required here. Each field is bounded by its BMS
 /// length [app/bms/COACTUP.bms], checked by [`AccountUpdateRequest::check`].
@@ -719,23 +734,45 @@ pub struct AccountUpdateRequest {
 }
 
 impl AccountUpdateRequest {
-    /// The BMS field lengths of the `COACTUP` input fields [app/bms/COACTUP.bms].
+    /// COACTUPC 1100-RECEIVE-MAP, 1210-EDIT-ACCOUNT — P-COACTUPC-018,
+    /// V-COACTUPC-002, V-COACTUPC-003 (field lengths only)
+    ///
+    /// The BMS field lengths of the `COACTUP` input fields [app/bms/COACTUP.bms]:
+    /// the body fields, and `account_id`, the `{id}` path segment the handler
+    /// passes for `ACCTSIDI X(11)`.
+    ///
+    /// The path is checked here, with the body, because `1210-EDIT-ACCOUNT`
+    /// edits the key only once `1100-RECEIVE-MAP` has moved it into
+    /// `CC-ACCT-ID X(11)`, cut at the field's width: a longer segment would
+    /// otherwise address the account its first 11 characters name. A segment
+    /// of 11 characters or fewer, blank included, passes, and the key edit
+    /// answers it (V-COACTUPC-002, V-COACTUPC-003).
     ///
     /// A blank, missing or otherwise invalid value passes: the rule edits it.
     /// Lengths count characters, as the 3270 field positions do.
     ///
     /// # Errors
     ///
-    /// 400 `Invalid` with an empty message when any field is longer than its
-    /// BMS field, listing each such field once in `fields`, in the order
-    /// `COACTUPC` edits them ([`AccountUpdateField`]'s rank).
-    pub fn check(&self) -> Result<(), ApiError> {
-        self.validate()
-            .map_err(|errors| reject_invalid(&errors, update_field, OVER_LENGTH_MESSAGE))
+    /// 400 `Invalid` with an empty message when any value is longer than its
+    /// BMS field, listing each such field once in `fields`, `ACCTSID` for the
+    /// path segment, in the order `COACTUPC` edits them
+    /// ([`AccountUpdateField`]'s rank).
+    pub fn check(&self, account_id: &str) -> Result<(), ApiError> {
+        let mut errors = self.validate().err().unwrap_or_default();
+        // `validator` counts characters, and so does this bound.
+        if account_id.chars().count() > ACCOUNT_ID_LEN {
+            errors.add(PATH_ACCOUNT_ID, ValidationError::new(LENGTH_CODE));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(reject_invalid(&errors, update_field, OVER_LENGTH_MESSAGE))
+        }
     }
 
     /// The rule input for the account `account_id` (the `{id}` path segment
-    /// as received) whose fetched records the client saw under `version`.
+    /// as received, which [`AccountUpdateRequest::check`] has bounded) whose
+    /// fetched records the client saw under `version`.
     ///
     /// Every value goes on as entered, and a missing one as empty text: the
     /// field `1100-RECEIVE-MAP` reads as not entered.
@@ -845,11 +882,13 @@ fn entered(value: Option<String>) -> String {
 }
 
 /// The BMS field of the [`AccountUpdateRequest`] field whose JSON name is
-/// `name`, for the length errors `validator` reports by that name. `None` for
-/// `version`, which has no length rule, and for any other name.
+/// `name`, or of the `{id}` segment for [`PATH_ACCOUNT_ID`], for the length
+/// errors `validator` reports by that name. `None` for `version`, which has
+/// no length rule, and for any other name.
 fn update_field(name: &str) -> Option<AccountUpdateField> {
     use AccountUpdateField as F;
     let field = match name {
+        PATH_ACCOUNT_ID => F::Acctsid,
         "acct_active_status" => F::Acsttus,
         "acct_open_year" => F::Opnyear,
         "acct_open_mon" => F::Opnmon,
@@ -994,6 +1033,9 @@ mod tests {
     /// A well-formed token; the tests never compute one, so no key is needed.
     const TOKEN: &str = "0123456789abcdef";
 
+    /// An `{id}` path segment of the full 11 characters of `ACCTSIDI X(11)`.
+    const ACCOUNT: &str = "00000000001";
+
     /// (JSON name, BMS field, BMS length) of every length-checked request
     /// field, in `COACTUP` map order [app/bms/COACTUP.bms].
     const REQUEST_FIELDS: [(&str, &str, usize); 42] = [
@@ -1063,7 +1105,7 @@ mod tests {
                 acct_expiraion_date: Alnum::move_from("2025-05-20"),
                 acct_reissue_date: Alnum::move_from("2025-05-20"),
                 acct_curr_cyc_credit: Money::<10>::ZERO,
-                acct_curr_cyc_debit: Money::<10>::from_cents(-5)?,
+                acct_curr_cyc_debit: Money::<10>::ZERO,
                 acct_addr_zip: Alnum::move_from("A000000000"),
                 acct_group_id: AccountGroupId::move_from(""),
             },
@@ -1112,10 +1154,11 @@ mod tests {
         serde_json::from_value(Value::Object(body)).expect("a request body")
     }
 
-    /// The BMS fields of the error body `check` answers, which must be the
-    /// 400 `Invalid` length answer with no message.
-    fn rejected_fields(request: &AccountUpdateRequest) -> Vec<String> {
-        let error = request.check().expect_err("a field is too long");
+    /// The BMS fields of the error body `check` answers for `request` under
+    /// the path segment `account_id`, which must be the 400 `Invalid` length
+    /// answer with no message.
+    fn rejected_fields(request: &AccountUpdateRequest, account_id: &str) -> Vec<String> {
+        let error = request.check(account_id).expect_err("a value is too long");
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
         let body = error.body();
         assert_eq!(body.code, ErrorKind::Invalid.code());
@@ -1140,7 +1183,7 @@ mod tests {
                 "acct_credit_limit": "2020.00",
                 "acct_cash_credit_limit": "1020.00",
                 "acct_curr_cyc_credit": "0.00",
-                "acct_curr_cyc_debit": "-0.05",
+                "acct_curr_cyc_debit": "0.00",
                 "acct_open_date": "2014-11-20",
                 "acct_expiraion_date": "2025-05-20",
                 "acct_reissue_date": "2025-05-20",
@@ -1172,6 +1215,24 @@ mod tests {
         let text = json.to_string();
         assert!(!text.contains("A000000000"), "{text}");
         assert!(!text.contains("cvv"), "{text}");
+        Ok(())
+    }
+
+    #[test]
+    fn a_negative_cycle_debit_keeps_its_sign_below_one_unit() -> Result<(), NumericError> {
+        // Synthetic: the fixture account's ACCT-CURR-CYC-DEBIT is +0.00, so
+        // this S9(10)V99 value is set by hand to a negative under one dollar,
+        // whose sign a zero integer part must not drop.
+        let fixture = fixture_view()?;
+        let view = AccountView {
+            account: Account {
+                acct_curr_cyc_debit: Money::<10>::from_cents(-5)?,
+                ..fixture.account
+            },
+            ..fixture
+        };
+        let json = serde_json::to_value(AccountResponse::from_view(&view)).expect("serializes");
+        assert_eq!(json["acct_curr_cyc_debit"], "-0.05");
         Ok(())
     }
 
@@ -1249,12 +1310,55 @@ mod tests {
                 Some(bms)
             );
             let over = request_with(name, &"9".repeat(max + 1));
-            assert_eq!(rejected_fields(&over), [bms], "{name}");
+            assert_eq!(rejected_fields(&over, ACCOUNT), [bms], "{name}");
             let at_limit = request_with(name, &"9".repeat(max));
-            assert!(at_limit.check().is_ok(), "{name}");
+            assert!(at_limit.check(ACCOUNT).is_ok(), "{name}");
         }
         assert_eq!(update_field("version"), None);
-        assert_eq!(update_field("account_id"), None);
+        // The name of the `{id}` segment's length error, not a body field.
+        assert_eq!(
+            update_field("account_id"),
+            Some(AccountUpdateField::Acctsid)
+        );
+    }
+
+    #[test]
+    fn the_path_segment_is_bounded_by_acctsid() {
+        // ACSTTUS ranks first among the body fields, so a body over-length in
+        // it and in ACSPFLG shows where ACCTSID falls.
+        let over_status_and_flag = AccountUpdateRequest {
+            acct_active_status: Some("YY".to_owned()),
+            cust_pri_card_holder_ind: Some("YY".to_owned()),
+            ..AccountUpdateRequest::default()
+        };
+        let none = AccountUpdateRequest::default();
+        // (segment, body, the BMS fields of the length answer, empty when the
+        // check passes)
+        let cases: [(&str, &AccountUpdateRequest, &[&str]); 7] = [
+            // Over 11 characters: refused before 1100-RECEIVE-MAP would cut
+            // them to the account their first 11 characters name.
+            ("00000000001X", &none, &["ACCTSID"]),
+            ("000000000012", &none, &["ACCTSID"]),
+            ("00000000001 ", &none, &["ACCTSID"]),
+            // Reported with the body's over-length fields, in COACTUPC order.
+            (
+                "00000000001X",
+                &over_status_and_flag,
+                &["ACCTSID", "ACSTTUS", "ACSPFLG"],
+            ),
+            // 11 characters or fewer, blank included: left to the key edit
+            // (V-COACTUPC-002, V-COACTUPC-003).
+            ("0000000000A", &none, &[]),
+            ("           ", &none, &[]),
+            ("", &none, &[]),
+        ];
+        for (segment, body, expected) in cases {
+            if expected.is_empty() {
+                assert!(body.check(segment).is_ok(), "{segment:?}");
+            } else {
+                assert_eq!(rejected_fields(body, segment), expected, "{segment:?}");
+            }
+        }
     }
 
     #[test]
@@ -1270,7 +1374,7 @@ mod tests {
         ];
         // `validator` reports through a hash map; the body must not vary.
         for _ in 0..8 {
-            assert_eq!(rejected_fields(&all_over), expected);
+            assert_eq!(rejected_fields(&all_over, ACCOUNT), expected);
         }
 
         let two = AccountUpdateRequest {
@@ -1278,7 +1382,7 @@ mod tests {
             acct_active_status: Some("YY".to_owned()),
             ..AccountUpdateRequest::default()
         };
-        assert_eq!(rejected_fields(&two), ["ACSTTUS", "ACSPFLG"]);
+        assert_eq!(rejected_fields(&two, ACCOUNT), ["ACSTTUS", "ACSPFLG"]);
     }
 
     #[test]
@@ -1286,7 +1390,7 @@ mod tests {
         let blank = request_of_all(|_| String::new());
         let spaces = request_of_all(|max| " ".repeat(max));
         for request in [AccountUpdateRequest::default(), blank, spaces.clone()] {
-            assert!(request.check().is_ok(), "{request:?}");
+            assert!(request.check(ACCOUNT).is_ok(), "{request:?}");
         }
         let missing = AccountUpdateRequest::default().into_input(String::new(), token());
         let empty = request_of_all(|_| String::new()).into_input(String::new(), token());

@@ -24,32 +24,48 @@
 //!
 //! # CT02 atomicity
 //!
-//! CT02 is the only all-or-nothing write of the API. One database transaction
-//! holds the cross-reference read of the validation, the serialized TRAN-ID
-//! allocation, the record write, the reward accrual and the balance credit.
-//! The unit commits only when all of them succeeded; any failure after the
-//! unit was opened rolls the whole unit back, so the transaction row, its
-//! accrual and the balance update are persisted together or not at all. The
-//! other legacy writes keep what their savepoints released, but here the
-//! accrual is mandated to commit with the insert (P-COTRN02C-024), and the
-//! COBOL add has no write before the transaction record that could persist.
+//! The reward accrual is mandated to commit with the transaction insert
+//! (AAP 0.3.5, P-COTRN02C-024). One database transaction holds the
+//! cross-reference read of the validation, the serialized TRAN-ID allocation,
+//! the record write, the reward accrual and the balance update, and commits
+//! only when all of them succeeded; any failure after it was opened rolls it
+//! back whole, so the transaction row, its accrual and the balance update
+//! persist together or not at all. This is separate from the `RECOVERY(NONE)`
+//! VSAM write paths [app/csd/CARDDEMO.CSD:L1-96], which run each legacy write
+//! under its own savepoint and keep completed writes when a later one fails
+//! (AAP 0.6.4); the COBOL add has no write before the transaction record that
+//! could persist.
 //!
 //! # Telemetry
 //!
 //! Each handler runs inside one INFO span named after its operation, with
 //! `transaction` (`CT00`, `CT01`, `CT02`), the signed-on `user_id`, the
-//! resource keys (`account_id`, `tran_id`) and `outcome`, recorded once the
-//! unit of work has finished: `ok` or `rejected` for the reads, and
-//! `committed`, `rolled_back` (a failure after validation) or `rejected` (the
-//! request refused before any write) for CT02, which also records
-//! `reward_points` when the add accrued points. The card number is never
-//! recorded.
+//! resource keys and `outcome`, recorded once the unit of work has finished:
+//! `ok` or `rejected` for the reads, and `committed`, `rolled_back` (a failure
+//! after validation) or `rejected` (the request refused before any write) for
+//! CT02, which also records `reward_points` when the add accrued points. The
+//! card number is never recorded.
+//!
+//! A key is recorded only in the form its check gave it, never as entered:
+//! `account_id` is the typed account of the CT00 filter or of the validated
+//! CT02 add, and `tran_id` the TRAN-ID that CT02 allocated or that the CT01
+//! read found. A CT00 filter or a CT02 body that fails its check records
+//! neither key. A CT01 Tran ID that found no transaction records no part of
+//! its text, only `tran_id_length`, its count of characters, and
+//! `tran_id_rejected`:
+//!
+//! | `tran_id_rejected` | The Tran ID |
+//! |---|---|
+//! | `blank` | Was not entered: empty, spaces or `LOW-VALUES` (V-COTRN01C-001) |
+//! | `not_found` | Names no live transaction (V-COTRN01C-002) |
+//! | `unread` | Was never looked up: the read failed or no unit of work could be opened |
 
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use carddemo_domain::clock::Clock;
 use carddemo_domain::entities::Transaction;
+use carddemo_domain::error::ErrorKind;
 use carddemo_domain::ports::{PortError, PortResult, TransactionWriter};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine};
 use carddemo_domain::rules::transaction_add::{self, ValidatedTransaction};
@@ -82,9 +98,18 @@ const OUTCOME_COMMITTED: &str = "committed";
 /// whole.
 const OUTCOME_ROLLED_BACK: &str = "rolled_back";
 
+/// `tran_id_rejected` of a CT01 Tran ID that was not entered.
+const TRAN_ID_BLANK: &str = "blank";
+
+/// `tran_id_rejected` of a CT01 Tran ID that names no live transaction.
+const TRAN_ID_NOT_FOUND: &str = "not_found";
+
+/// `tran_id_rejected` of a CT01 Tran ID that was never looked up.
+const TRAN_ID_UNREAD: &str = "unread";
+
 /// COTRN00C PROCESS-ENTER-KEY, PROCESS-PF7-KEY, PROCESS-PF8-KEY,
-/// PROCESS-PAGE-FORWARD/BACKWARD — P-COTRN00C-005 to P-COTRN00C-016;
-/// V-COTRN00C-001 to V-COTRN00C-013.
+/// PROCESS-PAGE-FORWARD/BACKWARD, SEND-TRNLST-SCREEN — P-COTRN00C-005 to
+/// P-COTRN00C-016, P-COTRN00C-018; V-COTRN00C-001 to V-COTRN00C-013.
 ///
 /// One page of the live transaction master in TRAN-ID order: `direction`
 /// `forward` is ENTER (and PF8 from the `next_key` of the previous page),
@@ -159,8 +184,9 @@ async fn list_page(
     ))
 }
 
-/// COTRN01C PROCESS-ENTER-KEY, READ-TRANSACT-FILE — P-COTRN01C-003 to
-/// P-COTRN01C-005; V-COTRN01C-001 to V-COTRN01C-003.
+/// COTRN01C PROCESS-ENTER-KEY, READ-TRANSACT-FILE, SEND-TRNVIEW-SCREEN —
+/// P-COTRN01C-003 to P-COTRN01C-005, P-COTRN01C-007; V-COTRN01C-001 to
+/// V-COTRN01C-003.
 ///
 /// The live transaction whose TRAN-ID is the path segment, moved into the
 /// 16-byte key as entered, with every `CVTRA05Y` field.
@@ -196,12 +222,50 @@ pub async fn get_transaction(
         "get_transaction",
         transaction = "CT01",
         user_id = %user.user_id,
-        tran_id = %tran_id,
+        tran_id = Empty,
+        tran_id_rejected = Empty,
+        tran_id_length = Empty,
         outcome = Empty,
     );
+    let entered_length = tran_id.chars().count();
     let result = view_one(&state, tran_id).instrument(span.clone()).await;
+    record_tran_id(&span, &result, entered_length);
     span.record("outcome", read_outcome(&result));
     result.map(Json)
+}
+
+/// Records the Tran ID of the CT01 `result` on `span`: the TRAN-ID of the
+/// transaction read, or, when none was, only the category of the failure and
+/// `entered_length`, the entered Tran ID's count of characters.
+fn record_tran_id(
+    span: &Span,
+    result: &Result<TransactionResponse, ApiError>,
+    entered_length: usize,
+) {
+    match result {
+        Ok(found) => {
+            span.record("tran_id", found.tran_id.as_str());
+        }
+        Err(error) => {
+            span.record("tran_id_rejected", tran_id_rejection(error))
+                .record("tran_id_length", entered_length);
+        }
+    }
+}
+
+/// The `tran_id_rejected` category of the CT01 `error`, by its code, which
+/// `crate::error` takes from the error's kind: [`TRAN_ID_BLANK`] for the
+/// `EMPTY` blank Tran ID, [`TRAN_ID_NOT_FOUND`] for `NOT_FOUND`, and
+/// [`TRAN_ID_UNREAD`] for any other failure.
+fn tran_id_rejection(error: &ApiError) -> &'static str {
+    let code = error.body().code.as_str();
+    if code == ErrorKind::Empty.code() {
+        TRAN_ID_BLANK
+    } else if code == ErrorKind::NotFound.code() {
+        TRAN_ID_NOT_FOUND
+    } else {
+        TRAN_ID_UNREAD
+    }
 }
 
 /// The CT01 view of `tran_id`.
@@ -405,5 +469,42 @@ const fn read_outcome<T>(result: &Result<T, ApiError>) -> &'static str {
     match result {
         Ok(_) => OUTCOME_OK,
         Err(_) => OUTCOME_REJECTED,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carddemo_domain::error::DomainError;
+    use carddemo_domain::messages::{
+        TRAN_ID_CAN_NOT_BE_EMPTY, TRANSACTION_ID_NOT_FOUND, UNABLE_TO_LOOKUP_TRANSACTION,
+    };
+    use carddemo_domain::rules::transaction_view::TRAN_ID_FIELD;
+
+    use super::{TRAN_ID_BLANK, TRAN_ID_NOT_FOUND, TRAN_ID_UNREAD, tran_id_rejection};
+    use crate::error::ApiError;
+
+    #[test]
+    fn a_tran_id_that_found_no_transaction_is_recorded_only_by_its_failure_class() {
+        // CT01 error -> `tran_id_rejected`
+        let cases = [
+            (
+                DomainError::empty(TRAN_ID_CAN_NOT_BE_EMPTY).with_field(TRAN_ID_FIELD),
+                TRAN_ID_BLANK,
+            ),
+            (
+                DomainError::not_found(TRANSACTION_ID_NOT_FOUND).with_field(TRAN_ID_FIELD),
+                TRAN_ID_NOT_FOUND,
+            ),
+            (
+                DomainError::unexpected(UNABLE_TO_LOOKUP_TRANSACTION).with_field(TRAN_ID_FIELD),
+                TRAN_ID_UNREAD,
+            ),
+        ];
+        for (error, expected) in cases {
+            let error = ApiError::from(error);
+            assert_eq!(tran_id_rejection(&error), expected, "{error:?}");
+        }
+        // No unit of work could be opened, so the Tran ID was never edited.
+        assert_eq!(tran_id_rejection(&ApiError::unexpected()), TRAN_ID_UNREAD);
     }
 }
