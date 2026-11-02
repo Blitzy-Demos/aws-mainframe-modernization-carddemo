@@ -1,0 +1,176 @@
+//! `batch seed`: the jobs that build and reload the `CardDemo` files.
+//!
+//! | Options | Jobs replaced |
+//! |---|---|
+//! | none | The README refresh sequence: `ACCTFILE`, `CARDFILE`, `CUSTFILE`, `XREFFILE`, `DISCGRP`, `TCATBALF`, `TRANTYPE`, `TRANCATG` (IDCAMS `REPRO`) and `DUSRSECJ` (IEBGENER, `REPRO`), plus the `CREADB21` loads `LDTTYPE`/`LDTCCAT` [app/app-transaction-type-db2/jcl/CREADB21.jcl:L64-84] while the Db2 masters are empty |
+//! | `--if-empty` | The same, on a first start only: nothing happens when the account master holds rows |
+//! | `--only tranextr` | `TRANEXTR` STEP40/STEP50 (DSNTIAUL) [app/app-transaction-type-db2/jcl/TRANEXTR.jcl:L62-122] and the `TRANTYPE`/`TRANCATG` loads of its unload: the Db2 masters copied over the processing copies |
+//!
+//! The loading itself is `carddemo_persistence::seed::run`, one database transaction per run
+//! that decodes every fixture through the `carddemo-codec` layouts, so the database holds the
+//! bytes the codec round-trips (o4). This job only locates the sources and turns the outcome
+//! into an exit status. Seed jobs are replaced, not parity-tested (AAP 0.3.2), so no audit row
+//! gates this module.
+
+use std::path::Path;
+
+use carddemo_persistence::Db;
+use carddemo_persistence::seed::{self, SeedReport, SeedSources};
+use carddemo_runtime::config::Settings;
+use tracing::Span;
+
+use super::{JobContext, setup_failure};
+use crate::cli::SeedArgs;
+use crate::exit::ExitStatus;
+
+/// Runs the seed `args` selects against `db` and records the rows it wrote in `written` on
+/// the job span.
+///
+/// The sources resolve against the current directory, the repository root the runbook runs
+/// every command from: the fixture directory is `CARDDEMO_FIXTURE_DIR` (default
+/// `app/data/ASCII`), and the `DUSRSECJ` job and the `CREADB21` load statements stay at their
+/// repository paths. `--if-empty` on a seeded database writes nothing and ends normally.
+///
+/// A source that cannot be read or decoded, or a failed statement, is a setup failure
+/// (exit 16): the seed jobs have no condition code the work reproduces. The seed's single
+/// transaction is then rolled back, so the database is left as it was.
+pub(crate) async fn run(ctx: &JobContext, db: &Db, args: &SeedArgs) -> ExitStatus {
+    let repo_root = match std::env::current_dir() {
+        Ok(dir) => dir,
+        Err(err) => return setup_failure("current directory unavailable", err),
+    };
+    let sources = seed_sources(&repo_root, &ctx.settings);
+    match seed::run(db, args.mode(), &sources).await {
+        Ok(report) => {
+            // `seed::run` already emits the per-table counts and the refreshed,
+            // masters-loaded and skipped flags as one event inside this span, so the job adds
+            // only the span's `written` total rather than a second event with the same counts.
+            Span::current().record("written", rows_written(&report));
+            ExitStatus::Success
+        }
+        Err(err) => setup_failure("seed failed", err),
+    }
+}
+
+/// The seed sources of the repository at `repo_root`, with the fixture directory of
+/// `settings`. A relative `CARDDEMO_FIXTURE_DIR` resolves against `repo_root`, an absolute one
+/// stands as given.
+fn seed_sources(repo_root: &Path, settings: &Settings) -> SeedSources {
+    SeedSources {
+        fixture_dir: repo_root.join(&settings.fixture_dir),
+        ..SeedSources::with_defaults(repo_root)
+    }
+}
+
+/// The rows `report` says were inserted, over every table. The destructuring names every
+/// field, so a count added to [`SeedReport`] fails to compile here until it is summed.
+fn rows_written(report: &SeedReport) -> usize {
+    let SeedReport {
+        accounts,
+        cards,
+        card_xref,
+        customers,
+        disclosure_groups,
+        tran_cat_balances,
+        trantype_file,
+        trancatg_file,
+        users,
+        transaction_types,
+        transaction_categories,
+        reward_rules,
+        masters_loaded: _,
+        refreshed: _,
+        skipped: _,
+    } = report;
+    [
+        accounts,
+        cards,
+        card_xref,
+        customers,
+        disclosure_groups,
+        tran_cat_balances,
+        trantype_file,
+        trancatg_file,
+        users,
+        transaction_types,
+        transaction_categories,
+        reward_rules,
+    ]
+    .into_iter()
+    .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use carddemo_persistence::seed::{SeedReport, SeedSources};
+    use carddemo_runtime::config::Settings;
+
+    use super::{rows_written, seed_sources};
+
+    #[test]
+    fn fixture_dir_comes_from_the_settings_and_the_rest_from_the_repository() {
+        let root = Path::new("/repo");
+        let cases = [
+            (PathBuf::from("app/data/ASCII"), root.join("app/data/ASCII")),
+            (PathBuf::from("/data/ascii"), PathBuf::from("/data/ascii")),
+        ];
+        for (configured, expected) in cases {
+            let settings = Settings {
+                fixture_dir: configured.clone(),
+                ..Settings::default()
+            };
+            let sources = seed_sources(root, &settings);
+            let defaults = SeedSources::with_defaults(root);
+            assert_eq!(sources.fixture_dir, expected, "{}", configured.display());
+            assert_eq!(sources.dusrsecj_jcl, defaults.dusrsecj_jcl);
+            assert_eq!(sources.db2_ctl_dir, defaults.db2_ctl_dir);
+        }
+    }
+
+    #[test]
+    fn rows_written_sums_every_count_and_no_flag() {
+        let cases = [
+            (SeedReport::default(), 0),
+            (
+                SeedReport {
+                    skipped: true,
+                    ..SeedReport::default()
+                },
+                0,
+            ),
+            (
+                SeedReport {
+                    trantype_file: 7,
+                    trancatg_file: 18,
+                    ..SeedReport::default()
+                },
+                25,
+            ),
+            (
+                SeedReport {
+                    accounts: 50,
+                    cards: 50,
+                    card_xref: 50,
+                    customers: 50,
+                    disclosure_groups: 51,
+                    tran_cat_balances: 50,
+                    trantype_file: 7,
+                    trancatg_file: 18,
+                    users: 10,
+                    transaction_types: 7,
+                    transaction_categories: 18,
+                    reward_rules: 2,
+                    masters_loaded: true,
+                    refreshed: false,
+                    skipped: false,
+                },
+                363,
+            ),
+        ];
+        for (report, expected) in cases {
+            assert_eq!(rows_written(&report), expected, "{report:?}");
+        }
+    }
+}
