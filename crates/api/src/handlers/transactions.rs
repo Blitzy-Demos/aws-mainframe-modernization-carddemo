@@ -336,22 +336,28 @@ async fn validate_request(
 
 /// COTRN02C ADD-TRANSACTION, WRITE-TRANSACT-FILE — P-COTRN02C-020 to
 /// P-COTRN02C-025; V-COTRN02C-029 to V-COTRN02C-033; `RewardEngine`
-/// (AAP 0.3.5): allocate the TRAN-ID, write the record, accrue its points.
+/// (AAP 0.3.5): lock the account the accrual credits, allocate the TRAN-ID,
+/// write the record, accrue its points.
 ///
 /// Nothing here commits or rolls back; the caller ends `uow` according to the
 /// result.
 ///
 /// # Errors
 ///
-/// The allocation error of `transaction_add::allocated_tran_id`, the write
-/// error of `transaction_add::write_result`, and 500 for a reward-engine
-/// failure.
+/// 500 when the account lock fails, the allocation error of
+/// `transaction_add::allocated_tran_id`, the write error of
+/// `transaction_add::write_result`, and 500 for a reward-engine failure.
 async fn insert_and_accrue(
     uow: &mut UnitOfWork,
     validated: &ValidatedTransaction,
     clock: &impl Clock,
     span: &Span,
 ) -> Result<TransactionAddResponse, ApiError> {
+    // Lock order (`carddemo_persistence::ids`): the account lock the reward
+    // balance's foreign key takes comes before the TRAN-ID advisory lock, as
+    // CB00's `READ UPDATE` of the account does, so a CT02 and a CB00 on the
+    // same account queue on the account row and never deadlock.
+    uow.lock_account_reference(validated.account_id()).await?;
     // An allocation failure gets the audited `COTRN02C` browse messages, an
     // empty live master its not-found (V-COTRN02C-029 to V-COTRN02C-031),
     // rather than the generic unexpected error.

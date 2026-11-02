@@ -33,7 +33,18 @@
 //! [app/csd/CARDDEMO.CSD:L1-96], so each `REWRITE` is durable when it completes and survives a
 //! later abend (P-CBACT04C-010). A commit per record gives the account rewrites that durability,
 //! and holds no account row lock beyond its record, so online bill payments and account updates
-//! do not wait for the end of the run.
+//! do not wait for the end of the run. Because the earlier records of an account are already
+//! committed when its break comes, the rule re-reads the account with a row lock at the break
+//! and adds the interest to that record, so a payment, account update or posting committed in
+//! between keeps its changes; the lock lasts until the break record's commit.
+//!
+//! `DISCGRP` is reference data: CBACT04C opens it `INPUT`, `batch seed` loads it, and no online
+//! program or other job writes it, so a key reads the same record, or the same status 23, for
+//! the whole run. The job therefore keeps the outcome of each disclosure group key the run has
+//! read and answers the repeated reads from it (`RecordStore`). The rule still issues the reads
+//! of `1200-GET-INTEREST-RATE` and `1200-A-GET-DEFAULT-INT-RATE` for every balance record and
+//! counts its `DEFAULT` fallbacks (P-CBACT04C-004, P-CBACT04C-005, P-CBACT04C-193); a read that
+//! fails otherwise is never kept and abends as before.
 //!
 //! On an abend the record's unit of work is still committed, because the rule's account rewrite
 //! ran under its own savepoint and persists, and the pending `SYSTRAN(+1)` is dropped
@@ -43,17 +54,24 @@
 //! No interest transaction enters the live transaction master: `SYSTRAN(0)` reaches it only
 //! through `batch combtran`.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::slice;
 
 use carddemo_codec::layouts::{TransactionLayout, TransactionRecord};
-use carddemo_domain::entities::{NewTransaction, TranCatBalance, TranCatBalanceKey};
+use carddemo_domain::entities::{
+    Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
+    TranCatBalanceKey,
+};
 use carddemo_domain::messages::{
     ABENDING_PROGRAM, END_OF_EXECUTION_OF_PROGRAM_CBACT04C, ERROR_CLOSING_TRANSACTION_FILE,
     ERROR_OPENING_TRANSACTION_FILE, file_status_message,
 };
-use carddemo_domain::numeric::Alnum;
-use carddemo_domain::ports::TranCatBalanceStore;
+use carddemo_domain::numeric::{AccountId, Alnum, CardNumber};
+use carddemo_domain::ports::{
+    AccountReader, AccountWriter, DisclosureGroupReader, PortError, PortResult,
+    TranCatBalanceStore, XrefReader,
+};
 use carddemo_domain::rules::interest::{InterestAbend, InterestRun};
 use carddemo_persistence::{Db, UnitOfWork};
 use tracing::Span;
@@ -91,6 +109,7 @@ pub(super) async fn run(ctx: &JobContext, db: &Db, args: &IntcalcArgs) -> ExitSt
         ctx,
         db,
         interest: InterestRun::new(parm),
+        groups: DisclosureGroups::new(),
         systran,
         read: 0,
         written: 0,
@@ -164,6 +183,90 @@ async fn read_page(
     }
 }
 
+/// The `DISCGRP` outcomes a run has read, by the key read: the record, or `None` for a key that
+/// ended with status 23.
+type DisclosureGroups = HashMap<DisclosureGroupKey, Option<DisclosureGroup>>;
+
+/// The store the rule uses for one balance record: `store`, bound to the record's unit of work,
+/// for every file, with the `DISCGRP` reads answered from the run's `groups` once a key is read.
+///
+/// `DISCGRP` does not change during the run (see the module documentation), so each key's
+/// record or status 23 is read from the store once per run instead of once or twice per balance
+/// record. The account and cross-reference accesses pass straight to `store`, so their locks,
+/// savepoints and outcomes are those of the unit of work.
+struct RecordStore<'g, S> {
+    /// The record's unit of work.
+    store: S,
+    /// The `DISCGRP` outcomes of the run.
+    groups: &'g mut DisclosureGroups,
+}
+
+/// CBACT04C 1100-GET-ACCT-DATA and the locked re-read of 1050-UPDATE-ACCOUNT — P-CBACT04C-002,
+/// P-CBACT04C-010: the reads of the record's unit of work.
+impl<S: AccountReader + Send> AccountReader for RecordStore<'_, S> {
+    async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
+        self.store.read_account(id).await
+    }
+
+    async fn read_account_for_update(&mut self, id: AccountId) -> PortResult<Account> {
+        self.store.read_account_for_update(id).await
+    }
+}
+
+/// CBACT04C 1050-UPDATE-ACCOUNT — P-CBACT04C-010: the rewrite of the record's unit of work,
+/// under its own savepoint.
+impl<S: AccountWriter + Send> AccountWriter for RecordStore<'_, S> {
+    async fn rewrite_account(&mut self, account: Account) -> PortResult<()> {
+        self.store.rewrite_account(account).await
+    }
+}
+
+/// CBACT04C 1110-GET-XREF-DATA — P-CBACT04C-002: the reads of the record's unit of work.
+impl<S: XrefReader + Send> XrefReader for RecordStore<'_, S> {
+    async fn read_xref_by_card(&mut self, card: CardNumber) -> PortResult<CardXref> {
+        self.store.read_xref_by_card(card).await
+    }
+
+    async fn read_xref_by_account(&mut self, id: AccountId) -> PortResult<CardXref> {
+        self.store.read_xref_by_account(id).await
+    }
+
+    async fn xrefs_after(
+        &mut self,
+        after: Option<CardNumber>,
+        limit: u16,
+    ) -> PortResult<Vec<CardXref>> {
+        self.store.xrefs_after(after, limit).await
+    }
+}
+
+/// CBACT04C 1200-GET-INTEREST-RATE and 1200-A-GET-DEFAULT-INT-RATE — P-CBACT04C-004,
+/// P-CBACT04C-005, P-CBACT04C-193: the random `READ` of `DISCGRP` by `key`.
+///
+/// A key the run has read returns its kept outcome: the record, or [`PortError::NotFound`] for
+/// status 23, on which the rule reads `DEFAULT` and counts the fallback as before. A key not yet
+/// read goes to the store, and a record or status 23 is kept. Any other failure is returned as
+/// the store gave it and not kept, so the rule abends with it and a later read of the key would
+/// go to the store again.
+impl<S: DisclosureGroupReader + Send> DisclosureGroupReader for RecordStore<'_, S> {
+    async fn read_disclosure_group(
+        &mut self,
+        key: DisclosureGroupKey,
+    ) -> PortResult<DisclosureGroup> {
+        if let Some(kept) = self.groups.get(&key) {
+            return kept.clone().ok_or(PortError::NotFound);
+        }
+        let outcome = self.store.read_disclosure_group(key.clone()).await;
+        let kept = match &outcome {
+            Ok(group) => Some(group.clone()),
+            Err(PortError::NotFound) => None,
+            Err(_) => return outcome,
+        };
+        self.groups.insert(key, kept);
+        outcome
+    }
+}
+
 /// One `batch intcalc` run: the CBACT04C state the rule keeps, the open `SYSTRAN(+1)` and the
 /// counts the job span records.
 struct IntcalcJob<'a> {
@@ -173,6 +276,8 @@ struct IntcalcJob<'a> {
     db: &'a Db,
     /// The CBACT04C working storage across balance records.
     interest: InterestRun,
+    /// The `DISCGRP` outcomes the run has read, shared by every record's [`RecordStore`].
+    groups: DisclosureGroups,
     /// `TRANSACT DD DSN=SYSTRAN(+1)`, open for output.
     systran: PendingGeneration,
     /// `WS-RECORD-COUNT`: the balance records read.
@@ -208,8 +313,9 @@ impl IntcalcJob<'_> {
     /// CBACT04C loop body [app/cbl/CBACT04C.cbl:L191-217] — P-CBACT04C-002, P-CBACT04C-006,
     /// P-CBACT04C-007, P-CBACT04C-010, P-CBACT04C-182: `ADD 1 TO WS-RECORD-COUNT`,
     /// `DISPLAY TRAN-CAT-BAL-RECORD`, then the rule on one balance record in its own unit of
-    /// work, and the interest record it returns written to `SYSTRAN(+1)`. A zero rate returns
-    /// none and writes nothing.
+    /// work, through a [`RecordStore`] that answers the run's repeated `DISCGRP` reads, and the
+    /// interest record it returns written to `SYSTRAN(+1)`. A zero rate returns none and writes
+    /// nothing.
     ///
     /// # Errors
     ///
@@ -226,7 +332,14 @@ impl IntcalcJob<'_> {
             .map_err(|err| setup_failure("balance record unit of work could not begin", err))?;
         let processed = self
             .interest
-            .process_record(&mut uow.store(), record, &self.ctx.clock)
+            .process_record(
+                &mut RecordStore {
+                    store: uow.store(),
+                    groups: &mut self.groups,
+                },
+                record,
+                &self.ctx.clock,
+            )
             .await;
         let written = match processed {
             Ok(Some(tran)) => self.write_systran(tran),
@@ -383,19 +496,109 @@ fn systran_abend(text: &'static str) -> ExitStatus {
 
 #[cfg(test)]
 mod tests {
+    use carddemo_domain::entities::{DisclosureGroup, DisclosureGroupKey};
     use carddemo_domain::messages::{
         ABENDING_PROGRAM, ERROR_CLOSING_TRANSACTION_FILE, ERROR_OPENING_TRANSACTION_FILE,
         ERROR_WRITING_TRANSACTION_RECORD,
     };
+    use carddemo_domain::numeric::{AccountGroupId, InterestRate, TranCategoryCode, TranTypeCode};
+    use carddemo_domain::ports::{DisclosureGroupReader, PortError, PortResult};
     use carddemo_domain::rules::interest::InterestAbend;
 
-    use super::{NO_FURTHER_INFORMATION, abend_status, parm_date, systran_abend};
+    use super::{
+        DisclosureGroups, NO_FURTHER_INFORMATION, RecordStore, abend_status, parm_date,
+        systran_abend,
+    };
     use crate::cli::IntcalcArgs;
     use crate::exit::{ABEND, ExitStatus};
 
     fn args(parm: &str) -> IntcalcArgs {
         IntcalcArgs {
             parm_date: parm.to_owned(),
+        }
+    }
+
+    /// `DISCGRP` in memory, counting the reads that reach it; the first read fails with `failure`
+    /// when one is given.
+    struct CountedGroups {
+        groups: Vec<DisclosureGroup>,
+        failure: Option<PortError>,
+        reads: usize,
+    }
+
+    impl DisclosureGroupReader for CountedGroups {
+        async fn read_disclosure_group(
+            &mut self,
+            key: DisclosureGroupKey,
+        ) -> PortResult<DisclosureGroup> {
+            self.reads += 1;
+            if let Some(cause) = self.failure.take() {
+                return Err(cause);
+            }
+            self.groups
+                .iter()
+                .find(|group| group.key == key)
+                .cloned()
+                .ok_or(PortError::NotFound)
+        }
+    }
+
+    #[tokio::test]
+    async fn discgrp_reads_keep_records_and_status_23_for_the_run_but_not_failures() {
+        // The DEFAULT 01/0001 rate of every fixture 01/0001 balance (P-CBACT04C-023) and the
+        // blank-group key of the same balance, which ends with status 23 (E-06).
+        let type_01 = TranTypeCode::move_from("01");
+        let category_1 = TranCategoryCode::new(1).expect("a four-digit category");
+        let default_01 = DisclosureGroup {
+            key: DisclosureGroupKey::default_group(type_01, category_1),
+            dis_int_rate: InterestRate::from_hundredths(1_500).expect("a rate within S9(04)V99"),
+        };
+        let blank_01 = DisclosureGroupKey {
+            dis_acct_group_id: AccountGroupId::move_from(""),
+            dis_tran_type_cd: type_01,
+            dis_tran_cat_cd: category_1,
+        };
+        let unavailable = PortError::Unavailable("connection reset".to_owned());
+        // (key, failure of the first store read, outcomes of two records' reads, store reads)
+        let cases = [
+            (
+                default_01.key.clone(),
+                None,
+                [Ok(default_01.clone()), Ok(default_01.clone())],
+                1,
+            ),
+            (
+                blank_01,
+                None,
+                [Err(PortError::NotFound), Err(PortError::NotFound)],
+                1,
+            ),
+            (
+                default_01.key.clone(),
+                Some(unavailable.clone()),
+                [Err(unavailable), Ok(default_01.clone())],
+                2,
+            ),
+        ];
+        for (key, failure, expected, reads) in cases {
+            let mut store = CountedGroups {
+                groups: vec![default_01.clone()],
+                failure,
+                reads: 0,
+            };
+            let mut groups = DisclosureGroups::new();
+            let mut outcomes = Vec::new();
+            // One RecordStore per balance record, sharing the run's outcomes.
+            for _ in 0..2 {
+                let mut record_store = RecordStore {
+                    store,
+                    groups: &mut groups,
+                };
+                outcomes.push(record_store.read_disclosure_group(key.clone()).await);
+                store = record_store.store;
+            }
+            assert_eq!(outcomes, expected, "{key:?}");
+            assert_eq!(store.reads, reads, "{key:?}");
         }
     }
 

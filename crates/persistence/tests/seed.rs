@@ -1,8 +1,9 @@
 //! Integration tests of `carddemo_persistence::seed`: the first seed, the
 //! `--if-empty` guard, the refresh that replaces the README refresh sequence
 //! `ACCTFILE` … `DUSRSECJ` [README.md:L213-232], the `TRANEXTR` copy of the Db2
-//! masters over the processing copies, and the single database transaction of
-//! every run (AAP 0.3.2, 0.3.6, 0.9.3 "Seed counts").
+//! masters over the processing copies, the single database transaction of
+//! every run (AAP 0.3.2, 0.3.6, 0.9.3 "Seed counts"), and the refresh's place
+//! in the account lock order `carddemo_persistence::ids` documents.
 //!
 //! Each test starts its own migrated `postgres:16.15` container through
 //! `carddemo_testkit::TestStack`, so the Docker daemon must be running. The
@@ -14,10 +15,12 @@
 //!
 //! The testkit reaches `carddemo-persistence` through a dev-dependency cycle,
 //! so only plain sqlx values cross from it: every `Db` here wraps a clone of
-//! the stack's `PgPool`.
+//! the stack's `PgPool`, or a pool of its own on the stack's database URL.
 
 use std::fs;
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use carddemo_codec::layouts::tran_cat_balance::TRAN_CAT_BAL;
 use carddemo_codec::{
@@ -25,20 +28,72 @@ use carddemo_codec::{
     DisclosureGroupLayout, Layout, TranCatBalanceLayout, decode_ascii_file, split_ascii,
 };
 use carddemo_domain::auth::{hash_stored_password, verify_as_entered, verify_signon};
-use carddemo_domain::numeric::AccountId;
+use carddemo_domain::entities::{CardXref, NewTransaction, Transaction};
+use carddemo_domain::numeric::{
+    AccountId, Alnum, MerchantId, Money, RewardPoints, TranCategoryCode, TranId, TranTypeCode,
+};
 use carddemo_domain::ports::{
     AccountReader, CardReader, CustomerReader, DisclosureGroupReader, PortError,
-    TranCatBalanceStore, XrefReader,
+    TranCatBalanceStore, TransactionWriter, XrefReader,
 };
+use carddemo_domain::rewards::{AccrualInput, RewardEngine};
 use carddemo_persistence::seed::{SeedMode, SeedReport, SeedSources, run};
-use carddemo_persistence::{Db, PersistenceError, PgStore};
+use carddemo_persistence::{Db, PersistenceError, PgStore, UnitOfWork};
 use carddemo_testkit::{TestStack, block_on, fixtures};
 use chrono::{DateTime, TimeZone, Utc};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
 /// The balance account 1 is edited to after a seed: 12345.67.
 const EDITED_BALANCE_CENTS: i64 = 1_234_567;
+
+/// The message of the exception [`FAIL_RULE_INSERT_AT_COMMIT`] raises.
+const INJECTED_COMMIT_FAILURE: &str = "injected seed commit failure";
+
+/// A deferred constraint trigger that fails, at its commit, every transaction
+/// that inserted a reward rule, raising [`INJECTED_COMMIT_FAILURE`].
+const FAIL_RULE_INSERT_AT_COMMIT: &str = r"
+CREATE FUNCTION test_fail_reward_rule_commit() RETURNS trigger
+    LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'injected seed commit failure';
+END
+$$;
+CREATE CONSTRAINT TRIGGER test_fail_reward_rule_commit
+    AFTER INSERT ON reward_rules
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION test_fail_reward_rule_commit();";
+
+/// Removes [`FAIL_RULE_INSERT_AT_COMMIT`].
+const DROP_FAIL_RULE_INSERT_AT_COMMIT: &str = r"
+DROP TRIGGER test_fail_reward_rule_commit ON reward_rules;
+DROP FUNCTION test_fail_reward_rule_commit();";
+
+/// The `application_name` of the sessions that contend for `accounts` in
+/// `refresh_waits_for_an_account_row_lock_holder`, which tells them apart in
+/// `pg_stat_activity`. [`CONTENDER_LOCK_WAITERS`] and [`CONTENDER_SESSIONS`]
+/// spell it out.
+const CONTENDERS: &str = "seed-lock-order";
+
+/// The contending sessions that wait for a heavyweight lock: a table lock, or
+/// a row lock, which a session waits for as the transaction ID of its holder.
+const CONTENDER_LOCK_WAITERS: &str = "SELECT count(*)::text FROM pg_stat_activity \
+     WHERE application_name = 'seed-lock-order' AND wait_event_type = 'Lock'";
+
+/// The contending sessions still connected.
+const CONTENDER_SESSIONS: &str =
+    "SELECT count(*)::text FROM pg_stat_activity WHERE application_name = 'seed-lock-order'";
+
+/// The deadlocks the server has detected in the test database.
+const DEADLOCKS: &str =
+    "SELECT deadlocks::text FROM pg_stat_database WHERE datname = current_database()";
+
+/// How long a session may take to reach a lock wait, or to disconnect.
+const SESSION_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The pause between two reads of `pg_stat_activity`.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Rows per table, read in one statement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -108,6 +163,18 @@ struct RuleRow {
     max_transaction_amount: Option<Decimal>,
     active_from: DateTime<Utc>,
     active_to: Option<DateTime<Utc>>,
+}
+
+/// The state of the identity sequences behind `reward_rules.rule_id` and
+/// `reward_accruals.accrual_id`: each one's last value, and whether `nextval`
+/// has returned it. When it has not, the next identity is the last value
+/// itself; otherwise it is the one after.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RewardSequences {
+    rule_last_value: i64,
+    rule_is_called: bool,
+    accrual_last_value: i64,
+    accrual_is_called: bool,
 }
 
 /// The seed sources at their places in the repository, read only.
@@ -347,6 +414,51 @@ async fn insert_rule(pool: &PgPool) -> i64 {
     .fetch_one(pool)
     .await
     .expect("rule insert")
+}
+
+/// The state of both reward identity sequences, read from the sequences
+/// `PostgreSQL` names after their identity columns.
+async fn reward_sequences(pool: &PgPool) -> RewardSequences {
+    sqlx::query_as!(
+        RewardSequences,
+        r#"SELECT r.last_value AS "rule_last_value!", r.is_called AS "rule_is_called!",
+                  a.last_value AS "accrual_last_value!", a.is_called AS "accrual_is_called!"
+             FROM reward_rules_rule_id_seq r CROSS JOIN reward_accruals_accrual_id_seq a"#
+    )
+    .fetch_one(pool)
+    .await
+    .expect("reward identity sequences")
+}
+
+/// Inserts an accrual of account 1 against the transaction `transaction_id`
+/// and rule 1, as the reward store would, returning its identity.
+async fn insert_accrual(pool: &PgPool, transaction_id: i64) -> i64 {
+    let created_at = Utc
+        .with_ymd_and_hms(2022, 7, 2, 12, 0, 0)
+        .single()
+        .expect("2022-07-02T12:00:00Z is one instant");
+    sqlx::query_scalar!(
+        r#"INSERT INTO reward_accruals (account_id, transaction_id, rule_id, points_earned, created_at)
+           VALUES (1, $1, 1, 10, $2)
+           RETURNING accrual_id"#,
+        transaction_id,
+        created_at
+    )
+    .fetch_one(pool)
+    .await
+    .expect("accrual insert")
+}
+
+/// Deletes the accrual of the transaction `transaction_id`, which frees the
+/// transaction for another accrual.
+async fn delete_accrual(pool: &PgPool, transaction_id: i64) {
+    sqlx::query!(
+        "DELETE FROM reward_accruals WHERE transaction_id = $1",
+        transaction_id
+    )
+    .execute(pool)
+    .await
+    .expect("accrual delete");
 }
 
 /// Sets the current balance of account 1.
@@ -615,6 +727,166 @@ fn assert_last_tcatbal_sign_rejected(err: &PersistenceError, sources: &SeedSourc
         source.kind,
         CodecErrorKind::PlainDigitInSigned { byte: b'0' }
     );
+}
+
+/// A pool of two sessions named [`CONTENDERS`] on the stack's database: one
+/// for the unit of work that holds an account row, one for the refresh.
+fn contender_pool(stack: &TestStack) -> PgPool {
+    let options = stack
+        .database_url()
+        .parse::<PgConnectOptions>()
+        .unwrap_or_else(|err| panic!("the stack's database URL does not parse: {err}"))
+        .application_name(CONTENDERS);
+    block_on(
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options),
+    )
+    .unwrap_or_else(|err| panic!("the contender pool cannot connect: {err}"))
+}
+
+/// Reads `sql`, a one-row count, until it is `count`, panicking with `what`
+/// when that does not happen within [`SESSION_DEADLINE`]. The pause between
+/// two reads blocks only the calling thread, which drives nothing else.
+async fn wait_for_count(stack: &TestStack, sql: &str, count: usize, what: &str) {
+    let expected = vec![vec![Some(count.to_string())]];
+    let until = Instant::now() + SESSION_DEADLINE;
+    loop {
+        let seen = stack.fetch_text_rows(sql).await;
+        if seen == expected {
+            return;
+        }
+        assert!(
+            Instant::now() < until,
+            "expected {count} {what} within {SESSION_DEADLINE:?}, last saw {seen:?}"
+        );
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// The deadlocks the server has counted in the test database, as text.
+fn deadlocks(stack: &TestStack) -> Vec<Vec<Option<String>>> {
+    block_on(stack.fetch_text_rows(DEADLOCKS))
+}
+
+/// The `CVTRA05Y` record of a 50.00 purchase, type `01` and category `0001`,
+/// on the card of `xref`, as CT02 writes it: seed rule 1 accrues
+/// `ceil(50.00 × 1.0)` = 50 points on it.
+fn purchase(tran_id: TranId, xref: &CardXref) -> NewTransaction {
+    NewTransaction {
+        tran_id,
+        tran_type_cd: TranTypeCode::move_from("01"),
+        tran_cat_cd: TranCategoryCode::new(1).expect("a 9(04) category code"),
+        tran_source: Alnum::move_from("POS TERM"),
+        tran_desc: Alnum::move_from("Seed lock order purchase"),
+        tran_amt: Money::from_cents(5_000).expect("an S9(09)V99 amount"),
+        tran_merchant_id: MerchantId::new(800_000_001).expect("a 9(09) merchant ID"),
+        tran_merchant_name: Alnum::move_from("Lock order merchant"),
+        tran_merchant_city: Alnum::move_from("Seattle"),
+        tran_merchant_zip: Alnum::move_from("98101"),
+        tran_card_num: xref.xref_card_num,
+        tran_orig_ts: Alnum::move_from("2022-07-01 12:00:00.000000"),
+        tran_proc_ts: Alnum::move_from("2022-07-01 12:00:00.000000"),
+    }
+}
+
+/// Commits the live row `0000000000000001` on the card of `account`, so the
+/// live master a CT02 allocates from is not empty (E-07), and returns the
+/// cross-reference of that card.
+async fn commit_live_row(db: &Db, account: AccountId) -> CardXref {
+    let mut uow = db.begin().await.expect("the live row's unit of work");
+    let xref = uow
+        .store()
+        .read_xref_by_account(account)
+        .await
+        .unwrap_or_else(|err| panic!("account {account} has no card: {err}"));
+    let first = TranId::zeros().next().expect("sixteen zeros are numeric");
+    uow.store()
+        .write_transaction(purchase(first, &xref))
+        .await
+        .expect("the live row insert");
+    uow.commit().await.expect("the live row commits");
+    xref
+}
+
+/// The CT02 add after its account lock, in `uow`: the TRAN-ID allocation, the
+/// insert of [`purchase`], and the reward accrual, which reads `reward_rules`
+/// and writes `reward_accruals` and `reward_balances`. Returns the allocated
+/// TRAN-ID and the points earned.
+async fn add_and_accrue(uow: &mut UnitOfWork, xref: &CardXref) -> (TranId, RewardPoints) {
+    let tran_id = uow
+        .next_tran_id()
+        .await
+        .unwrap_or_else(|err| panic!("the CT02 allocation failed: {err}"));
+    let record = purchase(tran_id, xref);
+    let row_id = uow
+        .store()
+        .write_transaction(record.clone())
+        .await
+        .unwrap_or_else(|err| panic!("the CT02 insert failed: {err}"));
+    let added = Transaction::from_new(row_id, record);
+    let at = Utc
+        .with_ymd_and_hms(2022, 7, 1, 12, 0, 0)
+        .single()
+        .expect("2022-07-01T12:00:00Z is one instant");
+    let input = AccrualInput::for_transaction(&added, xref.xref_acct_id);
+    let accrual = RewardEngine::accrue(&mut uow.rewards(), input, at)
+        .await
+        .unwrap_or_else(|err| panic!("the CT02 accrual failed: {err}"))
+        .expect("a 50.00 purchase 01/0001 accrues under seed rule 1");
+    (tran_id, accrual.points_earned)
+}
+
+/// The race of `refresh_waits_for_an_account_row_lock_holder`, on two sessions
+/// of `contenders`: a holder takes `FOR KEY SHARE` on the account of `xref`, a
+/// refresh starts on a thread of its own and must wait for a lock, the holder
+/// then makes the CT02 add with [`add_and_accrue`] while the refresh still
+/// waits, and commits. Returns the refresh's outcome.
+///
+/// The holder lives inside this one future, so a failed assertion drops its
+/// unit of work inside the test runtime, which rolls it back, rather than
+/// outside every runtime, where its connection could not be returned.
+async fn race_refresh_with_holder(
+    stack: &TestStack,
+    contenders: &PgPool,
+    xref: &CardXref,
+) -> Result<SeedReport, PersistenceError> {
+    let mut holder = Db::from_pool(contenders.clone())
+        .begin()
+        .await
+        .expect("the holder's unit of work");
+    holder
+        .lock_account_reference(xref.xref_acct_id)
+        .await
+        .expect("FOR KEY SHARE on the account");
+    let refresh_db = Db::from_pool(contenders.clone());
+    let refresh = thread::spawn(move || run_seed(&refresh_db, SeedMode::Full, &sources()));
+    wait_for_count(
+        stack,
+        CONTENDER_LOCK_WAITERS,
+        1,
+        "refresh waiting for a lock",
+    )
+    .await;
+    let (tran_id, earned) = add_and_accrue(&mut holder, xref).await;
+    assert_eq!(
+        tran_id.to_string(),
+        "0000000000000002",
+        "the key after the live row"
+    );
+    assert_eq!(
+        earned,
+        RewardPoints::try_from(50).expect("non-negative points"),
+        "ceil(50.00 × 1.0) under seed rule 1"
+    );
+    if refresh.is_finished() {
+        let ended = refresh.join().map_err(|_| "the refresh thread panicked");
+        panic!("the refresh must wait until the holder ends, but it ended first: {ended:?}");
+    }
+    holder.commit().await.expect("the holder commits");
+    refresh
+        .join()
+        .unwrap_or_else(|_| panic!("the refresh thread panicked"))
 }
 
 /// `ACCTFILE`, `CARDFILE`, `XREFFILE`, `CUSTFILE`, `DISCGRP`, `TCATBALF`,
@@ -926,8 +1198,10 @@ fn only_tranextr_copies_masters_to_processing_copies() {
 }
 
 /// One database transaction per run: a `batch seed` whose `TCATBALF` input
-/// fails to decode, after five tables were already reloaded inside the run,
-/// leaves an empty database empty and a seeded, edited one exactly as it was.
+/// fails to decode, after the reward identities were restarted and five tables
+/// were already reloaded inside the run, leaves an empty database empty and a
+/// seeded, edited one exactly as it was, its reward identity sequences
+/// included.
 #[test]
 fn failed_seed_changes_nothing() {
     let (_stack, db) = stack();
@@ -940,11 +1214,158 @@ fn failed_seed_changes_nothing() {
     run_seed(&db, SeedMode::Full, &sources()).expect("first seed");
     block_on(set_account_one_balance(pool, EDITED_BALANCE_CENTS));
     let before = block_on(snapshot(pool));
+    let sequences = block_on(reward_sequences(pool));
     let err = run_seed(&db, SeedMode::Full, &corrupt).expect_err("corrupt tcatbal.txt");
     assert_last_tcatbal_sign_rejected(&err, &corrupt);
     assert_eq!(block_on(snapshot(pool)), before);
     assert_eq!(
+        block_on(reward_sequences(pool)),
+        sequences,
+        "the identity restart rolls back"
+    );
+    assert_eq!(
         block_on(account_one_balance(pool)),
         Decimal::new(EDITED_BALANCE_CENTS, 2)
     );
+}
+
+/// One database transaction per run, reward identities included: a refresh
+/// whose commit fails, after the reward tables were emptied and their
+/// identities restarted inside the run, leaves every table and both identity
+/// sequences as they were, so the next rule and accrual continue after the
+/// surviving ones instead of colliding with them. A deferred constraint
+/// trigger on `reward_rules` fails the commit. Once it is dropped, a refresh
+/// succeeds and restores the first seed's identities: rules 1 and 2, then rule
+/// 3, and accrual 1.
+#[test]
+fn failed_commit_keeps_reward_identities() {
+    let (stack, db) = stack();
+    let pool = db.pool();
+    run_seed(&db, SeedMode::Full, &sources()).expect("first seed");
+    let seeded = block_on(reward_sequences(pool));
+    assert_eq!(
+        seeded,
+        RewardSequences {
+            rule_last_value: 2,
+            rule_is_called: true,
+            accrual_last_value: 1,
+            accrual_is_called: false,
+        },
+        "rules 1 and 2 generated, no accrual yet"
+    );
+    let transaction_id = block_on(edit_seeded_state(pool));
+    let before = block_on(snapshot(pool));
+    let sequences = block_on(reward_sequences(pool));
+    assert_eq!(
+        sequences,
+        RewardSequences {
+            rule_last_value: 3,
+            rule_is_called: true,
+            accrual_last_value: 1,
+            accrual_is_called: true,
+        },
+        "rule 3 and accrual 1 survive"
+    );
+    block_on(stack.exec_sql(FAIL_RULE_INSERT_AT_COMMIT));
+
+    let err = run_seed(&db, SeedMode::Full, &sources()).expect_err("the commit fails");
+    let PersistenceError::Sqlx(sqlx::Error::Database(failure)) = &err else {
+        panic!("expected the injected commit failure, got {err}");
+    };
+    assert_eq!(failure.message(), INJECTED_COMMIT_FAILURE);
+    block_on(Box::pin(async {
+        assert_eq!(snapshot(pool).await, before);
+        assert_eq!(
+            reward_sequences(pool).await,
+            sequences,
+            "the identity restart rolls back"
+        );
+        stack.exec_sql(DROP_FAIL_RULE_INSERT_AT_COMMIT).await;
+        assert_eq!(insert_rule(pool).await, 4, "the rule after rule 3");
+        delete_accrual(pool, transaction_id).await;
+        assert_eq!(
+            insert_accrual(pool, transaction_id).await,
+            2,
+            "the accrual after accrual 1"
+        );
+    }));
+
+    run_seed(&db, SeedMode::Full, &sources()).expect("refresh");
+    block_on(Box::pin(async {
+        assert_eq!(reward_rules(pool).await, seed_rules());
+        assert_eq!(reward_sequences(pool).await, seeded);
+        assert_eq!(insert_rule(pool).await, 3, "the rule after the seed rules");
+        assert_eq!(
+            insert_accrual(pool, transaction_id).await,
+            1,
+            "the first accrual"
+        );
+    }));
+}
+
+/// The refresh and a CT02 add on a seeded database queue on `accounts` instead
+/// of deadlocking: the lock order `carddemo_persistence::ids` documents. A
+/// unit of work takes `FOR KEY SHARE` on account 1, the lock CT02 takes before
+/// it allocates. A refresh started then must wait for that unit, which then
+/// allocates, inserts and accrues as CT02 does, reading `reward_rules` and
+/// writing `reward_accruals` and `reward_balances` while the refresh still
+/// waits, and commits.
+///
+/// Both must succeed, the refresh after the unit: the unit's accrual and
+/// balance are gone, its transaction rows are kept and the reward identities
+/// are restarted. The server must count no deadlock. A refresh that truncated
+/// the reward tables before locking `accounts` would hold them while waiting
+/// at the `DELETE` of the account row the unit holds, and the unit's
+/// `reward_rules` read would close the cycle.
+#[test]
+fn refresh_waits_for_an_account_row_lock_holder() {
+    let (stack, db) = stack();
+    run_seed(&db, SeedMode::Full, &sources()).expect("first seed");
+    let seeded = block_on(reward_sequences(db.pool()));
+    let xref = block_on(commit_live_row(&db, account_id(1)));
+    let contenders = contender_pool(&stack);
+    let deadlocks_before = deadlocks(&stack);
+
+    let report = block_on(Box::pin(race_refresh_with_holder(
+        &stack,
+        &contenders,
+        &xref,
+    )))
+    .expect("the refresh succeeds");
+
+    assert_eq!(
+        report,
+        SeedReport {
+            transaction_types: 0,
+            transaction_categories: 0,
+            masters_loaded: false,
+            refreshed: true,
+            ..first_seed_report()
+        }
+    );
+    let pool = db.pool();
+    block_on(Box::pin(async {
+        assert_eq!(
+            counts(pool).await,
+            Counts {
+                transactions: 2,
+                ..fixture_counts()
+            },
+            "the refresh cleared the holder's accrual and balance and kept its rows"
+        );
+        assert_eq!(reward_rules(pool).await, seed_rules());
+        assert_eq!(
+            reward_sequences(pool).await,
+            seeded,
+            "the identities restart after the holder's accrual 1"
+        );
+    }));
+    // A session adds the deadlocks it detected to the database's count when it
+    // next flushes its statistics, at the latest as it disconnects, so the
+    // count is final once every contending session has gone.
+    block_on(async {
+        contenders.close().await;
+        wait_for_count(&stack, CONTENDER_SESSIONS, 0, "contending sessions").await;
+    });
+    assert_eq!(deadlocks(&stack), deadlocks_before, "no deadlock detected");
 }

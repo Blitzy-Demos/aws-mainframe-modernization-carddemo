@@ -9,7 +9,12 @@
 //!
 //! - on an account break it rewrites the previous account with its interest
 //!   total (`1050-UPDATE-ACCOUNT`) and reads the new account and its card
-//!   cross-reference (`1100-GET-ACCT-DATA`, `1110-GET-XREF-DATA`);
+//!   cross-reference (`1100-GET-ACCT-DATA`, `1110-GET-XREF-DATA`). The
+//!   rewrite re-reads the previous account with a row lock and applies only
+//!   the interest and the cycle resets to that record, so a bill payment,
+//!   account update or posting committed since the account's first balance
+//!   record keeps its changes (P-CBACT04C-010, P-CBACT04C-191,
+//!   P-CBACT04C-192);
 //! - it reads the rate of the account's disclosure group for the balance's type
 //!   and category, falling back to the `DEFAULT` group on status 23
 //!   (`1200-GET-INTEREST-RATE`, `1200-A-GET-DEFAULT-INT-RATE`). Every fixture
@@ -40,7 +45,7 @@ use std::error::Error;
 use std::fmt;
 
 use crate::clock::{Clock, db2_timestamp};
-use crate::entities::{Account, CardXref, DisclosureGroupKey, NewTransaction, TranCatBalance};
+use crate::entities::{CardXref, DisclosureGroupKey, NewTransaction, TranCatBalance};
 use crate::messages::{
     ABENDING_PROGRAM, ACCOUNT_NOT_FOUND_CBACT04C, ERROR_RE_WRITING_ACCOUNT_FILE,
     ERROR_READING_ACCOUNT_FILE, ERROR_READING_DEFAULT_DISCLOSURE_GROUP,
@@ -48,7 +53,8 @@ use crate::messages::{
     ERROR_READING_XREF_FILE, ERROR_WRITING_TRANSACTION_RECORD, file_status_message,
 };
 use crate::numeric::{
-    AccountId, Alnum, InterestRate, MerchantId, Money, TranCategoryCode, TranId, TranTypeCode,
+    AccountGroupId, AccountId, Alnum, InterestRate, MerchantId, Money, TranCategoryCode, TranId,
+    TranTypeCode,
 };
 use crate::ports::{AccountReader, AccountWriter, DisclosureGroupReader, PortError, XrefReader};
 
@@ -153,12 +159,13 @@ pub enum InterestAbend {
         cause: PortError,
     },
     /// CBACT04C 1050-UPDATE-ACCOUNT — P-CBACT04C-010: the account rewrite
-    /// failed. The paragraph has no `INVALID KEY` clause, so a missing account
-    /// shows only its status, 23.
+    /// failed, or the locked re-read of the account that precedes it. The
+    /// paragraph has no `INVALID KEY` clause, so a missing account shows only
+    /// its status, 23.
     AccountRewrite {
         /// `ACCT-ID` of the account rewritten.
         acct_id: AccountId,
-        /// Why the rewrite failed.
+        /// Why the re-read or the rewrite failed.
         cause: PortError,
     },
     /// CBACT04C 1300-B-WRITE-TX — P-CBACT04C-009: the write of the interest
@@ -283,14 +290,23 @@ pub struct InterestSummary {
 }
 
 /// The account whose balance records are being read: the working storage the
-/// main loop keeps across records of one account.
+/// main loop keeps across records of one account (P-CBACT04C-002).
+///
+/// It keeps what the later records of the account use, never the whole
+/// `ACCOUNT-RECORD`. Each record is committed on its own, so an online bill
+/// payment, account update or posting can change the account before its
+/// break; `1050-UPDATE-ACCOUNT` therefore re-reads the record rather than
+/// rewriting a copy taken at the first record (P-CBACT04C-010).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CurrentAccount {
     /// `WS-LAST-ACCT-NUM`: the `TRANCAT-ACCT-ID` of the record that started the
-    /// account [app/cbl/CBACT04C.cbl:L201].
+    /// account [app/cbl/CBACT04C.cbl:L201]. `1100-GET-ACCT-DATA` reads the
+    /// account by this key, so it is also the `ACCT-ID` the interest
+    /// description and the rewrite use.
     acct_num: AccountId,
-    /// `ACCOUNT-RECORD` as `1100-GET-ACCT-DATA` read it.
-    account: Account,
+    /// `ACCT-GROUP-ID` as `1100-GET-ACCT-DATA` read it: the group of every
+    /// rate read of the account (`1200-GET-INTEREST-RATE`, P-CBACT04C-004).
+    group_id: AccountGroupId,
     /// `CARD-XREF-RECORD` as `1110-GET-XREF-DATA` read it.
     xref: CardXref,
     /// `WS-TOTAL-INT PIC S9(09)V99`, set to 0 at the break (P-CBACT04C-190).
@@ -346,9 +362,11 @@ impl InterestRun {
     /// balance record of `TCATBALF`, read in key order.
     ///
     /// When the record's account differs from the previous record's, the
-    /// previous account is rewritten with its interest total (skipped for the
-    /// first record), the total is set to zero and the new account and its
-    /// cross-reference are read. The rate of the account's disclosure group
+    /// previous account is re-read with a row lock and rewritten with its
+    /// interest total added (skipped for the first record), so the changes
+    /// other programs committed to it since its first record survive. The
+    /// total is then set to zero and the new account and its cross-reference
+    /// are read. The rate of the account's disclosure group
     /// for the record's type and category is then read, with the `DEFAULT`
     /// group as fallback. A zero rate computes nothing and returns `None`,
     /// leaving the total and the TRAN-ID suffix unchanged. Any other rate
@@ -375,14 +393,14 @@ impl InterestRun {
             Some(current) if current.acct_num == acct_num => self.current.insert(current),
             previous => {
                 if let Some(previous) = previous {
-                    update_account(store, previous).await?;
+                    update_account(store, &previous).await?;
                     self.accounts_updated += 1;
                 }
                 let opened = open_account(store, acct_num).await?;
                 self.current.insert(opened)
             }
         };
-        let (rate, defaulted) = rate_for(store, &current.account, record).await?;
+        let (rate, defaulted) = rate_for(store, current.group_id, record).await?;
         if defaulted {
             self.default_group_reads += 1;
         }
@@ -425,7 +443,7 @@ impl InterestRun {
             accounts_updated: self.accounts_updated,
             default_group_reads: self.default_group_reads,
             unposted: self.current.map(|current| UnpostedInterest {
-                acct_id: current.account.acct_id,
+                acct_id: current.acct_num,
                 total_interest: current.total,
             }),
         }
@@ -438,7 +456,9 @@ impl InterestRun {
 ///
 /// The account is read by `TRANCAT-ACCT-ID` and its cross-reference by the
 /// same account on the alternate index `CXACAIX`
-/// [app/cbl/CBACT04C.cbl:L200-205] [app/cbl/CBACT04C.cbl:L372-413].
+/// [app/cbl/CBACT04C.cbl:L200-205] [app/cbl/CBACT04C.cbl:L372-413]. Of the
+/// account record only its group ID is kept, for the rate reads; the rewrite
+/// at the next break reads the record again.
 async fn open_account<S>(
     store: &mut S,
     acct_num: AccountId,
@@ -463,7 +483,7 @@ where
         })?;
     Ok(CurrentAccount {
         acct_num,
-        account,
+        group_id: account.acct_group_id,
         xref,
         total: Money::ZERO,
     })
@@ -473,24 +493,38 @@ where
 /// P-CBACT04C-010, P-CBACT04C-021, P-CBACT04C-191, P-CBACT04C-192: the
 /// account of `finished` rewritten with its interest.
 ///
-/// `ADD WS-TOTAL-INT TO ACCT-CURR-BAL` is exact and stored into
-/// `S9(10)V99`, high-order digits truncated; both cycle amounts become zero,
-/// whatever `POSTTRAN` accumulated in them.
-async fn update_account<S>(store: &mut S, finished: CurrentAccount) -> Result<(), InterestAbend>
+/// The account is re-read with a row lock (`read_account_for_update`) and
+/// the paragraph's three statements are applied to that record: `ADD
+/// WS-TOTAL-INT TO ACCT-CURR-BAL`, exact and stored into `S9(10)V99` with
+/// high-order digits truncated, and both cycle amounts set to zero, whatever
+/// `POSTTRAN` accumulated in them. Every other field is rewritten as the
+/// re-read found it. The balance records before the break were committed one
+/// by one, so a bill payment, account update or posting committed since the
+/// account's first record is in the re-read record and survives; the lock
+/// holds off any other writer from the re-read until the caller commits the
+/// rewrite. Without concurrent writers the re-read returns the record
+/// `1100-GET-ACCT-DATA` read, as in the COBOL, where nothing else changes the
+/// account during the run.
+///
+/// # Errors
+///
+/// [`InterestAbend::AccountRewrite`] when the re-read or the rewrite fails.
+/// A missing account is status 23, as a `REWRITE` of a record that no longer
+/// exists; a lock that cannot be taken is status 30.
+async fn update_account<S>(store: &mut S, finished: &CurrentAccount) -> Result<(), InterestAbend>
 where
-    S: AccountWriter,
+    S: AccountReader + AccountWriter,
 {
-    let CurrentAccount {
-        mut account, total, ..
-    } = finished;
-    account.acct_curr_bal = (account.acct_curr_bal + total).store::<10>();
+    let acct_id = finished.acct_num;
+    let rewrite_failed = move |cause| InterestAbend::AccountRewrite { acct_id, cause };
+    let mut account = store
+        .read_account_for_update(acct_id)
+        .await
+        .map_err(rewrite_failed)?;
+    account.acct_curr_bal = (account.acct_curr_bal + finished.total).store::<10>();
     account.acct_curr_cyc_credit = Money::ZERO;
     account.acct_curr_cyc_debit = Money::ZERO;
-    let acct_id = account.acct_id;
-    store
-        .rewrite_account(account)
-        .await
-        .map_err(|cause| InterestAbend::AccountRewrite { acct_id, cause })
+    store.rewrite_account(account).await.map_err(rewrite_failed)
 }
 
 /// CBACT04C 1200-GET-INTEREST-RATE and 1200-A-GET-DEFAULT-INT-RATE
@@ -498,20 +532,20 @@ where
 /// P-CBACT04C-004, P-CBACT04C-005, P-CBACT04C-193, E-06: the annual rate for
 /// `record`, and whether it came from the `DEFAULT` group fallback.
 ///
-/// The key is the account's `ACCT-GROUP-ID` with the record's type and
-/// category. A missing key (status 23) reads the same type and category under
-/// the group `DEFAULT`; the fixture accounts all reach that read, because
-/// their group IDs are blank.
+/// The key is the account's `ACCT-GROUP-ID`, `group_id`, with the record's
+/// type and category. A missing key (status 23) reads the same type and
+/// category under the group `DEFAULT`; the fixture accounts all reach that
+/// read, because their group IDs are blank.
 async fn rate_for<S>(
     store: &mut S,
-    account: &Account,
+    group_id: AccountGroupId,
     record: &TranCatBalance,
 ) -> Result<(InterestRate, bool), InterestAbend>
 where
     S: DisclosureGroupReader,
 {
     let key = DisclosureGroupKey {
-        dis_acct_group_id: account.acct_group_id,
+        dis_acct_group_id: group_id,
         dis_tran_type_cd: record.key.trancat_type_cd,
         dis_tran_cat_cd: record.key.trancat_cd,
     };
@@ -572,10 +606,7 @@ fn systran_record(
         tran_type_cd: INTEREST_TRAN_TYPE_CD,
         tran_cat_cd: INTEREST_TRAN_CAT_CD,
         tran_source: Alnum::move_from(INTEREST_TRAN_SOURCE),
-        tran_desc: Alnum::move_from(&format!(
-            "{INTEREST_DESC_PREFIX}{}",
-            current.account.acct_id
-        )),
+        tran_desc: Alnum::move_from(&format!("{INTEREST_DESC_PREFIX}{}", current.acct_num)),
         tran_amt: amount,
         tran_merchant_id: NO_MERCHANT,
         tran_merchant_name: Alnum::spaces(),
@@ -1014,34 +1045,104 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rewrite_abends_before_the_next_account_is_read() {
-        // P-CBACT04C-010: REWRITE has no INVALID KEY clause, so a missing
-        // account shows only its status.
+    fn a_change_committed_before_the_break_survives_the_rewrite() {
+        // P-CBACT04C-010, P-CBACT04C-191, P-CBACT04C-192: a payment and an
+        // address change committed to account 1 after its first balance record
+        // are in the record 1050-UPDATE-ACCOUNT re-reads, which receives the
+        // interest and the cycle resets and nothing else.
         let (mut store, records) = fixture_slice();
-        store.fail_next("rewrite_account", PortError::NotFound);
         let clock = clock();
         let mut run = InterestRun::new(parm_date());
         for record in &records[..2] {
             block_on(run.process_record(&mut store, record, &clock)).expect("account 1 posts");
         }
-        let abend = block_on(run.process_record(&mut store, &records[2], &clock))
-            .expect_err("the rewrite of account 1 abends");
+        let mut changed = account(1, -10_000, 116_487, -7_077);
+        changed.acct_addr_zip = Alnum::move_from("Z8888");
+        store.accounts.insert(account_id(1), changed.clone());
+        store.calls.clear();
+
+        block_on(run.process_record(&mut store, &records[2], &clock)).expect("account 2 posts");
+
+        // -100.00 plus the 14.56 of account 1 (P-CBACT04C-023).
+        let mut expected = changed;
+        expected.acct_curr_bal = cents(-8_544);
+        expected.acct_curr_cyc_credit = Money::ZERO;
+        expected.acct_curr_cyc_debit = Money::ZERO;
+        assert_eq!(store.accounts[&account_id(1)], expected);
+        // Account 1 is re-read and rewritten before account 2 and its rate
+        // are read (P-CBACT04C-002).
         assert_eq!(
-            abend,
-            InterestAbend::AccountRewrite {
-                acct_id: account_id(1),
-                cause: PortError::NotFound,
-            }
-        );
-        assert_eq!(
-            abend.lines(),
+            store.calls,
             [
-                ERROR_RE_WRITING_ACCOUNT_FILE,
-                "FILE STATUS IS: NNNN0023",
-                ABENDING_PROGRAM,
+                "read_account_for_update",
+                "rewrite_account",
+                "read_account",
+                "read_xref_by_account",
+                "read_disclosure_group",
+                "read_disclosure_group",
             ]
         );
-        assert_eq!(store.calls.last(), Some(&"rewrite_account"));
+    }
+
+    #[test]
+    fn a_failed_rewrite_abends_before_the_next_account_is_read() {
+        // P-CBACT04C-010: REWRITE has no INVALID KEY clause, so a missing
+        // account shows only its status. The locked re-read before the
+        // rewrite fails as the rewrite does: a record gone since its first
+        // balance record is status 23, a lock that cannot be taken 30.
+        // (failing method, cause, status display)
+        let cases = [
+            (
+                "rewrite_account",
+                PortError::NotFound,
+                "FILE STATUS IS: NNNN0023",
+            ),
+            (
+                "read_account_for_update",
+                PortError::NotFound,
+                "FILE STATUS IS: NNNN0023",
+            ),
+            (
+                "read_account_for_update",
+                PortError::Contention,
+                "FILE STATUS IS: NNNN0030",
+            ),
+        ];
+        for (method, cause, status) in cases {
+            let (mut store, records) = fixture_slice();
+            store.fail_next(method, cause.clone());
+            let clock = clock();
+            let mut run = InterestRun::new(parm_date());
+            for record in &records[..2] {
+                block_on(run.process_record(&mut store, record, &clock)).expect("account 1 posts");
+            }
+            let abend = block_on(run.process_record(&mut store, &records[2], &clock))
+                .expect_err("the rewrite of account 1 abends");
+            assert_eq!(
+                abend,
+                InterestAbend::AccountRewrite {
+                    acct_id: account_id(1),
+                    cause: cause.clone(),
+                },
+                "{method}"
+            );
+            assert_eq!(
+                abend.lines(),
+                [ERROR_RE_WRITING_ACCOUNT_FILE, status, ABENDING_PROGRAM],
+                "{method}"
+            );
+            let source = abend
+                .source()
+                .and_then(|source| source.downcast_ref::<PortError>());
+            assert_eq!(source, Some(&cause), "{method}");
+            // Account 2 is never read, and account 1 keeps its record.
+            assert_eq!(store.calls.last(), Some(&method), "{method}");
+            assert_eq!(
+                store.accounts[&account_id(1)],
+                account(1, 128_810, 116_487, -7_077),
+                "{method}"
+            );
+        }
     }
 
     #[test]

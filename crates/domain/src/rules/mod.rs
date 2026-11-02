@@ -1025,10 +1025,11 @@ pub(crate) mod test_support {
             Ok(self.transactions.values().next_back().cloned())
         }
 
-        async fn transactions_by_card(&mut self) -> PortResult<Vec<Transaction>> {
+        async fn transactions_by_card(&mut self, limit: u16) -> PortResult<Vec<Transaction>> {
             self.enter("transactions_by_card").await?;
             let mut rows: Vec<Transaction> = self.transactions.values().cloned().collect();
             rows.sort_by_key(|tran| (tran.tran_card_num, tran.tran_id));
+            rows.truncate(usize::from(limit));
             Ok(rows)
         }
 
@@ -1963,7 +1964,11 @@ mod tests {
             store.browse_transactions(all_trans, None)
         );
         fails_as_injected!(store, "highest_transaction", store.highest_transaction());
-        fails_as_injected!(store, "transactions_by_card", store.transactions_by_card());
+        fails_as_injected!(
+            store,
+            "transactions_by_card",
+            store.transactions_by_card(10)
+        );
         fails_as_injected!(
             store,
             "transactions_by_proc_date",
@@ -2343,18 +2348,20 @@ mod tests {
             assert_eq!(ids, expected, "{page:?} {account:?}");
         }
 
-        let by_card = block_on(store.transactions_by_card()).expect("a sorted read");
-        let order = texts(&by_card, |row| {
-            format!("{}/{}", row.tran_card_num, row.tran_id)
-        });
-        assert_eq!(
-            order,
-            [
-                format!("{CARD_A}/0000000000000003"),
-                format!("{CARD_B}/0000000000000001"),
-                format!("{CARD_C}/0000000000000002"),
-            ]
-        );
+        let sorted = [
+            format!("{CARD_A}/0000000000000003"),
+            format!("{CARD_B}/0000000000000001"),
+            format!("{CARD_C}/0000000000000002"),
+        ];
+        // A limit past the rows reads them all; one below stops after the
+        // first rows of the card-number order.
+        for (limit, expected) in [(10, &sorted[..]), (3, &sorted[..]), (2, &sorted[..2])] {
+            let by_card = block_on(store.transactions_by_card(limit)).expect("a sorted read");
+            let order = texts(&by_card, |row| {
+                format!("{}/{}", row.tran_card_num, row.tran_id)
+            });
+            assert_eq!(order, expected, "limit {limit}");
+        }
 
         let ranges = [
             (

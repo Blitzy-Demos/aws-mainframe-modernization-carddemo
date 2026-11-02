@@ -46,6 +46,23 @@ pub const CARD_CAPACITY: usize = 51;
 /// [app/cbl/CBSTM03A.CBL:L228-230] (P-CBSTM03A-004).
 pub const TRANSACTIONS_PER_CARD: usize = 10;
 
+/// The records of the sorted transaction file that decide [`load_table`]: one
+/// more than the 510 slots of the `CBSTM03A` tables, [`CARD_CAPACITY`] cards of
+/// [`TRANSACTIONS_PER_CARD`] transactions (P-CBSTM03A-004).
+///
+/// The load halts at the first record that has no slot, and every record
+/// before it fills one, so that record is at most the 511th; a file that fits
+/// the tables has at most 510 records. The first 511 records therefore give
+/// the same table, the same [`StatementError::CapacityExceeded`] counts or the
+/// same empty-file [`StatementError::ReadFailed`] as the whole file, and a file
+/// of more records always ends in the capacity stop (P-CBSTM03A-1256,
+/// escalation [`CAPACITY_ESCALATION`]): reading no further drops no record a
+/// statement could hold. `batch creastmt` reads at most this many.
+///
+/// The value is written out because a constant cannot convert the `usize`
+/// product to `u16` without a lossy cast; a unit test holds it to the product.
+pub const TRNXFILE_READ_LIMIT: u16 = 511;
+
 /// The `halt` escalation that records a transaction file beyond the tables:
 /// more than [`CARD_CAPACITY`] cards or [`TRANSACTIONS_PER_CARD`] transactions
 /// for one card, where the COBOL subscripts run past their tables
@@ -527,6 +544,10 @@ fn totals(output: &mut StatementOutput, total: Money<9>) {
 /// record opens the next card slot. The grouping is by run, as the COBOL
 /// compares each record with `WS-SAVE-CARD` only.
 ///
+/// At most [`TRNXFILE_READ_LIMIT`] records are taken from `transactions`: the
+/// result over the first that many records is the result over the whole file,
+/// so the caller need not read past them.
+///
 /// # Errors
 ///
 /// - [`StatementError::ReadFailed`] with `ERROR READING TRNXFILE` and return
@@ -635,7 +656,7 @@ mod tests {
 
     use super::{
         CAPACITY_ESCALATION, CARD_CAPACITY, StatementError, StatementOutput, TRANSACTIONS_PER_CARD,
-        TransactionTable, create_statements, load_table,
+        TRNXFILE_READ_LIMIT, TransactionTable, create_statements, load_table,
     };
     use crate::entities::{Account, CardXref, Customer, NewTransaction, Transaction};
     use crate::format::HtmlFixedLine::{
@@ -1087,6 +1108,71 @@ mod tests {
             assert_eq!(pulled.get(), case.pulled, "records pulled from {label}");
         }
         assert_eq!(CAPACITY_ESCALATION, "E-33");
+    }
+
+    #[test]
+    fn the_trnxfile_read_limit_is_one_record_past_the_tables() {
+        assert_eq!(
+            usize::from(TRNXFILE_READ_LIMIT),
+            CARD_CAPACITY * TRANSACTIONS_PER_CARD + 1
+        );
+    }
+
+    #[test]
+    fn the_first_records_up_to_the_read_limit_decide_the_load() {
+        /// The records of one card per entry of `per_card`, in sort order,
+        /// each card with the entry's count of transactions.
+        fn records(per_card: &[usize]) -> Vec<Transaction> {
+            per_card
+                .iter()
+                .enumerate()
+                .flat_map(|(card_index, &count)| {
+                    (0..count).map(move |tran_index| {
+                        tran(
+                            &format!("{card_index:016}"),
+                            &format!("{tran_index:016}"),
+                            "Purchase",
+                            100,
+                        )
+                    })
+                })
+                .collect()
+        }
+        let limit = usize::from(TRNXFILE_READ_LIMIT);
+        let cases: [(&str, Vec<usize>); 10] = [
+            ("an empty file", Vec::new()),
+            ("one record", vec![1]),
+            ("51 cards of 10", vec![TRANSACTIONS_PER_CARD; CARD_CAPACITY]),
+            ("1 card of 10", vec![TRANSACTIONS_PER_CARD]),
+            ("52 cards of 1", vec![1; CARD_CAPACITY + 1]),
+            ("1 card of 11", vec![TRANSACTIONS_PER_CARD + 1]),
+            (
+                "52 cards of 10",
+                vec![TRANSACTIONS_PER_CARD; CARD_CAPACITY + 1],
+            ),
+            (
+                "51 cards, the last of 11",
+                [
+                    vec![TRANSACTIONS_PER_CARD; CARD_CAPACITY - 1],
+                    vec![TRANSACTIONS_PER_CARD + 1],
+                ]
+                .concat(),
+            ),
+            ("1000 cards of 1", vec![1; 1000]),
+            ("1 card of 1000", vec![1000]),
+        ];
+        for (label, per_card) in cases {
+            let file = records(&per_card);
+            let whole = load_table(file.clone());
+            let bounded = load_table(file.iter().take(limit).cloned());
+            assert_eq!(bounded, whole, "{label}");
+            if file.len() > limit {
+                assert!(
+                    matches!(whole, Err(StatementError::CapacityExceeded { .. })),
+                    "{label}: a file past the limit halts, {whole:?}"
+                );
+            }
+        }
     }
 
     #[test]

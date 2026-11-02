@@ -221,7 +221,8 @@ async fn process(state: &AppState, body: PaymentRequest) -> PaymentAnswer {
 /// `pay` returned: a failed transaction write leaves the balance rewrite in
 /// place and a failed rewrite leaves the transaction write in place, as the
 /// `RECOVERY(NONE)` files keep them. A failed allocation wrote nothing and is
-/// rolled back.
+/// rolled back. The account row lock `prepare` took precedes the allocation's
+/// advisory lock, the order `carddemo_persistence::ids` documents.
 async fn complete_payment(
     state: &AppState,
     mut uow: UnitOfWork,

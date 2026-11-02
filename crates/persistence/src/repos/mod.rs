@@ -72,6 +72,8 @@ pub mod xref;
 pub use rewards::SoftDeleteOutcome;
 pub use transactions::LoadOutcome;
 
+use std::collections::BTreeMap;
+
 use carddemo_domain::numeric::{
     AccountGroupId, AccountId, Alnum, AuthCount, CardNumber, CustSsn, CustomerId, Cvv, FicoScore,
     InterestRate, MerchantId, Money, NumericCode, NumericError, RewardPoints, RewardRate,
@@ -348,19 +350,53 @@ pub(crate) fn expect_affected(rows: u64) -> PortResult<()> {
     }
 }
 
+/// The outcome of the keyed reads that one `WHERE <key> = ANY($1)` statement
+/// stands for: one entry per requested key, each the outcome the keyed read of
+/// that key alone returns.
+///
+/// `binds` holds each requested key with the value its key column binds, or
+/// with the failure of binding it, which is then that key's outcome. `rows` are
+/// the rows the statement returned, and `row_key` gives the key column of each.
+/// A key no row has is [`PortError::NotFound`], the `NOTFND` (status 23) of
+/// its read. A row becomes its record through `record` on its own, so a stored
+/// value that does not fit its PIC clause fails that key and no other.
+pub(crate) fn keyed_records<K, B, R, T>(
+    binds: BTreeMap<K, PortResult<B>>,
+    rows: Vec<R>,
+    row_key: fn(&R) -> B,
+    record: fn(R) -> Result<T, PersistenceError>,
+) -> BTreeMap<K, PortResult<T>>
+where
+    K: Ord,
+    B: Ord,
+{
+    let mut by_key: BTreeMap<B, R> = rows.into_iter().map(|row| (row_key(&row), row)).collect();
+    binds
+        .into_iter()
+        .map(|(key, bind)| {
+            let outcome = bind.and_then(|value| {
+                let row = by_key.remove(&value).ok_or(PortError::NotFound)?;
+                record(row).map_err(PortError::from)
+            });
+            (key, outcome)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fmt::Display;
 
-    use carddemo_domain::numeric::AuthCount;
+    use carddemo_domain::numeric::{AuthCount, FicoScore};
     use carddemo_domain::ports::PortError;
     use rust_decimal::Decimal;
 
     use super::{
         PersistenceError, account_group_id, account_id, alnum, auth_count, card_number, cust_ssn,
-        customer_id, cvv, expect_affected, fico_score, interest_rate, limit_i64, merchant_id,
-        money, numeric_code, opt_alnum, opt_money, reward_points, reward_rate, tran_category_code,
-        tran_id, tran_type_code, user_id,
+        customer_id, cvv, expect_affected, fico_score, interest_rate, keyed_records, limit_i64,
+        merchant_id, money, numeric_code, opt_alnum, opt_money, reward_points, reward_rate,
+        tran_category_code, tran_id, tran_type_code, user_id,
     };
 
     const TABLE: &str = "accounts";
@@ -692,5 +728,39 @@ mod tests {
         for (rows, expected) in [(0, Err(PortError::NotFound)), (1, Ok(())), (2, Ok(()))] {
             assert_eq!(expect_affected(rows), expected, "{rows} rows");
         }
+    }
+
+    #[test]
+    fn a_batch_of_keyed_reads_gives_each_key_the_outcome_of_its_own_read() {
+        let unbound = PortError::Unavailable("value exceeds the INTEGER range".to_owned());
+        let binds = BTreeMap::from([
+            ("fits", Ok(1)),
+            ("no row", Ok(2)),
+            ("misfit", Ok(3)),
+            ("unbound", Err(unbound.clone())),
+            ("last", Ok(5)),
+        ]);
+        // Rows in no particular order, as `= ANY($1)` returns them.
+        let rows = vec![(5, 999), (3, 1_000), (1, 274)];
+        let outcomes = keyed_records(
+            binds,
+            rows,
+            |row| row.0,
+            |row| fico_score(row.1, "customers", "cust_fico_credit_score"),
+        );
+        let misfit = format!(
+            "stored customers.cust_fico_credit_score value does not fit its domain type: \
+             {OUT_OF_RANGE}"
+        );
+        assert_eq!(
+            outcomes,
+            BTreeMap::from([
+                ("fits", Ok(FicoScore::new(274).expect("274 fits 9(03)"))),
+                ("no row", Err(PortError::NotFound)),
+                ("misfit", Err(PortError::Unavailable(misfit))),
+                ("unbound", Err(unbound)),
+                ("last", Ok(FicoScore::new(999).expect("999 fits 9(03)"))),
+            ])
+        );
     }
 }

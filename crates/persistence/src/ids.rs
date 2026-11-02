@@ -27,6 +27,49 @@
 //! would take its snapshot before waiting for the lock and could read a stale
 //! maximum.
 //!
+//! # Lock order
+//!
+//! Every unit of work that allocates takes its account row locks before the
+//! advisory lock, never after it. A unit holding the advisory lock then never
+//! waits for an account row that another unit holds while it waits for the
+//! advisory lock.
+//!
+//! - CB00 keeps the order of `COBIL00C`: the `READ UPDATE` of the account
+//!   [app/cbl/COBIL00C.cbl:L177] (`SELECT ... FOR UPDATE`, taken by
+//!   `bill_payment::prepare`), then the browse this allocation replaces
+//!   [app/cbl/COBIL00C.cbl:L212-219].
+//! - CT02 reads the account without a lock, but its reward accrual locks the
+//!   account row: inserting the account's first `reward_balances` row runs the
+//!   check of the foreign key `reward_balances_account_id_fkey`, which takes
+//!   `FOR KEY SHARE` on the `accounts` row. Taken there, after the advisory
+//!   lock, it would wait for a CB00 holding the row `FOR UPDATE` while that
+//!   CB00 waits for the advisory lock, a deadlock `PostgreSQL` breaks by
+//!   failing one of the two requests. CT02 therefore takes the same `FOR KEY
+//!   SHARE` with [`lock_account_reference`] before it calls [`next_tran_id`].
+//!
+//! `FOR KEY SHARE` conflicts only with `FOR UPDATE`, the lock of a `SELECT ...
+//! FOR UPDATE`, a `DELETE` or an `UPDATE` of the key. It is compatible with
+//! plain reads, with the same lock other CT02 adds hold, and with `UPDATE`s
+//! that leave the key unchanged, such as the balance rewrites, so among row
+//! locks it waits only for an in-flight `READ UPDATE` of the same account: a
+//! CB00 or CAUP that has not yet ended. It also waits for a seed refresh in
+//! progress, which locks the whole table.
+//!
+//! The seed refresh (`seed::run` in `SeedMode::Full`, `batch seed`) allocates
+//! nothing, but it deletes the account rows these units lock and empties the
+//! reward tables CT02 and `POSTTRAN` accrue into. It also takes the account
+//! lock before the reward tables: `LOCK TABLE accounts IN EXCLUSIVE MODE`,
+//! then the `TRUNCATE` of `reward_accruals`, `reward_balances` and
+//! `reward_rules`. `EXCLUSIVE` conflicts with the table lock every account row
+//! lock takes, and not with plain reads. The refresh therefore waits for every
+//! unit that already holds an account row; that unit can finish, because the
+//! refresh holds no reward table yet. A unit that asks for an account row lock
+//! later waits until the refresh has ended. The units that write the reward
+//! tables while holding an account lock, CT02 and `POSTTRAN`, take that lock
+//! before they touch a reward table, and the reward-rule administration takes
+//! no account lock, so no unit holds a reward table while it waits for the
+//! refresh.
+//!
 //! # The live master
 //!
 //! The read goes through the view `transaction_master`, not the base table:
@@ -39,7 +82,7 @@
 //! (`migrations/0003_transactions.sql`), so `max` compares byte values: the key
 //! order the `READPREV` from `HIGH-VALUES` follows under ASCII collation.
 
-use carddemo_domain::numeric::{NumericError, TranId};
+use carddemo_domain::numeric::{AccountId, NumericError, TranId};
 use carddemo_domain::ports::PortError;
 use sqlx::{Postgres, Transaction};
 
@@ -99,6 +142,45 @@ pub async fn next_tran_id(tx: &mut Transaction<'_, Postgres>) -> Result<TranId, 
         .fetch_one(&mut **tx)
         .await?;
     next_after(highest.as_deref())
+}
+
+/// Takes `FOR KEY SHARE` on the `accounts` row of `account_id` for the rest of
+/// `tx`: the account lock CT02 takes before [`next_tran_id`], in the order the
+/// module's "Lock order" section sets out.
+///
+/// The step is the replacement's alone, with no COBOL paragraph and no audit
+/// row: VSAM has no foreign key, and the `STARTBR`/`READPREV` browse the
+/// allocation replaces takes no lock. It takes, ahead of the advisory lock, the
+/// lock the foreign key `reward_balances_account_id_fkey` takes when the
+/// accrual inserts the account's first `reward_balances` row. The lock is held
+/// until `tx` commits or rolls back, as the foreign key's would be.
+///
+/// An `account_id` that names no `accounts` row locks nothing and is no error
+/// here: the foreign key check of the later insert still reports it as
+/// `PortError::Restricted`, as without this step. The statement waits only for
+/// a unit of work holding the row `FOR UPDATE`, a CB00 or CAUP `READ UPDATE`
+/// that has not ended, and for a seed refresh that holds `accounts` in
+/// `EXCLUSIVE` mode.
+///
+/// Like [`next_tran_id`], the function takes no savepoint: it writes nothing,
+/// and on an error the caller rolls back the transaction that would hold the
+/// lock.
+///
+/// # Errors
+///
+/// [`PersistenceError::Sqlx`] when the statement fails, for example on a lost
+/// connection or a lock wait the server cancels.
+pub async fn lock_account_reference(
+    tx: &mut Transaction<'_, Postgres>,
+    account_id: AccountId,
+) -> Result<(), PersistenceError> {
+    sqlx::query_scalar!(
+        "SELECT account_id FROM accounts WHERE account_id = $1 FOR KEY SHARE",
+        account_id.to_i64()
+    )
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// The TRAN-ID that follows `highest`, the right-trimmed text of the highest

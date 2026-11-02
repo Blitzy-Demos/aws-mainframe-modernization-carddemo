@@ -10,6 +10,7 @@
 //! | `READ` by key | `SELECT` | none: a plain read |
 //! | `READ ... UPDATE` | `SELECT ... FOR UPDATE` | its own |
 //! | `REWRITE` | `UPDATE` of the eleven non-key columns | its own |
+//! | `READ` by key of each account the `CBSTM03A` cross-references name ([`PgStore::read_accounts`]) | one `SELECT ... WHERE account_id = ANY($1)` | none: a plain read |
 //!
 //! # Columns
 //!
@@ -28,12 +29,14 @@
 //! expiry tests the programs make on an account belong to the rules in
 //! `carddemo_domain::rules`.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use carddemo_domain::entities::Account;
 use carddemo_domain::numeric::AccountId;
 use carddemo_domain::ports::{AccountReader, AccountWriter, PortError, PortResult};
 use rust_decimal::Decimal;
 
-use super::{account_group_id, account_id, alnum, expect_affected, money};
+use super::{account_group_id, account_id, alnum, expect_affected, keyed_records, money};
 use crate::tx::{PgStore, savepoint, settle};
 use crate::{PersistenceError, port_error};
 
@@ -229,6 +232,56 @@ impl AccountWriter for PgStore<'_, '_> {
         .await;
         let done = settle(sp, result).await?;
         expect_affected(done.rows_affected())
+    }
+}
+
+/// The batch read the ports do not declare: only `batch creastmt` calls it.
+impl PgStore<'_, '_> {
+    /// CBSTM03B 4000-ACCTFILE-PROC — P-CBSTM03B-005 [app/cbl/CBSTM03B.CBL:L206-229]
+    /// for CBSTM03A 3000-ACCTFILE-GET — P-CBSTM03A-1259
+    /// [app/cbl/CBSTM03A.CBL:L392-414]: the keyed `READ` of `ACCTFILE` for
+    /// each of `ids`, all in one statement. A plain read: no lock and no
+    /// savepoint.
+    ///
+    /// Each entry is what [`AccountReader::read_account`] returns for its ID:
+    /// the record; [`PortError::NotFound`] when no account has the ID; or
+    /// [`PortError::Unavailable`] when the stored row does not fit its PIC
+    /// clause, which fails that ID alone. No statement runs when `ids` is
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// The [`PortError`] of the statement when it fails as a whole; no entry is
+    /// returned then.
+    pub async fn read_accounts(
+        &mut self,
+        ids: BTreeSet<AccountId>,
+    ) -> PortResult<BTreeMap<AccountId, PortResult<Account>>> {
+        let keys: Vec<i64> = ids.iter().copied().map(AccountId::to_i64).collect();
+        let rows = if keys.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as!(
+                AccountRow,
+                r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
+                          acct_cash_credit_limit, acct_open_date, acct_expiraion_date,
+                          acct_reissue_date, acct_curr_cyc_credit, acct_curr_cyc_debit,
+                          acct_addr_zip, acct_group_id
+                     FROM accounts
+                    WHERE account_id = ANY($1)"#,
+                keys.as_slice()
+            )
+            .fetch_all(&mut **self.tx)
+            .await
+            .map_err(|err| port_error(&err))?
+        };
+        let binds = ids.into_iter().map(|id| (id, Ok(id.to_i64()))).collect();
+        Ok(keyed_records(
+            binds,
+            rows,
+            |row| row.account_id,
+            Account::try_from,
+        ))
     }
 }
 

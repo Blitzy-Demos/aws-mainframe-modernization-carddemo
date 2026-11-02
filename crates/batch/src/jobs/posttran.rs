@@ -28,6 +28,14 @@
 //! (`RECOVERY(NONE)`, P-CBTRN02C-015 to P-CBTRN02C-019). When the reward engine fails, the
 //! record's unit is rolled back whole, posting updates included.
 //!
+//! The account read of `1500-B-LOOKUP-ACCT` (P-CBTRN02C-009) locks the account row, and the
+//! record's unit holds that lock through the posting, the accrual and its commit or rollback
+//! ([`PostingReads`]). CBTRN02C reads `ACCTFILE` unlocked because `CLOSEFIL` has closed
+//! `ACCTDAT` to CICS before the batch cycle [app/jcl/CLOSEFIL.jcl:L28]. The replacement has no
+//! such step, so the lock is its guard against the online writers, CB00 and CAUP, that rewrite
+//! the same row while POSTTRAN runs: `2800-UPDATE-ACCOUNT-REC` rewrites the whole record the
+//! validation read, and an unlocked read would let that rewrite overwrite their committed change.
+//!
 //! # How a run ends
 //!
 //! | Outcome | Exit code | `DALYREJS(+1)` |
@@ -54,8 +62,8 @@ use carddemo_domain::entities::{Account, CardXref, DailyTran};
 use carddemo_domain::messages::{
     ACCOUNT_RECORD_NOT_FOUND, transactions_processed_message, transactions_rejected_message,
 };
-use carddemo_domain::numeric::{Alnum, NumericCode};
-use carddemo_domain::ports::TransactionReader;
+use carddemo_domain::numeric::{AccountId, Alnum, CardNumber, NumericCode};
+use carddemo_domain::ports::{AccountReader, PortResult, TransactionReader, XrefReader};
 use carddemo_domain::rewards::{AccrualInput, RewardEngine, RewardError};
 use carddemo_domain::rules::posting::{self, PostingAbend, PostingCounts, Validation};
 use carddemo_persistence::{Db, UnitOfWork};
@@ -171,7 +179,8 @@ fn read_daily(mut file: File, input: &Path) -> Result<Vec<Framed<DailyTranRecord
 
 /// CBTRN02C main loop — P-CBTRN02C-006 [app/cbl/CBTRN02C.cbl:L202-219]: each record in file
 /// order, numbered from 1, is counted, validated by `1500-VALIDATE-TRAN` (P-CBTRN02C-008 to
-/// P-CBTRN02C-011), then posted or counted and written as a reject.
+/// P-CBTRN02C-011) through the locking reads of [`PostingReads`], then posted or counted and
+/// written as a reject.
 ///
 /// Records run strictly one after another, never batched or concurrently, because the cycle
 /// totals a posted record leaves take part in the limit check of the next one.
@@ -189,7 +198,7 @@ async fn post_records(
             .begin()
             .await
             .map_err(|err| setup_failure("unit of work could not begin", err))?;
-        let validation = posting::validate(&mut uow.store(), &daily.daily_tran).await;
+        let validation = posting::validate(&mut PostingReads(uow.store()), &daily.daily_tran).await;
         match validation {
             Ok(Validation::Accepted { xref, account }) => {
                 post_record(ctx, uow, record_number, &daily.daily_tran, &xref, account).await?;
@@ -213,9 +222,62 @@ async fn post_records(
     Ok(())
 }
 
+/// CBTRN02C 1500-A-LOOKUP-XREF and 1500-B-LOOKUP-ACCT — P-CBTRN02C-008, P-CBTRN02C-009
+/// [app/cbl/CBTRN02C.cbl:L380-399]: the reads `1500-VALIDATE-TRAN` makes, over the record's
+/// store `S`.
+///
+/// The cross-reference reads pass through unchanged. The account read is the locking read
+/// `read_account_for_update`, on the record's `PgStore` a `SELECT … FOR UPDATE` under its own
+/// savepoint, whose row lock the record's unit of work keeps until it commits or rolls back. A CB00
+/// payment or CAUP edit of the account then either waits for the record's commit, or the read waits
+/// for the online write's commit and validates and posts against its result; neither change is lost
+/// (module documentation, "Units of work").
+///
+/// The outcomes the rule branches on are unchanged: a missing account is still `NotFound`,
+/// reason 101 (P-CBTRN02C-009), and any other failure, a lock that cannot be taken included,
+/// still abends (E-77).
+struct PostingReads<S>(S);
+
+impl<S: XrefReader + Send> XrefReader for PostingReads<S> {
+    /// CBTRN02C 1500-A-LOOKUP-XREF — P-CBTRN02C-008: the plain read of `S`; `CCXREF` is
+    /// read-only at run time.
+    async fn read_xref_by_card(&mut self, card: CardNumber) -> PortResult<CardXref> {
+        self.0.read_xref_by_card(card).await
+    }
+
+    /// The alternate-index read of `S`, which CBTRN02C does not make.
+    async fn read_xref_by_account(&mut self, id: AccountId) -> PortResult<CardXref> {
+        self.0.read_xref_by_account(id).await
+    }
+
+    /// The sequential read of `S`, which CBTRN02C does not make.
+    async fn xrefs_after(
+        &mut self,
+        after: Option<CardNumber>,
+        limit: u16,
+    ) -> PortResult<Vec<CardXref>> {
+        self.0.xrefs_after(after, limit).await
+    }
+}
+
+impl<S: AccountReader + Send> AccountReader for PostingReads<S> {
+    /// CBTRN02C 1500-B-LOOKUP-ACCT — P-CBTRN02C-009 [app/cbl/CBTRN02C.cbl:L393-399]: the
+    /// `READ ACCOUNT-FILE` of `XREF-ACCT-ID`, taken as the locking read of `S`, so the account
+    /// `2800-UPDATE-ACCOUNT-REC` rewrites is the one the record's unit of work has locked.
+    async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
+        self.0.read_account_for_update(id).await
+    }
+
+    /// The locking read of `S`, unchanged.
+    async fn read_account_for_update(&mut self, id: AccountId) -> PortResult<Account> {
+        self.0.read_account_for_update(id).await
+    }
+}
+
 /// CBTRN02C 2000-POST-TRANSACTION — P-CBTRN02C-013 to P-CBTRN02C-019, P-CBTRN02C-218
 /// [app/cbl/CBTRN02C.cbl:L424-444], then the reward accrual (AAP 0.3.5), in the unit of work
-/// `uow` the validation read in.
+/// `uow` the validation read in, which holds the account's row lock ([`PostingReads`]) until
+/// it commits or rolls back.
 ///
 /// The clock is read once, so the record's `TRAN-PROC-TS` (P-CBTRN02C-014, P-CBTRN02C-220) and
 /// its accrual time are the same instant; `CARDDEMO_CLOCK_OVERRIDE` pins both. The accrual
@@ -407,6 +469,92 @@ impl Tally {
             processed_display = transactions_processed_message(self.counts.read).as_str(),
             rejected_display = transactions_rejected_message(self.counts.rejected).as_str(),
             "end of job counts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use carddemo_domain::entities::{Account, CardXref};
+    use carddemo_domain::numeric::{AccountId, CardNumber};
+    use carddemo_domain::ports::{AccountReader, PortError, PortResult, XrefReader};
+
+    use super::PostingReads;
+
+    /// A store that records which of its reads ran and answers each with `NotFound`.
+    #[derive(Default)]
+    struct RecordingStore {
+        reads: Vec<&'static str>,
+    }
+
+    impl RecordingStore {
+        fn not_found<T>(&mut self, read: &'static str) -> PortResult<T> {
+            self.reads.push(read);
+            Err(PortError::NotFound)
+        }
+    }
+
+    impl XrefReader for RecordingStore {
+        async fn read_xref_by_card(&mut self, _card: CardNumber) -> PortResult<CardXref> {
+            self.not_found("read_xref_by_card")
+        }
+
+        async fn read_xref_by_account(&mut self, _id: AccountId) -> PortResult<CardXref> {
+            self.not_found("read_xref_by_account")
+        }
+
+        async fn xrefs_after(
+            &mut self,
+            _after: Option<CardNumber>,
+            _limit: u16,
+        ) -> PortResult<Vec<CardXref>> {
+            self.not_found("xrefs_after")
+        }
+    }
+
+    impl AccountReader for RecordingStore {
+        async fn read_account(&mut self, _id: AccountId) -> PortResult<Account> {
+            self.not_found("read_account")
+        }
+
+        async fn read_account_for_update(&mut self, _id: AccountId) -> PortResult<Account> {
+            self.not_found("read_account_for_update")
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_reads_lock_the_account_and_pass_the_cross_reference_through() {
+        let card = CardNumber::move_from("0000000000000007");
+        let account = AccountId::new(7).expect("an 11-digit account number");
+        let mut reads = PostingReads(RecordingStore::default());
+
+        assert_eq!(
+            reads.read_xref_by_card(card).await,
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
+            reads.read_xref_by_account(account).await,
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
+            reads.xrefs_after(Some(card), 1).await,
+            Err(PortError::NotFound)
+        );
+        // `NotFound` of the locking read reaches the rule unchanged: reason 101.
+        assert_eq!(reads.read_account(account).await, Err(PortError::NotFound));
+        assert_eq!(
+            reads.read_account_for_update(account).await,
+            Err(PortError::NotFound)
+        );
+        assert_eq!(
+            reads.0.reads,
+            [
+                "read_xref_by_card",
+                "read_xref_by_account",
+                "xrefs_after",
+                "read_account_for_update",
+                "read_account_for_update",
+            ]
         );
     }
 }

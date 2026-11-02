@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master\nORDER BY tran_card_num, tran_id",
+  "query": "SELECT transaction_id AS \"transaction_id!\", tran_id AS \"tran_id!\",\n       tran_type_cd AS \"tran_type_cd!\", tran_cat_cd AS \"tran_cat_cd!\",\n       tran_source AS \"tran_source!\", tran_desc AS \"tran_desc!\", tran_amt AS \"tran_amt!\",\n       tran_merchant_id AS \"tran_merchant_id!\", tran_merchant_name AS \"tran_merchant_name!\",\n       tran_merchant_city AS \"tran_merchant_city!\", tran_merchant_zip AS \"tran_merchant_zip!\",\n       tran_card_num AS \"tran_card_num!\", tran_orig_ts AS \"tran_orig_ts!\",\n       tran_proc_ts AS \"tran_proc_ts!\"\nFROM transaction_master\nORDER BY tran_card_num, tran_id\nLIMIT $1",
   "describe": {
     "columns": [
       {
@@ -75,7 +75,9 @@
       }
     ],
     "parameters": {
-      "Left": []
+      "Left": [
+        "Int8"
+      ]
     },
     "nullable": [
       true,
@@ -94,5 +96,5 @@
       true
     ]
   },
-  "hash": "3db3694a8c8e06b7986dde6ca7645dca4cb951ad716c4a65ac9ebb5391091399"
+  "hash": "962db3a84388526a2f58a7661349273c98166c896036fd8d1648bdd36b00b3ad"
 }

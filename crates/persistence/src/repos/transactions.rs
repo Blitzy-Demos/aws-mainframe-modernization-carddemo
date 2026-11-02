@@ -504,12 +504,16 @@ WHERE tran_id = $1"#,
     }
 
     /// CREASTMT STEP010 — P-CREASTMT-002 [app/jcl/CREASTMT.JCL:L44-55]:
-    /// `SORT FIELDS=(263,16,CH,A,1,16,CH,A)`, every live row by card number
+    /// `SORT FIELDS=(263,16,CH,A,1,16,CH,A)`, the live rows by card number
     /// then TRAN-ID, both in byte order, as CBSTM03B 1000-TRNXFILE-PROC —
     /// P-CBSTM03B-002 [app/cbl/CBSTM03B.CBL:L133-155] reads the sorted file.
-    /// The keys are unique, so the order is total. Not paged: `CBSTM03A` loads
-    /// the whole file into its tables.
-    async fn transactions_by_card(&mut self) -> PortResult<Vec<Transaction>> {
+    /// The keys are unique, so the order is total and the first `limit` rows
+    /// are the first `limit` records of the sorted file; the database stops
+    /// there instead of returning the whole master. `batch creastmt` passes
+    /// the bound of the CBSTM03A 8500-READTRNX-READ table load — P-CBSTM03A-004,
+    /// `statement::TRNXFILE_READ_LIMIT`, past which no record changes the load.
+    async fn transactions_by_card(&mut self, limit: u16) -> PortResult<Vec<Transaction>> {
+        let limit = limit_i64(limit)?;
         let rows = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
@@ -520,7 +524,9 @@ WHERE tran_id = $1"#,
        tran_card_num AS "tran_card_num!", tran_orig_ts AS "tran_orig_ts!",
        tran_proc_ts AS "tran_proc_ts!"
 FROM transaction_master
-ORDER BY tran_card_num, tran_id"#
+ORDER BY tran_card_num, tran_id
+LIMIT $1"#,
+            limit
         )
         .fetch_all(&mut **self.tx)
         .await

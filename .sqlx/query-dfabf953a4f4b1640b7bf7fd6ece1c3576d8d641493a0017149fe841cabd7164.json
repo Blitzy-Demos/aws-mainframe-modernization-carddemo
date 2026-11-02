@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT setval(pg_get_serial_sequence('reward_rules', 'rule_id'), $1, true)",
+  "query": "SELECT account_id FROM accounts WHERE account_id = $1 FOR KEY SHARE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "setval",
+        "name": "account_id",
         "type_info": "Int8"
       }
     ],
@@ -15,8 +15,8 @@
       ]
     },
     "nullable": [
-      null
+      false
     ]
   },
-  "hash": "58613d155a225893ab8f92ec1a9808bc605e3dc645ef7022e7ca4f6cf4a8cd58"
+  "hash": "dfabf953a4f4b1640b7bf7fd6ece1c3576d8d641493a0017149fe841cabd7164"
 }

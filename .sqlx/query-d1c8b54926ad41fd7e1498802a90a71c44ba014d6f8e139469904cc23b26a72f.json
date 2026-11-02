@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.last_value AS \"rule_last_value!\", r.is_called AS \"rule_is_called!\",\n                  a.last_value AS \"accrual_last_value!\", a.is_called AS \"accrual_is_called!\"\n             FROM reward_rules_rule_id_seq r CROSS JOIN reward_accruals_accrual_id_seq a",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rule_last_value!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "rule_is_called!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "accrual_last_value!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "accrual_is_called!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d1c8b54926ad41fd7e1498802a90a71c44ba014d6f8e139469904cc23b26a72f"
+}

@@ -72,7 +72,7 @@
 //! Spans belong to the adapters, which record the outcome of each request,
 //! job record or message. This module emits only `debug` events.
 
-use carddemo_domain::numeric::TranId;
+use carddemo_domain::numeric::{AccountId, TranId};
 use carddemo_domain::ports::PortResult;
 use sqlx::{Acquire, Postgres, Transaction};
 
@@ -128,6 +128,24 @@ impl UnitOfWork {
     ///   digits.
     pub async fn next_tran_id(&mut self) -> Result<TranId, PersistenceError> {
         crate::ids::next_tran_id(&mut self.tx).await
+    }
+
+    /// Takes `FOR KEY SHARE` on the `accounts` row of `account_id` inside this
+    /// transaction, through [`crate::ids::lock_account_reference`].
+    ///
+    /// CT02 calls it before [`UnitOfWork::next_tran_id`], so the lock its
+    /// reward accrual needs on the account is held before the advisory lock,
+    /// the order [`crate::ids`] documents. The lock is held until this unit of
+    /// work commits or rolls back; an account without a row locks nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistenceError::Sqlx`] when the statement fails.
+    pub async fn lock_account_reference(
+        &mut self,
+        account_id: AccountId,
+    ) -> Result<(), PersistenceError> {
+        crate::ids::lock_account_reference(&mut self.tx, account_id).await
     }
 
     /// Commits the transaction, every released savepoint with it.

@@ -121,11 +121,13 @@ impl AccountReader for MemoryStore {
         future::ready(self.accounts.get(&id).cloned().ok_or(PortError::NotFound))
     }
 
+    /// The locked re-read `1050-UPDATE-ACCOUNT` makes before its rewrite: the
+    /// stored record, as the plain read returns it.
     fn read_account_for_update(
         &mut self,
-        _id: AccountId,
+        id: AccountId,
     ) -> impl Future<Output = PortResult<Account>> + Send + '_ {
-        future::ready(Err(not_issued("READ UPDATE of ACCTFILE")))
+        future::ready(self.accounts.get(&id).cloned().ok_or(PortError::NotFound))
     }
 }
 

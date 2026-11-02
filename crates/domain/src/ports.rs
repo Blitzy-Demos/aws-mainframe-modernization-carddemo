@@ -515,11 +515,15 @@ pub trait TransactionReader {
         &mut self,
     ) -> impl Future<Output = PortResult<Option<Transaction>>> + Send + '_;
 
-    /// Every live transaction in the `CREASTMT` statement order: `STEP010`
-    /// `SORT FIELDS=(263,16,CH,A,1,16,CH,A)`, card number then TRAN-ID, both in
-    /// byte order (P-CREASTMT-002), read sequentially by `CBSTM03B`
-    /// `1000-TRNXFILE-PROC` (P-CBSTM03B-002). `CBSTM03A` loads the whole file
-    /// into its tables (P-CBSTM03A-004), so the read is not paged.
+    /// The first `limit` live transactions in the `CREASTMT` statement order:
+    /// `STEP010` `SORT FIELDS=(263,16,CH,A,1,16,CH,A)`, card number then
+    /// TRAN-ID, both in byte order (P-CREASTMT-002), read sequentially by
+    /// `CBSTM03B` `1000-TRNXFILE-PROC` (P-CBSTM03B-002). Fewer when the master
+    /// holds fewer.
+    ///
+    /// `CBSTM03A` loads the file into tables of fixed size (P-CBSTM03A-004), so
+    /// `CREASTMT` reads only the records that decide the load, the bound
+    /// [`crate::rules::statement::TRNXFILE_READ_LIMIT`] names.
     ///
     /// # Errors
     ///
@@ -527,6 +531,7 @@ pub trait TransactionReader {
     /// no rows.
     fn transactions_by_card(
         &mut self,
+        limit: u16,
     ) -> impl Future<Output = PortResult<Vec<Transaction>>> + Send + '_;
 
     /// The `TRANREPT` selection: the live transactions whose processing date,

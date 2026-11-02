@@ -102,6 +102,10 @@ const DB2LTCAT: &str = "DB2LTCAT.ctl";
 /// The seed reward rules of AAP 0.3.6: rule ID, transaction type code,
 /// category code and `reward_rate` in units of 0.0001 points per dollar.
 ///
+/// The rule ID is not inserted: it is the identity the restarted
+/// `reward_rules.rule_id` sequence generates for the rule's position in this
+/// list, which the load checks.
+///
 /// - Rule 1, retail purchase (1 pt/$): type `01` Purchase
 ///   [app/data/ASCII/trantype.txt:L1], category `0001` Regular Sales Draft
 ///   [app/data/ASCII/trancatg.txt:L1].
@@ -209,8 +213,9 @@ pub struct SeedReport {
 /// - [`PersistenceError::Fixture`] when the `DUSRSECJ` in-stream data or a
 ///   `DB2LT*.ctl` statement does not parse.
 /// - [`PersistenceError::Password`] when a password cannot be hashed.
-/// - [`PersistenceError::Corrupt`] when a value does not fit its column, or a
-///   Db2 category code has no four-digit processing-copy form.
+/// - [`PersistenceError::Corrupt`] when a value does not fit its column, a
+///   Db2 category code has no four-digit processing-copy form, or a seed
+///   reward rule is not generated under its fixed ID.
 /// - [`PersistenceError::Sqlx`] when a statement or the commit fails, for
 ///   example a duplicate key in a fixture.
 pub async fn run(
@@ -313,21 +318,43 @@ async fn masters_empty(conn: &mut PgConnection) -> Result<bool, PersistenceError
 }
 
 /// Empties the reward tables and every table the seed reloads, children
-/// before their parents.
+/// before their parents, after locking `accounts` against every row lock.
 ///
-/// The reward tables go first: `reward_balances` references the accounts
-/// about to be reloaded, and seeded accruals come only from posting the
-/// fixtures (AAP 0.3.2, 0.3.6). Clearing `reward_rules` on every run also
-/// frees the seed rule IDs 1 and 2. The other tables are the delete and define
-/// steps (STEP05, STEP10) of each load job; none references another.
+/// `LOCK TABLE accounts IN EXCLUSIVE MODE` comes first, the lock order
+/// [`crate::ids`] documents: account locks before the reward tables. The mode
+/// conflicts with the table lock every account row lock takes (`SELECT ...
+/// FOR KEY SHARE` and `FOR UPDATE`, `UPDATE`, `DELETE`, and the foreign key
+/// check of a `reward_balances` insert), and not with plain reads. The
+/// statement therefore waits for every unit of work that already holds an
+/// account row lock, such as a CT02 add whose accrual is still to read
+/// `reward_rules` and write the accrual and the balance; holding no reward
+/// table yet, the run lets that unit finish. A unit that asks for an account
+/// row lock later waits for the run to end. The lock is held until the run
+/// ends, so the `DELETE` of `accounts` never waits for a row lock. Truncating
+/// the reward tables first would deadlock with that CT02: the run would hold
+/// them while waiting at the `DELETE` for the account row CT02 holds, and CT02
+/// would wait for `reward_rules`.
+///
+/// The reward tables are emptied next: `reward_balances` references the
+/// accounts about to be reloaded, and seeded accruals come only from posting
+/// the fixtures (AAP 0.3.2, 0.3.6). One `TRUNCATE … RESTART IDENTITY` empties
+/// them and restarts the `rule_id` and `accrual_id` identities at 1, so the
+/// seed rules are generated as rules 1 and 2. The restart is part of the run's
+/// transaction: if the run or its commit fails, it rolls back with the rows,
+/// together with every identity drawn from the restarted sequences, and the
+/// surviving rows keep sequences that continue after them. `setval` would not
+/// roll back, leaving those rows behind sequences that issue their identities
+/// again. The `TRUNCATE` also holds `ACCESS EXCLUSIVE` on the three tables
+/// until the run ends, so a concurrent rule or accrual writer waits instead of
+/// drawing an identity from a restarted sequence. A CT02 or `POSTTRAN` accrual
+/// takes its account row lock first, so during a run it waits at that lock,
+/// before it reaches them. The other tables are the delete and define steps
+/// (STEP05, STEP10) of each load job; none references another.
 async fn clear(conn: &mut PgConnection) -> Result<(), PersistenceError> {
-    sqlx::query!("DELETE FROM reward_accruals")
+    sqlx::query!("LOCK TABLE accounts IN EXCLUSIVE MODE")
         .execute(&mut *conn)
         .await?;
-    sqlx::query!("DELETE FROM reward_balances")
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query!("DELETE FROM reward_rules")
+    sqlx::query!("TRUNCATE reward_accruals, reward_balances, reward_rules RESTART IDENTITY")
         .execute(&mut *conn)
         .await?;
     sqlx::query!("DELETE FROM card_xref")
@@ -1066,21 +1093,27 @@ fn seed_rules() -> Result<Vec<(RuleId, NewRewardRule)>, PersistenceError> {
         .collect()
 }
 
-/// Inserts the seed reward rules under their fixed IDs and resets both reward
-/// identities, so that a refresh restores the seeded state exactly: the next
-/// rule an admin creates is rule 3, and the first accrual `batch posttran`
-/// writes is accrual 1 (AAP 0.3.6).
+/// Inserts the seed reward rules in [`SEED_RULES`] order into the table
+/// [`clear`] has emptied and whose identities it has restarted, so that a
+/// refresh restores the seeded state exactly: the rules are generated as rules
+/// 1 and 2, the next rule an admin creates is rule 3, and the first accrual
+/// `batch posttran` writes is accrual 1 (AAP 0.3.6). No identity is supplied
+/// or set here, so every identity change rolls back with the run.
+///
+/// # Errors
+///
+/// - [`PersistenceError::Corrupt`] when the identity generated for a rule is
+///   not its [`SEED_RULES`] ID.
+/// - [`PersistenceError::Sqlx`] when an insert fails.
 async fn load_reward_rules(conn: &mut PgConnection) -> Result<usize, PersistenceError> {
     let rules = seed_rules()?;
-    let mut last_rule_id = 0;
     for (rule_id, rule) in &rules {
-        sqlx::query!(
+        let generated = sqlx::query_scalar!(
             r#"INSERT INTO reward_rules (
-                   rule_id, transaction_type_cd, transaction_category_cd, reward_rate,
+                   transaction_type_cd, transaction_category_cd, reward_rate,
                    min_transaction_amount, max_transaction_amount, active_from, active_to)
-               OVERRIDING SYSTEM VALUE
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
-            rule_id.get(),
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               RETURNING rule_id"#,
             rule.transaction_type_cd.trimmed().into_owned(),
             i32::from(rule.transaction_category_cd.get()),
             rule.reward_rate.to_decimal(),
@@ -1089,21 +1122,16 @@ async fn load_reward_rules(conn: &mut PgConnection) -> Result<usize, Persistence
             rule.active_from,
             rule.active_to
         )
-        .execute(&mut *conn)
+        .fetch_one(&mut *conn)
         .await?;
-        last_rule_id = last_rule_id.max(rule_id.get());
+        if generated != rule_id.get() {
+            return Err(PersistenceError::Corrupt {
+                table: "reward_rules",
+                column: "rule_id",
+                reason: format!("seed rule {rule_id} was generated as rule {generated}"),
+            });
+        }
     }
-    sqlx::query_scalar!(
-        "SELECT setval(pg_get_serial_sequence('reward_rules', 'rule_id'), $1, true)",
-        last_rule_id
-    )
-    .fetch_one(&mut *conn)
-    .await?;
-    sqlx::query_scalar!(
-        "SELECT setval(pg_get_serial_sequence('reward_accruals', 'accrual_id'), 1, false)"
-    )
-    .fetch_one(&mut *conn)
-    .await?;
     Ok(rules.len())
 }
 

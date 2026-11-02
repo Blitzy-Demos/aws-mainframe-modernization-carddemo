@@ -7,6 +7,7 @@
 //! | [`CustomerReader::read_customer`] | CICS `READ` by `CUST-ID`, or the batch keyed `READ`, in `COACTVWC`, `COACTUPC`, `COPAUA0C`, `COPAUS0C` and `CBSTM03B` | `SELECT ... FROM customers WHERE customer_id = $1` |
 //! | [`CustomerReader::read_customer_for_update`] | CICS `READ ... UPDATE` in `COACTUPC` `9600-WRITE-PROCESSING` | the same `SELECT ... FOR UPDATE`, under a savepoint |
 //! | [`CustomerWriter::rewrite_customer`] | CICS `REWRITE` in `COACTUPC` `9600-WRITE-PROCESSING` | `UPDATE customers SET <every non-key column> WHERE customer_id = $1`, under a savepoint |
+//! | [`PgStore::read_customers`] | the `CBSTM03B` keyed `READ` of each customer the `CBSTM03A` cross-references name | one `SELECT ... FROM customers WHERE customer_id = ANY($1)` |
 //!
 //! # Columns
 //!
@@ -33,11 +34,13 @@
 //! that statement alone and leaves the caller's transaction usable. The plain
 //! read runs on the transaction directly.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use carddemo_domain::entities::Customer;
 use carddemo_domain::numeric::CustomerId;
 use carddemo_domain::ports::{CustomerReader, CustomerWriter, PortError, PortResult};
 
-use super::{alnum, cust_ssn, customer_id, expect_affected, fico_score};
+use super::{alnum, cust_ssn, customer_id, expect_affected, fico_score, keyed_records};
 use crate::tx::{PgStore, savepoint, settle};
 use crate::{PersistenceError, port_error};
 
@@ -273,6 +276,63 @@ impl CustomerWriter for PgStore<'_, '_> {
         .await;
         let done = settle(sp, result).await?;
         expect_affected(done.rows_affected())
+    }
+}
+
+/// The batch read the ports do not declare: only `batch creastmt` calls it.
+impl PgStore<'_, '_> {
+    /// CBSTM03B 3000-CUSTFILE-PROC — P-CBSTM03B-004 [app/cbl/CBSTM03B.CBL:L181-204]
+    /// for CBSTM03A 2000-CUSTFILE-GET — P-CBSTM03A-1258
+    /// [app/cbl/CBSTM03A.CBL:L368-390]: the keyed `READ` of `CUSTFILE` for
+    /// each of `ids`, all in one statement. No lock is taken.
+    ///
+    /// Each entry is what [`CustomerReader::read_customer`] returns for its ID:
+    /// the record; [`PortError::NotFound`] when no customer has the ID; or
+    /// [`PortError::Unavailable`] when the stored row does not fit its PIC
+    /// clause, which fails that ID alone. No statement runs when `ids` is
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// The [`PortError`] of the statement when it fails as a whole; no entry is
+    /// returned then.
+    pub async fn read_customers(
+        &mut self,
+        ids: BTreeSet<CustomerId>,
+    ) -> PortResult<BTreeMap<CustomerId, PortResult<Customer>>> {
+        let binds: BTreeMap<CustomerId, PortResult<i32>> = ids
+            .into_iter()
+            .map(|id| (id, integer(id.to_i64(), "customer_id")))
+            .collect();
+        let keys: Vec<i32> = binds
+            .values()
+            .filter_map(|bind| bind.as_ref().ok().copied())
+            .collect();
+        let rows = if keys.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as!(
+                CustomerRow,
+                "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \
+                        cust_addr_line_1, cust_addr_line_2, cust_addr_line_3, \
+                        cust_addr_state_cd, cust_addr_country_cd, cust_addr_zip, \
+                        cust_phone_num_1, cust_phone_num_2, cust_ssn, cust_govt_issued_id, \
+                        cust_dob_yyyy_mm_dd, cust_eft_account_id, cust_pri_card_holder_ind, \
+                        cust_fico_credit_score \
+                 FROM customers \
+                 WHERE customer_id = ANY($1)",
+                keys.as_slice(),
+            )
+            .fetch_all(&mut **self.tx)
+            .await
+            .map_err(|err| port_error(&err))?
+        };
+        Ok(keyed_records(
+            binds,
+            rows,
+            |row| row.customer_id,
+            Customer::try_from,
+        ))
     }
 }
 

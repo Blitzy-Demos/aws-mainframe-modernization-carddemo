@@ -13,7 +13,8 @@
 //!   group;
 //! - [`rewards`]: [`PgRewardStore`], the reward store adapter;
 //! - [`ids`]: [`next_tran_id`], the serialized highest-key-plus-one `TRAN-ID`
-//!   allocation of `COTRN02C` and `COBIL00C`;
+//!   allocation of `COTRN02C` and `COBIL00C`, and the account lock order
+//!   around it;
 //! - [`migrate`]: the migrations of `migrations/`, embedded at build time;
 //! - [`seed`]: the fixture seed, refresh and `TRANEXTR` copy that replace the
 //!   seed and load jobs.

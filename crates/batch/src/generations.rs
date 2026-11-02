@@ -24,18 +24,24 @@
 //!   [app/jcl/DALYREJS.jcl:STEP05]: cataloging deletes the oldest generations until the newest
 //!   [`LIMIT`] remain.
 //!
-//! # Allocation lock
+//! # Lock files
 //!
-//! JES serializes jobs that allocate the same GDG `DISP=(NEW,CATLG,DELETE)` through the dataset
-//! enqueue [app/jcl/POSTTRAN.jcl:L34-38]. Here [`Generations::begin_next`] takes that enqueue as
-//! the lock file `.<DATASET>.lock` in the catalog directory, created exclusively and holding the
-//! process id, before it reads the current generation. The [`PendingGeneration`] holds the lock
-//! until it is cataloged, roll-off included, or dropped, so two `(+1)` allocations of one GDG can
-//! never pick the same number. An allocation that finds the lock fails with
-//! [`GenerationError::InUse`]: it neither waits nor takes the lock over. A job killed before it
-//! could release the lock (`SIGKILL`, a power loss) leaves the file behind, and every later
-//! allocation of that GDG is refused until an operator removes it, which is safe only while no
-//! batch job is running. Allocations of different GDGs take different locks and run side by side.
+//! JES serializes jobs that allocate the same dataset with `DISP=NEW`, `MOD` or `OLD` through the
+//! dataset enqueue. A [`LockFile`] stands for that enqueue: a hidden file created exclusively and
+//! holding the process id, deleted when the value is dropped. A job that finds the file fails
+//! with [`GenerationError::Locked`]: it neither waits nor takes the lock over. A job killed before
+//! it could release the lock (`SIGKILL`, a power loss) leaves the file behind, and every later
+//! job that needs the lock is refused until an operator removes it, which is safe only while no
+//! batch job is running. Different locks are different files and are held side by side.
+//!
+//! - Allocation lock: JES enqueues a GDG that a job allocates `DISP=(NEW,CATLG,DELETE)`
+//!   [app/jcl/POSTTRAN.jcl:L34-38]. [`Generations::begin_next`] takes `.<DATASET>.lock` in the
+//!   catalog directory before it reads the current generation, and the [`PendingGeneration`]
+//!   holds it until it is cataloged, roll-off included, or dropped, so two `(+1)` allocations of
+//!   one GDG can never pick the same number. A held allocation lock is reported as
+//!   [`GenerationError::InUse`].
+//! - Statement lock: `creastmt` takes `.STATEMNT.lock` in `CARDDEMO_STATEMENT_DIR` for the
+//!   statement datasets it deletes and writes, from before `STEP030` to the end of the job.
 //!
 //! Every temporary file is created exclusively under a name unique to its process and allocation,
 //! and [`PendingGeneration::catalog`] publishes a generation as a hard link to its final name,
@@ -214,6 +220,20 @@ pub(crate) enum GenerationError {
         /// The lock file, `<root>/.<DATASET>.lock`.
         path: PathBuf,
     },
+    /// A [`LockFile`] exists: another batch job holds the lock, or a job killed before it could
+    /// release the lock left the file behind. The `(+1)` allocation lock reports this as
+    /// [`GenerationError::InUse`].
+    #[error(
+        "another batch job holds the {name} {}; remove that file only when no batch job is \
+         running, because a job killed before releasing the lock leaves it behind",
+        path.display()
+    )]
+    Locked {
+        /// What the lock stands for, as [`LockFile::acquire`] names it.
+        name: &'static str,
+        /// The lock file.
+        path: PathBuf,
+    },
     /// `(0)` was requested while no generation is cataloged.
     #[error("{dataset}(0): no generation is cataloged")]
     NotCataloged {
@@ -307,7 +327,7 @@ impl Generations {
         dataset: Dataset,
     ) -> Result<PendingGeneration, GenerationError> {
         fs::create_dir_all(&self.root).map_err(|source| io_error(&self.root, source))?;
-        let lock = AllocationLock::acquire(&self.root, dataset)?;
+        let lock = allocation_lock(&self.root, dataset)?;
         let number = match self.current(dataset)? {
             None => FIRST_NUMBER,
             Some(newest) => newest
@@ -334,53 +354,73 @@ impl Generations {
     }
 }
 
-/// The allocation lock of one GDG, `<root>/.<DATASET>.lock`: the dataset enqueue JES takes for a
-/// job that allocates the GDG `DISP=(NEW,CATLG,DELETE)` [app/jcl/POSTTRAN.jcl:L34-38]. Dropping
-/// the value deletes the file and so releases the lock.
+/// A held lock file, which stands for the dataset enqueue JES takes for a job as the module's
+/// "Lock files" section describes. Dropping the value deletes the file and so releases the lock.
 #[derive(Debug)]
-struct AllocationLock {
+pub(crate) struct LockFile {
+    /// The lock file.
     path: PathBuf,
+    /// What the lock stands for, for example `generation allocation lock`, as
+    /// [`GenerationError::Locked`] and the release warning name it.
+    name: &'static str,
 }
 
-impl AllocationLock {
-    /// Creates the lock file of `dataset` under `root` exclusively and writes the process id to
-    /// it, so an operator can tell which process holds it.
+impl LockFile {
+    /// Takes the lock `name` by creating the file `path` exclusively and writing the process id
+    /// to it, so an operator can tell which process holds it. The directory of `path` must
+    /// exist.
     ///
     /// # Errors
     ///
-    /// [`GenerationError::InUse`] when the lock file exists, and [`GenerationError::Io`] when it
-    /// cannot be created or written; a file created but not written is deleted again.
-    fn acquire(root: &Path, dataset: Dataset) -> Result<Self, GenerationError> {
-        let path = root.join(format!(".{}.lock", dataset.name()));
+    /// [`GenerationError::Locked`] when `path` exists: the lock is neither waited for nor taken
+    /// over, and the file is left as it is. [`GenerationError::Io`] when the file cannot be
+    /// created or written; a file created but not written is deleted again.
+    pub(crate) fn acquire(path: PathBuf, name: &'static str) -> Result<Self, GenerationError> {
         let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(source) if source.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(GenerationError::InUse {
-                    dataset: dataset.name(),
-                    path,
-                });
+                return Err(GenerationError::Locked { name, path });
             }
             Err(source) => return Err(io_error(&path, source)),
         };
-        let lock = Self { path };
+        let lock = Self { path, name };
         writeln!(file, "{}", process::id()).map_err(|source| io_error(&lock.path, source))?;
         Ok(lock)
     }
 }
 
-impl Drop for AllocationLock {
+impl Drop for LockFile {
     /// Releases the lock. Best effort, because a destructor has no caller to report to: a lock
-    /// file that cannot be deleted is logged, and the next allocation reports it as
-    /// [`GenerationError::InUse`].
+    /// file that cannot be deleted is logged, and the next job that takes the lock reports it as
+    /// held.
     fn drop(&mut self) {
         if let Err(error) = fs::remove_file(&self.path) {
             tracing::warn!(
                 path = %self.path.display(),
                 %error,
-                "generation allocation lock not released"
+                "{} not released",
+                self.name
             );
         }
     }
+}
+
+/// Takes the allocation lock of one GDG, `<root>/.<DATASET>.lock`: the dataset enqueue JES takes
+/// for a job that allocates the GDG `DISP=(NEW,CATLG,DELETE)` [app/jcl/POSTTRAN.jcl:L34-38].
+///
+/// # Errors
+///
+/// [`GenerationError::InUse`] when the lock file exists, and [`GenerationError::Io`] when it
+/// cannot be created or written, as [`LockFile::acquire`] reports them.
+fn allocation_lock(root: &Path, dataset: Dataset) -> Result<LockFile, GenerationError> {
+    let path = root.join(format!(".{}.lock", dataset.name()));
+    LockFile::acquire(path, "generation allocation lock").map_err(|err| match err {
+        GenerationError::Locked { path, .. } => GenerationError::InUse {
+            dataset: dataset.name(),
+            path,
+        },
+        other => other,
+    })
 }
 
 /// A `(+1)` generation being written: the `DISP=(NEW,CATLG,DELETE)` DD of a running step.
@@ -402,7 +442,7 @@ pub(crate) struct PendingGeneration {
     /// Held, never read: fields drop after `Drop::drop` and after the body of `catalog`, so the
     /// lock is released only once the temporary file is deleted or the generation is cataloged
     /// and rolled off.
-    _lock: AllocationLock,
+    _lock: LockFile,
 }
 
 impl PendingGeneration {
