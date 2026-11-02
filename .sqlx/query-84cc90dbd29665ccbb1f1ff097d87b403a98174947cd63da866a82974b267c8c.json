@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO accounts (\n    account_id, acct_active_status, acct_curr_bal, acct_credit_limit, acct_cash_credit_limit,\n    acct_open_date, acct_expiraion_date, acct_reissue_date, acct_curr_cyc_credit,\n    acct_curr_cyc_debit, acct_addr_zip, acct_group_id)\nVALUES ($1, 'Y', 194.00, 2020.00, 1020.00, '2014-11-20', '2025-05-20', '2025-05-20', 0.00,\n    0.00, 'A000000000', '')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "84cc90dbd29665ccbb1f1ff097d87b403a98174947cd63da866a82974b267c8c"
+}

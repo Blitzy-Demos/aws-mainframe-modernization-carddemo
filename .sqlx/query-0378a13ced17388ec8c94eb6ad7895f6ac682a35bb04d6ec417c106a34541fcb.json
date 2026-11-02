@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET acct_curr_bal = $1 WHERE account_id = 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Numeric"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0378a13ced17388ec8c94eb6ad7895f6ac682a35bb04d6ec417c106a34541fcb"
+}

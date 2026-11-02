@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT xref_card_num FROM card_xref WHERE xref_acct_id = $1 ORDER BY xref_card_num LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "xref_card_num",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6d14e19fa0287616c1204c6727fc04fe8f32bd0bbb79f5bdd949d45dbb4afbbd"
+}

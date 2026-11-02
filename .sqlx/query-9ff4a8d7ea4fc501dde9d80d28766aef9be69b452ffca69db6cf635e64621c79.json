@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO transactions (\n               tran_id, tran_type_cd, tran_cat_cd, tran_source, tran_desc, tran_amt,\n               tran_merchant_id, tran_merchant_name, tran_merchant_city, tran_merchant_zip,\n               tran_card_num, tran_orig_ts, tran_proc_ts)\n           VALUES ('0000000000000001', '01', 1, 'POS TERM', 'Refresh survivor', 10.00,\n                   800000001, 'Merchant', 'City', '12345',\n                   $1, '2022-07-01 12:00:00.000000', '2022-07-01-12.00.00.000000')\n           RETURNING transaction_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9ff4a8d7ea4fc501dde9d80d28766aef9be69b452ffca69db6cf635e64621c79"
+}

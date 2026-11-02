@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE transaction_types SET tr_description = 'EDITED PURCHASE' WHERE tr_type = '01'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "293d1a924fa740e997200cb5228dd670a98aa72738a189d822724de9a05bf0da"
+}

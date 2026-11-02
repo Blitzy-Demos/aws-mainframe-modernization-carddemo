@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    (SELECT count(*) FROM transaction_master) AS \"view!\",\n    (SELECT count(*) FROM transactions WHERE in_master) AS \"live!\",\n    (SELECT count(*) FROM transactions) AS \"all!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "view!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "live!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "all!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "7bac61744f5618dfba8fbab2ca31da1bdc2fbf903398a8bffdddcc5f18c66646"
+}

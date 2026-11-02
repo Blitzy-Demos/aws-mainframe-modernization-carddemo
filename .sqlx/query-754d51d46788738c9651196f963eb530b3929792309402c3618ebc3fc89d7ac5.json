@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT column_name::text AS \"column_name!\"\n                 FROM information_schema.columns\n                WHERE table_schema = current_schema()\n                  AND table_name = 'users'\n                  AND (column_name::text ILIKE '%pw%' OR column_name::text ILIKE '%password%')\n                ORDER BY 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "column_name!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "754d51d46788738c9651196f963eb530b3929792309402c3618ebc3fc89d7ac5"
+}

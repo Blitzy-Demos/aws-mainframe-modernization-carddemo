@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    table_name::text AS \"table_name!\",\n    column_name::text AS \"column_name!\",\n    data_type::text AS \"data_type!\",\n    numeric_precision::int4 AS \"numeric_precision?\",\n    numeric_scale::int4 AS \"numeric_scale?\"\nFROM information_schema.columns\nWHERE table_schema = 'public'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "table_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "column_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "data_type!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "numeric_precision?",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "numeric_scale?",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "33ab96dd25259c461e632be51ce4b739d004d851e076053b2c75181e77150ba1"
+}

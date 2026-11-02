@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT table_name::text AS \"name!\", table_type::text AS \"kind!\"\nFROM information_schema.tables\nWHERE table_schema = 'public'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "kind!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "827ad1193b43c84d93a302a11b35d8d4660780e669a487d74331f4db95dc46ef"
+}

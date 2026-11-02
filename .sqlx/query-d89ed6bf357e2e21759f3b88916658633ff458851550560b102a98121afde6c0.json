@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT\n    idx.indexname::text AS \"name!\",\n    idx.tablename::text AS \"table_name!\",\n    idx.indexdef AS \"definition!\",\n    ind.indisunique AS \"is_unique!\",\n    ind.indisprimary AS \"is_primary!\",\n    pg_get_expr(ind.indpred, ind.indrelid) AS \"predicate?\"\nFROM pg_indexes idx\nJOIN pg_namespace nsp ON nsp.nspname = idx.schemaname\nJOIN pg_class cls ON cls.relname = idx.indexname AND cls.relnamespace = nsp.oid\nJOIN pg_index ind ON ind.indexrelid = cls.oid\nWHERE idx.schemaname = 'public'\nORDER BY 2, 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "table_name!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "definition!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "is_unique!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "is_primary!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 5,
+        "name": "predicate?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null,
+      null,
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "d89ed6bf357e2e21759f3b88916658633ff458851550560b102a98121afde6c0"
+}

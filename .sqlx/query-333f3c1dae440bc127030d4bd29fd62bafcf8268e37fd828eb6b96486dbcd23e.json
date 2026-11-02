@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO reward_balances (\n               account_id, total_points_earned, total_points_redeemed, available_points)\n           VALUES (1, 10, 0, 10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "333f3c1dae440bc127030d4bd29fd62bafcf8268e37fd828eb6b96486dbcd23e"
+}
