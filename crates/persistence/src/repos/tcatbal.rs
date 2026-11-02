@@ -129,7 +129,7 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
     /// `INVALID KEY` (status 23) on which the rule creates the record.
     async fn read_tcatbal(&mut self, key: TranCatBalanceKey) -> PortResult<TranCatBalance> {
         let (acct_id, type_cd, cat_cd) = key_binds(&key);
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             TcatbalRow,
             "SELECT trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal \
@@ -151,7 +151,7 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
     /// [`PortError::Duplicate`] (status 22).
     async fn write_tcatbal(&mut self, rec: TranCatBalance) -> PortResult<()> {
         let (acct_id, type_cd, cat_cd) = key_binds(&rec.key);
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "INSERT INTO transaction_category_balances \
              (trancat_acct_id, trancat_type_cd, trancat_cd, tran_cat_bal) \
@@ -173,7 +173,7 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
     /// that names no record is [`PortError::NotFound`].
     async fn rewrite_tcatbal(&mut self, rec: TranCatBalance) -> PortResult<()> {
         let (acct_id, type_cd, cat_cd) = key_binds(&rec.key);
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE transaction_category_balances SET tran_cat_bal = $4 \
              WHERE trancat_acct_id = $1 AND trancat_type_cd = $2 AND trancat_cd = $3",
@@ -203,7 +203,7 @@ impl TranCatBalanceStore for PgStore<'_, '_> {
         // The bound after a key is one row comparison over the same three
         // expressions, the key of `transaction_category_balances_padded_key`,
         // so the index seeks to the key instead of filtering the account.
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match after {
             None => {
                 sqlx::query_as!(

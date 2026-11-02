@@ -95,7 +95,7 @@ impl DisclosureGroupReader for PgStore<'_, '_> {
         let group = key.dis_acct_group_id.trimmed();
         let tran_type = key.dis_tran_type_cd.trimmed();
         let category = i32::from(key.dis_tran_cat_cd.get());
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             DisclosureGroupRow,
             "SELECT dis_acct_group_id AS acct_group_id, dis_tran_type_cd AS tran_type_cd, \

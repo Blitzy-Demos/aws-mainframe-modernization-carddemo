@@ -43,6 +43,8 @@
 //! set (E-41); a write plan of that kind writes nothing. Each is logged with
 //! the escalation ID and its request is rejected without requeue (AAP 0.9.6).
 
+use std::time::Duration;
+
 use carddemo_domain::clock::{self, AnyClock, Clock};
 use carddemo_domain::numeric::Money;
 use carddemo_domain::ports::AuthorizationStore;
@@ -52,8 +54,9 @@ use carddemo_domain::rules::auth_decision::{
 };
 use carddemo_persistence::Db;
 
+use crate::connection::BROKER_TIMEOUT;
 use crate::consumer::{self, Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
-use crate::db_deadline::{BoundedStore, bounded};
+use crate::db_deadline::{BoundedStore, DB_DEADLINE, bounded};
 use crate::ids;
 
 /// COPAUA0C 2100-EXTRACT-REQUEST-MSG — P-COPAUA0C-004: the paragraph a
@@ -70,6 +73,32 @@ const DECISION_PARAGRAPH: &str = "6000-MAKE-DECISION";
 /// plan the audit cannot pin is skipped at, recorded in its log event and as
 /// the message span's `location`.
 const WRITE_PARAGRAPH: &str = "8000-WRITE-AUTH-TO-DB";
+
+/// The database calls [`Cp00Flow::read`] makes, each under its own database
+/// deadline: the `BEGIN`, the four reads of `auth_decision::gather`
+/// (cross-reference, account, customer, summary) and the `ROLLBACK`.
+const READ_CALLS: u32 = 6;
+
+/// The database calls [`Cp00Flow::write`] makes, each under its own database
+/// deadline: the `BEGIN`, the summary write, the detail insert and the
+/// `COMMIT`.
+const WRITE_CALLS: u32 = 4;
+
+/// The longest CP00's post-acknowledgement unit of work runs with every call
+/// within its deadline: `WRITE_CALLS` database deadlines. What an abandoned
+/// call leaves on the connection is settled inside the next call's deadline,
+/// the `COMMIT`'s included, so the unit spends no time outside its calls.
+pub(crate) const POST_ACK_BUDGET: Duration = DB_DEADLINE.saturating_mul(WRITE_CALLS);
+
+/// The longest one CP00 delivery runs with every bounded step within its
+/// limit: the read unit of work (`READ_CALLS` database deadlines), the reply's
+/// publish and confirm ([`BROKER_TIMEOUT`]) and [`POST_ACK_BUDGET`]. CP00
+/// publishes no error record. The acknowledgement between the reply and the
+/// writes has no limit (`crate::consumer`).
+pub(crate) const DELIVERY_BUDGET: Duration = DB_DEADLINE
+    .saturating_mul(READ_CALLS)
+    .saturating_add(BROKER_TIMEOUT)
+    .saturating_add(POST_ACK_BUDGET);
 
 /// The CP00 flow: the `COPAUA0C` rules adapted to [`Flow`].
 #[derive(Debug, Clone)]
@@ -245,7 +274,12 @@ impl Cp00Flow {
     /// timeout, or that outlives the database deadline, fails like any other
     /// read failure, so it becomes the `C001`, `C002`, `C003` or
     /// `I002` record of that read; the database cause of every failed read is
-    /// logged beside the record, which keeps only the legacy codes.
+    /// logged beside the record, which keeps only the legacy codes. An
+    /// abandoned read is rolled back to its savepoint by the next read or the
+    /// `ROLLBACK`, within that call's deadline, so the reads after it still
+    /// run in the same unit of work. `READ_CALLS` counts these calls for
+    /// [`DELIVERY_BUDGET`], from which the shutdown drain is derived, so a call
+    /// added here is counted there.
     async fn read(&self, request: &AuthRequest) -> Result<AuthContext, &'static str> {
         let mut uow = match bounded("begin", self.db.begin()).await {
             Ok(uow) => uow,
@@ -284,11 +318,15 @@ impl Cp00Flow {
     /// `crate::db_deadline`, so a stalled database cannot hold the consumer
     /// after the acknowledgement. A write the server cancels at the statement
     /// timeout, or that outlives the database deadline, fails like any other
-    /// failed write (`I003` or `I004`); its savepoint is rolled back before
-    /// the `COMMIT`, which still keeps the summary written before a failed
-    /// detail. A `BEGIN` or `COMMIT` that fails or outlives the deadline is
-    /// `I003`. The database cause of each failure is logged beside the record,
-    /// and the acknowledged request is never replayed.
+    /// failed write (`I003` or `I004`). A write abandoned at its deadline,
+    /// wherever it waits, is rolled back to its own savepoint when the
+    /// `COMMIT` call first settles the connection, within the commit's
+    /// deadline, and the same unit of work then commits the summary written
+    /// before a failed detail. A `BEGIN` or `COMMIT` that fails or outlives
+    /// the deadline is `I003`. The database cause of each failure is logged
+    /// beside the record, and the acknowledged request is never replayed.
+    /// `WRITE_CALLS` counts these calls for [`POST_ACK_BUDGET`], which the
+    /// shutdown drain waits for, so a call added here is counted there.
     ///
     /// Each record's location is recorded in the message span as soon as it
     /// is logged ([`consumer::record_location`]). A failed commit's `I003`
@@ -580,11 +618,11 @@ mod tests {
     use carddemo_testkit::TestStack;
 
     use super::{
-        Cp00Flow, NoReply, PendingWrite, log_record, logged_event_key, reply_failure_entry_for,
-        reply_queue, respond, write_segments,
+        Cp00Flow, NoReply, POST_ACK_BUDGET, PendingWrite, WRITE_CALLS, log_record,
+        logged_event_key, reply_failure_entry_for, reply_queue, respond, write_segments,
     };
     use crate::consumer::{Disposition, Flow, PublishFailure, Reply, Request};
-    use crate::db_deadline::BoundedStore;
+    use crate::db_deadline::{BoundedStore, DB_DEADLINE};
 
     /// The section F pin of P-COPAUA0C-030 and P-COPAUA0C-031.
     const PINNED: &str = "2022-07-01T12:00:00Z";
@@ -1070,6 +1108,18 @@ mod tests {
             assert_eq!(ready_now(write_segments(&mut store, &plan)), None);
             assert_eq!(store.calls, [summary_call, "insert_detail"]);
         }
+    }
+
+    #[test]
+    fn the_post_ack_budget_counts_every_call_of_the_write_unit() {
+        // POST_ACK_BUDGET is WRITE_CALLS database deadlines: the BEGIN and the
+        // COMMIT of `write` and every store call `write_segments` makes.
+        let plan = approved_plan(true);
+        let mut store = FakeStore::default();
+        assert_eq!(ready_now(write_segments(&mut store, &plan)), None);
+        let calls = u32::try_from(store.calls.len()).expect("a handful of calls");
+        assert_eq!(calls + 2, WRITE_CALLS);
+        assert_eq!(POST_ACK_BUDGET, DB_DEADLINE * WRITE_CALLS);
     }
 
     #[test]

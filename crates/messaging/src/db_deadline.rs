@@ -27,10 +27,13 @@
 //! - [`DB_DEADLINE`], on the client: every database call a flow makes runs
 //!   under it, for a server that stops answering, or a pool opened without
 //!   the statement timeout. A call that outlives it is abandoned: its future
-//!   is dropped, and sqlx finishes what the call left on the connection, and
-//!   rolls back the savepoint a write opened, before the connection runs
-//!   anything else. A `COMMIT` that cannot complete within its own deadline is
-//!   reported as the lost summary, `I003`.
+//!   is dropped wherever it waits. The unit of work's next call, `COMMIT` or
+//!   `ROLLBACK` first settles what the abandoned call left on the connection,
+//!   within its own deadline: a statement that never returned is rolled back
+//!   to its own savepoint, every statement reported done before it stays, and
+//!   the same transaction still commits them (`carddemo_persistence::tx`,
+//!   "Abandoned calls"). A `COMMIT` that cannot complete within its own
+//!   deadline is reported as the lost summary, `I003`.
 //!
 //! [`BoundedStore`] puts every port call of a store under the deadline and
 //! logs the cause of each failure other than `NOTFND`. The `CCPAUERY` record

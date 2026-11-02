@@ -235,12 +235,15 @@ impl Settings {
     /// Resolves the settings from `lookup`, which returns the value of a
     /// variable or `None` when it is not set.
     ///
-    /// A value of `None` keeps the field's default. `CARDDEMO_DATABASE_URL`,
-    /// `CARDDEMO_AMQP_URL` and `CARDDEMO_JWT_SECRET` reject a blank value
-    /// (empty or only whitespace) and take any other value as given. The other
-    /// text and path fields take a value as given. Only an empty
-    /// `CARDDEMO_CLOCK_OVERRIDE` counts as unset; any other value of it,
-    /// whitespace-only included, is passed through verbatim, and
+    /// A value of `None` keeps the field's default. These variables reject a
+    /// blank value (empty or only whitespace) and take any other value as
+    /// given: `CARDDEMO_DATABASE_URL`, `CARDDEMO_AMQP_URL`,
+    /// `CARDDEMO_JWT_SECRET`, the request queues `CARDDEMO_QUEUE_DATE_REQUEST`,
+    /// `CARDDEMO_QUEUE_ACCT_REQUEST` and `CARDDEMO_QUEUE_PAUTH_REQUEST`, and the
+    /// directories `CARDDEMO_STATEMENT_DIR`, `CARDDEMO_BATCH_DIR` and
+    /// `CARDDEMO_FIXTURE_DIR`. `CARDDEMO_CORS_ORIGIN` takes a value as given.
+    /// Only an empty `CARDDEMO_CLOCK_OVERRIDE` counts as unset; any other value
+    /// of it, whitespace-only included, is passed through verbatim, and
     /// `AnyClock::from_override` in the domain clock rejects what is not an
     /// RFC 3339 instant of at most microsecond precision and no leap second.
     /// An empty `RUST_LOG` likewise counts as unset and gives
@@ -258,9 +261,8 @@ impl Settings {
     ///
     /// # Errors
     ///
-    /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
-    ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
-    ///   whitespace-only value.
+    /// - [`ConfigError::Blank`] when one of the variables above that reject a
+    ///   blank value is set to an empty or whitespace-only value.
     /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not a
     ///   positive integer that fits a `u64`.
     /// - [`ConfigError::InvalidAddress`] when `CARDDEMO_HTTP_ADDR` is not an IP
@@ -281,8 +283,8 @@ impl Settings {
     /// - [`ConfigError::NotUnicode`] when a variable is set to a value that is
     ///   not valid Unicode. `RUST_LOG` is the exception: such a value counts as
     ///   unset and gives the default `info`, as in `telemetry::init`.
-    /// - [`ConfigError::Blank`] when `CARDDEMO_DATABASE_URL`,
-    ///   `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET` is set to an empty or
+    /// - [`ConfigError::Blank`] when a variable that [`Settings::from_lookup`]
+    ///   lists as rejecting a blank value is set to an empty or
     ///   whitespace-only value.
     /// - [`ConfigError::InvalidNumber`] when `CARDDEMO_JWT_TTL_SECS` is not a
     ///   positive integer that fits a `u64`.
@@ -332,22 +334,24 @@ impl Settings {
                 })?
                 .get();
         }
-        if let Some(value) = lookup(keys::QUEUE_DATE_REQUEST)? {
+        // A blank queue name would fail only later, at the broker, and a blank
+        // directory would silently mean the working directory.
+        if let Some(value) = lookup_non_blank(&lookup, keys::QUEUE_DATE_REQUEST)? {
             settings.queue_date_request = value;
         }
-        if let Some(value) = lookup(keys::QUEUE_ACCT_REQUEST)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::QUEUE_ACCT_REQUEST)? {
             settings.queue_acct_request = value;
         }
-        if let Some(value) = lookup(keys::QUEUE_PAUTH_REQUEST)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::QUEUE_PAUTH_REQUEST)? {
             settings.queue_pauth_request = value;
         }
-        if let Some(value) = lookup(keys::STATEMENT_DIR)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::STATEMENT_DIR)? {
             settings.statement_dir = PathBuf::from(value);
         }
-        if let Some(value) = lookup(keys::BATCH_DIR)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::BATCH_DIR)? {
             settings.batch_dir = PathBuf::from(value);
         }
-        if let Some(value) = lookup(keys::FIXTURE_DIR)? {
+        if let Some(value) = lookup_non_blank(&lookup, keys::FIXTURE_DIR)? {
             settings.fixture_dir = PathBuf::from(value);
         }
         if let Some(value) = lookup(keys::CORS_ORIGIN)? {
@@ -382,7 +386,7 @@ pub fn rust_log_directives(value: Option<String>) -> String {
 }
 
 /// Looks up `key`, a setting that must not be blank once it is set: a
-/// connection URL or the token signing secret.
+/// connection URL, the token signing secret, a request queue or a directory.
 ///
 /// An unset variable gives `None`, so its field keeps the default. Any other
 /// non-blank value is returned as given.
@@ -433,8 +437,9 @@ pub enum ConfigError {
         #[source]
         source: AddrParseError,
     },
-    /// `CARDDEMO_DATABASE_URL`, `CARDDEMO_AMQP_URL` or `CARDDEMO_JWT_SECRET`
-    /// is set to an empty or whitespace-only value.
+    /// A setting that must not be blank (a connection URL,
+    /// `CARDDEMO_JWT_SECRET`, a request queue or a directory) is set to an
+    /// empty or whitespace-only value.
     #[error("{key} is set but blank")]
     Blank {
         /// Variable name.
@@ -714,8 +719,18 @@ mod tests {
     }
 
     #[test]
-    fn blank_connection_urls_and_jwt_secret_are_rejected_naming_only_the_key() {
-        for key in [keys::DATABASE_URL, keys::AMQP_URL, keys::JWT_SECRET] {
+    fn blank_urls_secret_queues_and_dirs_are_rejected_naming_only_the_key() {
+        for key in [
+            keys::DATABASE_URL,
+            keys::AMQP_URL,
+            keys::JWT_SECRET,
+            keys::QUEUE_DATE_REQUEST,
+            keys::QUEUE_ACCT_REQUEST,
+            keys::QUEUE_PAUTH_REQUEST,
+            keys::STATEMENT_DIR,
+            keys::BATCH_DIR,
+            keys::FIXTURE_DIR,
+        ] {
             for blank in ["", "   ", "\t"] {
                 let Err(err) = Settings::from_lookup(lookup_from(&[(key, blank)])) else {
                     panic!("{key}={blank:?} was accepted");

@@ -127,7 +127,7 @@ impl UserStore for PgStore<'_, '_> {
         let Some(key) = key_text(&id) else {
             return Err(PortError::NotFound);
         };
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             UserRow,
             "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type \
@@ -150,7 +150,7 @@ impl UserStore for PgStore<'_, '_> {
         let Some(key) = key_text(&id) else {
             return Err(PortError::NotFound);
         };
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             UserRow,
             "SELECT user_id, sec_usr_fname, sec_usr_lname, password_hash, sec_usr_type \
@@ -196,7 +196,7 @@ impl UserStore for PgStore<'_, '_> {
         // custom plan. Under the generic plan `PostgreSQL` may adopt for the
         // prepared statement it stays an `OR` that no index condition can
         // use, so a deep page would read every preceding key.
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match (browse.direction, start) {
             (Direction::Forward, None) => {
                 sqlx::query_as!(
@@ -268,7 +268,7 @@ impl UserStore for PgStore<'_, '_> {
         let fname = user.sec_usr_fname.trimmed();
         let lname = user.sec_usr_lname.trimmed();
         let user_type = user.sec_usr_type.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "INSERT INTO users (user_id, sec_usr_fname, sec_usr_lname, password_hash, \
              sec_usr_type) VALUES ($1, $2, $3, $4, $5)",
@@ -296,7 +296,7 @@ impl UserStore for PgStore<'_, '_> {
         let fname = user.sec_usr_fname.trimmed();
         let lname = user.sec_usr_lname.trimmed();
         let user_type = user.sec_usr_type.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE users SET sec_usr_fname = $2, sec_usr_lname = $3, password_hash = $4, \
              sec_usr_type = $5 WHERE user_id = $1",
@@ -321,7 +321,7 @@ impl UserStore for PgStore<'_, '_> {
         let Some(key) = key_text(&id) else {
             return Err(PortError::NotFound);
         };
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!("DELETE FROM users WHERE user_id = $1", &*key)
             .execute(&mut *sp)
             .await;

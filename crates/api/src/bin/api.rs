@@ -33,6 +33,7 @@
 //! A failure is one line on standard error, `api: <stage>: <error>`, and exit
 //! status 1. The stages, in start-up order, are `configuration`, `telemetry`,
 //! `state`, `database`, `bind <addr>`, `signals` and, once serving, `serve`.
+//! Line breaks in the error text become spaces, so the report stays one line.
 //! Every setting is checked by `state` before `database` makes the first
 //! connection attempt, so an unreachable database never hides an invalid
 //! setting. A failure after telemetry is installed is also an ERROR event on
@@ -170,8 +171,49 @@ async fn stop_signal() -> &'static str {
 /// telemetry is installed it is the only channel that keeps standard output
 /// JSON-only. Afterwards the same failure is also an ERROR event among the
 /// JSON lines; before that the event has no subscriber and is discarded.
+/// The standard error line is [`stderr_report`]'s, so it stays one line.
 fn fail(stage: &str, err: &dyn Display) -> ExitCode {
     tracing::error!(stage, error = %err, "api failed");
-    eprintln!("api: {stage}: {err}");
+    eprintln!("{}", stderr_report(stage, err));
     ExitCode::FAILURE
+}
+
+/// The standard error line that reports a failure at `stage`,
+/// `api: <stage>: <error>`, without its line ending.
+///
+/// Line breaks in the error text, such as one inside an invalid
+/// `CARDDEMO_CLOCK_OVERRIDE`, become spaces, so the report is always one
+/// line. The ERROR event keeps the error text as it is, since JSON escapes
+/// its line breaks.
+fn stderr_report(stage: &str, err: &dyn Display) -> String {
+    let text = err.to_string().replace(['\r', '\n'], " ");
+    format!("api: {stage}: {text}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stderr_report;
+
+    #[test]
+    fn the_stderr_report_is_one_line_with_line_breaks_as_spaces() {
+        for (stage, error, expected) in [
+            (
+                "state",
+                "invalid CARDDEMO_CLOCK_OVERRIDE: CARDDEMO_CLOCK_OVERRIDE is not an RFC 3339 instant: 2022\nbad",
+                "api: state: invalid CARDDEMO_CLOCK_OVERRIDE: CARDDEMO_CLOCK_OVERRIDE is not an RFC 3339 instant: 2022 bad",
+            ),
+            ("state", "2022\r\nbad", "api: state: 2022  bad"),
+            ("state", "2022\rbad", "api: state: 2022 bad"),
+            ("configuration", "a\n\nb\n", "api: configuration: a  b "),
+            (
+                "bind 127.0.0.1:8080",
+                "Address already in use (os error 98)",
+                "api: bind 127.0.0.1:8080: Address already in use (os error 98)",
+            ),
+        ] {
+            let report = stderr_report(stage, &error);
+            assert_eq!(report, expected, "{error:?}");
+            assert!(!report.contains(['\r', '\n']), "{report:?}");
+        }
+    }
 }

@@ -144,7 +144,7 @@ impl CustomerReader for PgStore<'_, '_> {
     /// its PIC clause included, is [`PortError::Unavailable`].
     async fn read_customer(&mut self, id: CustomerId) -> PortResult<Customer> {
         let key = integer(id.to_i64(), "customer_id")?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             CustomerRow,
             "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \
@@ -178,7 +178,7 @@ impl CustomerReader for PgStore<'_, '_> {
     /// could-not-lock outcome. Any other failure is [`PortError::Unavailable`].
     async fn read_customer_for_update(&mut self, id: CustomerId) -> PortResult<Customer> {
         let key = integer(id.to_i64(), "customer_id")?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             CustomerRow,
             "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \
@@ -232,7 +232,7 @@ impl CustomerWriter for PgStore<'_, '_> {
         let eft_account_id = customer.cust_eft_account_id.trimmed();
         let pri_card_holder_ind = customer.cust_pri_card_holder_ind.trimmed();
 
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE customers \
              SET cust_first_name = $2, \
@@ -312,7 +312,7 @@ impl PgStore<'_, '_> {
         let rows = if keys.is_empty() {
             Vec::new()
         } else {
-            let mut sp = savepoint(self.tx).await?;
+            let mut sp = savepoint(self.tx, &mut self.ledger).await?;
             let result = sqlx::query_as!(
                 CustomerRow,
                 "SELECT customer_id, cust_first_name, cust_middle_name, cust_last_name, \

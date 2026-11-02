@@ -55,8 +55,12 @@
 //!
 //! - Each consumer's intake is stopped between deliveries, so the delivery
 //!   being settled finishes, CP00's writes after its acknowledgement included.
-//! - The tasks get a bounded time to end. One still running then is aborted
-//!   and logged at ERROR, since the CP00 writes it has not committed are lost.
+//! - The tasks get a bounded time to end, derived from the flows' own limits:
+//!   the longest delivery, CP00's, with every database call within its
+//!   30-second deadline and every publish within
+//!   [`connection::BROKER_TIMEOUT`], plus one broker timeout, 320 seconds in
+//!   all. One still running then is aborted and logged at ERROR, since the
+//!   CP00 writes it has not committed are lost.
 //! - The connection is closed, and the broker redelivers every request not yet
 //!   acknowledged or rejected, a case single-delivery parity excludes.
 //!
@@ -147,10 +151,34 @@ pub enum MessagingError {
 }
 
 /// How long [`Running::shutdown`] waits for the consumers to end once their
-/// intake is stopped: long enough for a delivery in flight to finish its two
-/// bounded publishes (reply and error record) and CP00's post-acknowledgement
-/// unit of work.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// intake is stopped: the longest a delivery in flight can still need, plus
+/// one [`connection::BROKER_TIMEOUT`].
+///
+/// A delivery can be anywhere in its handling when the intake stops, so the
+/// wait covers a whole delivery of the slowest flow, each database call and
+/// publish within its own limit: CP00's read unit of work, reply and
+/// post-acknowledgement unit of work (`flows::cp00::DELIVERY_BUDGET`, 310
+/// seconds), ahead of CDRA's 110 seconds and CDRD's 20. Each budget counts
+/// the calls its flow makes; settling an abandoned database call runs inside
+/// the next call's deadline, so the counts are complete. The broker timeout
+/// added covers the steps no limit bounds, the acknowledgement and the work
+/// between the calls, and the timers' lateness. The drain is therefore 320
+/// seconds, and a consumer still running at its end is one whose
+/// acknowledgement the broker held back longer than that allowance.
+const DRAIN_TIMEOUT: Duration = longer(
+    flows::cp00::DELIVERY_BUDGET,
+    longer(flows::cdra::DELIVERY_BUDGET, flows::cdrd::DELIVERY_BUDGET),
+)
+.saturating_add(connection::BROKER_TIMEOUT);
+
+/// The longer of two budgets.
+const fn longer(first: Duration, second: Duration) -> Duration {
+    if first.as_nanos() >= second.as_nanos() {
+        first
+    } else {
+        second
+    }
+}
 
 /// One spawned consumer, which [`Running`] tracks until its task ends.
 #[derive(Debug)]
@@ -219,8 +247,10 @@ impl Running {
     /// Stops every consumer and closes the broker connection.
     ///
     /// Each consumer's intake is stopped first, so it ends after the delivery
-    /// it is settling, and the tasks get 60 seconds (`DRAIN_TIMEOUT`) to end.
-    /// The work in flight ends in one of two ways:
+    /// it is settling, and the tasks get 320 seconds (`DRAIN_TIMEOUT`) to end:
+    /// a whole delivery of the slowest flow, CP00, with every database call
+    /// and publish within its limit, and one broker timeout more. The work in
+    /// flight ends in one of two ways:
     ///
     /// - A request that is stopped before it is acknowledged or rejected,
     ///   because it was never handled or its settlement failed, stays
@@ -228,9 +258,11 @@ impl Running {
     ///   Redelivery after a lost connection is outside single-delivery parity.
     /// - The work a flow runs after acknowledging its request, CP00's
     ///   pending-authorization writes, cannot be redelivered, so it is waited
-    ///   for. Only a consumer still running at the deadline is aborted, which
-    ///   loses its writes not yet committed, and the abort is logged at ERROR
-    ///   with the unfinished flows.
+    ///   for, each of its calls within its deadline. Only a consumer still
+    ///   running at the drain's end is aborted, which loses its writes not yet
+    ///   committed, and the abort is logged at ERROR with the unfinished
+    ///   flows. That takes a step without a limit, the acknowledgement held
+    ///   back by the broker, outlasting the broker timeout the drain adds.
     ///
     /// The close waits for the broker's reply for at most
     /// [`connection::BROKER_TIMEOUT`].
@@ -402,7 +434,7 @@ mod tests {
     use carddemo_persistence::PersistenceError;
     use lapin::ChannelState;
 
-    use super::MessagingError;
+    use super::{DRAIN_TIMEOUT, MessagingError, connection, flows};
 
     /// `AnyClock::from_override` behind `?`, as the `mq` binary calls it
     /// before it connects and passes the clock to `start`.
@@ -465,5 +497,26 @@ mod tests {
             "{error:?}"
         );
         assert!(clock("2022-07-01T12:00:00Z").is_ok());
+    }
+
+    #[test]
+    fn the_drain_outlasts_every_delivery_by_one_broker_timeout() {
+        // CP00: 6 read-unit calls and 4 post-acknowledgement calls of 30 s, and
+        // the reply's 10 s; CDRA: 3 calls of 30 s and 2 publishes of 10 s;
+        // CDRD: 2 publishes of 10 s.
+        let budgets = [
+            ("CP00 writes", flows::cp00::POST_ACK_BUDGET, 120),
+            ("CP00", flows::cp00::DELIVERY_BUDGET, 310),
+            ("CDRA", flows::cdra::DELIVERY_BUDGET, 110),
+            ("CDRD", flows::cdrd::DELIVERY_BUDGET, 20),
+        ];
+        for (flow, budget, seconds) in budgets {
+            assert_eq!(budget, Duration::from_secs(seconds), "{flow}");
+            assert!(
+                DRAIN_TIMEOUT >= budget + connection::BROKER_TIMEOUT,
+                "{flow}: {budget:?} and the allowance outlast the drain"
+            );
+        }
+        assert_eq!(DRAIN_TIMEOUT, Duration::from_secs(320));
     }
 }

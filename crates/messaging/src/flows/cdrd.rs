@@ -28,10 +28,12 @@
 //! P-CODATE01-022, P-CODATE01-023).
 
 use std::future::{self, Future};
+use std::time::Duration;
 
 use carddemo_domain::clock::{AnyClock, Clock};
 use carddemo_domain::rules::mq_date_reply;
 
+use crate::connection::BROKER_TIMEOUT;
 use crate::consumer::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
 use crate::error_queue;
 
@@ -43,6 +45,16 @@ use crate::error_queue;
 /// so it is a constant here and not a setting. `infra/rabbitmq/definitions.json`
 /// declares it as a durable queue.
 pub const REPLY_QUEUE: &str = "CARD.DEMO.REPLY.DATE";
+
+/// The publishes the consumer makes for one CDRD request, each held to
+/// [`BROKER_TIMEOUT`]: the reply and, when it is not confirmed, the error
+/// record. CDRD reads no database.
+const PUBLISHES: u32 = 2;
+
+/// The longest one CDRD delivery runs with every bounded step within its
+/// limit: `PUBLISHES` broker timeouts. The settlement after them has no limit
+/// (`crate::consumer`).
+pub(crate) const DELIVERY_BUDGET: Duration = BROKER_TIMEOUT.saturating_mul(PUBLISHES);
 
 /// The CDRD flow: the `CODATE01` rules adapted to [`Flow`].
 #[derive(Debug, Clone)]

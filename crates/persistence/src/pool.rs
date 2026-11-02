@@ -22,13 +22,26 @@
 //! such a parameter before sqlx parses it, naming the parameter but never its
 //! value.
 //!
+//! [`connect`] and [`connect_with_statement_timeout`] open the first connection
+//! directly, in one attempt sqlx does not retry, beside the pool's own first
+//! connection. A server that refuses the connection or turns it away therefore
+//! reports its cause at once, `Connection refused (os error 111)` for example,
+//! instead of the `pool timed out while waiting for an open connection` that
+//! sqlx's pool returns after retrying a refused connection for its whole
+//! 30-second acquire timeout. A server that never answers still fails at that
+//! acquire timeout, and once the pool holds its first connection the opener
+//! returns without waiting for the direct attempt, which only diagnoses.
+//!
 //! The pool runs on the caller's tokio runtime through sqlx's `runtime-tokio`
 //! feature; this module starts none.
 
+use std::future::poll_fn;
+use std::pin::pin;
+use std::task::Poll;
 use std::time::Duration;
 
-use sqlx::PgPool;
-use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
+use sqlx::{Connection, PgPool};
 
 use crate::PersistenceError;
 use crate::tx::UnitOfWork;
@@ -148,22 +161,25 @@ impl Db {
 ///
 /// One connection is opened at once, so a wrong URL, a wrong password or an
 /// unreachable server fails here, at start-up, rather than on the first
-/// request.
+/// request. That first connection is opened directly, in one attempt sqlx does
+/// not retry, so a server that refuses it or turns it away reports its cause
+/// at once, such as `Connection refused`; a server that never answers fails at
+/// the pool's acquire timeout of 30 seconds.
 ///
 /// # Errors
 ///
 /// [`PersistenceError::Sqlx`] when `url` does not parse as a connection URL,
-/// or when the first connection cannot be opened or authenticated. A query
-/// parameter sqlx does not read is refused first, as a
-/// [`sqlx::Error::Configuration`] that names the parameter but not its value
-/// (nor any of its text when it has no `=`), because sqlx would log that
-/// value.
+/// or when the first connection cannot be opened or authenticated: the error
+/// of that attempt, [`sqlx::Error::Io`] for a refused or unreachable server
+/// for example, or [`sqlx::Error::PoolTimedOut`] when the server does not
+/// answer within the acquire timeout. A query parameter sqlx does not read is
+/// refused first, as a [`sqlx::Error::Configuration`] that names the parameter
+/// but not its value (nor any of its text when it has no `=`), because sqlx
+/// would log that value.
 pub async fn connect(url: &str) -> Result<Db, PersistenceError> {
     check_query_parameters(url)?;
-    let pool = PgPoolOptions::new()
-        .max_connections(MAX_CONNECTIONS)
-        .connect(url)
-        .await?;
+    // The parse `PgPoolOptions::connect` would make of `url`.
+    let pool = open_pool(url.parse::<PgConnectOptions>()?).await?;
     // The URL is left out of the event: it carries the password.
     tracing::debug!(max_connections = MAX_CONNECTIONS, "database pool connected");
     Ok(Db::from_pool(pool))
@@ -184,7 +200,10 @@ pub async fn connect(url: &str) -> Result<Db, PersistenceError> {
 /// # Errors
 ///
 /// Every error [`connect`] returns, the refusal of a query parameter sqlx
-/// does not read included, checked before sqlx parses `url`.
+/// does not read included, checked before sqlx parses `url`. The first
+/// connection is opened directly as [`connect`] opens it, so a server that
+/// refuses it or turns it away reports its cause at once here too, and one
+/// that never answers fails at the pool's acquire timeout.
 pub async fn connect_with_statement_timeout(
     url: &str,
     statement_timeout: Duration,
@@ -194,10 +213,7 @@ pub async fn connect_with_statement_timeout(
     let options = url
         .parse::<PgConnectOptions>()?
         .options([("statement_timeout", timeout_ms)]);
-    let pool = PgPoolOptions::new()
-        .max_connections(MAX_CONNECTIONS)
-        .connect_with(options)
-        .await?;
+    let pool = open_pool(options).await?;
     // The URL is left out of the event: it carries the password.
     tracing::debug!(
         max_connections = MAX_CONNECTIONS,
@@ -205,6 +221,92 @@ pub async fn connect_with_statement_timeout(
         "database pool connected"
     );
     Ok(Db::from_pool(pool))
+}
+
+/// Opens a pool of at most [`MAX_CONNECTIONS`] connections on `options`, and
+/// reports a first connection that fails by its cause.
+///
+/// sqlx's pool retries a connection the server refuses, or turns away as
+/// starting up or full, until its acquire timeout of 30 seconds, and then
+/// returns only [`sqlx::Error::PoolTimedOut`]. One direct connection attempt,
+/// which nothing retries, therefore runs beside the pool's own first
+/// connection, and [`first_connection`] decides between them:
+///
+/// - When the direct attempt fails before the pool has opened, its error is
+///   returned at once: `Connection refused`, an unknown host, a failed
+///   password or an unknown database.
+/// - When it succeeds, its connection is closed while the pool's first
+///   connection is still awaited.
+/// - When the pool's first connection completes, its outcome is returned at
+///   once, whatever the direct attempt or its close is still doing. For a
+///   server that never answers that is the acquire timeout, so start-up ends
+///   there, and not at the operating system's TCP connect timeout, which the
+///   direct attempt alone would wait for because it has no deadline. A healthy
+///   pool is likewise never held up by a direct attempt that stalls.
+///
+/// Neither error holds the URL or its password: sqlx's I/O, database and
+/// timeout errors carry neither.
+async fn open_pool(options: PgConnectOptions) -> Result<PgPool, PersistenceError> {
+    let pool = PgPoolOptions::new()
+        .max_connections(MAX_CONNECTIONS)
+        .connect_with(options.clone());
+    let probe = PgConnection::connect_with(&options);
+    Ok(first_connection(pool, probe, PgConnection::close).await?)
+}
+
+/// Waits for `pool`, the pool's first connection, while `probe`, a direct
+/// connection attempt on the same server, runs beside it, and returns the
+/// pool's outcome, or the probe's error when the probe fails first.
+///
+/// One poll loop drives three futures until the pool's first connection
+/// completes, and never polls one of them again once it has completed:
+///
+/// - `probe`: its error, when the pool has not completed in the same poll, is
+///   returned at once. The connection it opens is handed to `close`.
+/// - the future `close` returns: driven beside the pool, its outcome ignored.
+///   The probe only diagnoses why a server cannot be reached; the pool holds
+///   connections of its own, so a failed close says nothing about the pool
+///   and must not fail start-up.
+/// - `pool`: its outcome is returned the moment it completes, even in the poll
+///   in which the probe fails, because a pool that opened can serve. A probe or
+///   a close still pending is then dropped, which drops its socket, so neither
+///   can hold start-up past the pool, whose own acquire timeout bounds the
+///   whole wait.
+async fn first_connection<T, C, E, Close>(
+    pool: impl Future<Output = Result<T, E>>,
+    probe: impl Future<Output = Result<C, E>>,
+    mut close: impl FnMut(C) -> Close,
+) -> Result<T, E>
+where
+    Close: Future,
+{
+    let mut pool = pin!(pool);
+    // Each slot is emptied once its future completes, so none is polled again.
+    let mut probe = pin!(Some(probe));
+    let mut closing = pin!(None::<Close>);
+    poll_fn(|cx| {
+        let mut probe_error = None;
+        if let Some(attempt) = probe.as_mut().as_pin_mut() {
+            if let Poll::Ready(outcome) = attempt.poll(cx) {
+                probe.set(None);
+                match outcome {
+                    Ok(connection) => closing.set(Some(close(connection))),
+                    Err(error) => probe_error = Some(error),
+                }
+            }
+        }
+        if let Some(pending_close) = closing.as_mut().as_pin_mut() {
+            if pending_close.poll(cx).is_ready() {
+                closing.set(None);
+            }
+        }
+        match (pool.as_mut().poll(cx), probe_error) {
+            (Poll::Ready(outcome), _) => Poll::Ready(outcome),
+            (Poll::Pending, Some(error)) => Poll::Ready(Err(error)),
+            (Poll::Pending, None) => Poll::Pending,
+        }
+    })
+    .await
 }
 
 /// Refuses `url` when its query holds a parameter sqlx does not read, which
@@ -308,10 +410,12 @@ fn hex_digit(byte: u8) -> Option<u8> {
 mod tests {
     use std::fmt;
     use std::future::Future;
-    use std::pin::pin;
+    use std::io::ErrorKind;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::pin::{Pin, pin};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::task::{Context, Poll, Waker};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use sqlx::postgres::PgConnectOptions;
     use tracing::field::{Field, Visit};
@@ -319,11 +423,17 @@ mod tests {
     use tracing::{Event, Metadata, Subscriber};
 
     use super::{
-        PersistenceError, check_query_parameters, connect, connect_with_statement_timeout,
+        Db, PersistenceError, check_query_parameters, connect, connect_with_statement_timeout,
+        first_connection,
     };
 
     /// A stand-in for a credential written into a connection URL.
     const SECRET: &str = "not-a-real-secret";
+
+    /// How long a refused first connection may take to be reported: well
+    /// under the pool's 30-second acquire timeout, which sqlx's retries of a
+    /// refused connection would run out.
+    const PROMPT: Duration = Duration::from_secs(10);
 
     /// The field values a visitor was shown, each as `name=value` text.
     struct FieldText(Vec<String>);
@@ -527,6 +637,213 @@ mod tests {
                     "{url:?}: {fields:?}"
                 );
             }
+        }
+    }
+
+    /// A loopback port nothing listens on: bound to take a free port, then
+    /// released, so a connection to it is refused.
+    fn refused_port() -> u16 {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap_or_else(|error| panic!("cannot bind a loopback port: {error}"));
+        listener
+            .local_addr()
+            .unwrap_or_else(|error| panic!("cannot read the bound loopback port: {error}"))
+            .port()
+    }
+
+    /// The URL of a server that refuses every connection, with [`SECRET`] as
+    /// its password.
+    fn refused_url() -> String {
+        format!(
+            "postgres://carddemo:{SECRET}@127.0.0.1:{}/carddemo",
+            refused_port()
+        )
+    }
+
+    #[test]
+    fn a_refused_first_connection_reports_its_cause_at_once_without_the_secret() {
+        /// One of the two openers, run on a URL.
+        type Opener = fn(String) -> Pin<Box<dyn Future<Output = Result<Db, PersistenceError>>>>;
+        let openers: [(&str, Opener); 2] = [
+            ("connect", |url| {
+                Box::pin(async move { connect(&url).await })
+            }),
+            ("connect_with_statement_timeout", |url| {
+                Box::pin(async move {
+                    connect_with_statement_timeout(&url, Duration::from_secs(25)).await
+                })
+            }),
+        ];
+        for (opener, open) in openers {
+            let url = refused_url();
+            let started = Instant::now();
+            let outcome = carddemo_testkit::block_on(open(url.clone()));
+            let elapsed = started.elapsed();
+            let error = match outcome {
+                Err(error) => error,
+                Ok(db) => panic!("{opener}: connected to a refused port: {db:?}"),
+            };
+            let text = error.to_string();
+            match &error {
+                PersistenceError::Sqlx(sqlx::Error::Io(cause)) => {
+                    assert_eq!(
+                        cause.kind(),
+                        ErrorKind::ConnectionRefused,
+                        "{opener}: {text}"
+                    );
+                    assert!(text.contains(&cause.to_string()), "{opener}: {text}");
+                }
+                other => panic!("{opener}: expected the refused connection, got {other:?}"),
+            }
+            assert!(elapsed < PROMPT, "{opener}: took {elapsed:?}: {text}");
+            for withheld in [SECRET, url.as_str()] {
+                assert!(!text.contains(withheld), "{opener}: {text}");
+                assert!(
+                    !format!("{error:?}").contains(withheld),
+                    "{opener}: {error:?}"
+                );
+            }
+        }
+    }
+
+    /// The most polls a race case may take. Its scripted futures are ready
+    /// within a few polls, so a race still pending after this many waits on a
+    /// future that never completes.
+    const MAX_POLLS: usize = 16;
+
+    /// A stand-in for one future of the start-up race, polled by hand: pending
+    /// for its first `pending_polls` polls and then ready with `output`, or
+    /// pending for ever when `pending_polls` is `None`. A poll after it is
+    /// ready panics, so a race that polls a completed future again fails.
+    struct Scripted<T> {
+        pending_polls: Option<usize>,
+        output: Option<T>,
+    }
+
+    impl<T> Scripted<T> {
+        fn after(pending_polls: usize, output: T) -> Self {
+            Self {
+                pending_polls: Some(pending_polls),
+                output: Some(output),
+            }
+        }
+
+        fn never() -> Self {
+            Self {
+                pending_polls: None,
+                output: None,
+            }
+        }
+    }
+
+    impl<T: Unpin> Future for Scripted<T> {
+        type Output = T;
+
+        fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+            let this = self.get_mut();
+            match &mut this.pending_polls {
+                None => Poll::Pending,
+                Some(0) => Poll::Ready(
+                    this.output
+                        .take()
+                        .unwrap_or_else(|| panic!("polled again after it was ready")),
+                ),
+                Some(left) => {
+                    *left -= 1;
+                    Poll::Pending
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pool_outcome_ends_the_start_up_race_and_a_probe_failing_first_is_reported() {
+        /// A scripted future with a value or an error.
+        type Script<T> = Scripted<Result<T, &'static str>>;
+        /// One race: its three futures, the outcome, the poll it completes
+        /// on, and the probe connections handed to the close.
+        struct Case {
+            name: &'static str,
+            probe: Script<&'static str>,
+            close: Script<()>,
+            pool: Script<&'static str>,
+            outcome: Result<&'static str, &'static str>,
+            polls: usize,
+            closed: &'static [&'static str],
+        }
+        let cases = [
+            Case {
+                name: "a probe that stalls does not hold up the pool",
+                probe: Scripted::never(),
+                close: Scripted::never(),
+                pool: Scripted::after(0, Ok("pool")),
+                outcome: Ok("pool"),
+                polls: 1,
+                closed: &[],
+            },
+            Case {
+                name: "a probe failing before the pool opens is the outcome",
+                probe: Scripted::after(0, Err("connection refused")),
+                close: Scripted::never(),
+                pool: Scripted::never(),
+                outcome: Err("connection refused"),
+                polls: 1,
+                closed: &[],
+            },
+            Case {
+                name: "a close that stalls does not hold up the pool",
+                probe: Scripted::after(0, Ok("probe")),
+                close: Scripted::never(),
+                pool: Scripted::after(2, Ok("pool")),
+                outcome: Ok("pool"),
+                polls: 3,
+                closed: &["probe"],
+            },
+            Case {
+                name: "a pool failing while the probe waits is the outcome",
+                probe: Scripted::never(),
+                close: Scripted::never(),
+                pool: Scripted::after(0, Err("pool timed out")),
+                outcome: Err("pool timed out"),
+                polls: 1,
+                closed: &[],
+            },
+            Case {
+                name: "a probe closed, even by a failed close, leaves the pool's later outcome",
+                probe: Scripted::after(0, Ok("probe")),
+                close: Scripted::after(1, Err("close failed")),
+                pool: Scripted::after(3, Ok("pool")),
+                outcome: Ok("pool"),
+                polls: 4,
+                closed: &["probe"],
+            },
+            Case {
+                name: "a pool opening in the poll the probe fails in stands",
+                probe: Scripted::after(1, Err("too many clients")),
+                close: Scripted::never(),
+                pool: Scripted::after(1, Ok("pool")),
+                outcome: Ok("pool"),
+                polls: 2,
+                closed: &[],
+            },
+        ];
+        for case in cases {
+            let mut closed = Vec::new();
+            let mut close = Some(case.close);
+            let finished = {
+                let mut race = pin!(first_connection(case.pool, case.probe, |connection| {
+                    closed.push(connection);
+                    close
+                        .take()
+                        .unwrap_or_else(|| panic!("{}: closed twice", case.name))
+                }));
+                (1..=MAX_POLLS).find_map(|poll| match poll_once(race.as_mut()) {
+                    Poll::Ready(outcome) => Some((outcome, poll)),
+                    Poll::Pending => None,
+                })
+            };
+            assert_eq!(finished, Some((case.outcome, case.polls)), "{}", case.name);
+            assert_eq!(closed, case.closed, "{}", case.name);
         }
     }
 

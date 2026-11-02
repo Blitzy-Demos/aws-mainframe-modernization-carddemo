@@ -137,7 +137,7 @@ impl AccountReader for PgStore<'_, '_> {
     /// (V-COACTVWC-006, V-COACTUPC-007), and INTCALC still commits the
     /// account rewrite made before it (P-CBACT04C-010).
     async fn read_account(&mut self, id: AccountId) -> PortResult<Account> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             AccountRow,
             r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
@@ -164,7 +164,7 @@ impl AccountReader for PgStore<'_, '_> {
     /// runs under its own savepoint, so a lock timeout or any other failure
     /// leaves the transaction usable for the writes that follow.
     async fn read_account_for_update(&mut self, id: AccountId) -> PortResult<Account> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             AccountRow,
             r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,
@@ -204,7 +204,7 @@ impl AccountWriter for PgStore<'_, '_> {
         let reissue_date = account.acct_reissue_date.trimmed();
         let addr_zip = account.acct_addr_zip.trimmed();
         let group_id = account.acct_group_id.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"UPDATE accounts
                   SET acct_active_status     = $2,
@@ -265,7 +265,7 @@ impl PgStore<'_, '_> {
         let rows = if keys.is_empty() {
             Vec::new()
         } else {
-            let mut sp = savepoint(self.tx).await?;
+            let mut sp = savepoint(self.tx, &mut self.ledger).await?;
             let result = sqlx::query_as!(
                 AccountRow,
                 r#"SELECT account_id, acct_active_status, acct_curr_bal, acct_credit_limit,

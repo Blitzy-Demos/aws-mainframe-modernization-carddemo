@@ -105,7 +105,7 @@ impl XrefReader for PgStore<'_, '_> {
             return Err(PortError::NotFound);
         }
         let key = card.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             XrefRow,
             r#"SELECT xref_card_num AS card_num,
@@ -143,7 +143,7 @@ impl XrefReader for PgStore<'_, '_> {
     /// `cardxref.txt`, where each account has exactly one cross-reference
     /// (P-CVACT03Y-006).
     async fn read_xref_by_account(&mut self, id: AccountId) -> PortResult<CardXref> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             XrefRow,
             r#"SELECT xref_card_num AS card_num,
@@ -176,7 +176,7 @@ impl XrefReader for PgStore<'_, '_> {
         limit: u16,
     ) -> PortResult<Vec<CardXref>> {
         let limit = limit_i64(limit)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match after {
             None => {
                 sqlx::query_as!(

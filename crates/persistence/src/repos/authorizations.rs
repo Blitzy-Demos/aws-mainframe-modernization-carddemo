@@ -81,7 +81,7 @@ use super::{
     numeric_code, opt_alnum, opt_money,
 };
 use crate::PersistenceError;
-use crate::tx::{PgStore, savepoint, settle};
+use crate::tx::{Ledger, PgStore, savepoint, settle};
 
 /// The table of the `PAUTSUM0` root segments, as a misfit names it.
 const SUMMARIES: &str = "pending_auth_summaries";
@@ -301,7 +301,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// [app/app-authorization-ims-db2-mq/cbl/COPAUS0C.cbl:L966-997]:
     /// `GU PAUTSUM0 WHERE (ACCNTID = PA-ACCT-ID)`. No row is the `GE` status.
     async fn read_summary(&mut self, id: AccountId) -> PortResult<PendingAuthSummary> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             SummaryRow,
             r#"SELECT pa_acct_id AS acct_id, pa_cust_id AS cust_id,
@@ -339,7 +339,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// (P-COPAUS1C-014), whose outcome decides between the summary and the
     /// detail error text (V-COPAUS1C-003, V-COPAUS1C-006).
     async fn read_summary_of_detail(&mut self, id: AuthId) -> PortResult<PendingAuthSummary> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             SummaryRow,
             r#"SELECT s.pa_acct_id AS acct_id, s.pa_cust_id AS cust_id,
@@ -369,7 +369,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// flow, not here.
     async fn insert_summary(&mut self, summary: PendingAuthSummary) -> PortResult<()> {
         let columns = SummaryColumns::new(&summary)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"INSERT INTO pending_auth_summaries
                    (pa_acct_id, pa_cust_id, pa_auth_status, pa_account_status,
@@ -402,7 +402,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// [`PortError::NotFound`].
     async fn update_summary(&mut self, summary: PendingAuthSummary) -> PortResult<()> {
         let columns = SummaryColumns::new(&summary)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"UPDATE pending_auth_summaries
                   SET pa_cust_id = $2,
@@ -443,7 +443,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// of a parent deletes its dependents (P-CBPAUP0C-006). No row is
     /// [`PortError::NotFound`].
     async fn delete_summary(&mut self, id: AccountId) -> PortResult<()> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "DELETE FROM pending_auth_summaries WHERE pa_acct_id = $1",
             id.to_i64()
@@ -470,7 +470,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
         limit: u16,
     ) -> PortResult<Vec<PendingAuthSummary>> {
         let limit = limit_i64(limit)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match after {
             None => {
                 sqlx::query_as!(
@@ -533,7 +533,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// shared mapping gives a blocked delete.
     async fn insert_detail(&mut self, detail: NewPendingAuthDetail) -> PortResult<AuthId> {
         let c = DetailColumns::new(&detail)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_scalar!(
             r#"INSERT INTO pending_auth_details
                    (pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
@@ -590,7 +590,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// detail `GNP PAUTDTL1 WHERE (PAUT9CTS = PA-AUTHORIZATION-KEY)` reaches,
     /// addressed by its identity. No row is the `GE` status.
     async fn read_detail(&mut self, id: AuthId) -> PortResult<PendingAuthDetail> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             DetailRow,
             r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
@@ -625,7 +625,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// failure leaves the transaction usable; a released savepoint keeps the
     /// lock in the transaction. No row is the `GE` status.
     async fn read_detail_for_update(&mut self, id: AuthId) -> PortResult<PendingAuthDetail> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             DetailRow,
             r#"SELECT auth_id, pa_acct_id, pa_auth_date_9c, pa_auth_time_9c,
@@ -668,7 +668,15 @@ impl AuthorizationStore for PgStore<'_, '_> {
     ) -> PortResult<Vec<PendingAuthDetail>> {
         let start = browse.start_key.map(AuthId::get);
         let limit = limit_i64(browse.limit)?;
-        details_page(self.tx, id.to_i64(), start, browse.direction, limit).await
+        details_page(
+            self.tx,
+            &mut self.ledger,
+            id.to_i64(),
+            start,
+            browse.direction,
+            limit,
+        )
+        .await
     }
 
     /// COPAUS1C READ-NEXT-AUTH-RECORD — P-COPAUS1C-014, P-COPAUS1C-009
@@ -690,7 +698,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
         auth_time_9c: i32,
         direction: Direction,
     ) -> PortResult<Option<PendingAuthDetail>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match direction {
             Direction::Forward => {
                 sqlx::query_as!(
@@ -761,7 +769,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// identity is [`PortError::NotFound`].
     async fn update_detail(&mut self, detail: PendingAuthDetail) -> PortResult<()> {
         let c = DetailColumns::new(&detail.to_new())?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"UPDATE pending_auth_details
                   SET pa_auth_orig_date = $5,
@@ -834,7 +842,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// `DLET PAUTDTL1` of an expired detail. No row is
     /// [`PortError::NotFound`].
     async fn delete_detail(&mut self, id: AuthId) -> PortResult<()> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "DELETE FROM pending_auth_details WHERE auth_id = $1",
             id.get()
@@ -858,7 +866,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
             .pos_entry_mode
             .map(|code| narrow::<_, i16>(code.get(), "pos_entry_mode"))
             .transpose()?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"INSERT INTO auth_fraud
                    (card_num, auth_ts, auth_type, card_expiry_date, message_type,
@@ -909,7 +917,7 @@ impl AuthorizationStore for PgStore<'_, '_> {
     /// passes, never the database's current date. No row is the `SQLCODE`
     /// +100: [`PortError::NotFound`].
     async fn update_fraud(&mut self, fraud: AuthFraud) -> PortResult<()> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             r#"UPDATE auth_fraud
                   SET auth_fraud = $3,
@@ -948,7 +956,7 @@ impl PgStore<'_, '_> {
         card_num: CardNumber,
         auth_ts: NaiveDateTime,
     ) -> PortResult<AuthFraud> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             FraudRow,
             r#"SELECT card_num, auth_ts, auth_type, card_expiry_date, message_type,
@@ -993,12 +1001,13 @@ impl PgStore<'_, '_> {
 /// of filtering out every twin that precedes it.
 async fn details_page(
     tx: &mut Transaction<'_, Postgres>,
+    ledger: &mut Ledger<'_>,
     acct_id: i64,
     start: Option<i64>,
     direction: Direction,
     limit: i64,
 ) -> PortResult<Vec<PendingAuthDetail>> {
-    let mut sp = savepoint(tx).await?;
+    let mut sp = savepoint(tx, ledger).await?;
     let result = match direction {
         Direction::Forward => details_forward(&mut sp, acct_id, start, limit).await,
         Direction::Backward => details_backward(&mut sp, acct_id, start, limit).await,

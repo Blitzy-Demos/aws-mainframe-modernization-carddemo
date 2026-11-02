@@ -72,7 +72,7 @@ use rust_decimal::Decimal;
 use sqlx::{Postgres, Transaction};
 
 use crate::repos::rewards::ACCRUALS_TABLE;
-use crate::tx::{PgStore, UnitOfWork, savepoint, settle};
+use crate::tx::{Ledger, PgStore, UnitOfWork, savepoint, settle};
 // The row conversions go through the crate's shared column helpers in
 // `crate::repos` rather than copies of them, so a stored reward value is held
 // to its domain type exactly as every repository holds its columns.
@@ -88,22 +88,32 @@ const BALANCES_TABLE: &str = "reward_balances";
 /// The reward store port over one borrowed `PostgreSQL` transaction.
 ///
 /// `'t` is the borrow of the transaction and `'c` the connection the
-/// transaction runs on. The store holds only the `&mut` borrow, which is
-/// `Send`, so the `async fn` port methods give the `Send` futures the
-/// [`RewardStore`] trait declares.
+/// transaction runs on. The store holds the `&mut` borrow of the transaction
+/// and the record of its statement savepoint (`crate::tx`), both `Send`, so
+/// the `async fn` port methods give the `Send` futures the [`RewardStore`]
+/// trait declares.
 #[derive(Debug)]
 pub struct PgRewardStore<'t, 'c> {
     tx: &'t mut Transaction<'c, Postgres>,
+    /// The record the store's calls settle and update: that of the unit of
+    /// work or [`PgStore`] it was taken from, or its own.
+    ledger: Ledger<'t>,
 }
 
 impl<'t, 'c> PgRewardStore<'t, 'c> {
     /// Binds the store to a transaction the caller already holds.
     ///
     /// Every call made through the store belongs to that transaction, and the
-    /// caller commits or rolls it back.
+    /// caller commits or rolls it back. The store keeps its own record of the
+    /// statement savepoint, as [`PgStore::new`] does, so a call abandoned
+    /// through it is settled by its next call but not by another store bound
+    /// to the same transaction.
     #[must_use]
     pub fn new(tx: &'t mut Transaction<'c, Postgres>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            ledger: Ledger::own(),
+        }
     }
 }
 
@@ -111,23 +121,29 @@ impl UnitOfWork {
     /// The reward store bound to this unit of work's transaction.
     ///
     /// The store borrows the unit of work, so its accrual and balance writes
-    /// commit or roll back with everything else the unit holds.
+    /// commit or roll back with everything else the unit holds, and it shares
+    /// the unit of work's record of the statement savepoint.
     #[must_use]
     pub fn rewards(&mut self) -> PgRewardStore<'_, 'static> {
-        PgRewardStore::new(self.transaction())
+        let (tx, ledger) = self.bound();
+        PgRewardStore { tx, ledger }
     }
 }
 
 impl<'c> PgStore<'_, 'c> {
     /// The reward store bound to the same transaction as this port adapter.
     ///
-    /// It re-borrows the transaction for as long as the reward store lives, so
-    /// a rule that recorded a transaction through this [`PgStore`] can hand the
-    /// reward store to `RewardEngine::accrue` and keep using the [`PgStore`]
+    /// It re-borrows the transaction and the store's record of its statement
+    /// savepoint for as long as the reward store lives, so a rule that
+    /// recorded a transaction through this [`PgStore`] can hand the reward
+    /// store to `RewardEngine::accrue` and keep using the [`PgStore`]
     /// afterwards.
     #[must_use]
     pub fn reward_store(&mut self) -> PgRewardStore<'_, 'c> {
-        PgRewardStore::new(&mut *self.tx)
+        PgRewardStore {
+            tx: &mut *self.tx,
+            ledger: self.ledger.share(),
+        }
     }
 }
 
@@ -293,7 +309,7 @@ impl RewardStore for PgRewardStore<'_, '_> {
         category_cd: TranCategoryCode,
     ) -> PortResult<Vec<RewardRule>> {
         let type_text = type_cd.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
@@ -348,7 +364,7 @@ impl RewardStore for PgRewardStore<'_, '_> {
             created_at,
         } = accrual;
         let created_at = repos::exact_instant(created_at, ACCRUALS_TABLE, "created_at")?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_scalar!(
             "INSERT INTO reward_accruals \
                  (account_id, transaction_id, rule_id, points_earned, created_at) \
@@ -404,7 +420,7 @@ impl RewardStore for PgRewardStore<'_, '_> {
         account_id: AccountId,
         points: RewardPoints,
     ) -> PortResult<RewardBalance> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardBalanceRow,
             "INSERT INTO reward_balances \

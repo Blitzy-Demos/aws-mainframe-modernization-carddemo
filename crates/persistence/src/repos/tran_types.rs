@@ -138,7 +138,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// savepoint, as every statement of this store does.
     async fn read_tran_type(&mut self, code: TranTypeCode) -> PortResult<TranTypeMaster> {
         let key = code.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             MasterRow,
             "SELECT tr_type, tr_description FROM transaction_types WHERE tr_type = $1",
@@ -189,7 +189,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
         let pattern = filter.description.as_deref();
         let limit = limit_i64(browse.limit)?;
         let (type_code, start) = (type_code.as_deref(), start.as_deref());
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match browse.direction {
             Direction::Forward => types_forward(&mut sp, type_code, start, pattern, limit).await,
             Direction::Backward => types_backward(&mut sp, type_code, start, pattern, limit).await,
@@ -208,7 +208,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     async fn count_tran_types(&mut self, filter: TranTypeFilter) -> PortResult<u64> {
         let type_code = filter.type_code.as_ref().map(TranTypeCode::trimmed);
         let pattern = filter.description.as_deref();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match type_code.as_deref() {
             Some(code) => {
                 sqlx::query_scalar!(
@@ -247,7 +247,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// -803, [`PortError::Duplicate`].
     async fn insert_tran_type(&mut self, rec: TranTypeMaster) -> PortResult<()> {
         let key = rec.tr_type.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "INSERT INTO transaction_types (tr_type, tr_description) VALUES ($1, $2)",
             key.as_ref(),
@@ -271,7 +271,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// its insert.
     async fn update_tran_type(&mut self, rec: TranTypeMaster) -> PortResult<()> {
         let key = rec.tr_type.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE transaction_types SET tr_description = $2 WHERE tr_type = $1",
             key.as_ref(),
@@ -295,7 +295,7 @@ impl TranTypeMasterStore for PgStore<'_, '_> {
     /// [`PortError::NotFound`].
     async fn delete_tran_type(&mut self, code: TranTypeCode) -> PortResult<()> {
         let key = code.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "DELETE FROM transaction_types WHERE tr_type = $1",
             key.as_ref(),
@@ -452,7 +452,7 @@ impl TranTypeFileReader for PgStore<'_, '_> {
     /// description padded (P-CVTRA03Y-001, P-CVTRA03Y-002).
     async fn read_tran_type_file(&mut self, code: TranTypeCode) -> PortResult<TranTypeRecord> {
         let key = code.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "SELECT tran_type, tran_type_desc FROM trantype_file WHERE tran_type = $1",
             key.as_ref(),
@@ -478,7 +478,7 @@ impl TranTypeFileReader for PgStore<'_, '_> {
         category: TranCategoryCode,
     ) -> PortResult<TranCategoryRecord> {
         let key = code.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "SELECT tran_type_cd, tran_cat_cd, tran_cat_type_desc
                FROM trancatg_file

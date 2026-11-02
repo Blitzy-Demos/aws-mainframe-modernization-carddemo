@@ -447,7 +447,7 @@ impl TransactionReader for PgStore<'_, '_> {
     /// "Transaction ID NOT found...".
     async fn read_transaction(&mut self, id: TranId) -> PortResult<Transaction> {
         let key = id.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
@@ -488,7 +488,7 @@ WHERE tran_id = $1"#,
         let limit = limit_i64(browse.limit)?;
         let account = account_id.map(AccountId::to_i64);
         let start = browse.start_key.as_ref().map(TranId::trimmed);
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let conn = &mut *sp;
         let result = match (browse.direction, start.as_deref()) {
             (Direction::Forward, start) => {
@@ -510,7 +510,7 @@ WHERE tran_id = $1"#,
     /// account. `None` on an empty live master, the `STARTBR` `NOTFND` of
     /// P-COTRN02C-021 and P-COBIL00C-013.
     async fn highest_transaction(&mut self) -> PortResult<Option<Transaction>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = select_backward_from_end(&mut sp, None, 1).await;
         Ok(into_transactions(settle(sp, result).await?)?.pop())
     }
@@ -526,7 +526,7 @@ WHERE tran_id = $1"#,
     /// `statement::TRNXFILE_READ_LIMIT`, past which no record changes the load.
     async fn transactions_by_card(&mut self, limit: u16) -> PortResult<Vec<Transaction>> {
         let limit = limit_i64(limit)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
@@ -589,7 +589,7 @@ LIMIT $1"#,
         //   by 16 U+00FF: a value whose prefix is $2 carries at most 16 more
         //   characters, none above U+00FF, and a prefix below $2 keeps the value
         //   below it.
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             TransactionRow,
             r#"SELECT transaction_id AS "transaction_id!", tran_id AS "tran_id!",
@@ -633,7 +633,7 @@ impl TransactionWriter for PgStore<'_, '_> {
     /// of the transaction references.
     async fn write_transaction(&mut self, tran: NewTransaction) -> PortResult<TransactionRowId> {
         let binds = RecordBinds::new(&tran)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = insert_live(&mut sp, &binds).await;
         settle(sp, result).await.map(TransactionRowId::from)
     }
@@ -677,7 +677,7 @@ impl PgStore<'_, '_> {
         // Two statements rather than `None` bound as "": an all-space TRAN-ID
         // is stored as "", which `tran_id > ''` would leave out of the first
         // page.
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match after {
             None => {
                 sqlx::query_as!(
@@ -760,7 +760,7 @@ LIMIT $2"#,
     /// [`PortError::Contention`] when the wait ends in a deadlock or a lock
     /// timeout, [`PortError::Unavailable`] on any other failure.
     pub async fn exclude_master_writers(&mut self) -> PortResult<()> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_scalar!(
             r#"SELECT 1 AS "locked!" FROM pg_advisory_xact_lock($1)"#,
             TRAN_ID_LOCK_KEY
@@ -768,7 +768,7 @@ LIMIT $2"#,
         .fetch_one(&mut *sp)
         .await;
         settle(sp, result).await?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!("LOCK TABLE transactions IN SHARE ROW EXCLUSIVE MODE")
             .execute(&mut *sp)
             .await;
@@ -799,7 +799,7 @@ LIMIT $2"#,
     /// failure. Either way the savepoint is rolled back and the live master is
     /// unchanged.
     pub async fn empty_live_master(&mut self) -> PortResult<(u64, u64)> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = take_master_offline(&mut sp).await;
         settle(sp, result).await
     }
@@ -831,7 +831,7 @@ LIMIT $2"#,
     /// nothing of the record is written.
     pub async fn load_combined_record(&mut self, rec: NewTransaction) -> PortResult<LoadOutcome> {
         let binds = RecordBinds::new(&rec)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = load(&mut sp, &binds).await;
         match settle(sp, result).await {
             // A live row that a concurrent writer committed after the check of

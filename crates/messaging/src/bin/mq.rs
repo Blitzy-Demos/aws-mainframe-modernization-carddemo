@@ -25,18 +25,25 @@
 //!
 //! # Output and exit status
 //!
-//! Every diagnostic, a start-up failure included, is a JSON line on standard
-//! output from the shared telemetry formatter of `carddemo_runtime::telemetry`,
-//! and nothing is written to standard error. A failure before telemetry is
-//! installed (invalid settings, telemetry setup) is one JSON line, the ERROR
-//! event `mq start-up failed` with the failed `stage` (`configuration` or
-//! `telemetry`) and the `error`. Once telemetry is installed, the end of the
-//! run is the JSON event `mq stopped`, then telemetry is shut down and flushed
-//! before the process exits, and a failed shutdown is one more ERROR event,
-//! `telemetry shutdown failed`. The exit status is non-zero whenever start-up
-//! fails or the consumers stop on an error; a failed telemetry shutdown leaves
-//! it unchanged. No database or broker URL is ever written, because both carry
-//! credentials.
+//! Standard output carries JSON lines only, from the shared telemetry
+//! formatter of `carddemo_runtime::telemetry`: the log events and the spans.
+//!
+//! A failure is one line on standard error, `mq: <stage>: <error>`, as `api`
+//! reports its own, and exit status 1. The stages, in start-up order, are
+//! `configuration`, `telemetry`, `clock` (`CARDDEMO_CLOCK_OVERRIDE`),
+//! `database` (opening the pool) and `serve` (the broker connection, the
+//! consumers, and the first of them to stop). Line breaks in the error text
+//! become spaces, so the report stays one line.
+//!
+//! Each failure is also a JSON line on standard output. One before telemetry
+//! is installed (`configuration`, `telemetry`) is the ERROR event `mq start-up
+//! failed` with the `stage` and the `error`. Once telemetry is installed, the
+//! end of the run is the JSON event `mq stopped`, with the `stage` and the
+//! `error` when the run failed. Telemetry is then shut down and flushed before
+//! the process exits, and a failed shutdown is one more ERROR event,
+//! `telemetry shutdown failed`, which writes nothing to standard error and
+//! leaves the exit status unchanged. No database or broker URL is ever
+//! written, because both carry credentials.
 //!
 //! A signal ends the process without settling the delivery in flight; the
 //! broker redelivers it once the connection drops.
@@ -76,8 +83,9 @@ async fn main() -> ExitCode {
             tracing::info!("mq stopped");
             ExitCode::SUCCESS
         }
-        Err(error) => {
-            tracing::error!(error = %error, "mq stopped");
+        Err((stage, error)) => {
+            tracing::error!(stage, error = %error, "mq stopped");
+            report_on_stderr(stage, &error);
             ExitCode::FAILURE
         }
     };
@@ -95,16 +103,17 @@ async fn main() -> ExitCode {
 /// Reports a start-up failure that happens before [`telemetry::init`] has
 /// installed the process telemetry: one ERROR event, `mq start-up failed`,
 /// with the failed `stage` and the `error`, written as a JSON line on standard
-/// output by the shared telemetry formatter, like every other diagnostic of the
-/// process. Nothing is written to standard error.
+/// output by the shared telemetry formatter, like every other event of the
+/// process, and the standard error line `mq: <stage>: <error>` of
+/// [`report_on_stderr`].
 ///
 /// The subscriber is scoped to this one event, and dropping its guard shuts
 /// its tracer provider down. `error` is a settings or telemetry error, neither
 /// of which ever holds a database or broker URL.
 fn report_startup_failure(stage: &'static str, error: &dyn Display) {
+    report_on_stderr(stage, error);
     // The fixed directive `info` always parses, so this subscriber is always
-    // built. Were it not, no channel would be left to report on, and the exit
-    // status alone tells of the failure.
+    // built. Were it not, the standard error line would be the whole report.
     let Ok((subscriber, guard)) =
         telemetry::subscriber_with_writer(SERVICE_NAME, "info", std::io::stdout)
     else {
@@ -114,6 +123,18 @@ fn report_startup_failure(stage: &'static str, error: &dyn Display) {
         tracing::error!(stage, error = %error, "mq start-up failed");
     });
     drop(guard);
+}
+
+/// Writes the one standard error line that reports a failure at `stage`,
+/// `mq: <stage>: <error>`, the form `api` reports its own failures in.
+///
+/// Standard output stays JSON-only, so this line is the plain-text report an
+/// operator reads. Line breaks in the error text, such as one inside an
+/// invalid `CARDDEMO_CLOCK_OVERRIDE`, become spaces, so the report is always
+/// one line. No error that reaches it holds a database or broker URL.
+fn report_on_stderr(stage: &str, error: &dyn Display) {
+    let text = error.to_string().replace(['\r', '\n'], " ");
+    eprintln!("mq: {stage}: {text}");
 }
 
 /// Parses the processing clock from `CARDDEMO_CLOCK_OVERRIDE`, opens the
@@ -131,10 +152,12 @@ fn report_startup_failure(stage: &'static str, error: &dyn Display) {
 ///
 /// # Errors
 ///
-/// [`MessagingError::Clock`] when the override is not an RFC 3339 instant,
-/// [`MessagingError::Persistence`] when the pool cannot be opened, and any
-/// error of `run`.
-async fn serve(settings: &Settings) -> Result<(), MessagingError> {
+/// The failed stage with its error: `clock` and [`MessagingError::Clock`]
+/// when the override is not an RFC 3339 instant, `database` and
+/// [`MessagingError::Persistence`] when the pool cannot be opened, and
+/// `serve` with any error of `run`, from the broker connection to the first
+/// consumer that stops.
+async fn serve(settings: &Settings) -> Result<(), (&'static str, MessagingError)> {
     tracing::info!(
         service = SERVICE_NAME,
         queue_date_request = %settings.queue_date_request,
@@ -142,9 +165,12 @@ async fn serve(settings: &Settings) -> Result<(), MessagingError> {
         queue_pauth_request = %settings.queue_pauth_request,
         "mq starting"
     );
-    let clock = AnyClock::from_override(settings.clock_override.as_deref())?;
+    let clock = AnyClock::from_override(settings.clock_override.as_deref())
+        .map_err(|error| ("clock", MessagingError::Clock(error)))?;
     let db = connect_with_statement_timeout(&settings.database_url, STATEMENT_TIMEOUT)
         .await
-        .map_err(MessagingError::Persistence)?;
-    run(settings, clock, db).await
+        .map_err(|error| ("database", MessagingError::Persistence(error)))?;
+    run(settings, clock, db)
+        .await
+        .map_err(|error| ("serve", error))
 }

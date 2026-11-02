@@ -180,7 +180,7 @@ impl PgStore<'_, '_> {
     /// [`PortError::Unavailable`] when the read fails or a stored rule does not
     /// fit its domain type.
     pub async fn list_reward_rules(&mut self) -> PortResult<Vec<RewardRule>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
@@ -201,7 +201,7 @@ impl PgStore<'_, '_> {
     /// [`PortError::Unavailable`] when the read fails or the stored rule does
     /// not fit its domain type.
     pub async fn reward_rule(&mut self, id: RuleId) -> PortResult<Option<RewardRule>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "SELECT rule_id, transaction_type_cd, transaction_category_cd, reward_rate, \
@@ -229,7 +229,7 @@ impl PgStore<'_, '_> {
     /// or when the returned row does not fit its domain type.
     pub async fn insert_reward_rule(&mut self, rule: NewRewardRule) -> PortResult<RewardRule> {
         let binds = RuleBinds::try_from(&rule)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "INSERT INTO reward_rules \
@@ -270,7 +270,7 @@ impl PgStore<'_, '_> {
         rule: NewRewardRule,
     ) -> PortResult<Option<RewardRule>> {
         let binds = RuleBinds::try_from(&rule)?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "UPDATE reward_rules SET \
@@ -323,7 +323,7 @@ impl PgStore<'_, '_> {
         at: DateTime<Utc>,
     ) -> PortResult<SoftDeleteOutcome> {
         let at = exact_instant(at, RULES_TABLE, "active_to")?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardRuleRow,
             "UPDATE reward_rules SET active_to = $2 \
@@ -360,7 +360,7 @@ impl PgStore<'_, '_> {
         &mut self,
         account: AccountId,
     ) -> PortResult<Option<RewardBalance>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             RewardBalanceRow,
             "SELECT account_id, total_points_earned, total_points_redeemed, available_points \
@@ -409,7 +409,7 @@ impl PgStore<'_, '_> {
         let rows_with_look_ahead = limit_i64(limit)?.checked_add(1).ok_or_else(|| {
             PortError::Unavailable("row limit exceeds the BIGINT range".to_owned())
         })?;
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match start_key {
             None => {
                 sqlx::query_as!(

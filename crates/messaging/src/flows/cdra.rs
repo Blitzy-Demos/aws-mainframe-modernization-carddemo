@@ -38,6 +38,7 @@
 //! no credential, and its descriptor fields serve routing and correlation only.
 
 use std::future::{self, Future};
+use std::time::Duration;
 
 use carddemo_domain::entities::Account;
 use carddemo_domain::numeric::AccountId;
@@ -45,8 +46,9 @@ use carddemo_domain::ports::{AccountReader, PortError, PortResult};
 use carddemo_domain::rules::mq_account_reply::{self, AccountRequest, ReplyOutcome};
 use carddemo_persistence::{Db, UnitOfWork};
 
+use crate::connection::BROKER_TIMEOUT;
 use crate::consumer::{Disposition, FailureAction, Flow, PublishFailure, Reply, Request};
-use crate::db_deadline::bounded;
+use crate::db_deadline::{DB_DEADLINE, bounded};
 use crate::error_queue;
 
 /// COACCT01 1000-CONTROL / 2400-OPEN-OUTPUT-QUEUE — P-COACCT01-010,
@@ -62,6 +64,23 @@ pub const REPLY_QUEUE: &str = "CARD.DEMO.REPLY.ACCT";
 /// request whose key test the audit cannot pin (E-28) is rejected at,
 /// recorded as the message span's `location`.
 const PROCESS_PARAGRAPH: &str = "4000-PROCESS-REQUEST-REPLY";
+
+/// The database calls one CDRA request makes through [`AccountFile`], each
+/// under its own database deadline: the `BEGIN`, the account read and the
+/// `ROLLBACK`.
+const DB_CALLS: u32 = 3;
+
+/// The publishes the consumer makes for one CDRA request, each held to
+/// [`BROKER_TIMEOUT`]: the reply and, when it is not confirmed, the error
+/// record.
+const PUBLISHES: u32 = 2;
+
+/// The longest one CDRA delivery runs with every bounded step within its
+/// limit: `DB_CALLS` database deadlines and `PUBLISHES` broker timeouts. The
+/// settlement after them has no limit (`crate::consumer`).
+pub(crate) const DELIVERY_BUDGET: Duration = DB_DEADLINE
+    .saturating_mul(DB_CALLS)
+    .saturating_add(BROKER_TIMEOUT.saturating_mul(PUBLISHES));
 
 /// The CDRA flow: the `COACCT01` rules adapted to [`Flow`].
 #[derive(Debug, Clone)]
@@ -166,6 +185,8 @@ impl Flow for CdraFlow {
 /// the same way, so a stalled database ends in the error record rather than
 /// stopping the consumer; a `ROLLBACK` that outlives the deadline is logged
 /// and the unit of work is dropped, which sqlx rolls back on the connection.
+/// `DB_CALLS` counts these three calls for [`DELIVERY_BUDGET`], from which the
+/// shutdown drain is derived, so a call added here is counted there.
 struct AccountFile<'d> {
     /// The pool the unit of work is begun on.
     db: &'d Db,

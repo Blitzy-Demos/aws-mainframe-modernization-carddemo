@@ -93,7 +93,7 @@ impl CardReader for PgStore<'_, '_> {
     /// number alone: both programs leave the account out of the key (E-55).
     async fn read_card(&mut self, card: CardNumber) -> PortResult<Card> {
         let key = card.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             CardRow,
             "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,
@@ -117,7 +117,7 @@ impl CardReader for PgStore<'_, '_> {
     /// lock timeout or deadlock is `PortError::Contention`.
     async fn read_card_for_update(&mut self, card: CardNumber) -> PortResult<Card> {
         let key = card.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             CardRow,
             "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,
@@ -177,7 +177,7 @@ impl CardReader for PgStore<'_, '_> {
         let only_card = filter.card_number.as_ref().map(CardNumber::trimmed);
         let limit = limit_i64(browse.limit)?;
         let (only_card, start) = (only_card.as_deref(), start.as_deref());
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = match browse.direction {
             Direction::Forward => cards_forward(&mut sp, only_card, account, start, limit).await,
             Direction::Backward => cards_backward(&mut sp, only_card, account, start, limit).await,
@@ -191,7 +191,7 @@ impl CardReader for PgStore<'_, '_> {
     /// serves the account's cards in base-key order, the first of them being
     /// the record that `READ` returns.
     async fn cards_for_account(&mut self, id: AccountId) -> PortResult<Vec<Card>> {
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query_as!(
             CardRow,
             "SELECT card_number AS num, card_acct_id AS acct_id, card_cvv_cd AS cvv_cd,
@@ -397,7 +397,7 @@ impl CardWriter for PgStore<'_, '_> {
         let embossed_name = card.card_embossed_name.trimmed();
         let expiraion_date = card.card_expiraion_date.trimmed();
         let active_status = card.card_active_status.trimmed();
-        let mut sp = savepoint(self.tx).await?;
+        let mut sp = savepoint(self.tx, &mut self.ledger).await?;
         let result = sqlx::query!(
             "UPDATE cards
                 SET card_acct_id = $2,
