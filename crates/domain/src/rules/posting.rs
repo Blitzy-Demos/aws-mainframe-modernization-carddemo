@@ -586,8 +586,8 @@ mod tests {
         Transaction,
     };
     use crate::messages::{
-        ACCOUNT_RECORD_NOT_FOUND, ERROR_OPENING_DALY_REJECTS_FILE, ERROR_OPENING_DALYTRAN,
-        ERROR_OPENING_TRANSACTION_FILE, ERROR_READING_DALYTRAN_FILE,
+        ABENDING_PROGRAM, ACCOUNT_RECORD_NOT_FOUND, ERROR_OPENING_DALY_REJECTS_FILE,
+        ERROR_OPENING_DALYTRAN, ERROR_OPENING_TRANSACTION_FILE, ERROR_READING_DALYTRAN_FILE,
         ERROR_READING_TRANSACTION_BALANCE_FILE, ERROR_REWRITING_TRANSACTION_BALANCE_FILE,
         ERROR_WRITING_TO_REJECTS_FILE, ERROR_WRITING_TO_TRANSACTION_FILE,
         ERROR_WRITING_TRANSACTION_BALANCE_FILE, INVALID_CARD_NUMBER_FOUND, OVERLIMIT_TRANSACTION,
@@ -1069,7 +1069,7 @@ mod tests {
         assert_eq!(abend.file_status, "");
         assert_eq!(
             abend.to_string(),
-            [ERROR_REWRITING_TRANSACTION_BALANCE_FILE, "ABENDING PROGRAM"].join("\n")
+            [ERROR_REWRITING_TRANSACTION_BALANCE_FILE, ABENDING_PROGRAM].join("\n")
         );
         assert_eq!(store.calls.last(), Some(&"rewrite_tcatbal"));
         assert_eq!(balance_of(&store, 1, "01"), Some(money9(8_144)));
@@ -1094,7 +1094,7 @@ mod tests {
             [
                 ERROR_WRITING_TO_TRANSACTION_FILE,
                 "FILE STATUS IS: NNNN0022",
-                "ABENDING PROGRAM",
+                ABENDING_PROGRAM,
             ]
             .join("\n")
         );
@@ -1318,7 +1318,7 @@ mod tests {
             (
                 PostingAbend::dalytran_open(),
                 "0000-DALYTRAN-OPEN",
-                vec![ERROR_OPENING_DALYTRAN, "ABENDING PROGRAM"],
+                vec![ERROR_OPENING_DALYTRAN, ABENDING_PROGRAM],
             ),
             (
                 PostingAbend::tranfile_open_not_empty(),
@@ -1326,23 +1326,23 @@ mod tests {
                 vec![
                     ERROR_OPENING_TRANSACTION_FILE,
                     "FILE STATUS IS: NNNN0037",
-                    "ABENDING PROGRAM",
+                    ABENDING_PROGRAM,
                 ],
             ),
             (
                 PostingAbend::dalyrejs_open(),
                 "0300-DALYREJS-OPEN",
-                vec![ERROR_OPENING_DALY_REJECTS_FILE, "ABENDING PROGRAM"],
+                vec![ERROR_OPENING_DALY_REJECTS_FILE, ABENDING_PROGRAM],
             ),
             (
                 PostingAbend::dalytran_read(),
                 "1000-DALYTRAN-GET-NEXT",
-                vec![ERROR_READING_DALYTRAN_FILE, "ABENDING PROGRAM"],
+                vec![ERROR_READING_DALYTRAN_FILE, ABENDING_PROGRAM],
             ),
             (
                 PostingAbend::reject_write(),
                 "2500-WRITE-REJECT-REC",
-                vec![ERROR_WRITING_TO_REJECTS_FILE, "ABENDING PROGRAM"],
+                vec![ERROR_WRITING_TO_REJECTS_FILE, ABENDING_PROGRAM],
             ),
         ];
         for (abend, paragraph, lines) in cases {

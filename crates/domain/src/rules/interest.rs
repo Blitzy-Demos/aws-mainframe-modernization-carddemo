@@ -600,6 +600,12 @@ mod tests {
         Account, CardXref, DisclosureGroup, DisclosureGroupKey, NewTransaction, TranCatBalance,
         TranCatBalanceKey,
     };
+    use crate::messages::{
+        ABENDING_PROGRAM, ERROR_RE_WRITING_ACCOUNT_FILE, ERROR_READING_ACCOUNT_FILE,
+        ERROR_READING_DEFAULT_DISCLOSURE_GROUP, ERROR_READING_DISCLOSURE_GROUP_FILE,
+        ERROR_READING_TRANSACTION_CATEGORY_FILE, ERROR_READING_XREF_FILE,
+        ERROR_WRITING_TRANSACTION_RECORD,
+    };
     use crate::numeric::{
         AccountGroupId, AccountId, Alnum, CardNumber, CustomerId, InterestRate, Money,
         TranCategoryCode, TranTypeCode,
@@ -945,21 +951,21 @@ mod tests {
                 PortError::NotFound,
                 vec![
                     "ACCOUNT NOT FOUND: 00000000001",
-                    "ERROR READING ACCOUNT FILE",
+                    ERROR_READING_ACCOUNT_FILE,
                     "FILE STATUS IS: NNNN0023",
                 ],
             ),
             (
                 "read_account",
                 unavailable(),
-                vec!["ERROR READING ACCOUNT FILE", "FILE STATUS IS: NNNN0030"],
+                vec![ERROR_READING_ACCOUNT_FILE, "FILE STATUS IS: NNNN0030"],
             ),
             (
                 "read_xref_by_account",
                 PortError::NotFound,
                 vec![
                     "ACCOUNT NOT FOUND: 00000000001",
-                    "ERROR READING XREF FILE",
+                    ERROR_READING_XREF_FILE,
                     "FILE STATUS IS: NNNN0023",
                 ],
             ),
@@ -967,7 +973,7 @@ mod tests {
                 "read_disclosure_group",
                 unavailable(),
                 vec![
-                    "ERROR READING DISCLOSURE GROUP FILE",
+                    ERROR_READING_DISCLOSURE_GROUP_FILE,
                     "FILE STATUS IS: NNNN0030",
                 ],
             ),
@@ -977,7 +983,7 @@ mod tests {
             store.fail_next(method, cause.clone());
             let abend = first_record(&mut store).expect_err("an abend");
             let mut lines = expected;
-            lines.push("ABENDING PROGRAM");
+            lines.push(ABENDING_PROGRAM);
             assert_eq!(abend.lines(), lines, "{method} {cause:?}");
             assert_eq!(abend.to_string(), lines.join("\n"), "{method}");
             let source = abend
@@ -1000,9 +1006,9 @@ mod tests {
         assert_eq!(
             abend.lines(),
             [
-                "ERROR READING DEFAULT DISCLOSURE GROUP",
+                ERROR_READING_DEFAULT_DISCLOSURE_GROUP,
                 "FILE STATUS IS: NNNN0023",
-                "ABENDING PROGRAM",
+                ABENDING_PROGRAM,
             ]
         );
     }
@@ -1030,9 +1036,9 @@ mod tests {
         assert_eq!(
             abend.lines(),
             [
-                "ERROR RE-WRITING ACCOUNT FILE",
+                ERROR_RE_WRITING_ACCOUNT_FILE,
                 "FILE STATUS IS: NNNN0023",
-                "ABENDING PROGRAM",
+                ABENDING_PROGRAM,
             ]
         );
         assert_eq!(store.calls.last(), Some(&"rewrite_account"));
@@ -1045,19 +1051,19 @@ mod tests {
                 InterestAbend::TcatbalRead {
                     cause: PortError::Unavailable("timeout".to_owned()),
                 },
-                "ERROR READING TRANSACTION CATEGORY FILE",
+                ERROR_READING_TRANSACTION_CATEGORY_FILE,
                 "FILE STATUS IS: NNNN0030",
                 true,
             ),
             (
                 InterestAbend::SystranWrite { status: *b"34" },
-                "ERROR WRITING TRANSACTION RECORD",
+                ERROR_WRITING_TRANSACTION_RECORD,
                 "FILE STATUS IS: NNNN0034",
                 false,
             ),
         ];
         for (abend, text, status, has_source) in cases {
-            assert_eq!(abend.lines(), [text, status, "ABENDING PROGRAM"]);
+            assert_eq!(abend.lines(), [text, status, ABENDING_PROGRAM]);
             assert_eq!(abend.source().is_some(), has_source, "{abend:?}");
         }
         assert_eq!(InterestAbend::ABCODE, 999);

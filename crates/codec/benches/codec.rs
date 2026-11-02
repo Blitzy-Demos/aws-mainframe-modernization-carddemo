@@ -2,9 +2,7 @@
 //! over the `CardDemo` fixture corpus (AAP 0.2.1, goal o4).
 //!
 //! Every benchmark reads the real fixture bytes (`app/data/ASCII/*.txt` and
-//! `app/data/EBCDIC/AWS.M2.CARDDEMO.DALYTRAN.PS`) and proves its round trip
-//! once before timing, so a broken codec fails the run instead of being
-//! measured:
+//! `app/data/EBCDIC/AWS.M2.CARDDEMO.DALYTRAN.PS`) and only times the codecs:
 //!
 //! - `dailytran`: `decode_ascii_file` and `encode_ascii_file` of the 300
 //!   `CVTRA06Y` records of `dailytran.txt`.
@@ -13,7 +11,12 @@
 //! - `corpus`: decode and re-encode of all nine ASCII fixture files, 626
 //!   records in all.
 //!
-//! The record types stay opaque: the benchmarks compare bytes, never fields.
+//! The benchmarks check nothing. Byte identity of every record and file, and
+//! the record count of every fixture, are proved by
+//! `crates/codec/tests/fixture_roundtrip.rs`. A fixture file that cannot be
+//! read, or a daily-transaction file that does not decode, still stops the run
+//! before timing: the encode benchmarks time the decoded records, so they have
+//! no input without them.
 
 use std::hint::black_box;
 use std::path::Path;
@@ -38,15 +41,9 @@ const DAILY_TRAN_ASCII: &str = "dailytran.txt";
 /// The EBCDIC counterpart of `dailytran.txt`.
 const DAILY_TRAN_EBCDIC: &str = "AWS.M2.CARDDEMO.DALYTRAN.PS";
 
-/// The records of `dailytran.txt` and of its EBCDIC counterpart.
-const DAILY_TRAN_RECORDS: usize = 300;
-
-/// The records of the nine ASCII fixture files together.
-const CORPUS_RECORDS: usize = 626;
-
 /// Decodes an ASCII file with one layout and re-encodes it, returning the
-/// record count and the re-encoded bytes.
-type RoundTrip = fn(&[u8]) -> Result<(usize, Vec<u8>), CodecError>;
+/// re-encoded bytes.
+type RoundTrip = fn(&[u8]) -> Result<Vec<u8>, CodecError>;
 
 /// Each ASCII fixture file with the round trip of its layout.
 const CORPUS: [(&str, RoundTrip); 9] = [
@@ -103,27 +100,17 @@ fn byte_len(bytes: &[u8]) -> u64 {
     u64::try_from(bytes.len()).expect("fixture length fits in u64")
 }
 
-fn roundtrip<L: Layout>(bytes: &[u8]) -> Result<(usize, Vec<u8>), CodecError> {
+/// Decodes the ASCII file `bytes` with the layout `L` and re-encodes the
+/// decoded records, returning the re-encoded bytes.
+fn roundtrip<L: Layout>(bytes: &[u8]) -> Result<Vec<u8>, CodecError> {
     let framed = decode_ascii_file::<L>(bytes)?;
-    let encoded = encode_ascii_file::<L>(&framed)?;
-    Ok((framed.len(), encoded))
+    encode_ascii_file::<L>(&framed)
 }
 
 fn bench_daily_tran_ascii(c: &mut Criterion) {
     let bytes = fixtures().ascii(DAILY_TRAN_ASCII);
     let framed = decode_ascii_file::<DailyTranLayout>(bytes)
         .unwrap_or_else(|err| panic!("{DAILY_TRAN_ASCII} does not decode: {err}"));
-    assert_eq!(
-        framed.len(),
-        DAILY_TRAN_RECORDS,
-        "{DAILY_TRAN_ASCII} record count"
-    );
-    let encoded = encode_ascii_file::<DailyTranLayout>(&framed)
-        .unwrap_or_else(|err| panic!("{DAILY_TRAN_ASCII} does not re-encode: {err}"));
-    assert!(
-        encoded.as_slice() == bytes,
-        "{DAILY_TRAN_ASCII} ASCII round trip is not byte-identical"
-    );
 
     let mut group = c.benchmark_group("dailytran");
     group.throughput(Throughput::Bytes(byte_len(bytes)));
@@ -140,15 +127,6 @@ fn bench_daily_tran_ebcdic(c: &mut Criterion) {
     let bytes = fixtures().daily_ebcdic.as_slice();
     let records = decode_ebcdic_file::<DailyTranLayout>(bytes)
         .unwrap_or_else(|err| panic!("{DAILY_TRAN_EBCDIC} does not decode: {err}"));
-    assert_eq!(
-        records.len(),
-        DAILY_TRAN_RECORDS,
-        "{DAILY_TRAN_EBCDIC} record count"
-    );
-    assert!(
-        encode_ebcdic_file::<DailyTranLayout>(&records).as_slice() == bytes,
-        "{DAILY_TRAN_EBCDIC} EBCDIC round trip is not byte-identical"
-    );
 
     let mut group = c.benchmark_group("dailytran_ebcdic");
     group.throughput(Throughput::Bytes(byte_len(bytes)));
@@ -164,21 +142,10 @@ fn bench_daily_tran_ebcdic(c: &mut Criterion) {
 fn bench_corpus(c: &mut Criterion) {
     let fx = fixtures();
     // File lookups are resolved here so the timed loop runs only the codecs.
-    let inputs = CORPUS.map(|(name, rt)| (name, rt, fx.ascii(name)));
-    let mut total_records = 0;
-    for &(name, rt, bytes) in &inputs {
-        let (records, encoded) =
-            rt(bytes).unwrap_or_else(|err| panic!("{name} does not round trip: {err}"));
-        assert!(
-            encoded.as_slice() == bytes,
-            "{name} ASCII round trip is not byte-identical"
-        );
-        total_records += records;
-    }
-    assert_eq!(total_records, CORPUS_RECORDS, "corpus record count");
+    let inputs = CORPUS.map(|(name, rt)| (rt, fx.ascii(name)));
     let total_bytes = inputs
         .iter()
-        .map(|&(_, _, bytes)| byte_len(bytes))
+        .map(|&(_, bytes)| byte_len(bytes))
         .sum::<u64>();
 
     let mut group = c.benchmark_group("corpus");
@@ -186,7 +153,7 @@ fn bench_corpus(c: &mut Criterion) {
     // The closure returns all nine results, so criterion keeps every one of
     // them observed and none of the round trips can be optimised away.
     group.bench_function("ascii_roundtrip", |b| {
-        b.iter(|| inputs.map(|(_, rt, bytes)| rt(black_box(bytes))));
+        b.iter(|| inputs.map(|(rt, bytes)| rt(black_box(bytes))));
     });
     group.finish();
 }
