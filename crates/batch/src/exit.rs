@@ -118,7 +118,7 @@ impl ExitStatus {
             Self::ReturnCode(return_code) => {
                 let code = i32::from(*return_code);
                 // The code passes through unchanged. The check pins the contract that only
-                // 0 and 4 arrive here, and is the one place the binary reads RECORDS_REJECTED.
+                // 0 and 4 arrive here.
                 debug_assert!(
                     matches!(code, SUCCESS | RECORDS_REJECTED),
                     "RETURN-CODE {code} is not one the carried programs set"
