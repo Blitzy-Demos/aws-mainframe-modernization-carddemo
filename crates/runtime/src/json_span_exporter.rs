@@ -208,7 +208,7 @@ mod tests {
     use opentelemetry::{Array, InstrumentationScope, KeyValue, StringValue, Value};
     use opentelemetry_sdk::Resource;
     use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
-    use opentelemetry_sdk::trace::{SpanEvents, SpanLinks};
+    use opentelemetry_sdk::trace::{Sampler, SpanEvents, SpanLimits, SpanLinks};
     use serde_json::{Value as Json, json};
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -520,7 +520,11 @@ mod tests {
     #[test]
     fn sdk_provider_feeds_the_exporter_through_the_simple_processor() -> TestResult {
         let capture = Capture::default();
+        // An explicit sampler and span limits keep the SDK from reading OTEL_TRACES_SAMPLER and
+        // OTEL_SPAN_*_COUNT_LIMIT from the environment, like `telemetry::subscriber_with_writer`.
         let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_sampler(Sampler::AlwaysOn)
+            .with_span_limits(SpanLimits::default())
             .with_simple_exporter(JsonSpanExporter::new(capture.clone()))
             .with_resource(Resource::new([KeyValue::new("service.name", "batch")]))
             .build();
